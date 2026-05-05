@@ -724,9 +724,94 @@ jobs:
   # `:<SANDBOX_IMAGE_VERSION>` (the immutable tag the runtime pulls) and
   # `:latest` (operator convenience).
   # ─────────────────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────────────
+  # Compile helpers + render every per-runtime Dockerfile + materialise
+  # the shared bundle, ONCE. The matrix below depends on this — was
+  # being repeated 6× in parallel across the matrix.
+  # ─────────────────────────────────────────────────────────────────────
+  prepare-sandbox-context:
+    name: Prepare sandbox build context
+    needs: [create-release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      sandbox_image_version: ${{ steps.version.outputs.sandbox_image_version }}
+      gateway_version: ${{ steps.version.outputs.gateway_version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo deps
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: sandbox-image-builder
+
+      - name: Build helpers (print_dockerfile + print_bundle)
+        # Single source of truth: same examples the runtime ships use of.
+        # `pty_agent_bundle::BUNDLE` and `git_credential_bundle::BUNDLE`
+        # are linked into both, so what we materialise here is exactly
+        # what `temps serve` would tar at runtime.
+        run: |
+          cargo build \
+            --example print_dockerfile \
+            --example print_bundle \
+            -p temps-agents
+
+      - name: Extract versions
+        id: version
+        run: |
+          IMAGE_VERSION=$(grep -E '^pub const SANDBOX_IMAGE_VERSION' \
+            crates/temps-agents/src/sandbox/docker.rs \
+            | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ -z "$IMAGE_VERSION" ]; then
+            echo "::error::Failed to extract SANDBOX_IMAGE_VERSION from docker.rs"
+            exit 1
+          fi
+          echo "sandbox_image_version=$IMAGE_VERSION" >> $GITHUB_OUTPUT
+
+          GATEWAY_VERSION=$(grep -E '^version = ' \
+            crates/temps-preview-gateway/Cargo.standalone.toml \
+            | head -n 1 \
+            | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ -z "$GATEWAY_VERSION" ]; then
+            echo "::error::Failed to extract preview gateway version"
+            exit 1
+          fi
+          echo "gateway_version=$GATEWAY_VERSION" >> $GITHUB_OUTPUT
+
+          echo "Sandbox image version: $IMAGE_VERSION"
+          echo "Gateway version:       $GATEWAY_VERSION"
+
+      - name: Render Dockerfiles for every runtime
+        run: |
+          mkdir -p sandbox-context/dockerfiles
+          for runtime in node bun python rust go full; do
+            ./target/debug/examples/print_dockerfile "$runtime" \
+              > "sandbox-context/dockerfiles/$runtime.Dockerfile"
+            echo "  rendered: $runtime"
+          done
+
+      - name: Materialise bundles into shared build context
+        run: |
+          mkdir -p sandbox-context/bundle
+          ./target/debug/examples/print_bundle sandbox-context/bundle
+          echo "Bundle layout:"
+          find sandbox-context/bundle -type f | sort
+
+      - name: Upload sandbox build context
+        uses: actions/upload-artifact@v4
+        with:
+          name: sandbox-context
+          path: sandbox-context/
+          retention-days: 1
+
   build-and-push-sandbox-images:
     name: Build sandbox image (${{ matrix.runtime }})
-    needs: [create-release]
+    needs: [create-release, prepare-sandbox-context]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -741,62 +826,22 @@ jobs:
       CHANNEL_TAG: ${{ needs.create-release.outputs.channel_tag }}
       IS_PRERELEASE: ${{ needs.create-release.outputs.is_prerelease }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo deps
-        uses: Swatinem/rust-cache@v2
+      - name: Download prepared context
+        uses: actions/download-artifact@v4
         with:
-          key: sandbox-image-builder
+          name: sandbox-context
+          path: sandbox-context
 
-      - name: Build sandbox-context helpers
-        run: |
-          # `print_dockerfile` emits the per-runtime Dockerfile; `print_bundle`
-          # writes the pty-agent sources + sandbox-entrypoint.sh that the
-          # generated Dockerfile's `COPY pty-agent/...` lines reference. Both
-          # share `pty_agent_bundle::BUNDLE` with the runtime build path, so
-          # CI can't drift from what `temps serve` ships to Docker.
-          cargo build \
-            --example print_dockerfile \
-            --example print_bundle \
-            -p temps-agents
-
-      - name: Extract sandbox image version
-        id: version
-        run: |
-          # Single source of truth: the constant in docker.rs. The runtime
-          # uses this exact tag to pull, so the workflow must publish under
-          # the same string.
-          IMAGE_VERSION=$(grep -E '^pub const SANDBOX_IMAGE_VERSION' \
-            crates/temps-agents/src/sandbox/docker.rs \
-            | sed -E 's/.*"([^"]+)".*/\1/')
-          if [ -z "$IMAGE_VERSION" ]; then
-            echo "::error::Failed to extract SANDBOX_IMAGE_VERSION from docker.rs"
-            exit 1
-          fi
-          echo "version=$IMAGE_VERSION" >> $GITHUB_OUTPUT
-          echo "Sandbox image version: $IMAGE_VERSION"
-
-      - name: Materialize Dockerfile for ${{ matrix.runtime }}
+      - name: Assemble per-runtime build context
+        # `docker buildx build` wants a single directory: this runtime's
+        # rendered Dockerfile + the materialised bundle, side by side.
         run: |
           mkdir -p build-context
-          ./target/debug/examples/print_dockerfile ${{ matrix.runtime }} \
-            > build-context/Dockerfile
-          echo "Generated Dockerfile (first 30 lines):"
-          head -n 30 build-context/Dockerfile
-
-      - name: Materialize pty-agent bundle into build context
-        run: |
-          # The generated Dockerfile copies from `pty-agent/` (sources + the
-          # sandbox-entrypoint.sh script). Those files only exist as
-          # `include_bytes!` constants in the temps-agents crate, so we
-          # materialize them onto disk before docker buildx runs.
-          ./target/debug/examples/print_bundle build-context
+          cp -r sandbox-context/bundle/. build-context/
+          cp "sandbox-context/dockerfiles/${{ matrix.runtime }}.Dockerfile" \
+             build-context/Dockerfile
           echo "Build context layout:"
-          find build-context -type f | sort
+          find build-context -maxdepth 2 | sort
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -821,7 +866,7 @@ jobs:
         id: tags
         run: |
           REPO="ghcr.io/${{ github.repository_owner }}/temps-sandbox-${{ matrix.runtime }}"
-          VER="${{ steps.version.outputs.version }}"
+          VER="${{ needs.prepare-sandbox-context.outputs.sandbox_image_version }}"
           SHA="${{ github.sha }}"
           {
             echo "list<<TAGS_EOF"
@@ -865,7 +910,7 @@ jobs:
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.version=${{ needs.prepare-sandbox-context.outputs.sandbox_image_version }}
             org.opencontainers.image.title=temps-sandbox-${{ matrix.runtime }}
             org.opencontainers.image.description=Temps workspace sandbox image (${{ matrix.runtime }} runtime)
           cache-from: type=gha,scope=sandbox-${{ matrix.runtime }}
@@ -873,7 +918,7 @@ jobs:
 
   build-and-push-preview-gateway:
     name: Build preview gateway image
-    needs: [create-release]
+    needs: [create-release, prepare-sandbox-context]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -883,24 +928,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Extract preview gateway version
-        id: version
-        # The crate's own Cargo.standalone.toml carries the package version
-        # the gateway publishes as. Keep the published tag aligned so the
-        # gateway's image stream is independently versionable from the
-        # main `temps` server (different release cadence is fine).
-        run: |
-          GATEWAY_VERSION=$(grep -E '^version = ' \
-            crates/temps-preview-gateway/Cargo.standalone.toml \
-            | head -n 1 \
-            | sed -E 's/.*"([^"]+)".*/\1/')
-          if [ -z "$GATEWAY_VERSION" ]; then
-            echo "::error::Failed to extract preview gateway version"
-            exit 1
-          fi
-          echo "version=$GATEWAY_VERSION" >> $GITHUB_OUTPUT
-          echo "Preview gateway version: $GATEWAY_VERSION"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -923,7 +950,7 @@ jobs:
         id: tags
         run: |
           REPO="ghcr.io/${{ github.repository_owner }}/temps-preview-gateway"
-          VER="${{ steps.version.outputs.version }}"
+          VER="${{ needs.prepare-sandbox-context.outputs.gateway_version }}"
           SHA="${{ github.sha }}"
           {
             echo "list<<TAGS_EOF"
@@ -950,7 +977,7 @@ jobs:
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.version=${{ needs.prepare-sandbox-context.outputs.gateway_version }}
             org.opencontainers.image.title=temps-preview-gateway
             org.opencontainers.image.description=Temps preview gateway — routes ws-<sid>-<port> hosts to sandbox containers
           cache-from: type=gha,scope=preview-gateway

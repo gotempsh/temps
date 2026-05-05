@@ -94,6 +94,20 @@ for runtime in "${RUNTIMES[@]}"; do
     # with "not found" before any apt-get can run.
     "$PRINT_BUNDLE" "$BUILD_DIR" > /dev/null
 
+    # OCI labels — must match what the workflow attaches. The
+    # `image.source` annotation is what GHCR uses to auto-link a package
+    # to a repository; without it, the package is owned by whoever
+    # pushed it (the user running this script) and the workflow's
+    # GITHUB_TOKEN gets 403 trying to push to "someone else's" package.
+    # Keeping this in lock-step with `.github/workflows/release.yml`.
+    LABEL_ARGS=(
+        --label "org.opencontainers.image.source=https://github.com/gotempsh/temps"
+        --label "org.opencontainers.image.revision=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+        --label "org.opencontainers.image.version=$IMAGE_VERSION"
+        --label "org.opencontainers.image.title=temps-sandbox-${runtime}"
+        --label "org.opencontainers.image.description=Temps workspace sandbox image (${runtime} runtime)"
+    )
+
     # Stable owns the canonical `:<ver>` ref; beta only publishes suffixed
     # refs so it can never overwrite a stable image at the same version.
     if [ "$CHANNEL" = "stable" ]; then
@@ -120,6 +134,7 @@ for runtime in "${RUNTIMES[@]}"; do
     docker buildx build \
         --platform linux/amd64,linux/arm64 \
         "${TAG_ARGS[@]}" \
+        "${LABEL_ARGS[@]}" \
         --push \
         "$BUILD_DIR"
 

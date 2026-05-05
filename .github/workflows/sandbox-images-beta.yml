@@ -5,6 +5,18 @@ name: Sandbox Images (beta)
 # `:latest`, `:stable`) is owned by `release.yml` triggered on `v*.*.*`
 # tags — those two paths must never collide on the same tag.
 #
+# Pipeline shape:
+#
+#   prepare-context  ->  build-and-push-sandbox-images (matrix × 6)
+#                    \\
+#                     -> build-and-push-preview-gateway
+#
+# `prepare-context` compiles the Rust helpers ONCE and pre-renders one
+# Dockerfile per runtime + the bundle tree, then uploads them as an
+# artifact. The matrix jobs download the artifact and feed `docker buildx`
+# directly — they don't touch Rust at all. Saves ~30s of toolchain
+# install × 6 parallel jobs of CI minutes per run.
+#
 # Why a separate workflow:
 #   - `release.yml` runs the full server build/release dance (linux+darwin
 #     binaries, GitHub release notes, Homebrew formula). 99% of `main`
@@ -13,8 +25,7 @@ name: Sandbox Images (beta)
 #     image rebuilds. The `paths` list below intentionally enumerates
 #     every file that affects image content; if you add a new bundle or
 #     change the install script, ADD IT HERE or builds will silently go
-#     stale (the same class of bug the channel split was designed to
-#     prevent).
+#     stale.
 #
 # Channel discipline:
 #   - This workflow only ever pushes `:<ver>-beta`, `:beta`, and `:<sha>`.
@@ -56,13 +67,18 @@ permissions:
   packages: write
 
 jobs:
-  build-and-push-sandbox-images:
-    name: Sandbox image (${{ matrix.runtime }})
+  # ─────────────────────────────────────────────────────────────────────
+  # Compile helpers + render every per-runtime Dockerfile + materialise
+  # the shared bundle, ONCE. The matrix jobs below download the artifact
+  # and skip the entire Rust toolchain install — was duplicated 6 times,
+  # now runs exactly once per workflow.
+  # ─────────────────────────────────────────────────────────────────────
+  prepare-context:
+    name: Prepare sandbox build context
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        runtime: [node, bun, python, rust, go, full]
+    outputs:
+      sandbox_image_version: ${{ steps.version.outputs.sandbox_image_version }}
+      gateway_version: ${{ steps.version.outputs.gateway_version }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -75,20 +91,24 @@ jobs:
         with:
           key: sandbox-image-builder
 
-      - name: Build sandbox-context helpers
-        # Same helpers the release workflow builds. They share a single
-        # `pty_agent_bundle::BUNDLE` source of truth with the runtime so
-        # CI can't drift from what `temps serve` ships to Docker at
-        # runtime.
+      - name: Build helpers (print_dockerfile + print_bundle)
+        # Single source of truth: same examples the runtime ships use of.
+        # `pty_agent_bundle::BUNDLE` and `git_credential_bundle::BUNDLE`
+        # are linked into both, so what we materialise here is exactly
+        # what `temps serve` would tar at runtime.
         run: |
           cargo build \
             --example print_dockerfile \
             --example print_bundle \
             -p temps-agents
 
-      - name: Extract sandbox image version
+      - name: Extract versions
         id: version
         run: |
+          # Sandbox image version: pinned constant in docker.rs. The
+          # runtime pulls images at this exact tag, so the workflow MUST
+          # publish under the same string. A drift between the two is the
+          # bug the channel split was designed to prevent.
           IMAGE_VERSION=$(grep -E '^pub const SANDBOX_IMAGE_VERSION' \
             crates/temps-agents/src/sandbox/docker.rs \
             | sed -E 's/.*"([^"]+)".*/\1/')
@@ -96,18 +116,90 @@ jobs:
             echo "::error::Failed to extract SANDBOX_IMAGE_VERSION from docker.rs"
             exit 1
           fi
-          echo "version=$IMAGE_VERSION" >> $GITHUB_OUTPUT
-          echo "Sandbox image version: $IMAGE_VERSION"
+          echo "sandbox_image_version=$IMAGE_VERSION" >> $GITHUB_OUTPUT
 
-      - name: Materialize Dockerfile for ${{ matrix.runtime }}
+          # Gateway version: from its standalone Cargo manifest. Different
+          # release cadence is intentional — gateway and server are
+          # independently versioned.
+          GATEWAY_VERSION=$(grep -E '^version = ' \
+            crates/temps-preview-gateway/Cargo.standalone.toml \
+            | head -n 1 \
+            | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ -z "$GATEWAY_VERSION" ]; then
+            echo "::error::Failed to extract preview gateway version"
+            exit 1
+          fi
+          echo "gateway_version=$GATEWAY_VERSION" >> $GITHUB_OUTPUT
+
+          echo "Sandbox image version: $IMAGE_VERSION"
+          echo "Gateway version:       $GATEWAY_VERSION"
+
+      - name: Render Dockerfiles for every runtime
+        # Pre-generate all 6 Dockerfiles up front so matrix jobs can pick
+        # the right one by name. The runtime's `print_dockerfile` is the
+        # same code that builds in-process tar archives at `temps serve`
+        # time — using the same helper for both paths keeps them in sync.
+        run: |
+          mkdir -p sandbox-context/dockerfiles
+          for runtime in node bun python rust go full; do
+            ./target/debug/examples/print_dockerfile "$runtime" \
+              > "sandbox-context/dockerfiles/$runtime.Dockerfile"
+            echo "  rendered: $runtime"
+          done
+
+      - name: Materialise bundles into shared build context
+        # `print_bundle` writes both `pty_agent_bundle` AND
+        # `git_credential_bundle`. The bundle contents are
+        # runtime-agnostic, so a single materialisation feeds all 6
+        # matrix jobs.
+        run: |
+          mkdir -p sandbox-context/bundle
+          ./target/debug/examples/print_bundle sandbox-context/bundle
+          echo "Bundle layout:"
+          find sandbox-context/bundle -type f | sort
+
+      - name: Upload sandbox build context
+        uses: actions/upload-artifact@v4
+        with:
+          name: sandbox-context
+          path: sandbox-context/
+          # Short retention — we don't need the artifact after the
+          # workflow finishes. Lower than the 90-day default to keep
+          # storage tidy.
+          retention-days: 1
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Per-runtime build + push. No Rust toolchain here — these jobs are
+  # pure docker pipelines, fast to spin up.
+  # ─────────────────────────────────────────────────────────────────────
+  build-and-push-sandbox-images:
+    name: Sandbox image (${{ matrix.runtime }})
+    needs: prepare-context
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: [node, bun, python, rust, go, full]
+    steps:
+      - name: Download prepared context
+        uses: actions/download-artifact@v4
+        with:
+          name: sandbox-context
+          path: sandbox-context
+
+      - name: Assemble per-runtime build context
+        # `docker buildx build` wants a single directory: the runtime's
+        # rendered Dockerfile + the materialised bundle, side by side.
+        # Copy (not move) the dockerfile so the artifact stays
+        # readable if a later job needs to debug.
         run: |
           mkdir -p build-context
-          ./target/debug/examples/print_dockerfile ${{ matrix.runtime }} \
-            > build-context/Dockerfile
-
-      - name: Materialize bundles into build context
-        run: |
-          ./target/debug/examples/print_bundle build-context
+          cp sandbox-context/bundle/* build-context/ -R 2>/dev/null || \
+            cp -r sandbox-context/bundle/. build-context/
+          cp "sandbox-context/dockerfiles/${{ matrix.runtime }}.Dockerfile" \
+             build-context/Dockerfile
+          echo "Build context layout:"
+          find build-context -maxdepth 2 | sort
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -125,12 +217,10 @@ jobs:
       - name: Compose tag list (beta only)
         id: tags
         # Beta channel publishes only suffixed refs + sha. Never touches
-        # `:<ver>` or `:latest` — those are reserved for stable. Hard-coded
-        # here (vs. release.yml's branching) because this workflow only
-        # ever runs in beta mode.
+        # `:<ver>` or `:latest` — those are reserved for stable.
         run: |
           REPO="ghcr.io/${{ github.repository_owner }}/temps-sandbox-${{ matrix.runtime }}"
-          VER="${{ steps.version.outputs.version }}"
+          VER="${{ needs.prepare-context.outputs.sandbox_image_version }}"
           SHA="${{ github.sha }}"
           {
             echo "list<<TAGS_EOF"
@@ -157,31 +247,25 @@ jobs:
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.version=${{ needs.prepare-context.outputs.sandbox_image_version }}
             org.opencontainers.image.title=temps-sandbox-${{ matrix.runtime }}
             org.opencontainers.image.description=Temps workspace sandbox image (${{ matrix.runtime }} runtime, beta channel)
           cache-from: type=gha,scope=sandbox-${{ matrix.runtime }}
           cache-to: type=gha,scope=sandbox-${{ matrix.runtime }},mode=max
 
+  # ─────────────────────────────────────────────────────────────────────
+  # Preview gateway has its own crate + own Dockerfile, no shared bundle
+  # work. Gets the version from `prepare-context` output so we don't
+  # reparse the manifest twice. Doesn't depend on the artifact, but does
+  # depend on the prepare job for the version string.
+  # ─────────────────────────────────────────────────────────────────────
   build-and-push-preview-gateway:
     name: Preview gateway image
+    needs: prepare-context
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Extract preview gateway version
-        id: version
-        run: |
-          GATEWAY_VERSION=$(grep -E '^version = ' \
-            crates/temps-preview-gateway/Cargo.standalone.toml \
-            | head -n 1 \
-            | sed -E 's/.*"([^"]+)".*/\1/')
-          if [ -z "$GATEWAY_VERSION" ]; then
-            echo "::error::Failed to extract preview gateway version"
-            exit 1
-          fi
-          echo "version=$GATEWAY_VERSION" >> $GITHUB_OUTPUT
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -200,7 +284,7 @@ jobs:
         id: tags
         run: |
           REPO="ghcr.io/${{ github.repository_owner }}/temps-preview-gateway"
-          VER="${{ steps.version.outputs.version }}"
+          VER="${{ needs.prepare-context.outputs.gateway_version }}"
           SHA="${{ github.sha }}"
           {
             echo "list<<TAGS_EOF"
@@ -220,7 +304,7 @@ jobs:
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.version=${{ needs.prepare-context.outputs.gateway_version }}
             org.opencontainers.image.title=temps-preview-gateway
             org.opencontainers.image.description=Temps preview gateway (beta channel)
           cache-from: type=gha,scope=preview-gateway
