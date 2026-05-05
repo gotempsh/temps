@@ -199,7 +199,11 @@ impl DoctorCommand {
         let current = upgrade::current_version_tag();
         report.add("Current version", CheckResult::Info(current.clone()));
 
-        match upgrade::fetch_latest_release(false).await {
+        // Doctor wants visibility into "is anything newer out there?"
+        // regardless of channel — `Beta` includes both stable and beta
+        // releases, so it gives the absolute latest tag. The label below
+        // surfaces `(prerelease)` if the newest happens to be a beta.
+        match upgrade::fetch_latest_release_in_channel(upgrade::UpgradeChannel::Beta).await {
             Ok(release) => {
                 let latest = &release.tag_name;
                 if latest == &current {

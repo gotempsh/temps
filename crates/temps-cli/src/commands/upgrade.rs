@@ -1,4 +1,4 @@
-use clap::Args;
+use clap::{Args, ValueEnum};
 use serde::Deserialize;
 use std::env::consts::{ARCH, OS};
 use std::fs;
@@ -8,9 +8,61 @@ use tracing::{debug, info};
 
 const GITHUB_RELEASES_API: &str = "https://api.github.com/repos/gotempsh/temps/releases";
 
+/// Release channel the upgrader subscribes to. The picker filters all
+/// available GitHub releases through this channel before selecting the
+/// newest, so a host on `Stable` never auto-upgrades onto a beta tag.
+/// Pre-release tags carry a `-` (`v1.2.0-beta.4`, `v1.2.0-rc.1`); stable
+/// tags don't (`v1.2.0`).
+///
+/// Channel selection is **CLI-only** — there is no env-var fallback. The
+/// default is `Stable` and the user must explicitly pass `--channel beta`
+/// to opt into prereleases. This is by design: an env var on a long-lived
+/// shell or CI runner could silently switch a host onto beta without an
+/// audit trail, which we want to prevent. Pinning a specific `--version`
+/// ignores the channel entirely.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum UpgradeChannel {
+    /// Track stable releases only (default). Tag must NOT contain `-`.
+    Stable,
+    /// Track beta releases. Includes any prerelease tag (anything with `-`).
+    /// `Beta` selects the newest of stable + beta, so a beta host receives
+    /// stable releases too — they're considered an upgrade from the latest
+    /// beta on the same line.
+    Beta,
+}
+
+impl UpgradeChannel {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Beta => "beta",
+        }
+    }
+
+    /// Does this release belong to this channel?
+    /// - Stable: only non-prerelease tags. `v1.2.0` matches; `v1.2.0-beta.4` does not.
+    /// - Beta: any non-draft tag. Both stable AND beta releases qualify, so
+    ///   a beta host always sees the freshest available version regardless of
+    ///   whether it was promoted to stable or not.
+    fn includes(self, release: &GitHubRelease) -> bool {
+        if release.draft {
+            return false;
+        }
+        match self {
+            Self::Stable => !release.prerelease,
+            Self::Beta => true,
+        }
+    }
+}
+
 /// Self-upgrade temps to the latest version
 #[derive(Args)]
 pub struct UpgradeCommand {
+    /// Release channel to track. Default: `stable`. Pass `--channel beta`
+    /// to opt into prereleases. Pinning a `--version` ignores the channel.
+    #[arg(long, value_enum)]
+    pub channel: Option<UpgradeChannel>,
+
     /// Target version to upgrade to (e.g. "v1.2.0"). Defaults to latest.
     #[arg(long)]
     pub version: Option<String>,
@@ -27,12 +79,15 @@ pub struct UpgradeCommand {
     #[arg(long)]
     pub check: bool,
 
-    /// Only consider stable releases (skip prereleases)
-    #[arg(long)]
+    /// DEPRECATED: alias for `--channel stable`. Kept for backward compat
+    /// with existing scripts; will be removed in a future release. New
+    /// callers should use `--channel stable` (or just omit the flag — it's
+    /// the default).
+    #[arg(long, hide = true)]
     pub stable: bool,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Clone, Deserialize, Debug)]
 pub struct GitHubRelease {
     pub tag_name: String,
     pub prerelease: bool,
@@ -41,7 +96,7 @@ pub struct GitHubRelease {
     pub html_url: String,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Clone, Deserialize, Debug)]
 pub struct GitHubAsset {
     name: String,
     browser_download_url: String,
@@ -52,6 +107,23 @@ impl UpgradeCommand {
     pub fn execute(self) -> anyhow::Result<()> {
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(self.run())
+    }
+
+    /// Resolve the effective channel. CLI-only by design — no env-var
+    /// fallback so a host can never auto-switch onto beta without an
+    /// explicit `--channel` invocation.
+    /// Precedence:
+    ///   1. `--channel <X>` flag wins
+    ///   2. legacy `--stable` alias selects Stable
+    ///   3. default: Stable
+    fn resolved_channel(&self) -> UpgradeChannel {
+        if let Some(c) = self.channel {
+            return c;
+        }
+        if self.stable {
+            return UpgradeChannel::Stable;
+        }
+        UpgradeChannel::Stable
     }
 
     async fn run(self) -> anyhow::Result<()> {
@@ -75,13 +147,20 @@ impl UpgradeCommand {
         let target = platform_target()?;
         debug!("Detected platform target: {}", target);
 
+        // Resolve channel before any network call so log output reflects
+        // the actual subscription. Pinning a `--version` ignores channel.
+        let channel = self.resolved_channel();
+
         // Fetch release info
         let release = if let Some(ref version) = self.version {
             info!("Fetching release {}...", version);
             fetch_specific_release(version).await?
         } else {
-            info!("Checking for latest release...");
-            fetch_latest_release(self.stable).await?
+            info!(
+                "Checking for latest release on '{}' channel...",
+                channel.as_str()
+            );
+            fetch_latest_release_in_channel(channel).await?
         };
 
         let latest_version = &release.tag_name;
@@ -119,7 +198,9 @@ impl UpgradeCommand {
 
         let size_mb = asset.size as f64 / 1_048_576.0;
 
-        // Display upgrade plan
+        // Display upgrade plan. Echo the channel so the operator can
+        // confirm at a glance whether this run is subscribed to stable or
+        // beta — easier than scraping logs after the fact.
         let prerelease_label = if release.prerelease {
             " (prerelease)"
         } else {
@@ -131,6 +212,7 @@ impl UpgradeCommand {
             "    {} -> {}{}",
             current_version, latest_version, prerelease_label
         );
+        println!("    Channel:  {}", channel.as_str());
         println!("    Platform: {}", target);
         println!("    Binary:   {}", binary_path.display());
         println!("    Size:     {:.1} MB", size_mb);
@@ -243,13 +325,20 @@ fn platform_target() -> anyhow::Result<String> {
     Ok(target.to_string())
 }
 
-/// Fetch the latest release from GitHub.
-/// When `stable_only` is false, includes prereleases (the most recent release wins).
-/// When `stable_only` is true, skips prereleases.
-pub async fn fetch_latest_release(stable_only: bool) -> anyhow::Result<GitHubRelease> {
+/// Fetch the latest release on a given channel from GitHub.
+///
+/// Pulls the first page of releases (per_page=20, GitHub's default ordering
+/// is most-recent-first) and returns the first one that belongs to the
+/// requested channel. 20 is enough to find the newest stable even on a
+/// project that ships many betas between stables.
+///
+/// Note: this returns the channel's *newest* release, which may be older
+/// than the absolute newest tag — that's the point. A `Stable` host on a
+/// project actively shipping `vX.Y.Z-beta.N` should ignore those betas.
+pub async fn fetch_latest_release_in_channel(
+    channel: UpgradeChannel,
+) -> anyhow::Result<GitHubRelease> {
     let client = reqwest::Client::new();
-    // Fetch the first page of releases sorted by most recent (GitHub default).
-    // per_page=20 is enough to find the latest stable even if there are many prereleases.
     let url = format!("{}?per_page=20", GITHUB_RELEASES_API);
     let response = client
         .get(&url)
@@ -274,18 +363,20 @@ pub async fn fetch_latest_release(stable_only: bool) -> anyhow::Result<GitHubRel
         .await
         .map_err(|e| anyhow::anyhow!("Failed to parse releases response: {}", e))?;
 
-    releases
-        .into_iter()
-        .find(|r| !r.draft && (!stable_only || !r.prerelease))
-        .ok_or_else(|| {
-            if stable_only {
-                anyhow::anyhow!(
-                    "No stable releases found. Try without --stable to include prereleases."
-                )
-            } else {
-                anyhow::anyhow!("No releases found.")
-            }
-        })
+    pick_release_for_channel(releases, channel).ok_or_else(|| match channel {
+        UpgradeChannel::Stable => anyhow::anyhow!(
+            "No stable releases found. Try `--channel beta` to include prereleases."
+        ),
+        UpgradeChannel::Beta => anyhow::anyhow!("No releases found."),
+    })
+}
+
+/// Pure picker — split out so tests can drive it without an HTTP mock.
+fn pick_release_for_channel(
+    releases: Vec<GitHubRelease>,
+    channel: UpgradeChannel,
+) -> Option<GitHubRelease> {
+    releases.into_iter().find(|r| channel.includes(r))
 }
 
 /// Fetch a specific release by tag from GitHub.
@@ -651,5 +742,169 @@ mod tests {
         }
 
         version.to_string()
+    }
+
+    // ── Channel logic ─────────────────────────────────────────────────────
+    //
+    // The release picker is the contract that determines what `temps
+    // upgrade` actually does. Each test below pins one rule of that
+    // contract so a future refactor can't silently change behavior.
+
+    fn release(tag: &str, prerelease: bool, draft: bool) -> GitHubRelease {
+        GitHubRelease {
+            tag_name: tag.to_string(),
+            prerelease,
+            draft,
+            assets: vec![],
+            html_url: String::new(),
+        }
+    }
+
+    #[test]
+    fn channel_includes_only_non_prerelease_for_stable() {
+        // Stable must reject any prerelease tag, even if it's newer.
+        // This is the property that protects stable hosts from auto-
+        // upgrading onto a beta line.
+        let stable = release("v1.2.0", false, false);
+        let beta = release("v1.3.0-beta.1", true, false);
+        let draft = release("v1.4.0", false, true);
+
+        assert!(UpgradeChannel::Stable.includes(&stable));
+        assert!(!UpgradeChannel::Stable.includes(&beta));
+        assert!(!UpgradeChannel::Stable.includes(&draft));
+    }
+
+    #[test]
+    fn channel_includes_both_kinds_for_beta() {
+        // Beta sees both stable and beta releases — a beta host should
+        // upgrade to a fresh stable when one ships, not stay stuck on
+        // the latest beta. Drafts are never visible.
+        let stable = release("v1.2.0", false, false);
+        let beta = release("v1.3.0-beta.1", true, false);
+        let draft = release("v1.4.0-beta.2", true, true);
+
+        assert!(UpgradeChannel::Beta.includes(&stable));
+        assert!(UpgradeChannel::Beta.includes(&beta));
+        assert!(!UpgradeChannel::Beta.includes(&draft));
+    }
+
+    #[test]
+    fn picker_returns_first_matching_in_response_order() {
+        // GitHub returns releases newest-first. Picker takes the first
+        // match, which is the newest release on that channel. We trust
+        // GitHub's ordering here — re-sorting by semver locally would
+        // also have to handle prerelease ordering correctly, and we'd
+        // rather lean on GitHub than reimplement it.
+        let releases = vec![
+            release("v1.3.0-beta.2", true, false), // newest, beta
+            release("v1.3.0-beta.1", true, false),
+            release("v1.2.0", false, false), // newest stable
+            release("v1.1.0", false, false),
+        ];
+
+        let picked_stable = pick_release_for_channel(releases.clone(), UpgradeChannel::Stable);
+        assert_eq!(
+            picked_stable.expect("stable should match v1.2.0").tag_name,
+            "v1.2.0"
+        );
+
+        let picked_beta = pick_release_for_channel(releases, UpgradeChannel::Beta);
+        assert_eq!(
+            picked_beta
+                .expect("beta should match v1.3.0-beta.2")
+                .tag_name,
+            "v1.3.0-beta.2"
+        );
+    }
+
+    #[test]
+    fn picker_skips_drafts() {
+        // A draft should never be selected even if it's the newest entry,
+        // because users can't actually download a draft release's assets.
+        let releases = vec![
+            release("v2.0.0", false, true), // draft, ignored
+            release("v1.9.0", false, false),
+        ];
+        let picked = pick_release_for_channel(releases, UpgradeChannel::Stable);
+        assert_eq!(
+            picked.expect("should fall through to v1.9.0").tag_name,
+            "v1.9.0"
+        );
+    }
+
+    #[test]
+    fn picker_returns_none_when_no_release_in_channel() {
+        // If every available release is a prerelease, a Stable picker
+        // returns None. The caller is responsible for surfacing a
+        // helpful error pointing the user at `--channel beta`.
+        let releases = vec![
+            release("v1.0.0-beta.1", true, false),
+            release("v1.0.0-beta.2", true, false),
+        ];
+        let picked = pick_release_for_channel(releases, UpgradeChannel::Stable);
+        assert!(picked.is_none());
+    }
+
+    #[test]
+    fn resolved_channel_defaults_to_stable() {
+        // CLI-only design: with no flags set, the user always lands on
+        // stable. No env var or implicit state can change this. This is
+        // the contract operators rely on — running `temps upgrade` on a
+        // fresh shell never lands them on a beta build.
+        let cmd = UpgradeCommand {
+            channel: None,
+            version: None,
+            path: None,
+            yes: false,
+            check: false,
+            stable: false,
+        };
+        assert_eq!(cmd.resolved_channel(), UpgradeChannel::Stable);
+    }
+
+    #[test]
+    fn resolved_channel_legacy_stable_flag_selects_stable() {
+        // The legacy `--stable` flag is now a no-op (Stable is already
+        // default), but we accept it for backward compat with existing
+        // CI scripts. Verify it doesn't somehow yield Beta.
+        let cmd = UpgradeCommand {
+            channel: None,
+            version: None,
+            path: None,
+            yes: false,
+            check: false,
+            stable: true,
+        };
+        assert_eq!(cmd.resolved_channel(), UpgradeChannel::Stable);
+    }
+
+    #[test]
+    fn resolved_channel_explicit_flag_wins_over_legacy() {
+        // If a user passes both `--channel beta` and the legacy
+        // `--stable`, the explicit channel flag wins. Documented
+        // precedence: --channel > --stable > default.
+        let cmd = UpgradeCommand {
+            channel: Some(UpgradeChannel::Beta),
+            version: None,
+            path: None,
+            yes: false,
+            check: false,
+            stable: true,
+        };
+        assert_eq!(cmd.resolved_channel(), UpgradeChannel::Beta);
+    }
+
+    #[test]
+    fn resolved_channel_explicit_beta_selects_beta() {
+        // Sanity: --channel beta does what it says.
+        let cmd = UpgradeCommand {
+            channel: Some(UpgradeChannel::Beta),
+            version: None,
+            path: None,
+            yes: false,
+            check: false,
+            stable: false,
+        };
+        assert_eq!(cmd.resolved_channel(), UpgradeChannel::Beta);
     }
 }

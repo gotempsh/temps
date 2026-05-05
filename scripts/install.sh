@@ -61,8 +61,43 @@ warning() {
 command -v curl >/dev/null ||
     error 'curl is required to install temps'
 
-if [[ $# -gt 1 ]]; then
-    error 'Too many arguments, only 1 is allowed. It can be a specific tag to install. (e.g. "v0.1.0")'
+# Channel selection. Mirrors `temps upgrade --channel`:
+#   stable (default) — track non-prerelease tags only
+#   beta             — track the newest tag, prerelease or not
+#
+# CLI-only by design: there is no env-var fallback. A user must pass
+# `--channel beta` explicitly to opt into prereleases. `bash install.sh`
+# always lands on stable — same contract as `temps upgrade`.
+channel="stable"
+positional=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --channel=*)
+            channel="${1#--channel=}"
+            shift
+            ;;
+        --channel)
+            shift
+            [[ $# -gt 0 ]] || error '--channel requires a value, e.g. --channel beta'
+            channel="$1"
+            shift
+            ;;
+        *)
+            positional+=("$1")
+            shift
+            ;;
+    esac
+done
+
+case "$channel" in
+    stable|beta) ;;
+    *)
+        error "Unknown channel '$channel'. Supported: stable, beta"
+        ;;
+esac
+
+if [[ ${#positional[@]} -gt 1 ]]; then
+    error 'Too many arguments. Usage: install.sh [--channel beta|stable] [version]'
 fi
 
 case $platform in
@@ -86,29 +121,57 @@ github_repo="$GITHUB/gotempsh/temps"
 
 exe_name=temps
 
-if [[ $# = 0 ]]; then
-    # Fetch the latest release tag from GitHub API
-    info "Fetching latest release version..."
+if [[ ${#positional[@]} -eq 0 ]]; then
+    info "Fetching latest release on channel: $channel"
 
-    # Temporarily disable pipefail to handle API errors gracefully
+    # Channel resolution against GitHub Releases:
+    #
+    # - stable: GET /releases/latest returns the most recent NON-prerelease
+    #   release. This is GitHub's contract — it's exactly what we want.
+    #   404 means there are zero stable releases yet; fall through to a
+    #   helpful error.
+    # - beta: GET /releases/latest skips betas, so we have to walk the
+    #   first page of /releases (newest-first) and take the first non-
+    #   draft entry. That's the same logic the Rust CLI uses.
     set +e
-    temps_tag=$(curl --silent "https://api.github.com/repos/gotempsh/temps/releases/latest" |
-                grep '"tag_name":' |
-                sed -E 's/.*"([^"]+)".*/\1/' 2>/dev/null)
+    if [[ "$channel" = "stable" ]]; then
+        temps_tag=$(curl --silent "https://api.github.com/repos/gotempsh/temps/releases/latest" |
+                    grep '"tag_name":' |
+                    sed -E 's/.*"([^"]+)".*/\1/' 2>/dev/null)
+    else
+        # First non-draft release on the first page. We pick the first
+        # `tag_name` whose nearest preceding `draft` is `false`. The
+        # GitHub default ordering is most-recent-first so this gives us
+        # the newest release of any kind.
+        temps_tag=$(curl --silent "https://api.github.com/repos/gotempsh/temps/releases?per_page=20" |
+                    awk '
+                        /"draft":/ { in_draft=$0; next }
+                        /"tag_name":/ {
+                            if (in_draft ~ /false/) {
+                                gsub(/.*"tag_name": *"|".*/, "")
+                                print
+                                exit
+                            }
+                        }' 2>/dev/null)
+    fi
     set -e
 
     if [[ -z "$temps_tag" ]]; then
         echo ""
-        error "No releases found. Please specify a version explicitly:
-    curl -fsSL https://raw.githubusercontent.com/gotempsh/temps/main/scripts/install.sh | bash -s v0.1.0
+        error "No releases found on channel '$channel'. Try a specific version:
+    curl -fsSL https://raw.githubusercontent.com/gotempsh/temps/main/scripts/install.sh | bash -s -- v0.1.0
 
-Or check available versions at: https://github.com/gotempsh/temps/releases"
+Or pick a different channel:
+    curl -fsSL https://raw.githubusercontent.com/gotempsh/temps/main/scripts/install.sh | bash -s -- --channel beta
+
+Available versions: https://github.com/gotempsh/temps/releases"
     fi
 
-    info "Latest version: $temps_tag"
+    info "Latest version on $channel: $temps_tag"
     temps_uri=$github_repo/releases/download/$temps_tag/temps-$target.tar.gz
 else
-    temps_uri=$github_repo/releases/download/$1/temps-$target.tar.gz
+    # Explicit version pin — channel is irrelevant.
+    temps_uri=$github_repo/releases/download/${positional[0]}/temps-$target.tar.gz
 fi
 
 install_env=TEMPS_INSTALL
