@@ -1,0 +1,41 @@
+[package]
+name = "temps-analytics-backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[features]
+default = []
+# Enables the ClickHouse analytics backend. Off by default so a stock build
+# stays a single binary against PostgreSQL/TimescaleDB only.
+clickhouse = []
+
+[dependencies]
+# Core
+temps-core = { path = "../temps-core" }
+
+# Database
+sea-orm = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Async
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

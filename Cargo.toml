@@ -33,6 +33,7 @@ members = [
     "crates/temps-audit",
     "crates/temps-config",
     "crates/temps-geo",
+    "crates/temps-analytics-backend",
     "crates/temps-analytics-events",
     "crates/temps-routes",
     "crates/temps-analytics-funnels",

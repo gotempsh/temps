@@ -10800,6 +10800,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "temps-analytics-backend"
+version = "0.1.0-beta.6"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "temps-core",
+ "thiserror 2.0.17",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "temps-analytics-events"
 version = "0.1.0-beta.6"
 dependencies = [
