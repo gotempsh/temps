@@ -69,6 +69,16 @@ impl ClickHouseBackend {
     pub(crate) fn client(&self) -> &::clickhouse::Client {
         &self.client
     }
+
+    /// Clone the underlying client out of the backend.
+    ///
+    /// `clickhouse::Client` is cheap to clone (it's an `Arc` of an HTTP
+    /// connector internally). Plugin wiring uses this to share one client
+    /// between the read-side `ClickHouseEventsBackend` and the fan-out
+    /// worker so connections aren't doubled up.
+    pub fn client_clone(&self) -> ::clickhouse::Client {
+        self.client.clone()
+    }
 }
 
 #[async_trait]

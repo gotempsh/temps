@@ -1501,6 +1501,38 @@ WHERE project_id = $1
         };
 
         let result = event.insert(self.db.as_ref()).await?;
+
+        // Enqueue for the ClickHouse fan-out worker. This is a separate
+        // statement, not in the same transaction as the events insert,
+        // because:
+        //   1. `events` is a TimescaleDB hypertable; running multi-statement
+        //      transactions across hypertables is fine but adds locking
+        //      that this hot path doesn't need.
+        //   2. If the outbox insert fails, the event is still recorded —
+        //      we'd rather lose the CH replication of one event than fail
+        //      the user's request.
+        // Failures are logged at debug because the outbox table may not
+        // exist on installs that haven't run migrations yet, and that's
+        // not a user-actionable problem.
+        use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+        let outbox_sql = "INSERT INTO events_ch_outbox (event_id) VALUES ($1) \
+                          ON CONFLICT (event_id) DO NOTHING";
+        if let Err(e) = self
+            .db
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                outbox_sql,
+                vec![result.id.into()],
+            ))
+            .await
+        {
+            tracing::debug!(
+                event_id = result.id,
+                error = %e,
+                "ch_fanout outbox enqueue failed (non-fatal); event will not replicate to ClickHouse"
+            );
+        }
+
         Ok(result)
     }
 }

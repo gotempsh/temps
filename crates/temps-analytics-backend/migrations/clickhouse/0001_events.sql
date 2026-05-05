@@ -1,50 +1,92 @@
 -- Events table: derived analytical replica of Postgres `events`.
--- ReplacingMergeTree dedupes on (sort key + event_id) using `_version`,
--- so retries from the outbox worker are safe.
+-- ReplacingMergeTree dedupes on the sort key (event_id is the last
+-- component) using `_version`, so retries from the outbox worker are safe.
 --
--- Sort key intentionally puts workspace_id and project_id first so the most
--- common analytics queries (everything is project-scoped) ride the index
--- prefix.
-CREATE TABLE IF NOT EXISTS events (
-    event_id        UUID,
-    workspace_id    UUID,
-    project_id      UInt32,
-    environment_id  Nullable(UInt32),
-    deployment_id   Nullable(UInt32),
-    session_id      String,
-    visitor_id      Nullable(String),
-    user_id         Nullable(UUID),
-    timestamp       DateTime64(3, 'UTC'),
-    event_name      LowCardinality(String),
-    event_type      LowCardinality(String),
-    event_data      String,                   -- raw JSON; parse on read with JSONExtract
-    page_url        String,
-    page_title      String,
-    referrer        String,
-    referrer_hostname String,
-    hostname        String,
-    request_path    String,
-    request_query   String,
-    user_agent      String,
-    device_type     LowCardinality(String),
-    browser         LowCardinality(String),
-    os              LowCardinality(String),
-    country_code    LowCardinality(FixedString(2)),
-    utm_source      LowCardinality(String),
-    utm_medium      LowCardinality(String),
-    utm_campaign    LowCardinality(String),
-    utm_term        String,
-    utm_content     String,
-    channel         LowCardinality(String),
+-- Sort key intentionally puts project_id and timestamp first so the most
+-- common analytics queries (everything is project-scoped, time-windowed)
+-- ride the index prefix.
+--
+-- Type choices match the Postgres source:
+--   - event_id is `bigint` in PG → Int64 here.
+--   - project_id / environment_id / deployment_id are `int` in PG → Int32.
+--   - visitor_id is `int` in PG → Int32 (nullable).
+--   - session_id is `text` in PG → String (nullable, but we mirror NOT NULL).
+--   - timestamp is `timestamptz(3)` semantically → DateTime64(3, 'UTC').
+CREATE TABLE IF NOT EXISTS events
+(
+    event_id            Int64,
+    project_id          Int32,
+    environment_id      Nullable(Int32),
+    deployment_id       Nullable(Int32),
+    session_id          String,
+    visitor_id          Nullable(Int32),
+    timestamp           DateTime64(3, 'UTC'),
+
+    -- Page data
+    hostname            String,
+    pathname            String,
+    page_path           String,
+    href                String,
+    querystring         String,
+    page_title          String,
+    referrer            String,
+    referrer_hostname   String,
+
+    -- Event identity
+    event_type          LowCardinality(String),
+    event_name          LowCardinality(String),
+    -- Raw JSON properties; parse on read with JSONExtract*. Keeping it as
+    -- String avoids early commitment to a Map shape that may not match
+    -- what apps actually send.
+    props               String,
+
+    -- Device / browser
+    user_agent          String,
+    browser             LowCardinality(String),
+    browser_version     String,
+    operating_system    LowCardinality(String),
+    operating_system_version String,
+    device_type         LowCardinality(String),
+    screen_width        Nullable(Int16),
+    screen_height       Nullable(Int16),
+    viewport_width      Nullable(Int16),
+    viewport_height     Nullable(Int16),
+
+    -- Geography
+    ip_geolocation_id   Nullable(Int32),
+
+    -- Traffic source
+    channel             LowCardinality(String),
+    utm_source          LowCardinality(String),
+    utm_medium          LowCardinality(String),
+    utm_campaign        LowCardinality(String),
+    utm_term            String,
+    utm_content         String,
+
     -- Web Vitals
-    ttfb            Nullable(Float32),
-    lcp             Nullable(Float32),
-    fid             Nullable(Float32),
-    fcp             Nullable(Float32),
-    cls             Nullable(Float32),
-    inp             Nullable(Float32),
-    ingested_at     DateTime64(3, 'UTC') DEFAULT now64(),
-    _version        UInt64 DEFAULT toUnixTimestamp64Milli(now64())
+    ttfb                Nullable(Float32),
+    lcp                 Nullable(Float32),
+    fid                 Nullable(Float32),
+    fcp                 Nullable(Float32),
+    cls                 Nullable(Float32),
+    inp                 Nullable(Float32),
+
+    -- Session flow
+    is_entry            UInt8 DEFAULT 0,
+    is_exit             UInt8 DEFAULT 0,
+    is_bounce           UInt8 DEFAULT 0,
+    is_crawler          UInt8 DEFAULT 0,
+    time_on_page        Nullable(Int32),
+    session_page_number Nullable(Int32),
+    scroll_depth        Nullable(Int32),
+    clicks              Nullable(Int32),
+
+    -- Misc
+    language            LowCardinality(String),
+    crawler_name        String,
+
+    ingested_at         DateTime64(3, 'UTC') DEFAULT now64(),
+    _version            UInt64 DEFAULT toUnixTimestamp64Milli(now64())
 )
 ENGINE = ReplacingMergeTree(_version)
 PARTITION BY toYYYYMM(timestamp)

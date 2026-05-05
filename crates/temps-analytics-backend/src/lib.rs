@@ -12,6 +12,7 @@
 //! second backend can later be added without touching the handler layer.
 
 pub mod error;
+pub mod migrations;
 pub mod traits;
 pub mod types;
 
