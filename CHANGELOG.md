@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **Stale skill content tests**: updated to match current `temps-cli/SKILL.md` headings so the suite stops failing on docs drift
+- **MFA verification left users stranded on the login page**: `verify_mfa_challenge` built a `HeaderMap` containing the new `session=…` cookie via `create_session_cookie`, then called `response_headers.insert(SET_COOKIE, mfa_clear_cookie)` to expire the temporary `mfa_session` cookie. `HeaderMap::insert` replaces all values for the key, so the response went out with only `mfa_session=; Max-Age=0` and no real session — the immediate `/user/me` refetch returned 401, and `ProtectedLayout` bounced the user back to `<Login />` even though the toast had already announced "MFA verified successfully". Fixed by switching to `append`, plus a regression test that mirrors the handler's exact header merge and asserts both `Set-Cookie` entries survive
 
 ### Security
 - **Shell-escape user-controllable `--model` flag**: AI CLI invocations now escape the model name before passing it to the shell, preventing argument injection via crafted model strings
