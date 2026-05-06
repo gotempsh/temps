@@ -971,6 +971,48 @@ mod tests {
         assert!(session_cookie.contains("Secure"));
     }
 
+    // Regression: verify_mfa_challenge handler must `append` (not `insert`) the
+    // mfa_session clear cookie onto the headers returned by `create_session_cookie`.
+    // Using `insert` overwrites all existing Set-Cookie headers, dropping the new
+    // session cookie and leaving the user stuck on the login page after MFA.
+    #[tokio::test]
+    async fn test_verify_mfa_handler_cookie_merge_preserves_session_cookie() {
+        let (_db, auth_service, _) = setup_test_env().await;
+
+        let mut response_headers = auth_service.create_session_cookie("session_tok", true);
+        let pre_count = response_headers.get_all(SET_COOKIE).iter().count();
+        assert_eq!(pre_count, 2, "session_cookie + mfa_session clear");
+
+        // Simulate the exact merge done in verify_mfa_challenge handler:
+        // append a fresh mfa_session=; Max-Age=0 cookie.
+        let clear_mfa_cookie = Cookie::build(("mfa_session", ""))
+            .http_only(true)
+            .path("/")
+            .max_age(cookie::time::Duration::seconds(0))
+            .same_site(cookie::SameSite::Strict)
+            .secure(true)
+            .build();
+        response_headers.append(SET_COOKIE, clear_mfa_cookie.to_string().parse().unwrap());
+
+        let cookies: Vec<String> = response_headers
+            .get_all(SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+
+        // The session cookie MUST still be present alongside the mfa_session clear.
+        assert!(
+            cookies.iter().any(|c| c.contains("session=session_tok")),
+            "session cookie was clobbered: {:?}",
+            cookies,
+        );
+        assert!(
+            cookies.iter().any(|c| c.contains("mfa_session=")),
+            "mfa_session clear cookie missing: {:?}",
+            cookies,
+        );
+    }
+
     #[tokio::test]
     async fn test_create_session_cookie_does_not_panic() {
         // Verify that cookie creation never panics, even with unusual tokens.

@@ -242,7 +242,7 @@ pub async fn verify_mfa_challenge(
                 .same_site(cookie::SameSite::Strict)
                 .secure(metadata.is_secure)
                 .build();
-            response_headers.insert(SET_COOKIE, clear_mfa_cookie.to_string().parse().unwrap());
+            response_headers.append(SET_COOKIE, clear_mfa_cookie.to_string().parse().unwrap());
 
             Ok((StatusCode::NO_CONTENT, response_headers))
         }
