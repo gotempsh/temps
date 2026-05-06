@@ -8,6 +8,7 @@ export const metadata = {
 
 export const sections = [
   { title: 'Overview', id: 'overview' },
+  { title: 'Storage Backend', id: 'storage-backend' },
   { title: 'Visitor Analytics', id: 'visitor-analytics' },
   { title: 'Event Tracking', id: 'event-tracking' },
   { title: 'Session Replay', id: 'session-replay' },
@@ -54,10 +55,35 @@ Unlike Vercel and other platforms that require third-party integrations, Temps p
 ### Architecture
 
 Temps analytics is powered by:
-- **TimescaleDB**: Time-series database for high-throughput event ingestion
-- **PostgreSQL**: Hypertables for automatic data partitioning
+- **PostgreSQL + TimescaleDB**: default time-series storage; hypertables for automatic partitioning. The system of record for every event.
+- **ClickHouse (optional)**: opt-in columnar replica for analytical reads at scale. Set the four `TEMPS_CLICKHOUSE_*` env vars and Temps swaps the read path to ClickHouse on the next restart — same binary, no rebuild. PG keeps writing; a fan-out worker streams events from a Postgres outbox to ClickHouse asynchronously. See [Storage Backend](#storage-backend) below.
 - **In-Memory Caching**: Sub-100ms query performance
 - **Event Batching**: Efficient network usage
+
+### Storage Backend {{ anchor: true, id: 'storage-backend' }}
+
+By default, Temps stores analytics events in PostgreSQL with the TimescaleDB extension. This works well up to single-digit millions of events per month on a modest VPS — most installs never need anything else.
+
+For high-volume installs (~50M events/month or more), Temps supports an optional **ClickHouse backend** for analytics reads:
+
+| Backend | When to use | What it handles |
+|---|---|---|
+| PostgreSQL + TimescaleDB *(default)* | Default for every install | Writes (system of record) + reads for visitor / session / journey / page-flow queries |
+| ClickHouse *(opt-in)* | When dashboard queries get slow at scale | Reads for event counts, timelines, property breakdowns, multi-project dashboards |
+
+Enabling ClickHouse is four environment variables:
+
+```bash
+export TEMPS_CLICKHOUSE_URL=https://ch.example.internal:8443
+export TEMPS_CLICKHOUSE_DATABASE=temps_analytics
+export TEMPS_CLICKHOUSE_USER=temps
+export TEMPS_CLICKHOUSE_PASSWORD=...
+./temps serve
+```
+
+PostgreSQL stays the system of record either way — disabling ClickHouse later means unsetting the env vars and restarting. No data migration, no rebuild.
+
+Full step-by-step guide including verification, rollback, and the operator runbook for outage / dead-letter / backfill: [Enable ClickHouse for Analytics Reads](/docs/enable-clickhouse-analytics).
 
 ---
 
