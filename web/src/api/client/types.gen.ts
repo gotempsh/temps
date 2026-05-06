@@ -1664,6 +1664,105 @@ export type ContainerResponse = {
     name: string;
 };
 
+/**
+ * Snapshot of a container's lifecycle state from `docker inspect`.
+ * `restart_count` and `oom_killed` are the load-bearing fields when
+ * diagnosing crash loops — the kernel OOM killer never reaches the
+ * application's logs, so seeing `oom_killed=true` is the only signal
+ * that a memory limit was the cause.
+ */
+export type ContainerRuntimeInfo = {
+    /**
+     * Container Docker id, when present. None = container does not exist
+     * (was never created or was removed externally).
+     */
+    container_id?: string | null;
+    /**
+     * Stable name of the Docker container (e.g. `postgres-mydb`).
+     */
+    container_name: string;
+    /**
+     * Last container exit code, when known. Non-zero = unclean stop.
+     */
+    exit_code?: number | null;
+    /**
+     * ISO-8601 timestamp of the most recent termination, when known.
+     */
+    finished_at?: string | null;
+    /**
+     * Currently-effective Docker image (e.g. `gotempsh/postgres-walg:18-bookworm`).
+     */
+    image?: string | null;
+    /**
+     * True when the container's last termination was caused by the
+     * kernel OOM killer. Set if the user enabled hard memory limits
+     * and the working set exceeded them.
+     */
+    oom_killed?: boolean | null;
+    /**
+     * Currently-applied resource limits read off the container's
+     * `HostConfig`. Compare this against the user-configured limits to
+     * detect drift (an old container that never picked up new caps).
+     */
+    resource_limits: ServiceResourceLimits;
+    /**
+     * Total restarts since the container was created. Useful for
+     * detecting crash loops — a steady stream means something is killing
+     * the container repeatedly (frequently OOM).
+     */
+    restart_count?: number | null;
+    /**
+     * `service_members.role` for cluster members; "standalone" otherwise.
+     */
+    role: string;
+    /**
+     * ISO-8601 timestamp of when the container last started. None when
+     * it has never started (i.e. created but never run).
+     */
+    started_at?: string | null;
+    /**
+     * Bollard container state ("running", "exited", "dead", etc.). None
+     * when the container does not exist.
+     */
+    status?: string | null;
+};
+
+/**
+ * Live resource usage sample for a single container.
+ *
+ * `cpu_percent` is computed by Docker's standard formula:
+ * ((cpu_delta / system_delta) * online_cpus) * 100
+ * `memory_percent` is `(memory_usage / memory_limit) * 100` — when no
+ * memory limit is set the limit reported by Docker is the host's total
+ * RAM, so a 5% reading means "5% of host RAM", not "5% of allocated".
+ */
+export type ContainerStatsSample = {
+    container_name: string;
+    /**
+     * CPU usage as a percentage. `None` when the container is not running
+     * (Docker returns no usable counters).
+     */
+    cpu_percent?: number | null;
+    /**
+     * Memory limit in bytes (host RAM if no limit set).
+     */
+    memory_limit_bytes?: number | null;
+    /**
+     * Memory usage as a percentage of `memory_limit_bytes`.
+     */
+    memory_percent?: number | null;
+    /**
+     * Resident memory usage in bytes.
+     */
+    memory_usage_bytes?: number | null;
+    /**
+     * Number of cores Docker observed at sample time. Used by the UI
+     * to label "x/y cores" instead of just a percent.
+     */
+    online_cpus?: number | null;
+    role: string;
+};
+
 export type ContentPart = {
     image_url?: unknown;
     text?: string | null;
@@ -9684,6 +9783,33 @@ export type ResourceInfo = {
 };
 
 /**
+ * Per-container outcome of a live `docker update` call. Surfaced from the
+ * PATCH /resources endpoint so the UI can tell the operator whether the
+ * new caps are already in effect or whether they only apply on next
+ * recreate (e.g., container was missing).
+ */
+export type ResourceLimitApplyResult = {
+    container_name: string;
+    /**
+     * Populated only when `outcome == "failed"`.
+     */
+    error?: string | null;
+    /**
+     * One of:
+     * - "applied"  — Docker accepted the update; caps are live now.
+     * - "missing"  — container does not exist; caps stored, will apply on next start.
+     * - "stopped"  — container exists but isn't running; Docker still
+     * accepts the update (the new caps apply on next start).
+     * - "failed"   — `docker update` returned an error (see `error`).
+     */
+    outcome: string;
+    /**
+     * `service_members.role` for cluster members; "standalone" otherwise.
+     */
+    role: string;
+};
+
+/**
  * Resource limits and requests
  */
 export type ResourceLimits = {
@@ -9713,6 +9839,20 @@ export type ResourceLimitsResponse = {
     cpu_request?: number | null;
     memory_limit?: number | null;
     memory_request?: number | null;
+};
+
+/**
+ * Response from PATCH /external-services/{id}/resources.
+ */
+export type ResourceLimitsUpdateResponse = {
+    /**
+     * Per-container result of trying to apply the limits live.
+     */
+    applied: Array<ResourceLimitApplyResult>;
+    /**
+     * The limits that were persisted to the encrypted config.
+     */
+    limits: ServiceResourceLimits;
 };
 
 /**
@@ -10583,6 +10723,63 @@ export type ServicePlan = {
      * Service version to create (e.g., "16" for Postgres 16)
      */
     version?: string | null;
+};
+
+/**
+ * Optional cgroup resource limits applied to a service container.
+ *
+ * All fields are `Option<i64>`: `None` means "no limit" (the kernel default),
+ * matching Docker's behavior when the corresponding `HostConfig` field is
+ * left at zero. Operators opt in to limits explicitly through the
+ * `PATCH /external-services/{id}/resources` endpoint or by writing the
+ * `resources` block into `ServiceConfig::parameters` at create time.
+ *
+ * These map directly onto bollard fields:
+ * - `memory_mb`     → `HostConfig.memory`        (bytes)
+ * - `memory_swap_mb`→ `HostConfig.memory_swap`   (bytes; ≥ memory)
+ * - `nano_cpus`     → `HostConfig.nano_cpus`     (1e9 = 1 full CPU)
+ * - `cpu_shares`    → `HostConfig.cpu_shares`    (relative weight, default 1024)
+ *
+ * IMPORTANT: enabling hard memory limits causes the kernel OOM killer to
+ * terminate the container when the working set exceeds the limit. The
+ * container will restart (RestartPolicy::ALWAYS) but in-flight queries
+ * fail. Surface this clearly in any UI that lets users set limits.
+ */
+export type ServiceResourceLimits = {
+    /**
+     * Relative CPU weight (default 1024). Only used when `nano_cpus` is None.
+     */
+    cpu_shares?: number | null;
+    /**
+     * Hard memory limit in MiB. None = unlimited.
+     */
+    memory_mb?: number | null;
+    /**
+     * Memory + swap limit in MiB. None = unlimited.
+     * MUST be >= memory_mb when both are set; Docker rejects the request otherwise.
+     * Set equal to `memory_mb` to disable swap entirely.
+     */
+    memory_swap_mb?: number | null;
+    /**
+     * CPU quota in nano-cpus. 1_000_000_000 = 1 full CPU core. None = unlimited.
+     */
+    nano_cpus?: number | null;
+};
+
+/**
+ * Aggregate runtime info for an external service. For standalone services,
+ * `members` has exactly one entry. For clusters, one entry per member.
+ */
+export type ServiceRuntimeReport = {
+    members: Array<ContainerRuntimeInfo>;
+    service_id: number;
+    topology: string;
+};
+
+export type ServiceStatsReport = {
+    members: Array<ContainerStatsSample>;
+    service_id: number;
+    topology: string;
 };
 
 export type ServiceTypeInfo = {
@@ -20480,6 +20677,42 @@ export type GetServiceEnvironmentVariableResponses = {
 
 export type GetServiceEnvironmentVariableResponse = GetServiceEnvironmentVariableResponses[keyof GetServiceEnvironmentVariableResponses];
 
+export type UpdateServiceResourcesData = {
+    body: ServiceResourceLimits;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/resources';
+};
+
+export type UpdateServiceResourcesErrors = {
+    /**
+     * Invalid resource limits
+     */
+    400: unknown;
+    /**
+     * Service not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateServiceResourcesResponses = {
+    /**
+     * Updated resource limits
+     */
+    200: ResourceLimitsUpdateResponse;
+};
+
+export type UpdateServiceResourcesResponse = UpdateServiceResourcesResponses[keyof UpdateServiceResourcesResponses];
+
 export type StartRestoreData = {
     body: StartRestoreRequest;
     path: {
@@ -20632,6 +20865,38 @@ export type RetryClusterResponses = {
 
 export type RetryClusterResponse = RetryClusterResponses[keyof RetryClusterResponses];
 
+export type GetServiceRuntimeData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/runtime';
+};
+
+export type GetServiceRuntimeErrors = {
+    /**
+     * Service not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetServiceRuntimeResponses = {
+    /**
+     * Container runtime snapshot
+     */
+    200: ServiceRuntimeReport;
+};
+
+export type GetServiceRuntimeResponse = GetServiceRuntimeResponses[keyof GetServiceRuntimeResponses];
+
 export type StartServiceData = {
     body?: never;
     path: {
@@ -20663,6 +20928,38 @@ export type StartServiceResponses = {
 };
 
 export type StartServiceResponse = StartServiceResponses[keyof StartServiceResponses];
+
+export type GetServiceStatsData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/stats';
+};
+
+export type GetServiceStatsErrors = {
+    /**
+     * Service not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetServiceStatsResponses = {
+    /**
+     * Container stats snapshot
+     */
+    200: ServiceStatsReport;
+};
+
+export type GetServiceStatsResponse = GetServiceStatsResponses[keyof GetServiceStatsResponses];
 
 export type StopServiceData = {
     body?: never;

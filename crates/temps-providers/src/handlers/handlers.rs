@@ -6,7 +6,7 @@ use axum::{
     extract::{Extension, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
     Json, Router,
 };
 use temps_auth::permission_guard;
@@ -312,6 +312,12 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route(
             "/external-services/by-slug/{slug}",
             get(get_service_by_slug),
+        )
+        .route("/external-services/{id}/runtime", get(get_service_runtime))
+        .route("/external-services/{id}/stats", get(get_service_stats))
+        .route(
+            "/external-services/{id}/resources",
+            patch(update_service_resources),
         )
         .merge(super::query_handlers::configure_query_routes())
 }
@@ -1967,6 +1973,203 @@ async fn get_service_preview_environment_variables_masked(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Container runtime + stats + resource limits.
+//
+// These three endpoints exist so operators can:
+//   - see why a database is restarting (RestartCount, OOMKilled),
+//   - watch live CPU/memory pressure,
+//   - opt in to hard cgroup limits (with the OOM warning surfaced in the UI).
+// They are intentionally read-mostly: PATCH .../resources only updates the
+// stored config; new caps take effect on the next container recreate.
+// ---------------------------------------------------------------------------
+
+/// Inspect a service's container(s): status, restart count, OOM-killed flag,
+/// exit code, and the cgroup limits actually applied.
+#[utoipa::path(
+    get,
+    path = "/external-services/{id}/runtime",
+    tag = "External Services",
+    responses(
+        (status = 200, description = "Container runtime snapshot", body = crate::services::ServiceRuntimeReport),
+        (status = 404, description = "Service not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("id" = i32, Path, description = "External service ID")
+    )
+)]
+async fn get_service_runtime(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ExternalServicesRead);
+
+    match app_state
+        .external_service_manager
+        .get_service_runtime(id)
+        .await
+    {
+        Ok(report) => Ok((StatusCode::OK, Json(report))),
+        Err(crate::services::ExternalServiceError::ServiceNotFound { .. }) => {
+            Err(not_found().detail("Service not found").build())
+        }
+        Err(e) => Err(internal_server_error()
+            .detail(format!("Failed to load service runtime: {}", e))
+            .build()),
+    }
+}
+
+/// Sample current CPU/memory usage from each of a service's containers.
+/// One-shot sample, no streaming. Cheap to call (single Docker round-trip
+/// per member) so the UI can poll on a 5–10s interval.
+#[utoipa::path(
+    get,
+    path = "/external-services/{id}/stats",
+    tag = "External Services",
+    responses(
+        (status = 200, description = "Container stats snapshot", body = crate::services::ServiceStatsReport),
+        (status = 404, description = "Service not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("id" = i32, Path, description = "External service ID")
+    )
+)]
+async fn get_service_stats(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ExternalServicesRead);
+
+    match app_state
+        .external_service_manager
+        .get_service_stats(id)
+        .await
+    {
+        Ok(report) => Ok((StatusCode::OK, Json(report))),
+        Err(crate::services::ExternalServiceError::ServiceNotFound { .. }) => {
+            Err(not_found().detail("Service not found").build())
+        }
+        Err(e) => Err(internal_server_error()
+            .detail(format!("Failed to load service stats: {}", e))
+            .build()),
+    }
+}
+
+/// Update a service's resource limits (memory, CPU caps).
+///
+/// Persists the new caps to the encrypted config AND live-applies them
+/// via Docker's update API. Memory and CPU can be hot-changed without a
+/// restart on running containers; stopped containers also accept the
+/// update and pick up the new caps on next start.
+///
+/// Pass `null` (or omit) any field to leave it unlimited. A request where
+/// every field is `null` removes any existing limits.
+///
+/// The response includes a per-container `applied[]` list so the caller
+/// can tell which members got the update and which were skipped (e.g.,
+/// container not yet created, or `docker update` rejected because the
+/// new memory cap is below current usage).
+#[utoipa::path(
+    patch,
+    path = "/external-services/{id}/resources",
+    tag = "External Services",
+    request_body = crate::externalsvc::ServiceResourceLimits,
+    responses(
+        (status = 200, description = "Updated resource limits", body = crate::services::ResourceLimitsUpdateResponse),
+        (status = 400, description = "Invalid resource limits"),
+        (status = 404, description = "Service not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("id" = i32, Path, description = "External service ID")
+    )
+)]
+async fn update_service_resources(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<crate::externalsvc::ServiceResourceLimits>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ExternalServicesWrite);
+
+    match app_state
+        .external_service_manager
+        .update_service_resource_limits(id, request)
+        .await
+    {
+        Ok(response) => {
+            let applied_limits = &response.limits;
+            // Audit: capture the new caps as flat strings so the existing
+            // ExternalServiceUpdatedAudit shape works.
+            let mut params = HashMap::new();
+            params.insert(
+                "memory_mb".to_string(),
+                applied_limits
+                    .memory_mb
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "unlimited".to_string()),
+            );
+            params.insert(
+                "memory_swap_mb".to_string(),
+                applied_limits
+                    .memory_swap_mb
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "unlimited".to_string()),
+            );
+            params.insert(
+                "nano_cpus".to_string(),
+                applied_limits
+                    .nano_cpus
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "unlimited".to_string()),
+            );
+            params.insert(
+                "cpu_shares".to_string(),
+                applied_limits
+                    .cpu_shares
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "unlimited".to_string()),
+            );
+
+            // Look up the service for context fields the audit log needs.
+            // If this fails, log but don't fail the response — the limits
+            // are already saved.
+            if let Ok(service) = app_state.external_service_manager.get_service(id).await {
+                let audit = ExternalServiceUpdatedAudit {
+                    context: AuditContext {
+                        user_id: auth.user_id(),
+                        ip_address: Some(metadata.ip_address.clone()),
+                        user_agent: metadata.user_agent.clone(),
+                    },
+                    service_id: service.id,
+                    name: service.name.clone(),
+                    service_type: service.service_type.clone(),
+                    updated_parameters: params,
+                };
+                if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
+                    error!("Failed to create audit log for resource update: {}", e);
+                }
+            }
+
+            Ok((StatusCode::OK, Json(response)))
+        }
+        Err(crate::services::ExternalServiceError::ServiceNotFound { .. }) => {
+            Err(not_found().detail("Service not found").build())
+        }
+        Err(crate::services::ExternalServiceError::ParameterValidationFailed {
+            reason, ..
+        }) => Err(bad_request().detail(reason).build()),
+        Err(e) => Err(internal_server_error()
+            .detail(format!("Failed to update resource limits: {}", e))
+            .build()),
+    }
+}
+
 #[derive(OpenApi)]
 #[openapi(
     paths(
@@ -2003,6 +2206,9 @@ async fn get_service_preview_environment_variables_masked(
         trigger_service_health_check,
         list_service_health_statuses,
         get_cluster_health,
+        get_service_runtime,
+        get_service_stats,
+        update_service_resources,
         super::query_handlers::check_explorer_support,
         super::query_handlers::list_root_containers,
         super::query_handlers::list_containers_at_path,
@@ -2036,6 +2242,13 @@ async fn get_service_preview_environment_variables_masked(
         ServiceHealthStatusEntryResponse,
         ClusterHealthReportResponse,
         ClusterMemberHealthResponse,
+        crate::externalsvc::ServiceResourceLimits,
+        crate::services::ContainerRuntimeInfo,
+        crate::services::ServiceRuntimeReport,
+        crate::services::ContainerStatsSample,
+        crate::services::ServiceStatsReport,
+        crate::services::ResourceLimitApplyResult,
+        crate::services::ResourceLimitsUpdateResponse,
         super::query_handlers::ExplorerSupportResponse,
         super::query_handlers::ContainerResponse,
         super::query_handlers::EntityResponse,

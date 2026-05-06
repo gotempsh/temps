@@ -160,7 +160,7 @@ pub async fn create_service(
         );
     }
 
-    let host_config = bollard::models::HostConfig {
+    let mut host_config = bollard::models::HostConfig {
         binds: Some(binds),
         port_bindings: Some(port_bindings),
         network_mode: request.network.clone(),
@@ -171,6 +171,20 @@ pub async fn create_service(
         }),
         ..Default::default()
     };
+    if let Some(ref limits) = request.resource_limits {
+        if let Some(mb) = limits.memory_mb {
+            host_config.memory = Some(mb.saturating_mul(1024 * 1024));
+        }
+        if let Some(mb) = limits.memory_swap_mb {
+            host_config.memory_swap = Some(mb.saturating_mul(1024 * 1024));
+        }
+        if let Some(nc) = limits.nano_cpus {
+            host_config.nano_cpus = Some(nc);
+        }
+        if let Some(cs) = limits.cpu_shares {
+            host_config.cpu_shares = Some(cs);
+        }
+    }
 
     let container_config = bollard::models::ContainerCreateBody {
         image: Some(request.image.clone()),

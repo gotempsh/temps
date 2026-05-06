@@ -39,6 +39,11 @@ pub struct RemoteServiceCreateParams {
     pub network: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<Vec<String>>,
+    /// Optional cgroup limits applied to the container (memory, swap, CPU).
+    /// Skipped from the wire when unset, so older agents that don't know
+    /// about the field still parse the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_limits: Option<crate::externalsvc::ServiceResourceLimits>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -419,11 +424,13 @@ mod tests {
             )]),
             network: Some("temps".to_string()),
             command: None,
+            resource_limits: None,
         };
 
         let json = serde_json::to_string(&params).unwrap();
         assert!(json.contains("postgres-main"));
         assert!(json.contains("30001"));
         assert!(!json.contains("command")); // None fields skipped
+        assert!(!json.contains("resource_limits")); // None field skipped
     }
 }

@@ -577,6 +577,124 @@ fn build_walg_env(
     env
 }
 
+// ---------------------------------------------------------------------------
+// Runtime + stats DTOs (response shapes for the runtime/stats endpoints).
+//
+// These surface raw container state so the UI can warn about restarts and
+// OOM kills, plus live CPU/memory usage. Cluster services return a list
+// of members; standalone services return a single entry with role="standalone".
+// ---------------------------------------------------------------------------
+
+/// Snapshot of a container's lifecycle state from `docker inspect`.
+/// `restart_count` and `oom_killed` are the load-bearing fields when
+/// diagnosing crash loops — the kernel OOM killer never reaches the
+/// application's logs, so seeing `oom_killed=true` is the only signal
+/// that a memory limit was the cause.
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct ContainerRuntimeInfo {
+    /// `service_members.role` for cluster members; "standalone" otherwise.
+    pub role: String,
+    /// Stable name of the Docker container (e.g. `postgres-mydb`).
+    pub container_name: String,
+    /// Container Docker id, when present. None = container does not exist
+    /// (was never created or was removed externally).
+    pub container_id: Option<String>,
+    /// Bollard container state ("running", "exited", "dead", etc.). None
+    /// when the container does not exist.
+    pub status: Option<String>,
+    /// Total restarts since the container was created. Useful for
+    /// detecting crash loops — a steady stream means something is killing
+    /// the container repeatedly (frequently OOM).
+    pub restart_count: Option<i64>,
+    /// True when the container's last termination was caused by the
+    /// kernel OOM killer. Set if the user enabled hard memory limits
+    /// and the working set exceeded them.
+    pub oom_killed: Option<bool>,
+    /// Last container exit code, when known. Non-zero = unclean stop.
+    pub exit_code: Option<i64>,
+    /// ISO-8601 timestamp of when the container last started. None when
+    /// it has never started (i.e. created but never run).
+    pub started_at: Option<String>,
+    /// ISO-8601 timestamp of the most recent termination, when known.
+    pub finished_at: Option<String>,
+    /// Currently-effective Docker image (e.g. `gotempsh/postgres-walg:18-bookworm`).
+    pub image: Option<String>,
+    /// Currently-applied resource limits read off the container's
+    /// `HostConfig`. Compare this against the user-configured limits to
+    /// detect drift (an old container that never picked up new caps).
+    pub resource_limits: super::externalsvc::ServiceResourceLimits,
+}
+
+/// Aggregate runtime info for an external service. For standalone services,
+/// `members` has exactly one entry. For clusters, one entry per member.
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct ServiceRuntimeReport {
+    pub service_id: i32,
+    pub topology: String,
+    pub members: Vec<ContainerRuntimeInfo>,
+}
+
+/// Live resource usage sample for a single container.
+///
+/// `cpu_percent` is computed by Docker's standard formula:
+///   ((cpu_delta / system_delta) * online_cpus) * 100
+/// `memory_percent` is `(memory_usage / memory_limit) * 100` — when no
+/// memory limit is set the limit reported by Docker is the host's total
+/// RAM, so a 5% reading means "5% of host RAM", not "5% of allocated".
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct ContainerStatsSample {
+    pub role: String,
+    pub container_name: String,
+    /// CPU usage as a percentage. `None` when the container is not running
+    /// (Docker returns no usable counters).
+    pub cpu_percent: Option<f64>,
+    /// Resident memory usage in bytes.
+    pub memory_usage_bytes: Option<u64>,
+    /// Memory limit in bytes (host RAM if no limit set).
+    pub memory_limit_bytes: Option<u64>,
+    /// Memory usage as a percentage of `memory_limit_bytes`.
+    pub memory_percent: Option<f64>,
+    /// Number of cores Docker observed at sample time. Used by the UI
+    /// to label "x/y cores" instead of just a percent.
+    pub online_cpus: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct ServiceStatsReport {
+    pub service_id: i32,
+    pub topology: String,
+    pub members: Vec<ContainerStatsSample>,
+}
+
+/// Per-container outcome of a live `docker update` call. Surfaced from the
+/// PATCH /resources endpoint so the UI can tell the operator whether the
+/// new caps are already in effect or whether they only apply on next
+/// recreate (e.g., container was missing).
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct ResourceLimitApplyResult {
+    /// `service_members.role` for cluster members; "standalone" otherwise.
+    pub role: String,
+    pub container_name: String,
+    /// One of:
+    /// - "applied"  — Docker accepted the update; caps are live now.
+    /// - "missing"  — container does not exist; caps stored, will apply on next start.
+    /// - "stopped"  — container exists but isn't running; Docker still
+    ///   accepts the update (the new caps apply on next start).
+    /// - "failed"   — `docker update` returned an error (see `error`).
+    pub outcome: String,
+    /// Populated only when `outcome == "failed"`.
+    pub error: Option<String>,
+}
+
+/// Response from PATCH /external-services/{id}/resources.
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct ResourceLimitsUpdateResponse {
+    /// The limits that were persisted to the encrypted config.
+    pub limits: crate::externalsvc::ServiceResourceLimits,
+    /// Per-container result of trying to apply the limits live.
+    pub applied: Vec<ResourceLimitApplyResult>,
+}
+
 pub struct ExternalServiceManager {
     db: Arc<DatabaseConnection>,
     encryption_service: Arc<EncryptionService>,
@@ -926,6 +1044,30 @@ impl ExternalServiceManager {
         let container_name_for_volume = format!("{}-{}", service_type, service_name);
         let volume_name = format!("{}_data", container_name_for_volume);
 
+        // Resource limits, when provided, are stored as flat string keys in
+        // `parameters` (set alongside `memory_mb=512`, `nano_cpus=1000000000`,
+        // etc.) so they survive the `HashMap<String, String>` round-trip
+        // used by the cluster manager. Missing keys → unlimited.
+        let resource_limits = {
+            let parse_i64 = |key: &str| -> Option<i64> {
+                parameters
+                    .get(key)
+                    .and_then(|s| s.trim().parse::<i64>().ok())
+                    .filter(|&n| n > 0)
+            };
+            let limits = crate::externalsvc::ServiceResourceLimits {
+                memory_mb: parse_i64("memory_mb"),
+                memory_swap_mb: parse_i64("memory_swap_mb"),
+                nano_cpus: parse_i64("nano_cpus"),
+                cpu_shares: parse_i64("cpu_shares"),
+            };
+            if limits.is_unlimited() {
+                None
+            } else {
+                Some(limits)
+            }
+        };
+
         Ok(RemoteServiceCreateParams {
             name: container_name,
             service_type: service_type.to_string(),
@@ -938,6 +1080,7 @@ impl ExternalServiceManager {
             volumes: HashMap::from([(volume_name, volume_path)]),
             network: Some(temps_core::NETWORK_NAME.to_string()),
             command,
+            resource_limits,
         })
     }
 
@@ -1217,7 +1360,12 @@ impl ExternalServiceManager {
         service_id: i32,
     ) -> Result<ExternalServiceDetails, ExternalServiceError> {
         let service_info = self.get_service_info(service_id).await?;
-        let parameters = self.get_service_parameters(service_id).await?;
+        let mut parameters = self.get_service_parameters(service_id).await?;
+        // Hide structured sub-blocks from the flat Configuration card. The
+        // `resources` block ({memory_mb, nano_cpus, ...}) is surfaced via
+        // its own panel + endpoint; if it stays in this map the React
+        // `<dl>` renders the object directly and crashes the page.
+        parameters.remove("resources");
         let service_type =
             ServiceType::from_str(&service_info.service_type.to_string()).map_err(|_| {
                 ExternalServiceError::InvalidServiceType {
@@ -3961,6 +4109,17 @@ echo "[restore] Pre-seed complete"
                 }
             })?;
 
+        // Pull resource limits once for the whole cluster — every member
+        // (monitor + data nodes) gets the same caps. Defaults to unlimited
+        // when the operator hasn't set a `resources` block.
+        let cluster_resource_limits =
+            crate::externalsvc::ServiceResourceLimits::from_parameters(&service_config.parameters);
+        if let Err(e) = cluster_resource_limits.validate() {
+            return Err(ExternalServiceError::InternalError {
+                reason: format!("Invalid cluster resource limits: {}", e),
+            });
+        }
+
         // Find the monitor hostname for data node configuration.
         // For remote workers, use the node's private/WireGuard address.
         // For local (no node_id), use the monitor container name so Docker DNS resolves it.
@@ -4051,6 +4210,7 @@ echo "[restore] Pre-seed complete"
                             monitor_hostname,
                             monitor_port,
                             member_port,
+                            cluster_resource_limits.clone(),
                         )
                     } else {
                         return Err(ExternalServiceError::InitializationFailed {
@@ -4062,6 +4222,11 @@ echo "[restore] Pre-seed complete"
                     // Each cluster member uses a unique port assigned by the
                     // manager. Map container_port = host_port to avoid conflicts.
                     let volume_name = format!("{}_data", result.container_name);
+                    let limits_for_remote = if member_params.resource_limits.is_unlimited() {
+                        None
+                    } else {
+                        Some(member_params.resource_limits.clone())
+                    };
                     let remote_params = RemoteServiceCreateParams {
                         name: result.container_name.clone(),
                         service_type: "postgres".to_string(),
@@ -4074,6 +4239,7 @@ echo "[restore] Pre-seed complete"
                         volumes: HashMap::from([(volume_name, member_params.volume_path)]),
                         network: Some(temps_core::NETWORK_NAME.to_string()),
                         command: member_params.command,
+                        resource_limits: limits_for_remote,
                     };
 
                     let response = client.create_service(remote_params).await.map_err(|e| {
@@ -4101,6 +4267,7 @@ echo "[restore] Pre-seed complete"
                             monitor_hostname,
                             monitor_port,
                             member_port,
+                            cluster_resource_limits.clone(),
                         )
                     } else {
                         return Err(ExternalServiceError::InitializationFailed {
@@ -5066,6 +5233,16 @@ echo "[restore] Pre-seed complete"
                 }
             })?;
 
+        // Inherit cluster-wide resource limits when adding a new member so
+        // every node ends up with the same caps as the rest of the cluster.
+        let member_limits =
+            crate::externalsvc::ServiceResourceLimits::from_parameters(&service_config.parameters);
+        if let Err(e) = member_limits.validate() {
+            return Err(ExternalServiceError::InternalError {
+                reason: format!("Invalid cluster resource limits: {}", e),
+            });
+        }
+
         let base_port = 6000u16 + (service_id as u16 * 10);
         let member_port = base_port + spec.ordinal as u16;
 
@@ -5075,6 +5252,7 @@ echo "[restore] Pre-seed complete"
             &monitor_hostname,
             monitor_port,
             member_port,
+            member_limits,
         );
         let container_name = member_params.container_name.clone();
         let member_fqdn = format!(
@@ -5128,6 +5306,11 @@ echo "[restore] Pre-seed complete"
                     }
                 };
                 let volume_name = format!("{}_data", plan.container_name);
+                let limits_for_remote = if plan.member_params.resource_limits.is_unlimited() {
+                    None
+                } else {
+                    Some(plan.member_params.resource_limits.clone())
+                };
                 let remote_params = RemoteServiceCreateParams {
                     name: plan.container_name.clone(),
                     service_type: "postgres".to_string(),
@@ -5140,6 +5323,7 @@ echo "[restore] Pre-seed complete"
                     volumes: HashMap::from([(volume_name, plan.member_params.volume_path.clone())]),
                     network: Some(temps_core::NETWORK_NAME.to_string()),
                     command: plan.member_params.command.clone(),
+                    resource_limits: limits_for_remote,
                 };
                 client
                     .create_service(remote_params)
@@ -6096,21 +6280,25 @@ echo "[restore] Pre-seed complete"
         let dns_servers = self.lookup_overlay_bridge_gateway().await;
 
         // Create container
+        let mut cluster_host_config = HostConfig {
+            binds: Some(vec![format!("{}:{}", volume_name, params.volume_path)]),
+            port_bindings: Some(port_bindings),
+            dns: dns_servers,
+            restart_policy: Some(RestartPolicy {
+                name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
+                maximum_retry_count: None,
+            }),
+            network_mode: Some(temps_core::NETWORK_NAME.to_string()),
+            ..Default::default()
+        };
+        params
+            .resource_limits
+            .apply_to_host_config(&mut cluster_host_config);
         let container_config = ContainerCreateBody {
             image: Some(params.image.clone()),
             env: Some(env),
             cmd: params.command.clone(),
-            host_config: Some(HostConfig {
-                binds: Some(vec![format!("{}:{}", volume_name, params.volume_path)]),
-                port_bindings: Some(port_bindings),
-                dns: dns_servers,
-                restart_policy: Some(RestartPolicy {
-                    name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
-                    maximum_retry_count: None,
-                }),
-                network_mode: Some(temps_core::NETWORK_NAME.to_string()),
-                ..Default::default()
-            }),
+            host_config: Some(cluster_host_config),
             labels: Some(HashMap::from([
                 ("sh.temps.managed".to_string(), "true".to_string()),
                 ("sh.temps.service".to_string(), "true".to_string()),
@@ -7779,6 +7967,495 @@ echo "[restore] Pre-seed complete"
             members: Vec::new(),
             error_message: external_service.error_message,
         })
+    }
+
+    // -----------------------------------------------------------------------
+    // Runtime + stats
+    //
+    // These methods sit close to bollard so handlers can return a clean DTO
+    // without having to deal with `inspect_container` quirks (Option<...>
+    // everywhere, OOMKilled vs RestartCount nesting, etc.).
+    //
+    // For services running on a remote node (`service.node_id = Some(_)`),
+    // we currently return an empty/placeholder runtime entry — the agent
+    // does not yet expose an inspect-or-stats endpoint. Wiring that up is
+    // a separate change; this lets the UI render local services today.
+    // -----------------------------------------------------------------------
+
+    /// Resolve `(role, container_name)` pairs for every container that
+    /// makes up this service. Standalone services return a single entry;
+    /// cluster services return one entry per `service_members` row.
+    async fn resolve_member_containers(
+        &self,
+        service: &external_services::Model,
+    ) -> Result<Vec<(String, String)>, ExternalServiceError> {
+        if service.topology == "cluster" {
+            let members = service_members::Entity::find()
+                .filter(service_members::Column::ServiceId.eq(service.id))
+                .all(self.db.as_ref())
+                .await?;
+            Ok(members
+                .into_iter()
+                .map(|m| (m.role, m.container_name))
+                .collect())
+        } else {
+            // Build a fresh service instance just to ask for its container
+            // name — every engine knows its own naming convention.
+            let service_type = ServiceType::from_str(&service.service_type).map_err(|_| {
+                ExternalServiceError::InvalidServiceType {
+                    id: service.id,
+                    service_type: service.service_type.clone(),
+                }
+            })?;
+            let instance = self.create_service_instance(service.name.clone(), service_type);
+            Ok(vec![(
+                "standalone".to_string(),
+                instance.get_docker_container_name(),
+            )])
+        }
+    }
+
+    /// Inspect a single container and project the result onto
+    /// `ContainerRuntimeInfo`. Treats container-not-found as a soft
+    /// signal (returns `container_id: None`) rather than an error so
+    /// the UI can still render "container missing" instead of a 500.
+    async fn inspect_one_container(
+        &self,
+        role: String,
+        container_name: String,
+    ) -> ContainerRuntimeInfo {
+        let inspected = self
+            .docker
+            .inspect_container(
+                &container_name,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await;
+
+        match inspected {
+            Ok(info) => {
+                let state = info.state.as_ref();
+                let host_config_limits = info
+                    .host_config
+                    .as_ref()
+                    .map(|hc| crate::externalsvc::ServiceResourceLimits {
+                        memory_mb: hc.memory.filter(|&m| m > 0).map(|m| m / (1024 * 1024)),
+                        memory_swap_mb: hc
+                            .memory_swap
+                            .filter(|&m| m > 0)
+                            .map(|m| m / (1024 * 1024)),
+                        nano_cpus: hc.nano_cpus.filter(|&n| n > 0),
+                        cpu_shares: hc.cpu_shares.filter(|&n| n > 0),
+                    })
+                    .unwrap_or_default();
+
+                ContainerRuntimeInfo {
+                    role,
+                    container_name,
+                    container_id: info.id,
+                    status: state.and_then(|s| {
+                        s.status
+                            .as_ref()
+                            .map(|st| format!("{:?}", st).to_lowercase())
+                    }),
+                    restart_count: info.restart_count,
+                    oom_killed: state.and_then(|s| s.oom_killed),
+                    exit_code: state.and_then(|s| s.exit_code),
+                    started_at: state.and_then(|s| s.started_at.clone()),
+                    finished_at: state.and_then(|s| s.finished_at.clone()),
+                    image: info.image,
+                    resource_limits: host_config_limits,
+                }
+            }
+            Err(_) => ContainerRuntimeInfo {
+                role,
+                container_name,
+                container_id: None,
+                status: None,
+                restart_count: None,
+                oom_killed: None,
+                exit_code: None,
+                started_at: None,
+                finished_at: None,
+                image: None,
+                resource_limits: crate::externalsvc::ServiceResourceLimits::default(),
+            },
+        }
+    }
+
+    /// Get a snapshot of every container that makes up this service:
+    /// status, restart count, OOM-killed flag, exit code, and current
+    /// applied resource limits.
+    pub async fn get_service_runtime(
+        &self,
+        service_id: i32,
+    ) -> Result<ServiceRuntimeReport, ExternalServiceError> {
+        let service = self.get_service(service_id).await?;
+        let containers = self.resolve_member_containers(&service).await?;
+
+        let mut members = Vec::with_capacity(containers.len());
+        for (role, name) in containers {
+            members.push(self.inspect_one_container(role, name).await);
+        }
+
+        Ok(ServiceRuntimeReport {
+            service_id: service.id,
+            topology: service.topology,
+            members,
+        })
+    }
+
+    /// Sample one stats snapshot from every container in this service.
+    /// Uses `one_shot=true, stream=false` so the call returns immediately
+    /// instead of holding the connection open for streaming updates.
+    pub async fn get_service_stats(
+        &self,
+        service_id: i32,
+    ) -> Result<ServiceStatsReport, ExternalServiceError> {
+        use futures::StreamExt;
+
+        let service = self.get_service(service_id).await?;
+        let containers = self.resolve_member_containers(&service).await?;
+
+        let mut members = Vec::with_capacity(containers.len());
+        for (role, name) in containers {
+            let opts = bollard::query_parameters::StatsOptionsBuilder::default()
+                .stream(false)
+                .one_shot(true)
+                .build();
+            let mut stream = self.docker.stats(&name, Some(opts));
+            let sample = match stream.next().await {
+                Some(Ok(s)) => Some(s),
+                Some(Err(_)) | None => None,
+            };
+
+            let stats = match sample {
+                Some(s) => compute_stats_sample(role.clone(), name.clone(), s),
+                None => ContainerStatsSample {
+                    role,
+                    container_name: name,
+                    cpu_percent: None,
+                    memory_usage_bytes: None,
+                    memory_limit_bytes: None,
+                    memory_percent: None,
+                    online_cpus: None,
+                },
+            };
+            members.push(stats);
+        }
+
+        Ok(ServiceStatsReport {
+            service_id: service.id,
+            topology: service.topology,
+            members,
+        })
+    }
+
+    /// Apply a resource-limits block to every container that backs this
+    /// service via Docker's live `update_container` API. Works on running
+    /// AND stopped containers (Docker accepts updates for both states —
+    /// stopped containers pick up the new caps on next start).
+    ///
+    /// **Limitation: removing a previously-set memory cap requires a
+    /// container recreate on most Docker setups.** The Docker daemon
+    /// silently treats `Memory: 0` as "no change" and rejects `Memory:
+    /// -1` with "Minimum memory limit allowed is 6MB" on Docker Desktop /
+    /// recent versions. We detect this case and mark the outcome as
+    /// "requires_recreate" so the UI can prompt the operator to restart.
+    ///
+    /// CPU caps don't have this problem: `NanoCpus: 0` correctly removes
+    /// the CPU cap on a running container.
+    ///
+    /// Returns a per-member outcome so the caller can tell which
+    /// containers got the update and which were skipped (missing or
+    /// errored). Never fails the request as a whole — limits are already
+    /// persisted in the DB by the time this runs.
+    async fn apply_limits_to_running_containers(
+        &self,
+        service: &external_services::Model,
+        limits: &crate::externalsvc::ServiceResourceLimits,
+    ) -> Vec<ResourceLimitApplyResult> {
+        // Resolve every container name that backs this service. Soft-fails
+        // back to an empty list when resolution itself errors so the
+        // outer call doesn't blow up — limits are already persisted.
+        let containers = match self.resolve_member_containers(service).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    service_id = service.id,
+                    error = %e,
+                    "Could not resolve member containers for live limit update"
+                );
+                return Vec::new();
+            }
+        };
+
+        let mut results = Vec::with_capacity(containers.len());
+
+        for (role, container_name) in containers {
+            // First check whether the container actually exists. Calling
+            // update_container on a missing name returns a confusing 404;
+            // distinguishing "missing" from "failed" up front gives the
+            // operator a clearer signal in the response.
+            let inspected = self
+                .docker
+                .inspect_container(
+                    &container_name,
+                    None::<bollard::query_parameters::InspectContainerOptions>,
+                )
+                .await;
+
+            let outcome = match inspected {
+                Err(_) => ResourceLimitApplyResult {
+                    role,
+                    container_name,
+                    outcome: "missing".to_string(),
+                    error: None,
+                },
+                Ok(info) => {
+                    let is_running = info.state.as_ref().and_then(|s| s.running).unwrap_or(false);
+
+                    // Detect "removing a previously-set memory cap" up
+                    // front: if the container currently has a non-zero
+                    // memory limit and the new request is unlimited, the
+                    // live update can't honor it. Tell the caller they
+                    // need to restart the container to pick up the
+                    // change. The persisted limits are correct, and the
+                    // recreate path in the engines' `start()` will apply
+                    // them on next boot.
+                    let current_memory = info
+                        .host_config
+                        .as_ref()
+                        .and_then(|hc| hc.memory)
+                        .unwrap_or(0);
+                    let removing_memory_cap = current_memory > 0 && limits.memory_mb.is_none();
+
+                    if removing_memory_cap {
+                        ResourceLimitApplyResult {
+                            role,
+                            container_name,
+                            outcome: "requires_recreate".to_string(),
+                            error: Some(
+                                "Docker cannot remove a memory limit on a live \
+                                 container. Restart the service to apply unlimited \
+                                 memory."
+                                    .to_string(),
+                            ),
+                        }
+                    } else {
+                        // Build the body fresh per-container so a future
+                        // per-member override (different caps per cluster
+                        // role, etc.) slots in cleanly.
+                        let body = build_container_update_body(limits);
+                        match self.docker.update_container(&container_name, body).await {
+                            Ok(()) => ResourceLimitApplyResult {
+                                role,
+                                container_name,
+                                outcome: if is_running { "applied" } else { "stopped" }.to_string(),
+                                error: None,
+                            },
+                            Err(e) => {
+                                // Most common failure: setting memory
+                                // below current usage (Docker rejects).
+                                // Surface the raw message so the operator
+                                // sees the actionable detail.
+                                let msg = e.to_string();
+                                tracing::warn!(
+                                    service_id = service.id,
+                                    container = %container_name,
+                                    error = %msg,
+                                    "docker update_container rejected"
+                                );
+                                ResourceLimitApplyResult {
+                                    role,
+                                    container_name,
+                                    outcome: "failed".to_string(),
+                                    error: Some(msg),
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+            results.push(outcome);
+        }
+
+        results
+    }
+
+    /// Persist a new resource-limits block onto an existing service's
+    /// `external_service_params`, then live-apply via Docker's update API.
+    ///
+    /// Memory and CPU caps can be hot-changed on running containers — no
+    /// restart required. Stopped containers also accept the update; they
+    /// pick up the new caps on next start. When the container is
+    /// completely absent (e.g., never created on this node), only the
+    /// stored config is updated and the apply step records "missing".
+    pub async fn update_service_resource_limits(
+        &self,
+        service_id: i32,
+        new_limits: crate::externalsvc::ServiceResourceLimits,
+    ) -> Result<ResourceLimitsUpdateResponse, ExternalServiceError> {
+        if let Err(e) = new_limits.validate() {
+            return Err(ExternalServiceError::ParameterValidationFailed {
+                service_id,
+                reason: e,
+            });
+        }
+
+        // Load the service plus its current parameters JSON.
+        let service = self.get_service(service_id).await?;
+        let mut config_json: serde_json::Value = match service.config.as_deref() {
+            Some(s) => match self.encryption_service.decrypt_string(s) {
+                Ok(decrypted) => serde_json::from_str(&decrypted).map_err(|e| {
+                    ExternalServiceError::InternalError {
+                        reason: format!(
+                            "Failed to parse stored config for service {}: {}",
+                            service_id, e
+                        ),
+                    }
+                })?,
+                Err(e) => {
+                    return Err(ExternalServiceError::InternalError {
+                        reason: format!(
+                            "Failed to decrypt config for service {}: {}",
+                            service_id, e
+                        ),
+                    })
+                }
+            },
+            None => serde_json::json!({}),
+        };
+
+        // Splice the resources block into the parameters JSON. Setting
+        // `unlimited` removes the block so the service goes back to
+        // running without caps.
+        if new_limits.is_unlimited() {
+            if let Some(obj) = config_json.as_object_mut() {
+                obj.remove("resources");
+            }
+        } else {
+            let limits_value = serde_json::to_value(&new_limits).map_err(|e| {
+                ExternalServiceError::InternalError {
+                    reason: format!("Failed to serialize resource limits: {}", e),
+                }
+            })?;
+            match config_json.as_object_mut() {
+                Some(obj) => {
+                    obj.insert("resources".to_string(), limits_value);
+                }
+                None => {
+                    config_json = serde_json::json!({ "resources": limits_value });
+                }
+            }
+        }
+
+        // Re-encrypt and persist.
+        let serialized = serde_json::to_string(&config_json).map_err(|e| {
+            ExternalServiceError::InternalError {
+                reason: format!("Failed to serialize updated config: {}", e),
+            }
+        })?;
+        let encrypted = self
+            .encryption_service
+            .encrypt_string(&serialized)
+            .map_err(|e| ExternalServiceError::InternalError {
+                reason: format!("Failed to encrypt updated config: {}", e),
+            })?;
+
+        let mut active: external_services::ActiveModel = service.clone().into();
+        active.config = Set(Some(encrypted));
+        active.update(self.db.as_ref()).await?;
+
+        // Best-effort live apply. Errors here don't undo the persisted
+        // limits — the operator can still recreate the container manually
+        // to pick them up.
+        let applied = self
+            .apply_limits_to_running_containers(&service, &new_limits)
+            .await;
+
+        Ok(ResourceLimitsUpdateResponse {
+            limits: new_limits,
+            applied,
+        })
+    }
+}
+
+/// Map our `ServiceResourceLimits` onto a bollard `ContainerUpdateBody`.
+///
+/// CRITICAL: Docker uses `0` (not `null`) as the special value for
+/// "remove this constraint". Sending `null` leaves the existing limit in
+/// place — exactly the bug an operator hits when they switch a service
+/// from limited back to unlimited. So we always emit explicit zeros for
+/// the four fields we manage.
+///
+/// Conversions:
+/// - memory_mb       → memory       (bytes; 0 = unlimited)
+/// - memory_swap_mb  → memory_swap  (bytes; -1 = unlimited swap, 0 = no swap; we map None→0)
+/// - nano_cpus       → nano_cpus    (1e9 = 1 core; 0 = unlimited)
+/// - cpu_shares      → cpu_shares   (default 1024; 0 = default)
+fn build_container_update_body(
+    limits: &crate::externalsvc::ServiceResourceLimits,
+) -> bollard::models::ContainerUpdateBody {
+    let memory_bytes = limits
+        .memory_mb
+        .map(|mb| mb.saturating_mul(1024 * 1024))
+        .unwrap_or(0);
+    let memory_swap_bytes = limits
+        .memory_swap_mb
+        .map(|mb| mb.saturating_mul(1024 * 1024))
+        .unwrap_or(0);
+    bollard::models::ContainerUpdateBody {
+        memory: Some(memory_bytes),
+        memory_swap: Some(memory_swap_bytes),
+        nano_cpus: Some(limits.nano_cpus.unwrap_or(0)),
+        cpu_shares: Some(limits.cpu_shares.unwrap_or(0)),
+        ..Default::default()
+    }
+}
+
+/// Bollard's stats response is full of `Option<u64>`s. This helper
+/// projects the fields we care about onto `ContainerStatsSample`,
+/// returning `None` for any value where the upstream is missing.
+fn compute_stats_sample(
+    role: String,
+    container_name: String,
+    s: bollard::models::ContainerStatsResponse,
+) -> ContainerStatsSample {
+    let cpu_stats = s.cpu_stats.as_ref();
+    let online_cpus = cpu_stats.and_then(|c| c.online_cpus);
+    let cpu_percent = cpu_stats.and_then(|c| {
+        let cpu_usage = c.cpu_usage.as_ref()?;
+        let total = cpu_usage.total_usage? as f64;
+        let system = c.system_cpu_usage? as f64;
+        // Docker's reference formula. Negative deltas can happen on
+        // stopped containers; clamp to zero so we never surface a
+        // misleading negative percent.
+        let cpus = c.online_cpus.unwrap_or(1).max(1) as f64;
+        let percent = (total / system) * cpus * 100.0;
+        if percent.is_finite() && percent >= 0.0 {
+            Some(percent)
+        } else {
+            None
+        }
+    });
+
+    let mem_stats = s.memory_stats.as_ref();
+    let memory_usage_bytes = mem_stats.and_then(|m| m.usage);
+    let memory_limit_bytes = mem_stats.and_then(|m| m.limit);
+    let memory_percent = match (memory_usage_bytes, memory_limit_bytes) {
+        (Some(usage), Some(limit)) if limit > 0 => Some((usage as f64 / limit as f64) * 100.0),
+        _ => None,
+    };
+
+    ContainerStatsSample {
+        role,
+        container_name,
+        cpu_percent,
+        memory_usage_bytes,
+        memory_limit_bytes,
+        memory_percent,
+        online_cpus,
     }
 }
 

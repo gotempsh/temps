@@ -26,7 +26,10 @@ use crate::utils::ensure_network_exists;
 /// indefinitely.
 const BACKUP_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
 
-use super::{ExternalService, HealthProbeResult, RuntimeEnvVar, ServiceConfig, ServiceType};
+use super::{
+    ExternalService, HealthProbeResult, RuntimeEnvVar, ServiceConfig, ServiceResourceLimits,
+    ServiceType,
+};
 
 /// POSIX-safe shell escaping: wraps value in single quotes, escaping any
 /// embedded single quotes. Safe for use in `sh -c` command strings.
@@ -236,6 +239,11 @@ fn find_available_port(start_port: u16) -> Option<u16> {
 pub struct PostgresService {
     name: String,
     config: Arc<RwLock<Option<PostgresConfig>>>,
+    /// Resource limits captured at init time and reused by `start()` when
+    /// recreating a container that was removed externally. Defaults to
+    /// unlimited; populated from the `resources` block in the
+    /// `ServiceConfig::parameters` JSON.
+    resource_limits: Arc<RwLock<ServiceResourceLimits>>,
     docker: Arc<Docker>,
 }
 
@@ -244,6 +252,7 @@ impl PostgresService {
         Self {
             name,
             config: Arc::new(RwLock::new(None)),
+            resource_limits: Arc::new(RwLock::new(ServiceResourceLimits::default())),
             docker,
         }
     }
@@ -261,7 +270,12 @@ impl PostgresService {
         format!("postgres-{}", self.name)
     }
 
-    async fn create_container(&self, docker: &Docker, config: &PostgresConfig) -> Result<()> {
+    async fn create_container(
+        &self,
+        docker: &Docker,
+        config: &PostgresConfig,
+        resource_limits: &ServiceResourceLimits,
+    ) -> Result<()> {
         // Pull image first
         info!("Pulling PostgreSQL image {}", config.docker_image);
 
@@ -370,7 +384,7 @@ impl PostgresService {
             "POSTGRES_HOST_AUTH_METHOD=md5".to_string(), // Use md5 password authentication for better compatibility
         ];
 
-        let host_config = bollard::models::HostConfig {
+        let mut host_config = bollard::models::HostConfig {
             port_bindings: Some(HashMap::from([(
                 "5432/tcp".to_string(),
                 Some(vec![bollard::models::PortBinding {
@@ -391,6 +405,7 @@ impl PostgresService {
             pids_limit: Some(512),
             ..Default::default()
         };
+        resource_limits.apply_to_host_config(&mut host_config);
 
         ensure_network_exists(docker)
             .await
@@ -2505,14 +2520,25 @@ impl ExternalService for PostgresService {
             config.name, config.service_type, config.version
         );
 
+        // Pull resource limits out of the raw parameters JSON before the
+        // typed config consumes it. Missing/malformed `resources` block
+        // defaults to unlimited, preserving legacy behavior for services
+        // created before this field existed.
+        let resource_limits = ServiceResourceLimits::from_parameters(&config.parameters);
+        if let Err(e) = resource_limits.validate() {
+            return Err(anyhow::anyhow!("Invalid resource limits: {}", e));
+        }
+
         // Parse input config and transform to runtime config
         let postgres_config = self.get_postgres_config(config)?;
 
-        // Store runtime config
+        // Store runtime config and limits so `start()` can recreate the
+        // container with the same constraints if it has been removed.
         *self.config.write().await = Some(postgres_config.clone());
+        *self.resource_limits.write().await = resource_limits.clone();
 
         // Create Docker container
-        self.create_container(&self.docker, &postgres_config)
+        self.create_container(&self.docker, &postgres_config, &resource_limits)
             .await?;
 
         // Serialize the full runtime config to save to database
@@ -2808,7 +2834,9 @@ impl ExternalService for PostgresService {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("PostgreSQL configuration not found"))?
                 .clone();
-            self.create_container(&self.docker, &config).await?;
+            let limits = self.resource_limits.read().await.clone();
+            self.create_container(&self.docker, &config, &limits)
+                .await?;
         } else {
             // Container exists, check if it's running
             let container = &containers[0];
@@ -3056,7 +3084,9 @@ impl ExternalService for PostgresService {
                 old_version
             );
             self.stop().await?;
-            self.create_container(&self.docker, &new_pg_config).await?;
+            let limits = self.resource_limits.read().await.clone();
+            self.create_container(&self.docker, &new_pg_config, &limits)
+                .await?;
             info!("PostgreSQL image swap completed successfully");
         } else {
             // Major version upgrade — requires pg_upgrade
@@ -3064,7 +3094,9 @@ impl ExternalService for PostgresService {
             self.stop().await?;
             self.run_pg_upgrade(&old_pg_config, &new_pg_config, old_version, new_version)
                 .await?;
-            self.create_container(&self.docker, &new_pg_config).await?;
+            let limits = self.resource_limits.read().await.clone();
+            self.create_container(&self.docker, &new_pg_config, &limits)
+                .await?;
             info!("PostgreSQL major version upgrade completed successfully");
         }
 
@@ -3285,13 +3317,19 @@ impl ExternalService for PostgresService {
         // Build a new PostgresService for the target name.
         let new_service = PostgresService::new(new_service_name.clone(), self.docker.clone());
 
+        // Carry resource limits over from the source service so the
+        // restored copy inherits the same constraints (or unlimited if
+        // none were set on the source).
+        let cloned_limits = ServiceResourceLimits::from_parameters(&ctx.source_config.parameters);
+
         // Stash the runtime config so later methods (restore_from_walg -> get_postgres_config)
         // can resolve via ServiceConfig.
         *new_service.config.write().await = Some(source_config.clone());
+        *new_service.resource_limits.write().await = cloned_limits.clone();
 
         // Create the new container+volume.
         new_service
-            .create_container(&self.docker, &source_config)
+            .create_container(&self.docker, &source_config, &cloned_limits)
             .await?;
 
         // Build a ServiceConfig that parses cleanly back into PostgresConfig.
@@ -3388,9 +3426,12 @@ impl ExternalService for PostgresService {
             source_config.port = new_port;
 
             let new_service = PostgresService::new(new_name.clone(), self.docker.clone());
+            let cloned_limits =
+                ServiceResourceLimits::from_parameters(&ctx.source_config.parameters);
             *new_service.config.write().await = Some(source_config.clone());
+            *new_service.resource_limits.write().await = cloned_limits.clone();
             new_service
-                .create_container(&self.docker, &source_config)
+                .create_container(&self.docker, &source_config, &cloned_limits)
                 .await?;
 
             let new_service_config = ServiceConfig {

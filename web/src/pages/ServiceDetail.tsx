@@ -13,6 +13,7 @@ import {
 import type { SourceBackupEntry } from '@/api/client/types.gen'
 import { ClusterHealthPanel } from '@/components/storage/ClusterHealthPanel'
 import { EditServiceDialog } from '@/components/storage/EditServiceDialog'
+import { ServiceResourcesPanel } from '@/components/storage/ServiceResourcesPanel'
 import { MajorUpgradeDialog } from '@/components/storage/MajorUpgradeDialog'
 import {
   ServiceHealthBadge,
@@ -1036,6 +1037,12 @@ export function ServiceDetail() {
               <ClusterHealthPanel serviceId={service.service.id} />
             )}
 
+          {/* Resources: container runtime, live CPU/mem, applied limits */}
+          <ServiceResourcesPanel
+            serviceId={service.service.id}
+            serviceName={service.service.name}
+          />
+
           {/* Service Configuration Section */}
           <Card>
             <CardHeader>
@@ -1050,9 +1057,19 @@ export function ServiceDetail() {
                     ([key, value]) => {
                       const isSensitive = shouldMaskValue(key)
                       const isVisible = visibleParameters.has(key)
+                      // Coerce non-primitive values to a JSON string so a
+                      // future structured sub-block (`resources`, etc.)
+                      // doesn't crash the page with "Objects are not valid
+                      // as a React child". Primitives render unchanged.
+                      const safeValue =
+                        value != null && typeof value === 'object'
+                          ? JSON.stringify(value)
+                          : value
                       const displayValue =
-                        isSensitive && !isVisible ? maskValue(value) : value
-                      const hasValue = Boolean(value)
+                        isSensitive && !isVisible
+                          ? maskValue(safeValue)
+                          : safeValue
+                      const hasValue = Boolean(safeValue)
 
                       return (
                         <div

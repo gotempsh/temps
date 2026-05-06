@@ -120,6 +120,30 @@ pub struct ServiceCreateRequest {
     /// Optional command override
     #[serde(default)]
     pub command: Option<Vec<String>>,
+    /// Optional cgroup limits applied to the container. `None` = unlimited.
+    /// Older control planes that don't send this field still parse correctly
+    /// thanks to `#[serde(default)]`.
+    #[serde(default)]
+    pub resource_limits: Option<ServiceResourceLimits>,
+}
+
+/// Subset of bollard `HostConfig` fields exposed for runtime caps. Mirrors
+/// `temps_providers::externalsvc::ResourceLimits` over the wire — keeping
+/// them as separate structs avoids coupling the agent crate to providers.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ServiceResourceLimits {
+    /// Hard memory limit in MiB. None = unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_mb: Option<i64>,
+    /// Memory + swap limit in MiB. None = unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_swap_mb: Option<i64>,
+    /// CPU quota in nano-cpus (1e9 = 1 full CPU). None = unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nano_cpus: Option<i64>,
+    /// Relative CPU weight (default 1024). Only used when `nano_cpus` is None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_shares: Option<i64>,
 }
 
 /// Port mapping for a service container.
@@ -257,6 +281,7 @@ mod tests {
             )]),
             network: Some("temps".to_string()),
             command: None,
+            resource_limits: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -265,6 +290,7 @@ mod tests {
         assert_eq!(parsed.service_type, "postgres");
         assert_eq!(parsed.port_mappings.len(), 1);
         assert_eq!(parsed.port_mappings[0].host_port, 30001);
+        assert!(parsed.resource_limits.is_none());
     }
 
     #[test]

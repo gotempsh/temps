@@ -28,7 +28,9 @@ use tracing::{error, info, warn};
 
 use crate::utils::ensure_network_exists;
 
-use super::{ExternalService, HealthProbeResult, ServiceConfig, ServiceType};
+use super::{
+    ExternalService, HealthProbeResult, ServiceConfig, ServiceResourceLimits, ServiceType,
+};
 
 /// Default RustFS Docker image (from Docker Hub)
 pub const DEFAULT_RUSTFS_IMAGE: &str = "rustfs/rustfs:1.0.0-alpha.98";
@@ -341,6 +343,8 @@ pub struct RustfsService {
     name: String,
     config: Arc<RwLock<Option<RustfsConfig>>>,
     client: Arc<RwLock<Option<Client>>>,
+    /// Resource limits captured at init time, applied to recreate paths.
+    resource_limits: Arc<RwLock<ServiceResourceLimits>>,
     docker: Arc<Docker>,
     /// Reserved for encrypting/decrypting credentials when storing to database
     #[allow(dead_code)]
@@ -360,6 +364,7 @@ impl RustfsService {
             name,
             config: Arc::new(RwLock::new(None)),
             client: Arc::new(RwLock::new(None)),
+            resource_limits: Arc::new(RwLock::new(ServiceResourceLimits::default())),
             docker,
             encryption_service,
         }
@@ -449,7 +454,12 @@ impl RustfsService {
         Ok((exit_code == 0, stdout, stderr))
     }
 
-    async fn create_container(&self, docker: &Docker, config: &RustfsConfig) -> Result<()> {
+    async fn create_container(
+        &self,
+        docker: &Docker,
+        config: &RustfsConfig,
+        resource_limits: &ServiceResourceLimits,
+    ) -> Result<()> {
         // Pull the image first
         info!("Pulling RustFS image {}", config.docker_image);
 
@@ -570,7 +580,7 @@ impl RustfsService {
             )])),
         });
 
-        let host_config = bollard::models::HostConfig {
+        let mut host_config = bollard::models::HostConfig {
             port_bindings: Some(HashMap::from([
                 (
                     "9000/tcp".to_string(),
@@ -608,6 +618,7 @@ impl RustfsService {
             pids_limit: Some(512),
             ..Default::default()
         };
+        resource_limits.apply_to_host_config(&mut host_config);
 
         let container_config = bollard::models::ContainerCreateBody {
             image: Some(config.docker_image.to_string()),
@@ -775,6 +786,13 @@ impl ExternalService for RustfsService {
     async fn init(&self, config: ServiceConfig) -> Result<HashMap<String, String>> {
         info!("Initializing RustFS service: {}", config.name);
 
+        // Pull resource limits before consuming the parameters JSON.
+        let resource_limits = ServiceResourceLimits::from_parameters(&config.parameters);
+        if let Err(e) = resource_limits.validate() {
+            return Err(anyhow::anyhow!("Invalid resource limits: {}", e));
+        }
+        *self.resource_limits.write().await = resource_limits.clone();
+
         // Parse input configuration
         let input_config: RustfsInputConfig = serde_json::from_value(config.parameters.clone())
             .context("Failed to parse RustFS configuration")?;
@@ -783,7 +801,8 @@ impl ExternalService for RustfsService {
         let runtime_config = RustfsConfig::from_input_async(input_config, &self.docker).await;
 
         // Create container
-        self.create_container(&self.docker, &runtime_config).await?;
+        self.create_container(&self.docker, &runtime_config, &resource_limits)
+            .await?;
 
         // Create S3 client
         let client = self.create_s3_client(&runtime_config).await?;
@@ -1720,10 +1739,14 @@ impl ExternalService for RustfsService {
             self.docker.clone(),
             self.encryption_service.clone(),
         );
+        // Inherit limits from the source service so the restored copy
+        // runs with the same caps. Unlimited when the source had none.
+        let cloned_limits = ServiceResourceLimits::from_parameters(&ctx.source_config.parameters);
         *new_service.config.write().await = Some(new_config.clone());
+        *new_service.resource_limits.write().await = cloned_limits.clone();
 
         new_service
-            .create_container(&self.docker, &new_config)
+            .create_container(&self.docker, &new_config, &cloned_limits)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to create new RustFS container: {}", e))?;
 

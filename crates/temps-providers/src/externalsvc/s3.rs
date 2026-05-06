@@ -21,7 +21,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::utils::ensure_network_exists;
 
-use super::{ExternalService, HealthProbeResult, ServiceConfig, ServiceType};
+use super::{
+    ExternalService, HealthProbeResult, ServiceConfig, ServiceResourceLimits, ServiceType,
+};
 
 /// Input configuration for creating an S3/MinIO service
 /// This is what users provide when creating the service
@@ -171,6 +173,8 @@ pub struct S3Service {
     name: String,
     config: Arc<RwLock<Option<S3Config>>>,
     client: Arc<RwLock<Option<Client>>>,
+    /// Resource limits captured at init time, applied to recreate paths.
+    resource_limits: Arc<RwLock<ServiceResourceLimits>>,
     docker: Arc<Docker>,
     encryption_service: Arc<EncryptionService>,
 }
@@ -188,6 +192,7 @@ impl S3Service {
             name,
             config: Arc::new(RwLock::new(None)),
             client: Arc::new(RwLock::new(None)),
+            resource_limits: Arc::new(RwLock::new(ServiceResourceLimits::default())),
             docker,
             encryption_service,
         }
@@ -197,7 +202,12 @@ impl S3Service {
         format!("minio-{}", self.name)
     }
 
-    async fn create_container(&self, docker: &Docker, config: &S3Config) -> Result<()> {
+    async fn create_container(
+        &self,
+        docker: &Docker,
+        config: &S3Config,
+        resource_limits: &ServiceResourceLimits,
+    ) -> Result<()> {
         // Pull the image first
         info!("Pulling MinIO image {}", config.docker_image);
 
@@ -305,7 +315,7 @@ impl S3Service {
                 },
             )])),
         });
-        let host_config = bollard::models::HostConfig {
+        let mut host_config = bollard::models::HostConfig {
             port_bindings: Some(HashMap::from([(
                 "9000/tcp".to_string(),
                 Some(vec![bollard::models::PortBinding {
@@ -326,6 +336,7 @@ impl S3Service {
             pids_limit: Some(512),
             ..Default::default()
         };
+        resource_limits.apply_to_host_config(&mut host_config);
 
         let container_config = bollard::models::ContainerCreateBody {
             image: Some(config.docker_image.to_string()),
@@ -613,6 +624,13 @@ impl ExternalService for S3Service {
             config.name, config.service_type, config.version
         );
 
+        // Pull resource limits before consuming the parameters JSON.
+        let resource_limits = ServiceResourceLimits::from_parameters(&config.parameters);
+        if let Err(e) = resource_limits.validate() {
+            return Err(anyhow::anyhow!("Invalid resource limits: {}", e));
+        }
+        *self.resource_limits.write().await = resource_limits.clone();
+
         // Parse input config and transform to runtime config
         let s3_config = self.get_s3_config(config)?;
         info!(
@@ -624,7 +642,8 @@ impl ExternalService for S3Service {
         *self.config.write().await = Some(s3_config.clone());
 
         // Create Docker container
-        self.create_container(&self.docker, &s3_config).await?;
+        self.create_container(&self.docker, &s3_config, &resource_limits)
+            .await?;
 
         // Serialize the full runtime config to save to database
         // This ensures auto-generated values (keys, port) are persisted
@@ -806,7 +825,8 @@ impl ExternalService for S3Service {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("S3 configuration not found"))?
                 .clone();
-            self.create_container(docker, &config).await?;
+            let limits = self.resource_limits.read().await.clone();
+            self.create_container(docker, &config, &limits).await?;
         } else {
             docker
                 .start_container(
@@ -1679,11 +1699,13 @@ impl ExternalService for S3Service {
             self.docker.clone(),
             self.encryption_service.clone(),
         );
+        let cloned_limits = ServiceResourceLimits::from_parameters(&ctx.source_config.parameters);
         *new_service.config.write().await = Some(new_config.clone());
+        *new_service.resource_limits.write().await = cloned_limits.clone();
 
         // Provision the new container (image pull, volume, port binding, health check).
         new_service
-            .create_container(&self.docker, &new_config)
+            .create_container(&self.docker, &new_config, &cloned_limits)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to create new S3/MinIO container: {}", e))?;
 
@@ -2062,7 +2084,9 @@ impl ExternalService for S3Service {
 
         // Create container with new image (keeping the same volume for data persistence)
         info!("Starting S3/MinIO container with new image");
-        self.create_container(&self.docker, &new_s3_config).await?;
+        let limits = self.resource_limits.read().await.clone();
+        self.create_container(&self.docker, &new_s3_config, &limits)
+            .await?;
 
         info!("S3/MinIO upgrade completed successfully");
         Ok(())

@@ -1,6 +1,8 @@
 use crate::utils::ensure_network_exists;
 
-use super::{ExternalService, HealthProbeResult, ServiceConfig, ServiceType};
+use super::{
+    ExternalService, HealthProbeResult, ServiceConfig, ServiceResourceLimits, ServiceType,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use bollard::query_parameters::{InspectContainerOptions, StopContainerOptions};
@@ -158,6 +160,9 @@ fn find_available_port(start_port: u16) -> Option<u16> {
 pub struct RedisService {
     name: String,
     config: Arc<RwLock<Option<RedisConfig>>>,
+    /// Resource limits captured at init time, applied to recreate paths
+    /// (start, upgrade) so the container keeps the same constraints.
+    resource_limits: Arc<RwLock<ServiceResourceLimits>>,
     docker: Arc<Docker>,
 }
 
@@ -166,6 +171,7 @@ impl RedisService {
         Self {
             name,
             config: Arc::new(RwLock::new(None)),
+            resource_limits: Arc::new(RwLock::new(ServiceResourceLimits::default())),
             docker,
         }
     }
@@ -233,6 +239,7 @@ impl RedisService {
         docker: &Docker,
         config: &RedisConfig,
         password: &str,
+        resource_limits: &ServiceResourceLimits,
     ) -> Result<()> {
         let container_name = self.get_container_name();
 
@@ -340,7 +347,7 @@ impl RedisService {
         }
 
         let volume_name = format!("redis_data_{}", self.name);
-        let host_config = bollard::models::HostConfig {
+        let mut host_config = bollard::models::HostConfig {
             port_bindings: Some(HashMap::from([(
                 "6379/tcp".to_string(),
                 Some(vec![bollard::models::PortBinding {
@@ -360,6 +367,7 @@ impl RedisService {
             pids_limit: Some(512),
             ..Default::default()
         };
+        resource_limits.apply_to_host_config(&mut host_config);
         ensure_network_exists(docker)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to ensure network exists: {:?}", e))?;
@@ -1189,6 +1197,14 @@ impl ExternalService for RedisService {
             config.name, config.service_type, config.version
         );
 
+        // Pull resource limits out of the raw parameters JSON before the
+        // typed config consumes it. Defaults to unlimited when no
+        // `resources` block is present (legacy services).
+        let resource_limits = ServiceResourceLimits::from_parameters(&config.parameters);
+        if let Err(e) = resource_limits.validate() {
+            return Err(anyhow::anyhow!("Invalid resource limits: {}", e));
+        }
+
         // Parse input config and transform to runtime config
         let redis_config = self.get_redis_config(config)?;
 
@@ -1198,15 +1214,21 @@ impl ExternalService for RedisService {
             redis_config.password.len()
         );
 
-        // Store runtime config
+        // Store runtime config and limits so `start()` recreates correctly.
         *self.config.write().await = Some(redis_config.clone());
+        *self.resource_limits.write().await = resource_limits.clone();
 
         info!("Redis init - config stored successfully");
 
         // Create Docker container (but don't start it yet)
         // Note: Connection will be established in start() method
-        self.create_container(&self.docker, &redis_config, &redis_config.password)
-            .await?;
+        self.create_container(
+            &self.docker,
+            &redis_config,
+            &redis_config.password,
+            &resource_limits,
+        )
+        .await?;
 
         info!("Redis container created, connection will be established on start");
 
@@ -1500,7 +1522,8 @@ impl ExternalService for RedisService {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Redis configuration not found"))?
                 .clone();
-            self.create_container(&self.docker, &config, &config.password)
+            let limits = self.resource_limits.read().await.clone();
+            self.create_container(&self.docker, &config, &config.password, &limits)
                 .await?;
         } else {
             self.docker
@@ -1871,8 +1894,14 @@ impl ExternalService for RedisService {
 
         // Create container with new image (keeping the same volume for data persistence)
         info!("Starting Redis container with new image");
-        self.create_container(&self.docker, &new_redis_config, &new_redis_config.password)
-            .await?;
+        let limits = self.resource_limits.read().await.clone();
+        self.create_container(
+            &self.docker,
+            &new_redis_config,
+            &new_redis_config.password,
+            &limits,
+        )
+        .await?;
 
         info!("Redis upgrade completed successfully");
         Ok(())

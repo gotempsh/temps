@@ -13,7 +13,8 @@ mod tests {
 
     use crate::externalsvc::postgres_cluster::PostgresClusterService;
     use crate::externalsvc::{
-        ClusterMemberInfo, ClusterMemberSpec, ExternalService, ServiceConfig, ServiceType,
+        ClusterMemberInfo, ClusterMemberSpec, ExternalService, ServiceConfig,
+        ServiceResourceLimits, ServiceType,
     };
 
     // -----------------------------------------------------------------------
@@ -284,7 +285,14 @@ mod tests {
             hostname: Some("10.0.0.1".to_string()),
         };
 
-        let params = service.build_member_params(&monitor_spec, &config, "10.0.0.1", 6100, 6100);
+        let params = service.build_member_params(
+            &monitor_spec,
+            &config,
+            "10.0.0.1",
+            6100,
+            6100,
+            ServiceResourceLimits::default(),
+        );
 
         assert!(
             !params.environment.contains_key("MONITOR_URI"),
@@ -316,7 +324,14 @@ mod tests {
             hostname: Some("10.0.0.2".to_string()),
         };
 
-        let params = service.build_member_params(&primary_spec, &config, "10.0.0.1", 6100, 6101);
+        let params = service.build_member_params(
+            &primary_spec,
+            &config,
+            "10.0.0.1",
+            6100,
+            6101,
+            ServiceResourceLimits::default(),
+        );
 
         assert!(params.environment.contains_key("MONITOR_URI"));
         assert!(params

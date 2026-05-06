@@ -260,6 +260,115 @@ pub struct ServiceConfig {
     pub parameters: serde_json::Value,
 }
 
+/// Optional cgroup resource limits applied to a service container.
+///
+/// All fields are `Option<i64>`: `None` means "no limit" (the kernel default),
+/// matching Docker's behavior when the corresponding `HostConfig` field is
+/// left at zero. Operators opt in to limits explicitly through the
+/// `PATCH /external-services/{id}/resources` endpoint or by writing the
+/// `resources` block into `ServiceConfig::parameters` at create time.
+///
+/// These map directly onto bollard fields:
+/// - `memory_mb`     → `HostConfig.memory`        (bytes)
+/// - `memory_swap_mb`→ `HostConfig.memory_swap`   (bytes; ≥ memory)
+/// - `nano_cpus`     → `HostConfig.nano_cpus`     (1e9 = 1 full CPU)
+/// - `cpu_shares`    → `HostConfig.cpu_shares`    (relative weight, default 1024)
+///
+/// IMPORTANT: enabling hard memory limits causes the kernel OOM killer to
+/// terminate the container when the working set exceeds the limit. The
+/// container will restart (RestartPolicy::ALWAYS) but in-flight queries
+/// fail. Surface this clearly in any UI that lets users set limits.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct ServiceResourceLimits {
+    /// Hard memory limit in MiB. None = unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_mb: Option<i64>,
+    /// Memory + swap limit in MiB. None = unlimited.
+    /// MUST be >= memory_mb when both are set; Docker rejects the request otherwise.
+    /// Set equal to `memory_mb` to disable swap entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_swap_mb: Option<i64>,
+    /// CPU quota in nano-cpus. 1_000_000_000 = 1 full CPU core. None = unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nano_cpus: Option<i64>,
+    /// Relative CPU weight (default 1024). Only used when `nano_cpus` is None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_shares: Option<i64>,
+}
+
+impl ServiceResourceLimits {
+    /// True when no limits are set — the container runs unconstrained.
+    pub fn is_unlimited(&self) -> bool {
+        self.memory_mb.is_none()
+            && self.memory_swap_mb.is_none()
+            && self.nano_cpus.is_none()
+            && self.cpu_shares.is_none()
+    }
+
+    /// Validate that memory_swap >= memory when both are set, and that no
+    /// negative values slipped through.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(mem) = self.memory_mb {
+            if mem <= 0 {
+                return Err(format!("memory_mb must be > 0, got {}", mem));
+            }
+        }
+        if let Some(swap) = self.memory_swap_mb {
+            if swap <= 0 {
+                return Err(format!("memory_swap_mb must be > 0, got {}", swap));
+            }
+            if let Some(mem) = self.memory_mb {
+                if swap < mem {
+                    return Err(format!(
+                        "memory_swap_mb ({}) must be >= memory_mb ({})",
+                        swap, mem
+                    ));
+                }
+            }
+        }
+        if let Some(nc) = self.nano_cpus {
+            if nc <= 0 {
+                return Err(format!("nano_cpus must be > 0, got {}", nc));
+            }
+        }
+        if let Some(cs) = self.cpu_shares {
+            if cs <= 0 {
+                return Err(format!("cpu_shares must be > 0, got {}", cs));
+            }
+        }
+        Ok(())
+    }
+
+    /// Extract a `ServiceResourceLimits` block from a service-config parameters JSON.
+    ///
+    /// Looks for a `resources` object at the top level. Missing or malformed
+    /// blocks resolve to `ServiceResourceLimits::default()` (unlimited) so existing
+    /// services continue to run unconstrained until an operator opts in.
+    pub fn from_parameters(parameters: &serde_json::Value) -> Self {
+        parameters
+            .get("resources")
+            .and_then(|v| serde_json::from_value::<ServiceResourceLimits>(v.clone()).ok())
+            .unwrap_or_default()
+    }
+
+    /// Apply these limits to a bollard `HostConfig`. Fields with `None`
+    /// values are left untouched, preserving Docker defaults.
+    pub fn apply_to_host_config(&self, host_config: &mut bollard::models::HostConfig) {
+        if let Some(mb) = self.memory_mb {
+            host_config.memory = Some(mb.saturating_mul(1024 * 1024));
+        }
+        if let Some(mb) = self.memory_swap_mb {
+            host_config.memory_swap = Some(mb.saturating_mul(1024 * 1024));
+        }
+        if let Some(nc) = self.nano_cpus {
+            host_config.nano_cpus = Some(nc);
+        }
+        if let Some(cs) = self.cpu_shares {
+            host_config.cpu_shares = Some(cs);
+        }
+    }
+}
+
 /// Capabilities a service exposes for the generic restore framework.
 ///
 /// Each engine overrides `ExternalService::restore_capabilities` to declare
@@ -917,5 +1026,104 @@ pub trait ExternalService: Send + Sync {
         _additional_config: serde_json::Value,
     ) -> Result<ServiceConfig> {
         Err(anyhow::anyhow!("Import not implemented for this service"))
+    }
+}
+
+#[cfg(test)]
+mod resource_limits_tests {
+    use super::*;
+
+    #[test]
+    fn default_is_unlimited() {
+        let limits = ServiceResourceLimits::default();
+        assert!(limits.is_unlimited());
+    }
+
+    #[test]
+    fn validate_rejects_zero_and_negative_values() {
+        // memory must be > 0
+        assert!(ServiceResourceLimits {
+            memory_mb: Some(0),
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+        assert!(ServiceResourceLimits {
+            memory_mb: Some(-1),
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+
+        // swap < memory is rejected (Docker would refuse the request anyway)
+        assert!(ServiceResourceLimits {
+            memory_mb: Some(512),
+            memory_swap_mb: Some(256),
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+
+        // swap == memory is fine — that disables swap
+        assert!(ServiceResourceLimits {
+            memory_mb: Some(512),
+            memory_swap_mb: Some(512),
+            ..Default::default()
+        }
+        .validate()
+        .is_ok());
+    }
+
+    #[test]
+    fn from_parameters_reads_resources_block() {
+        let params = serde_json::json!({
+            "port": "5432",
+            "resources": {
+                "memory_mb": 1024,
+                "nano_cpus": 1_000_000_000_i64
+            }
+        });
+        let limits = ServiceResourceLimits::from_parameters(&params);
+        assert_eq!(limits.memory_mb, Some(1024));
+        assert_eq!(limits.nano_cpus, Some(1_000_000_000));
+        assert_eq!(limits.cpu_shares, None);
+        assert_eq!(limits.memory_swap_mb, None);
+    }
+
+    #[test]
+    fn from_parameters_missing_block_is_unlimited() {
+        let params = serde_json::json!({ "port": "5432" });
+        let limits = ServiceResourceLimits::from_parameters(&params);
+        assert!(limits.is_unlimited());
+    }
+
+    #[test]
+    fn apply_to_host_config_only_sets_some_fields() {
+        let limits = ServiceResourceLimits {
+            memory_mb: Some(512),
+            nano_cpus: Some(500_000_000),
+            ..Default::default()
+        };
+        let mut hc = bollard::models::HostConfig::default();
+        limits.apply_to_host_config(&mut hc);
+        // 512 MiB = 536870912 bytes
+        assert_eq!(hc.memory, Some(536_870_912));
+        assert_eq!(hc.nano_cpus, Some(500_000_000));
+        // Untouched fields stay None — Docker default = unlimited.
+        assert_eq!(hc.memory_swap, None);
+        assert_eq!(hc.cpu_shares, None);
+    }
+
+    #[test]
+    fn apply_to_host_config_unlimited_leaves_host_config_untouched() {
+        let limits = ServiceResourceLimits::default();
+        let mut hc = bollard::models::HostConfig {
+            cpu_shares: Some(1024), // pretend something else set this
+            ..Default::default()
+        };
+        limits.apply_to_host_config(&mut hc);
+        // None values must not overwrite — preserves whatever the engine set.
+        assert_eq!(hc.cpu_shares, Some(1024));
+        assert_eq!(hc.memory, None);
     }
 }

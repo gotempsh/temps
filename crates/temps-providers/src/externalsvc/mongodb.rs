@@ -25,7 +25,10 @@ use urlencoding;
 
 use crate::utils::ensure_network_exists;
 
-use super::{ExternalService, HealthProbeResult, RuntimeEnvVar, ServiceConfig, ServiceType};
+use super::{
+    ExternalService, HealthProbeResult, RuntimeEnvVar, ServiceConfig, ServiceResourceLimits,
+    ServiceType,
+};
 
 /// Input configuration for creating a MongoDB service
 /// This is what users provide when creating the service
@@ -233,6 +236,8 @@ fn find_available_port(start_port: u16) -> Option<u16> {
 pub struct MongodbService {
     name: String,
     config: Arc<RwLock<Option<MongodbRuntimeConfig>>>,
+    /// Resource limits captured at init time, applied to recreate paths.
+    resource_limits: Arc<RwLock<ServiceResourceLimits>>,
     docker: Arc<Docker>,
 }
 
@@ -241,6 +246,7 @@ impl MongodbService {
         Self {
             name,
             config: Arc::new(RwLock::new(None)),
+            resource_limits: Arc::new(RwLock::new(ServiceResourceLimits::default())),
             docker,
         }
     }
@@ -316,7 +322,12 @@ impl MongodbService {
         format!("temps-mongodb-{}", self.name)
     }
 
-    async fn create_container(&self, docker: &Docker, config: &MongodbRuntimeConfig) -> Result<()> {
+    async fn create_container(
+        &self,
+        docker: &Docker,
+        config: &MongodbRuntimeConfig,
+        resource_limits: &ServiceResourceLimits,
+    ) -> Result<()> {
         let container_name = self.get_container_name();
         let volume_name = format!("temps-mongodb-{}-data", self.name);
 
@@ -370,7 +381,7 @@ impl MongodbService {
             result.map_err(|e| anyhow::anyhow!("Failed to pull MongoDB image: {}", e))?;
         }
 
-        let host_config = bollard::models::HostConfig {
+        let mut host_config = bollard::models::HostConfig {
             port_bindings: Some(HashMap::from([(
                 "27017/tcp".to_string(),
                 Some(vec![bollard::models::PortBinding {
@@ -390,6 +401,7 @@ impl MongodbService {
             pids_limit: Some(512),
             ..Default::default()
         };
+        resource_limits.apply_to_host_config(&mut host_config);
 
         ensure_network_exists(docker)
             .await
@@ -1465,6 +1477,37 @@ impl MongodbService {
 /// Internal port used by MongoDB inside the container
 const MONGODB_INTERNAL_PORT: &str = "27017";
 
+/// Build the `MONGODB_URL` exposed to user containers.
+///
+/// `authSource=admin` is always set because Temps provisions the connection
+/// user as a root user in the `admin` database and never creates per-database
+/// users. When the deployment is a single-node replica set, `directConnection=true`
+/// is added so the driver skips topology discovery — the rs config advertises
+/// the mongod's internal hostname, which is not always routable from app
+/// containers, so SDAM would otherwise fail even though the seed host works.
+fn build_mongodb_url(
+    username: &str,
+    password: &str,
+    host: &str,
+    port: &str,
+    database: &str,
+    replica_set: Option<&str>,
+) -> String {
+    let mut params = vec!["authSource=admin".to_string()];
+    if replica_set.is_some() {
+        params.push("directConnection=true".to_string());
+    }
+    format!(
+        "mongodb://{}:{}@{}:{}/{}?{}",
+        urlencoding::encode(username),
+        urlencoding::encode(password),
+        host,
+        port,
+        database,
+        params.join("&"),
+    )
+}
+
 #[async_trait]
 impl ExternalService for MongodbService {
     fn get_effective_address(&self, service_config: ServiceConfig) -> Result<(String, String)> {
@@ -1488,6 +1531,13 @@ impl ExternalService for MongodbService {
     }
 
     async fn init(&self, service_config: ServiceConfig) -> Result<HashMap<String, String>> {
+        // Pull resource limits out of parameters JSON before consuming the config.
+        let resource_limits = ServiceResourceLimits::from_parameters(&service_config.parameters);
+        if let Err(e) = resource_limits.validate() {
+            return Err(anyhow::anyhow!("Invalid resource limits: {}", e));
+        }
+        *self.resource_limits.write().await = resource_limits;
+
         // Parse input config and transform to runtime config
         let mongodb_config = self.get_mongodb_config(service_config.clone())?;
         *self.config.write().await = Some(mongodb_config.clone());
@@ -1685,8 +1735,9 @@ impl ExternalService for MongodbService {
             .ok_or_else(|| anyhow::anyhow!("MongoDB configuration not found"))?
             .clone();
 
+        let limits = self.resource_limits.read().await.clone();
         if containers.is_empty() {
-            self.create_container(docker, &config).await?;
+            self.create_container(docker, &config, &limits).await?;
         } else {
             // If the persisted config now requires `--replSet` but the
             // existing container was created in standalone mode, restarting it
@@ -1730,7 +1781,7 @@ impl ExternalService for MongodbService {
                             e
                         )
                     })?;
-                self.create_container(docker, &config).await?;
+                self.create_container(docker, &config, &limits).await?;
             } else {
                 docker
                     .start_container(
@@ -1815,6 +1866,7 @@ impl ExternalService for MongodbService {
         // Always use container name and internal port for container-to-container communication
         let effective_host = self.get_container_name();
         let effective_port = MONGODB_INTERNAL_PORT.to_string();
+        let replica_set = parameters.get("replica_set").map(String::as_str);
 
         let mut env_vars = HashMap::new();
         env_vars.insert("MONGODB_HOST".to_string(), effective_host.clone());
@@ -1824,13 +1876,13 @@ impl ExternalService for MongodbService {
         env_vars.insert("MONGODB_PASSWORD".to_string(), password.clone());
         env_vars.insert(
             "MONGODB_URL".to_string(),
-            format!(
-                "mongodb://{}:{}@{}:{}/{}",
-                urlencoding::encode(username),
-                urlencoding::encode(password),
-                effective_host,
-                effective_port,
-                database
+            build_mongodb_url(
+                username,
+                password,
+                &effective_host,
+                &effective_port,
+                database,
+                replica_set,
             ),
         );
 
@@ -1854,6 +1906,7 @@ impl ExternalService for MongodbService {
         // Always use container name and internal port for container-to-container communication
         let effective_host = self.get_container_name();
         let effective_port = MONGODB_INTERNAL_PORT.to_string();
+        let replica_set = parameters.get("replica_set").map(String::as_str);
 
         let mut env_vars = HashMap::new();
         env_vars.insert("MONGODB_HOST".to_string(), effective_host.clone());
@@ -1863,13 +1916,13 @@ impl ExternalService for MongodbService {
         env_vars.insert("MONGODB_PASSWORD".to_string(), password.clone());
         env_vars.insert(
             "MONGODB_URL".to_string(),
-            format!(
-                "mongodb://{}:{}@{}:{}/{}",
-                urlencoding::encode(username),
-                urlencoding::encode(password),
-                effective_host,
-                effective_port,
-                database
+            build_mongodb_url(
+                username,
+                password,
+                &effective_host,
+                &effective_port,
+                database,
+                replica_set,
             ),
         );
 
@@ -1984,13 +2037,13 @@ impl ExternalService for MongodbService {
         env_vars.insert("MONGODB_PASSWORD".to_string(), config.password.clone());
         env_vars.insert(
             "MONGODB_URL".to_string(),
-            format!(
-                "mongodb://{}:{}@{}:{}/{}",
-                urlencoding::encode(&config.username),
-                urlencoding::encode(&config.password),
-                effective_host,
-                effective_port,
-                db_name
+            build_mongodb_url(
+                &config.username,
+                &config.password,
+                &effective_host,
+                &effective_port,
+                &db_name,
+                config.replica_set.as_deref(),
             ),
         );
 
@@ -2230,7 +2283,8 @@ impl ExternalService for MongodbService {
 
         // Create container with new image (keeping the same volume for data persistence)
         info!("Starting MongoDB container with new image");
-        self.create_container(&self.docker, &new_mongodb_config)
+        let limits = self.resource_limits.read().await.clone();
+        self.create_container(&self.docker, &new_mongodb_config, &limits)
             .await?;
 
         info!("MongoDB upgrade completed successfully");
@@ -2351,6 +2405,24 @@ mod tests {
         assert_eq!(
             default_docker_image(),
             "gotempsh/mongodb-walg:8.0".to_string()
+        );
+    }
+
+    #[test]
+    fn test_build_mongodb_url_standalone() {
+        let url = build_mongodb_url("root", "p@ss/word", "mongo", "27017", "mydb", None);
+        assert_eq!(
+            url,
+            "mongodb://root:p%40ss%2Fword@mongo:27017/mydb?authSource=admin"
+        );
+    }
+
+    #[test]
+    fn test_build_mongodb_url_replica_set() {
+        let url = build_mongodb_url("root", "secret", "mongo", "27017", "mydb", Some("rs0"));
+        assert_eq!(
+            url,
+            "mongodb://root:secret@mongo:27017/mydb?authSource=admin&directConnection=true"
         );
     }
 
@@ -2892,7 +2964,7 @@ mod tests {
 
         // Create and start MongoDB container
         service
-            .create_container(&docker, &mongodb_config)
+            .create_container(&docker, &mongodb_config, &ServiceResourceLimits::default())
             .await
             .expect("Failed to create MongoDB container");
         println!("✓ MongoDB container started and healthy");

@@ -619,6 +619,10 @@ pub struct ClusterMemberCreateParams {
     pub command: Option<Vec<String>>,
     pub container_port: u16,
     pub volume_path: String,
+    /// Per-member cgroup limits. Defaults to unlimited; populated by the
+    /// manager from the cluster's `ServiceConfig::parameters`.`resources`
+    /// block so every member of a HA cluster ends up with the same caps.
+    pub resource_limits: super::ServiceResourceLimits,
 }
 
 impl PostgresClusterService {
@@ -627,6 +631,7 @@ impl PostgresClusterService {
     /// * `monitor_hostname` — address the monitor advertises (host IP or container name)
     /// * `monitor_port` — port the monitor listens on (the host-mapped port)
     /// * `member_port` — port this member will listen on inside its container
+    /// * `resource_limits` — cgroup limits applied to every member (monitor + data nodes)
     ///
     /// The manager uses these to create containers locally or via the agent.
     pub fn build_member_params(
@@ -636,6 +641,7 @@ impl PostgresClusterService {
         monitor_hostname: &str,
         monitor_port: u16,
         member_port: u16,
+        resource_limits: super::ServiceResourceLimits,
     ) -> ClusterMemberCreateParams {
         use std::str::FromStr;
         // Unknown roles fall through the wildcard arm (treated as a data
@@ -652,6 +658,7 @@ impl PostgresClusterService {
                 command: Some(self.monitor_command()),
                 container_port: member_port,
                 volume_path: "/var/lib/postgresql".to_string(),
+                resource_limits,
             },
             // primary | replica | unknown → data-node setup; pg_auto_failover
             // elects which is which at runtime, so we only need one branch.
@@ -683,6 +690,7 @@ impl PostgresClusterService {
                     command: Some(self.node_command()),
                     container_port: member_port,
                     volume_path: "/var/lib/postgresql".to_string(),
+                    resource_limits,
                 }
             }
         }
@@ -864,7 +872,14 @@ mod tests {
             hostname: Some("10.100.0.1".to_string()),
         };
 
-        let params = service.build_member_params(&spec, &config, "10.100.0.1", 6100, 6100);
+        let params = service.build_member_params(
+            &spec,
+            &config,
+            "10.100.0.1",
+            6100,
+            6100,
+            crate::externalsvc::ServiceResourceLimits::default(),
+        );
         assert_eq!(params.container_name, "postgres-my-db-monitor");
         assert_eq!(params.container_port, 6100);
         assert_eq!(params.image, DEFAULT_CLUSTER_IMAGE);
@@ -898,7 +913,14 @@ mod tests {
             hostname: Some("10.100.0.2".to_string()),
         };
 
-        let params = service.build_member_params(&spec, &config, "10.100.0.1", 6100, 6101);
+        let params = service.build_member_params(
+            &spec,
+            &config,
+            "10.100.0.1",
+            6100,
+            6101,
+            crate::externalsvc::ServiceResourceLimits::default(),
+        );
         assert_eq!(params.container_name, "postgres-my-db-1");
         assert_eq!(params.container_port, 6101);
         assert_eq!(
