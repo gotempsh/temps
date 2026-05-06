@@ -46,8 +46,9 @@ use crate::services::traits::AnalyticsEvents;
 use crate::types::{
     AggregatedBucketItem, AggregatedBucketsResponse, AggregationLevel,
     AnalyticsSessionEventsResponse, DashboardProjectsAnalyticsResponse, EventCount, EventTimeline,
-    EventTypeBreakdown, PropertyBreakdownResponse, PropertyTimelineResponse, SessionEvent,
-    UniqueCountsResponse,
+    EventTypeBreakdown, ProjectDashboardAnalytics, PropertyBreakdownItem,
+    PropertyBreakdownResponse, PropertyColumn, PropertyTimelineItem, PropertyTimelineResponse,
+    SessionEvent, UniqueCountsResponse,
 };
 
 /// ClickHouse-backed analytics read implementation.
@@ -103,6 +104,53 @@ fn to_unix_milli(t: UtcDateTime) -> i64 {
 /// behaviour is the same: 500 with a useful detail.
 fn ch_err(query: &str, err: clickhouse::error::Error) -> EventsError {
     EventsError::Validation(format!("clickhouse {query} failed: {err}"))
+}
+
+/// Map a [`PropertyColumn`] to a ClickHouse expression that yields the
+/// grouping value. Geo columns (country/region/city) are denormalized onto
+/// the events table by the fan-out worker — see
+/// `ch_fanout::row_to_ch` — so we never need a JOIN at query time.
+///
+/// Returns the SQL expression alongside the default sentinel string used
+/// when the column is empty. Matches the Postgres impl's `'Direct'` for
+/// referrer_hostname and `'Unknown'` for everything else, so dashboard
+/// labels stay identical across backends.
+fn property_column_expr(col: PropertyColumn) -> (&'static str, &'static str) {
+    use PropertyColumn::*;
+    match col {
+        Channel => ("channel", "Unknown"),
+        DeviceType => ("device_type", "Unknown"),
+        Browser => ("browser", "Unknown"),
+        BrowserVersion => ("browser_version", "Unknown"),
+        OperatingSystem => ("operating_system", "Unknown"),
+        OperatingSystemVersion => ("operating_system_version", "Unknown"),
+        UtmSource => ("utm_source", "Unknown"),
+        UtmMedium => ("utm_medium", "Unknown"),
+        UtmCampaign => ("utm_campaign", "Unknown"),
+        UtmTerm => ("utm_term", "Unknown"),
+        UtmContent => ("utm_content", "Unknown"),
+        ReferrerHostname => ("referrer_hostname", "Direct"),
+        Language => ("language", "Unknown"),
+        EventType => ("event_type", "Unknown"),
+        EventName => ("event_name", "Unknown"),
+        PagePath => ("page_path", "Unknown"),
+        Pathname => ("pathname", "Unknown"),
+        Country => ("country", "Unknown"),
+        Region => ("region", "Unknown"),
+        City => ("city", "Unknown"),
+    }
+}
+
+/// Map an `aggregation_level` string ("events" / "sessions" / "visitors")
+/// to the matching CH count expression. Mirrors `count_expr` for
+/// [`AggregationLevel`] but takes a string because property breakdowns
+/// receive the level as a free-form `&str` from the wire format.
+fn count_expr_str(level: &str) -> &'static str {
+    match level {
+        "sessions" => "uniq(session_id)",
+        "visitors" => "uniq(visitor_id)",
+        _ => "count()",
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -454,26 +502,229 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
 
     async fn query_property_breakdown(
         &self,
-        _q: PropertyBreakdownSpec,
+        q: PropertyBreakdownSpec,
     ) -> Result<PropertyBreakdownResponse, EventsError> {
-        Err(EventsError::Validation(
-            "query_property_breakdown is not yet implemented for ClickHouse. \
-             Set TEMPS_CLICKHOUSE_* to None to fall back to TimescaleDB for this query, \
-             or contribute the implementation in temps-analytics-events."
-                .to_string(),
-        ))
+        let (col, sentinel) = property_column_expr(q.group_by_column.clone());
+        let count_sql = count_expr_str(&q.aggregation_level);
+        let group_by_str = q.group_by_column.as_str().to_string();
+
+        let env_filter_flag: i32 = q.scope.environment_id.map(|_| 1).unwrap_or(0);
+        let env_filter_value: i32 = q.scope.environment_id.unwrap_or(0);
+        let dep_filter_flag: i32 = q.scope.deployment_id.map(|_| 1).unwrap_or(0);
+        let dep_filter_value: i32 = q.scope.deployment_id.unwrap_or(0);
+        let event_filter_flag: i32 = q.event_name.as_ref().map(|_| 1).unwrap_or(0);
+        let event_filter_value = q.event_name.clone().unwrap_or_default();
+        let start_ms = to_unix_milli(q.range.start);
+        let end_ms = to_unix_milli(q.range.end);
+
+        // Drill-down filters mirror the Postgres impl. Every filter is
+        // optional; the (flag = 0 OR column = value) idiom keeps the SQL
+        // shape constant regardless of which filters are populated.
+        let f = q.filters.clone().unwrap_or_default();
+        let f_country_flag = i32::from(f.country.is_some());
+        let f_country_value = f.country.clone().unwrap_or_default();
+        let f_region_flag = i32::from(f.region.is_some());
+        let f_region_value = f.region.clone().unwrap_or_default();
+        let f_browser_flag = i32::from(f.browser.is_some());
+        let f_browser_value = f.browser.clone().unwrap_or_default();
+        let f_os_flag = i32::from(f.operating_system.is_some());
+        let f_os_value = f.operating_system.clone().unwrap_or_default();
+        let f_channel_flag = i32::from(f.channel.is_some());
+        let f_channel_value = f.channel.clone().unwrap_or_default();
+        // 'Direct' is the sentinel for "no referrer" — match it as empty
+        // string since CH stores empty referrer_hostname as ''.
+        let (f_referrer_flag, f_referrer_value) = match f.referrer.as_deref() {
+            None => (0, String::new()),
+            Some("Direct") => (2, String::new()),
+            Some(other) => (1, other.to_string()),
+        };
+
+        // NOTE on parity gap (documented divergence from PG):
+        // - The PG impl applies a self-referral filter against
+        //   `project_custom_domains` when grouping by referrer_hostname.
+        //   We don't have that table replicated to CH. Apps that drill
+        //   into referrer breakdowns will see their own domain in the
+        //   list. Acceptable v1; flagged in the runbook.
+        let sql = format!(
+            r#"
+            WITH value_counts AS (
+                SELECT
+                    if({col} = '', '{sentinel}', {col}) AS value,
+                    {count_sql} AS count
+                FROM events FINAL
+                WHERE project_id = ?
+                  AND timestamp >= fromUnixTimestamp64Milli(?)
+                  AND timestamp <= fromUnixTimestamp64Milli(?)
+                  AND (? = 0 OR environment_id = ?)
+                  AND (? = 0 OR deployment_id = ?)
+                  AND (? = 0 OR event_name = ?)
+                  AND (? = 0 OR country = ?)
+                  AND (? = 0 OR region = ?)
+                  AND (? = 0 OR browser = ?)
+                  AND (? = 0 OR operating_system = ?)
+                  AND (? = 0 OR channel = ?)
+                  AND (? = 0
+                       OR (? = 1 AND referrer_hostname = ?)
+                       OR (? = 2 AND referrer_hostname = ''))
+                GROUP BY value
+            ),
+            total AS (SELECT sum(count) AS t FROM value_counts)
+            SELECT
+                value,
+                count,
+                if((SELECT t FROM total) > 0,
+                   count / (SELECT t FROM total) * 100,
+                   0) AS percentage,
+                (SELECT t FROM total) AS total_count
+            FROM value_counts
+            ORDER BY count DESC
+            LIMIT ?
+            "#
+        );
+
+        #[derive(Row, Deserialize)]
+        struct BreakdownRow {
+            value: String,
+            count: u64,
+            percentage: f64,
+            total_count: u64,
+        }
+
+        let rows = self
+            .client
+            .query(&sql)
+            .bind(q.scope.project_id)
+            .bind(start_ms)
+            .bind(end_ms)
+            .bind(env_filter_flag)
+            .bind(env_filter_value)
+            .bind(dep_filter_flag)
+            .bind(dep_filter_value)
+            .bind(event_filter_flag)
+            .bind(&event_filter_value)
+            .bind(f_country_flag)
+            .bind(&f_country_value)
+            .bind(f_region_flag)
+            .bind(&f_region_value)
+            .bind(f_browser_flag)
+            .bind(&f_browser_value)
+            .bind(f_os_flag)
+            .bind(&f_os_value)
+            .bind(f_channel_flag)
+            .bind(&f_channel_value)
+            // Referrer filter has three states (none / equality / direct-only)
+            // so it gets three params; matched by the (? = 0 OR …) chain.
+            .bind(f_referrer_flag)
+            .bind(f_referrer_flag)
+            .bind(&f_referrer_value)
+            .bind(f_referrer_flag)
+            .bind(q.limit as u32)
+            .fetch_all::<BreakdownRow>()
+            .await
+            .map_err(|e| ch_err("query_property_breakdown", e))?;
+
+        let total = rows.first().map(|r| r.total_count as i64).unwrap_or(0);
+        Ok(PropertyBreakdownResponse {
+            property: group_by_str,
+            items: rows
+                .into_iter()
+                .map(|r| PropertyBreakdownItem {
+                    value: r.value,
+                    count: r.count as i64,
+                    percentage: r.percentage,
+                })
+                .collect(),
+            total,
+        })
     }
 
     async fn query_property_timeline(
         &self,
-        _q: PropertyTimelineSpec,
+        q: PropertyTimelineSpec,
     ) -> Result<PropertyTimelineResponse, EventsError> {
-        Err(EventsError::Validation(
-            "query_property_timeline is not yet implemented for ClickHouse. \
-             Set TEMPS_CLICKHOUSE_* to None to fall back to TimescaleDB for this query, \
-             or contribute the implementation in temps-analytics-events."
-                .to_string(),
-        ))
+        let (col, sentinel) = property_column_expr(q.group_by_column.clone());
+        let count_sql = count_expr_str(&q.aggregation_level);
+        let group_by_str = q.group_by_column.as_str().to_string();
+
+        // Bucket auto-detection mirrors the Postgres impl so dashboards
+        // pick the same granularity at the same range widths.
+        let duration_days = (q.range.end - q.range.start).num_days();
+        let bucket_label = q.bucket_size.clone().unwrap_or_else(|| {
+            if duration_days <= 1 {
+                "1 hour".to_string()
+            } else if duration_days <= 7 {
+                "1 day".to_string()
+            } else if duration_days <= 60 {
+                "1 week".to_string()
+            } else {
+                "1 month".to_string()
+            }
+        });
+        let interval = ch_interval(Some(bucket_label.as_str()));
+
+        let env_filter_flag: i32 = q.scope.environment_id.map(|_| 1).unwrap_or(0);
+        let env_filter_value: i32 = q.scope.environment_id.unwrap_or(0);
+        let dep_filter_flag: i32 = q.scope.deployment_id.map(|_| 1).unwrap_or(0);
+        let dep_filter_value: i32 = q.scope.deployment_id.unwrap_or(0);
+        let event_filter_flag: i32 = q.event_name.as_ref().map(|_| 1).unwrap_or(0);
+        let event_filter_value = q.event_name.clone().unwrap_or_default();
+        let start_ms = to_unix_milli(q.range.start);
+        let end_ms = to_unix_milli(q.range.end);
+
+        let sql = format!(
+            r#"
+            SELECT
+                toUnixTimestamp64Milli(toStartOfInterval(timestamp, {interval})) AS bucket_ms,
+                if({col} = '', '{sentinel}', {col}) AS value,
+                {count_sql} AS count
+            FROM events FINAL
+            WHERE project_id = ?
+              AND timestamp >= fromUnixTimestamp64Milli(?)
+              AND timestamp <= fromUnixTimestamp64Milli(?)
+              AND (? = 0 OR environment_id = ?)
+              AND (? = 0 OR deployment_id = ?)
+              AND (? = 0 OR event_name = ?)
+            GROUP BY bucket_ms, value
+            ORDER BY bucket_ms ASC, count DESC
+            "#
+        );
+
+        #[derive(Row, Deserialize)]
+        struct TimelineRow {
+            bucket_ms: i64,
+            value: String,
+            count: u64,
+        }
+
+        let rows = self
+            .client
+            .query(&sql)
+            .bind(q.scope.project_id)
+            .bind(start_ms)
+            .bind(end_ms)
+            .bind(env_filter_flag)
+            .bind(env_filter_value)
+            .bind(dep_filter_flag)
+            .bind(dep_filter_value)
+            .bind(event_filter_flag)
+            .bind(&event_filter_value)
+            .fetch_all::<TimelineRow>()
+            .await
+            .map_err(|e| ch_err("query_property_timeline", e))?;
+
+        Ok(PropertyTimelineResponse {
+            property: group_by_str,
+            bucket_size: bucket_label,
+            items: rows
+                .into_iter()
+                .map(|r| PropertyTimelineItem {
+                    // Match Timescale impl: ISO-8601 with timezone (`to_rfc3339`).
+                    timestamp: from_unix_milli(r.bucket_ms).to_rfc3339(),
+                    value: r.value,
+                    count: r.count as i64,
+                })
+                .collect(),
+        })
     }
 
     async fn query_active_visitors(&self, q: ActiveVisitorsSpec) -> Result<i64, EventsError> {
@@ -619,24 +870,170 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
         &self,
         q: DashboardProjectsSpec,
     ) -> Result<DashboardProjectsAnalyticsResponse, EventsError> {
-        // Returns an empty response for empty input — matches Timescale impl.
+        use std::collections::HashMap;
+
+        // Empty input short-circuits to empty output without hitting CH.
         if q.project_ids.is_empty() {
             return Ok(DashboardProjectsAnalyticsResponse {
-                projects: std::collections::HashMap::new(),
+                projects: HashMap::new(),
             });
         }
 
-        // Beyond that, this query joins to several Postgres-side tables and
-        // does period-over-period math against TimescaleDB continuous
-        // aggregates. Implementing it fully on CH is meaningful work and
-        // its output shape is dashboard-specific. Surface a clear error
-        // until that lands.
-        Err(EventsError::Validation(
-            "query_dashboard_projects is not yet implemented for ClickHouse. \
-             The dashboard view falls back to TimescaleDB; configure your hybrid \
-             read router to send this query to PG, or implement it here."
-                .to_string(),
-        ))
+        // Three CH queries in parallel would cut latency, but tokio::join!
+        // here would also fan out three separate connections. Sequential is
+        // fine for the dashboard view — each is sub-second on a healthy CH.
+        // If this becomes a bottleneck, batch them into a single query
+        // with FILTER clauses in CH ≥ 23.
+
+        let start_ms = to_unix_milli(q.range.start);
+        let end_ms = to_unix_milli(q.range.end);
+        // Previous period: same duration, shifted back. Mirrors Timescale impl.
+        let duration = q.range.end - q.range.start;
+        let prev_start_ms = to_unix_milli(q.range.start - duration);
+        let prev_end_ms = start_ms;
+
+        // ---- Query 1: current-period unique visitors per project ----
+        // Sub-select FROM (SELECT … FROM events FINAL) gives FINAL once
+        // and lets the outer aggregate group cleanly.
+        #[derive(Row, Deserialize)]
+        struct ProjectCountRow {
+            project_id: i32,
+            visitors: u64,
+        }
+
+        let current_sql = r#"
+            SELECT
+                project_id,
+                uniq(visitor_id) AS visitors
+            FROM events FINAL
+            WHERE has(?, project_id)
+              AND timestamp >= fromUnixTimestamp64Milli(?)
+              AND timestamp <= fromUnixTimestamp64Milli(?)
+            GROUP BY project_id
+        "#;
+
+        let project_ids = q.project_ids.clone();
+        let current: Vec<ProjectCountRow> = self
+            .client
+            .query(current_sql)
+            .bind(project_ids.clone())
+            .bind(start_ms)
+            .bind(end_ms)
+            .fetch_all::<ProjectCountRow>()
+            .await
+            .map_err(|e| ch_err("query_dashboard_projects[current]", e))?;
+        let current_map: HashMap<i32, i64> = current
+            .into_iter()
+            .map(|r| (r.project_id, r.visitors as i64))
+            .collect();
+
+        // ---- Query 2: previous-period unique visitors per project ----
+        let previous: Vec<ProjectCountRow> = self
+            .client
+            .query(current_sql)
+            .bind(project_ids.clone())
+            .bind(prev_start_ms)
+            .bind(prev_end_ms)
+            .fetch_all::<ProjectCountRow>()
+            .await
+            .map_err(|e| ch_err("query_dashboard_projects[previous]", e))?;
+        let previous_map: HashMap<i32, i64> = previous
+            .into_iter()
+            .map(|r| (r.project_id, r.visitors as i64))
+            .collect();
+
+        // ---- Query 3: hourly sparkline per project (page_view only) ----
+        // ClickHouse `WITH FILL` only fills along ORDER BY, so we have to
+        // pivot per project_id at the application layer. Each project gets
+        // a sparse row set; we densify in Rust below.
+        #[derive(Row, Deserialize)]
+        struct HourlyRow {
+            project_id: i32,
+            bucket_ms: i64,
+            visitors: u64,
+        }
+
+        let hourly_sql = r#"
+            SELECT
+                project_id,
+                toUnixTimestamp64Milli(toStartOfHour(timestamp)) AS bucket_ms,
+                uniq(visitor_id) AS visitors
+            FROM events FINAL
+            WHERE has(?, project_id)
+              AND timestamp >= fromUnixTimestamp64Milli(?)
+              AND timestamp <= fromUnixTimestamp64Milli(?)
+              AND event_type = 'page_view'
+            GROUP BY project_id, bucket_ms
+            ORDER BY project_id, bucket_ms
+        "#;
+
+        let hourly_rows: Vec<HourlyRow> = self
+            .client
+            .query(hourly_sql)
+            .bind(project_ids.clone())
+            .bind(start_ms)
+            .bind(end_ms)
+            .fetch_all::<HourlyRow>()
+            .await
+            .map_err(|e| ch_err("query_dashboard_projects[hourly]", e))?;
+
+        let mut hourly_map: HashMap<i32, HashMap<i64, i64>> = HashMap::new();
+        for r in hourly_rows {
+            hourly_map
+                .entry(r.project_id)
+                .or_default()
+                .insert(r.bucket_ms, r.visitors as i64);
+        }
+
+        // Densify: produce one EventTimeline per hour in [start, end] for
+        // every project, including zero-visitor hours. Mirrors the
+        // Timescale impl's generate_series gap-fill.
+        let bucket_start = align_to_hour_ms(start_ms);
+        let bucket_end = align_to_hour_ms(end_ms);
+        let mut buckets = Vec::new();
+        let mut t = bucket_start;
+        while t <= bucket_end {
+            buckets.push(t);
+            t += 3_600_000; // one hour in ms
+        }
+
+        let mut projects = HashMap::new();
+        for &pid in &q.project_ids {
+            let counts = hourly_map.remove(&pid).unwrap_or_default();
+            let hourly_visits: Vec<EventTimeline> = buckets
+                .iter()
+                .map(|&ms| EventTimeline {
+                    date: from_unix_milli(ms),
+                    count: counts.get(&ms).copied().unwrap_or(0),
+                })
+                .collect();
+
+            let current = current_map.get(&pid).copied().unwrap_or(0);
+            let previous = previous_map.get(&pid).copied().unwrap_or(0);
+            // Identical trend semantics to the Timescale impl: None when
+            // both periods are zero, 100% when previous is zero but
+            // current is positive.
+            let trend_percentage = if previous > 0 {
+                Some(((current - previous) as f64 / previous as f64) * 100.0)
+            } else if current > 0 {
+                Some(100.0)
+            } else {
+                None
+            };
+
+            projects.insert(
+                pid.to_string(),
+                ProjectDashboardAnalytics {
+                    project_id: pid,
+                    unique_visitors: current,
+                    previous_unique_visitors: previous,
+                    trend_percentage,
+                    hourly_visits,
+                },
+            );
+        }
+
+        Ok(DashboardProjectsAnalyticsResponse { projects })
     }
 
     async fn query_aggregated_buckets(
@@ -729,6 +1126,15 @@ fn format_unix_milli(ms: i64) -> String {
         .single()
         .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
         .unwrap_or_default()
+}
+
+/// Floor a Unix-millis timestamp to the start of its UTC hour. Used by the
+/// dashboard sparkline densifier to align bucket boundaries with CH's
+/// `toStartOfHour(timestamp)` so the in-memory grid lines up with the
+/// values CH returns.
+fn align_to_hour_ms(ms: i64) -> i64 {
+    const HOUR_MS: i64 = 3_600_000;
+    (ms / HOUR_MS) * HOUR_MS
 }
 
 fn from_unix_milli(ms: i64) -> UtcDateTime {
@@ -894,6 +1300,9 @@ mod tests {
             viewport_width: Option<i16>,
             viewport_height: Option<i16>,
             ip_geolocation_id: Option<i32>,
+            country: String,
+            region: String,
+            city: String,
             channel: String,
             utm_source: String,
             utm_medium: String,
@@ -957,6 +1366,9 @@ mod tests {
                 viewport_width: Some(1920),
                 viewport_height: Some(1080),
                 ip_geolocation_id: None,
+                country: "US".into(),
+                region: "CA".into(),
+                city: "San Francisco".into(),
                 channel: "direct".into(),
                 utm_source: String::new(),
                 utm_medium: String::new(),
@@ -1226,7 +1638,9 @@ mod tests {
             .expect("query_aggregated_buckets");
         assert_eq!(aggr.total, 5);
 
-        // ---- query_property_breakdown returns Validation (not implemented) ----
+        // ---- query_property_breakdown ----
+        // Group by channel; all 5 project-7 events have channel="direct".
+        // events level = 5 raw events, all under one bucket.
         let pb = backend
             .query_property_breakdown(PropertyBreakdownSpec::new(
                 full_range(),
@@ -1237,13 +1651,52 @@ mod tests {
                 Some(20),
                 None,
             ))
-            .await;
+            .await
+            .expect("query_property_breakdown channel");
+        assert_eq!(pb.property, "channel");
+        assert_eq!(pb.total, 5);
         assert!(
-            matches!(pb, Err(EventsError::Validation(_))),
-            "property_breakdown should report not-implemented as Validation"
+            pb.items.iter().any(|i| i.value == "direct" && i.count == 5),
+            "expected channel=direct count=5, got {:?}",
+            pb.items
         );
 
-        // ---- query_dashboard_projects with empty input returns empty ----
+        // Group by country (denormalized geo column populated by seed).
+        let pb_country = backend
+            .query_property_breakdown(PropertyBreakdownSpec::new(
+                full_range(),
+                project_scope(7),
+                None,
+                PropertyColumn::Country,
+                "events",
+                Some(20),
+                None,
+            ))
+            .await
+            .expect("query_property_breakdown country");
+        assert!(
+            pb_country.items.iter().any(|i| i.value == "US"),
+            "expected country=US in {:?}",
+            pb_country.items
+        );
+
+        // ---- query_property_timeline ----
+        let pt = backend
+            .query_property_timeline(crate::services::queries::PropertyTimelineSpec {
+                range: full_range(),
+                scope: project_scope(7).with_deployment(None),
+                event_name: None,
+                group_by_column: PropertyColumn::Channel,
+                aggregation_level: "events".to_string(),
+                bucket_size: Some("1 hour".to_string()),
+            })
+            .await
+            .expect("query_property_timeline");
+        assert_eq!(pt.property, "channel");
+        let pt_total: i64 = pt.items.iter().map(|i| i.count).sum();
+        assert_eq!(pt_total, 5, "got {:?}", pt.items);
+
+        // ---- query_dashboard_projects: empty short-circuit ----
         let empty_dash = backend
             .query_dashboard_projects(crate::services::queries::DashboardProjectsSpec {
                 project_ids: vec![],
@@ -1255,6 +1708,26 @@ mod tests {
             empty_dash.projects.is_empty(),
             "empty input must yield empty response without hitting CH"
         );
+
+        // ---- query_dashboard_projects: real input ----
+        let dash = backend
+            .query_dashboard_projects(crate::services::queries::DashboardProjectsSpec {
+                project_ids: vec![7, 8],
+                range: full_range(),
+            })
+            .await
+            .expect("query_dashboard_projects");
+        let p7 = dash.projects.get("7").expect("project 7 in response");
+        // 2 distinct visitors on project 7 (100, 101).
+        assert_eq!(p7.unique_visitors, 2);
+        // Hourly sparkline has one EventTimeline per hour in range,
+        // including zero-visitor hours (densified to mirror PG impl).
+        assert!(
+            !p7.hourly_visits.is_empty(),
+            "sparkline must include densified buckets"
+        );
+        let p8 = dash.projects.get("8").expect("project 8 in response");
+        assert_eq!(p8.unique_visitors, 1);
 
         // ---- migration runner is idempotent ----
         // Re-applying must skip everything, not error.

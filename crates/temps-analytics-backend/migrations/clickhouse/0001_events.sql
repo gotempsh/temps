@@ -52,8 +52,14 @@ CREATE TABLE IF NOT EXISTS events
     viewport_width      Nullable(Int16),
     viewport_height     Nullable(Int16),
 
-    -- Geography
+    -- Geography. Denormalized from the Postgres `ip_geolocations` table at
+    -- fan-out time so property breakdowns can group by country/region/city
+    -- without a cross-database join. Empty string is the canonical
+    -- "no value" sentinel (LowCardinality strings are not nullable here).
     ip_geolocation_id   Nullable(Int32),
+    country             LowCardinality(String),
+    region              LowCardinality(String),
+    city                String,
 
     -- Traffic source
     channel             LowCardinality(String),

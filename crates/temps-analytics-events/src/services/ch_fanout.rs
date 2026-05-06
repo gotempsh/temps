@@ -37,6 +37,16 @@ pub struct ChFanoutConfig {
     pub batch_size: u32,
     /// Max attempts before a row is marked dead-lettered (logged + skipped).
     pub max_attempts: i32,
+    /// Delete delivered outbox rows older than this. Without this the
+    /// outbox grows unbounded — at 100 events/s an install accumulates
+    /// ~8.6M rows/day.
+    pub retention: Duration,
+    /// How often to run the retention sweep (delete delivered rows older
+    /// than `retention`). Cheaper than per-poll cleanup.
+    pub retention_sweep_interval: Duration,
+    /// How often to scan for dead-lettered rows (`attempts >= max_attempts`)
+    /// and warn-log their count so operators can act.
+    pub deadletter_scan_interval: Duration,
 }
 
 impl Default for ChFanoutConfig {
@@ -45,6 +55,11 @@ impl Default for ChFanoutConfig {
             poll_interval: Duration::from_secs(1),
             batch_size: 10_000,
             max_attempts: 10,
+            // 7d covers most realistic CH outage windows; operators
+            // who need a longer replay can extend.
+            retention: Duration::from_secs(7 * 24 * 60 * 60),
+            retention_sweep_interval: Duration::from_secs(60 * 60),
+            deadletter_scan_interval: Duration::from_secs(5 * 60),
         }
     }
 }
@@ -77,13 +92,35 @@ impl ChFanoutWorker {
     }
 
     /// Run the worker loop until shutdown.
+    ///
+    /// Three concurrent timers feed `tokio::select!`:
+    /// - **poll**: claim+push a batch every `poll_interval`.
+    /// - **retention**: delete delivered rows older than `retention` every
+    ///   `retention_sweep_interval`. Without this the outbox grows
+    ///   unbounded.
+    /// - **dead-letter scan**: count rows where `attempts >= max_attempts`
+    ///   every `deadletter_scan_interval` and warn-log if non-zero so
+    ///   operators see the problem in their log aggregator.
+    ///
+    /// Shutdown is cooperative: the current batch finishes before exit.
     pub async fn run(self) {
         info!(
             backend = "clickhouse",
             poll_interval_ms = self.config.poll_interval.as_millis() as u64,
             batch_size = self.config.batch_size,
+            retention_secs = self.config.retention.as_secs(),
             "ch_fanout worker starting"
         );
+
+        let mut retention_tick = tokio::time::interval(self.config.retention_sweep_interval);
+        // Skip the first tick so we don't sweep on startup before the
+        // first poll has even run.
+        retention_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        retention_tick.tick().await;
+
+        let mut deadletter_tick = tokio::time::interval(self.config.deadletter_scan_interval);
+        deadletter_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        deadletter_tick.tick().await;
 
         loop {
             tokio::select! {
@@ -96,10 +133,82 @@ impl ChFanoutWorker {
                         warn!(error = %e, "ch_fanout batch failed; will retry");
                     }
                 }
+                _ = retention_tick.tick() => {
+                    if let Err(e) = self.sweep_retention().await {
+                        warn!(error = %e, "ch_fanout retention sweep failed");
+                    }
+                }
+                _ = deadletter_tick.tick() => {
+                    if let Err(e) = self.scan_deadletters().await {
+                        warn!(error = %e, "ch_fanout dead-letter scan failed");
+                    }
+                }
             }
         }
 
         info!("ch_fanout worker stopped");
+    }
+
+    /// Delete outbox rows that were successfully delivered more than
+    /// `config.retention` ago. Runs in its own statement, not the
+    /// process_one_batch hot path.
+    async fn sweep_retention(&self) -> Result<(), ChFanoutError> {
+        use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+        let secs = self.config.retention.as_secs() as i64;
+        let sql = "DELETE FROM events_ch_outbox \
+                   WHERE delivered_at IS NOT NULL \
+                     AND delivered_at < NOW() - ($1 * INTERVAL '1 second')";
+        let result = self
+            .db
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                sql,
+                vec![secs.into()],
+            ))
+            .await?;
+        let n = result.rows_affected();
+        if n > 0 {
+            debug!(rows = n, "ch_fanout retention swept delivered outbox rows");
+        }
+        Ok(())
+    }
+
+    /// Count rows that hit the retry ceiling (`attempts >= max_attempts`)
+    /// without being delivered. These are stuck — log a warning so
+    /// operators can investigate. We do NOT auto-delete them: better for
+    /// an operator to see them and decide.
+    async fn scan_deadletters(&self) -> Result<(), ChFanoutError> {
+        use sea_orm::{DatabaseBackend, FromQueryResult, Statement};
+
+        #[derive(FromQueryResult)]
+        struct Counted {
+            n: i64,
+        }
+
+        let sql = "SELECT COUNT(*)::bigint AS n \
+                   FROM events_ch_outbox \
+                   WHERE delivered_at IS NULL AND attempts >= $1";
+        let row = Counted::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            sql,
+            vec![self.config.max_attempts.into()],
+        ))
+        .one(self.db.as_ref())
+        .await?;
+        if let Some(c) = row {
+            if c.n > 0 {
+                warn!(
+                    deadletter_count = c.n,
+                    max_attempts = self.config.max_attempts,
+                    "ch_fanout has dead-lettered rows; investigate ClickHouse connectivity \
+                     or row mapping. These will not be retried automatically. \
+                     Inspect via: SELECT * FROM events_ch_outbox \
+                     WHERE delivered_at IS NULL AND attempts >= max_attempts;"
+                );
+            }
+        }
+        Ok(())
     }
 
     async fn process_one_batch(&self) -> Result<(), ChFanoutError> {
@@ -178,7 +287,25 @@ impl ChFanoutWorker {
 
         let first_id = rows.first().map(|r| r.id).unwrap_or(0);
 
-        // 3. Push to CH via the typed Inserter.
+        // 3. Resolve geolocations once for the whole batch so country /
+        //    region / city land on the CH row directly. Missing geo rows
+        //    (deleted, or `ip_geolocation_id IS NULL`) become empty strings.
+        use temps_entities::ip_geolocations;
+        let geo_ids: Vec<i32> = rows.iter().filter_map(|r| r.ip_geolocation_id).collect();
+        let geo_map: std::collections::HashMap<i32, ip_geolocations::Model> = if geo_ids.is_empty()
+        {
+            std::collections::HashMap::new()
+        } else {
+            ip_geolocations::Entity::find()
+                .filter(ip_geolocations::Column::Id.is_in(geo_ids))
+                .all(self.db.as_ref())
+                .await?
+                .into_iter()
+                .map(|m| (m.id, m))
+                .collect()
+        };
+
+        // 4. Push to CH via the typed Inserter.
         let mut inserter = self.ch.insert::<ChEventRow>("events").map_err(|e| {
             ChFanoutError::ClickHouseInsert {
                 first_event_id: first_id,
@@ -188,13 +315,13 @@ impl ChFanoutWorker {
 
         let row_count = rows.len();
         for r in rows {
-            inserter
-                .write(&row_to_ch(&r))
-                .await
-                .map_err(|e| ChFanoutError::ClickHouseInsert {
+            let geo = r.ip_geolocation_id.and_then(|id| geo_map.get(&id));
+            inserter.write(&row_to_ch(&r, geo)).await.map_err(|e| {
+                ChFanoutError::ClickHouseInsert {
                     first_event_id: first_id,
                     reason: format!("write failed: {e}"),
-                })?;
+                }
+            })?;
         }
         inserter
             .end()
@@ -285,6 +412,9 @@ struct ChEventRow {
     viewport_width: Option<i16>,
     viewport_height: Option<i16>,
     ip_geolocation_id: Option<i32>,
+    country: String,
+    region: String,
+    city: String,
     channel: String,
     utm_source: String,
     utm_medium: String,
@@ -311,8 +441,14 @@ struct ChEventRow {
 
 /// Map a Postgres `events::Model` into the `ChEventRow` shape. `Option<String>`
 /// becomes `""` because CH's `LowCardinality(String)` is non-null in our DDL
-/// — empty string is the canonical "no value" sentinel.
-fn row_to_ch(m: &temps_entities::events::Model) -> ChEventRow {
+/// — empty string is the canonical "no value" sentinel. The `geo` parameter
+/// is the matching `ip_geolocations` row (looked up by `m.ip_geolocation_id`)
+/// so country/region/city land on the CH row directly — no cross-database
+/// join at query time.
+fn row_to_ch(
+    m: &temps_entities::events::Model,
+    geo: Option<&temps_entities::ip_geolocations::Model>,
+) -> ChEventRow {
     use temps_core::DBDateTime;
 
     fn opt(s: &Option<String>) -> String {
@@ -322,6 +458,15 @@ fn row_to_ch(m: &temps_entities::events::Model) -> ChEventRow {
     fn ts_millis(ts: &DBDateTime) -> i64 {
         ts.timestamp_millis()
     }
+
+    let (country, region, city) = match geo {
+        Some(g) => (
+            g.country.clone(),
+            g.region.clone().unwrap_or_default(),
+            g.city.clone().unwrap_or_default(),
+        ),
+        None => (String::new(), String::new(), String::new()),
+    };
 
     ChEventRow {
         event_id: m.id,
@@ -353,6 +498,9 @@ fn row_to_ch(m: &temps_entities::events::Model) -> ChEventRow {
         viewport_width: m.viewport_width,
         viewport_height: m.viewport_height,
         ip_geolocation_id: m.ip_geolocation_id,
+        country,
+        region,
+        city,
         channel: opt(&m.channel),
         utm_source: opt(&m.utm_source),
         utm_medium: opt(&m.utm_medium),

@@ -1,0 +1,194 @@
+export const metadata = {
+  title: 'Enable ClickHouse for Analytics Reads',
+  description:
+    'Point Temps at an existing ClickHouse cluster for analytics reads while keeping PostgreSQL as the system of record. Requires no rebuild and no cargo feature flag.',
+  alternates: {
+    canonical: '/docs/enable-clickhouse-analytics',
+  },
+}
+
+export const sections = [
+  { title: 'When to enable ClickHouse', id: 'when-to-enable' },
+  { title: 'Prerequisites', id: 'prerequisites' },
+  { title: 'Enable the backend', id: 'enable-the-backend' },
+  { title: 'What happens on startup', id: 'what-happens-on-startup' },
+  { title: 'Verify it is working', id: 'verify-it-is-working' },
+  { title: 'Roll back to PostgreSQL', id: 'roll-back' },
+  { title: 'What is on PostgreSQL vs ClickHouse', id: 'whats-on-each' },
+  { title: 'Operational runbook', id: 'operational-runbook' },
+  { title: 'Known limitations', id: 'known-limitations' },
+]
+
+# Enable ClickHouse for Analytics Reads
+
+Temps stores analytics events in PostgreSQL with the TimescaleDB extension by default. Operators with high event volume can point Temps at a ClickHouse cluster for **analytics reads** while keeping Postgres as the **system of record**. Same binary, no rebuild, no cargo feature flag.
+
+See [ADR-012](https://github.com/gotempsh/temps/blob/main/docs/adr/012-clickhouse-analytics-backend.md) for the design rationale (why CH is bring-your-own rather than a managed `ServiceType`).
+
+## When to enable ClickHouse {#when-to-enable}
+
+Switch on ClickHouse when:
+
+- The `events` hypertable in Postgres exceeds **~50M rows / month** ingested.
+- Dashboard queries (event counts, timelines, property breakdowns) take **>2s** on warm cache.
+- You already operate a ClickHouse cluster and don't want a second analytical store.
+
+You don't need it for indie-hacker-scale installs. The Postgres path stays fast up to single-digit millions of events per month on a modest VPS.
+
+## Prerequisites {#prerequisites}
+
+- A reachable **ClickHouse server**, version **24.3 or newer** (tested against 24.8).
+- A database the Temps server has permission to use. Temps will create tables in it on first startup.
+- A user with **DDL + INSERT + SELECT** on the target database. The plugin runs `CREATE TABLE IF NOT EXISTS`, inserts via `INSERT INTO events …`, and reads with `SELECT … FROM events FINAL`.
+- HTTP(S) reachability between the Temps control plane and the CH server. The default `clickhouse-server` HTTP port is `8123`; HTTPS via a reverse proxy or `clickhouse-server` with TLS works the same.
+
+ClickHouse Cloud, Altinity, and self-hosted single-node and clustered deployments all work — Temps treats CH as an opaque HTTP target.
+
+## Enable the backend {#enable-the-backend}
+
+Set four environment variables on the Temps control plane and restart `temps serve`:
+
+```bash
+export TEMPS_CLICKHOUSE_URL=https://ch.example.internal:8443
+export TEMPS_CLICKHOUSE_DATABASE=temps_analytics
+export TEMPS_CLICKHOUSE_USER=temps
+export TEMPS_CLICKHOUSE_PASSWORD=...
+
+./temps serve
+```
+
+All four must be set. Partial configuration is treated as off (fail-closed).
+
+The variables are read at every startup. There is no admin UI toggle and no runtime reload — the swap is intentional, audited via env vars, and reversible.
+
+## What happens on startup {#what-happens-on-startup}
+
+When the four env vars are populated, the analytics events plugin:
+
+1. **Applies CH schema migrations**. Three tables created in your CH database: `events` (the analytical replica), `events_5m_mv` (a `SummingMergeTree` materialized view for 5-minute rollups), `sessions`. A fourth table `_temps_ch_migrations` tracks which migrations have run, so re-runs are idempotent. Migrations run in a background task — the server starts accepting requests immediately.
+
+2. **Spawns the fan-out worker**. A `ChFanoutWorker` task starts on the tokio runtime. It polls a new Postgres table `events_ch_outbox` every second, claims undelivered rows with `FOR UPDATE SKIP LOCKED`, batches up to 10,000 rows, and inserts them into ClickHouse via the typed `clickhouse::Client::insert()` path.
+
+3. **Swaps the read trait**. The handler-side `Arc<dyn AnalyticsEvents>` becomes a `ClickHouseEventsBackend` instead of the Postgres-backed `AnalyticsEventsService`. From this point, every `query_*` method reads from ClickHouse.
+
+The startup logs include a clear marker:
+
+```
+INFO clickhouse url=https://ch.example.internal:8443 database=temps_analytics
+     ClickHouse analytics backend enabled — applying migrations and starting fan-out worker
+```
+
+## Verify it is working {#verify-it-is-working}
+
+Three quick checks against a freshly-enabled install.
+
+**1. Migrations landed.** Connect to your CH instance:
+
+```sql
+SHOW TABLES FROM temps_analytics;
+-- Expected: _temps_ch_migrations, events, events_5m_mv, sessions
+
+SELECT name, applied_at FROM temps_analytics._temps_ch_migrations FINAL;
+-- Expected: 0001_events, 0002_events_5m_mv, 0003_sessions
+```
+
+**2. Fan-out worker is delivering**. After your app fires a few events, check the outbox:
+
+```sql
+-- On Postgres
+SELECT
+  COUNT(*) FILTER (WHERE delivered_at IS NOT NULL) AS delivered,
+  COUNT(*) FILTER (WHERE delivered_at IS NULL) AS pending,
+  COUNT(*) FILTER (WHERE attempts >= 10 AND delivered_at IS NULL) AS dead_lettered
+FROM events_ch_outbox;
+```
+
+Expect `pending` to be small (≤ batch_size) and `dead_lettered` to be `0`. If `pending` is growing without bound, the worker isn't running or CH is unreachable — check `temps serve` logs for `ch_fanout` warnings.
+
+**3. CH is serving reads.** Hit any analytics endpoint with a project that has events. The response should match what Postgres would return (within ~1% on `uniq()`-based metrics — see Known Limitations).
+
+```sql
+-- Sanity check on the CH side
+SELECT count() FROM temps_analytics.events FINAL;
+```
+
+The number should approximately match the count of `events` rows in Postgres.
+
+## Roll back to PostgreSQL {#roll-back}
+
+Unset the four env vars and restart:
+
+```bash
+unset TEMPS_CLICKHOUSE_URL
+unset TEMPS_CLICKHOUSE_DATABASE
+unset TEMPS_CLICKHOUSE_USER
+unset TEMPS_CLICKHOUSE_PASSWORD
+
+./temps serve
+```
+
+The trait object reverts to the Postgres-backed service on the next boot. The `events_ch_outbox` table keeps populating with new event_ids — operators who later re-enable CH replay history from where they left off (modulo retention).
+
+## What is on PostgreSQL vs ClickHouse {#whats-on-each}
+
+By design, **not all analytics queries move to ClickHouse**. The split:
+
+| Query class | Backend | Why |
+|---|---|---|
+| Event counts, timelines, aggregations, top-K (`AnalyticsEvents` trait) | ClickHouse | Where columnar wins decisively |
+| Visitors, sessions, journeys, page-flow, geolocation lookup (`Analytics` trait) | PostgreSQL | Mutable rows, joins to OLTP entities |
+| Funnels (`temps-analytics-funnels`) | PostgreSQL | Currently PG-only |
+| Session replay frames, error tracking, performance metrics | Stays where it is | Not events-shaped |
+| Writes (`record_event`) | PostgreSQL is the system of record | CH is a derived replica |
+
+This is intentional, not a missing feature. See ADR-012 for the reasoning.
+
+## Operational runbook {#operational-runbook}
+
+**Outbox grows forever?**
+No — the worker runs an hourly retention sweep that deletes delivered rows older than 7 days. Tunable via `ChFanoutConfig::retention` if you build a custom binary.
+
+**What if the CH cluster goes down?**
+PG ingestion is unaffected. The outbox keeps growing; the worker logs a warning every poll and retries on the next cycle. When CH comes back, the worker drains the backlog. Reads against CH endpoints return 5xx until CH is reachable.
+
+**A row hits `max_attempts` (default 10) without delivering.**
+The worker logs a warning every 5 minutes with the dead-letter count. Inspect with:
+
+```sql
+SELECT event_id, attempts, last_error, enqueued_at
+FROM events_ch_outbox
+WHERE delivered_at IS NULL AND attempts >= 10
+ORDER BY enqueued_at
+LIMIT 100;
+```
+
+The most common cause is a row mapping bug that breaks one specific event payload. Once fixed, manually reset:
+
+```sql
+UPDATE events_ch_outbox SET attempts = 0
+WHERE delivered_at IS NULL AND attempts >= 10;
+```
+
+**ClickHouse credentials rotate.**
+Update the env vars and restart `temps serve`. There is no live-reload path — restart is the audit trail.
+
+**Need to backfill all PG events into a fresh CH cluster.**
+After enabling CH, run this once on the Postgres side to enqueue every existing event:
+
+```sql
+INSERT INTO events_ch_outbox (event_id)
+SELECT id FROM events
+ON CONFLICT (event_id) DO NOTHING;
+```
+
+The worker drains the resulting backlog (~10k rows/sec depending on CH throughput) over the next minutes/hours.
+
+## Known limitations {#known-limitations}
+
+These are documented divergences in the v1 ClickHouse backend. None block typical use.
+
+- **`uniq()` is HLL-approximate**. CH's `uniq(visitor_id)` returns within ~1% of the true distinct count, vs Postgres's exact `COUNT(DISTINCT)`. Numbers will not match to the unit when comparing dashboards across backends.
+- **Self-referral filter on `referrer_hostname` is PG-only**. The Postgres property breakdown filters out a project's own custom domains when grouping by referrer; the CH path does not have `project_custom_domains` replicated, so apps will see their own domain in the referrer breakdown. Will be fixed via a CH `Dictionary` in a follow-up.
+- **`Analytics` trait stays on PG**. Visitor / session / journey / page-flow endpoints continue to read from Postgres even when CH is enabled (see [What is on each backend](#whats-on-each)). The only trait that switches is `AnalyticsEvents`.
+- **No CH cluster mode (yet)**. The current backend is a single-target HTTP client. Sharded CH clusters work behind a load balancer (CHProxy, ClickHouse Keeper-aware proxy) but Temps doesn't speak to the cluster topology directly.
+- **Retention is hard-coded to 5 years on CH and 7 days on the PG outbox**. Per-project retention is on the roadmap; for now, edit the migration SQL and run `ALTER TABLE events MODIFY TTL ...` manually if you need different windows.
