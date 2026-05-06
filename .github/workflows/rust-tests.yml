@@ -300,10 +300,11 @@ jobs:
     name: "Integration Tests (${{ matrix.group }})"
     runs-on: ubuntu-latest
     needs: [build-tests, unit-tests]
-    # 45 min covers the postgres-upgrades group worst-case
-    # (5 tests × ~6 min + pg17/pg18 image pulls on a cold runner).
-    # Other groups finish well under that.
-    timeout-minutes: 45
+    # 90 min headroom for the postgres-upgrades group, which can spike past
+    # 45 min when pg17/pg18 image pulls land on a cold runner and several
+    # orchestrator tests recover serially. Other groups still finish well
+    # under that — the timeout only kicks in for true outliers.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
