@@ -241,7 +241,7 @@ jobs:
                 \"preset\": \"$APP_PRESET\",
                 \"git_url\": \"$REPO_URL\",
                 \"is_public_repo\": true,
-                \"automatic_deploy\": false,
+                \"automatic_deploy\": true,
                 \"storage_service_ids\": [],
                 \"performance_metrics_enabled\": false
               }")
@@ -281,10 +281,9 @@ jobs:
             fi
             echo "Environment ID: $ENV_ID"
 
-            # Project creation auto-triggers the initial deployment via queue.
-            # Do NOT call trigger-pipeline here — it would create a second deployment
-            # that cancels the first via cancel_in_flight_deployments, causing a race
-            # where polling sees the cancelled deployment instead of the new one.
+            # Project creation emits a GitPushEvent which is gated by
+            # automatic_deploy. We pass automatic_deploy=true above so the
+            # event creates the initial deployment.
             echo "Waiting for auto-triggered deployment to be created..."
             sleep 5
 
