@@ -645,15 +645,44 @@ async fn process_git_push_event(
     // deployment configs (env overrides project). When both sides have
     // automatic_deploy=false, push events must NOT trigger a deployment —
     // the user has explicitly opted out.
-    if !is_automatic_deploy_enabled(
+    //
+    // Exception: the FIRST deployment for an environment always runs even
+    // when automatic_deploy=false. Without this, an opted-out project would
+    // never get a baseline deployment, and project creation would silently
+    // produce zero deployments.
+    use sea_orm::{EntityTrait, PaginatorTrait, QueryOrder};
+    let auto_deploy_enabled = is_automatic_deploy_enabled(
         project.deployment_config.as_ref(),
         environment.deployment_config.as_ref(),
-    ) {
+    );
+    if !auto_deploy_enabled {
+        let existing_count = match deployments::Entity::find()
+            .filter(deployments::Column::EnvironmentId.eq(environment.id))
+            .count(db.as_ref())
+            .await
+        {
+            Ok(n) => n,
+            Err(e) => {
+                error!(
+                    "Failed to count existing deployments for environment {}: {}",
+                    environment.id, e
+                );
+                return;
+            }
+        };
+
+        if existing_count > 0 {
+            info!(
+                "Skipping push event for project {} environment {} ({}): automatic_deploy is disabled",
+                project.id, environment.id, environment.name
+            );
+            return;
+        }
+
         info!(
-            "Skipping push event for project {} environment {} ({}): automatic_deploy is disabled",
+            "Allowing initial deployment for project {} environment {} ({}) despite automatic_deploy=false (no prior deployments)",
             project.id, environment.id, environment.name
         );
-        return;
     }
 
     // Check for duplicate deployment (same project, environment, and commit)
@@ -661,7 +690,6 @@ async fn process_git_push_event(
     // - Multiple webhook URLs are configured in GitHub (both /webhook/git/github/events and /webhook/source/github/events)
     // - GitHub sends duplicate webhooks
     // - Race condition between concurrent push events
-    use sea_orm::{EntityTrait, PaginatorTrait, QueryOrder};
     let existing_deployment = deployments::Entity::find()
         .filter(deployments::Column::ProjectId.eq(project.id))
         .filter(deployments::Column::EnvironmentId.eq(environment.id))
