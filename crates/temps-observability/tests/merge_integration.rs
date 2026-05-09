@@ -128,6 +128,7 @@ async fn merge_returns_rows_in_descending_ts_across_kinds() {
             environment_id: None,
             search: None,
             limit: 50,
+            hide_bots: None,
         })
         .await
         .expect("query");
@@ -192,6 +193,7 @@ async fn kinds_filter_excludes_unselected_tables() {
             environment_id: None,
             search: None,
             limit: 50,
+            hide_bots: None,
         })
         .await
         .expect("query errors only");
@@ -239,6 +241,7 @@ async fn time_range_filters_old_rows() {
             environment_id: None,
             search: None,
             limit: 50,
+            hide_bots: None,
         })
         .await
         .expect("query");
@@ -406,6 +409,7 @@ async fn fetch_spans_returns_span_rows_from_otel_table() {
             environment_id: None,
             search: None,
             limit: 50,
+            hide_bots: None,
         })
         .await
         .expect("query spans");
@@ -520,6 +524,7 @@ async fn merge_interleaves_spans_with_other_kinds() {
             environment_id: None,
             search: None,
             limit: 50,
+            hide_bots: None,
         })
         .await
         .expect("merge query");
