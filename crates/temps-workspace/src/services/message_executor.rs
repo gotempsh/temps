@@ -5,7 +5,9 @@ use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use temps_agents::ai_cli::OnEventCallback;
-use temps_agents::sandbox::{SANDBOX_CHOWN, SANDBOX_HOME, SANDBOX_WORK_DIR};
+use temps_agents::sandbox::{
+    SANDBOX_CHOWN, SANDBOX_GID, SANDBOX_HOME, SANDBOX_UID, SANDBOX_WORK_DIR,
+};
 use temps_config::ConfigService;
 use temps_core::{EncryptionService, WorkflowMemoryProvider};
 use temps_deployments::services::deployment_token_service::{
@@ -20,6 +22,81 @@ use crate::services::session_manager::WorkspaceSessionManager;
 use crate::services::workspace_service::{
     SendMessageRequest, UpdateSessionFields, WorkspaceService,
 };
+
+/// Recursively chown a path to the sandbox uid/gid, on the host.
+///
+/// In production, the temps server runs as real root, so the host-side
+/// `git clone` writes files owned by root with mode 700/600 (root's
+/// umask is typically 077 under hardened systemd units). When that
+/// directory is bind-mounted into the sandbox container, the
+/// container's "root" cannot heal it post-start: the container runs
+/// with `cap_drop=ALL` plus `cap_add=[CHOWN, FOWNER]`, which
+/// deliberately omits `CAP_DAC_OVERRIDE` and `CAP_DAC_READ_SEARCH`. So
+/// even with `CAP_CHOWN`, in-container "root" hits EPERM trying to
+/// `opendir(2)` on the 700 work dir before chown ever runs. The fix is
+/// to chown on the host *before* the bind mount sees the wrong uids.
+///
+/// We use blocking `std::os::unix::fs::lchown` (no symlink-follow) inside
+/// `tokio::task::spawn_blocking`. `walkdir` isn't a workspace dep, so we
+/// implement the recursion with a small explicit stack to avoid pulling
+/// in a new crate for ~30 lines of code.
+///
+/// Best-effort: failures are logged but don't fail sandbox creation.
+/// On macOS dev boxes the temps server may not be able to chown to a
+/// uid that doesn't exist on the host (the Linux uid 1000 may not map
+/// to anything meaningful), but the in-container chown post-start (in
+/// `temps-agents`'s `run_root_exec`) still handles the dev case where
+/// the bind-mount source already has world-readable mode bits.
+fn chown_workdir_to_sandbox_user(work_dir: std::path::PathBuf) {
+    use std::os::unix::fs::lchown;
+    let started = std::time::Instant::now();
+    let result = std::panic::catch_unwind(move || -> std::io::Result<usize> {
+        let mut count = 0usize;
+        let mut stack: Vec<std::path::PathBuf> = vec![work_dir.clone()];
+        // Chown the root itself first so we have permission to descend.
+        lchown(&work_dir, Some(SANDBOX_UID), Some(SANDBOX_GID))?;
+        count += 1;
+        while let Some(dir) = stack.pop() {
+            // `read_dir` follows the dir's metadata, but we lchown each
+            // entry directly to avoid following symlinks out of the tree.
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(e) => e,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            for entry in entries {
+                let entry = entry?;
+                let path = entry.path();
+                let file_type = entry.file_type()?;
+                lchown(&path, Some(SANDBOX_UID), Some(SANDBOX_GID))?;
+                count += 1;
+                if file_type.is_dir() && !file_type.is_symlink() {
+                    stack.push(path);
+                }
+            }
+        }
+        Ok(count)
+    });
+    match result {
+        Ok(Ok(count)) => tracing::debug!(
+            "Chowned {} entries under workspace work_dir to {}:{} in {:?}",
+            count,
+            SANDBOX_UID,
+            SANDBOX_GID,
+            started.elapsed()
+        ),
+        Ok(Err(e)) => tracing::warn!(
+            "Failed to chown workspace work_dir to sandbox uid {}:{}: {} \
+             — sandbox post-start chown will need to heal it",
+            SANDBOX_UID,
+            SANDBOX_GID,
+            e
+        ),
+        Err(_) => tracing::warn!(
+            "chown_workdir_to_sandbox_user panicked — sandbox post-start chown will need to heal it",
+        ),
+    }
+}
 
 /// Executes chat messages within a workspace session.
 ///
@@ -1289,6 +1366,18 @@ impl MessageExecutor {
                 session.id,
                 work_dir.display()
             );
+            // Heal stale root-owned files left behind by older temps
+            // server versions that cloned without chowning. New
+            // workspaces hit the clone branch below; existing ones land
+            // here on session reopen and would otherwise stay broken
+            // until manually chowned.
+            let to_chown = work_dir.clone();
+            tokio::task::spawn_blocking(move || chown_workdir_to_sandbox_user(to_chown))
+                .await
+                .map_err(|e| WorkspaceError::SandboxCreationFailed {
+                    session_id: session.id,
+                    reason: format!("Workspace chown task panicked: {}", e),
+                })?;
         } else if let Some(connection_id) = project.git_provider_connection_id {
             self.git_provider_manager
                 .clone_repository(
@@ -1332,6 +1421,25 @@ impl MessageExecutor {
                     session.id
                 );
             }
+
+            // Chown the work_dir to the sandbox uid. The clone (and any
+            // subsequent branch creation) ran in this temps server
+            // process — root in production, with umask 077 — so the
+            // resulting tree is mode 700/600 owned by root, unreadable
+            // to the in-container sandbox user (uid 1000). The
+            // container's post-start chown can't heal it: sandboxes run
+            // with `cap_drop=ALL` (no `CAP_DAC_OVERRIDE`), so even
+            // in-container "root" cannot traverse a 700 dir it doesn't
+            // own. Chown here on the host where real-root privileges
+            // are available, before the bind mount carries the wrong
+            // uids into the container.
+            let to_chown = work_dir.clone();
+            tokio::task::spawn_blocking(move || chown_workdir_to_sandbox_user(to_chown))
+                .await
+                .map_err(|e| WorkspaceError::SandboxCreationFailed {
+                    session_id: session.id,
+                    reason: format!("Workspace chown task panicked: {}", e),
+                })?;
         } else {
             // No git provider — write a placeholder README so the sandbox
             // has something to mount
@@ -1343,6 +1451,16 @@ impl MessageExecutor {
                 ),
             )
             .await?;
+            // Same host-side chown as the clone branch — the README we
+            // just wrote inherits the temps server's uid (root in prod)
+            // and would otherwise be unwritable from inside the sandbox.
+            let to_chown = work_dir.clone();
+            tokio::task::spawn_blocking(move || chown_workdir_to_sandbox_user(to_chown))
+                .await
+                .map_err(|e| WorkspaceError::SandboxCreationFailed {
+                    session_id: session.id,
+                    reason: format!("Workspace chown task panicked: {}", e),
+                })?;
         }
 
         // Issue a deployment token for this session so the sandbox can

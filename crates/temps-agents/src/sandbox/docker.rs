@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use super::user::{SANDBOX_CHOWN, SANDBOX_HOME, SANDBOX_USER, SANDBOX_WORK_DIR};
+use super::user::{SANDBOX_CHOWN, SANDBOX_HOME, SANDBOX_UID, SANDBOX_USER, SANDBOX_WORK_DIR};
 use super::{
     ExecStream, OnStreamEventCallback, SandboxCreateConfig, SandboxExecResult, SandboxHandle,
     SandboxProvider,
@@ -182,6 +182,7 @@ RUN cargo build --release --bin temps-git-credential-helper --bin temps-git-cred
     let home = SANDBOX_HOME;
     let chown = SANDBOX_CHOWN;
     let work_dir = SANDBOX_WORK_DIR;
+    let uid = SANDBOX_UID;
 
     format!(
         r#"{pty_agent_stage}FROM {base}
@@ -202,12 +203,12 @@ RUN GLAB_ARCH=$(dpkg --print-architecture) \
     && mv /tmp/bin/glab /usr/local/bin/glab \
     && chmod +x /usr/local/bin/glab \
     && rm -rf /tmp/glab.tar.gz /tmp/bin
-RUN EXISTING_USER=$(getent passwd 1000 | cut -d: -f1) \
+RUN EXISTING_USER=$(getent passwd {uid} | cut -d: -f1) \
     && if [ -n "$EXISTING_USER" ] && [ "$EXISTING_USER" != "{user}" ]; then \
          (userdel -r "$EXISTING_USER" 2>/dev/null || userdel "$EXISTING_USER" 2>/dev/null || true); \
          (groupdel "$EXISTING_USER" 2>/dev/null || true); \
        fi \
-    && useradd -m -s /bin/bash -u 1000 {user} \
+    && useradd -m -s /bin/bash -u {uid} {user} \
     && echo '# temps sandbox: scoped sudo for package install only.' > /etc/sudoers.d/{user} \
     && echo 'Cmnd_Alias TEMPS_PKG = /usr/bin/apt, /usr/bin/apt-get, /usr/bin/dpkg, /usr/bin/pip, /usr/bin/pip3, /usr/local/bin/uv, /usr/bin/npm, /usr/local/bin/bun' >> /etc/sudoers.d/{user} \
     && echo '{user} ALL=(ALL) NOPASSWD: TEMPS_PKG' >> /etc/sudoers.d/{user} \

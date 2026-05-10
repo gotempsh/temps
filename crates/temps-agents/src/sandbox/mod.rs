@@ -4,7 +4,10 @@ pub mod local;
 pub mod pty_agent_bundle;
 pub mod user;
 
-pub use user::{SANDBOX_CHOWN, SANDBOX_GROUP, SANDBOX_HOME, SANDBOX_USER, SANDBOX_WORK_DIR};
+pub use user::{
+    SANDBOX_CHOWN, SANDBOX_GID, SANDBOX_GROUP, SANDBOX_HOME, SANDBOX_UID, SANDBOX_USER,
+    SANDBOX_WORK_DIR,
+};
 
 use async_trait::async_trait;
 use std::collections::HashMap;

@@ -18,6 +18,19 @@ pub const SANDBOX_GROUP: &str = "temps";
 /// `chown` argument string — `user:group`.
 pub const SANDBOX_CHOWN: &str = "temps:temps";
 
+/// Numeric uid of [`SANDBOX_USER`] inside the container. Hardcoded to
+/// match the Dockerfile's `useradd -u 1000` directive. Exposed because the
+/// host-side workspace code also chowns the bind-mount source to this uid
+/// before the container starts — host-real-root can do the recursive
+/// chown without DAC_OVERRIDE, whereas in-container "root" runs with
+/// `cap_drop=ALL` plus `cap_add=[CHOWN, FOWNER]` and gets EPERM trying to
+/// traverse a 700 directory it doesn't own.
+pub const SANDBOX_UID: u32 = 1000;
+
+/// Numeric gid of [`SANDBOX_GROUP`] inside the container. Same rationale
+/// as [`SANDBOX_UID`].
+pub const SANDBOX_GID: u32 = 1000;
+
 /// Home directory of [`SANDBOX_USER`].
 pub const SANDBOX_HOME: &str = "/home/temps";
 
