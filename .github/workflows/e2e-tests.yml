@@ -288,6 +288,10 @@ jobs:
             sleep 5
 
             # --- Poll deployment status ---
+            # PipelineStatus enum: pending | running | built | completed | failed | cancelled
+            # 'running' means the workflow is executing (build, deploy_container, etc).
+            # 'completed' is the only terminal-success state — the route table is updated
+            # and the container is serving traffic only after this.
             echo "Polling deployment status (timeout: 10 minutes)..."
             DEPLOY_STATE="pending"
             DEPLOY_ID=""
@@ -301,8 +305,8 @@ jobs:
               DEPLOY_STATE=$(echo "$DEPLOY_LIST" | jq -r '.deployments[0].status // "pending"' 2>/dev/null || echo "pending")
               DEPLOY_ID=$(echo "$DEPLOY_LIST" | jq -r '.deployments[0].id // empty' 2>/dev/null || true)
 
-              if [ "$DEPLOY_STATE" = "running" ] || [ "$DEPLOY_STATE" = "deployed" ] || [ "$DEPLOY_STATE" = "completed" ]; then
-                echo "Deployment $DEPLOY_ID reached state: $DEPLOY_STATE"
+              if [ "$DEPLOY_STATE" = "completed" ]; then
+                echo "Deployment $DEPLOY_ID reached terminal state: $DEPLOY_STATE"
                 break
               fi
 
@@ -316,39 +320,41 @@ jobs:
                 break
               fi
 
-              echo "  State: $DEPLOY_STATE (waiting...)"
+              echo "  State: $DEPLOY_STATE (waiting for completed...)"
               sleep 15
             done
 
-            if [ "$DEPLOY_STATE" != "running" ] && [ "$DEPLOY_STATE" != "deployed" ] && [ "$DEPLOY_STATE" != "completed" ]; then
-              echo "FAIL: Deployment did not reach running state (last state: $DEPLOY_STATE)"
+            if [ "$DEPLOY_STATE" != "completed" ]; then
+              echo "FAIL: Deployment did not reach completed state (last state: $DEPLOY_STATE)"
               RESULTS+=("$APP_NAME: FAIL (state: $DEPLOY_STATE)")
               FAILED=$((FAILED + 1))
               continue
             fi
 
             # --- Verify app is reachable ---
+            # Even after deployment.status=completed the route table propagation and
+            # container HTTP readiness can lag a few seconds; retry up to ~60s.
             APP_URL="https://$APP_NAME.localho.st:3443/"
             echo "Verifying app at $APP_URL ..."
-            sleep 5
 
-            VERIFY_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$APP_URL" || echo "000")
+            VERIFY_DEADLINE=$((SECONDS + 60))
+            VERIFY_CODE="000"
+            while [ $SECONDS -lt $VERIFY_DEADLINE ]; do
+              VERIFY_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$APP_URL" || echo "000")
+              if [ "$VERIFY_CODE" = "200" ] || [ "$VERIFY_CODE" = "304" ]; then
+                break
+              fi
+              echo "  HTTP $VERIFY_CODE — waiting for app to be reachable..."
+              sleep 5
+            done
 
             if [ "$VERIFY_CODE" = "200" ] || [ "$VERIFY_CODE" = "304" ]; then
               echo "PASS: $APP_NAME is reachable (HTTP $VERIFY_CODE)"
               RESULTS+=("$APP_NAME: PASS (HTTP $VERIFY_CODE)")
             else
-              echo "WARN: $APP_NAME returned HTTP $VERIFY_CODE — retrying..."
-              sleep 10
-              VERIFY_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$APP_URL" || echo "000")
-              if [ "$VERIFY_CODE" = "200" ] || [ "$VERIFY_CODE" = "304" ]; then
-                echo "PASS: $APP_NAME is reachable on retry (HTTP $VERIFY_CODE)"
-                RESULTS+=("$APP_NAME: PASS (HTTP $VERIFY_CODE, retry)")
-              else
-                echo "FAIL: $APP_NAME not reachable (HTTP $VERIFY_CODE)"
-                RESULTS+=("$APP_NAME: FAIL (HTTP $VERIFY_CODE)")
-                FAILED=$((FAILED + 1))
-              fi
+              echo "FAIL: $APP_NAME not reachable (HTTP $VERIFY_CODE)"
+              RESULTS+=("$APP_NAME: FAIL (HTTP $VERIFY_CODE)")
+              FAILED=$((FAILED + 1))
             fi
           done
 
