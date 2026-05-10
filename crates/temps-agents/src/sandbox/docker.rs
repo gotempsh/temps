@@ -232,6 +232,17 @@ RUN groupadd -g 1100 git-users \
 # bypasses that restriction since the host's docker daemon doesn't
 # inherit the no-new-privileges flag.
 RUN mkdir -p {work_dir} && chown {chown} {work_dir}
+# Mark the workspace as a trusted Git directory regardless of stat owner.
+# Without this, `git pull` inside the sandbox fails with "dubious ownership"
+# whenever the bind-mounted host work_dir comes in owned by a uid other
+# than the container's `temps` user (uid 1000) — which happens whenever the
+# host-side temps server runs as root, or when userns-remap is enabled on
+# the host Docker daemon. Both situations are normal on production hosts.
+# The post-start `chown -R` is the primary fix for filesystem semantics,
+# but Git's safety check is independent of permissions, so we belt-and-
+# suspenders it here. Scoped to /home/temps/workspace (not '*') so we
+# don't blanket-trust every repo a user might mount or clone elsewhere.
+RUN git config --system --add safe.directory {work_dir}
 # /run/temps-pty holds one Unix socket per terminal tab (one per {{kind,tab}}
 # pair). dtach creates these sockets on first attach; subsequent reconnects
 # find the existing socket and re-attach instead of respawning the CLI. The
@@ -517,6 +528,94 @@ pub struct DockerSandboxProvider {
 impl DockerSandboxProvider {
     pub fn new(docker: Arc<Docker>, config: DockerSandboxConfig) -> Self {
         Self { docker, config }
+    }
+
+    /// Run a command as root inside a freshly-started sandbox container,
+    /// drain its output, and return its exit code. Used for the post-start
+    /// fix-up steps (chown of home + work dir, AI-CLI restore) where we
+    /// need to know whether the command actually succeeded — earlier
+    /// versions used `let _ = start_exec(...)` and silently masked
+    /// failures, leaving sandboxes with root-owned workspaces that broke
+    /// `git pull` ("dubious ownership") and writes from the temps user.
+    async fn run_root_exec(
+        &self,
+        container_id: &str,
+        run_id: i32,
+        label: &str,
+        cmd: Vec<String>,
+    ) -> Result<i64, AgentError> {
+        let exec = self
+            .docker
+            .create_exec(
+                container_id,
+                bollard::models::ExecConfig {
+                    user: Some("0:0".to_string()),
+                    cmd: Some(cmd),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| AgentError::SandboxCreationFailed {
+                run_id,
+                provider: "docker".to_string(),
+                reason: format!("Failed to create {} exec: {}", label, e),
+            })?;
+
+        let output = self
+            .docker
+            .start_exec(
+                &exec.id,
+                Some(bollard::exec::StartExecOptions {
+                    detach: false,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map_err(|e| AgentError::SandboxCreationFailed {
+                run_id,
+                provider: "docker".to_string(),
+                reason: format!("Failed to start {} exec: {}", label, e),
+            })?;
+
+        // Drain the output stream so the exec actually runs to completion;
+        // bollard tears the exec down when the stream is dropped, which
+        // can race with the underlying command on slow hosts.
+        let mut stderr_tail = String::new();
+        if let StartExecResults::Attached { mut output, .. } = output {
+            while let Some(chunk) = output.next().await {
+                if let Ok(LogOutput::StdErr { message }) = chunk {
+                    let text = String::from_utf8_lossy(&message);
+                    stderr_tail.push_str(&text);
+                }
+            }
+        }
+
+        let exit_code = self
+            .docker
+            .inspect_exec(&exec.id)
+            .await
+            .ok()
+            .and_then(|i| i.exit_code)
+            .unwrap_or(-1);
+
+        if exit_code != 0 {
+            let trimmed = stderr_tail.trim();
+            tracing::error!(
+                "Sandbox {} step '{}' exited {} (stderr: {})",
+                container_id,
+                label,
+                exit_code,
+                if trimmed.is_empty() {
+                    "<empty>"
+                } else {
+                    trimmed
+                }
+            );
+        }
+
+        Ok(exit_code)
     }
 
     /// Build the sandbox image if it doesn't exist.
@@ -1210,41 +1309,18 @@ impl SandboxProvider for DockerSandboxProvider {
         // earlier image builds may be owned by a different uid entirely.
         // Running chown as root (not USER {sandbox-user}) normalizes it
         // every start.
-        {
-            let exec = self
-                .docker
-                .create_exec(
-                    &container.id,
-                    bollard::models::ExecConfig {
-                        user: Some("0:0".to_string()),
-                        cmd: Some(vec![
-                            "chown".to_string(),
-                            "-R".to_string(),
-                            SANDBOX_CHOWN.to_string(),
-                            SANDBOX_HOME.to_string(),
-                        ]),
-                        attach_stdout: Some(true),
-                        attach_stderr: Some(true),
-                        ..Default::default()
-                    },
-                )
-                .await
-                .map_err(|e| AgentError::SandboxCreationFailed {
-                    run_id: config.run_id,
-                    provider: "docker".to_string(),
-                    reason: format!("Failed to create chown exec: {}", e),
-                })?;
-            let _ = self
-                .docker
-                .start_exec(
-                    &exec.id,
-                    Some(bollard::exec::StartExecOptions {
-                        detach: false,
-                        ..Default::default()
-                    }),
-                )
-                .await;
-        }
+        self.run_root_exec(
+            &container.id,
+            config.run_id,
+            "chown-home",
+            vec![
+                "chown".to_string(),
+                "-R".to_string(),
+                SANDBOX_CHOWN.to_string(),
+                SANDBOX_HOME.to_string(),
+            ],
+        )
+        .await?;
 
         // Fix work-dir ownership: the bind-mounted host directory carries
         // its host-side uid into the container, regardless of the image's
@@ -1254,41 +1330,18 @@ impl SandboxProvider for DockerSandboxProvider {
         // Inside the container the sandbox user then can't write — TUIs
         // fail, dev servers can't open lockfiles, etc. Mirror the home-dir
         // fix: recursively chown as root, every start.
-        {
-            let exec = self
-                .docker
-                .create_exec(
-                    &container.id,
-                    bollard::models::ExecConfig {
-                        user: Some("0:0".to_string()),
-                        cmd: Some(vec![
-                            "chown".to_string(),
-                            "-R".to_string(),
-                            SANDBOX_CHOWN.to_string(),
-                            CONTAINER_WORK_DIR.to_string(),
-                        ]),
-                        attach_stdout: Some(true),
-                        attach_stderr: Some(true),
-                        ..Default::default()
-                    },
-                )
-                .await
-                .map_err(|e| AgentError::SandboxCreationFailed {
-                    run_id: config.run_id,
-                    provider: "docker".to_string(),
-                    reason: format!("Failed to create workspace chown exec: {}", e),
-                })?;
-            let _ = self
-                .docker
-                .start_exec(
-                    &exec.id,
-                    Some(bollard::exec::StartExecOptions {
-                        detach: false,
-                        ..Default::default()
-                    }),
-                )
-                .await;
-        }
+        self.run_root_exec(
+            &container.id,
+            config.run_id,
+            "chown-work",
+            vec![
+                "chown".to_string(),
+                "-R".to_string(),
+                SANDBOX_CHOWN.to_string(),
+                CONTAINER_WORK_DIR.to_string(),
+            ],
+        )
+        .await?;
 
         // Ensure AI CLIs are present in the home volume. Named volumes
         // persist across image rebuilds and mask the image's home dir,
@@ -1323,34 +1376,27 @@ impl SandboxProvider for DockerSandboxProvider {
                 chown = SANDBOX_CHOWN,
                 user = SANDBOX_USER,
             );
-            let exec = self
-                .docker
-                .create_exec(
+            // Best-effort: a missing AI-CLI restore shouldn't fail the
+            // whole sandbox creation (the bind-mount + chown above are
+            // already what unblocks `git pull` and the sandbox terminal),
+            // so we log the exit code via run_root_exec but ignore
+            // non-zero results. The helper itself emits a tracing::error
+            // line so the failure is still visible in logs.
+            if let Err(e) = self
+                .run_root_exec(
                     &container.id,
-                    bollard::models::ExecConfig {
-                        user: Some("0:0".to_string()),
-                        cmd: Some(vec!["sh".to_string(), "-c".to_string(), restore_script]),
-                        attach_stdout: Some(true),
-                        attach_stderr: Some(true),
-                        ..Default::default()
-                    },
+                    config.run_id,
+                    "ai-cli-restore",
+                    vec!["sh".to_string(), "-c".to_string(), restore_script],
                 )
                 .await
-                .map_err(|e| AgentError::SandboxCreationFailed {
-                    run_id: config.run_id,
-                    provider: "docker".to_string(),
-                    reason: format!("Failed to create claude-fix exec: {}", e),
-                })?;
-            let _ = self
-                .docker
-                .start_exec(
-                    &exec.id,
-                    Some(bollard::exec::StartExecOptions {
-                        detach: false,
-                        ..Default::default()
-                    }),
-                )
-                .await;
+            {
+                tracing::warn!(
+                    "Sandbox {} ai-cli-restore step failed to launch: {} — continuing",
+                    container.id,
+                    e
+                );
+            }
         }
 
         tracing::info!(
