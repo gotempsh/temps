@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Sandbox `git pull` failed with `fatal: detected dubious ownership`**: `/home/temps/workspace` came up owned by uid `0:0` inside sandbox containers when the host-side `temps` server ran as root or the Docker daemon used userns-remap, so Git refused to operate on the bind-mount. The Dockerfile generator now bakes `git config --system --add safe.directory /home/temps/workspace` into the sandbox image while still root, so Git trusts the workspace regardless of stat owner — belt-and-suspenders against userns-remap and against post-start chown failures. Takes effect after sandbox images are rebuilt and pushed (`SANDBOX_CHANNEL=beta ./scripts/build-sandbox-images.sh`, then promote to `stable`). (#83)
+- **Silent sandbox-creation failures from swallowed exec errors**: `DockerSandboxProvider::create_sandbox` had three `let _ = start_exec(...)` post-start sites (home `chown`, work-dir `chown`, AI-CLI restore) that discarded both the exit code and stderr — so a chown that failed against a userns-remapped container left users with a "successfully created" sandbox that then exploded the first time Git or any uid-sensitive tool ran. Replaced with a new `run_root_exec` helper that drains the output stream, inspects the exit code, and logs stderr on non-zero. The two chown steps now fail sandbox creation visibly instead of leaving a silently broken workspace; the AI-CLI restore stays best-effort but its exit code is logged. (#83)
+
 ## [0.1.0-beta.8] - 2026-05-10
 
 ### Fixed
