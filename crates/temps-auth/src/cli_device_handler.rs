@@ -1,12 +1,10 @@
 //! CLI device-authorization flow (OAuth 2.0 RFC 8628-style).
 //!
-//! Why this exists alongside `cli_auth_handler::cli_login`:
-//!
-//! - Inside workspaces / sandboxes the user does not want to type their
-//!   password into a CLI prompt — they want to confirm the login in the
-//!   regular browser-based login UI.
-//! - SSO / magic-link users have no password at all, so the password
-//!   endpoint is unusable for them.
+//! This is the only interactive login path the CLI exposes — credentials are
+//! always entered in the web UI. The legacy password endpoint was removed:
+//! workspace/sandbox terminals have nothing reasonable to prompt into, and
+//! SSO / magic-link users have no password to type anyway. Headless callers
+//! authenticate with a pre-minted API key from the dashboard.
 //!
 //! Flow:
 //!
@@ -20,10 +18,9 @@
 //!      `GET /auth/cli/device/lookup?user_code=...` (session-authenticated)
 //!      to render device metadata, then `POST /auth/cli/device/approve`
 //!      or `/auth/cli/device/deny`.
-//!   4. On approve, the server mints a fresh API key (same machinery as
-//!      `cli_auth_handler`), stores the plaintext on the session row, and
-//!      flips status to `approved`. The next CLI poll returns the key
-//!      and the plaintext is cleared from the row.
+//!   4. On approve, the server mints a fresh API key, stores the plaintext
+//!      on the session row, and flips status to `approved`. The next CLI
+//!      poll returns the key and the plaintext is cleared from the row.
 //!
 //! Status transitions (all guarded by `expires_at`):
 //!   pending -> approved (terminal, key delivered once)
@@ -699,8 +696,8 @@ fn generate_user_code() -> String {
     out
 }
 
-/// Pick the user's primary role for API-key minting. Mirrors the logic in
-/// `cli_auth_handler::pick_primary_role`.
+/// Pick the user's primary role for API-key minting. Prefers admin > user >
+/// reader, falling back to whatever role the user has if none match.
 fn pick_primary_role(user_with_roles: &crate::user_service::UserWithRoles) -> Option<String> {
     if user_with_roles.roles.is_empty() {
         return None;
@@ -738,9 +735,9 @@ fn sanitize_client_name(raw: Option<&str>) -> Option<String> {
     }
 }
 
-/// Identical sanitization rule used by `cli_auth_handler::sanitize_device_name`
-/// — we splice the result into an API-key name where only `[A-Za-z0-9._-]`
-/// is safe.
+/// Sanitize a device label before splicing it into an API-key name. Keeps
+/// `[A-Za-z0-9._-]`, replaces every other byte with `_`, clamps to 64 chars,
+/// and falls back to `cli` when the result would be empty.
 fn sanitize_device_label(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len().min(64));
     for c in raw.chars().take(64) {

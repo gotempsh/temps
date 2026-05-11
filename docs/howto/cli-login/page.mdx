@@ -12,7 +12,7 @@ export const sections = [
   { title: 'Log in (interactive)', id: 'log-in-interactive' },
   { title: 'Log in from a workspace or sandbox', id: 'log-in-from-a-workspace-or-sandbox' },
   { title: 'Log in from a headless shell or CI', id: 'log-in-from-a-headless-shell-or-ci' },
-  { title: 'Log in with MFA', id: 'log-in-with-mfa' },
+  { title: 'MFA and SSO', id: 'mfa-and-sso' },
   { title: 'Switch between Temps instances', id: 'switch-between-temps-instances' },
   { title: 'Check who you are logged in as', id: 'check-who-you-are-logged-in-as' },
   { title: 'Log out', id: 'log-out' },
@@ -23,7 +23,12 @@ export const sections = [
 
 `bunx @temps-sdk/cli login` authenticates your terminal with a Temps server using a browser-based device flow — modeled after the OAuth 2.0 device-authorization grant. You approve the CLI in the same web UI you already use, and the CLI never sees your password. {{ className: 'lead' }}
 
-This is the default flow. It works for SSO and magic-link accounts (which have no password), inside Temps workspaces and sandboxes, and on any machine where you can open a browser tab — even remotely (you can copy the URL to a different device).
+There are only two ways to authenticate the CLI:
+
+- **Interactive** — the browser device flow described below. Credentials are always entered in the web app.
+- **Headless / CI** — pass a pre-minted API key with `--api-key` (see [Log in from a headless shell or CI](#log-in-from-a-headless-shell-or-ci)).
+
+There is no password prompt in the terminal. The CLI works for password accounts, SSO, and MFA the same way: you sign in once in the browser, then approve the device.
 
 ---
 
@@ -130,31 +135,11 @@ If you want to skip the browser-open attempt entirely (for example, in a `tmux` 
 
 ---
 
-## Log in with MFA {{ anchor: true, id: 'log-in-with-mfa' }}
+## MFA and SSO {{ anchor: true, id: 'mfa-and-sso' }}
 
-The browser flow handles MFA transparently — the regular `/login` page already prompts for your TOTP code when MFA is enabled on your account. Just complete the prompt in the browser before approving the device.
+The browser flow handles MFA and SSO transparently — the `/login` page already prompts for your TOTP code when MFA is enabled, and bounces SSO users through their identity provider. Complete the prompt in the browser before approving the device; the CLI doesn't need to know which authentication factors were involved.
 
-The legacy `--email` flow accepts a one-shot MFA code via `--mfa` for scripts that can supply one:
-
-<CodeGroup title="Email login with MFA (legacy)">
-
-```bash {{ title: 'bunx' }}
-bunx @temps-sdk/cli login \
-  --url https://your-temps-server.com \
-  --email you@example.com \
-  --mfa 123456
-```
-
-```bash {{ title: 'global' }}
-temps login \
-  --url https://your-temps-server.com \
-  --email you@example.com \
-  --mfa 123456
-```
-
-</CodeGroup>
-
-Prefer the API-key path for unattended jobs — a one-shot MFA code in a script defeats the point of MFA.
+For automated jobs that can't sit through an MFA prompt, generate an API key from the dashboard and use the headless path described above. The key inherits the role of the user who created it.
 
 ---
 

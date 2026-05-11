@@ -281,7 +281,6 @@ pub async fn verify_mfa_challenge(
         setup_mfa,
         verify_and_enable_mfa,
         disable_mfa,
-        crate::cli_auth_handler::cli_login,
         crate::cli_auth_handler::cli_logout,
         crate::cli_device_handler::cli_device_start,
         crate::cli_device_handler::cli_device_poll,
@@ -316,8 +315,6 @@ pub async fn verify_mfa_challenge(
             VerifyMfaRequest,
             MfaSetupResponse,
             DisableMfaRequest,
-            crate::cli_auth_handler::CliLoginPasswordRequest,
-            crate::cli_auth_handler::CliLoginResponse,
             crate::cli_device_handler::CliDeviceStartRequest,
             crate::cli_device_handler::CliDeviceStartResponse,
             crate::cli_device_handler::CliDevicePollRequest,
@@ -351,7 +348,6 @@ pub fn configure_routes() -> Router<Arc<AuthState>> {
     let rate_limited_auth_routes = Router::new()
         .route("/auth/login", post(login))
         .route("/auth/verify-mfa", post(verify_mfa_challenge))
-        .route("/auth/cli/login", post(crate::cli_auth_handler::cli_login))
         .route(
             "/auth/cli/device/start",
             post(crate::cli_device_handler::cli_device_start),

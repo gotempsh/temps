@@ -45,15 +45,14 @@ bunx @temps-sdk/cli configure
 
 ## `login`
 
-Authenticate with the current Temps instance
+Authenticate with a Temps server. The default opens your browser to a device-approval page — credentials are entered in the web app, not the terminal. Use `--api-key` for headless / CI. See the [Log in to the Temps CLI](/docs/cli-login) how-to for the full flow.
 
 **Options:**
 
-| Flag                  | Description                           | Default | Required |
-| --------------------- | ------------------------------------- | ------- | -------- |
-| `-k, --api-key <key>` | API key (will prompt if not provided) | -       | Yes      |
-| `--email [email]`     | Login with email and password         | -       | No       |
-| `--magic [email]`     | Login via magic link (email-based)    | -       | No       |
+| Flag                  | Description                                                                                | Default | Required |
+| --------------------- | ------------------------------------------------------------------------------------------ | ------- | -------- |
+| `-k, --api-key <key>` | Use a pre-minted API key (Settings → API Keys) instead of opening the browser              | -       | No       |
+| `--context <name>`    | Save the credentials under this context name (defaults to URL host)                        | -       | No       |
 
 ## `logout`
 

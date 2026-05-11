@@ -6,14 +6,9 @@ import { whoami } from './whoami.js'
 export function registerAuthCommands(program: Command): void {
   program
     .command('login [url]')
-    .description('Authenticate with a Temps server (browser flow by default; email/api-key/magic available as opt-in)')
-    .option('-k, --api-key <key>', 'Paste an API key instead of using the browser flow')
-    .option('--device', 'Force the browser-based device flow (default for interactive sessions)')
-    .option('--email [email]', 'Use the legacy email + password prompt')
-    .option('--password', 'Alias for --email; forces the legacy email + password prompt')
-    .option('--magic [email]', 'Login via magic link (email-based)')
+    .description('Authenticate with a Temps server. Opens the browser for interactive logins; use --api-key for headless / CI.')
+    .option('-k, --api-key <key>', 'Use a pre-minted API key (Settings → API Keys) instead of opening the browser. Required for headless / CI.')
     .option('--context <name>', 'Save the credentials under this context name (defaults to URL host)')
-    .option('--mfa <code>', 'Six-digit TOTP code (use in scripts to skip the interactive prompt)')
     .action(async (url: string | undefined, opts: Record<string, unknown>) => {
       // Forward the positional `url` as if it were `--url`. Commander
       // doesn't surface positional args via opts.

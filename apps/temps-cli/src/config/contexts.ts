@@ -14,7 +14,8 @@
  *   - name           friendly key the user types (e.g. "prod", "local")
  *   - url            base URL of the Temps server (no /api suffix; we
  *                    add it where needed via normalizeApiUrl)
- *   - apiKey         the bearer token minted by /auth/cli/login
+ *   - apiKey         the bearer token (minted by the device-flow approval,
+ *                    or pasted from the dashboard via `--api-key`)
  *   - email          the logged-in user's email (informational)
  *   - keyPrefix      first 8 chars of the API key — lets the user audit
  *                    the key in the web UI without revealing the secret
