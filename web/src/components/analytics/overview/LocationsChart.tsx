@@ -14,6 +14,8 @@ import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { ChevronLeft, ChevronRight, MapPin } from 'lucide-react'
 import * as React from 'react'
+import { useNavigate, useSearchParams } from 'react-router-dom'
+import { buildAnalyticsDimensionUrl } from './viewAllUrl'
 
 type LocationType = 'country' | 'region' | 'city'
 
@@ -36,6 +38,8 @@ export function LocationsChart({
   endDate,
   environment,
 }: LocationsChartProps) {
+  const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
   const [drill, setDrill] = React.useState<DrillState>({ level: 'country' })
 
   const { data, isLoading, error } = useQuery({
@@ -156,11 +160,31 @@ export function LocationsChart({
               )}
             </CardDescription>
           </div>
-          {canDrillDown && !canGoBack && (
-            <Badge variant="outline" className="text-xs">
-              Click to drill down
-            </Badge>
-          )}
+          <div className="flex items-center gap-2">
+            {canDrillDown && !canGoBack && (
+              <Badge variant="outline" className="text-xs">
+                Click to drill down
+              </Badge>
+            )}
+            <Button
+              variant="ghost"
+              size="sm"
+              className="text-xs"
+              onClick={() => {
+                const dim =
+                  drill.level === 'country'
+                    ? 'countries'
+                    : drill.level === 'region'
+                      ? 'regions'
+                      : 'cities'
+                navigate(
+                  buildAnalyticsDimensionUrl(project.slug, dim, searchParams)
+                )
+              }}
+            >
+              View all
+            </Button>
+          </div>
         </div>
       </CardHeader>
       <CardContent className="space-y-6">

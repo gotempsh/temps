@@ -14,6 +14,8 @@ import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { ChevronLeft, Monitor, Smartphone, Tablet } from 'lucide-react'
 import * as React from 'react'
+import { useNavigate, useSearchParams } from 'react-router-dom'
+import { buildAnalyticsDimensionUrl } from './viewAllUrl'
 
 function OsIcon({ os, size = 20 }: { os: string; size?: number }) {
   // Use emoji flags for well-known OSes, with lucide fallback
@@ -21,33 +23,65 @@ function OsIcon({ os, size = 20 }: { os: string; size?: number }) {
 
   if (osLower.includes('windows')) {
     return (
-      <span style={{ fontSize: size - 4, lineHeight: `${size}px` }} role="img" aria-label="Windows">
+      <span
+        style={{ fontSize: size - 4, lineHeight: `${size}px` }}
+        role="img"
+        aria-label="Windows"
+      >
         🪟
       </span>
     )
   }
   if (osLower.includes('mac') || osLower === 'ios') {
     return (
-      <span style={{ fontSize: size - 4, lineHeight: `${size}px` }} role="img" aria-label="Apple">
+      <span
+        style={{ fontSize: size - 4, lineHeight: `${size}px` }}
+        role="img"
+        aria-label="Apple"
+      >
         🍎
       </span>
     )
   }
-  if (osLower.includes('linux') || osLower.includes('ubuntu') || osLower.includes('debian') || osLower.includes('fedora')) {
+  if (
+    osLower.includes('linux') ||
+    osLower.includes('ubuntu') ||
+    osLower.includes('debian') ||
+    osLower.includes('fedora')
+  ) {
     return (
-      <span style={{ fontSize: size - 4, lineHeight: `${size}px` }} role="img" aria-label="Linux">
+      <span
+        style={{ fontSize: size - 4, lineHeight: `${size}px` }}
+        role="img"
+        aria-label="Linux"
+      >
         🐧
       </span>
     )
   }
   if (osLower.includes('android')) {
-    return <Smartphone className="text-muted-foreground" style={{ width: size, height: size }} />
+    return (
+      <Smartphone
+        className="text-muted-foreground"
+        style={{ width: size, height: size }}
+      />
+    )
   }
   if (osLower.includes('chrome')) {
-    return <Tablet className="text-muted-foreground" style={{ width: size, height: size }} />
+    return (
+      <Tablet
+        className="text-muted-foreground"
+        style={{ width: size, height: size }}
+      />
+    )
   }
 
-  return <Monitor className="text-muted-foreground" style={{ width: size, height: size }} />
+  return (
+    <Monitor
+      className="text-muted-foreground"
+      style={{ width: size, height: size }}
+    />
+  )
 }
 
 interface OperatingSystemChartProps {
@@ -63,6 +97,8 @@ export function OperatingSystemChart({
   endDate,
   environment,
 }: OperatingSystemChartProps) {
+  const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
   const [selectedOs, setSelectedOs] = React.useState<string | null>(null)
 
   const groupBy = selectedOs ? 'operating_system_version' : 'operating_system'
@@ -134,11 +170,31 @@ export function OperatingSystemChart({
                 : 'Select a date range'}
             </CardDescription>
           </div>
-          {!selectedOs && (
-            <Badge variant="outline" className="text-xs">
-              Click to drill down
-            </Badge>
-          )}
+          <div className="flex items-center gap-2">
+            {!selectedOs && (
+              <Badge variant="outline" className="text-xs">
+                Click to drill down
+              </Badge>
+            )}
+            {!selectedOs && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="text-xs"
+                onClick={() =>
+                  navigate(
+                    buildAnalyticsDimensionUrl(
+                      project.slug,
+                      'operating_systems',
+                      searchParams
+                    )
+                  )
+                }
+              >
+                View all
+              </Button>
+            )}
+          </div>
         </div>
       </CardHeader>
       <CardContent>

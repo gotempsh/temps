@@ -258,63 +258,96 @@ export function EventDetail({
             </div>
           ) : (
             <>
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Visitor</TableHead>
-                    <TableHead className="text-right">Count</TableHead>
-                    <TableHead>Last Triggered</TableHead>
-                    <TableHead>Browser</TableHead>
-                    <TableHead>Location</TableHead>
-                    <TableHead>Referrer</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {visitorsData.visitors.map((visitor) => (
-                    <TableRow
-                      key={visitor.visitor_id}
-                      className="cursor-pointer hover:bg-muted/50"
-                      onClick={() =>
-                        navigate(
-                          `/projects/${project.slug}/analytics/visitors/${visitor.visitor_id}`
-                        )
-                      }
-                    >
-                      <TableCell>
-                        <div className="flex items-center gap-1.5">
-                          <Users className="h-3 w-3 text-muted-foreground shrink-0" />
-                          <span className="text-sm font-medium">
-                            {visitor.visitor_id}
-                          </span>
-                        </div>
-                      </TableCell>
-                      <TableCell className="text-right">
-                        <Badge variant="secondary" className="text-xs">
-                          {visitor.event_count}x
-                        </Badge>
-                      </TableCell>
-                      <TableCell>
-                        <span className="text-sm text-muted-foreground">
-                          <TimeAgo date={visitor.last_triggered} />
-                        </span>
-                      </TableCell>
-                      <TableCell>
-                        <span className="text-sm text-muted-foreground">
-                          {visitor.browser || '-'}
-                        </span>
-                      </TableCell>
-                      <TableCell>
-                        <VisitorLocation visitor={visitor} />
-                      </TableCell>
-                      <TableCell>
-                        <span className="text-sm text-muted-foreground truncate max-w-[150px] block">
-                          {visitor.referrer_hostname || 'Direct'}
-                        </span>
-                      </TableCell>
+              <div className="overflow-x-auto">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Visitor</TableHead>
+                      <TableHead className="text-right">Count</TableHead>
+                      <TableHead>First → Last</TableHead>
+                      <TableHead className="hidden md:table-cell">
+                        Device
+                      </TableHead>
+                      <TableHead className="hidden lg:table-cell">
+                        Browser
+                      </TableHead>
+                      <TableHead className="hidden md:table-cell">
+                        Location
+                      </TableHead>
+                      <TableHead className="hidden lg:table-cell">
+                        Referrer
+                      </TableHead>
                     </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
+                  </TableHeader>
+                  <TableBody>
+                    {visitorsData.visitors.map((visitor) => (
+                      <TableRow
+                        key={visitor.visitor_id}
+                        className="cursor-pointer hover:bg-muted/50"
+                        onClick={() =>
+                          navigate(
+                            `/projects/${project.slug}/analytics/visitors/${visitor.visitor_id}`
+                          )
+                        }
+                      >
+                        <TableCell>
+                          <div className="flex items-center gap-1.5">
+                            <Users className="h-3 w-3 text-muted-foreground shrink-0" />
+                            <div className="flex flex-col">
+                              <span className="text-sm font-medium font-mono">
+                                {visitor.visitor_uuid?.slice(0, 8) ||
+                                  visitor.visitor_id}
+                              </span>
+                              <span className="text-xs text-muted-foreground">
+                                #{visitor.visitor_id}
+                              </span>
+                            </div>
+                          </div>
+                        </TableCell>
+                        <TableCell className="text-right">
+                          <Badge variant="secondary" className="text-xs">
+                            {visitor.event_count.toLocaleString()}×
+                          </Badge>
+                        </TableCell>
+                        <TableCell>
+                          <div className="flex flex-col leading-tight">
+                            <span className="text-sm">
+                              <TimeAgo date={visitor.last_triggered} />
+                            </span>
+                            {visitor.first_triggered !==
+                              visitor.last_triggered && (
+                              <span className="text-xs text-muted-foreground">
+                                first {format(
+                                  new Date(visitor.first_triggered),
+                                  'MMM d, HH:mm'
+                                )}
+                              </span>
+                            )}
+                          </div>
+                        </TableCell>
+                        <TableCell className="hidden md:table-cell">
+                          <span className="text-sm text-muted-foreground">
+                            {visitor.device_type || '-'}
+                          </span>
+                        </TableCell>
+                        <TableCell className="hidden lg:table-cell">
+                          <span className="text-sm text-muted-foreground">
+                            {visitor.browser || '-'}
+                          </span>
+                        </TableCell>
+                        <TableCell className="hidden md:table-cell">
+                          <VisitorLocation visitor={visitor} />
+                        </TableCell>
+                        <TableCell className="hidden lg:table-cell">
+                          <span className="text-sm text-muted-foreground truncate max-w-[150px] block">
+                            {visitor.referrer_hostname || 'Direct'}
+                          </span>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
 
               {/* Pagination */}
               {totalPages > 1 && (
@@ -494,10 +527,11 @@ function VisitorsTableSkeleton() {
         <TableRow>
           <TableHead>Visitor</TableHead>
           <TableHead className="text-right">Count</TableHead>
-          <TableHead>Last Triggered</TableHead>
-          <TableHead>Browser</TableHead>
-          <TableHead>Location</TableHead>
-          <TableHead>Referrer</TableHead>
+          <TableHead>First → Last</TableHead>
+          <TableHead className="hidden md:table-cell">Device</TableHead>
+          <TableHead className="hidden lg:table-cell">Browser</TableHead>
+          <TableHead className="hidden md:table-cell">Location</TableHead>
+          <TableHead className="hidden lg:table-cell">Referrer</TableHead>
         </TableRow>
       </TableHeader>
       <TableBody>
@@ -506,22 +540,31 @@ function VisitorsTableSkeleton() {
             <TableCell>
               <div className="flex items-center gap-1.5">
                 <Skeleton className="h-3 w-3 rounded-full" />
-                <Skeleton className="h-4 w-16" />
+                <div className="flex flex-col gap-1">
+                  <Skeleton className="h-4 w-16" />
+                  <Skeleton className="h-3 w-10" />
+                </div>
               </div>
             </TableCell>
             <TableCell className="text-right">
               <Skeleton className="h-5 w-8 rounded-full ml-auto" />
             </TableCell>
             <TableCell>
-              <Skeleton className="h-4 w-20" />
+              <div className="flex flex-col gap-1">
+                <Skeleton className="h-4 w-20" />
+                <Skeleton className="h-3 w-24" />
+              </div>
             </TableCell>
-            <TableCell>
+            <TableCell className="hidden md:table-cell">
               <Skeleton className="h-4 w-16" />
             </TableCell>
-            <TableCell>
+            <TableCell className="hidden lg:table-cell">
+              <Skeleton className="h-4 w-16" />
+            </TableCell>
+            <TableCell className="hidden md:table-cell">
               <Skeleton className="h-4 w-20" />
             </TableCell>
-            <TableCell>
+            <TableCell className="hidden lg:table-cell">
               <Skeleton className="h-4 w-24" />
             </TableCell>
           </TableRow>

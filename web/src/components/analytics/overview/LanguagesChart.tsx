@@ -13,6 +13,8 @@ import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { Languages } from 'lucide-react'
 import * as React from 'react'
+import { useNavigate, useSearchParams } from 'react-router-dom'
+import { buildAnalyticsDimensionUrl } from './viewAllUrl'
 
 // Map common language codes to human-readable names
 const LANGUAGE_NAMES: Record<string, string> = {
@@ -96,6 +98,8 @@ export function LanguagesChart({
   endDate,
   environment,
 }: LanguagesChartProps) {
+  const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
   const { data, isLoading, error } = useQuery({
     ...getPropertyBreakdownOptions({
       path: {
@@ -129,18 +133,41 @@ export function LanguagesChart({
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Languages</CardTitle>
-        <CardDescription>
-          {startDate && endDate
-            ? `${format(startDate, 'LLL dd, y')} - ${format(endDate, 'LLL dd, y')}`
-            : 'Select a date range'}
-        </CardDescription>
+        <div className="flex items-center justify-between">
+          <div>
+            <CardTitle>Languages</CardTitle>
+            <CardDescription>
+              {startDate && endDate
+                ? `${format(startDate, 'LLL dd, y')} - ${format(endDate, 'LLL dd, y')}`
+                : 'Select a date range'}
+            </CardDescription>
+          </div>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="text-xs"
+            onClick={() =>
+              navigate(
+                buildAnalyticsDimensionUrl(
+                  project.slug,
+                  'languages',
+                  searchParams
+                )
+              )
+            }
+          >
+            View all
+          </Button>
+        </div>
       </CardHeader>
       <CardContent>
         {isLoading ? (
           <div className="space-y-4 py-4">
             {[...Array(5)].map((_, i) => (
-              <div key={`skeleton-${i}`} className="flex items-center justify-between">
+              <div
+                key={`skeleton-${i}`}
+                className="flex items-center justify-between"
+              >
                 <div className="h-4 w-[150px] bg-muted animate-pulse rounded" />
                 <div className="h-4 w-[100px] bg-muted animate-pulse rounded" />
               </div>

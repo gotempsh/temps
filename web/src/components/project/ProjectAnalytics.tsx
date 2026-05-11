@@ -64,7 +64,10 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { SetupWizardShell, WizardStepId } from '@/components/project/setup/SetupWizardShell'
+import {
+  SetupWizardShell,
+  WizardStepId,
+} from '@/components/project/setup/SetupWizardShell'
 import VisitorAnalytics from '@/components/visitors/VisitorAnalytics'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -104,6 +107,11 @@ import {
   useSearchParams,
 } from 'react-router-dom'
 import { EventDetail } from '@/components/analytics/EventDetail'
+import {
+  DimensionList,
+  isDimensionKey,
+  type DimensionKey,
+} from '@/components/analytics/DimensionList'
 
 import { Badge } from '@/components/ui/badge'
 import { Line, LineChart, XAxis, YAxis } from 'recharts'
@@ -138,7 +146,9 @@ export function VisitorChart({
   const [refAreaLeft, setRefAreaLeft] = React.useState<number | null>(null)
   const [refAreaRight, setRefAreaRight] = React.useState<number | null>(null)
   const [dragPixelLeft, setDragPixelLeft] = React.useState<number | null>(null)
-  const [dragPixelRight, setDragPixelRight] = React.useState<number | null>(null)
+  const [dragPixelRight, setDragPixelRight] = React.useState<number | null>(
+    null
+  )
   const isDragging = React.useRef(false)
   const chartContainerRef = React.useRef<HTMLDivElement>(null)
 
@@ -313,7 +323,9 @@ export function VisitorChart({
   return (
     <div className="space-y-4">
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <CardTitle className="text-base sm:text-lg">{getChartTitle()}</CardTitle>
+        <CardTitle className="text-base sm:text-lg">
+          {getChartTitle()}
+        </CardTitle>
         <div className="flex items-center gap-2">
           {onZoom && (
             <span className="text-xs text-muted-foreground hidden sm:inline">
@@ -547,7 +559,11 @@ function AnalyticsFilters({
                 }
                 selected={dateRange}
                 onSelect={onDateRangeChange}
-                numberOfMonths={typeof window !== 'undefined' && window.innerWidth < 640 ? 1 : 2}
+                numberOfMonths={
+                  typeof window !== 'undefined' && window.innerWidth < 640
+                    ? 1
+                    : 2
+                }
                 disabled={(date) => date > new Date()}
                 toDate={new Date()}
                 fromDate={
@@ -590,9 +606,7 @@ function AnalyticsFilters({
                     type="time"
                     className="h-8 text-xs"
                     value={
-                      dateRange?.to
-                        ? format(dateRange.to, 'HH:mm')
-                        : '23:59'
+                      dateRange?.to ? format(dateRange.to, 'HH:mm') : '23:59'
                     }
                     onChange={(e) => {
                       if (!dateRange?.to) return
@@ -758,12 +772,29 @@ interface EventDetailTabProps {
 function EventDetailTab({ project }: EventDetailTabProps) {
   const { eventName: rawEventName } = useParams<{ eventName: string }>()
   const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
   const eventName = rawEventName ? decodeURIComponent(rawEventName) : ''
 
-  const [dateFilter, setDateFilter] = React.useState<AnalyticsDateFilter>({
-    quickFilter: '24hours',
-    dateRange: undefined,
-  })
+  // Restore date filter from URL search params (preserves context from overview).
+  // Supports both quick filters (today/24hours/7days/30days) and custom ranges.
+  const [dateFilter, setDateFilter] = React.useState<AnalyticsDateFilter>(
+    () => {
+      const filter = searchParams.get('filter') as QuickFilter | null
+      const from = searchParams.get('from')
+      const to = searchParams.get('to')
+
+      if (filter === 'custom' && from && to) {
+        return {
+          quickFilter: 'custom',
+          dateRange: { from: new Date(from), to: new Date(to) },
+        }
+      }
+      if (filter && QUICK_FILTERS.some((f) => f.value === filter)) {
+        return { quickFilter: filter, dateRange: undefined }
+      }
+      return { quickFilter: '24hours', dateRange: undefined }
+    }
+  )
   const [selectedEnvironment, setSelectedEnvironment] = React.useState<
     number | undefined
   >(undefined)
@@ -771,6 +802,28 @@ function EventDetailTab({ project }: EventDetailTabProps) {
   const queryClient = useQueryClient()
 
   const { startDate, endDate } = getDateRangeFromFilter(dateFilter)
+
+  // Sync date filter to URL so deep links and back-navigation keep the range.
+  const updateDateFilter = React.useCallback(
+    (next: AnalyticsDateFilter) => {
+      setDateFilter(next)
+      const params = new URLSearchParams(searchParams)
+      params.set('filter', next.quickFilter)
+      if (
+        next.quickFilter === 'custom' &&
+        next.dateRange?.from &&
+        next.dateRange?.to
+      ) {
+        params.set('from', next.dateRange.from.toISOString())
+        params.set('to', next.dateRange.to.toISOString())
+      } else {
+        params.delete('from')
+        params.delete('to')
+      }
+      setSearchParams(params, { replace: true })
+    },
+    [searchParams, setSearchParams]
+  )
 
   const handleRefresh = React.useCallback(() => {
     setIsRefreshing(true)
@@ -803,13 +856,13 @@ function EventDetailTab({ project }: EventDetailTabProps) {
         dateRange={dateFilter.dateRange}
         selectedEnvironment={selectedEnvironment}
         onFilterChange={(filter) =>
-          setDateFilter((prev) => ({ ...prev, quickFilter: filter }))
+          updateDateFilter({ ...dateFilter, quickFilter: filter })
         }
         onDateRangeChange={(range) =>
-          setDateFilter((prev) => ({
-            quickFilter: range ? 'custom' : prev.quickFilter,
+          updateDateFilter({
+            quickFilter: range ? 'custom' : dateFilter.quickFilter,
             dateRange: range,
-          }))
+          })
         }
         onEnvironmentChange={setSelectedEnvironment}
         onRefresh={handleRefresh}
@@ -822,7 +875,155 @@ function EventDetailTab({ project }: EventDetailTabProps) {
         startDate={startDate}
         endDate={endDate}
         environment={selectedEnvironment}
-        onBack={() => navigate(`/projects/${project.slug}/analytics`)}
+        onBack={() => {
+          // Preserve the current date filter on the way back to the overview.
+          const params = new URLSearchParams()
+          params.set('filter', dateFilter.quickFilter)
+          if (
+            dateFilter.quickFilter === 'custom' &&
+            dateFilter.dateRange?.from &&
+            dateFilter.dateRange?.to
+          ) {
+            params.set('from', dateFilter.dateRange.from.toISOString())
+            params.set('to', dateFilter.dateRange.to.toISOString())
+          }
+          const qs = params.toString()
+          navigate(
+            `/projects/${project.slug}/analytics${qs ? `?${qs}` : ''}`
+          )
+        }}
+      />
+    </div>
+  )
+}
+
+// Dimension List Tab — generic "view all" page for any property breakdown.
+interface DimensionTabProps {
+  project: ProjectResponse
+}
+
+function DimensionTab({ project }: DimensionTabProps) {
+  const { dimension: rawDimension } = useParams<{ dimension: string }>()
+  const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
+
+  // Restore date filter from URL search params (preserves context from overview)
+  const [dateFilter, setDateFilter] = React.useState<AnalyticsDateFilter>(
+    () => {
+      const filter = searchParams.get('filter') as QuickFilter | null
+      const from = searchParams.get('from')
+      const to = searchParams.get('to')
+
+      if (filter === 'custom' && from && to) {
+        return {
+          quickFilter: 'custom',
+          dateRange: { from: new Date(from), to: new Date(to) },
+        }
+      }
+      if (filter && QUICK_FILTERS.some((f) => f.value === filter)) {
+        return { quickFilter: filter, dateRange: undefined }
+      }
+      return { quickFilter: '24hours', dateRange: undefined }
+    }
+  )
+  const [selectedEnvironment, setSelectedEnvironment] = React.useState<
+    number | undefined
+  >(undefined)
+  const [isRefreshing, setIsRefreshing] = React.useState(false)
+  const queryClient = useQueryClient()
+
+  const { startDate, endDate } = getDateRangeFromFilter(dateFilter)
+
+  const handleRefresh = React.useCallback(() => {
+    setIsRefreshing(true)
+    queryClient.invalidateQueries({
+      predicate: (query) => {
+        const key = query.queryKey[0] as string
+        return !!(
+          key &&
+          typeof key === 'string' &&
+          (key.includes('getPropertyBreakdown') ||
+            key.includes('getEventsCount'))
+        )
+      },
+    })
+    setTimeout(() => setIsRefreshing(false), 1000)
+  }, [queryClient])
+
+  const updateDateFilter = React.useCallback(
+    (next: AnalyticsDateFilter) => {
+      setDateFilter(next)
+      const params = new URLSearchParams(searchParams)
+      params.set('filter', next.quickFilter)
+      if (
+        next.quickFilter === 'custom' &&
+        next.dateRange?.from &&
+        next.dateRange?.to
+      ) {
+        params.set('from', next.dateRange.from.toISOString())
+        params.set('to', next.dateRange.to.toISOString())
+      } else {
+        params.delete('from')
+        params.delete('to')
+      }
+      setSearchParams(params, { replace: true })
+    },
+    [searchParams, setSearchParams]
+  )
+
+  if (!isDimensionKey(rawDimension)) {
+    return (
+      <div className="p-8 text-center">
+        <p className="text-sm text-muted-foreground">
+          Unknown analytics dimension: {rawDimension}
+        </p>
+      </div>
+    )
+  }
+
+  const dimension: DimensionKey = rawDimension
+
+  return (
+    <div className="space-y-6">
+      <AnalyticsFilters
+        project={project}
+        activeFilter={dateFilter.quickFilter}
+        dateRange={dateFilter.dateRange}
+        selectedEnvironment={selectedEnvironment}
+        onFilterChange={(filter) =>
+          updateDateFilter({ ...dateFilter, quickFilter: filter })
+        }
+        onDateRangeChange={(range) =>
+          updateDateFilter({
+            quickFilter: range ? 'custom' : dateFilter.quickFilter,
+            dateRange: range,
+          })
+        }
+        onEnvironmentChange={setSelectedEnvironment}
+        onRefresh={handleRefresh}
+        isRefreshing={isRefreshing}
+      />
+
+      <DimensionList
+        project={project}
+        dimension={dimension}
+        startDate={startDate}
+        endDate={endDate}
+        environment={selectedEnvironment}
+        onBack={() => {
+          const params = new URLSearchParams()
+          params.set('filter', dateFilter.quickFilter)
+          if (
+            dateFilter.quickFilter === 'custom' &&
+            dateFilter.dateRange?.from &&
+            dateFilter.dateRange?.to
+          ) {
+            params.set('from', dateFilter.dateRange.from.toISOString())
+            params.set('to', dateFilter.dateRange.to.toISOString())
+          }
+          const qs = params.toString()
+          navigate(`/projects/${project.slug}/analytics${qs ? `?${qs}` : ''}`)
+        }}
       />
     </div>
   )
@@ -916,11 +1117,7 @@ function JourneyTab({ project }: JourneyTabProps) {
     queryClient.invalidateQueries({
       predicate: (query) => {
         const key = query.queryKey[0] as string
-        return !!(
-          key &&
-          typeof key === 'string' &&
-          key.includes('getPageFlow')
-        )
+        return !!(key && typeof key === 'string' && key.includes('getPageFlow'))
       },
     })
     setTimeout(() => setIsRefreshing(false), 1000)
@@ -976,17 +1173,18 @@ export function ProjectAnalytics({ project }: ProjectAnalyticsProps) {
         element={<VisitorAnalytics project={project} />}
       />
       <Route path="pages" element={<PagesTab project={project} />} />
-      <Route path="events/:eventName" element={<EventDetailTab project={project} />} />
+      <Route
+        path="events/:eventName"
+        element={<EventDetailTab project={project} />}
+      />
+      <Route
+        path="dimensions/:dimension"
+        element={<DimensionTab project={project} />}
+      />
       <Route path="replays" element={<SessionReplaysTab project={project} />} />
       <Route path="setup" element={<AnalyticsSetup project={project} />} />
-      <Route
-        path="live"
-        element={<LiveGlobePage project={project} />}
-      />
-      <Route
-        path="globe"
-        element={<VisitorGlobePage project={project} />}
-      />
+      <Route path="live" element={<LiveGlobePage project={project} />} />
+      <Route path="globe" element={<VisitorGlobePage project={project} />} />
       <Route path="journey" element={<JourneyTab project={project} />} />
     </Routes>
   )
@@ -1158,7 +1356,11 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
             dateRange={dateFilter.dateRange}
             selectedEnvironment={selectedEnvironment}
             onFilterChange={(filter) =>
-              updateDateFilter({ ...dateFilter, quickFilter: filter, dateRange: undefined })
+              updateDateFilter({
+                ...dateFilter,
+                quickFilter: filter,
+                dateRange: undefined,
+              })
             }
             onDateRangeChange={(range) =>
               updateDateFilter({
@@ -1186,7 +1388,10 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
                   size="sm"
                   className="h-7 text-xs gap-1.5"
                   onClick={() =>
-                    updateDateFilter({ quickFilter: '30days', dateRange: undefined })
+                    updateDateFilter({
+                      quickFilter: '30days',
+                      dateRange: undefined,
+                    })
                   }
                 >
                   <RotateCcw className="h-3.5 w-3.5" />
@@ -1303,6 +1508,7 @@ interface ChartProps {
 
 function EventsChart({ project, startDate, endDate, environment }: ChartProps) {
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
   const { data, isLoading, error } = useQuery({
     ...getEventsCountOptions({
       path: {
@@ -1330,15 +1536,46 @@ function EventsChart({ project, startDate, endDate, environment }: ChartProps) {
       }))
   }, [data])
 
+  const totalEvents = data?.length ?? 0
+  const hasMore = totalEvents > chartData.length
+
+  const handleViewAll = React.useCallback(() => {
+    const params = new URLSearchParams()
+    const filter = searchParams.get('filter')
+    const from = searchParams.get('from')
+    const to = searchParams.get('to')
+    if (filter) params.set('filter', filter)
+    if (from) params.set('from', from)
+    if (to) params.set('to', to)
+    const qs = params.toString()
+    navigate(
+      `/projects/${project.slug}/analytics/dimensions/events${qs ? `?${qs}` : ''}`
+    )
+  }, [navigate, project.slug, searchParams])
+
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Events</CardTitle>
-        <CardDescription>
-          {startDate && endDate
-            ? `${format(startDate, 'LLL dd, y')} - ${format(endDate, 'LLL dd, y')}`
-            : 'Select a date range'}
-        </CardDescription>
+        <div className="flex items-center justify-between">
+          <div>
+            <CardTitle>Events</CardTitle>
+            <CardDescription>
+              {startDate && endDate
+                ? `${format(startDate, 'LLL dd, y')} - ${format(endDate, 'LLL dd, y')}`
+                : 'Select a date range'}
+            </CardDescription>
+          </div>
+          {!isLoading && !error && chartData.length > 0 && (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="text-xs"
+              onClick={handleViewAll}
+            >
+              View all
+            </Button>
+          )}
+        </div>
       </CardHeader>
       <CardContent>
         {isLoading ? (
@@ -1386,7 +1623,16 @@ function EventsChart({ project, startDate, endDate, environment }: ChartProps) {
                   key={item.event}
                   className="cursor-pointer hover:bg-muted/50"
                   onClick={(e) => {
-                    const url = `/projects/${project.slug}/analytics/events/${encodeURIComponent(item.event)}`
+                    // Carry the active date filter into the event detail page.
+                    const params = new URLSearchParams()
+                    const filter = searchParams.get('filter')
+                    const from = searchParams.get('from')
+                    const to = searchParams.get('to')
+                    if (filter) params.set('filter', filter)
+                    if (from) params.set('from', from)
+                    if (to) params.set('to', to)
+                    const qs = params.toString()
+                    const url = `/projects/${project.slug}/analytics/events/${encodeURIComponent(item.event)}${qs ? `?${qs}` : ''}`
                     if (e.metaKey || e.ctrlKey) {
                       window.open(url, '_blank')
                     } else {
@@ -1410,7 +1656,9 @@ function EventsChart({ project, startDate, endDate, environment }: ChartProps) {
       {!isLoading && !error && chartData.length > 0 && (
         <CardFooter className="flex-col gap-2 text-sm">
           <div className="leading-none text-muted-foreground">
-            Showing top {chartData.length} events by count
+            Showing top {chartData.length} of {totalEvents.toLocaleString()}{' '}
+            event{totalEvents === 1 ? '' : 's'} by count
+            {hasMore ? ' — click "View all" to see the rest' : ''}
           </div>
         </CardFooter>
       )}
@@ -1995,7 +2243,9 @@ After implementation:
             <div className="space-y-3">
               <div className="flex items-center gap-2">
                 <FileCode className="size-4 text-muted-foreground" />
-                <h3 className="text-sm font-medium">3. Environment variables</h3>
+                <h3 className="text-sm font-medium">
+                  3. Environment variables
+                </h3>
               </div>
               <CodeBlock
                 language="bash"
@@ -2006,10 +2256,7 @@ After implementation:
           )}
 
           <div className="flex items-center justify-between gap-3 pt-2">
-            <Button
-              variant="ghost"
-              onClick={() => setWizardStep('framework')}
-            >
+            <Button variant="ghost" onClick={() => setWizardStep('framework')}>
               <ArrowLeft className="mr-2 size-4" />
               Back
             </Button>
@@ -2027,13 +2274,12 @@ After implementation:
             {hasEventsData?.has_events ? (
               <>
                 <div className="flex size-14 items-center justify-center rounded-full bg-emerald-500/10">
-                  <Check
-                    className="size-7 text-emerald-500"
-                    strokeWidth={3}
-                  />
+                  <Check className="size-7 text-emerald-500" strokeWidth={3} />
                 </div>
                 <div className="space-y-1">
-                  <h3 className="text-lg font-semibold">First event received</h3>
+                  <h3 className="text-lg font-semibold">
+                    First event received
+                  </h3>
                   <p className="text-sm text-muted-foreground">
                     Taking you to your analytics dashboard…
                   </p>

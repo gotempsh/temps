@@ -12,6 +12,8 @@ import {
 } from '@/components/ui/card'
 import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
+import { useNavigate, useSearchParams } from 'react-router-dom'
+import { buildAnalyticsDimensionUrl } from './viewAllUrl'
 import type { LucideIcon } from 'lucide-react'
 import {
   ChevronLeft,
@@ -95,8 +97,10 @@ export function ChannelsChart({
   endDate,
   environment,
 }: ChannelsChartProps) {
+  const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
   const [selectedChannel, setSelectedChannel] = React.useState<string | null>(
-    null,
+    null
   )
 
   // Main query: channel list or referrer_hostname drill-down
@@ -158,11 +162,31 @@ export function ChannelsChart({
                 : 'Select a date range'}
             </CardDescription>
           </div>
-          {!selectedChannel && (
-            <Badge variant="outline" className="text-xs">
-              Click to drill down
-            </Badge>
-          )}
+          <div className="flex items-center gap-2">
+            {!selectedChannel && (
+              <Badge variant="outline" className="text-xs">
+                Click to drill down
+              </Badge>
+            )}
+            {!selectedChannel && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="text-xs"
+                onClick={() =>
+                  navigate(
+                    buildAnalyticsDimensionUrl(
+                      project.slug,
+                      'channels',
+                      searchParams
+                    )
+                  )
+                }
+              >
+                View all
+              </Button>
+            )}
+          </div>
         </div>
       </CardHeader>
       <CardContent>
@@ -228,10 +252,7 @@ export function ChannelsChart({
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-3">
                       {selectedChannel ? (
-                        <ReferrerIcon
-                          domain={item.value}
-                          className="h-5 w-5"
-                        />
+                        <ReferrerIcon domain={item.value} className="h-5 w-5" />
                       ) : Icon ? (
                         <Icon className="h-5 w-5 text-muted-foreground" />
                       ) : null}

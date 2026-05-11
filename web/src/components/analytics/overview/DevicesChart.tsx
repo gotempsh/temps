@@ -14,6 +14,8 @@ import { format } from 'date-fns'
 import type { LucideIcon } from 'lucide-react'
 import { BarChart3, Monitor, Smartphone, Tablet } from 'lucide-react'
 import * as React from 'react'
+import { useNavigate, useSearchParams } from 'react-router-dom'
+import { buildAnalyticsDimensionUrl } from './viewAllUrl'
 
 const DEVICE_ICONS: Record<string, LucideIcon> = {
   Desktop: Monitor,
@@ -40,6 +42,8 @@ export function DevicesChart({
   endDate,
   environment,
 }: DevicesChartProps) {
+  const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
   const { data, isLoading, error } = useQuery({
     ...getPropertyBreakdownOptions({
       path: {
@@ -73,18 +77,41 @@ export function DevicesChart({
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Devices</CardTitle>
-        <CardDescription>
-          {startDate && endDate
-            ? `${format(startDate, 'LLL dd, y')} - ${format(endDate, 'LLL dd, y')}`
-            : 'Select a date range'}
-        </CardDescription>
+        <div className="flex items-center justify-between">
+          <div>
+            <CardTitle>Devices</CardTitle>
+            <CardDescription>
+              {startDate && endDate
+                ? `${format(startDate, 'LLL dd, y')} - ${format(endDate, 'LLL dd, y')}`
+                : 'Select a date range'}
+            </CardDescription>
+          </div>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="text-xs"
+            onClick={() =>
+              navigate(
+                buildAnalyticsDimensionUrl(
+                  project.slug,
+                  'devices',
+                  searchParams
+                )
+              )
+            }
+          >
+            View all
+          </Button>
+        </div>
       </CardHeader>
       <CardContent>
         {isLoading ? (
           <div className="space-y-4 py-4">
             {[...Array(3)].map((_, i) => (
-              <div key={`skeleton-${i}`} className="flex items-center justify-between">
+              <div
+                key={`skeleton-${i}`}
+                className="flex items-center justify-between"
+              >
                 <div className="h-4 w-[150px] bg-muted animate-pulse rounded" />
                 <div className="h-4 w-[100px] bg-muted animate-pulse rounded" />
               </div>

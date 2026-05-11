@@ -14,6 +14,8 @@ import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { Megaphone } from 'lucide-react'
 import * as React from 'react'
+import { useNavigate, useSearchParams } from 'react-router-dom'
+import { buildAnalyticsDimensionUrl } from './viewAllUrl'
 
 type UtmDimension =
   | 'utm_source'
@@ -43,6 +45,8 @@ export function UTMCampaignsChart({
   endDate,
   environment,
 }: UTMCampaignsChartProps) {
+  const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
   const [dimension, setDimension] = React.useState<UtmDimension>('utm_source')
 
   const { data, isLoading, error } = useQuery({
@@ -87,7 +91,7 @@ export function UTMCampaignsChart({
                 : 'Select a date range'}
             </CardDescription>
           </div>
-          <div className="flex flex-wrap gap-1">
+          <div className="flex flex-wrap items-center gap-1">
             {(Object.keys(UTM_LABELS) as UtmDimension[]).map((dim) => (
               <Badge
                 key={dim}
@@ -98,6 +102,22 @@ export function UTMCampaignsChart({
                 {UTM_LABELS[dim]}
               </Badge>
             ))}
+            <Button
+              variant="ghost"
+              size="sm"
+              className="text-xs"
+              onClick={() =>
+                navigate(
+                  buildAnalyticsDimensionUrl(
+                    project.slug,
+                    dimension,
+                    searchParams
+                  )
+                )
+              }
+            >
+              View all
+            </Button>
           </div>
         </div>
       </CardHeader>
@@ -105,7 +125,10 @@ export function UTMCampaignsChart({
         {isLoading ? (
           <div className="space-y-4 py-4">
             {[...Array(5)].map((_, i) => (
-              <div key={`skeleton-${i}`} className="flex items-center justify-between">
+              <div
+                key={`skeleton-${i}`}
+                className="flex items-center justify-between"
+              >
                 <div className="h-4 w-[150px] bg-muted animate-pulse rounded" />
                 <div className="h-4 w-[100px] bg-muted animate-pulse rounded" />
               </div>
@@ -168,8 +191,8 @@ export function UTMCampaignsChart({
       {!isLoading && !error && sortedItems.length > 0 && (
         <CardFooter className="flex-col items-start gap-2 text-sm">
           <div className="leading-none text-muted-foreground">
-            Showing top {sortedItems.length} UTM {UTM_LABELS[dimension].toLowerCase()}s by unique
-            visitors
+            Showing top {sortedItems.length} UTM{' '}
+            {UTM_LABELS[dimension].toLowerCase()}s by unique visitors
           </div>
         </CardFooter>
       )}

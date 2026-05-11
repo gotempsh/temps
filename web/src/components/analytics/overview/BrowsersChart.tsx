@@ -15,6 +15,8 @@ import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { ChevronLeft } from 'lucide-react'
 import * as React from 'react'
+import { useNavigate, useSearchParams } from 'react-router-dom'
+import { buildAnalyticsDimensionUrl } from './viewAllUrl'
 
 interface BrowsersChartProps {
   project: ProjectResponse
@@ -29,8 +31,10 @@ export function BrowsersChart({
   endDate,
   environment,
 }: BrowsersChartProps) {
+  const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
   const [selectedBrowser, setSelectedBrowser] = React.useState<string | null>(
-    null,
+    null
   )
 
   const groupBy = selectedBrowser ? 'browser_version' : 'browser'
@@ -81,9 +85,7 @@ export function BrowsersChart({
                   <ChevronLeft className="h-4 w-4" />
                 </Button>
               )}
-              {selectedBrowser
-                ? `${selectedBrowser} Versions`
-                : 'Browsers'}
+              {selectedBrowser ? `${selectedBrowser} Versions` : 'Browsers'}
             </CardTitle>
             <CardDescription>
               {startDate && endDate
@@ -91,11 +93,31 @@ export function BrowsersChart({
                 : 'Select a date range'}
             </CardDescription>
           </div>
-          {!selectedBrowser && (
-            <Badge variant="outline" className="text-xs">
-              Click to drill down
-            </Badge>
-          )}
+          <div className="flex items-center gap-2">
+            {!selectedBrowser && (
+              <Badge variant="outline" className="text-xs">
+                Click to drill down
+              </Badge>
+            )}
+            {!selectedBrowser && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="text-xs"
+                onClick={() =>
+                  navigate(
+                    buildAnalyticsDimensionUrl(
+                      project.slug,
+                      'browsers',
+                      searchParams
+                    )
+                  )
+                }
+              >
+                View all
+              </Button>
+            )}
+          </div>
         </div>
       </CardHeader>
       <CardContent>

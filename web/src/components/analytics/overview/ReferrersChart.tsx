@@ -14,6 +14,8 @@ import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { ChevronLeft, Globe, Link } from 'lucide-react'
 import * as React from 'react'
+import { useNavigate, useSearchParams } from 'react-router-dom'
+import { buildAnalyticsDimensionUrl } from './viewAllUrl'
 
 interface ReferrerIconProps {
   domain: string
@@ -131,8 +133,10 @@ export function ReferrersChart({
   endDate,
   environment,
 }: ReferrersChartProps) {
+  const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
   const [selectedReferrer, setSelectedReferrer] = React.useState<string | null>(
-    null,
+    null
   )
 
   const { data, isLoading, error } = useQuery({
@@ -190,7 +194,7 @@ export function ReferrersChart({
   // Detail view for a selected referrer
   if (selectedReferrer) {
     const referrer = sortedReferrers.find(
-      (r) => r.hostname === selectedReferrer,
+      (r) => r.hostname === selectedReferrer
     )
     return (
       <Card>
@@ -276,9 +280,27 @@ export function ReferrersChart({
                 : 'Select a date range'}
             </CardDescription>
           </div>
-          <Badge variant="outline" className="text-xs">
-            Click for details
-          </Badge>
+          <div className="flex items-center gap-2">
+            <Badge variant="outline" className="text-xs">
+              Click for details
+            </Badge>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="text-xs"
+              onClick={() =>
+                navigate(
+                  buildAnalyticsDimensionUrl(
+                    project.slug,
+                    'referrers',
+                    searchParams
+                  )
+                )
+              }
+            >
+              View all
+            </Button>
+          </div>
         </div>
       </CardHeader>
       <CardContent>
