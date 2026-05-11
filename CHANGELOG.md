@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
--
+- **CLI device-authorization (browser) login flow**: `bunx @temps-sdk/cli login` no longer prompts for a password in the terminal. The CLI requests a `device_code` + short `user_code` from the new `POST /auth/cli/device/start` endpoint, opens the matching `/cli-login/:userCode` page in the user's default browser (best-effort `open` / `xdg-open` / `start`, with a printed URL fallback for headless / SSH / sandbox shells), and polls `POST /auth/cli/device/poll` until the user approves the device in the existing web `/login` flow. The approval page is mounted inside `ProtectedLayout` so unauthenticated users get bounced through the standard login screen — no fork of the auth UI. New backing table `cli_login_sessions` tracks `device_code` / `user_code` / status, mints the API key on approval, and delivers the plaintext to the CLI exactly once before clearing it. The OAuth 2.0 device-flow status codes (`authorization_pending`, `slow_down`, `access_denied`, `expired_token`, `approved`) are honoured; `slow_down` doubles the CLI's polling interval up to a 10s cap. Default for all interactive `temps login` invocations; legacy `--email` / `--password` / `--magic` / `--api-key` flows remain available as opt-in for scripts. Critical for workspace/sandbox environments where `bunx @temps-sdk/cli` runs inside a container with no password to type, and for SSO / magic-link accounts that have no password at all. See [docs/howto/cli-login](docs/howto/cli-login/page.mdx) for the full flow including the `--api-key` script path and `TEMPS_NO_BROWSER` for headless CI.
 
 ### Changed
 -

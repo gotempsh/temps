@@ -1,0 +1,233 @@
+export const metadata = {
+  title: 'Log in to the Temps CLI',
+  description:
+    'Authenticate `bunx @temps-sdk/cli` using the browser-based device flow. Covers interactive logins, headless scripts, MFA, workspaces, and switching between multiple Temps instances.',
+  alternates: {
+    canonical: '/docs/cli-login',
+  },
+}
+
+export const sections = [
+  { title: 'How the browser flow works', id: 'how-the-browser-flow-works' },
+  { title: 'Log in (interactive)', id: 'log-in-interactive' },
+  { title: 'Log in from a workspace or sandbox', id: 'log-in-from-a-workspace-or-sandbox' },
+  { title: 'Log in from a headless shell or CI', id: 'log-in-from-a-headless-shell-or-ci' },
+  { title: 'Log in with MFA', id: 'log-in-with-mfa' },
+  { title: 'Switch between Temps instances', id: 'switch-between-temps-instances' },
+  { title: 'Check who you are logged in as', id: 'check-who-you-are-logged-in-as' },
+  { title: 'Log out', id: 'log-out' },
+  { title: 'Troubleshooting', id: 'troubleshooting' },
+]
+
+# Log in to the Temps CLI
+
+`bunx @temps-sdk/cli login` authenticates your terminal with a Temps server using a browser-based device flow — modeled after the OAuth 2.0 device-authorization grant. You approve the CLI in the same web UI you already use, and the CLI never sees your password. {{ className: 'lead' }}
+
+This is the default flow. It works for SSO and magic-link accounts (which have no password), inside Temps workspaces and sandboxes, and on any machine where you can open a browser tab — even remotely (you can copy the URL to a different device).
+
+---
+
+## How the browser flow works {{ anchor: true, id: 'how-the-browser-flow-works' }}
+
+1. The CLI asks the server for a `device_code` and a short, human-readable `user_code`.
+2. The CLI prints the approval URL and tries to open it in your default browser.
+3. You sign in to the Temps web app (if you aren't already), then approve the device — the page shows the `user_code` so you can confirm it matches the CLI.
+4. Once you approve, the server mints a CLI API key. The CLI is polling in the background; it picks up the key and stores it locally.
+
+You see the plaintext API key exactly once — the CLI persists it to your credential store and the server never returns it again. Approvals expire after 15 minutes if you don't act on them.
+
+---
+
+## Log in (interactive) {{ anchor: true, id: 'log-in-interactive' }}
+
+The simplest case — your laptop, a real terminal, your default browser:
+
+<CodeGroup title="Log in">
+
+```bash {{ title: 'bunx' }}
+bunx @temps-sdk/cli login https://your-temps-server.com
+```
+
+```bash {{ title: 'npx' }}
+npx @temps-sdk/cli login https://your-temps-server.com
+```
+
+```bash {{ title: 'global' }}
+temps login https://your-temps-server.com
+```
+
+</CodeGroup>
+
+You will see something like:
+
+```
+┌── ✨ Authorize the Temps CLI ─────────────────────────────────┐
+│ Open this URL to authorize:                                   │
+│   https://your-temps-server.com/cli-login/ABCD-1234           │
+│                                                               │
+│ If your browser doesn't open automatically, paste the code:   │
+│   ABCD-1234                                                   │
+│ at https://your-temps-server.com/cli-login                    │
+└───────────────────────────────────────────────────────────────┘
+
+⠋ Waiting for browser approval (code ABCD-1234)...
+```
+
+Your browser opens to the approval page, you confirm, and the CLI prints a welcome banner with the stored context name, key prefix, and expiry. After that, every other CLI command (`temps projects list`, `temps deploy`, etc.) uses the stored key automatically.
+
+If you omit the URL, the CLI uses the URL from your active context or the one set by `temps configure`.
+
+---
+
+## Log in from a workspace or sandbox {{ anchor: true, id: 'log-in-from-a-workspace-or-sandbox' }}
+
+Temps workspaces already seed CLI credentials for you when the session boots — `bunx @temps-sdk/cli` should work out of the box without running `login` at all. Run `temps whoami` to confirm.
+
+If you do need to re-authenticate inside a workspace (for example, to switch accounts, or after rotating your platform-issued token):
+
+<CodeGroup title="Re-login inside a workspace">
+
+```bash {{ title: 'bunx' }}
+bunx @temps-sdk/cli login
+```
+
+```bash {{ title: 'global' }}
+temps login
+```
+
+</CodeGroup>
+
+The CLI prints the approval URL. Copy it into your local browser (the one running on your laptop, not inside the workspace container — the workspace has no browser). Approve the device, and the CLI inside the workspace receives the new key.
+
+---
+
+## Log in from a headless shell or CI {{ anchor: true, id: 'log-in-from-a-headless-shell-or-ci' }}
+
+The browser flow is interactive by design — it expects a human to click "Approve" in a web UI. For headless CI runs and unattended scripts, use a long-lived API key instead:
+
+1. Open the Temps dashboard in a browser and go to **Settings → API Keys**.
+2. Create a new key, scope it to the permissions your CI job needs, and copy the plaintext value.
+3. Store the key as a CI secret (`TEMPS_API_KEY`, for example).
+4. In your CI job, pass it to the CLI:
+
+<CodeGroup title="Login with an API key">
+
+```bash {{ title: 'bunx' }}
+bunx @temps-sdk/cli login \
+  --url https://your-temps-server.com \
+  --api-key "$TEMPS_API_KEY"
+```
+
+```bash {{ title: 'global' }}
+temps login \
+  --url https://your-temps-server.com \
+  --api-key "$TEMPS_API_KEY"
+```
+
+</CodeGroup>
+
+If you want to skip the browser-open attempt entirely (for example, in a `tmux` session that would otherwise spawn a stray `xdg-open`), set `TEMPS_NO_BROWSER=1`. The CLI still prints the URL — it just won't try to launch a browser.
+
+---
+
+## Log in with MFA {{ anchor: true, id: 'log-in-with-mfa' }}
+
+The browser flow handles MFA transparently — the regular `/login` page already prompts for your TOTP code when MFA is enabled on your account. Just complete the prompt in the browser before approving the device.
+
+The legacy `--email` flow accepts a one-shot MFA code via `--mfa` for scripts that can supply one:
+
+<CodeGroup title="Email login with MFA (legacy)">
+
+```bash {{ title: 'bunx' }}
+bunx @temps-sdk/cli login \
+  --url https://your-temps-server.com \
+  --email you@example.com \
+  --mfa 123456
+```
+
+```bash {{ title: 'global' }}
+temps login \
+  --url https://your-temps-server.com \
+  --email you@example.com \
+  --mfa 123456
+```
+
+</CodeGroup>
+
+Prefer the API-key path for unattended jobs — a one-shot MFA code in a script defeats the point of MFA.
+
+---
+
+## Switch between Temps instances {{ anchor: true, id: 'switch-between-temps-instances' }}
+
+The CLI supports multiple named contexts so you can keep credentials for several Temps servers side by side. Pass `--url` to log in to a second server without disturbing the first:
+
+<CodeGroup title="Add a second context">
+
+```bash {{ title: 'bunx' }}
+bunx @temps-sdk/cli login \
+  --url https://staging.temps.example.com \
+  --context staging
+```
+
+```bash {{ title: 'global' }}
+temps login \
+  --url https://staging.temps.example.com \
+  --context staging
+```
+
+</CodeGroup>
+
+Then switch between them with `temps context use <name>`, or list them with `temps context list`. The context name defaults to the URL host if you omit `--context`.
+
+---
+
+## Check who you are logged in as {{ anchor: true, id: 'check-who-you-are-logged-in-as' }}
+
+<CodeGroup title="Whoami">
+
+```bash {{ title: 'bunx' }}
+bunx @temps-sdk/cli whoami
+```
+
+```bash {{ title: 'global' }}
+temps whoami
+```
+
+</CodeGroup>
+
+Prints your email, role, the active context, the key prefix, and the server URL. Add `--json` for a machine-readable response.
+
+---
+
+## Log out {{ anchor: true, id: 'log-out' }}
+
+<CodeGroup title="Logout">
+
+```bash {{ title: 'bunx' }}
+bunx @temps-sdk/cli logout
+```
+
+```bash {{ title: 'global' }}
+temps logout
+```
+
+</CodeGroup>
+
+This revokes the active context's API key on the server and removes it locally. Add `--local-only` to skip the server round-trip (useful if the server is unreachable). Pass `--context <name>` to log out of a specific named context while leaving the others intact.
+
+---
+
+## Troubleshooting {{ anchor: true, id: 'troubleshooting' }}
+
+**The browser didn't open automatically.** The CLI tried `open` (macOS), `xdg-open` (Linux), or `start` (Windows). If none are available — common in SSH sessions, Docker containers, and CI runners — the URL is still printed in the box at the top of the output. Copy it into any browser, even one on a different machine. The flow doesn't care which device the browser is on; it only cares that someone signed in as you approves the matching `user_code`.
+
+**"Authorization code expired before approval".** The `device_code` is valid for 15 minutes from the moment you ran `login`. Just run `temps login` again to get a fresh code.
+
+**"Authorization denied in the browser".** You clicked **Deny** on the approval page. Run `temps login` again if that was a mistake.
+
+**The CLI polls forever after I approved in the browser.** Check that the CLI is talking to the same server you approved on — `temps whoami` after a failed login will show whether anything stuck. If the URL has a typo or points to the wrong server, you'll see the approval succeed in your browser but the CLI will never see it.
+
+**"Already logged in as someone@example.com".** The CLI refuses to overwrite an existing context. Run `temps logout` first, or pass `--url` / `--context` to add a second context alongside the current one.
+
+**I'm in a script and the prompt won't work.** Don't use the device flow. Generate an API key in the dashboard and pass it via `--api-key` (see [Log in from a headless shell or CI](#log-in-from-a-headless-shell-or-ci)).

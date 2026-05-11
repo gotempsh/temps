@@ -64,25 +64,25 @@ temps --version
 
 Before using the CLI, you need to configure it to connect to your Temps instance.
 
-### Login with API Key
+### Login
 
 <CodeGroup title="Login to Temps">
 
 ```bash {{ title: 'bunx' }}
-bunx @temps-sdk/cli login
+bunx @temps-sdk/cli login https://your-temps-server.com
 ```
 
 ```bash {{ title: 'npx' }}
-npx @temps-sdk/cli login
+npx @temps-sdk/cli login https://your-temps-server.com
 ```
 
 ```bash {{ title: 'global' }}
-temps login
+temps login https://your-temps-server.com
 ```
 
 </CodeGroup>
 
-This will prompt you to enter your Temps server URL and API key. You can generate an API key from the Temps dashboard under **Settings → API Keys**.
+By default this opens your browser to a Temps approval page — you sign in with the same credentials you use for the web UI (including MFA and SSO) and confirm the device code shown in your terminal. The CLI never prompts for a password. See [Log in to the Temps CLI](/docs/cli-login) for the full flow, including how to authenticate headless CI jobs with `--api-key`, switch between multiple Temps servers, and use `TEMPS_NO_BROWSER=1` on servers without a browser.
 
 ### Configure with Wizard
 
