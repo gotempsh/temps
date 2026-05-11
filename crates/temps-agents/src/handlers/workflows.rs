@@ -38,9 +38,12 @@ use crate::handlers::AppState;
 const MAX_EPHEMERAL_YAML_BYTES: usize = 64 * 1024;
 
 /// Hard cap on `max_turns` for any ephemeral run, regardless of what the
-/// uploaded YAML claims. Mirrors the conservative default in `repo_config.rs`
-/// (10) doubled to give exploratory dry-runs some headroom.
-const MAX_EPHEMERAL_TURNS: i32 = 20;
+/// uploaded YAML claims. Sits comfortably above the default (30) so a
+/// dry-run can stretch its legs while still preventing runaway costs from
+/// an unreviewed YAML. Note: committed workflows (via the agent CRUD path)
+/// can opt into max_turns: 0 for unlimited; ephemeral dry-runs cannot
+/// because nobody has signed off on the cost profile.
+const MAX_EPHEMERAL_TURNS: i32 = 50;
 
 /// Hard cap on `timeout_seconds` for any ephemeral run (15 minutes).
 const MAX_EPHEMERAL_TIMEOUT_SECS: i32 = 900;

@@ -148,10 +148,15 @@ impl AiCliProvider for ClaudeCliProvider {
             .arg(&config.prompt)
             .arg("--output-format")
             .arg("stream-json")
-            .arg("--max-turns")
-            .arg(config.max_turns.to_string())
             .arg("--dangerously-skip-permissions")
             .arg("--verbose");
+        // max_turns <= 0 means "no limit": skip the flag entirely so the
+        // CLI uses its own (effectively unbounded) default. The timeout +
+        // daily-budget caps still bound the run, so this isn't a free path
+        // to infinite cost.
+        if config.max_turns > 0 {
+            cmd.arg("--max-turns").arg(config.max_turns.to_string());
+        }
         if let Some(m) = config.model.as_deref() {
             if !m.is_empty() {
                 cmd.arg("--model").arg(m);
@@ -285,10 +290,12 @@ impl AiCliProvider for ClaudeCliProvider {
             .arg(&config.prompt)
             .arg("--output-format")
             .arg("stream-json")
-            .arg("--max-turns")
-            .arg(config.max_turns.to_string())
             .arg("--dangerously-skip-permissions")
             .arg("--verbose");
+        // See first invocation: max_turns <= 0 disables the cap entirely.
+        if config.max_turns > 0 {
+            cmd.arg("--max-turns").arg(config.max_turns.to_string());
+        }
         if let Some(m) = config.model.as_deref() {
             if !m.is_empty() {
                 cmd.arg("--model").arg(m);

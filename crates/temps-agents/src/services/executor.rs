@@ -79,7 +79,7 @@ fn synthetic_agent_config(
         ai_model: None,
         api_key_encrypted: None,
         ai_provider_key_id: None,
-        max_turns: 10,
+        max_turns: 30,
         timeout_seconds: 600,
         daily_budget_cents: 0,
         cooldown_minutes: 0,
