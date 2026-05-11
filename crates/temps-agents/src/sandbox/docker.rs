@@ -1378,9 +1378,28 @@ impl SandboxProvider for DockerSandboxProvider {
             memory_swap: Some(memory_limit_mb as i64 * 1024 * 1024),
             // Security hardening
             cap_drop: Some(vec!["ALL".to_string()]),
-            // CHOWN/FOWNER are needed so the post-start chown of the sandbox
-            // home dir (fixing stale named-volume ownership) can run as root.
-            cap_add: Some(vec!["CHOWN".to_string(), "FOWNER".to_string()]),
+            // Minimum caps required for the post-start ownership-normalization
+            // dance (see `normalize_ownership`) and for `su temps -c ...` to
+            // drop privileges into the sandbox user:
+            //   CHOWN          — chown the home volume + bind-mounted workdir
+            //   FOWNER         — chmod/utime files we don't own (recover path)
+            //   DAC_OVERRIDE   — read/traverse dirs whose mode bits forbid it
+            //                    after a prior chown left them o-rwx; without
+            //                    this, even root gets EACCES on readdir() of
+            //                    /home/temps when a previous run scoped it
+            //   SETUID/SETGID  — `su` needs both to call setuid/setgroups when
+            //                    handing the write-probe (and every later
+            //                    workflow step) off to the temps user. Without
+            //                    them `su` fails with "cannot set groups:
+            //                    Operation not permitted" and the sandbox is
+            //                    declared broken at startup.
+            cap_add: Some(vec![
+                "CHOWN".to_string(),
+                "FOWNER".to_string(),
+                "DAC_OVERRIDE".to_string(),
+                "SETUID".to_string(),
+                "SETGID".to_string(),
+            ]),
             security_opt: Some(vec!["no-new-privileges:true".to_string()]),
             pids_limit: Some(config.pids_limit.unwrap_or(512)),
             init: Some(true),

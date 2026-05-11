@@ -1,5 +1,5 @@
 import {
-  createEmailProviderMutation,
+  createNotificationEmailProviderMutation,
   createSlackProviderMutation,
   createWebhookProviderMutation,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -90,8 +90,8 @@ export function AddNotificationProvider() {
 
   useEffect(() => {
     setBreadcrumbs([
-      { label: 'Monitoring & Alerts', href: '/monitoring' },
-      { label: 'Providers', href: '/monitoring/notifications' },
+      { label: 'Settings', href: '/settings' },
+      { label: 'Notification Providers', href: '/settings/notifications' },
       { label: 'Add Provider' },
     ])
   }, [setBreadcrumbs])
@@ -127,7 +127,7 @@ export function AddNotificationProvider() {
   })
 
   const createEmailMutation = useMutation({
-    ...createEmailProviderMutation(),
+    ...createNotificationEmailProviderMutation(),
     meta: {
       errorTitle: 'Failed to add email provider',
     },
@@ -135,7 +135,7 @@ export function AddNotificationProvider() {
       setCurrentStep('complete')
       toast.success('Email provider added successfully')
       setTimeout(() => {
-        navigate('/monitoring/notifications')
+        navigate('/settings/notifications')
       }, 2000)
     },
   })
@@ -149,7 +149,7 @@ export function AddNotificationProvider() {
       setCurrentStep('complete')
       toast.success('Slack provider added successfully')
       setTimeout(() => {
-        navigate('/monitoring/notifications')
+        navigate('/settings/notifications')
       }, 2000)
     },
   })
@@ -163,7 +163,7 @@ export function AddNotificationProvider() {
       setCurrentStep('complete')
       toast.success('Webhook provider added successfully')
       setTimeout(() => {
-        navigate('/monitoring/notifications')
+        navigate('/settings/notifications')
       }, 2000)
     },
   })
@@ -326,7 +326,7 @@ export function AddNotificationProvider() {
               <div className="mt-6 flex justify-between">
                 <Button
                   variant="outline"
-                  onClick={() => navigate('/monitoring/notifications')}
+                  onClick={() => navigate('/settings/notifications')}
                 >
                   <ArrowLeft className="h-4 w-4 mr-2" />
                   Cancel
@@ -354,9 +354,11 @@ export function AddNotificationProvider() {
                 form={form}
                 onSubmit={onSubmit}
                 isLoading={isLoading}
-                isEdit={true}
+                isEdit={false}
+                formId="add-notification-provider-form"
+                hideSubmit
               />
-              <div className="mt-6 flex justify-between border-t pt-4">
+              <div className="mt-6 flex items-center justify-between border-t pt-4">
                 <Button
                   variant="outline"
                   onClick={handleBack}
@@ -364,6 +366,13 @@ export function AddNotificationProvider() {
                 >
                   <ArrowLeft className="h-4 w-4 mr-2" />
                   Back
+                </Button>
+                <Button
+                  type="submit"
+                  form="add-notification-provider-form"
+                  disabled={isLoading}
+                >
+                  {isLoading ? 'Saving...' : 'Add Provider'}
                 </Button>
               </div>
             </CardContent>
@@ -387,7 +396,7 @@ export function AddNotificationProvider() {
               </div>
             </CardHeader>
             <CardContent className="flex justify-center">
-              <Button onClick={() => navigate('/monitoring/notifications')}>
+              <Button onClick={() => navigate('/settings/notifications')}>
                 <Bell className="h-4 w-4 mr-2" />
                 View Providers
               </Button>

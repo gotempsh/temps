@@ -62,8 +62,8 @@ export function EditNotificationProvider() {
   useEffect(() => {
     if (provider) {
       setBreadcrumbs([
-        { label: 'Monitoring & Alerts', href: '/monitoring' },
-        { label: 'Providers', href: '/monitoring/notifications' },
+        { label: 'Settings', href: '/settings' },
+        { label: 'Notification Providers', href: '/settings/notifications' },
         { label: provider.name || 'Edit Provider' },
       ])
     }
@@ -145,7 +145,7 @@ export function EditNotificationProvider() {
     onSuccess: () => {
       toast.success('Email provider updated successfully')
       queryClient.invalidateQueries({ queryKey: ['getNotificationProviders'] })
-      navigate('/monitoring/notifications')
+      navigate('/settings/notifications')
     },
   })
 
@@ -157,7 +157,7 @@ export function EditNotificationProvider() {
     onSuccess: () => {
       toast.success('Slack provider updated successfully')
       queryClient.invalidateQueries({ queryKey: ['getNotificationProviders'] })
-      navigate('/monitoring/notifications')
+      navigate('/settings/notifications')
     },
   })
 
@@ -169,7 +169,7 @@ export function EditNotificationProvider() {
     onSuccess: () => {
       toast.success('Webhook provider updated successfully')
       queryClient.invalidateQueries({ queryKey: ['getNotificationProviders'] })
-      navigate('/monitoring/notifications')
+      navigate('/settings/notifications')
     },
   })
 
@@ -190,7 +190,7 @@ export function EditNotificationProvider() {
     onSuccess: () => {
       toast.success('Provider deleted successfully')
       queryClient.invalidateQueries({ queryKey: ['getNotificationProviders'] })
-      navigate('/monitoring/notifications')
+      navigate('/settings/notifications')
     },
   })
 
@@ -293,7 +293,7 @@ export function EditNotificationProvider() {
             Failed to load provider. Please check the ID and try again.
           </AlertDescription>
         </Alert>
-        <Button onClick={() => navigate('/monitoring/notifications')} variant="outline">
+        <Button onClick={() => navigate('/settings/notifications')} variant="outline">
           <ArrowLeft className="h-4 w-4 mr-2" />
           Back to Providers
         </Button>
@@ -309,7 +309,7 @@ export function EditNotificationProvider() {
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-4">
           <Button
-            onClick={() => navigate('/monitoring/notifications')}
+            onClick={() => navigate('/settings/notifications')}
             variant="ghost"
             size="sm"
           >

@@ -15,11 +15,16 @@ pub struct EnvVarWithEnvironments {
     pub id: i32,
     pub project_id: i32,
     pub key: String,
-    pub value: String,
+    /// Plaintext value. `None` when `is_secret = true` (write-only). Callers
+    /// that need plaintext for deploy must go through
+    /// `EnvVarService::get_for_deploy` which decrypts independently of the
+    /// secret flag.
+    pub value: Option<String>,
     pub created_at: UtcDateTime,
     pub updated_at: UtcDateTime,
     pub environments: Vec<EnvVarEnvironment>,
     pub include_in_preview: bool,
+    pub is_secret: bool,
 }
 
 // Secret types. Deliberately NO `value` field — secret plaintext never leaves

@@ -134,10 +134,10 @@ fn make_audit_context(auth: &temps_auth::AuthContext, metadata: &RequestMetadata
             WebhookConfig,
             TlsMode,
             CreateSlackProviderRequest,
-            CreateEmailProviderRequest,
+            CreateNotificationEmailProviderRequest,
             CreateWebhookProviderRequest,
             UpdateSlackProviderRequest,
-            UpdateEmailProviderRequest,
+            UpdateNotificationEmailProviderRequest,
             UpdateWebhookProviderRequest,
             NotificationPreferencesResponse,
             UpdatePreferencesRequest,
@@ -232,7 +232,7 @@ pub struct CreateSlackProviderRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
-pub struct CreateEmailProviderRequest {
+pub struct CreateNotificationEmailProviderRequest {
     pub name: String,
     pub config: EmailConfig,
     pub enabled: Option<bool>,
@@ -246,7 +246,7 @@ pub struct UpdateSlackProviderRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
-pub struct UpdateEmailProviderRequest {
+pub struct UpdateNotificationEmailProviderRequest {
     pub name: Option<String>,
     pub config: EmailConfig,
     pub enabled: Option<bool>,
@@ -773,7 +773,7 @@ async fn create_slack_provider(
 #[utoipa::path(
     post,
     path = "/notification-providers/email",
-    request_body = CreateEmailProviderRequest,
+    request_body = CreateNotificationEmailProviderRequest,
     responses(
         (status = 201, description = "Successfully created Email provider", body = NotificationProviderResponse),
         (status = 400, description = "Invalid request"),
@@ -788,7 +788,7 @@ async fn create_notification_email_provider(
     State(app_state): State<Arc<NotificationState>>,
     RequireAuth(auth): RequireAuth,
     Extension(metadata): Extension<RequestMetadata>,
-    Json(request): Json<CreateEmailProviderRequest>,
+    Json(request): Json<CreateNotificationEmailProviderRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, NotificationProvidersCreate);
     info!("Creating Email notification provider {}", request.name);
@@ -928,7 +928,7 @@ async fn update_slack_provider(
 #[utoipa::path(
     put,
     path = "/notification-providers/email/{id}",
-    request_body = UpdateEmailProviderRequest,
+    request_body = UpdateNotificationEmailProviderRequest,
     responses(
         (status = 200, description = "Successfully updated Email provider", body = NotificationProviderResponse),
         (status = 404, description = "Provider not found"),
@@ -947,7 +947,7 @@ async fn update_email_provider(
     Path(id): Path<i32>,
     RequireAuth(auth): RequireAuth,
     Extension(metadata): Extension<RequestMetadata>,
-    Json(request): Json<UpdateEmailProviderRequest>,
+    Json(request): Json<UpdateNotificationEmailProviderRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, NotificationProvidersWrite);
     info!("Updating Email notification provider {}", id);
@@ -1730,7 +1730,7 @@ mod tests {
     async fn test_create_notification_email_provider() -> Result<(), Box<dyn std::error::Error>> {
         let setup = TestSetup::new().await?;
 
-        let request_body = CreateEmailProviderRequest {
+        let request_body = CreateNotificationEmailProviderRequest {
             name: "Test Email Provider".to_string(),
             config: setup.create_test_email_config(),
             enabled: Some(true),
@@ -1897,7 +1897,7 @@ mod tests {
     async fn test_update_email_provider() -> Result<(), Box<dyn std::error::Error>> {
         let setup = TestSetup::new().await?;
 
-        let request_body = UpdateEmailProviderRequest {
+        let request_body = UpdateNotificationEmailProviderRequest {
             name: Some("Updated Email Provider".to_string()),
             config: EmailConfig {
                 smtp_host: "updated-smtp.example.com".to_string(),

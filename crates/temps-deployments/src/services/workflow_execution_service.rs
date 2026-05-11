@@ -3,7 +3,6 @@
 //! Executes deployment jobs as workflows using the WorkflowExecutor
 
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
-use std::collections::HashMap;
 use std::sync::Arc;
 use temps_core::{
     Job, JobQueue, WorkflowBuilder, WorkflowCancellationProvider, WorkflowError, WorkflowExecutor,
@@ -535,15 +534,21 @@ impl WorkflowExecutionService {
                 let preset_str = format!("{:?}", project.preset).to_lowercase();
                 builder = builder.preset(preset_str);
 
-                // Add build args if present
-                if let Some(build_args_value) = config.get("build_args") {
-                    if let Some(build_args_obj) = build_args_value.as_object() {
-                        let build_args: Vec<(String, String)> = build_args_obj
-                            .iter()
-                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                            .collect();
-                        builder = builder.build_args(build_args);
-                    }
+                // Unseal build args from job_config. The planner derives build
+                // args from env vars and stores them encrypted (build_args
+                // contain everything env vars contain, including any value
+                // marked secret — they leak into `docker history` if dumped
+                // in plaintext).
+                let enc_for_build_args = self.encryption_service.get();
+                let build_args_map = crate::services::sensitive_envelope::read_sealed(
+                    config,
+                    enc_for_build_args,
+                    "build_args",
+                )
+                .map_err(|e| WorkflowExecutionError::InvalidJobConfig(e.to_string()))?;
+                if !build_args_map.is_empty() {
+                    let build_args: Vec<(String, String)> = build_args_map.into_iter().collect();
+                    builder = builder.build_args(build_args);
                 }
 
                 // Add build context if present (for monorepo subdirectories)
@@ -593,23 +598,35 @@ impl WorkflowExecutionService {
                     project.deployment_config.as_ref().map(|c| c.replicas)
                 );
 
-                // Get environment variables from job config (gathered during planning phase)
-                let env_variables = config
-                    .get("environment_variables")
-                    .and_then(|v| serde_json::from_value::<HashMap<String, String>>(v.clone()).ok())
-                    .unwrap_or_default();
+                // Unseal sensitive maps from job_config. The planner stores
+                // env vars / remote env vars / secrets as AES-256-GCM
+                // ciphertext under `*_encrypted` keys (with a non-sensitive
+                // `*_keys` list for debugging). `read_sealed` also falls back
+                // to plaintext for jobs queued before the encryption rollout.
+                let enc_for_unseal = self.encryption_service.get();
+                let env_variables = crate::services::sensitive_envelope::read_sealed(
+                    config,
+                    enc_for_unseal,
+                    "environment_variables",
+                )
+                .map_err(|e| WorkflowExecutionError::InvalidJobConfig(e.to_string()))?;
 
-                // Get remote environment variables (connection strings rewritten for worker nodes)
-                let remote_env_variables: Option<HashMap<String, String>> = config
-                    .get("remote_environment_variables")
-                    .and_then(|v| serde_json::from_value(v.clone()).ok());
+                let remote_env_variables =
+                    crate::services::sensitive_envelope::read_sealed_optional(
+                        config,
+                        enc_for_unseal,
+                        "remote_environment_variables",
+                    )
+                    .map_err(|e| WorkflowExecutionError::InvalidJobConfig(e.to_string()))?;
 
-                // Get secrets (decrypted plaintext values to be mounted as files under
-                // /run/secrets/<KEY> by the deployer; never passed as env vars).
-                let secrets: HashMap<String, String> = config
-                    .get("secrets")
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .unwrap_or_default();
+                // Secrets are mounted as files under /run/secrets/<KEY>; never
+                // injected as env vars. Same envelope as above.
+                let secrets = crate::services::sensitive_envelope::read_sealed(
+                    config,
+                    enc_for_unseal,
+                    "secrets",
+                )
+                .map_err(|e| WorkflowExecutionError::InvalidJobConfig(e.to_string()))?;
                 if !secrets.is_empty() {
                     debug!(
                         "🔐 Mounting {} secret file(s) into container: {}",
@@ -1402,10 +1419,12 @@ impl WorkflowExecutionService {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
 
-                let env_vars: HashMap<String, String> = config
-                    .get("environment_vars")
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .unwrap_or_default();
+                let env_vars = crate::services::sensitive_envelope::read_sealed(
+                    config,
+                    self.encryption_service.get(),
+                    "environment_vars",
+                )
+                .map_err(|e| WorkflowExecutionError::InvalidJobConfig(e.to_string()))?;
 
                 let directory = config
                     .get("directory")
@@ -1964,6 +1983,7 @@ mod tests {
     use async_trait::async_trait;
     use chrono::Utc;
     use sea_orm::{ActiveModelTrait, Set};
+    use std::collections::HashMap;
 
     use temps_database::test_utils::TestDatabase;
     use temps_entities::{preset::Preset, types::JobStatus, upstream_config::UpstreamList};

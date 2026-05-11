@@ -1158,11 +1158,15 @@ impl WorkflowPlanner {
                 project.preset
             );
 
-            // Convert environment variables to build args
-            let mut build_args_map = serde_json::Map::new();
-            for (key, value) in &env_vars {
-                build_args_map.insert(key.clone(), serde_json::Value::String(value.clone()));
-            }
+            // Build args are derived from env vars and would otherwise be
+            // stored in plaintext under `build_args` in job_config. Seal the
+            // whole map under `build_args_encrypted` instead so an operator
+            // dumping `deployment_jobs.job_config` for debugging never sees
+            // an env-var value they shouldn't.
+            let build_args_map: std::collections::HashMap<String, String> = env_vars
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
 
             // Parse preset_config if present (for Dockerfile preset)
             let mut dockerfile_path = "Dockerfile".to_string();
@@ -1179,17 +1183,27 @@ impl WorkflowPlanner {
                 }
             }
 
+            let mut build_job_config = serde_json::json!({
+                "dockerfile_path": dockerfile_path,
+                "build_context": build_context,
+            });
+            if let Some(obj) = build_job_config.as_object_mut() {
+                crate::services::sensitive_envelope::write_sealed(
+                    obj,
+                    self.encryption_service.as_ref(),
+                    "build_args",
+                    &build_args_map,
+                )
+                .map_err(|e| anyhow::anyhow!("Failed to seal build_args: {}", e))?;
+            }
+
             jobs.push(JobDefinition {
                 job_id: "build_image".to_string(),
                 job_type: "BuildImageJob".to_string(),
                 name: "Build Container Image".to_string(),
                 description: Some("Build Docker image from source code".to_string()),
                 dependencies: build_dependencies.clone(),
-                job_config: Some(serde_json::json!({
-                    "dockerfile_path": dockerfile_path,
-                    "build_args": build_args_map,
-                    "build_context": build_context
-                })),
+                job_config: Some(build_job_config),
                 required_for_completion: true,
             });
 
@@ -1225,26 +1239,51 @@ impl WorkflowPlanner {
             let mut job_config = serde_json::json!({
                 "port": exposed_port,
                 "replicas": replicas,
-                "environment_variables": deploy_env_vars,
                 "image_name": image_name
             });
-            if let Some(ref remote_vars) = remote_deploy_env_vars {
-                info!(
-                    "Storing remote_environment_variables in job config: POSTGRES_HOST={:?}, POSTGRES_URL={:?}",
-                    remote_vars.get("POSTGRES_HOST"),
-                    remote_vars.get("POSTGRES_URL").map(|u| if u.len() > 60 { format!("{}...", &u[..60]) } else { u.clone() })
-                );
-                job_config["remote_environment_variables"] =
-                    serde_json::to_value(remote_vars).unwrap_or_default();
-            } else {
-                info!("No remote_environment_variables to store (single-node mode or no active nodes)");
-            }
-            if !secrets.is_empty() {
-                info!(
-                    "Storing {} secret file(s) in deploy job config",
-                    secrets.len()
-                );
-                job_config["secrets"] = serde_json::to_value(&secrets).unwrap_or_default();
+            if let Some(obj) = job_config.as_object_mut() {
+                // Seal env vars, remote env vars, and secret-file contents.
+                // None of these end up in `job_config` in plaintext anymore;
+                // the executor pulls them back through `read_sealed`.
+                crate::services::sensitive_envelope::write_sealed(
+                    obj,
+                    self.encryption_service.as_ref(),
+                    "environment_variables",
+                    &deploy_env_vars,
+                )
+                .map_err(|e| anyhow::anyhow!("Failed to seal environment_variables: {}", e))?;
+
+                if let Some(ref remote_vars) = remote_deploy_env_vars {
+                    info!(
+                        "Sealing remote_environment_variables in job config ({} keys)",
+                        remote_vars.len()
+                    );
+                    crate::services::sensitive_envelope::write_sealed(
+                        obj,
+                        self.encryption_service.as_ref(),
+                        "remote_environment_variables",
+                        remote_vars,
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!("Failed to seal remote_environment_variables: {}", e)
+                    })?;
+                } else {
+                    info!("No remote_environment_variables to store (single-node mode or no active nodes)");
+                }
+
+                if !secrets.is_empty() {
+                    info!(
+                        "Sealing {} secret file(s) in deploy job config",
+                        secrets.len()
+                    );
+                    crate::services::sensitive_envelope::write_sealed(
+                        obj,
+                        self.encryption_service.as_ref(),
+                        "secrets",
+                        &secrets,
+                    )
+                    .map_err(|e| anyhow::anyhow!("Failed to seal secrets: {}", e))?;
+                }
             }
 
             jobs.push(JobDefinition {
@@ -1555,19 +1594,29 @@ impl WorkflowPlanner {
             vec![]
         };
 
+        let mut compose_job_config = serde_json::json!({
+            "compose_path": compose_path,
+            "project_id": project.id,
+            "environment_id": environment.id,
+            "directory": project.directory,
+        });
+        if let Some(obj) = compose_job_config.as_object_mut() {
+            crate::services::sensitive_envelope::write_sealed(
+                obj,
+                self.encryption_service.as_ref(),
+                "environment_vars",
+                &env_vars,
+            )
+            .map_err(|e| anyhow::anyhow!("Failed to seal compose environment_vars: {}", e))?;
+        }
+
         jobs.push(JobDefinition {
             job_id: "deploy_compose".to_string(),
             job_type: "DeployComposeJob".to_string(),
             name: "Deploy Compose Stack".to_string(),
             description: Some("Pull images and start Docker Compose services".to_string()),
             dependencies: deploy_dependencies,
-            job_config: Some(serde_json::json!({
-                "compose_path": compose_path,
-                "environment_vars": env_vars,
-                "project_id": project.id,
-                "environment_id": environment.id,
-                "directory": project.directory,
-            })),
+            job_config: Some(compose_job_config),
             required_for_completion: true,
         });
 
@@ -1722,26 +1771,49 @@ impl WorkflowPlanner {
         let mut job_config = serde_json::json!({
             "port": exposed_port,
             "replicas": replicas,
-            "environment_variables": deploy_env_vars,
             "image_name": external_image_ref,
             "use_external_image": true,
         });
-        if let Some(ref remote_vars) = remote_deploy_env_vars {
-            info!(
-                "Storing remote_environment_variables in docker image job config: POSTGRES_HOST={:?}",
-                remote_vars.get("POSTGRES_HOST"),
-            );
-            job_config["remote_environment_variables"] =
-                serde_json::to_value(remote_vars).unwrap_or_default();
-        } else {
-            info!("No remote_environment_variables for docker image deployment");
-        }
-        if !secrets.is_empty() {
-            info!(
-                "Storing {} secret file(s) in docker image deploy job config",
-                secrets.len()
-            );
-            job_config["secrets"] = serde_json::to_value(&secrets).unwrap_or_default();
+        if let Some(obj) = job_config.as_object_mut() {
+            crate::services::sensitive_envelope::write_sealed(
+                obj,
+                self.encryption_service.as_ref(),
+                "environment_variables",
+                &deploy_env_vars,
+            )
+            .map_err(|e| anyhow::anyhow!("Failed to seal environment_variables: {}", e))?;
+
+            if let Some(ref remote_vars) = remote_deploy_env_vars {
+                info!(
+                    "Sealing remote_environment_variables in docker image job config ({} keys)",
+                    remote_vars.len()
+                );
+                crate::services::sensitive_envelope::write_sealed(
+                    obj,
+                    self.encryption_service.as_ref(),
+                    "remote_environment_variables",
+                    remote_vars,
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to seal remote_environment_variables: {}", e)
+                })?;
+            } else {
+                info!("No remote_environment_variables for docker image deployment");
+            }
+
+            if !secrets.is_empty() {
+                info!(
+                    "Sealing {} secret file(s) in docker image deploy job config",
+                    secrets.len()
+                );
+                crate::services::sensitive_envelope::write_sealed(
+                    obj,
+                    self.encryption_service.as_ref(),
+                    "secrets",
+                    &secrets,
+                )
+                .map_err(|e| anyhow::anyhow!("Failed to seal secrets: {}", e))?;
+            }
         }
 
         jobs.push(JobDefinition {

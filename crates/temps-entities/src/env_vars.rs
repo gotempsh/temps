@@ -19,6 +19,11 @@ pub struct Model {
     pub include_in_preview: bool,
     /// Whether the value is stored encrypted (AES-256-GCM via EncryptionService)
     pub is_encrypted: bool,
+    /// When true, the value is write-only: never returned in plaintext from the
+    /// API, masked in the UI, and updates that omit the value keep the existing
+    /// ciphertext. The flag is one-way — non-secret rows can be promoted to
+    /// secret, but secrets cannot be demoted (prevents leaking by toggle).
+    pub is_secret: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

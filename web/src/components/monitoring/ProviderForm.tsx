@@ -1,7 +1,6 @@
 'use client'
 
 import { Button } from '@/components/ui/button'
-import { DialogFooter } from '@/components/ui/dialog'
 import {
   Form,
   FormControl,
@@ -29,6 +28,8 @@ interface ProviderFormProps {
   onSubmit: (data: ProviderFormData) => Promise<void>
   isEdit?: boolean
   isLoading?: boolean
+  formId?: string
+  hideSubmit?: boolean
 }
 
 const showToastFormError = (error: any) => {
@@ -42,6 +43,8 @@ export function ProviderForm({
   onSubmit,
   isEdit = false,
   isLoading = false,
+  formId,
+  hideSubmit = false,
 }: ProviderFormProps) {
   const providerType = form.watch('provider_type')
   const tlsMode = form.watch('config.tls_mode')
@@ -62,6 +65,7 @@ export function ProviderForm({
   return (
     <Form {...form}>
       <form
+        id={formId}
         onSubmit={form.handleSubmit(onSubmit, showToastFormError)}
         className="space-y-4 py-4"
       >
@@ -589,15 +593,17 @@ export function ProviderForm({
           </div>
         )}
 
-        <DialogFooter className="shrink-0">
-          <Button type="submit" disabled={isLoading}>
-            {isLoading
-              ? 'Saving...'
-              : isEdit
-                ? 'Update Provider'
-                : 'Add Provider'}
-          </Button>
-        </DialogFooter>
+        {!hideSubmit && (
+          <div className="flex justify-end pt-2">
+            <Button type="submit" disabled={isLoading}>
+              {isLoading
+                ? 'Saving...'
+                : isEdit
+                  ? 'Update Provider'
+                  : 'Add Provider'}
+            </Button>
+          </div>
+        )}
       </form>
     </Form>
   )

@@ -149,6 +149,19 @@ impl EnvironmentService {
         format!("{}.{}", environment_slug, base_domain)
     }
 
+    /// Compute the URL for a user-supplied custom domain (verbatim host).
+    /// Unlike `compute_environment_url`, this never appends `preview_domain` —
+    /// the input is expected to already be a fully-qualified hostname.
+    pub async fn compute_custom_domain_url(&self, domain: &str) -> String {
+        let settings = self.config_service.get_settings().await.unwrap_or_default();
+        let protocol = if settings.external_url.is_some() {
+            "https"
+        } else {
+            "http"
+        };
+        format!("{}://{}", protocol, domain)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn create_environment(
         &self,

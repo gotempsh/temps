@@ -5,7 +5,7 @@ import {
   listNotificationProvidersOptions,
   testNotificationProviderMutation as testProviderMutation,
   updateEmailProviderMutation,
-  updateProviderMutation,
+  updateNotificationProviderMutation,
   updateSlackProviderMutation,
   updateWebhookProviderMutation,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -117,7 +117,7 @@ export function ProvidersManagement() {
   })
 
   const toggleEnabledMutation = useMutation({
-    ...updateProviderMutation(),
+    ...updateNotificationProviderMutation(),
     meta: {
       errorTitle: 'Failed to update provider status',
     },
@@ -247,7 +247,7 @@ export function ProvidersManagement() {
       path: { id: provider.id },
       body: {
         name: provider.name,
-        is_active: !provider.enabled,
+        enabled: !provider.enabled,
       },
     })
   }

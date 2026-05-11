@@ -76,6 +76,10 @@ function EnvironmentVariableRow({
   const [isEditing, setIsEditing] = useState(false)
   const [editValue, setEditValue] = useState('')
   const [isEditMultiline, setIsEditMultiline] = useState(false)
+  // Secret env vars are write-only: the value is never fetched, the reveal
+  // button is hidden, and the edit dialog defaults to "leave blank to keep
+  // the existing value". This mirrors the file-based Secrets UX.
+  const isSecret = variable.is_secret ?? false
 
   const { data, refetch } = useQuery({
     ...getEnvironmentVariableValueOptions({
@@ -84,29 +88,33 @@ function EnvironmentVariableRow({
         key: variable.key,
       },
     }),
-    enabled: isVisible || isEditing || showAllValues,
+    enabled:
+      !isSecret && (isVisible || isEditing || showAllValues),
   })
 
   useEffect(() => {
+    if (isSecret) return
     if (data && typeof data === 'object' && 'value' in data) {
       // eslint-disable-next-line react-hooks/set-state-in-effect
       setEditValue(data.value)
       // eslint-disable-next-line react-hooks/set-state-in-effect
       setIsEditMultiline(data.value.includes('\n'))
     }
-  }, [data])
+  }, [data, isSecret])
 
   useEffect(() => {
+    if (isSecret) return
     setIsVisible(showAllValues)
     if (showAllValues) {
       refetch()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showAllValues])
+  }, [showAllValues, isSecret])
 
   const dataValue = useMemo(() => data?.value ?? '', [data])
 
   const toggleVisibility = async () => {
+    if (isSecret) return
     setIsVisible(!isVisible)
     if (!isVisible) {
       refetch()
@@ -168,13 +176,18 @@ function EnvironmentVariableRow({
   }
 
   const submitEdit = async () => {
+    // For secrets we never preloaded the value; an empty editValue means
+    // "keep the existing ciphertext". For regular vars we send the current
+    // text either way.
+    const valueField =
+      isSecret && editValue.length === 0 ? undefined : editValue
     await updateMutation.mutateAsync({
       path: {
         project_id: project.id,
         var_id: variable.id,
       },
       body: {
-        value: editValue,
+        value: valueField,
         environment_ids: selectedEditEnvironments,
         key: variable.key,
         include_in_preview: editIncludeInPreview,
@@ -182,6 +195,7 @@ function EnvironmentVariableRow({
     })
     setIsEditModalOpen(false)
     setIsEditing(false)
+    setEditValue('')
   }
 
   const { data: allEnvironments } = useQuery({
@@ -207,6 +221,14 @@ function EnvironmentVariableRow({
                 <IntegrationBadge service={overridesService} overridden />
               )}
               <p className="font-medium break-all">{variable.key}</p>
+              {isSecret && (
+                <span
+                  title="Write-only secret — value is never returned by the API"
+                  className="inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide bg-amber-500/10 text-amber-700 dark:text-amber-400 border border-amber-500/20"
+                >
+                  Secret
+                </span>
+              )}
               {overridesService && (
                 <Link
                   to={`/storage/${overridesService.service_id}`}
@@ -236,15 +258,17 @@ function EnvironmentVariableRow({
         <div className="flex flex-wrap items-center gap-2 pl-7 sm:pl-0">
           <div className="flex items-center gap-2 min-w-0 w-full sm:w-auto">
             <span className="font-mono text-sm truncate max-w-[180px] sm:max-w-[220px]">
-              {isVisible ? dataValue : '••••••••••••'}
+              {isSecret ? '••••••••••••' : isVisible ? dataValue : '••••••••••••'}
             </span>
-            <Button variant="ghost" size="sm" onClick={toggleVisibility}>
-              {isVisible ? (
-                <EyeOff className="h-4 w-4" />
-              ) : (
-                <Eye className="h-4 w-4" />
-              )}
-            </Button>
+            {!isSecret && (
+              <Button variant="ghost" size="sm" onClick={toggleVisibility}>
+                {isVisible ? (
+                  <EyeOff className="h-4 w-4" />
+                ) : (
+                  <Eye className="h-4 w-4" />
+                )}
+              </Button>
+            )}
           </div>
           <Button
             variant="outline"
@@ -335,13 +359,21 @@ function EnvironmentVariableRow({
                     onChange={(e) => setEditValue(e.target.value)}
                     className="font-mono resize-y"
                     rows={6}
+                    placeholder={isSecret ? 'Leave blank to keep current value' : undefined}
                   />
                 ) : (
                   <Input
                     value={editValue}
                     onChange={(e) => setEditValue(e.target.value)}
                     className="font-mono"
+                    placeholder={isSecret ? 'Leave blank to keep current value' : undefined}
                   />
+                )}
+                {isSecret && (
+                  <p className="text-xs text-muted-foreground">
+                    This variable is a write-only secret. Leave the value blank
+                    to change only environments or preview settings.
+                  </p>
                 )}
               </div>
               <div className="space-y-2">
@@ -515,6 +547,7 @@ interface AddEnvironmentVariableDialogProps {
     value: string
     environments: number[]
     includeInPreview: boolean
+    isSecret: boolean
   }) => Promise<void>
   allEnvironments: any[]
 }
@@ -530,6 +563,7 @@ function AddEnvironmentVariableDialog({
   const [isMultiline, setIsMultiline] = useState(false)
   const [selectedEnvironments, setSelectedEnvironments] = useState<number[]>([])
   const [includeInPreview, setIncludeInPreview] = useState(false)
+  const [isSecret, setIsSecret] = useState(false)
   const [hasInitialized, setHasInitialized] = useState(false)
 
   // Default-select all environments when the dialog first opens
@@ -565,12 +599,14 @@ function AddEnvironmentVariableDialog({
       value,
       environments: selectedEnvironments,
       includeInPreview,
+      isSecret,
     })
     setKey('')
     setValue('')
     setIsMultiline(false)
     setSelectedEnvironments([])
     setIncludeInPreview(false)
+    setIsSecret(false)
   }
 
   return (
@@ -676,6 +712,23 @@ function AddEnvironmentVariableDialog({
                 onCheckedChange={setIncludeInPreview}
               />
             </div>
+            <div className="flex items-center justify-between space-x-2 rounded-lg border p-4">
+              <div className="flex-1 space-y-1">
+                <Label htmlFor="is-secret" className="text-sm font-medium">
+                  Secret (write-only)
+                </Label>
+                <p className="text-sm text-muted-foreground">
+                  Mask the value in the UI and never return it from the API.
+                  Once enabled this cannot be reverted — only the value can be
+                  rotated.
+                </p>
+              </div>
+              <Switch
+                id="is-secret"
+                checked={isSecret}
+                onCheckedChange={setIsSecret}
+              />
+            </div>
           </div>
           <DialogFooter>
             <Button
@@ -688,6 +741,7 @@ function AddEnvironmentVariableDialog({
                 setIsMultiline(false)
                 setSelectedEnvironments([])
                 setIncludeInPreview(false)
+                setIsSecret(false)
               }}
             >
               Cancel
@@ -871,6 +925,7 @@ export function EnvironmentVariablesSettings({
     value: string
     environments: number[]
     includeInPreview: boolean
+    isSecret: boolean
   }) => {
     await createMutation.mutateAsync({
       path: {
@@ -881,6 +936,7 @@ export function EnvironmentVariablesSettings({
         value: values.value,
         environment_ids: values.environments,
         include_in_preview: values.includeInPreview,
+        is_secret: values.isSecret,
       },
     })
   }

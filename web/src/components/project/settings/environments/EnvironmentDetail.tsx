@@ -1,7 +1,5 @@
 import { ProjectResponse } from '@/api/client'
 import {
-  addEnvironmentDomainMutation,
-  deleteEnvironmentDomainMutation,
   deleteEnvironmentMutation,
   getDeploymentOptions,
   getEnvironmentDomainsOptions,
@@ -27,26 +25,16 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from '@/components/ui/alert-dialog'
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from '@/components/ui/dropdown-menu'
-import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import { TimeAgo } from '@/components/utils/TimeAgo'
-import { cn } from '@/lib/utils'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ExternalLink,
   Eye,
   EyeOff,
-  MoreVertical,
-  Plus,
-  Trash2,
   RefreshCw,
+  Trash2,
 } from 'lucide-react'
 import { useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
@@ -145,13 +133,6 @@ function EnvironmentVariableRow({
       </div>
     </div>
   )
-}
-
-const DOMAIN_REGEX =
-  /^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$/
-
-function isValidDomain(domain: string): boolean {
-  return DOMAIN_REGEX.test(domain)
 }
 
 function CurrentDeployment({
@@ -293,8 +274,6 @@ export function EnvironmentDetail({
   const { environmentId: paramEnvironmentId } = useParams<{
     environmentId: string
   }>()
-  const [newDomain, setNewDomain] = useState('')
-  const [domainError, setDomainError] = useState<string | null>(null)
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
   const queryClient = useQueryClient()
 
@@ -337,7 +316,6 @@ export function EnvironmentDetail({
     data: domains,
     isLoading: isLoadingDomains,
     error: domainsError,
-    refetch: refetchDomains,
   } = useQuery({
     ...getEnvironmentDomainsOptions({
       path: {
@@ -345,29 +323,6 @@ export function EnvironmentDetail({
         env_id: Number(environmentId!),
       },
     }),
-  })
-
-  const addDomainMutation = useMutation({
-    ...addEnvironmentDomainMutation(),
-    meta: {
-      errorTitle: 'Failed to add domain to environment',
-    },
-    onSuccess: () => {
-      toast.success('Domain added successfully')
-      setNewDomain('')
-      refetchDomains()
-    },
-  })
-
-  const deleteDomainMutation = useMutation({
-    ...deleteEnvironmentDomainMutation(),
-    meta: {
-      errorTitle: 'Failed to remove domain from environment',
-    },
-    onSuccess: () => {
-      toast.success('Domain removed successfully')
-      refetchDomains()
-    },
   })
 
   const removeEnvironmentMutation = useMutation({
@@ -388,48 +343,6 @@ export function EnvironmentDetail({
       toast.error(error?.message || 'Failed to delete environment')
     },
   })
-
-  const handleAddDomain = async () => {
-    setDomainError(null)
-
-    if (!newDomain) {
-      setDomainError('Domain is required')
-      return
-    }
-
-    if (!isValidDomain(newDomain)) {
-      setDomainError('Please enter a valid domain')
-      return
-    }
-
-    addDomainMutation.mutate({
-      path: {
-        project_id: project.id,
-        env_id: Number(environmentId!),
-      },
-      body: {
-        domain: newDomain,
-        is_primary: false,
-      },
-    })
-  }
-
-  const handleDomainChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    setNewDomain(e.target.value)
-    if (domainError) {
-      setDomainError(null)
-    }
-  }
-
-  const handleDeleteDomain = async (domainId: number) => {
-    deleteDomainMutation.mutate({
-      path: {
-        project_id: project.id,
-        env_id: Number(environmentId!),
-        domain_id: domainId,
-      },
-    })
-  }
 
   if (isLoadingEnvironment || isLoadingVariables || isLoadingDomains) {
     return <EnvironmentDetailSkeleton />
@@ -478,91 +391,51 @@ export function EnvironmentDetail({
 
       <Card>
         <CardHeader>
-          <CardTitle>Domains</CardTitle>
-          <CardDescription>
-            Manage custom domains for this environment
-          </CardDescription>
+          <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-2">
+            <div>
+              <CardTitle>Domains</CardTitle>
+              <CardDescription>
+                Custom domains attached to this environment
+              </CardDescription>
+            </div>
+            <Button variant="outline" size="sm" asChild>
+              <Link to={`/projects/${project.slug}/settings/domains`}>
+                Manage in Domains
+                <ExternalLink className="h-4 w-4 ml-2" />
+              </Link>
+            </Button>
+          </div>
         </CardHeader>
         <CardContent>
-          <div className="space-y-4">
-            {domains?.length ? (
-              <div className="space-y-2">
-                {domains.map((domain) => (
-                  <div
-                    key={domain.id}
-                    className="flex items-center justify-between rounded-lg border p-3 gap-2"
-                  >
-                    <div className="flex items-center gap-2 overflow-hidden">
-                      <span className="font-mono text-sm truncate">
-                        {domain.domain}
-                      </span>
-                    </div>
-                    <DropdownMenu>
-                      <DropdownMenuTrigger asChild>
-                        <Button variant="ghost" size="icon" className="h-8 w-8">
-                          <MoreVertical className="h-4 w-4" />
-                        </Button>
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent align="end">
-                        <DropdownMenuItem
-                          onClick={() =>
-                            window.open(`https://${domain.domain}`, '_blank')
-                          }
-                        >
-                          <ExternalLink className="h-4 w-4 mr-2" />
-                          Visit
-                        </DropdownMenuItem>
-                        <DropdownMenuItem
-                          className="text-destructive"
-                          onClick={() => handleDeleteDomain(domain.id)}
-                          disabled={deleteDomainMutation.isPending}
-                        >
-                          <Trash2 className="h-4 w-4 mr-2" />
-                          Delete
-                        </DropdownMenuItem>
-                      </DropdownMenuContent>
-                    </DropdownMenu>
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <p className="text-sm text-muted-foreground">
-                No domains configured
-              </p>
-            )}
-
+          {domains?.length ? (
             <div className="space-y-2">
-              <div className="flex flex-col sm:flex-row gap-2">
-                <div className="flex-1 space-y-1">
-                  <Input
-                    placeholder="Enter domain (e.g., example.com)"
-                    value={newDomain}
-                    onChange={handleDomainChange}
-                    className={cn(
-                      'flex-1',
-                      domainError && 'border-destructive'
-                    )}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') {
-                        handleAddDomain()
-                      }
-                    }}
-                  />
-                  {domainError && (
-                    <p className="text-xs text-destructive">{domainError}</p>
-                  )}
-                </div>
-                <Button
-                  onClick={handleAddDomain}
-                  disabled={addDomainMutation.isPending || !newDomain}
-                  className="w-full sm:w-auto"
+              {domains.map((domain) => (
+                <div
+                  key={domain.id}
+                  className="flex items-center justify-between rounded-lg border p-3 gap-2"
                 >
-                  <Plus className="h-4 w-4 mr-2" />
-                  Add Domain
-                </Button>
-              </div>
+                  <span className="font-mono text-sm truncate">
+                    {domain.domain}
+                  </span>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-8 w-8 shrink-0"
+                    onClick={() =>
+                      window.open(domain.url ?? `https://${domain.domain}`, '_blank')
+                    }
+                    aria-label={`Visit ${domain.domain}`}
+                  >
+                    <ExternalLink className="h-4 w-4" />
+                  </Button>
+                </div>
+              ))}
             </div>
-          </div>
+          ) : (
+            <p className="text-sm text-muted-foreground">
+              No domains attached. Add one from the project Domains tab.
+            </p>
+          )}
         </CardContent>
       </Card>
 

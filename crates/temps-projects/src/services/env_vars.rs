@@ -204,6 +204,7 @@ impl EnvVarService {
                             key: Set(key.clone()),
                             value: Set(encrypted_value),
                             is_encrypted: Set(true),
+                            is_secret: Set(false),
                             created_at: Set(chrono::Utc::now()),
                             updated_at: Set(chrono::Utc::now()),
                             environment_id: Set(None),

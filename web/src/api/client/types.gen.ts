@@ -2014,6 +2014,13 @@ export type CreateEnvironmentVariableRequest = {
      * Include this environment variable in preview environments (default: true)
      */
     include_in_preview?: boolean;
+    /**
+     * When true the variable is treated as write-only: never returned in
+     * plaintext from the API, masked in the UI, and updates that omit the
+     * value preserve the existing ciphertext. The flag is one-way — secret
+     * vars cannot be demoted back to regular vars.
+     */
+    is_secret?: boolean;
     key: string;
     value: string;
 };
@@ -4191,9 +4198,18 @@ export type EnvironmentVariableResponse = {
      * Include this environment variable in preview environments
      */
     include_in_preview: boolean;
+    /**
+     * Whether the variable is a write-only secret. Secrets always have
+     * `value: None` in responses.
+     */
+    is_secret: boolean;
     key: string;
     updated_at: number;
-    value: string;
+    /**
+     * Plaintext value for non-secret vars (or `"***"` mask for list responses).
+     * `None` for secret vars — secrets are write-only.
+     */
+    value?: string | null;
 };
 
 export type EnvironmentVariableValueResponse = {
@@ -12561,6 +12577,25 @@ export type UpdateEnvironmentSettingsRequest = {
      * Max seconds to wait for containers to start on wake (5-120). Default: 30.
      */
     wake_timeout_seconds?: number | null;
+};
+
+export type UpdateEnvironmentVariableRequest = {
+    environment_ids: Array<number>;
+    include_in_preview?: boolean;
+    /**
+     * Optional secret-flag transition.
+     * - `Some(true)` promotes a regular var to a secret.
+     * - `Some(false)` is rejected if the row is already secret (one-way flag).
+     * - `None` (omitted) leaves the flag unchanged.
+     */
+    is_secret?: boolean | null;
+    key: string;
+    /**
+     * New plaintext value. `None` (omitted) keeps the existing ciphertext,
+     * which is the only way to edit a secret env var without re-typing its
+     * value (e.g. changing which environments it applies to).
+     */
+    value?: string | null;
 };
 
 export type UpdateErrorGroupRequest = {
@@ -29135,7 +29170,7 @@ export type DeleteEnvironmentVariableResponses = {
 export type DeleteEnvironmentVariableResponse = DeleteEnvironmentVariableResponses[keyof DeleteEnvironmentVariableResponses];
 
 export type UpdateEnvironmentVariableData = {
-    body: CreateEnvironmentVariableRequest;
+    body: UpdateEnvironmentVariableRequest;
     path: {
         /**
          * Project ID or slug

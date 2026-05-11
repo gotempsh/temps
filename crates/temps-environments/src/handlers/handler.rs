@@ -24,7 +24,7 @@ use super::types::{
     EnvironmentResponse, EnvironmentVariableResponse, EnvironmentVariableValueResponse,
     GetEnvironmentVariablesQuery, GetProjectSecretsQuery, ProjectSecretEnvironmentInfo,
     ProjectSecretResponse, ResolvedEnvVarResponse, ResolvedEnvVarSource,
-    UpdateEnvironmentSettingsRequest, UpdateProjectSecretRequest,
+    UpdateEnvironmentSettingsRequest, UpdateEnvironmentVariableRequest, UpdateProjectSecretRequest,
 };
 use temps_core::problemdetails::Problem;
 
@@ -58,6 +58,12 @@ impl From<crate::services::env_var_service::EnvVarError> for Problem {
                     .detail(err.to_string())
                     .build()
             }
+            EnvVarError::CannotDemoteSecret { .. } => temps_core::error_builder::bad_request()
+                .detail(err.to_string())
+                .build(),
+            EnvVarError::SecretValueRequired { .. } => temps_core::error_builder::bad_request()
+                .detail(err.to_string())
+                .build(),
             EnvVarError::Other(msg) => temps_core::error_builder::internal_server_error()
                 .detail(msg)
                 .build(),
@@ -253,20 +259,15 @@ pub async fn get_environment_domains(
 
     let mut response: Vec<EnvironmentDomainResponse> = Vec::new();
     for d in domains {
-        let fqdn = state
-            .environment_service
-            .compute_environment_fqdn(&d.domain)
-            .await;
-
         let url = state
             .environment_service
-            .compute_environment_url(&d.domain)
+            .compute_custom_domain_url(&d.domain)
             .await;
 
         response.push(EnvironmentDomainResponse {
             id: d.id,
             environment_id: d.environment_id,
-            domain: fqdn,
+            domain: d.domain,
             created_at: d.created_at.timestamp_millis(),
             url,
         });
@@ -306,20 +307,15 @@ pub async fn add_environment_domain(
         .await
         .map_err(Problem::from)?;
 
-    let fqdn = state
-        .environment_service
-        .compute_environment_fqdn(&domain.domain)
-        .await;
-
     let url = state
         .environment_service
-        .compute_environment_url(&domain.domain)
+        .compute_custom_domain_url(&domain.domain)
         .await;
 
     let response = EnvironmentDomainResponse {
         id: domain.id,
         environment_id: domain.environment_id,
-        domain: fqdn,
+        domain: domain.domain,
         created_at: domain.created_at.timestamp_millis(),
         url,
     };
@@ -398,23 +394,35 @@ pub async fn get_environment_variables(
     // a total credential exfiltration.
     let response: Vec<EnvironmentVariableResponse> = vars
         .into_iter()
-        .map(|v| EnvironmentVariableResponse {
-            id: v.id,
-            key: v.key,
-            value: "***".to_string(),
-            created_at: v.created_at.timestamp_millis(),
-            updated_at: v.updated_at.timestamp_millis(),
-            environments: v
-                .environments
-                .into_iter()
-                .map(|env| EnvironmentInfo {
-                    id: env.id,
-                    name: env.name,
-                    main_url: env.main_url,
-                    current_deployment_id: env.current_deployment_id,
-                })
-                .collect(),
-            include_in_preview: v.include_in_preview,
+        .map(|v| {
+            // Non-secret rows get a masked preview so the UI never has the
+            // plaintext sitting in memory in a list view. Secret rows return
+            // `None` so the UI can render a stronger "write-only" affordance
+            // (and so an accidental JSON dump never contains a value at all).
+            let value = if v.is_secret {
+                None
+            } else {
+                Some("***".to_string())
+            };
+            EnvironmentVariableResponse {
+                id: v.id,
+                key: v.key,
+                value,
+                created_at: v.created_at.timestamp_millis(),
+                updated_at: v.updated_at.timestamp_millis(),
+                environments: v
+                    .environments
+                    .into_iter()
+                    .map(|env| EnvironmentInfo {
+                        id: env.id,
+                        name: env.name,
+                        main_url: env.main_url,
+                        current_deployment_id: env.current_deployment_id,
+                    })
+                    .collect(),
+                include_in_preview: v.include_in_preview,
+                is_secret: v.is_secret,
+            }
         })
         .collect();
 
@@ -704,6 +712,7 @@ pub async fn create_environment_variable(
             request.key,
             request.value,
             request.include_in_preview,
+            request.is_secret,
         )
         .await
         .map_err(Problem::from)?;
@@ -725,6 +734,7 @@ pub async fn create_environment_variable(
             })
             .collect(),
         include_in_preview: var.include_in_preview,
+        is_secret: var.is_secret,
     };
 
     Ok((StatusCode::CREATED, Json(response)))
@@ -765,7 +775,7 @@ pub async fn delete_environment_variable(
     put,
     path = "/projects/{project_id}/env-vars/{var_id}",
     tag = "Projects",
-    request_body = CreateEnvironmentVariableRequest,
+    request_body = UpdateEnvironmentVariableRequest,
     responses(
         (status = 200, description = "Environment variables updated successfully", body = EnvironmentVariableResponse),
         (status = 400, description = "Invalid input"),
@@ -781,7 +791,7 @@ pub async fn update_environment_variable(
     State(state): State<Arc<AppState>>,
     Path((project_id, var_id)): Path<(i32, i32)>,
     RequireAuth(auth): RequireAuth,
-    Json(request): Json<CreateEnvironmentVariableRequest>,
+    Json(request): Json<UpdateEnvironmentVariableRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsWrite);
 
@@ -794,6 +804,7 @@ pub async fn update_environment_variable(
             request.value,
             request.environment_ids,
             request.include_in_preview,
+            request.is_secret,
         )
         .await?;
 
@@ -814,6 +825,7 @@ pub async fn update_environment_variable(
             })
             .collect(),
         include_in_preview: var.include_in_preview,
+        is_secret: var.is_secret,
     };
 
     Ok(Json(response))
@@ -1745,6 +1757,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             AddEnvironmentDomainRequest,
             EnvironmentVariableResponse,
             CreateEnvironmentVariableRequest,
+            UpdateEnvironmentVariableRequest,
             EnvironmentVariableValueResponse,
             GetEnvironmentVariablesQuery,
             EnvironmentInfo,

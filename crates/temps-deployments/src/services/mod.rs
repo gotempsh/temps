@@ -40,3 +40,6 @@ pub use node_service::*;
 
 pub mod node_scheduler;
 pub use node_scheduler::*;
+
+pub mod sensitive_envelope;
+pub use sensitive_envelope::*;

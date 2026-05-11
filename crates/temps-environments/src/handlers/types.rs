@@ -50,6 +50,31 @@ pub struct CreateEnvironmentVariableRequest {
     /// Include this environment variable in preview environments (default: true)
     #[serde(default = "default_include_in_preview")]
     pub include_in_preview: bool,
+    /// When true the variable is treated as write-only: never returned in
+    /// plaintext from the API, masked in the UI, and updates that omit the
+    /// value preserve the existing ciphertext. The flag is one-way — secret
+    /// vars cannot be demoted back to regular vars.
+    #[serde(default)]
+    pub is_secret: bool,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct UpdateEnvironmentVariableRequest {
+    pub key: String,
+    /// New plaintext value. `None` (omitted) keeps the existing ciphertext,
+    /// which is the only way to edit a secret env var without re-typing its
+    /// value (e.g. changing which environments it applies to).
+    #[serde(default)]
+    pub value: Option<String>,
+    pub environment_ids: Vec<i32>,
+    #[serde(default = "default_include_in_preview")]
+    pub include_in_preview: bool,
+    /// Optional secret-flag transition.
+    /// - `Some(true)` promotes a regular var to a secret.
+    /// - `Some(false)` is rejected if the row is already secret (one-way flag).
+    /// - `None` (omitted) leaves the flag unchanged.
+    #[serde(default)]
+    pub is_secret: Option<bool>,
 }
 
 fn default_include_in_preview() -> bool {
@@ -60,12 +85,17 @@ fn default_include_in_preview() -> bool {
 pub struct EnvironmentVariableResponse {
     pub id: i32,
     pub key: String,
-    pub value: String,
+    /// Plaintext value for non-secret vars (or `"***"` mask for list responses).
+    /// `None` for secret vars — secrets are write-only.
+    pub value: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
     pub environments: Vec<EnvironmentInfo>,
     /// Include this environment variable in preview environments
     pub include_in_preview: bool,
+    /// Whether the variable is a write-only secret. Secrets always have
+    /// `value: None` in responses.
+    pub is_secret: bool,
 }
 
 #[derive(Serialize, Deserialize, ToSchema, Clone)]
