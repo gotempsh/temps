@@ -601,6 +601,7 @@ mod tests {
             secrets: std::collections::HashMap::new(),
             port_mappings: vec![],
             network_name: None,
+            extra_networks: Vec::new(),
             resource_limits: crate::ResourceLimits::default(),
             restart_policy: crate::RestartPolicy::default(),
             log_path: PathBuf::from("/tmp/deploy.log"),

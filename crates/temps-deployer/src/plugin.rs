@@ -119,11 +119,17 @@ impl TempsPlugin for DeployerPlugin {
             tracing::debug!("Using buildkit: {}", use_buildkit);
 
             // Create DockerRuntime service
-            let docker_runtime = Arc::new(DockerRuntime::new(
-                docker.clone(),
-                use_buildkit,
-                temps_core::NETWORK_NAME.to_string(),
-            ));
+            let config_service = context.require_service::<temps_config::ConfigService>();
+            let server_config = config_service.get_server_config();
+
+            let docker_runtime = Arc::new(
+                DockerRuntime::new(
+                    docker.clone(),
+                    use_buildkit,
+                    temps_core::NETWORK_NAME.to_string(),
+                )
+                .with_extra_networks(server_config.docker_extra_networks.clone()),
+            );
 
             // Register the concrete service
             context.register_service(docker_runtime.clone());
@@ -137,7 +143,6 @@ impl TempsPlugin for DeployerPlugin {
             context.register_service(image_builder);
 
             // Create and register StaticDeployer
-            let config_service = context.require_service::<temps_config::ConfigService>();
             let static_files_dir = config_service.get_server_config().data_dir.join("static");
             let filesystem_static_deployer =
                 Arc::new(FilesystemStaticDeployer::new(static_files_dir));

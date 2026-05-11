@@ -145,6 +145,12 @@ pub struct DeployRequest {
     pub secrets: HashMap<String, String>,
     pub port_mappings: Vec<PortMapping>,
     pub network_name: Option<String>,
+    /// Additional Docker networks that this container must join before it
+    /// starts. Use this for host-local dependency networks, such as a
+    /// self-hosted database Compose network, where a successful deploy is not
+    /// useful unless service DNS is available at application boot.
+    #[serde(default)]
+    pub extra_networks: Vec<String>,
     pub resource_limits: ResourceLimits,
     pub restart_policy: RestartPolicy,
     #[schema(value_type = String)]
@@ -703,6 +709,7 @@ mod tests {
             secrets: HashMap::new(),
             port_mappings,
             network_name: Some("test-network".to_string()),
+            extra_networks: vec!["dependency-network".to_string()],
             resource_limits: ResourceLimits::default(),
             restart_policy: RestartPolicy::Always,
             log_path,
@@ -719,6 +726,7 @@ mod tests {
         assert_eq!(request.port_mappings[0].container_port, 3000);
         assert!(matches!(request.port_mappings[0].protocol, Protocol::Tcp));
         assert_eq!(request.network_name.as_ref().unwrap(), "test-network");
+        assert_eq!(request.extra_networks, vec!["dependency-network"]);
         assert_eq!(request.command.as_ref().unwrap().len(), 2);
         assert_eq!(request.command.as_ref().unwrap()[0], "node");
         assert_eq!(request.command.as_ref().unwrap()[1], "server.js");
@@ -1010,6 +1018,7 @@ CMD ["echo", "Hello from container"]
             secrets: HashMap::new(),
             port_mappings: vec![],
             network_name: None,
+            extra_networks: Vec::new(),
             resource_limits: ResourceLimits::default(),
             restart_policy: RestartPolicy::Always,
             log_path: temp_dir.path().join("deploy.log"),

@@ -1126,6 +1126,7 @@ impl DeployImageJob {
             secrets: self.config.secrets.clone(),
             port_mappings,
             network_name: None,
+            extra_networks: Vec::new(),
             resource_limits,
             restart_policy: RestartPolicy::Always,
             log_path,
