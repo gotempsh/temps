@@ -266,6 +266,12 @@ pub struct ServerConfig {
     pub clickhouse_database: Option<String>,
     pub clickhouse_user: Option<String>,
     pub clickhouse_password: Option<String>,
+
+    // Required Docker networks that every deployed app container should join
+    // before start, in addition to Temps' primary app network. This is useful
+    // for self-hosted installs where apps depend on services exposed by a
+    // sibling Docker Compose network.
+    pub docker_extra_networks: Vec<String>,
 }
 
 impl ServerConfig {
@@ -416,6 +422,8 @@ impl ServerConfig {
             clickhouse_password: std::env::var("TEMPS_CLICKHOUSE_PASSWORD")
                 .ok()
                 .filter(|s| !s.is_empty()),
+
+            docker_extra_networks: parse_csv_env("TEMPS_DOCKER_EXTRA_NETWORKS"),
         })
     }
 
@@ -492,6 +500,20 @@ impl ServerConfig {
     pub fn get_postgres_max_lifetime_secs(&self) -> u64 {
         self.postgres_max_lifetime_secs.unwrap_or(1800)
     }
+}
+
+fn parse_csv_env(key: &str) -> Vec<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 // Default domain for local development (resolves to 127.0.0.1)

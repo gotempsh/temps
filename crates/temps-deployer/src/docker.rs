@@ -14,7 +14,7 @@ use bollard::{
     Docker,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -108,6 +108,11 @@ pub struct DockerRuntime {
     /// that's the legitimate "overlay not yet bootstrapped on this node"
     /// state, not an error. Set via [`Self::with_overlay_network`].
     overlay_network: Option<String>,
+    /// Operator-level dependency networks that every app container must join
+    /// before start. Unlike the optional overlay network, these are required:
+    /// missing or failing attachments fail the deploy because the app is
+    /// expected to depend on DNS/services from these networks.
+    extra_networks: Vec<String>,
     /// Static resolvers to write into each new container's
     /// `/etc/resolv.conf`. Use [`Self::with_dns_servers`] for tests or
     /// fixed-IP setups; in the live agent we use
@@ -187,6 +192,22 @@ fn signal_name_from_exit_code(code: i64) -> Option<&'static str> {
         15 => Some("SIGTERM"),
         _ => None,
     }
+}
+
+fn normalize_extra_networks(
+    networks: Vec<String>,
+    primary_network: &str,
+    overlay_network: Option<&str>,
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    networks
+        .into_iter()
+        .map(|network| network.trim().to_string())
+        .filter(|network| !network.is_empty())
+        .filter(|network| network != primary_network)
+        .filter(|network| Some(network.as_str()) != overlay_network)
+        .filter(|network| seen.insert(network.clone()))
+        .collect()
 }
 
 /// Build a short human-readable explanation of why a container is in its
@@ -432,6 +453,7 @@ impl DockerRuntime {
             network_name,
             host_bind_address: "127.0.0.1".to_string(),
             overlay_network: None,
+            extra_networks: Vec::new(),
             dns_servers: Vec::new(),
             overlay_dns_slot: None,
             overlay_peers: None,
@@ -555,6 +577,18 @@ impl DockerRuntime {
         self
     }
 
+    /// Configure required dependency networks for all containers created by
+    /// this runtime. Blank entries, duplicates, the primary network, and the
+    /// optional overlay network are ignored.
+    pub fn with_extra_networks(mut self, networks: Vec<String>) -> Self {
+        self.extra_networks = normalize_extra_networks(
+            networks,
+            &self.network_name,
+            self.overlay_network.as_deref(),
+        );
+        self
+    }
+
     /// Best-effort additional attachment to the overlay network. Logs and
     /// returns `Ok(())` when the overlay isn't configured or doesn't
     /// exist; only true bollard errors propagate.
@@ -606,6 +640,70 @@ impl DockerRuntime {
                 overlay, e
             ))),
         }
+    }
+
+    /// Attach required dependency networks before container start so Docker's
+    /// embedded DNS can resolve service names during app boot.
+    async fn attach_required_networks(
+        &self,
+        container_id: &str,
+        request_networks: &[String],
+    ) -> Result<(), DeployerError> {
+        let mut requested = self.extra_networks.clone();
+        requested.extend(request_networks.iter().cloned());
+        let networks = normalize_extra_networks(
+            requested,
+            &self.network_name,
+            self.overlay_network.as_deref(),
+        );
+        if networks.is_empty() {
+            return Ok(());
+        }
+
+        let existing_networks = self
+            .docker
+            .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
+            .await
+            .map_err(|e| DeployerError::NetworkError(format!("list_networks: {}", e)))?;
+
+        for network in networks {
+            let exists = existing_networks
+                .iter()
+                .any(|candidate| candidate.name.as_deref() == Some(network.as_str()));
+            if !exists {
+                return Err(DeployerError::NetworkError(format!(
+                    "required network '{}' does not exist",
+                    network
+                )));
+            }
+
+            let req = bollard::models::NetworkConnectRequest {
+                container: container_id.to_string(),
+                ..Default::default()
+            };
+            match self.docker.connect_network(&network, req).await {
+                Ok(()) => {
+                    tracing::info!(container = %container_id, network, "attached to required network");
+                }
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 403, ..
+                }) => {
+                    tracing::debug!(
+                        container = %container_id,
+                        network,
+                        "container already connected to required network (403)"
+                    );
+                }
+                Err(e) => {
+                    return Err(DeployerError::NetworkError(format!(
+                        "connect_network({}): {}",
+                        network, e
+                    )));
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Install per-peer routes inside the container's netns. Must be
@@ -1812,6 +1910,9 @@ impl ContainerDeployer for DockerRuntime {
         // network isn't present yet on this node.
         self.maybe_attach_overlay(&container.id).await?;
 
+        self.attach_required_networks(&container.id, &request.extra_networks)
+            .await?;
+
         // Start container
         self.docker
             .start_container(&container.id, None::<StartContainerOptions>)
@@ -2738,6 +2839,7 @@ mod docker_tests {
             secrets: HashMap::new(),
             port_mappings: vec![],
             network_name: None,
+            extra_networks: Vec::new(),
             resource_limits: ResourceLimits {
                 cpu_limit: None,
                 memory_limit_mb: None,
@@ -3029,6 +3131,10 @@ mod docker_tests {
                     runtime.overlay_network.is_none(),
                     "overlay_network must default to None for backwards compatibility"
                 );
+                assert!(
+                    runtime.extra_networks.is_empty(),
+                    "extra_networks must default to empty for backwards compatibility"
+                );
             }
             Err(e) => {
                 println!("🔧 Docker not available: {}", e);
@@ -3045,6 +3151,50 @@ mod docker_tests {
             }
             Err(e) => {
                 println!("🔧 Docker not available: {}", e);
+            }
+        }
+    }
+
+    #[test]
+    fn test_normalize_extra_networks_drops_empty_duplicates_primary_and_overlay() {
+        let normalized = normalize_extra_networks(
+            vec![
+                " ".to_string(),
+                "temps-app-network".to_string(),
+                "supabase_default".to_string(),
+                "supabase_default".to_string(),
+                "temps-overlay".to_string(),
+                "analytics_default".to_string(),
+            ],
+            "temps-app-network",
+            Some("temps-overlay"),
+        );
+
+        assert_eq!(
+            normalized,
+            vec![
+                "supabase_default".to_string(),
+                "analytics_default".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_with_extra_networks_sets_normalized_field() {
+        match create_test_docker_runtime().await {
+            Ok(runtime) => {
+                let runtime = runtime
+                    .with_overlay_network("temps-overlay")
+                    .with_extra_networks(vec![
+                        "test-network".to_string(),
+                        "supabase_default".to_string(),
+                        "supabase_default".to_string(),
+                        "temps-overlay".to_string(),
+                    ]);
+                assert_eq!(runtime.extra_networks, vec!["supabase_default"]);
+            }
+            Err(e) => {
+                println!("Docker not available: {}", e);
             }
         }
     }
@@ -3208,6 +3358,7 @@ CMD ["cat", "/hello.txt"]
                     secrets: HashMap::new(),
                     port_mappings: vec![],
                     network_name: None,
+                    extra_networks: Vec::new(),
                     resource_limits: ResourceLimits {
                         cpu_limit: Some(0.5),
                         memory_limit_mb: Some(64),
@@ -3300,6 +3451,7 @@ CMD ["cat", "/hello.txt"]
             secrets: HashMap::new(),
             port_mappings: vec![],
             network_name: None,
+            extra_networks: Vec::new(),
             resource_limits: limits,
             restart_policy: RestartPolicy::Never,
             log_path: PathBuf::from(format!("/tmp/{}.log", name)),

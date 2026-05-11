@@ -595,6 +595,7 @@ mod tests {
             clickhouse_database: None,
             clickhouse_user: None,
             clickhouse_password: None,
+            docker_extra_networks: Vec::new(),
         });
         let config_service = Arc::new(temps_config::ConfigService::new(
             server_config,

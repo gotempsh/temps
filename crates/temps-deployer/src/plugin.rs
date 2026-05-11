@@ -143,11 +143,13 @@ impl TempsPlugin for DeployerPlugin {
             };
 
             // Create DockerRuntime service
+            let server_config = config_service.get_server_config();
             let mut docker_runtime = DockerRuntime::new(
                 docker.clone(),
                 use_buildkit,
                 temps_core::NETWORK_NAME.to_string(),
-            );
+            )
+            .with_extra_networks(server_config.docker_extra_networks.clone());
             if let Some(limits) = build_limits {
                 let resource_caps = if limits.cpu_limit_cores > 0.0 && limits.memory_limit_mb > 0 {
                     Some(crate::docker::BuildResourceLimits {
@@ -237,7 +239,6 @@ impl TempsPlugin for DeployerPlugin {
             context.register_service(image_builder);
 
             // Create and register StaticDeployer
-            let config_service = context.require_service::<temps_config::ConfigService>();
             let static_files_dir = config_service.get_server_config().data_dir.join("static");
             let filesystem_static_deployer =
                 Arc::new(FilesystemStaticDeployer::new(static_files_dir));
