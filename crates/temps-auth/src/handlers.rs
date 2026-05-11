@@ -282,7 +282,12 @@ pub async fn verify_mfa_challenge(
         verify_and_enable_mfa,
         disable_mfa,
         crate::cli_auth_handler::cli_login,
-        crate::cli_auth_handler::cli_logout
+        crate::cli_auth_handler::cli_logout,
+        crate::cli_device_handler::cli_device_start,
+        crate::cli_device_handler::cli_device_poll,
+        crate::cli_device_handler::cli_device_lookup,
+        crate::cli_device_handler::cli_device_approve,
+        crate::cli_device_handler::cli_device_deny
     ),
     components(
         schemas(
@@ -312,7 +317,14 @@ pub async fn verify_mfa_challenge(
             MfaSetupResponse,
             DisableMfaRequest,
             crate::cli_auth_handler::CliLoginPasswordRequest,
-            crate::cli_auth_handler::CliLoginResponse
+            crate::cli_auth_handler::CliLoginResponse,
+            crate::cli_device_handler::CliDeviceStartRequest,
+            crate::cli_device_handler::CliDeviceStartResponse,
+            crate::cli_device_handler::CliDevicePollRequest,
+            crate::cli_device_handler::CliDevicePollResponse,
+            crate::cli_device_handler::CliDeviceLookupResponse,
+            crate::cli_device_handler::CliDeviceApproveRequest,
+            crate::cli_device_handler::CliDeviceApproveResponse
         )
     ),
     info(
@@ -340,6 +352,14 @@ pub fn configure_routes() -> Router<Arc<AuthState>> {
         .route("/auth/login", post(login))
         .route("/auth/verify-mfa", post(verify_mfa_challenge))
         .route("/auth/cli/login", post(crate::cli_auth_handler::cli_login))
+        .route(
+            "/auth/cli/device/start",
+            post(crate::cli_device_handler::cli_device_start),
+        )
+        .route(
+            "/auth/cli/device/poll",
+            post(crate::cli_device_handler::cli_device_poll),
+        )
         .route("/auth/magic-link/request", post(request_magic_link))
         .route("/auth/magic-link/verify", get(verify_magic_link))
         .route("/auth/password-reset/request", post(request_password_reset))
@@ -354,6 +374,18 @@ pub fn configure_routes() -> Router<Arc<AuthState>> {
         .route(
             "/auth/cli/logout",
             post(crate::cli_auth_handler::cli_logout),
+        )
+        .route(
+            "/auth/cli/device/lookup",
+            get(crate::cli_device_handler::cli_device_lookup),
+        )
+        .route(
+            "/auth/cli/device/approve",
+            post(crate::cli_device_handler::cli_device_approve),
+        )
+        .route(
+            "/auth/cli/device/deny",
+            post(crate::cli_device_handler::cli_device_deny),
         )
         .route("/auth/email-status", get(email_status))
         .route("/auth/verify-email", get(verify_email))

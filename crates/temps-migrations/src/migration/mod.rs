@@ -85,6 +85,7 @@ mod m20260502_000001_add_observe_correlation;
 mod m20260504_000001_widen_backup_size_and_heartbeat;
 mod m20260505_000001_create_events_ch_outbox;
 mod m20260507_000001_add_workspace_preview_password_encrypted;
+mod m20260511_000001_create_cli_login_sessions;
 
 pub struct Migrator;
 
@@ -173,6 +174,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260504_000001_widen_backup_size_and_heartbeat::Migration),
             Box::new(m20260505_000001_create_events_ch_outbox::Migration),
             Box::new(m20260507_000001_add_workspace_preview_password_encrypted::Migration),
+            Box::new(m20260511_000001_create_cli_login_sessions::Migration),
         ]
     }
 }

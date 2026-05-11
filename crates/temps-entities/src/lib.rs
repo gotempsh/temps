@@ -21,6 +21,7 @@ pub mod autopilot_runs;
 pub mod backup_schedules;
 pub mod backups;
 pub mod challenge_sessions;
+pub mod cli_login_sessions;
 pub mod cron_executions;
 pub mod crons;
 pub mod custom_routes;

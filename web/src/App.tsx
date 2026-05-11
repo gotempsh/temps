@@ -156,6 +156,9 @@ const ExternalConnectivitySetup = lazy(() =>
 const AuditLogs = lazy(() =>
   import('./pages/AuditLogs').then((m) => ({ default: m.AuditLogs }))
 )
+const CliLogin = lazy(() =>
+  import('./pages/CliLogin').then((m) => ({ default: m.CliLogin }))
+)
 const ProxyLogs = lazy(() => import('./pages/ProxyLogs'))
 const ProxyLogDetail = lazy(() => import('./pages/ProxyLogDetail'))
 const IpGeolocationDetail = lazy(() => import('./pages/IpGeolocationDetail'))
@@ -344,6 +347,12 @@ const FullAppRoutes = () => {
                 <Route path="/proxy-logs" element={<ProxyLogs />} />
                 <Route path="/proxy-logs/:id" element={<ProxyLogDetail />} />
                 <Route path="/audit-logs" element={<AuditLogs />} />
+                {/* CLI device-authorization approval surface. The route
+                    sits inside the protected layout so unauthenticated
+                    visitors get bounced through /login and the
+                    captureReturnTo() infrastructure brings them back. */}
+                <Route path="/cli-login" element={<CliLogin />} />
+                <Route path="/cli-login/:userCode" element={<CliLogin />} />
                 {/* Settings drill-down: only items NOT surfaced at the
                     main sidebar root live here. Top-level resources
                     (domains, storage, email, AI, source providers,

@@ -6,9 +6,11 @@ import { whoami } from './whoami.js'
 export function registerAuthCommands(program: Command): void {
   program
     .command('login [url]')
-    .description('Authenticate with a Temps server using email + password (or other methods)')
-    .option('-k, --api-key <key>', 'Paste an API key instead of prompting for password')
-    .option('--email [email]', 'Login with email + password (default flow)')
+    .description('Authenticate with a Temps server (browser flow by default; email/api-key/magic available as opt-in)')
+    .option('-k, --api-key <key>', 'Paste an API key instead of using the browser flow')
+    .option('--device', 'Force the browser-based device flow (default for interactive sessions)')
+    .option('--email [email]', 'Use the legacy email + password prompt')
+    .option('--password', 'Alias for --email; forces the legacy email + password prompt')
     .option('--magic [email]', 'Login via magic link (email-based)')
     .option('--context <name>', 'Save the credentials under this context name (defaults to URL host)')
     .option('--mfa <code>', 'Six-digit TOTP code (use in scripts to skip the interactive prompt)')
