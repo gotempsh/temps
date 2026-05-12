@@ -112,6 +112,10 @@ import {
   isDimensionKey,
   type DimensionKey,
 } from '@/components/analytics/DimensionList'
+import {
+  SegmentVisitors,
+  segmentSupportsVisitors,
+} from '@/components/analytics/SegmentVisitors'
 
 import { Badge } from '@/components/ui/badge'
 import { Line, LineChart, XAxis, YAxis } from 'recharts'
@@ -1029,6 +1033,152 @@ function DimensionTab({ project }: DimensionTabProps) {
   )
 }
 
+// Segment Visitors Tab — paginated visitors for one dimension value (e.g.
+// "browsers / Chrome"). Mirrors DimensionTab's URL/date-filter behaviour so
+// quick filters and custom ranges propagate cleanly.
+interface SegmentVisitorsTabProps {
+  project: ProjectResponse
+}
+
+function SegmentVisitorsTab({ project }: SegmentVisitorsTabProps) {
+  const { dimension: rawDimension, value: rawValue } = useParams<{
+    dimension: string
+    value: string
+  }>()
+  const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
+
+  const [dateFilter, setDateFilter] = React.useState<AnalyticsDateFilter>(() => {
+    const filter = searchParams.get('filter') as QuickFilter | null
+    const from = searchParams.get('from')
+    const to = searchParams.get('to')
+    if (filter === 'custom' && from && to) {
+      return {
+        quickFilter: 'custom',
+        dateRange: { from: new Date(from), to: new Date(to) },
+      }
+    }
+    if (filter && QUICK_FILTERS.some((f) => f.value === filter)) {
+      return { quickFilter: filter, dateRange: undefined }
+    }
+    return { quickFilter: '24hours', dateRange: undefined }
+  })
+  const [selectedEnvironment, setSelectedEnvironment] = React.useState<
+    number | undefined
+  >(undefined)
+  const [isRefreshing, setIsRefreshing] = React.useState(false)
+  const queryClient = useQueryClient()
+
+  const { startDate, endDate } = getDateRangeFromFilter(dateFilter)
+
+  const updateDateFilter = React.useCallback(
+    (next: AnalyticsDateFilter) => {
+      setDateFilter(next)
+      const params = new URLSearchParams(searchParams)
+      params.set('filter', next.quickFilter)
+      if (
+        next.quickFilter === 'custom' &&
+        next.dateRange?.from &&
+        next.dateRange?.to
+      ) {
+        params.set('from', next.dateRange.from.toISOString())
+        params.set('to', next.dateRange.to.toISOString())
+      } else {
+        params.delete('from')
+        params.delete('to')
+      }
+      setSearchParams(params, { replace: true })
+    },
+    [searchParams, setSearchParams]
+  )
+
+  const handleRefresh = React.useCallback(() => {
+    setIsRefreshing(true)
+    queryClient.invalidateQueries({
+      predicate: (query) => {
+        const key = query.queryKey[0] as string
+        return !!(
+          key &&
+          typeof key === 'string' &&
+          key.includes('getVisitors')
+        )
+      },
+    })
+    setTimeout(() => setIsRefreshing(false), 1000)
+  }, [queryClient])
+
+  if (!isDimensionKey(rawDimension) || !rawValue) {
+    return (
+      <div className="p-8 text-center">
+        <p className="text-sm text-muted-foreground">
+          Unknown analytics segment: {rawDimension}/{rawValue}
+        </p>
+      </div>
+    )
+  }
+
+  const dimension: DimensionKey = rawDimension
+  const value = decodeURIComponent(rawValue)
+
+  if (!segmentSupportsVisitors(dimension)) {
+    return (
+      <div className="p-8 text-center">
+        <p className="text-sm text-muted-foreground">
+          {dimension} segments can&apos;t be drilled into visitors.
+        </p>
+      </div>
+    )
+  }
+
+  return (
+    <div className="space-y-6">
+      <AnalyticsFilters
+        project={project}
+        activeFilter={dateFilter.quickFilter}
+        dateRange={dateFilter.dateRange}
+        selectedEnvironment={selectedEnvironment}
+        onFilterChange={(filter) =>
+          updateDateFilter({ ...dateFilter, quickFilter: filter })
+        }
+        onDateRangeChange={(range) =>
+          updateDateFilter({
+            quickFilter: range ? 'custom' : dateFilter.quickFilter,
+            dateRange: range,
+          })
+        }
+        onEnvironmentChange={setSelectedEnvironment}
+        onRefresh={handleRefresh}
+        isRefreshing={isRefreshing}
+      />
+
+      <SegmentVisitors
+        project={project}
+        dimension={dimension}
+        value={value}
+        startDate={startDate}
+        endDate={endDate}
+        environment={selectedEnvironment}
+        onBack={() => {
+          const params = new URLSearchParams()
+          params.set('filter', dateFilter.quickFilter)
+          if (
+            dateFilter.quickFilter === 'custom' &&
+            dateFilter.dateRange?.from &&
+            dateFilter.dateRange?.to
+          ) {
+            params.set('from', dateFilter.dateRange.from.toISOString())
+            params.set('to', dateFilter.dateRange.to.toISOString())
+          }
+          const qs = params.toString()
+          navigate(
+            `/projects/${project.slug}/analytics/dimensions/${dimension}${qs ? `?${qs}` : ''}`
+          )
+        }}
+      />
+    </div>
+  )
+}
+
 // Session Replays Tab Component
 interface SessionReplaysTabProps {
   project: ProjectResponse
@@ -1180,6 +1330,10 @@ export function ProjectAnalytics({ project }: ProjectAnalyticsProps) {
       <Route
         path="dimensions/:dimension"
         element={<DimensionTab project={project} />}
+      />
+      <Route
+        path="segments/:dimension/:value"
+        element={<SegmentVisitorsTab project={project} />}
       />
       <Route path="replays" element={<SessionReplaysTab project={project} />} />
       <Route path="setup" element={<AnalyticsSetup project={project} />} />

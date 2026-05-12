@@ -1,13 +1,8 @@
 import { ProjectResponse } from '@/api/client'
 import {
   deleteEnvironmentMutation,
-  getDeploymentOptions,
-  getEnvironmentDomainsOptions,
   getEnvironmentOptions,
-  getEnvironmentVariablesOptions,
-  getEnvironmentVariableValueOptions,
 } from '@/api/client/@tanstack/react-query.gen'
-import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -27,17 +22,10 @@ import {
 } from '@/components/ui/alert-dialog'
 import { Skeleton } from '@/components/ui/skeleton'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
-import { TimeAgo } from '@/components/utils/TimeAgo'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import {
-  ExternalLink,
-  Eye,
-  EyeOff,
-  RefreshCw,
-  Trash2,
-} from 'lucide-react'
+import { RefreshCw, Trash2 } from 'lucide-react'
 import { useState } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { useParams } from 'react-router-dom'
 import { toast } from 'sonner'
 import { EnvironmentConfigurationCard } from './EnvironmentConfigurationCard'
 
@@ -82,117 +70,6 @@ function EnvironmentDetailSkeleton() {
           </div>
         </CardContent>
       </Card>
-    </div>
-  )
-}
-
-interface EnvironmentVariableRowProps {
-  variable: any
-  project: ProjectResponse
-}
-
-function EnvironmentVariableRow({
-  variable,
-  project,
-}: EnvironmentVariableRowProps) {
-  const [isVisible, setIsVisible] = useState(false)
-
-  const { data, refetch } = useQuery({
-    ...getEnvironmentVariableValueOptions({
-      path: {
-        project_id: project.id,
-        key: variable.key,
-      },
-    }),
-    enabled: isVisible,
-  })
-
-  const toggleVisibility = async () => {
-    setIsVisible(!isVisible)
-    if (!isVisible) {
-      refetch()
-    }
-  }
-
-  return (
-    <div className="flex items-center justify-between gap-2 p-2 border rounded-md overflow-hidden">
-      <span className="font-mono text-sm truncate min-w-0">{variable.key}</span>
-      <div className="flex items-center gap-2 shrink-0">
-        {isVisible ? (
-          <span className="font-mono text-sm truncate max-w-[120px] sm:max-w-none">{data?.value}</span>
-        ) : (
-          <span className="font-mono text-sm">••••••••</span>
-        )}
-        <Button variant="ghost" size="sm" onClick={toggleVisibility}>
-          {isVisible ? (
-            <EyeOff className="h-4 w-4" />
-          ) : (
-            <Eye className="h-4 w-4" />
-          )}
-        </Button>
-      </div>
-    </div>
-  )
-}
-
-function CurrentDeployment({
-  project,
-  deploymentId,
-}: {
-  project: ProjectResponse
-  deploymentId: number
-}) {
-  const { data: deployment, isLoading } = useQuery({
-    ...getDeploymentOptions({
-      path: {
-        project_id: project.id,
-        deployment_id: deploymentId,
-      },
-    }),
-    enabled: !!deploymentId,
-  })
-
-  if (isLoading) {
-    return (
-      <div className="rounded-lg border p-4">
-        <div className="flex items-center justify-between">
-          <Skeleton className="h-5 w-[200px]" />
-          <Skeleton className="h-6 w-[100px]" />
-        </div>
-      </div>
-    )
-  }
-
-  if (!deployment) return null
-
-  return (
-    <div className="rounded-lg border p-3 sm:p-4">
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-        <div className="flex items-center gap-2 min-w-0">
-          <Badge
-            variant={
-              deployment.status === 'success'
-                ? 'success'
-                : deployment.status === 'failed'
-                  ? 'destructive'
-                  : 'secondary'
-            }
-            className="shrink-0"
-          >
-            {deployment.status}
-          </Badge>
-          <span className="text-sm text-muted-foreground">Deployed </span>
-          <TimeAgo
-            date={deployment.created_at}
-            className="text-sm text-muted-foreground"
-          />
-        </div>
-        <Button variant="outline" size="sm" asChild className="w-full sm:w-auto">
-          <Link to={`/projects/${project.slug}/deployments/${deployment.id}`}>
-            View Deployment
-          </Link>
-        </Button>
-      </div>
     </div>
   )
 }
@@ -298,33 +175,6 @@ export function EnvironmentDetail({
     enabled: !initialEnvironment, // Only fetch if we don't have initial data
   })
 
-  const {
-    data: variables,
-    isLoading: isLoadingVariables,
-    error: variablesError,
-  } = useQuery({
-    ...getEnvironmentVariablesOptions({
-      path: {
-        project_id: project.id,
-      },
-    }),
-    select: (data) =>
-      data.filter((v) => v.environments.some((e) => e.id === environmentId)),
-  })
-
-  const {
-    data: domains,
-    isLoading: isLoadingDomains,
-    error: domainsError,
-  } = useQuery({
-    ...getEnvironmentDomainsOptions({
-      path: {
-        project_id: project.id,
-        env_id: Number(environmentId!),
-      },
-    }),
-  })
-
   const removeEnvironmentMutation = useMutation({
     ...deleteEnvironmentMutation(),
     onSuccess: () => {
@@ -344,7 +194,7 @@ export function EnvironmentDetail({
     },
   })
 
-  if (isLoadingEnvironment || isLoadingVariables || isLoadingDomains) {
+  if (isLoadingEnvironment) {
     return <EnvironmentDetailSkeleton />
   }
 
@@ -357,24 +207,6 @@ export function EnvironmentDetail({
     )
   }
 
-  if (variablesError) {
-    return (
-      <ErrorAlert
-        title="Error loading environment variables"
-        description={variablesError.message}
-      />
-    )
-  }
-
-  if (domainsError) {
-    return (
-      <ErrorAlert
-        title="Error loading domains"
-        description={domainsError.message}
-      />
-    )
-  }
-
   if (!environment) return null
 
   // Check if this is a production environment
@@ -382,91 +214,6 @@ export function EnvironmentDetail({
 
   return (
     <div className="space-y-6">
-      {environment.current_deployment_id && (
-        <CurrentDeployment
-          project={project}
-          deploymentId={environment.current_deployment_id}
-        />
-      )}
-
-      <Card>
-        <CardHeader>
-          <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-2">
-            <div>
-              <CardTitle>Domains</CardTitle>
-              <CardDescription>
-                Custom domains attached to this environment
-              </CardDescription>
-            </div>
-            <Button variant="outline" size="sm" asChild>
-              <Link to={`/projects/${project.slug}/settings/domains`}>
-                Manage in Domains
-                <ExternalLink className="h-4 w-4 ml-2" />
-              </Link>
-            </Button>
-          </div>
-        </CardHeader>
-        <CardContent>
-          {domains?.length ? (
-            <div className="space-y-2">
-              {domains.map((domain) => (
-                <div
-                  key={domain.id}
-                  className="flex items-center justify-between rounded-lg border p-3 gap-2"
-                >
-                  <span className="font-mono text-sm truncate">
-                    {domain.domain}
-                  </span>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="h-8 w-8 shrink-0"
-                    onClick={() =>
-                      window.open(domain.url ?? `https://${domain.domain}`, '_blank')
-                    }
-                    aria-label={`Visit ${domain.domain}`}
-                  >
-                    <ExternalLink className="h-4 w-4" />
-                  </Button>
-                </div>
-              ))}
-            </div>
-          ) : (
-            <p className="text-sm text-muted-foreground">
-              No domains attached. Add one from the project Domains tab.
-            </p>
-          )}
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <CardTitle>Environment Variables</CardTitle>
-          <CardDescription>
-            Manage environment-specific variables
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <div className="space-y-4">
-            {variables?.length ? (
-              <div className="space-y-2">
-                {variables.map((variable) => (
-                  <EnvironmentVariableRow
-                    key={variable.id}
-                    variable={variable}
-                    project={project}
-                  />
-                ))}
-              </div>
-            ) : (
-              <p className="text-sm text-muted-foreground">
-                No environment variables configured
-              </p>
-            )}
-          </div>
-        </CardContent>
-      </Card>
-
       <EnvironmentConfigurationCard
         project={project}
         environment={environment}

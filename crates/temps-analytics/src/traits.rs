@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use serde_json;
 use temps_core::UtcDateTime;
 
+use crate::types::requests::VisitorSegmentFilters;
 use crate::types::responses::{
     EnrichVisitorResponse, EventCount, PageFlowResponse, SessionDetails, SessionEventsResponse,
     SessionLogsResponse, VisitorDetails, VisitorJourneyResponse, VisitorSessionsResponse,
@@ -22,7 +23,8 @@ pub trait Analytics: Send + Sync {
         end_date: Option<UtcDateTime>,
     ) -> Result<Vec<Page>, AnalyticsError>;
 
-    /// Get visitors list
+    /// Get visitors list, optionally narrowed to a segment (e.g. visitors who
+    /// used Chrome, came from the US, or triggered a specific event).
     async fn get_visitors(
         &self,
         start_date: UtcDateTime,
@@ -33,6 +35,7 @@ pub trait Analytics: Send + Sync {
         limit: Option<i32>,
         offset: Option<i32>,
         has_activity_only: Option<bool>,
+        segment: VisitorSegmentFilters,
     ) -> Result<VisitorsResponse, AnalyticsError>;
 
     /// Get event counts

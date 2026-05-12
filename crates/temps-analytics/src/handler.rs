@@ -104,6 +104,7 @@ pub struct AppState {
         StatusCodesQuery,
         EventsCountQuery,
         VisitorsListQuery,
+        VisitorSegmentFilters,
         VisitorSessionsQuery,
         SessionDetailsQuery,
         SessionEventsQuery,
@@ -289,6 +290,25 @@ pub async fn get_analytics_events_count(
         ("limit" = Option<i32>, Query, description = "Maximum number of visitors to return (default: 50)"),
         ("offset" = Option<i32>, Query, description = "Number of visitors to skip (default: 0)"),
         ("has_activity_only" = Option<bool>, Query, description = "Filter to only include visitors with recorded activity (events/sessions). When true, excludes ghost visitors (default: true)"),
+        // Segment filters — drill into a single dimension value. Visitor-row
+        // filters (country/region/city/channel/referrer) match visitor metadata;
+        // event-row filters (event/browser/os/device/language/utm_*) require
+        // at least one matching event in the date range.
+        ("filter_country" = Option<String>, Query, description = "Geolocation country"),
+        ("filter_region" = Option<String>, Query, description = "Geolocation region"),
+        ("filter_city" = Option<String>, Query, description = "Geolocation city"),
+        ("filter_channel" = Option<String>, Query, description = "First-touch channel"),
+        ("filter_referrer" = Option<String>, Query, description = "First-touch referrer hostname (use 'Direct' for null)"),
+        ("filter_event" = Option<String>, Query, description = "Event name (custom or system)"),
+        ("filter_browser" = Option<String>, Query, description = "Event-side browser"),
+        ("filter_os" = Option<String>, Query, description = "Event-side operating system"),
+        ("filter_device" = Option<String>, Query, description = "Event-side device type"),
+        ("filter_language" = Option<String>, Query, description = "Event-side language"),
+        ("filter_utm_source" = Option<String>, Query, description = "Event-side UTM source"),
+        ("filter_utm_medium" = Option<String>, Query, description = "Event-side UTM medium"),
+        ("filter_utm_campaign" = Option<String>, Query, description = "Event-side UTM campaign"),
+        ("filter_utm_term" = Option<String>, Query, description = "Event-side UTM term"),
+        ("filter_utm_content" = Option<String>, Query, description = "Event-side UTM content"),
     ),
     responses(
         (status = 200, description = "Successfully retrieved visitors", body = VisitorsResponse),
@@ -318,6 +338,7 @@ pub async fn get_visitors(
             query.limit,
             query.offset,
             Some(query.has_activity_only.unwrap_or(true)),
+            query.segment,
         )
         .await
     {

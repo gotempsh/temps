@@ -196,24 +196,25 @@ export function DimensionList({
   const [search, setSearch] = React.useState('')
 
   /**
-   * Some dimensions have a dedicated detail page when you click a value.
-   * Events have a detail view at `/analytics/events/:eventName` that shows
-   * which visitors triggered the event. We propagate the active date filter
-   * (filter / from / to) so the detail page opens on the same range.
+   * Only the `events` dimension currently has a per-value detail page
+   * (`/analytics/events/:eventName`) that lists the visitors who triggered it.
+   * Other dimensions don't have a segment-detail route yet, so their rows stay
+   * non-clickable. The active date filter is propagated so the detail page
+   * opens on the same range.
    */
   const getRowHref = (value: string): string | undefined => {
-    if (dimension === 'events') {
-      const params = new URLSearchParams()
-      const filter = searchParams.get('filter')
-      const from = searchParams.get('from')
-      const to = searchParams.get('to')
-      if (filter) params.set('filter', filter)
-      if (from) params.set('from', from)
-      if (to) params.set('to', to)
-      const qs = params.toString()
-      return `/projects/${project.slug}/analytics/events/${encodeURIComponent(value)}${qs ? `?${qs}` : ''}`
-    }
-    return undefined
+    if (dimension !== 'events') return undefined
+
+    const params = new URLSearchParams()
+    const filter = searchParams.get('filter')
+    const from = searchParams.get('from')
+    const to = searchParams.get('to')
+    if (filter) params.set('filter', filter)
+    if (from) params.set('from', from)
+    if (to) params.set('to', to)
+    const qs = params.toString()
+
+    return `/projects/${project.slug}/analytics/events/${encodeURIComponent(value)}${qs ? `?${qs}` : ''}`
   }
 
   const breakdownQuery = useQuery({

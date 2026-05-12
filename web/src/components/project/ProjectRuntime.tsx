@@ -73,7 +73,7 @@ export function ProjectRuntime({ project }: ProjectRuntimeProps) {
 
   return (
     <Tabs value={activeTab} onValueChange={handleTabChange} className="w-full">
-      <div className="px-4 pt-4">
+      <div className="mb-2">
         <TabsList>
           <TabsTrigger value="live" className="gap-1.5">
             <Radio className="h-3.5 w-3.5" />

@@ -1316,13 +1316,16 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
             </div>
           )}
         </div>
-        {/* Logs Display — fills available viewport height. The 280px subtrahend
-            accounts for the page header, tab strip, and the two toolbar rows
-            above us. min-h floors the pane on short viewports so the empty
-            state is still legible. */}
+        {/* Logs Display — fills available viewport height. The 360px subtrahend
+            accounts for the shell header (~64px), Runtime Live/History tabs
+            (~40px), page padding, and the two toolbar rows above the log pane.
+            Keep this in sync with ProjectRuntime so the page never produces a
+            second outer scrollbar that would hide the tabs while scrolling
+            logs. min-h floors the pane on short viewports so the empty state
+            is still legible. */}
         <div className="border-t border-border">
           {!selectedTarget ? (
-            <div className="h-[calc(100vh-280px)] min-h-[300px] flex items-center justify-center text-muted-foreground">
+            <div className="h-[calc(100vh-360px)] min-h-[300px] flex items-center justify-center text-muted-foreground">
               <div className="text-center">
                 <AlertCircle className="h-12 w-12 mx-auto mb-3 opacity-50" />
                 <p className="text-sm">Select an environment to view logs</p>
@@ -1332,7 +1335,7 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
             <div
               ref={parentRef}
               className={cn(
-                'h-[calc(100vh-280px)] min-h-[300px] overflow-auto px-3 py-2 font-mono text-xs bg-background text-foreground select-text',
+                'h-[calc(100vh-360px)] min-h-[300px] overflow-auto px-3 py-2 font-mono text-xs bg-background text-foreground select-text',
                 mode.kind === 'live' &&
                   connectionStatus === 'connecting' &&
                   'opacity-50'

@@ -1104,46 +1104,87 @@ export type ChatMessage = {
     tool_calls?: Array<unknown> | null;
 };
 
-export type CliLoginPasswordRequest = {
-    /**
-     * Friendly device name shown to the user when they audit API keys.
-     * Defaults to `cli` when omitted.
-     */
-    device_name?: string | null;
-    /**
-     * User email.
-     */
-    email: string;
-    /**
-     * Six-digit TOTP code. Required only when the user has MFA enabled.
-     */
-    mfa_code?: string | null;
-    /**
-     * Opaque session token returned by a prior `/auth/cli/login` call when
-     * MFA was required. Must be passed back together with `mfa_code`.
-     */
-    mfa_session_token?: string | null;
-    /**
-     * User password.
-     */
-    password: string;
+export type CliDeviceApproveRequest = {
+    user_code: string;
 };
 
-export type CliLoginRequest = {
-    password: string;
-    username: string;
+export type CliDeviceApproveResponse = {
+    status: string;
+    user_code: string;
 };
 
-export type CliLoginResponse = {
-    mfa_required: boolean;
-    mfa_session_token: string;
+export type CliDeviceLookupResponse = {
+    client_name?: string | null;
+    expires_at: string;
+    requested_ip?: string | null;
+    /**
+     * `pending` | `approved` | `denied` | `expired`.
+     */
+    status: string;
+    user_code: string;
+};
+
+export type CliDevicePollRequest = {
+    device_code: string;
+};
+
+export type CliDevicePollResponse = {
+    status: 'authorization_pending';
+} | {
+    status: 'slow_down';
+} | {
+    status: 'access_denied';
+} | {
+    status: 'expired_token';
 } | {
     api_key: string;
     email: string;
     expires_at?: string | null;
     key_prefix: string;
     role: string;
+    status: 'approved';
     user_id: number;
+};
+
+export type CliDeviceStartRequest = {
+    /**
+     * Friendly hostname / client identifier shown in the browser approval
+     * screen. Sanitized before display.
+     */
+    client_name?: string | null;
+};
+
+export type CliDeviceStartResponse = {
+    /**
+     * Opaque secret the CLI polls with. Never display to a human.
+     */
+    device_code: string;
+    /**
+     * Seconds until the device_code expires.
+     */
+    expires_in: number;
+    /**
+     * Suggested polling interval, in seconds.
+     */
+    interval: number;
+    /**
+     * Short human-readable code the user types into the browser.
+     */
+    user_code: string;
+    /**
+     * Base verification URL — the CLI may display this when the
+     * pre-filled URL is too long to be useful.
+     */
+    verification_uri: string;
+    /**
+     * `verification_uri` with `user_code` pre-filled. Open this directly.
+     */
+    verification_uri_complete: string;
+};
+
+export type CliLoginRequest = {
+    password: string;
+    username: string;
 };
 
 /**
@@ -2132,6 +2173,12 @@ export type CreateMonitorRequest = {
     check_path?: string | null;
     environment_id: number;
     monitor_type: string;
+    name: string;
+};
+
+export type CreateNotificationEmailProviderRequest = {
+    config: EmailConfig;
+    enabled?: boolean | null;
     name: string;
 };
 
@@ -12500,12 +12547,6 @@ export type UpdateDnsProviderRequest = {
     name?: string | null;
 };
 
-export type UpdateEmailProviderRequest = {
-    config: EmailConfig;
-    enabled?: boolean | null;
-    name?: string | null;
-};
-
 export type UpdateEnvironmentSettingsRequest = {
     /**
      * Anti-affinity: spread replicas across different nodes.
@@ -12688,6 +12729,12 @@ export type UpdateMcpRequest = {
         [key: string]: unknown;
     };
     description?: string | null;
+    name?: string | null;
+};
+
+export type UpdateNotificationEmailProviderRequest = {
+    config: EmailConfig;
+    enabled?: boolean | null;
     name?: string | null;
 };
 
@@ -13417,6 +13464,75 @@ export type VisitorRecord = {
     visitor_id: string;
 };
 
+/**
+ * Optional segment filters for [`VisitorsListQuery`]. Each filter narrows the
+ * result set to visitors who match the given dimension value within the date
+ * range. Visitor-row filters resolve against `visitor` / `ip_geolocations`;
+ * event-row filters resolve via `EXISTS (SELECT 1 FROM events e …)`.
+ */
+export type VisitorSegmentFilters = {
+    /**
+     * Visitors with at least one event from this browser
+     */
+    filter_browser?: string | null;
+    /**
+     * First-touch marketing channel (matches `visitor.first_channel`)
+     */
+    filter_channel?: string | null;
+    /**
+     * Geolocation city (matches `ip_geolocations.city`)
+     */
+    filter_city?: string | null;
+    /**
+     * Geolocation country (matches `ip_geolocations.country`)
+     */
+    filter_country?: string | null;
+    /**
+     * Visitors with at least one event from this device type
+     */
+    filter_device?: string | null;
+    /**
+     * Visitors who triggered this event_name in the range
+     */
+    filter_event?: string | null;
+    /**
+     * Visitors with at least one event in this language
+     */
+    filter_language?: string | null;
+    /**
+     * Visitors with at least one event from this operating system
+     */
+    filter_os?: string | null;
+    /**
+     * First-touch referrer hostname (matches `visitor.first_referrer_hostname`)
+     */
+    filter_referrer?: string | null;
+    /**
+     * Geolocation region (matches `ip_geolocations.region`)
+     */
+    filter_region?: string | null;
+    /**
+     * Visitors with at least one event from this UTM campaign
+     */
+    filter_utm_campaign?: string | null;
+    /**
+     * Visitors with at least one event from this UTM content
+     */
+    filter_utm_content?: string | null;
+    /**
+     * Visitors with at least one event from this UTM medium
+     */
+    filter_utm_medium?: string | null;
+    /**
+     * Visitors with at least one event from this UTM source
+     */
+    filter_utm_source?: string | null;
+    /**
+     * Visitors with at least one event from this UTM term
+     */
+    filter_utm_term?: string | null;
+};
+
 export type VisitorSessionsQuery = {
     environment_id?: number | null;
     limit?: number | null;
@@ -13479,7 +13595,7 @@ export type VisitorWithGeolocation = {
     visitor_id: string;
 };
 
-export type VisitorsListQuery = {
+export type VisitorsListQuery = VisitorSegmentFilters & {
     end_date: string;
     environment_id?: number | null;
     /**
@@ -15854,6 +15970,66 @@ export type GetVisitorsData = {
          * Filter to only include visitors with recorded activity (events/sessions). When true, excludes ghost visitors (default: true)
          */
         has_activity_only?: boolean;
+        /**
+         * Geolocation country
+         */
+        filter_country?: string;
+        /**
+         * Geolocation region
+         */
+        filter_region?: string;
+        /**
+         * Geolocation city
+         */
+        filter_city?: string;
+        /**
+         * First-touch channel
+         */
+        filter_channel?: string;
+        /**
+         * First-touch referrer hostname (use 'Direct' for null)
+         */
+        filter_referrer?: string;
+        /**
+         * Event name (custom or system)
+         */
+        filter_event?: string;
+        /**
+         * Event-side browser
+         */
+        filter_browser?: string;
+        /**
+         * Event-side operating system
+         */
+        filter_os?: string;
+        /**
+         * Event-side device type
+         */
+        filter_device?: string;
+        /**
+         * Event-side language
+         */
+        filter_language?: string;
+        /**
+         * Event-side UTM source
+         */
+        filter_utm_source?: string;
+        /**
+         * Event-side UTM medium
+         */
+        filter_utm_medium?: string;
+        /**
+         * Event-side UTM campaign
+         */
+        filter_utm_campaign?: string;
+        /**
+         * Event-side UTM term
+         */
+        filter_utm_term?: string;
+        /**
+         * Event-side UTM content
+         */
+        filter_utm_content?: string;
     };
     url: '/analytics/visitors';
 };
@@ -16544,36 +16720,173 @@ export type DeactivateApiKeyResponses = {
 
 export type DeactivateApiKeyResponse = DeactivateApiKeyResponses[keyof DeactivateApiKeyResponses];
 
-export type CliLoginData = {
-    body: CliLoginPasswordRequest;
+export type CliDeviceApproveData = {
+    body: CliDeviceApproveRequest;
     path?: never;
     query?: never;
-    url: '/auth/cli/login';
+    url: '/auth/cli/device/approve';
 };
 
-export type CliLoginErrors = {
+export type CliDeviceApproveErrors = {
     /**
-     * Invalid credentials or MFA code
+     * Unauthorized
      */
     401: unknown;
     /**
-     * User has no role assigned
+     * Unknown user_code
      */
-    403: unknown;
+    404: unknown;
+    /**
+     * Already resolved
+     */
+    409: unknown;
+    /**
+     * Session expired
+     */
+    410: unknown;
     /**
      * Internal server error
      */
     500: unknown;
 };
 
-export type CliLoginResponses = {
+export type CliDeviceApproveResponses = {
     /**
-     * Login successful or MFA challenge issued
+     * Session approved; CLI can now claim the API key
      */
-    200: CliLoginResponse;
+    200: CliDeviceApproveResponse;
 };
 
-export type CliLoginResponse2 = CliLoginResponses[keyof CliLoginResponses];
+export type CliDeviceApproveResponse2 = CliDeviceApproveResponses[keyof CliDeviceApproveResponses];
+
+export type CliDeviceDenyData = {
+    body: CliDeviceApproveRequest;
+    path?: never;
+    query?: never;
+    url: '/auth/cli/device/deny';
+};
+
+export type CliDeviceDenyErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Unknown user_code
+     */
+    404: unknown;
+    /**
+     * Already resolved
+     */
+    409: unknown;
+    /**
+     * Session expired
+     */
+    410: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CliDeviceDenyResponses = {
+    /**
+     * Session denied
+     */
+    200: CliDeviceApproveResponse;
+};
+
+export type CliDeviceDenyResponse = CliDeviceDenyResponses[keyof CliDeviceDenyResponses];
+
+export type CliDeviceLookupData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * `user_code` as displayed in the CLI / pasted into the URL.
+         */
+        user_code: string;
+    };
+    url: '/auth/cli/device/lookup';
+};
+
+export type CliDeviceLookupErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Unknown user_code
+     */
+    404: unknown;
+    /**
+     * Device session expired
+     */
+    410: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CliDeviceLookupResponses = {
+    /**
+     * Device session metadata
+     */
+    200: CliDeviceLookupResponse;
+};
+
+export type CliDeviceLookupResponse2 = CliDeviceLookupResponses[keyof CliDeviceLookupResponses];
+
+export type CliDevicePollData = {
+    body: CliDevicePollRequest;
+    path?: never;
+    query?: never;
+    url: '/auth/cli/device/poll';
+};
+
+export type CliDevicePollErrors = {
+    /**
+     * Unknown device_code
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CliDevicePollResponses = {
+    /**
+     * Poll result; check `status` field
+     */
+    200: CliDevicePollResponse;
+};
+
+export type CliDevicePollResponse2 = CliDevicePollResponses[keyof CliDevicePollResponses];
+
+export type CliDeviceStartData = {
+    body: CliDeviceStartRequest;
+    path?: never;
+    query?: never;
+    url: '/auth/cli/device/start';
+};
+
+export type CliDeviceStartErrors = {
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CliDeviceStartResponses = {
+    /**
+     * Device session created
+     */
+    200: CliDeviceStartResponse;
+};
+
+export type CliDeviceStartResponse2 = CliDeviceStartResponses[keyof CliDeviceStartResponses];
 
 export type CliLogoutData = {
     body?: never;
@@ -24772,7 +25085,7 @@ export type CreateNotificationProviderResponses = {
 export type CreateNotificationProviderResponse = CreateNotificationProviderResponses[keyof CreateNotificationProviderResponses];
 
 export type CreateNotificationEmailProviderData = {
-    body: CreateEmailProviderRequest;
+    body: CreateNotificationEmailProviderRequest;
     path?: never;
     query?: never;
     url: '/notification-providers/email';
@@ -24799,7 +25112,7 @@ export type CreateNotificationEmailProviderResponses = {
 export type CreateNotificationEmailProviderResponse = CreateNotificationEmailProviderResponses[keyof CreateNotificationEmailProviderResponses];
 
 export type UpdateEmailProviderData = {
-    body: UpdateEmailProviderRequest;
+    body: UpdateNotificationEmailProviderRequest;
     path: {
         /**
          * Provider ID

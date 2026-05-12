@@ -111,6 +111,44 @@ pub enum EventBreakdown {
     City,
 }
 
+/// Optional segment filters for [`VisitorsListQuery`]. Each filter narrows the
+/// result set to visitors who match the given dimension value within the date
+/// range. Visitor-row filters resolve against `visitor` / `ip_geolocations`;
+/// event-row filters resolve via `EXISTS (SELECT 1 FROM events e …)`.
+#[derive(Debug, Deserialize, Clone, Default, ToSchema)]
+pub struct VisitorSegmentFilters {
+    /// Geolocation country (matches `ip_geolocations.country`)
+    pub filter_country: Option<String>,
+    /// Geolocation region (matches `ip_geolocations.region`)
+    pub filter_region: Option<String>,
+    /// Geolocation city (matches `ip_geolocations.city`)
+    pub filter_city: Option<String>,
+    /// First-touch marketing channel (matches `visitor.first_channel`)
+    pub filter_channel: Option<String>,
+    /// First-touch referrer hostname (matches `visitor.first_referrer_hostname`)
+    pub filter_referrer: Option<String>,
+    /// Visitors who triggered this event_name in the range
+    pub filter_event: Option<String>,
+    /// Visitors with at least one event from this browser
+    pub filter_browser: Option<String>,
+    /// Visitors with at least one event from this operating system
+    pub filter_os: Option<String>,
+    /// Visitors with at least one event from this device type
+    pub filter_device: Option<String>,
+    /// Visitors with at least one event in this language
+    pub filter_language: Option<String>,
+    /// Visitors with at least one event from this UTM source
+    pub filter_utm_source: Option<String>,
+    /// Visitors with at least one event from this UTM medium
+    pub filter_utm_medium: Option<String>,
+    /// Visitors with at least one event from this UTM campaign
+    pub filter_utm_campaign: Option<String>,
+    /// Visitors with at least one event from this UTM term
+    pub filter_utm_term: Option<String>,
+    /// Visitors with at least one event from this UTM content
+    pub filter_utm_content: Option<String>,
+}
+
 #[derive(Deserialize, Clone, ToSchema)]
 pub struct VisitorsListQuery {
     pub start_date: DateTime,
@@ -123,6 +161,11 @@ pub struct VisitorsListQuery {
     /// Filter to only include visitors with recorded activity (events/sessions).
     /// When true, excludes "ghost" visitors that have no events.
     pub has_activity_only: Option<bool>,
+
+    // Segment filters — drill into "visitors who match this dimension value".
+    // Flattened so each filter remains a top-level query string param.
+    #[serde(flatten)]
+    pub segment: VisitorSegmentFilters,
 }
 
 #[derive(Deserialize, Clone, ToSchema)]

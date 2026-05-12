@@ -226,6 +226,7 @@ impl Analytics for AnalyticsService {
         limit: Option<i32>,
         offset: Option<i32>,
         has_activity_only: Option<bool>,
+        segment: crate::types::requests::VisitorSegmentFilters,
     ) -> Result<VisitorsResponse, AnalyticsError> {
         // Build WHERE conditions with parameterized queries
         let mut where_conditions = vec!["v.project_id = $1".to_string()];
@@ -258,19 +259,144 @@ impl Analytics for AnalyticsService {
         values.push(end_date.into());
         param_index += 1;
 
+        // ─── Segment filters ────────────────────────────────────────────────
+        // Visitor-row filters resolve against the visitor table directly so we
+        // can keep the count/list queries on the same plan. Event-row filters
+        // (browser/OS/device/UTM/event_name/language) need at least one event
+        // in the range that matches — expressed as a single EXISTS subquery
+        // so we don't multiply rows.
+
+        // Visitor-side: country / region / city require the ip_geolocations
+        // LEFT JOIN we already do in the list query. For the count query we
+        // need to make sure ig.* is reachable — we handle that by joining in
+        // both queries below when a geo filter is present.
+        let needs_geo_join = segment.filter_country.is_some()
+            || segment.filter_region.is_some()
+            || segment.filter_city.is_some();
+
+        if let Some(country) = &segment.filter_country {
+            where_conditions.push(format!("ig.country = ${}", param_index));
+            values.push(country.clone().into());
+            param_index += 1;
+        }
+        if let Some(region) = &segment.filter_region {
+            where_conditions.push(format!("ig.region = ${}", param_index));
+            values.push(region.clone().into());
+            param_index += 1;
+        }
+        if let Some(city) = &segment.filter_city {
+            where_conditions.push(format!("ig.city = ${}", param_index));
+            values.push(city.clone().into());
+            param_index += 1;
+        }
+
+        // Visitor-side: first-touch channel / referrer.
+        // "Direct" referrer is stored as NULL in the visitor table.
+        if let Some(channel) = &segment.filter_channel {
+            where_conditions.push(format!("v.first_channel = ${}", param_index));
+            values.push(channel.clone().into());
+            param_index += 1;
+        }
+        if let Some(referrer) = &segment.filter_referrer {
+            if referrer == "Direct" {
+                where_conditions.push("v.first_referrer_hostname IS NULL".to_string());
+            } else {
+                where_conditions.push(format!("v.first_referrer_hostname = ${}", param_index));
+                values.push(referrer.clone().into());
+                param_index += 1;
+            }
+        }
+
+        // Event-side filters bundled into one EXISTS subquery so we touch the
+        // events hypertable once per visitor row (uses idx_events_visitor_*).
+        let mut event_conditions: Vec<String> = Vec::new();
+        if let Some(event_name) = &segment.filter_event {
+            event_conditions.push(format!(
+                "COALESCE(e.event_name, e.event_type) = ${}",
+                param_index
+            ));
+            values.push(event_name.clone().into());
+            param_index += 1;
+        }
+        if let Some(browser) = &segment.filter_browser {
+            event_conditions.push(format!("e.browser = ${}", param_index));
+            values.push(browser.clone().into());
+            param_index += 1;
+        }
+        if let Some(os) = &segment.filter_os {
+            event_conditions.push(format!("e.operating_system = ${}", param_index));
+            values.push(os.clone().into());
+            param_index += 1;
+        }
+        if let Some(device) = &segment.filter_device {
+            event_conditions.push(format!("e.device_type = ${}", param_index));
+            values.push(device.clone().into());
+            param_index += 1;
+        }
+        if let Some(language) = &segment.filter_language {
+            event_conditions.push(format!("e.language = ${}", param_index));
+            values.push(language.clone().into());
+            param_index += 1;
+        }
+        for (column, value) in [
+            ("utm_source", &segment.filter_utm_source),
+            ("utm_medium", &segment.filter_utm_medium),
+            ("utm_campaign", &segment.filter_utm_campaign),
+            ("utm_term", &segment.filter_utm_term),
+            ("utm_content", &segment.filter_utm_content),
+        ] {
+            if let Some(v) = value {
+                event_conditions.push(format!("e.{} = ${}", column, param_index));
+                values.push(v.clone().into());
+                param_index += 1;
+            }
+        }
+
+        if !event_conditions.is_empty() {
+            // Constrain the EXISTS to the same date window so a visitor only
+            // qualifies if they had a matching event in the chosen range.
+            event_conditions.push(format!("e.timestamp >= ${}", param_index));
+            values.push(start_date.into());
+            param_index += 1;
+            event_conditions.push(format!("e.timestamp <= ${}", param_index));
+            values.push(end_date.into());
+            param_index += 1;
+
+            // Including `e.project_id = v.project_id` lets the planner prune
+            // hypertable chunks by project before the visitor-id seek, and
+            // short-circuits via the events composite indexes on
+            // (project_id, visitor_id, timestamp).
+            where_conditions.push(format!(
+                "EXISTS (SELECT 1 FROM events e \
+                 WHERE e.visitor_id = v.id \
+                 AND e.project_id = v.project_id \
+                 AND {})",
+                event_conditions.join(" AND ")
+            ));
+        }
+
         let limit_val = limit.unwrap_or(50).min(100);
         let offset_val = offset.unwrap_or(0);
 
         let where_clause = where_conditions.join(" AND ");
+
+        // FROM clause needs the geo join when a geo filter is in play; the
+        // list query already uses LEFT JOIN ig so reuse the same join here.
+        let geo_join = if needs_geo_join {
+            "LEFT JOIN ip_geolocations ig ON v.ip_address_id = ig.id"
+        } else {
+            ""
+        };
 
         // Count total before applying limit/offset
         let count_sql = format!(
             r#"
             SELECT COUNT(*) as total
             FROM visitor v
+            {}
             WHERE {}
             "#,
-            where_clause
+            geo_join, where_clause
         );
 
         #[derive(FromQueryResult)]
