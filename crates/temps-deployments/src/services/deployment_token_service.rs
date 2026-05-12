@@ -520,13 +520,24 @@ impl DeploymentTokenService {
                 query.filter(temps_entities::deployment_tokens::Column::EnvironmentId.is_null());
         }
 
-        // Check expiration
-        let now = Utc::now();
-        query = query.filter(
-            temps_entities::deployment_tokens::Column::ExpiresAt
-                .is_null()
-                .or(temps_entities::deployment_tokens::Column::ExpiresAt.gt(now)),
-        );
+        // Only reuse PERMANENT tokens (expires_at IS NULL).
+        //
+        // The deploy pipeline burns this token into the container's
+        // `TEMPS_API_TOKEN` env var at create time. That value never gets
+        // refreshed for the life of the container, so the token has to
+        // outlive every redeploy of every app in the project.
+        //
+        // Previously the filter was `is_null().or(gt(now))`, which happily
+        // returned short-lived tokens (`workflow-run-*` with 2h expiry,
+        // `workspace-session-*` with 6h expiry) as long as they hadn't
+        // expired YET. Containers deployed during one of those windows got
+        // a token that died a couple hours later and 401'd ever after.
+        //
+        // Restricting to `expires_at IS NULL` means we only reuse tokens we
+        // ourselves auto-generated for the deploy path below — those are
+        // the only ones that ever carry no expiry. Anything else falls
+        // through to the create branch and we mint a fresh permanent row.
+        query = query.filter(temps_entities::deployment_tokens::Column::ExpiresAt.is_null());
 
         // Order by: prefer environment-specific tokens, then by creation date
         query = query
@@ -1458,5 +1469,92 @@ mod tests {
         // Note: DeploymentTokenResponse doesn't have a `token` field - only token_prefix
         assert!(response.token_prefix.ends_with("..."));
         assert_eq!(response.permissions.as_ref().unwrap().len(), 2);
+    }
+
+    /// Regression test for the production bug where the deploy pipeline got
+    /// handed a short-lived `workflow-run-*` token instead of a permanent
+    /// one. The container baked the expiring token into TEMPS_API_TOKEN at
+    /// create time, then 401'd every API call once the token's 2h window
+    /// closed.
+    ///
+    /// `get_or_create_deployment_token` MUST skip any row with a non-NULL
+    /// `expires_at`, even if that row hasn't expired yet — those rows
+    /// belong to other subsystems (workflow runs, workspace sessions) and
+    /// are not intended for the deploy pipeline.
+    #[tokio::test]
+    async fn test_get_or_create_skips_short_lived_tokens() {
+        let Some((_db, service, project)) = setup_test_env().await else {
+            return;
+        };
+
+        // Seed an active, non-expired, short-lived token that mimics a
+        // workflow-run token (2h expiry, future).
+        let short_lived = service
+            .create_token(
+                project.id,
+                Some(1),
+                CreateDeploymentTokenRequest {
+                    name: "workflow-run-fake-1".to_string(),
+                    environment_id: None,
+                    deployment_id: None,
+                    permissions: Some(vec!["*".to_string()]),
+                    expires_at: Some(Utc::now() + Duration::hours(2)),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Now ask the deploy pipeline's helper for a token.
+        let returned = service
+            .get_or_create_deployment_token(project.id, None, None)
+            .await
+            .unwrap();
+
+        // The short-lived row's plaintext is in `short_lived.token`. The
+        // returned token must NOT equal it — the function should have
+        // fallen through to the create branch and minted a fresh
+        // permanent row.
+        assert_ne!(
+            returned, short_lived.token,
+            "deploy pipeline reused a short-lived (expiring) token — would 401 after expiry"
+        );
+
+        // And the newly-minted permanent row must exist with expires_at = NULL.
+        let permanent = DeploymentTokenEntity::find()
+            .filter(temps_entities::deployment_tokens::Column::ProjectId.eq(project.id))
+            .filter(temps_entities::deployment_tokens::Column::ExpiresAt.is_null())
+            .one(service.db.as_ref())
+            .await
+            .unwrap()
+            .expect("get_or_create should have created a permanent token");
+        assert!(permanent.name.starts_with("Auto-generated"));
+    }
+
+    /// Happy-path test: when a permanent token already exists for the
+    /// project, `get_or_create_deployment_token` reuses it instead of
+    /// minting a new one. Without this, every redeploy of every app would
+    /// orphan the previous deployment's token.
+    #[tokio::test]
+    async fn test_get_or_create_reuses_permanent_token() {
+        let Some((_db, service, project)) = setup_test_env().await else {
+            return;
+        };
+
+        // First call: no token exists, so this creates a permanent one.
+        let first = service
+            .get_or_create_deployment_token(project.id, None, None)
+            .await
+            .unwrap();
+
+        // Second call: must return the SAME plaintext.
+        let second = service
+            .get_or_create_deployment_token(project.id, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            first, second,
+            "get_or_create should reuse the existing permanent token"
+        );
     }
 }
