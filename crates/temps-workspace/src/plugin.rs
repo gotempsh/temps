@@ -19,6 +19,7 @@ use crate::services::git_credential_service::GitCredentialService;
 use crate::services::memory_service::WorkflowMemoryService;
 use crate::services::message_executor::MessageExecutor;
 use crate::services::session_manager::WorkspaceSessionManager;
+use crate::services::token_refresher::TokenRefresher;
 use crate::services::workspace_service::WorkspaceService;
 
 /// Default idle timeout for workspace sessions: 2 hours.
@@ -313,6 +314,28 @@ impl TempsPlugin for WorkspacePlugin {
                     }
                 }
             });
+
+            // Spawn the deployment-token refresher. Without this, workspace
+            // sessions left idle for >6h have their TEMPS_API_TOKEN expire
+            // mid-session and the in-sandbox CLI / credential daemon start
+            // 401'ing every call back to the control plane. The refresher
+            // wakes every 30 min and re-issues tokens that expire within
+            // the next 90 min — see services/token_refresher.rs for the
+            // full rationale. Requires the MessageExecutor: without it,
+            // there's no `refresh_sandbox` entry point to call.
+            if let Some(executor) =
+                context.get_service::<crate::services::message_executor::MessageExecutor>()
+            {
+                let db = context.require_service::<sea_orm::DatabaseConnection>();
+                TokenRefresher::new(db, executor).spawn();
+                info!("Workspace token refresher started");
+            } else {
+                warn!(
+                    "Token refresher not started: MessageExecutor unavailable. \
+                     Long-idle workspace sessions will hit 401 once their \
+                     deployment tokens expire."
+                );
+            }
 
             debug!("Workspace plugin initialized");
             Ok(())
