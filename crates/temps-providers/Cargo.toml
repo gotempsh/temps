@@ -30,7 +30,7 @@ tracing = { workspace = true }
 reqwest = { workspace = true }
 sea-orm = { workspace = true }
 redis = { version = "0.28.2", features = ["tokio-comp", "connection-manager"] }
-mongodb = "3.3.0"
+mongodb = "3.7.0"
 aws-sdk-s3 = { workspace = true }
 aws-smithy-runtime = "1.9"
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
