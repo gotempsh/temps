@@ -54,10 +54,8 @@ impl ActiveModelBehavior for ActiveModel {
         C: ConnectionTrait,
     {
         let now = chrono::Utc::now();
-        if insert {
-            if self.created_at.is_not_set() {
-                self.created_at = Set(now);
-            }
+        if insert && self.created_at.is_not_set() {
+            self.created_at = Set(now);
         }
         self.updated_at = Set(now);
         Ok(self)
