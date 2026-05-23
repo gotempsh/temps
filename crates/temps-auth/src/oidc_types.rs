@@ -120,7 +120,9 @@ pub fn mask_secret() -> String {
     MASKED_SECRET.to_string()
 }
 
-pub fn provider_to_response(provider: &temps_entities::oidc_providers::Model) -> OidcProviderResponse {
+pub fn provider_to_response(
+    provider: &temps_entities::oidc_providers::Model,
+) -> OidcProviderResponse {
     OidcProviderResponse {
         id: provider.id,
         name: provider.name.clone(),

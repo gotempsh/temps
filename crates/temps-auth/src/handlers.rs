@@ -359,8 +359,14 @@ pub fn configure_routes() -> Router<Arc<AuthState>> {
         .route("/auth/magic-link/verify", get(verify_magic_link))
         .route("/auth/password-reset/request", post(request_password_reset))
         .route("/auth/password-reset/verify", post(reset_password))
-        .route("/auth/oidc/login/{provider_id}", get(crate::oidc_handler::start_oidc_login))
-        .route("/auth/oidc/callback", get(crate::oidc_handler::oidc_callback))
+        .route(
+            "/auth/oidc/login/{provider_id}",
+            get(crate::oidc_handler::start_oidc_login),
+        )
+        .route(
+            "/auth/oidc/callback",
+            get(crate::oidc_handler::oidc_callback),
+        )
         .layer(axum::Extension(rate_limiter))
         .layer(axum::middleware::from_fn(auth_rate_limit_middleware));
 

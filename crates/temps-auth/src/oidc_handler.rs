@@ -19,8 +19,8 @@ use crate::oidc_errors::OidcError;
 use crate::oidc_service::OidcService;
 use crate::oidc_types::{
     provider_to_response, CreateOidcProviderRequest, CreateOidcRoleMappingRequest,
-    OidcProviderResponse, OidcProviderSummary, OidcRoleMappingResponse,
-    OidcTestConnectionResponse, UpdateOidcProviderRequest,
+    OidcProviderResponse, OidcProviderSummary, OidcRoleMappingResponse, OidcTestConnectionResponse,
+    UpdateOidcProviderRequest,
 };
 use crate::permission_guard;
 use crate::state::AuthState;
@@ -177,29 +177,29 @@ async fn complete_oidc_login(
         .await?;
     let resolved = state
         .oidc_service
-        .resolve_user(
-            login_state.provider_id,
-            &claims.claims,
-            &claims.raw_claims,
-        )
+        .resolve_user(login_state.provider_id, &claims.claims, &claims.raw_claims)
         .await?;
     let user = resolved.user;
 
     let return_to = OidcService::sanitize_return_to(login_state.return_to);
 
     if user.mfa_enabled {
-        let mfa_token = state.auth_service.create_mfa_session(user.id).await.map_err(|e| {
-            OidcError::DiscoveryFailed {
+        let mfa_token = state
+            .auth_service
+            .create_mfa_session(user.id)
+            .await
+            .map_err(|e| OidcError::DiscoveryFailed {
                 issuer: provider.issuer_url.clone(),
                 reason: format!("failed to create MFA session: {e}"),
-            }
-        })?;
-        let encrypted_token = state.cookie_crypto.encrypt(&mfa_token).map_err(|e| {
-            OidcError::DiscoveryFailed {
-                issuer: provider.issuer_url.clone(),
-                reason: format!("failed to encrypt MFA token: {e}"),
-            }
-        })?;
+            })?;
+        let encrypted_token =
+            state
+                .cookie_crypto
+                .encrypt(&mfa_token)
+                .map_err(|e| OidcError::DiscoveryFailed {
+                    issuer: provider.issuer_url.clone(),
+                    reason: format!("failed to encrypt MFA token: {e}"),
+                })?;
 
         let mut headers = HeaderMap::new();
         let mfa_cookie = Cookie::build(("mfa_session", encrypted_token))
@@ -214,18 +214,22 @@ async fn complete_oidc_login(
         return Ok((headers, Redirect::to("/mfa-verify")).into_response());
     }
 
-    let session_token = state.auth_service.create_session(user.id).await.map_err(|e| {
-        OidcError::DiscoveryFailed {
+    let session_token = state
+        .auth_service
+        .create_session(user.id)
+        .await
+        .map_err(|e| OidcError::DiscoveryFailed {
             issuer: provider.issuer_url.clone(),
             reason: format!("failed to create session: {e}"),
-        }
-    })?;
-    let encrypted_token = state.cookie_crypto.encrypt(&session_token).map_err(|e| {
-        OidcError::DiscoveryFailed {
-            issuer: provider.issuer_url.clone(),
-            reason: format!("failed to encrypt session token: {e}"),
-        }
-    })?;
+        })?;
+    let encrypted_token =
+        state
+            .cookie_crypto
+            .encrypt(&session_token)
+            .map_err(|e| OidcError::DiscoveryFailed {
+                issuer: provider.issuer_url.clone(),
+                reason: format!("failed to encrypt session token: {e}"),
+            })?;
     let headers = state
         .auth_service
         .create_session_cookie(&encrypted_token, metadata.is_secure);
@@ -251,10 +255,7 @@ async fn complete_oidc_login(
 
 fn redirect_login_error(reason: &str) -> Response {
     let encoded = urlencoding::encode(reason);
-    Redirect::to(&format!(
-        "/login?error=oidc_failed&reason={encoded}"
-    ))
-    .into_response()
+    Redirect::to(&format!("/login?error=oidc_failed&reason={encoded}")).into_response()
 }
 
 #[utoipa::path(
@@ -293,9 +294,7 @@ pub async fn list_oidc_providers(
 ) -> Result<Json<Vec<OidcProviderResponse>>, Problem> {
     permission_guard!(auth, SettingsWrite);
     let providers = state.oidc_service.list_providers().await?;
-    Ok(Json(
-        providers.iter().map(provider_to_response).collect(),
-    ))
+    Ok(Json(providers.iter().map(provider_to_response).collect()))
 }
 
 #[utoipa::path(

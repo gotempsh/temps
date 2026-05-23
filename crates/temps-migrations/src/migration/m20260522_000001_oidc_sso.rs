@@ -65,11 +65,7 @@ impl MigrationTrait for Migration {
                 Table::alter()
                     .table(Users::Table)
                     .add_column(ColumnDef::new(Users::OidcSubject).text().null())
-                    .add_column(
-                        ColumnDef::new(Users::OidcProviderId)
-                            .integer()
-                            .null(),
-                    )
+                    .add_column(ColumnDef::new(Users::OidcProviderId).integer().null())
                     .to_owned(),
             )
             .await?;

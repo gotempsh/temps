@@ -61,11 +61,7 @@ impl MigrationTrait for Migration {
                             .not_null()
                             .default(100),
                     )
-                    .col(
-                        ColumnDef::new(OidcRoleMappings::IdpGroup)
-                            .text()
-                            .not_null(),
-                    )
+                    .col(ColumnDef::new(OidcRoleMappings::IdpGroup).text().not_null())
                     .col(ColumnDef::new(OidcRoleMappings::Role).text().not_null())
                     .col(
                         ColumnDef::new(OidcRoleMappings::CreatedAt)

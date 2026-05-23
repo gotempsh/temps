@@ -19,8 +19,8 @@ use tokio::sync::Mutex;
 
 use crate::oidc_errors::OidcError;
 use crate::oidc_types::{
-    CreateOidcProviderRequest, CreateOidcRoleMappingRequest, OidcProviderSummary,
-    OidcRoleMappingResponse, UpdateOidcProviderRequest, role_mapping_to_response,
+    role_mapping_to_response, CreateOidcProviderRequest, CreateOidcRoleMappingRequest,
+    OidcProviderSummary, OidcRoleMappingResponse, UpdateOidcProviderRequest,
 };
 use crate::user_service::UserService;
 use temps_core::EncryptionService;
@@ -96,9 +96,7 @@ impl OidcService {
     }
 
     pub async fn list_providers(&self) -> Result<Vec<oidc_providers::Model>, OidcError> {
-        Ok(oidc_providers::Entity::find()
-            .all(self.db.as_ref())
-            .await?)
+        Ok(oidc_providers::Entity::find().all(self.db.as_ref()).await?)
     }
 
     pub async fn get_provider(&self, provider_id: i32) -> Result<oidc_providers::Model, OidcError> {
@@ -112,7 +110,9 @@ impl OidcService {
         &self,
         request: CreateOidcProviderRequest,
     ) -> Result<oidc_providers::Model, OidcError> {
-        let existing = oidc_providers::Entity::find().count(self.db.as_ref()).await?;
+        let existing = oidc_providers::Entity::find()
+            .count(self.db.as_ref())
+            .await?;
         if existing > 0 {
             return Err(OidcError::ProviderAlreadyExists);
         }
@@ -139,14 +139,8 @@ impl OidcService {
             jit_provisioning: Set(request.jit_provisioning),
             enabled: Set(request.enabled),
             template: Set(normalize_template(&request.template)),
-            group_claim: Set(normalize_claim_name(
-                &request.group_claim,
-                "groups",
-            )),
-            role_claim: Set(normalize_claim_name(
-                &request.role_claim,
-                "roles",
-            )),
+            group_claim: Set(normalize_claim_name(&request.group_claim, "groups")),
+            role_claim: Set(normalize_claim_name(&request.role_claim, "roles")),
             default_role: Set(parse_sso_role(&request.default_role)?.as_str().to_string()),
             ..Default::default()
         }
@@ -296,7 +290,9 @@ impl OidcService {
             validate_return_to(path)?;
         }
 
-        let client = self.core_client_for_provider(&provider, redirect_uri).await?;
+        let client = self
+            .core_client_for_provider(&provider, redirect_uri)
+            .await?;
         let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
         let pkce_verifier_str = pkce_verifier.secret().to_string();
 
@@ -328,10 +324,7 @@ impl OidcService {
         })
     }
 
-    pub async fn consume_login_state(
-        &self,
-        state: &str,
-    ) -> Result<OidcLoginState, OidcError> {
+    pub async fn consume_login_state(&self, state: &str) -> Result<OidcLoginState, OidcError> {
         let row = oidc_login_states::Entity::find()
             .filter(oidc_login_states::Column::State.eq(state))
             .one(self.db.as_ref())
@@ -367,12 +360,12 @@ impl OidcService {
         code: &str,
         login_state: &OidcLoginState,
     ) -> Result<OidcExchangeResult, OidcError> {
-        let client = self.core_client_for_provider(provider, redirect_uri).await?;
+        let client = self
+            .core_client_for_provider(provider, redirect_uri)
+            .await?;
         let token_response = client
             .exchange_code(AuthorizationCode::new(code.to_string()))
-            .set_pkce_verifier(PkceCodeVerifier::new(
-                login_state.pkce_verifier.clone(),
-            ))
+            .set_pkce_verifier(PkceCodeVerifier::new(login_state.pkce_verifier.clone()))
             .request_async(async_http_client)
             .await
             .map_err(|e| OidcError::TokenExchangeFailed {
@@ -407,7 +400,10 @@ impl OidcService {
     ) -> Result<OidcResolvedUser, OidcError> {
         let provider = self.get_provider(provider_id).await?;
         let mappings = self.load_role_mappings(provider_id).await?;
-        let groups = string_slice_claim(raw_claims, claim_name_or_default(&provider.group_claim, "groups"));
+        let groups = string_slice_claim(
+            raw_claims,
+            claim_name_or_default(&provider.group_claim, "groups"),
+        );
         let role = evaluate_role(&provider, &mappings, &groups, raw_claims);
 
         let sub = claims.subject().as_str();
@@ -458,12 +454,7 @@ impl OidcService {
 
         let created = self
             .user_service
-            .create_user(
-                display_name,
-                email.clone(),
-                None,
-                vec![role.clone()],
-            )
+            .create_user(display_name, email.clone(), None, vec![role.clone()])
             .await
             .map_err(|e| OidcError::DiscoveryFailed {
                 issuer: provider.issuer_url.clone(),
@@ -500,11 +491,7 @@ impl OidcService {
             .await?)
     }
 
-    async fn sync_user_sso_role(
-        &self,
-        user_id: i32,
-        role: RoleType,
-    ) -> Result<(), OidcError> {
+    async fn sync_user_sso_role(&self, user_id: i32, role: RoleType) -> Result<(), OidcError> {
         let user = self
             .user_service
             .get_user_with_roles(user_id)
@@ -577,12 +564,12 @@ impl OidcService {
             ClientId::new(provider.client_id.clone()),
             Some(ClientSecret::new(client_secret)),
         )
-        .set_redirect_uri(
-            RedirectUrl::new(redirect_uri.to_string()).map_err(|e| OidcError::DiscoveryFailed {
+        .set_redirect_uri(RedirectUrl::new(redirect_uri.to_string()).map_err(|e| {
+            OidcError::DiscoveryFailed {
                 issuer: provider.issuer_url.clone(),
                 reason: format!("invalid redirect URI: {e}"),
-            })?,
-        ))
+            }
+        })?))
     }
 
     async fn fetch_provider_metadata(
@@ -685,18 +672,25 @@ fn claim_name_or_default<'a>(claim: &'a str, fallback: &'a str) -> &'a str {
 }
 
 fn parse_sso_role(role: &str) -> Result<RoleType, OidcError> {
-    RoleType::from_str(role.trim().to_ascii_lowercase().as_str()).map_err(|_| OidcError::InvalidRole {
-        role: role.to_string(),
+    RoleType::from_str(role.trim().to_ascii_lowercase().as_str()).map_err(|_| {
+        OidcError::InvalidRole {
+            role: role.to_string(),
+        }
     })
 }
 
-fn decode_verified_id_token_payload(id_token: &CoreIdToken) -> Result<serde_json::Value, OidcError> {
+fn decode_verified_id_token_payload(
+    id_token: &CoreIdToken,
+) -> Result<serde_json::Value, OidcError> {
     use base64::Engine;
 
     let jwt = id_token.to_string();
-    let payload_b64 = jwt.split('.').nth(1).ok_or_else(|| OidcError::IdTokenInvalid {
-        reason: "malformed id_token".into(),
-    })?;
+    let payload_b64 = jwt
+        .split('.')
+        .nth(1)
+        .ok_or_else(|| OidcError::IdTokenInvalid {
+            reason: "malformed id_token".into(),
+        })?;
     let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload_b64)
         .map_err(|e| OidcError::IdTokenInvalid {

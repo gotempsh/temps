@@ -492,9 +492,8 @@ impl std::fmt::Debug for RouteOverride {
 /// Async function that produces the override response. Takes the original
 /// request, returns a response. No `Next` parameter — overrides are terminal
 /// by definition; they own the request fully.
-pub type OverrideHandler = Arc<
-    dyn Fn(Request) -> Pin<Box<dyn Future<Output = Response> + Send>> + Send + Sync,
->;
+pub type OverrideHandler =
+    Arc<dyn Fn(Request) -> Pin<Box<dyn Future<Output = Response> + Send>> + Send + Sync>;
 
 /// Route configuration returned by plugins.
 ///
@@ -535,7 +534,12 @@ impl PluginRoutes {
     ///
     /// Last call wins on collision; a `tracing::warn!` is emitted when the
     /// override aggregator sees the same pair declared twice.
-    pub fn with_override<F, Fut>(mut self, method: axum::http::Method, path: impl Into<String>, handler: F) -> Self
+    pub fn with_override<F, Fut>(
+        mut self,
+        method: axum::http::Method,
+        path: impl Into<String>,
+        handler: F,
+    ) -> Self
     where
         F: Fn(Request) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Response> + Send + 'static,
@@ -606,18 +610,20 @@ fn apply_route_overrides(
             .map(|(k, (_plugin, handler))| (k, handler))
             .collect(),
     );
-    router.layer(axum::middleware::from_fn(move |req: Request, next: Next| {
-        let map = map.clone();
-        async move {
-            let key = (req.method().clone(), req.uri().path().to_string());
-            if let Some(handler) = map.get(&key) {
-                let handler = handler.clone();
-                Ok::<Response, axum::http::StatusCode>(handler(req).await)
-            } else {
-                Ok(next.run(req).await)
+    router.layer(axum::middleware::from_fn(
+        move |req: Request, next: Next| {
+            let map = map.clone();
+            async move {
+                let key = (req.method().clone(), req.uri().path().to_string());
+                if let Some(handler) = map.get(&key) {
+                    let handler = handler.clone();
+                    Ok::<Response, axum::http::StatusCode>(handler(req).await)
+                } else {
+                    Ok(next.run(req).await)
+                }
             }
-        }
-    }))
+        },
+    ))
 }
 
 /// Two-listener router split produced by [`PluginManager::build_split_application`].

@@ -2207,6 +2207,8 @@ mod tests {
             mfa_secret: None,
             mfa_enabled: false,
             mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
