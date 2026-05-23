@@ -23,10 +23,14 @@
     "paths": {
       "@/*": [
         "./src/*"
+      ],
+      "@temps-sdk/console-kit": [
+        "./packages/console-kit/src/index.ts"
       ]
     }
   },
   "include": [
-    "src"
+    "src",
+    "packages/console-kit/src"
   ]
 }

@@ -461,17 +461,163 @@ pub trait TempsPlugin: Send + Sync {
     }
 }
 
-/// Route configuration returned by plugins
+/// A single `(METHOD, PATH)` claim that replaces whatever an earlier-loaded
+/// plugin (typically OSS) bound for the same pair.
+///
+/// Axum 0.8 panics if two routers register the same `(method, path)` via
+/// `Router::merge`. That makes naive route replacement impossible. The
+/// override mechanism sidesteps the merge entirely: matching requests are
+/// dispatched by a wrapper middleware layer applied above the merged router,
+/// so the additive route is registered but never reached.
+///
+/// `path` is the path inside the listener's router — without the `/api`
+/// prefix that `build_application` applies at the end. Example:
+/// `"/auth/login"`, not `"/api/auth/login"`.
+pub struct RouteOverride {
+    pub method: axum::http::Method,
+    pub path: String,
+    pub handler: OverrideHandler,
+}
+
+impl std::fmt::Debug for RouteOverride {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RouteOverride")
+            .field("method", &self.method)
+            .field("path", &self.path)
+            .field("handler", &"<async fn>")
+            .finish()
+    }
+}
+
+/// Async function that produces the override response. Takes the original
+/// request, returns a response. No `Next` parameter — overrides are terminal
+/// by definition; they own the request fully.
+pub type OverrideHandler = Arc<
+    dyn Fn(Request) -> Pin<Box<dyn Future<Output = Response> + Send>> + Send + Sync,
+>;
+
+/// Route configuration returned by plugins.
+///
+/// `router` is the *additive* router — routes that get merged into the
+/// listener's router as new endpoints. Path collisions on `router` panic
+/// (Axum's normal behavior).
+///
+/// `overrides` is the *replacement* list — `(method, path)` pairs this
+/// plugin claims exclusive control over. When two plugins claim the same
+/// pair, the last-registered plugin wins and a warning is logged; an
+/// explicit override always wins against any additive route registered for
+/// the same pair.
+///
+/// The field `overrides` is intentionally `pub(crate)` — plugins construct
+/// `PluginRoutes` through `new()` + `with_override()`, never via a struct
+/// literal. This keeps the override aggregation contract enforceable inside
+/// `temps-core` and prevents accidental bypass.
 pub struct PluginRoutes {
-    /// The actual router with handlers
+    /// Additive router merged into the host listener's router.
     pub router: Router,
+    /// `(method, path)` pairs this plugin replaces.
+    pub(crate) overrides: Vec<RouteOverride>,
 }
 
 impl PluginRoutes {
-    /// Create plugin routes with no path prefix
+    /// Create plugin routes with no overrides. Existing additive-only
+    /// plugins (the OSS default) use this — no behavior change.
     pub fn new(router: Router) -> Self {
-        Self { router }
+        Self {
+            router,
+            overrides: Vec::new(),
+        }
     }
+
+    /// Declare that this plugin owns `(method, path)`. The override handler
+    /// is called instead of any additive route registered for the same pair
+    /// (whether by this plugin, an OSS plugin, or another EE plugin).
+    ///
+    /// Last call wins on collision; a `tracing::warn!` is emitted when the
+    /// override aggregator sees the same pair declared twice.
+    pub fn with_override<F, Fut>(mut self, method: axum::http::Method, path: impl Into<String>, handler: F) -> Self
+    where
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Response> + Send + 'static,
+    {
+        let boxed: OverrideHandler = Arc::new(move |req: Request| {
+            let fut = handler(req);
+            Box::pin(fut) as Pin<Box<dyn Future<Output = Response> + Send>>
+        });
+        self.overrides.push(RouteOverride {
+            method,
+            path: path.into(),
+            handler: boxed,
+        });
+        self
+    }
+}
+
+/// Drop overridden paths from a plugin's OpenAPI contribution unless the
+/// plugin itself is the one that claimed them. After this, only the
+/// override-declaring plugin can publish a `PathItem` for paths in
+/// `overridden_paths` — guaranteeing the merged OpenAPI matches what the
+/// runtime dispatcher actually serves.
+fn filter_overridden_paths(
+    mut schema: utoipa::openapi::OpenApi,
+    overridden_paths: &std::collections::HashSet<String>,
+    plugin_name: &str,
+    path_owner_by_plugin: &std::collections::HashSet<(String, String)>,
+) -> utoipa::openapi::OpenApi {
+    if overridden_paths.is_empty() {
+        return schema;
+    }
+    let owned_paths: std::collections::HashSet<&String> = path_owner_by_plugin
+        .iter()
+        .filter_map(|(p, path)| (p == plugin_name).then_some(path))
+        .collect();
+    schema.paths.paths.retain(|path, _item| {
+        // Keep paths that aren't overridden at all, or that this plugin owns.
+        !overridden_paths.contains(path) || owned_paths.contains(path)
+    });
+    schema
+}
+
+/// Apply a set of `(method, path)` overrides as a middleware layer wrapping
+/// `router`. The layer matches each incoming request against the override
+/// map; on hit it dispatches directly to the override handler, on miss it
+/// calls `next.run(req).await` to let the additive router serve as usual.
+///
+/// Why a middleware layer and not Axum routes: registering both an OSS route
+/// and an EE override for the same `(method, path)` via `Router::merge`
+/// panics on `Router::merge` -> `MethodRouter::merge_for_path` "Overlapping
+/// method route" (axum 0.8 `routing/method_routing.rs:1052`). The layer
+/// intercepts before axum's matcher runs, so the additive route is still
+/// registered (no merge conflict) but never reached for overridden pairs.
+///
+/// `overrides` map is `(Method, Path) -> (declaring_plugin_name, handler)`.
+/// The plugin name is kept for `Debug`/discovery; the dispatcher only needs
+/// the handler.
+fn apply_route_overrides(
+    router: Router,
+    overrides: HashMap<(axum::http::Method, String), (String, OverrideHandler)>,
+) -> Router {
+    if overrides.is_empty() {
+        return router;
+    }
+    let map: Arc<HashMap<(axum::http::Method, String), OverrideHandler>> = Arc::new(
+        overrides
+            .into_iter()
+            .map(|(k, (_plugin, handler))| (k, handler))
+            .collect(),
+    );
+    router.layer(axum::middleware::from_fn(move |req: Request, next: Next| {
+        let map = map.clone();
+        async move {
+            let key = (req.method().clone(), req.uri().path().to_string());
+            if let Some(handler) = map.get(&key) {
+                let handler = handler.clone();
+                Ok::<Response, axum::http::StatusCode>(handler(req).await)
+            } else {
+                Ok(next.run(req).await)
+            }
+        }
+    }))
 }
 
 /// Two-listener router split produced by [`PluginManager::build_split_application`].
@@ -780,17 +926,58 @@ impl PluginManager {
         let plugin_context = self.context.create_plugin_context();
         let mut admin_router = Router::new();
         let mut public_router = Router::new();
+        // Aggregated overrides — last-registered wins. Separate maps for the
+        // admin and public listeners; an override declared in
+        // `configure_routes` overrides admin paths only, and vice versa.
+        let mut admin_overrides: HashMap<(axum::http::Method, String), (String, OverrideHandler)> =
+            HashMap::new();
+        let mut public_overrides: HashMap<(axum::http::Method, String), (String, OverrideHandler)> =
+            HashMap::new();
 
         for plugin in &self.plugins {
             if let Some(plugin_routes) = plugin.configure_routes(&plugin_context) {
                 debug!("Adding admin routes for plugin: {}", plugin.name());
                 admin_router = admin_router.merge(plugin_routes.router);
+                for ov in plugin_routes.overrides {
+                    let key = (ov.method.clone(), ov.path.clone());
+                    if let Some((prev, _)) = admin_overrides.get(&key) {
+                        tracing::warn!(
+                            "Plugin '{}' overrides admin route {} {} previously claimed by '{}' — last-loaded wins",
+                            plugin.name(),
+                            ov.method,
+                            ov.path,
+                            prev,
+                        );
+                    }
+                    admin_overrides.insert(key, (plugin.name().to_string(), ov.handler));
+                }
             }
             if let Some(public_routes) = plugin.configure_public_routes(&plugin_context) {
                 debug!("Adding public routes for plugin: {}", plugin.name());
                 public_router = public_router.merge(public_routes.router);
+                for ov in public_routes.overrides {
+                    let key = (ov.method.clone(), ov.path.clone());
+                    if let Some((prev, _)) = public_overrides.get(&key) {
+                        tracing::warn!(
+                            "Plugin '{}' overrides public route {} {} previously claimed by '{}' — last-loaded wins",
+                            plugin.name(),
+                            ov.method,
+                            ov.path,
+                            prev,
+                        );
+                    }
+                    public_overrides.insert(key, (plugin.name().to_string(), ov.handler));
+                }
             }
         }
+
+        // Mount the override interceptor *inside* both routers, before
+        // middleware is layered on top. This way auth / request-metadata
+        // middleware still wraps overrides — they're real routes from the
+        // request lifecycle's perspective, just dispatched through a single
+        // hashmap-backed layer instead of axum's route table.
+        admin_router = apply_route_overrides(admin_router, admin_overrides);
+        public_router = apply_route_overrides(public_router, public_overrides);
 
         let middleware = self.collect_middleware(&plugin_context);
 
@@ -831,8 +1018,26 @@ impl PluginManager {
         self.collect_middleware(&plugin_context)
     }
 
-    /// Build unified OpenAPI schema from all plugins
+    /// Build unified OpenAPI schema from all plugins.
+    ///
+    /// Override-aware: when a plugin declares a `RouteOverride` on
+    /// `(method, path)`, that plugin's OpenAPI `PathItem` for `path` wins
+    /// regardless of plugin load order. Without this, an OSS plugin
+    /// registered after the EE override plugin would still publish its own
+    /// schema for the overridden path — and the generated SDK would lie
+    /// about the request/response shape clients should actually see.
+    ///
+    /// Note that the override map is keyed by `(method, path)` but OpenAPI
+    /// `PathItem`s aggregate all methods for a path. If an EE plugin
+    /// overrides only `POST /auth/login` but the OSS plugin also exposes
+    /// `GET /auth/login` (e.g. a redirect helper), the EE plugin's
+    /// `PathItem` will replace OSS's entirely — losing the `GET`. This
+    /// matches the v1 runtime semantics ("overrides own the whole path
+    /// across all methods declared in their plugin's openapi schema") and is
+    /// documented; an EE override should re-declare any method on the path
+    /// it wants to preserve from OSS.
     fn build_unified_openapi(&self) -> Result<OpenApi, PluginError> {
+        use std::collections::HashSet;
         use utoipa::openapi::*;
 
         let mut combined_openapi = OpenApiBuilder::new()
@@ -862,11 +1067,44 @@ impl PluginManager {
             ))
             .build();
 
-        // Merge OpenAPI schemas from all plugins
+        // Pass 1 — collect override-claimed paths and the plugin that claims
+        // each. Plugins declare overrides through both `configure_routes`
+        // and `configure_public_routes`; we union the two because the
+        // OpenAPI doc is unified across listeners.
+        let plugin_context = self.context.create_plugin_context();
+        let mut path_owner_by_plugin: HashSet<(String /* plugin */, String /* path */)> =
+            HashSet::new();
         for plugin in &self.plugins {
+            if let Some(routes) = plugin.configure_routes(&plugin_context) {
+                for ov in &routes.overrides {
+                    path_owner_by_plugin.insert((plugin.name().to_string(), ov.path.clone()));
+                }
+            }
+            if let Some(routes) = plugin.configure_public_routes(&plugin_context) {
+                for ov in &routes.overrides {
+                    path_owner_by_plugin.insert((plugin.name().to_string(), ov.path.clone()));
+                }
+            }
+        }
+        let overridden_paths: HashSet<String> = path_owner_by_plugin
+            .iter()
+            .map(|(_p, path)| path.clone())
+            .collect();
+
+        // Pass 2 — merge non-overridden paths normally. Any path in
+        // `overridden_paths` from a plugin that didn't claim it is dropped
+        // here; pass 3 puts the claimant's version in.
+        for plugin in &self.plugins {
+            let plugin_name = plugin.name().to_string();
             if let Some(plugin_openapi) = plugin.openapi_schema() {
                 debug!("Merging OpenAPI schema for plugin: {}", plugin.name());
-                combined_openapi = self.merge_openapi_schemas(combined_openapi, plugin_openapi)?;
+                let filtered = filter_overridden_paths(
+                    plugin_openapi,
+                    &overridden_paths,
+                    &plugin_name,
+                    &path_owner_by_plugin,
+                );
+                combined_openapi = self.merge_openapi_schemas(combined_openapi, filtered)?;
             }
         }
 
@@ -1401,6 +1639,230 @@ mod split_application_tests {
             probe_status(split.public.clone(), "/public-probe").await,
             axum::http::StatusCode::OK,
             "admin-only middleware must NOT run on the public router"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Route override tests (PluginRoutes::with_override)
+    // ──────────────────────────────────────────────────────────────────
+
+    use axum::http::Method;
+    use axum::response::IntoResponse;
+    use axum::routing::post;
+
+    /// Stand-in for an OSS plugin that owns `POST /auth/login` and
+    /// `POST /auth/logout`. Returns 200 with a body the test can grep for.
+    struct OssAuthLikePlugin;
+
+    impl TempsPlugin for OssAuthLikePlugin {
+        fn name(&self) -> &'static str {
+            "oss-auth-like"
+        }
+
+        fn register_services<'a>(
+            &'a self,
+            _ctx: &'a ServiceRegistrationContext,
+        ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn configure_routes(&self, _ctx: &PluginContext) -> Option<PluginRoutes> {
+            let router = Router::new()
+                .route("/auth/login", post(|| async { "oss-login" }))
+                .route("/auth/logout", post(|| async { "oss-logout" }));
+            Some(PluginRoutes::new(router))
+        }
+    }
+
+    /// EE plugin that overrides `POST /auth/login` with a 403. Does NOT
+    /// touch `/auth/logout` — that one must keep flowing to the OSS handler.
+    struct EeOverrideLoginPlugin;
+
+    impl TempsPlugin for EeOverrideLoginPlugin {
+        fn name(&self) -> &'static str {
+            "ee-override-login"
+        }
+
+        fn register_services<'a>(
+            &'a self,
+            _ctx: &'a ServiceRegistrationContext,
+        ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn configure_routes(&self, _ctx: &PluginContext) -> Option<PluginRoutes> {
+            let routes = PluginRoutes::new(Router::new()).with_override(
+                Method::POST,
+                "/auth/login",
+                |_req: Request| async move {
+                    (
+                        axum::http::StatusCode::FORBIDDEN,
+                        "ee-password-login-disabled",
+                    )
+                        .into_response()
+                },
+            );
+            Some(routes)
+        }
+    }
+
+    /// Second EE plugin that ALSO claims `POST /auth/login`. Used to
+    /// verify last-loaded-wins collision policy.
+    struct EeSecondLoginClaimantPlugin;
+
+    impl TempsPlugin for EeSecondLoginClaimantPlugin {
+        fn name(&self) -> &'static str {
+            "ee-second-claimant"
+        }
+
+        fn register_services<'a>(
+            &'a self,
+            _ctx: &'a ServiceRegistrationContext,
+        ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn configure_routes(&self, _ctx: &PluginContext) -> Option<PluginRoutes> {
+            let routes = PluginRoutes::new(Router::new()).with_override(
+                Method::POST,
+                "/auth/login",
+                |_req: Request| async move {
+                    (axum::http::StatusCode::IM_A_TEAPOT, "second-claimant").into_response()
+                },
+            );
+            Some(routes)
+        }
+    }
+
+    /// Probe an axum::Router with a POST request and return (status, body).
+    async fn probe_post(router: Router, path: &str) -> (axum::http::StatusCode, String) {
+        use tower::ServiceExt;
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri(path)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn override_replaces_additive_handler_for_same_method_and_path() {
+        // OSS registers POST /auth/login; EE overrides it. Override wins.
+        // Without the override mechanism, Router::merge would panic on the
+        // duplicate (Method, Path) pair — the override layer dispatches
+        // before the inner router even sees the request.
+        let mut manager = PluginManager::default();
+        manager.register_plugin(Box::new(OssAuthLikePlugin));
+        manager.register_plugin(Box::new(EeOverrideLoginPlugin));
+
+        let split = manager.build_split_application().unwrap();
+        let (status, body) = probe_post(split.admin.clone(), "/auth/login").await;
+
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(body, "ee-password-login-disabled");
+    }
+
+    #[tokio::test]
+    async fn non_overridden_routes_from_same_plugin_still_work() {
+        // The override on POST /auth/login must not affect POST /auth/logout,
+        // which OSS still owns. This is the critical "additive + selective
+        // override" guarantee.
+        let mut manager = PluginManager::default();
+        manager.register_plugin(Box::new(OssAuthLikePlugin));
+        manager.register_plugin(Box::new(EeOverrideLoginPlugin));
+
+        let split = manager.build_split_application().unwrap();
+        let (status, body) = probe_post(split.admin.clone(), "/auth/logout").await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(body, "oss-logout");
+    }
+
+    #[tokio::test]
+    async fn override_does_not_leak_across_admin_public_listeners() {
+        // An override declared in configure_routes (admin) must not affect
+        // the public router. Same path on the public side keeps falling
+        // through to whatever (if anything) the public router has —
+        // here, nothing, so 404.
+        let mut manager = PluginManager::default();
+        manager.register_plugin(Box::new(OssAuthLikePlugin));
+        manager.register_plugin(Box::new(EeOverrideLoginPlugin));
+
+        let split = manager.build_split_application().unwrap();
+        let (status, _) = probe_post(split.public.clone(), "/auth/login").await;
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::NOT_FOUND,
+            "admin-side override must not be visible on the public listener"
+        );
+    }
+
+    #[tokio::test]
+    async fn last_registered_override_wins_on_collision() {
+        // Two EE plugins both claim POST /auth/login. Last-loaded wins —
+        // documented policy, deterministic for the test. The collision is
+        // logged via tracing::warn but the build still succeeds.
+        let mut manager = PluginManager::default();
+        manager.register_plugin(Box::new(OssAuthLikePlugin));
+        manager.register_plugin(Box::new(EeOverrideLoginPlugin)); // first claimant
+        manager.register_plugin(Box::new(EeSecondLoginClaimantPlugin)); // wins
+
+        let split = manager.build_split_application().unwrap();
+        let (status, body) = probe_post(split.admin.clone(), "/auth/login").await;
+
+        assert_eq!(status, axum::http::StatusCode::IM_A_TEAPOT);
+        assert_eq!(body, "second-claimant");
+    }
+
+    #[tokio::test]
+    async fn override_runs_through_admin_middleware_stack() {
+        // The override layer is applied *inside* the router, before
+        // middleware is layered on top. So admin-side middleware (auth,
+        // request-metadata, audit, etc.) still wraps overrides — they're
+        // real routes from the lifecycle's perspective.
+        //
+        // Concretely: AdminOnlyShortCircuitPlugin's middleware returns 418
+        // for every admin request. If middleware wraps the override layer
+        // correctly, the override handler is never reached and 418 wins.
+        let mut manager = PluginManager::default();
+        manager.register_plugin(Box::new(OssAuthLikePlugin));
+        manager.register_plugin(Box::new(EeOverrideLoginPlugin));
+        manager.register_plugin(Box::new(AdminOnlyShortCircuitPlugin));
+
+        let split = manager.build_split_application().unwrap();
+        let (status, _) = probe_post(split.admin.clone(), "/auth/login").await;
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::IM_A_TEAPOT,
+            "middleware must still wrap overridden routes; 418 short-circuits before override handler runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_routes_new_is_backwards_compatible() {
+        // The 20+ existing plugins call PluginRoutes::new(router) with no
+        // overrides. That must keep working — overrides default to empty,
+        // and a no-override PluginManager must produce the same router shape
+        // it did before the override mechanism existed.
+        let mut manager = PluginManager::default();
+        manager.register_plugin(Box::new(MarkerPlugin));
+
+        let split = manager.build_split_application().unwrap();
+
+        assert_eq!(
+            probe_status(split.admin.clone(), "/admin-marker").await,
+            axum::http::StatusCode::OK
         );
     }
 }

@@ -8,13 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
--
+- **OIDC single sign-on (SSO) for the console**: log in to Temps with any standards-compliant OpenID Connect identity provider (Keycloak, Auth0, Okta, Authentik, Zitadel, Microsoft Entra/Azure AD, Google Workspace). New `temps-auth/src/oidc_*` module (errors/handler/service/types) backed by the `openidconnect` 3.x crate handles discovery, PKCE code-flow, nonce/state validation, userinfo, and just-in-time user provisioning. Admin endpoints (`POST/GET/PATCH/DELETE /auth/oidc/providers`, `POST /auth/oidc/providers/{id}/test`) and public flow endpoints (`GET /auth/oidc/providers`, `POST /auth/oidc/{provider}/start`, `GET /auth/oidc/{provider}/callback`) wired through the existing `AuthState`. Two migrations: `m20260522_000001_oidc_sso` creates `oidc_providers` + `oidc_login_states` and adds `users.oidc_provider_id` / `users.oidc_subject` (unique compound index for the federation key); `m20260522_000002_oidc_role_mappings` adds `oidc_role_mappings` so groups/claims from the IdP map to Temps roles automatically. Web: new `/settings/auth` page (`AuthSettingsPage`, `CreateOidcProviderPage`, `OidcProviderForm`, `OidcRoleMappingsCard`, `oidc-provider-constants`) for IdP CRUD + role mapping, "Continue with {provider}" buttons on the login form. Local dev tooling under `tools/keycloak-dev/` (docker-compose + realm export + setup script) for a one-command Keycloak realm against `localhost:9080` — see `tools/keycloak-dev/setup.sh`.
+- **Console extension points (`@temps-sdk/console-kit`)**: new local workspace package under `web/packages/console-kit/` exporting `ConsoleExtensionsProvider` + `useConsoleExtensions` so downstream consoles (notably `temps-ee/web`) can inject extra routes into the authenticated shell without forking `App.tsx`. The OSS console mounts `ConsoleExtensionsProvider` and renders any `routes` it provides alongside the built-in routes; rsbuild resolves the package via an explicit `resolve.alias` so it works even when `node_modules/@temps-sdk/console-kit` is stale or missing. Parallel `web/packages/ui/` package set up for shared shadcn/ui primitives (see ADR 0003 — OSS↔EE frontend reuse).
 
 ### Changed
--
+- **Workflow trigger save no longer enables triggers the user didn't configure**: `AgentSettingsDialog` initialised the new-issue / regression / manual toggles to `?? true` and emitted every trigger block on save, so opening Edit and clicking Save would silently turn on `error.new_issue`, `error.regression`, and `manual` even when the YAML omitted them. Defaults now flip to `?? false`, and the save payload only includes `error` / `manual` / `schedule` blocks when their corresponding inputs are actually set — round-tripping an Edit → Save with no UI changes now leaves `triggers` byte-identical.
 
 ### Fixed
--
+- **`fix(deps)`: bump `mongodb` 3.6.0 → 3.7.0 to drop transitive `hickory-proto` 0.25** — closes the last residual of the hickory NSEC3 / O(n²) zone-walking CVEs (mongodb 3.6 hard-pinned the vulnerable resolver). Already shipped on `main` as `fcd54381` and rolled into this PR for traceability.
 
 
 ## [0.1.0-beta.19] - 2026-05-20

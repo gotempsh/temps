@@ -90,15 +90,19 @@ export function AgentSettingsDialog({
     agent?.mcp_servers_config ?? [],
   )
 
-  // Triggers
+  // Triggers. Defaults are `false` so a workflow whose YAML omits a trigger
+  // (e.g. a daily report with only `schedule.cron`) does not render its
+  // unrelated toggles as "on" — and, crucially, can't accidentally persist
+  // them on save. The previous `?? true` defaults silently enabled error /
+  // regression / manual triggers for every workflow that lacked them.
   const [triggerNewIssue, setTriggerNewIssue] = useState(
-    agent?.trigger_config?.error?.new_issue ?? true,
+    agent?.trigger_config?.error?.new_issue ?? false,
   )
   const [triggerRegression, setTriggerRegression] = useState(
-    agent?.trigger_config?.error?.regression ?? true,
+    agent?.trigger_config?.error?.regression ?? false,
   )
   const [triggerManual, setTriggerManual] = useState(
-    agent?.trigger_config?.manual ?? true,
+    agent?.trigger_config?.manual ?? false,
   )
   const [triggerCron, setTriggerCron] = useState(
     agent?.trigger_config?.schedule?.cron ?? '',
@@ -123,9 +127,9 @@ export function AgentSettingsDialog({
     setConfigRepoBranch(agent?.config_repo_branch ?? '')
     setSelectedSkills(agent?.skills_config ?? [])
     setSelectedMcps(agent?.mcp_servers_config ?? [])
-    setTriggerNewIssue(agent?.trigger_config?.error?.new_issue ?? true)
-    setTriggerRegression(agent?.trigger_config?.error?.regression ?? true)
-    setTriggerManual(agent?.trigger_config?.manual ?? true)
+    setTriggerNewIssue(agent?.trigger_config?.error?.new_issue ?? false)
+    setTriggerRegression(agent?.trigger_config?.error?.regression ?? false)
+    setTriggerManual(agent?.trigger_config?.manual ?? false)
     setTriggerCron(agent?.trigger_config?.schedule?.cron ?? '')
   }
 
@@ -237,9 +241,20 @@ export function AgentSettingsDialog({
   const isPending = createMutation.isPending || updateMutation.isPending
 
   const handleSubmit = () => {
-    const triggerConfig: Record<string, unknown> = {
-      error: { new_issue: triggerNewIssue, regression: triggerRegression },
-      manual: triggerManual,
+    // Only include trigger blocks the user actually enabled. Writing
+    // `error: { new_issue: false, regression: false }` and `manual: false`
+    // unconditionally caused workflows to persist triggers they never asked
+    // for — and a later read+save round-trip with the old `?? true` defaults
+    // could then flip them on.
+    const triggerConfig: Record<string, unknown> = {}
+    if (triggerNewIssue || triggerRegression) {
+      triggerConfig.error = {
+        new_issue: triggerNewIssue,
+        regression: triggerRegression,
+      }
+    }
+    if (triggerManual) {
+      triggerConfig.manual = true
     }
     if (triggerCron.trim()) {
       triggerConfig.schedule = { cron: triggerCron.trim() }

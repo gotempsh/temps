@@ -1,0 +1,127 @@
+{
+  "realm": "temps",
+  "enabled": true,
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "resetPasswordAllowed": false,
+  "editUsernameAllowed": false,
+  "sslRequired": "none",
+  "groups": [
+    {
+      "name": "temps-admins",
+      "path": "/temps-admins"
+    },
+    {
+      "name": "temps-users",
+      "path": "/temps-users"
+    }
+  ],
+  "roles": {
+    "realm": [
+      { "name": "admin", "description": "Temps admin role claim" },
+      { "name": "user", "description": "Temps user role claim" }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "temps-ee",
+      "name": "Temps EE (local dev)",
+      "enabled": true,
+      "publicClient": false,
+      "secret": "temps-ee-dev-secret",
+      "redirectUris": [
+        "http://localhost:9081/api/auth/oidc/callback",
+        "http://127.0.0.1:9081/api/auth/oidc/callback",
+        "http://localhost:9100/api/auth/oidc/callback",
+        "http://127.0.0.1:9100/api/auth/oidc/callback"
+      ],
+      "webOrigins": [
+        "http://localhost:9081",
+        "http://127.0.0.1:9081",
+        "http://localhost:9100",
+        "http://127.0.0.1:9100",
+        "+"
+      ],
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": true,
+      "serviceAccountsEnabled": false,
+      "protocol": "openid-connect",
+      "fullScopeAllowed": true,
+      "defaultClientScopes": [
+        "web-origins",
+        "acr",
+        "profile",
+        "roles",
+        "basic",
+        "email"
+      ],
+      "optionalClientScopes": ["address", "phone", "offline_access", "microprofile-jwt"],
+      "protocolMappers": [
+        {
+          "name": "groups",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-group-membership-mapper",
+          "consentRequired": false,
+          "config": {
+            "full.path": "false",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "claim.name": "groups",
+            "userinfo.token.claim": "true"
+          }
+        },
+        {
+          "name": "realm roles",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "consentRequired": false,
+          "config": {
+            "multivalued": "true",
+            "userinfo.token.claim": "true",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "claim.name": "roles",
+            "jsonType.label": "String"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "sso-admin",
+      "email": "sso-admin@temps.local",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "SSO",
+      "lastName": "Admin",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "sso-admin",
+          "temporary": false
+        }
+      ],
+      "realmRoles": ["admin"],
+      "groups": ["/temps-admins"]
+    },
+    {
+      "username": "sso-user",
+      "email": "sso-user@temps.local",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "SSO",
+      "lastName": "User",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "sso-user",
+          "temporary": false
+        }
+      ],
+      "realmRoles": ["user"],
+      "groups": ["/temps-users"]
+    }
+  ]
+}

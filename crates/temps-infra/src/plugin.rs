@@ -103,9 +103,7 @@ impl TempsPlugin for InfraPlugin {
         // Configure infrastructure routes
         let infra_routes = configure_routes::<InfraState>().with_state(infra_state);
 
-        Some(PluginRoutes {
-            router: infra_routes,
-        })
+        Some(PluginRoutes::new(infra_routes))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {

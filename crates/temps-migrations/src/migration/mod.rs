@@ -98,6 +98,8 @@ mod m20260518_000001_drop_backups_last_heartbeat_at;
 mod m20260519_000001_create_backup_schedule_services;
 mod m20260519_000002_add_target_all_services;
 mod m20260519_000003_add_include_control_plane;
+mod m20260522_000001_oidc_sso;
+mod m20260522_000002_oidc_role_mappings;
 
 pub struct Migrator;
 
@@ -199,6 +201,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260519_000001_create_backup_schedule_services::Migration),
             Box::new(m20260519_000002_add_target_all_services::Migration),
             Box::new(m20260519_000003_add_include_control_plane::Migration),
+            Box::new(m20260522_000001_oidc_sso::Migration),
+            Box::new(m20260522_000002_oidc_role_mappings::Migration),
         ]
     }
 }

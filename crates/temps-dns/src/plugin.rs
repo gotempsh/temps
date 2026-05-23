@@ -90,9 +90,7 @@ impl TempsPlugin for DnsPlugin {
         let sync_state = context.require_service::<DnsSyncAppState>();
         let sync_routes = handlers::configure_internal_routes().with_state(sync_state);
 
-        Some(PluginRoutes {
-            router: dns_routes.merge(sync_routes),
-        })
+        Some(PluginRoutes::new(dns_routes.merge(sync_routes)))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {

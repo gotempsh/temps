@@ -38,6 +38,8 @@ image = "0.25.6"
 base64 = { workspace = true }
 urlencoding = { workspace = true }
 tracing = { workspace = true }
+openidconnect = { workspace = true }
+reqwest = { workspace = true }
 
 [dev-dependencies]
 temps-migrations = { path = "../temps-migrations" }

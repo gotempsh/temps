@@ -26,6 +26,8 @@ pub struct AuthState {
     pub cookie_crypto: Arc<CookieCrypto>,
     /// Deployment token validation service
     pub deployment_token_service: Arc<DeploymentTokenValidationService>,
+    /// OIDC SSO service
+    pub oidc_service: Arc<crate::oidc_service::OidcService>,
 }
 
 impl AuthState {
@@ -41,6 +43,11 @@ impl AuthState {
         let api_key_service = Arc::new(ApiKeyService::new(db.clone()));
         let user_service = Arc::new(UserService::new(db.clone()));
         let deployment_token_service = Arc::new(DeploymentTokenValidationService::new(db.clone()));
+        let oidc_service = Arc::new(crate::oidc_service::OidcService::new(
+            db.clone(),
+            encryption_service.clone(),
+            user_service.clone(),
+        ));
         Self {
             db,
             auth_service,
@@ -50,6 +57,7 @@ impl AuthState {
             user_service,
             cookie_crypto,
             deployment_token_service,
+            oidc_service,
         }
     }
 }

@@ -1,10 +1,21 @@
+import path from 'node:path'
 import { defineConfig } from '@rsbuild/core'
 import { pluginReact } from '@rsbuild/plugin-react'
+
 const rsbuildOutputPath = process.env.RSBUILD_OUTPUT_PATH as string | undefined
 const nodeEnv = process.env.NODE_ENV as string | undefined
 const tempsVersion = process.env.TEMPS_VERSION || 'dev'
+const consoleKitEntry = path.resolve(__dirname, 'packages/console-kit/src/index.ts')
+
 export default defineConfig({
   plugins: [pluginReact()],
+  resolve: {
+    alias: {
+      // Local workspace package — pin explicitly so rsbuild resolves it even
+      // when node_modules/@temps-sdk/console-kit is missing or stale.
+      '@temps-sdk/console-kit': consoleKitEntry,
+    },
+  },
   source: {
     define: {
       'import.meta.env.TEMPS_VERSION': JSON.stringify(tempsVersion),

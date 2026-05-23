@@ -255,7 +255,7 @@ impl TempsPlugin for ErrorTrackingPlugin {
             .merge(dsn_routes)
             .merge(source_map_routes);
 
-        Some(PluginRoutes { router: routes })
+        Some(PluginRoutes::new(routes))
     }
 
     fn configure_public_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
@@ -290,7 +290,7 @@ impl TempsPlugin for ErrorTrackingPlugin {
                 .with_state(sentry_compat_state);
 
         let routes = sentry_routes.merge(sentry_compat_routes);
-        Some(PluginRoutes { router: routes })
+        Some(PluginRoutes::new(routes))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {

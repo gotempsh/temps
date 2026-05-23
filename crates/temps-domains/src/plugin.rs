@@ -126,9 +126,7 @@ impl TempsPlugin for DomainsPlugin {
         // Configure routes
         let domains_routes = handlers::configure_routes().with_state(domain_app_state);
 
-        Some(PluginRoutes {
-            router: domains_routes,
-        })
+        Some(PluginRoutes::new(domains_routes))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {

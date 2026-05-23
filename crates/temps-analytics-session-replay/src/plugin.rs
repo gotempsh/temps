@@ -68,7 +68,7 @@ impl TempsPlugin for SessionReplayPlugin {
             },
         ));
 
-        Some(PluginRoutes { router: routes })
+        Some(PluginRoutes::new(routes))
     }
 
     fn configure_public_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
@@ -84,7 +84,7 @@ impl TempsPlugin for SessionReplayPlugin {
             },
         ));
 
-        Some(PluginRoutes { router: routes })
+        Some(PluginRoutes::new(routes))
     }
 
     fn openapi_schema(&self) -> Option<utoipa::openapi::OpenApi> {

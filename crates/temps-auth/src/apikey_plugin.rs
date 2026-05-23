@@ -92,9 +92,7 @@ impl TempsPlugin for ApiKeyPlugin {
             )
             .with_state(apikey_state);
 
-        Some(PluginRoutes {
-            router: apikey_routes,
-        })
+        Some(PluginRoutes::new(apikey_routes))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {

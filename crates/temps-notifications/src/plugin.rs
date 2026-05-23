@@ -107,7 +107,7 @@ impl TempsPlugin for NotificationsPlugin {
         // Build notification routes using the existing configure_routes function
         let routes = configure_routes().with_state(notification_state);
 
-        Some(PluginRoutes { router: routes })
+        Some(PluginRoutes::new(routes))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {

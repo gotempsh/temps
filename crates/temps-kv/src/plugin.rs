@@ -177,7 +177,7 @@ impl TempsPlugin for KvPlugin {
         // Configure routes with the app state
         let kv_routes = configure_routes().with_state(app_state);
 
-        Some(PluginRoutes { router: kv_routes })
+        Some(PluginRoutes::new(kv_routes))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {

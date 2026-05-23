@@ -40,6 +40,7 @@ import {
   History,
   Home,
   Key,
+  KeyRound,
   Mail,
   Monitor,
   Network,
@@ -134,6 +135,18 @@ const settingsNavItems: NavigationItem[] = [
     url: '/settings/users',
     icon: Users,
     keywords: ['team', 'members', 'people', 'accounts'],
+  },
+  {
+    title: 'Authentication',
+    url: '/settings/auth',
+    icon: KeyRound,
+    keywords: ['sso', 'oidc', 'openid', 'identity', 'login', 'saml'],
+  },
+  {
+    title: 'Add SSO Provider',
+    url: '/settings/auth/new',
+    icon: KeyRound,
+    keywords: ['sso', 'oidc', 'create', 'connect', 'okta', 'auth0', 'keycloak'],
   },
   {
     title: 'API Keys',

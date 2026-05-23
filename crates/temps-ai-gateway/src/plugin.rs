@@ -80,7 +80,7 @@ impl TempsPlugin for AiGatewayPlugin {
             .merge(handlers::configure_gateway_routes())
             .with_state(app_state);
 
-        Some(PluginRoutes { router: routes })
+        Some(PluginRoutes::new(routes))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {

@@ -190,6 +190,7 @@ x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 sha2 = "0.10.9"
 base64 = "0.22"
 hex = "0.4.3"
+openidconnect = { version = "3", default-features = false, features = ["reqwest"] }
 
 # ============================================================================
 # TLS & Certificate Management

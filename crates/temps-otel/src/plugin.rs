@@ -374,7 +374,7 @@ impl TempsPlugin for OtelPlugin {
 
         let router = handlers::configure_routes().with_state(app_state);
 
-        Some(PluginRoutes { router })
+        Some(PluginRoutes::new(router))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {

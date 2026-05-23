@@ -1,9 +1,19 @@
 {
-  "name": "temps-ui",
+  "name": "@temps-sdk/console",
   "private": true,
   "version": "1.0.0",
+  "description": "The Temps console — the full OSS web app, also exported as <TempsConsole> for downstream editions to consume whole.",
   "engines": {
     "node": ">=22.0.0"
+  },
+  "exports": {
+    ".": "./src/App.tsx",
+    "./app.css": "./src/globals.css",
+    "./package.json": "./package.json",
+    "./components/auth/login-form": "./src/components/auth/login-form.tsx",
+    "./contexts/AuthContext": "./src/contexts/AuthContext.tsx",
+    "./lib/return-to": "./src/lib/return-to.ts",
+    "./api/react-query": "./src/api/client/@tanstack/react-query.gen.ts"
   },
   "scripts": {
     "openapi-ts": "openapi-ts",
@@ -18,6 +28,7 @@
     "format:check": "prettier --check \"src/**/*.{ts,tsx,js,jsx,json,css,md}\""
   },
   "dependencies": {
+    "@temps-sdk/console-kit": "file:./packages/console-kit",
     "@hookform/resolvers": "^5.2.2",
     "@monaco-editor/react": "^4.7.0",
     "@nivo/line": "^0.99.0",

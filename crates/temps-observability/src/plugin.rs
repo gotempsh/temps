@@ -61,7 +61,7 @@ impl TempsPlugin for ObservabilityPlugin {
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         let state = context.require_service::<ObservabilityState>();
         let router: Router = configure_observability_routes().with_state(state);
-        Some(PluginRoutes { router })
+        Some(PluginRoutes::new(router))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {

@@ -49,9 +49,7 @@ impl temps_core::plugin::TempsPlugin for StaticFilesPlugin {
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         let file_service = context.get_service::<FileService>()?;
-        Some(PluginRoutes {
-            router: handler::configure_routes(file_service),
-        })
+        Some(PluginRoutes::new(handler::configure_routes(file_service)))
     }
 
     fn openapi_schema(&self) -> Option<utoipa::openapi::OpenApi> {

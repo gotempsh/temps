@@ -351,7 +351,7 @@ impl TempsPlugin for BackupPlugin {
             .merge(handlers::pg_upgrade_handler::configure_routes())
             .merge(handlers::restore_handler::configure_routes())
             .with_state(backup_app_state);
-        Some(PluginRoutes { router: routes })
+        Some(PluginRoutes::new(routes))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {

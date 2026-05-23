@@ -18,6 +18,13 @@ pub struct ResetPasswordCommand {
     /// Data directory for storing configuration and runtime files
     #[arg(long, env = "TEMPS_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
+
+    /// Set the admin password to this exact value instead of generating a
+    /// random one. When provided, the command runs non-interactively: no
+    /// password is printed and no "have you saved it?" confirmation is
+    /// requested. Intended for scripted/CI use.
+    #[arg(long, env = "TEMPS_ADMIN_PASSWORD")]
+    pub password: Option<String>,
 }
 
 fn generate_secure_password() -> String {
@@ -32,7 +39,10 @@ fn generate_secure_password() -> String {
         .collect()
 }
 
-async fn reset_admin_password(conn: &sea_orm::DatabaseConnection) -> anyhow::Result<()> {
+async fn reset_admin_password(
+    conn: &sea_orm::DatabaseConnection,
+    provided_password: Option<String>,
+) -> anyhow::Result<()> {
     use sea_orm::ColumnTrait;
 
     // Find the admin user (first user with admin role)
@@ -53,8 +63,18 @@ async fn reset_admin_password(conn: &sea_orm::DatabaseConnection) -> anyhow::Res
         .await?
         .ok_or_else(|| anyhow::anyhow!("Admin user not found"))?;
 
-    // Generate a new secure random password
-    let new_password = generate_secure_password();
+    // When a password is supplied, run non-interactively. Otherwise generate
+    // a random one and walk the operator through saving it.
+    let non_interactive = provided_password.is_some();
+    let new_password = match provided_password {
+        Some(pw) => {
+            if pw.is_empty() {
+                return Err(anyhow::anyhow!("Provided password cannot be empty"));
+            }
+            pw
+        }
+        None => generate_secure_password(),
+    };
 
     // Hash the password using Argon2
     let argon2 = Argon2::default();
@@ -68,6 +88,24 @@ async fn reset_admin_password(conn: &sea_orm::DatabaseConnection) -> anyhow::Res
     let mut user_update: users::ActiveModel = user.clone().into();
     user_update.password_hash = Set(Some(password_hash));
     user_update.update(conn).await?;
+
+    // Non-interactive path: confirm success without echoing the password
+    // (the caller already knows it) and skip the save-confirmation prompt.
+    if non_interactive {
+        println!();
+        println!(
+            "{}",
+            "✅ Admin password reset successfully (non-interactive).".bright_green()
+        );
+        println!(
+            "{} {}",
+            "Email:".bright_white().bold(),
+            user.email.bright_cyan()
+        );
+        println!();
+        debug!("Reset admin password for user: {}", user.email);
+        return Ok(());
+    }
 
     println!();
     println!(
@@ -164,7 +202,7 @@ impl ResetPasswordCommand {
         let db = rt.block_on(temps_database::establish_connection(&self.database_url))?;
 
         // Reset the admin password
-        rt.block_on(reset_admin_password(db.as_ref()))?;
+        rt.block_on(reset_admin_password(db.as_ref(), self.password))?;
 
         Ok(())
     }

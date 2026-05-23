@@ -22,6 +22,7 @@ import {
   FormLabel,
   FormMessage,
 } from '@/components/ui/form'
+import { Badge } from '@/components/ui/badge'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -291,6 +292,23 @@ export function Account() {
                   </FormItem>
                 )}
               />
+              {/* Role — read-only. The user can't change their own role
+                  here; that requires an admin via /users. Surfacing it
+                  reduces the "what permissions do I have?" question that
+                  drives a lot of console support traffic. */}
+              {user?.role && (
+                <div className="space-y-2">
+                  <FormLabel>Role</FormLabel>
+                  <div className="flex items-center gap-2">
+                    <Badge variant={user.role === 'admin' ? 'default' : 'secondary'}>
+                      {user.role}
+                    </Badge>
+                    <span className="text-xs text-muted-foreground">
+                      Contact an administrator to change your role.
+                    </span>
+                  </div>
+                </div>
+              )}
               <div className="flex justify-end">
                 <Button type="submit" disabled={isPending}>
                   {isPending && (

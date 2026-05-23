@@ -1,4 +1,8 @@
 import {
+  useConsoleExtensions,
+  type ConsoleNavItem,
+} from '@temps-sdk/console-kit'
+import {
   Sidebar,
   SidebarContent,
   SidebarFooter,
@@ -155,6 +159,7 @@ const settingsGroups: SettingsGroupDef[] = [
     label: 'Access',
     items: [
       { title: 'Users', url: '/settings/users', icon: Users },
+      { title: 'Authentication', url: '/settings/auth', icon: KeyRound },
       { title: 'API Keys', url: '/settings/keys', icon: Key },
     ],
   },
@@ -281,6 +286,7 @@ export default function AppSidebar() {
   const { isMinimal, isMobile } = useSidebar()
   const { platformNavEntries } = usePluginsContext()
   const location = useLocation()
+  const { logoBadge } = useConsoleExtensions()
 
   // Convert plugin nav entries to sidebar item format
   const pluginItems = useMemo(
@@ -346,7 +352,10 @@ export default function AppSidebar() {
               </div>
               {!compact && (
                 <div className="grid flex-1 text-left text-sm leading-tight">
-                  <span className="truncate font-semibold">Temps</span>
+                  <span className="flex items-center gap-1.5 truncate font-semibold">
+                    Temps
+                    {logoBadge}
+                  </span>
                   <span className="truncate text-xs">
                     {import.meta.env.TEMPS_VERSION}
                   </span>
@@ -609,6 +618,66 @@ interface NavProps {
   onReturnToProject?: () => void
 }
 
+function ExtensionNav({ items }: { items?: ConsoleNavItem[] }) {
+  const location = useLocation()
+  const { isMinimal, isMobile } = useSidebar()
+  const compact = isMinimal && !isMobile
+
+  if (!items || items.length === 0) return null
+
+  const sections: string[] = []
+  const bySection = new Map<string, ConsoleNavItem[]>()
+  for (const item of items) {
+    const key = item.section ?? 'Enterprise'
+    if (!bySection.has(key)) {
+      bySection.set(key, [])
+      sections.push(key)
+    }
+    bySection.get(key)!.push(item)
+  }
+
+  return (
+    <>
+      {sections.map((section) => (
+        <SidebarGroup
+          key={section}
+          className={compact ? '' : 'group-data-[collapsible=icon]:hidden'}
+        >
+          <SidebarGroupLabel className={compact ? 'hidden' : ''}>
+            {section}
+          </SidebarGroupLabel>
+          <SidebarMenu>
+            {bySection.get(section)!.map((item) => {
+              const isActive =
+                location.pathname === item.path ||
+                location.pathname.startsWith(item.path + '/')
+              return (
+                <SidebarMenuItem key={item.id}>
+                  <SidebarMenuButton
+                    asChild
+                    tooltip={compact ? item.label : undefined}
+                    className={cn(
+                      'justify-center',
+                      !compact && 'justify-start',
+                      isActive &&
+                        'bg-sidebar-accent text-sidebar-accent-foreground'
+                    )}
+                  >
+                    <Link to={item.path}>
+                      {item.icon}
+                      {!compact && <span>{item.label}</span>}
+                    </Link>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+              )
+            })}
+          </SidebarMenu>
+        </SidebarGroup>
+      ))}
+    </>
+  )
+}
+
 function DefaultNav({
   pluginItems,
   pinnedProjectSlug,
@@ -623,6 +692,7 @@ function DefaultNav({
   // the main "Platform" group at the top.
   const flatItems = navWorkflow.filter((it) => !it.subItems?.length)
   const grouped = navWorkflow.filter((it) => it.subItems?.length)
+  const { navItems: extraNavItems } = useConsoleExtensions()
 
   return (
     <>
@@ -643,6 +713,7 @@ function DefaultNav({
       ))}
       <NavSection label="Observe" items={navObservability} />
       <NavPlugins items={pluginItems} />
+      <ExtensionNav items={extraNavItems} />
       <SidebarGroup className="mt-auto">
         <SidebarMenu>
           <SidebarMenuItem>

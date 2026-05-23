@@ -44,7 +44,7 @@ impl TempsPlugin for FunnelsPlugin {
             crate::handlers::types::AppState { funnel_service },
         ));
 
-        Some(PluginRoutes { router: routes })
+        Some(PluginRoutes::new(routes))
     }
 
     fn openapi_schema(&self) -> Option<utoipa::openapi::OpenApi> {

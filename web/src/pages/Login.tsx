@@ -1,9 +1,14 @@
 import { LoginForm } from '@/components/auth/login-form'
-import { loginMutation } from '@/api/client/@tanstack/react-query.gen'
-import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { useState } from 'react'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import {
+  emailStatusOptions,
+  loginMutation,
+} from '@/api/client/@tanstack/react-query.gen'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { AlertCircle } from 'lucide-react'
+import { useMemo, useState } from 'react'
 import { toast } from 'sonner'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import { useAuth } from '@/contexts/AuthContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { consumeReturnTo } from '@/lib/return-to'
@@ -14,6 +19,16 @@ export const Login = () => {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const { refetch } = useAuth()
+  const [searchParams] = useSearchParams()
+
+  const { data: emailStatus } = useQuery(emailStatusOptions())
+
+  const oidcError = useMemo(() => {
+    if (searchParams.get('error') !== 'oidc_failed') {
+      return null
+    }
+    return searchParams.get('reason') ?? 'SSO sign-in failed'
+  }, [searchParams])
 
   const login = useMutation({
     ...loginMutation(),
@@ -67,9 +82,18 @@ export const Login = () => {
           </div>
         </div>
 
+        {oidcError && (
+          <Alert variant="destructive">
+            <AlertCircle className="h-4 w-4" />
+            <AlertTitle>SSO sign-in failed</AlertTitle>
+            <AlertDescription>{oidcError}</AlertDescription>
+          </Alert>
+        )}
+
         <LoginForm
           onSubmit={handleSubmit}
           isLoading={isLoading || login.isPending}
+          oidcProviders={emailStatus?.oidc_providers ?? []}
         />
       </div>
     </div>

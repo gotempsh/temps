@@ -27,6 +27,8 @@ pub struct Model {
     pub mfa_enabled: bool,
     #[serde(skip_serializing)]
     pub mfa_recovery_codes: Option<String>,
+    pub oidc_subject: Option<String>,
+    pub oidc_provider_id: Option<i32>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }
@@ -39,6 +41,14 @@ pub enum Relation {
     AuditLogs,
     #[sea_orm(has_many = "super::user_roles::Entity")]
     UserRoles,
+    #[sea_orm(
+        belongs_to = "super::oidc_providers::Entity",
+        from = "Column::OidcProviderId",
+        to = "super::oidc_providers::Column::Id",
+        on_update = "NoAction",
+        on_delete = "SetNull"
+    )]
+    OidcProvider,
 }
 
 impl Related<super::sessions::Entity> for Entity {
@@ -56,6 +66,12 @@ impl Related<super::audit_logs::Entity> for Entity {
 impl Related<super::user_roles::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::UserRoles.def()
+    }
+}
+
+impl Related<super::oidc_providers::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::OidcProvider.def()
     }
 }
 

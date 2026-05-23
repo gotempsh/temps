@@ -1,0 +1,14 @@
+{
+  "name": "@temps-sdk/ui",
+  "version": "1.0.0",
+  "description": "Re-exports OSS UI primitives from temps/web/src — single source of truth for OSS and EE.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./globals.css": "./src/globals.css"
+  },
+  "peerDependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  }
+}

@@ -197,7 +197,7 @@ impl TempsPlugin for SandboxPlugin {
 
         let app_state = Arc::new(SandboxAppState { sandbox_service });
         let router = configure_routes().with_state(app_state);
-        Some(PluginRoutes { router })
+        Some(PluginRoutes::new(router))
     }
 
     fn openapi_schema(&self) -> Option<utoipa::openapi::OpenApi> {

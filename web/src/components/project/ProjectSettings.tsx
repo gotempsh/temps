@@ -1,5 +1,4 @@
 import { ProjectResponse } from '@/api/client'
-import { Card } from '@/components/ui/card'
 import { Navigate, Route, Routes } from 'react-router-dom'
 import { CronJobDetail } from './settings/CronJobDetail'
 import { CronJobsSettings } from './settings/CronJobsSettings'
@@ -23,7 +22,7 @@ interface ProjectSettingsProps {
 
 export function ProjectSettings({ project, refetch }: ProjectSettingsProps) {
   return (
-    <Card className="p-4 sm:p-6">
+    <div>
       <Routes>
         <Route index element={<Navigate to="general" replace />} />
         <Route
@@ -78,6 +77,6 @@ export function ProjectSettings({ project, refetch }: ProjectSettingsProps) {
         />
         <Route path="*" element={<Navigate to="." replace />} />
       </Routes>
-    </Card>
+    </div>
   )
 }

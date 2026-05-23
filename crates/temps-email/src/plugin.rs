@@ -104,9 +104,7 @@ impl TempsPlugin for EmailPlugin {
         // Configure authenticated routes
         let email_routes = handlers::configure_routes().with_state(app_state);
 
-        Some(PluginRoutes {
-            router: email_routes,
-        })
+        Some(PluginRoutes::new(email_routes))
     }
 
     fn configure_public_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
@@ -115,9 +113,7 @@ impl TempsPlugin for EmailPlugin {
         // Public tracking routes (no auth required)
         let tracking_routes = handlers::configure_public_routes().with_state(app_state);
 
-        Some(PluginRoutes {
-            router: tracking_routes,
-        })
+        Some(PluginRoutes::new(tracking_routes))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {

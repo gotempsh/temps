@@ -32,6 +32,7 @@
         "@tailwindcss/postcss": "^4.1.12",
         "@tanstack/react-query": "^5.85.5",
         "@tanstack/react-virtual": "^3.13.12",
+        "@temps-sdk/console-kit": "file:./packages/console-kit",
         "@temps-sdk/react-analytics": "^0.0.1-beta.15",
         "@types/three": "^0.182.0",
         "ansi-to-html": "^0.7.2",
@@ -440,6 +441,8 @@
     "@tanstack/react-virtual": ["@tanstack/react-virtual@3.13.12", "", { "dependencies": { "@tanstack/virtual-core": "3.13.12" }, "peerDependencies": { "react": "^16.8.0 || ^17.0.0 || ^18.0.0 || ^19.0.0", "react-dom": "^16.8.0 || ^17.0.0 || ^18.0.0 || ^19.0.0" } }, "sha512-Gd13QdxPSukP8ZrkbgS2RwoZseTTbQPLnQEn7HY/rqtM+8Zt95f7xKC7N0EsKs7aoz0WzZ+fditZux+F8EzYxA=="],
 
     "@tanstack/virtual-core": ["@tanstack/virtual-core@3.13.12", "", {}, "sha512-1YBOJfRHV4sXUmWsFSf5rQor4Ss82G8dQWLRbnk3GA4jeP8hQt1hxXh0tmflpC0dz3VgEv/1+qwPyLeWkQuPFA=="],
+
+    "@temps-sdk/console-kit": ["@temps-sdk/console-kit@file:packages/console-kit", { "devDependencies": { "@types/react": "^19.1.12", "react": "^19.1.1", "typescript": "^5.9.2" }, "peerDependencies": { "react": "^19.0.0" } }],
 
     "@temps-sdk/react-analytics": ["@temps-sdk/react-analytics@0.0.1-beta.33", "", { "dependencies": { "@rrweb/packer": "^2.0.0-alpha.17", "rrweb": "^2.0.0-alpha.17", "web-vitals": "^4.2.4" }, "peerDependencies": { "react": "^18.0.0 || ^19.0.0-rc || ^19.0.0", "react-dom": "^18.0.0 || ^19.0.0-rc || ^19.0.0" }, "optionalPeers": ["react-dom"] }, "sha512-dUtGO+ODuuAHqQnWrPEv8FjAwDH8biI00+UIUNCHW+W/zAKrO5LJN4v7ZROwPRCp6vRZzYrX6hKB5B9YGyuE1w=="],
 

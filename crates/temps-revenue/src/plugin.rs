@@ -94,13 +94,13 @@ impl TempsPlugin for RevenuePlugin {
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         let state = context.require_service::<ManagementState>();
         let router: Router = configure_management_routes().with_state(state);
-        Some(PluginRoutes { router })
+        Some(PluginRoutes::new(router))
     }
 
     fn configure_public_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         let state = context.require_service::<PublicState>();
         let router: Router = configure_public_routes().with_state(state);
-        Some(PluginRoutes { router })
+        Some(PluginRoutes::new(router))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {

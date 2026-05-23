@@ -105,9 +105,7 @@ impl TempsPlugin for ProvidersPlugin {
         // Configure routes with the app state
         let providers_routes = handlers::configure_routes().with_state(app_state);
 
-        Some(PluginRoutes {
-            router: providers_routes,
-        })
+        Some(PluginRoutes::new(providers_routes))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {

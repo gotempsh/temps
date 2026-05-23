@@ -71,7 +71,7 @@ impl TempsPlugin for AnalyticsPlugin {
         // Configure routes with the state
         let routes = configure_routes().with_state(app_state);
 
-        Some(PluginRoutes { router: routes })
+        Some(PluginRoutes::new(routes))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {

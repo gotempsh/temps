@@ -1,6 +1,7 @@
 import { useAuth } from '@/contexts/AuthContext'
 import { captureReturnTo } from '@/lib/return-to'
 import { Login } from '@/pages/Login'
+import { useConsoleExtensions } from '@temps-sdk/console-kit'
 import {
   AlertCircle,
   RefreshCw,
@@ -204,6 +205,12 @@ export const ProtectedLayout = ({
   children: React.ReactNode
 }) => {
   const { user, isLoading, error, refetch } = useAuth()
+  // Allow an EE-style extension to replace the OSS login screen wholesale
+  // (e.g. swap the email/password form for an SSO-only view when the EE
+  // password-login policy is enabled). Falls back to <Login /> when no
+  // extension provides one — preserving OSS behaviour unchanged.
+  const { loginPage } = useConsoleExtensions()
+  const loginElement = loginPage ?? <Login />
 
   if (isLoading) {
     return (
@@ -228,7 +235,7 @@ export const ProtectedLayout = ({
       errorTitle === 'Unauthorized'
     ) {
       captureReturnTo()
-      return <Login />
+      return loginElement
     }
 
     const categorized = categorizeError(error)
@@ -343,7 +350,7 @@ export const ProtectedLayout = ({
 
   if (!user) {
     captureReturnTo()
-    return <Login />
+    return loginElement
   }
 
   return <>{children}</>

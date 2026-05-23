@@ -1,0 +1,17 @@
+{
+  "name": "@temps-sdk/console-kit",
+  "version": "1.0.0",
+  "description": "Temps console extension contract: add-only routes, nav items, and badge slot layered onto the OSS console.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "peerDependencies": {
+    "react": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.1.12",
+    "react": "^19.1.1",
+    "typescript": "^5.9.2"
+  }
+}

@@ -302,6 +302,7 @@ pub async fn verify_mfa_challenge(
             ResetPasswordRequest,
             AuthResponse,
             EmailStatusResponse,
+            crate::oidc_types::OidcProviderSummary,
             RouteUser,
             RouteRole,
             RouteUserWithRoles,
@@ -358,6 +359,8 @@ pub fn configure_routes() -> Router<Arc<AuthState>> {
         .route("/auth/magic-link/verify", get(verify_magic_link))
         .route("/auth/password-reset/request", post(request_password_reset))
         .route("/auth/password-reset/verify", post(reset_password))
+        .route("/auth/oidc/login/{provider_id}", get(crate::oidc_handler::start_oidc_login))
+        .route("/auth/oidc/callback", get(crate::oidc_handler::oidc_callback))
         .layer(axum::Extension(rate_limiter))
         .layer(axum::middleware::from_fn(auth_rate_limit_middleware));
 
@@ -474,6 +477,7 @@ pub struct EmailStatusResponse {
     pub email_configured: bool,
     pub magic_link_available: bool,
     pub password_reset_available: bool,
+    pub oidc_providers: Vec<crate::oidc_types::OidcProviderSummary>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -825,11 +829,17 @@ pub async fn verify_magic_link(
 )]
 pub async fn email_status(State(state): State<Arc<AuthState>>) -> Json<EmailStatusResponse> {
     let email_configured = state.auth_service.is_email_configured();
+    let oidc_providers = state
+        .oidc_service
+        .list_enabled_providers()
+        .await
+        .unwrap_or_default();
 
     Json(EmailStatusResponse {
         email_configured,
         magic_link_available: email_configured,
         password_reset_available: email_configured,
+        oidc_providers,
     })
 }
 

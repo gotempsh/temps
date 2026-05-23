@@ -60,7 +60,15 @@ impl TempsPlugin for AuthPlugin {
 
             // Create UserService
             let user_service = Arc::new(UserService::new(db.clone()));
-            context.register_service(user_service);
+            context.register_service(user_service.clone());
+
+            // Create OidcService
+            let oidc_service = Arc::new(crate::oidc_service::OidcService::new(
+                db.clone(),
+                encryption_service.clone(),
+                user_service.clone(),
+            ));
+            context.register_service(oidc_service);
 
             // Create AuthState for handlers
             let auth_state = Arc::new(AuthState::new(
@@ -82,10 +90,10 @@ impl TempsPlugin for AuthPlugin {
         let auth_state = context.require_service::<AuthState>();
 
         // Use the existing configure_routes function which includes all endpoints
-        let auth_routes = handlers::configure_routes().with_state(auth_state);
-        Some(PluginRoutes {
-            router: auth_routes,
-        })
+        let auth_routes = handlers::configure_routes()
+            .merge(crate::oidc_handler::configure_oidc_routes())
+            .with_state(auth_state);
+        Some(PluginRoutes::new(auth_routes))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {
@@ -96,6 +104,7 @@ impl TempsPlugin for AuthPlugin {
 
         let auth_schema = <handlers::AuthApiDoc as OpenApiTrait>::openapi();
         let user_schema = <handlers::UserApiDoc as OpenApiTrait>::openapi();
+        let oidc_schema = <crate::oidc_handler::OidcApiDoc as OpenApiTrait>::openapi();
 
         // Create a new combined OpenAPI schema
         let mut combined = OpenApiBuilder::new()
@@ -119,27 +128,25 @@ impl TempsPlugin for AuthPlugin {
         for (path, path_item) in user_schema.paths.paths {
             combined.paths.paths.insert(path, path_item);
         }
-
-        // Merge components if they exist
-        if let Some(auth_components) = auth_schema.components {
-            if let Some(user_components) = user_schema.components {
-                let mut merged_components = ComponentsBuilder::new();
-
-                // Merge schemas
-                for (name, schema) in auth_components.schemas {
-                    merged_components = merged_components.schema(name, schema);
-                }
-                for (name, schema) in user_components.schemas {
-                    merged_components = merged_components.schema(name, schema);
-                }
-
-                combined.components = Some(merged_components.build());
-            } else {
-                combined.components = Some(auth_components);
-            }
-        } else if let Some(user_components) = user_schema.components {
-            combined.components = Some(user_components);
+        for (path, path_item) in oidc_schema.paths.paths {
+            combined.paths.paths.insert(path, path_item);
         }
+
+        // Merge components from auth, user, and OIDC schemas.
+        let mut merged_components = ComponentsBuilder::new();
+        for schema_source in [
+            auth_schema.components.as_ref(),
+            user_schema.components.as_ref(),
+            oidc_schema.components.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for (name, schema) in &schema_source.schemas {
+                merged_components = merged_components.schema(name.clone(), schema.clone());
+            }
+        }
+        combined.components = Some(merged_components.build());
 
         // Add tags
         combined.tags = Some(vec![
