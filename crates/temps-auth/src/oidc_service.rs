@@ -35,6 +35,17 @@ const DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(3600);
 
 struct CachedClient {
     metadata: CoreProviderMetadata,
+    /// Decrypted client secret, kept in memory next to the metadata so
+    /// `core_client_for_provider` doesn't have to round-trip
+    /// `EncryptionService::decrypt_string` on every authorize / token-exchange
+    /// call. The plaintext has to be in memory anyway when we POST to the IdP,
+    /// so caching it for the metadata TTL is no worse than the status quo.
+    client_secret: String,
+    /// The encrypted blob the plaintext was derived from. If a later
+    /// `provider.client_secret_encrypted` doesn't match this value (e.g.
+    /// secret rotated via direct DB edit and the `update_provider`
+    /// invalidation was skipped), we treat the cache entry as stale.
+    client_secret_ciphertext: String,
     cached_at: Instant,
 }
 
@@ -131,11 +142,7 @@ impl OidcService {
             issuer_url: Set(normalize_issuer_url(&request.issuer_url)?),
             client_id: Set(request.client_id.trim().to_string()),
             client_secret_encrypted: Set(encrypted_secret),
-            scopes: Set(if request.scopes.trim().is_empty() {
-                "openid email profile".to_string()
-            } else {
-                request.scopes.trim().to_string()
-            }),
+            scopes: Set(normalize_scopes(&request.scopes)),
             jit_provisioning: Set(request.jit_provisioning),
             enabled: Set(request.enabled),
             template: Set(normalize_template(&request.template)),
@@ -179,7 +186,11 @@ impl OidcService {
             active.client_secret_encrypted = Set(encrypted_secret);
         }
         if let Some(scopes) = request.scopes {
-            active.scopes = Set(scopes.trim().to_string());
+            // Mirror create_provider: a PATCH that sets scopes to "" or
+            // whitespace gets the OIDC-minimum default instead of silently
+            // persisting an empty string (which then makes start_login send
+            // an empty scopes vector and breaks login on strict IdPs).
+            active.scopes = Set(normalize_scopes(&scopes));
         }
         if let Some(jit_provisioning) = request.jit_provisioning {
             active.jit_provisioning = Set(jit_provisioning);
@@ -550,14 +561,7 @@ impl OidcService {
         provider: &oidc_providers::Model,
         redirect_uri: &str,
     ) -> Result<CoreClient, OidcError> {
-        let metadata = self.fetch_provider_metadata(provider, false).await?;
-        let client_secret = self
-            .encryption_service
-            .decrypt_string(&provider.client_secret_encrypted)
-            .map_err(|e| OidcError::DiscoveryFailed {
-                issuer: provider.issuer_url.clone(),
-                reason: format!("failed to decrypt client secret: {e}"),
-            })?;
+        let (metadata, client_secret) = self.provider_client_bundle(provider, false).await?;
 
         Ok(CoreClient::from_provider_metadata(
             metadata,
@@ -572,16 +576,23 @@ impl OidcService {
         })?))
     }
 
-    async fn fetch_provider_metadata(
+    /// Returns `(provider_metadata, decrypted_client_secret)` for the given
+    /// provider, populating both from cache when possible. Pass
+    /// `force_refresh: true` from the operator-driven test-connection path
+    /// so the operator sees the result of a *fresh* discovery + decrypt
+    /// rather than whatever's been sitting in cache for up to an hour.
+    async fn provider_client_bundle(
         &self,
         provider: &oidc_providers::Model,
         force_refresh: bool,
-    ) -> Result<CoreProviderMetadata, OidcError> {
+    ) -> Result<(CoreProviderMetadata, String), OidcError> {
         if !force_refresh {
             let cache = self.discovery_cache.lock().await;
             if let Some(entry) = cache.get(&provider.id) {
-                if entry.cached_at.elapsed() < DISCOVERY_CACHE_TTL {
-                    return Ok(entry.metadata.clone());
+                if entry.cached_at.elapsed() < DISCOVERY_CACHE_TTL
+                    && entry.client_secret_ciphertext == provider.client_secret_encrypted
+                {
+                    return Ok((entry.metadata.clone(), entry.client_secret.clone()));
                 }
             }
         }
@@ -599,14 +610,33 @@ impl OidcService {
                 reason: e.to_string(),
             })?;
 
+        let client_secret = self
+            .encryption_service
+            .decrypt_string(&provider.client_secret_encrypted)
+            .map_err(|e| OidcError::DiscoveryFailed {
+                issuer: provider.issuer_url.clone(),
+                reason: format!("failed to decrypt client secret: {e}"),
+            })?;
+
         self.discovery_cache.lock().await.insert(
             provider.id,
             CachedClient {
                 metadata: metadata.clone(),
+                client_secret: client_secret.clone(),
+                client_secret_ciphertext: provider.client_secret_encrypted.clone(),
                 cached_at: Instant::now(),
             },
         );
 
+        Ok((metadata, client_secret))
+    }
+
+    async fn fetch_provider_metadata(
+        &self,
+        provider: &oidc_providers::Model,
+        force_refresh: bool,
+    ) -> Result<CoreProviderMetadata, OidcError> {
+        let (metadata, _secret) = self.provider_client_bundle(provider, force_refresh).await?;
         Ok(metadata)
     }
 }
@@ -616,6 +646,19 @@ fn parse_scopes(scopes: &str) -> Vec<Scope> {
         .split_whitespace()
         .map(|s| Scope::new(s.to_string()))
         .collect()
+}
+
+/// OIDC requires the `openid` scope; `email` + `profile` are needed for
+/// our claims pipeline (email is the user-identity key, profile gives us a
+/// display name). Empty input therefore falls back to all three rather
+/// than persisting an empty string.
+fn normalize_scopes(scopes: &str) -> String {
+    let trimmed = scopes.trim();
+    if trimmed.is_empty() {
+        "openid email profile".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn validate_issuer_url(issuer: &str) -> Result<(), OidcError> {
@@ -776,6 +819,22 @@ mod tests {
         assert_eq!(
             normalize_issuer_url("https://auth.example.com/").unwrap(),
             "https://auth.example.com"
+        );
+    }
+
+    #[test]
+    fn normalize_scopes_falls_back_to_default_on_empty() {
+        assert_eq!(normalize_scopes(""), "openid email profile");
+        assert_eq!(normalize_scopes("   "), "openid email profile");
+        assert_eq!(normalize_scopes("\t\n  "), "openid email profile");
+    }
+
+    #[test]
+    fn normalize_scopes_preserves_caller_value_when_present() {
+        assert_eq!(normalize_scopes("openid"), "openid");
+        assert_eq!(
+            normalize_scopes("  openid email profile groups "),
+            "openid email profile groups"
         );
     }
 

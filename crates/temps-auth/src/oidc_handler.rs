@@ -149,7 +149,35 @@ pub async fn oidc_callback(
     match complete_oidc_login(&state, &metadata, &code, &state_param).await {
         Ok(response) => response,
         Err(err) => {
-            warn!("OIDC callback failed: {}", err);
+            // Distinguish potentially-abusive probes from ordinary failures.
+            // `StateNotFound` means an attacker guessed (or replayed) a state
+            // token that never existed; `StateExpired` is the same shape but
+            // for stale tokens. Both are interesting to a SOC even though we
+            // return the same generic error to the browser.
+            match &err {
+                OidcError::StateNotFound { .. } => {
+                    warn!(
+                        target: "temps_auth::oidc::abuse",
+                        ip = %metadata.ip_address,
+                        user_agent = %metadata.user_agent,
+                        "OIDC callback with unknown state token (possible probe / replay): {}",
+                        err
+                    );
+                }
+                OidcError::StateExpired { age_secs, .. } => {
+                    warn!(
+                        target: "temps_auth::oidc::abuse",
+                        ip = %metadata.ip_address,
+                        user_agent = %metadata.user_agent,
+                        age_secs = age_secs,
+                        "OIDC callback with expired state token: {}",
+                        err
+                    );
+                }
+                _ => {
+                    warn!("OIDC callback failed: {}", err);
+                }
+            }
             redirect_login_error(&err.to_string())
         }
     }
@@ -209,7 +237,36 @@ async fn complete_oidc_login(
             .same_site(cookie::SameSite::Strict)
             .secure(metadata.is_secure)
             .build();
-        headers.insert(SET_COOKIE, mfa_cookie.to_string().parse().unwrap());
+        let cookie_header =
+            mfa_cookie
+                .to_string()
+                .parse()
+                .map_err(|e| OidcError::DiscoveryFailed {
+                    issuer: provider.issuer_url.clone(),
+                    reason: format!("failed to build MFA cookie header: {e}"),
+                })?;
+        headers.insert(SET_COOKIE, cookie_header);
+
+        // Audit the SSO leg of an MFA-gated login here. The MFA-verify
+        // endpoint emits its own follow-up audit on success; together they
+        // tell the full story (SSO ok → MFA challenge issued → MFA verified).
+        // Without this row, an attacker who stops at MFA never appears in
+        // the audit log even though they completed a full IdP login.
+        if let Err(e) = state
+            .audit_service
+            .create_audit_log(&LoginAudit {
+                context: AuditContext {
+                    user_id: user.id,
+                    ip_address: Some(metadata.ip_address.to_string()),
+                    user_agent: metadata.user_agent.as_str().to_string(),
+                },
+                success: true,
+                login_method: "oidc-mfa-pending".to_string(),
+            })
+            .await
+        {
+            error!("Failed to create OIDC MFA-pending audit log: {}", e);
+        }
 
         return Ok((headers, Redirect::to("/mfa-verify")).into_response());
     }
