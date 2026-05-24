@@ -120,37 +120,39 @@ export function SecurityPage() {
   }
 
   return (
-    <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
+    <div className="space-y-6">
       <AdminGateCard />
-      <SecuritySettings
-        control={control}
-        register={register}
-        setValue={setValue}
-        securityHeaders={securityHeaders}
-        rateLimiting={rateLimiting}
-      />
-      {isDirty && (
-        <div className="sticky bottom-0 bg-background border-t pt-4 pb-2">
-          <div className="flex justify-between items-center">
-            <p className="text-sm text-muted-foreground">
-              You have unsaved changes
-            </p>
-            <Button type="submit" disabled={isSubmitting}>
-              {isSubmitting ? (
-                <>
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  Saving...
-                </>
-              ) : (
-                <>
-                  <Save className="mr-2 h-4 w-4" />
-                  Save Changes
-                </>
-              )}
-            </Button>
+      <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
+        <SecuritySettings
+          control={control}
+          register={register}
+          setValue={setValue}
+          securityHeaders={securityHeaders}
+          rateLimiting={rateLimiting}
+        />
+        {isDirty && (
+          <div className="sticky bottom-0 bg-background border-t pt-4 pb-2">
+            <div className="flex justify-between items-center">
+              <p className="text-sm text-muted-foreground">
+                You have unsaved changes
+              </p>
+              <Button type="submit" disabled={isSubmitting}>
+                {isSubmitting ? (
+                  <>
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    Saving...
+                  </>
+                ) : (
+                  <>
+                    <Save className="mr-2 h-4 w-4" />
+                    Save Changes
+                  </>
+                )}
+              </Button>
+            </div>
           </div>
-        </div>
-      )}
-    </form>
+        )}
+      </form>
+    </div>
   )
 }

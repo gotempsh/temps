@@ -119,6 +119,61 @@ pub struct EmailVerifiedAudit {
     pub email: String,
 }
 
+// OIDC provider configuration audits. SSO provider config is one of
+// the highest-impact settings in the system — it controls who can log
+// in and with what role — so every mutation gets a row. The diff-shape
+// payloads (PATCH only carries deltas, DELETE only IDs) are
+// intentional: an auditor reconstructing "who changed what when"
+// shouldn't have to read source to interpret the entry.
+#[derive(Debug, Clone, Serialize)]
+pub struct OidcProviderCreatedAudit {
+    pub context: AuditContext,
+    pub provider_id: i32,
+    pub name: String,
+    pub issuer_url: String,
+    pub template: String,
+    pub enabled: bool,
+    pub jit_provisioning: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OidcProviderUpdatedAudit {
+    pub context: AuditContext,
+    pub provider_id: i32,
+    pub name: String,
+    /// Names of fields included in the PATCH. We do NOT log the new
+    /// values (issuer URLs, client IDs) here — the provider row
+    /// itself is the source of truth post-change; the audit row just
+    /// needs to prove that someone touched it. Critically, this list
+    /// reveals whether `client_secret` was rotated, which is the
+    /// single most interesting forensic question.
+    pub fields_changed: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OidcProviderDeletedAudit {
+    pub context: AuditContext,
+    pub provider_id: i32,
+    pub name: String,
+    pub issuer_url: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OidcRoleMappingCreatedAudit {
+    pub context: AuditContext,
+    pub provider_id: i32,
+    pub mapping_id: i32,
+    pub idp_group: String,
+    pub role: String,
+    pub priority: i32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OidcRoleMappingDeletedAudit {
+    pub context: AuditContext,
+    pub mapping_id: i32,
+}
+
 // Implement AuditOperation for each struct
 impl AuditOperation for LoginAudit {
     fn operation_type(&self) -> String {
@@ -440,3 +495,38 @@ impl AuditOperation for EmailVerifiedAudit {
             .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
     }
 }
+
+// Shared boilerplate for the five OIDC admin audits below. Each just
+// forwards through `self.context` and emits its own operation type.
+macro_rules! impl_oidc_audit_op {
+    ($ty:ty, $op:literal) => {
+        impl AuditOperation for $ty {
+            fn operation_type(&self) -> String {
+                $op.to_string()
+            }
+
+            fn user_id(&self) -> i32 {
+                self.context.user_id
+            }
+
+            fn ip_address(&self) -> Option<String> {
+                self.context.ip_address.clone()
+            }
+
+            fn user_agent(&self) -> &str {
+                &self.context.user_agent
+            }
+
+            fn serialize(&self) -> Result<String> {
+                serde_json::to_string(self)
+                    .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+            }
+        }
+    };
+}
+
+impl_oidc_audit_op!(OidcProviderCreatedAudit, "OIDC_PROVIDER_CREATED");
+impl_oidc_audit_op!(OidcProviderUpdatedAudit, "OIDC_PROVIDER_UPDATED");
+impl_oidc_audit_op!(OidcProviderDeletedAudit, "OIDC_PROVIDER_DELETED");
+impl_oidc_audit_op!(OidcRoleMappingCreatedAudit, "OIDC_ROLE_MAPPING_CREATED");
+impl_oidc_audit_op!(OidcRoleMappingDeletedAudit, "OIDC_ROLE_MAPPING_DELETED");

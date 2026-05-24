@@ -82,6 +82,20 @@ pub trait UpstreamResolver: Send + Sync {
     /// Check if a host has custom routing configured
     async fn has_custom_route(&self, host: &str) -> bool;
 
+    /// Check if any routing source knows about this host.
+    ///
+    /// Returns true when the host would resolve to a real upstream — including
+    /// project deployment hosts (HTTP route table, SNI/TLS table, wildcards)
+    /// AND operator-defined custom routes. Used by the admin gate so that
+    /// requests for legitimate project hosts are never short-circuited as
+    /// "unknown host" just because they aren't in `custom_routes`.
+    ///
+    /// Default implementation falls back to `has_custom_route` for legacy
+    /// implementors; production impls should override it.
+    async fn has_route_for_host(&self, host: &str) -> bool {
+        self.has_custom_route(host).await
+    }
+
     /// Get load balancing strategy for a host (for future use)
     async fn get_lb_strategy(&self, host: &str) -> Option<String>;
 }

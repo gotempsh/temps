@@ -516,6 +516,22 @@ impl LoadBalancer {
         Some(trace_id.to_ascii_lowercase())
     }
 
+    /// Decide whether the admin gate should be consulted for this request.
+    ///
+    /// The gate is only meaningful when it's non-noop, the request isn't a
+    /// workspace/sandbox preview (those carry their own auth), and the path
+    /// isn't a public temps ingest endpoint (`/api/_temps/*` must reach the
+    /// console from any host). Even when this returns `true`, the caller
+    /// must still consult `has_route_for_host` first so legitimate project
+    /// traffic is never gated — only console fall-throughs are.
+    fn should_consult_admin_gate(
+        config: &temps_core::admin_gate::AdminGateConfig,
+        path: &str,
+        is_preview: bool,
+    ) -> bool {
+        !config.is_noop() && !is_preview && !path.starts_with(ROUTE_PREFIX_TEMPS)
+    }
+
     /// Check if a request should be logged to proxy_logs based on path
     fn should_log_request(path: &str) -> bool {
         if LOG_STATIC_ASSETS {
@@ -3241,11 +3257,8 @@ impl ProxyHttp for LoadBalancer {
         // invisible from non-admin hosts.
         if let Some(gate) = self.admin_gate.as_ref() {
             let config = gate.current();
-            if !config.is_noop()
-                && ctx.preview_route.is_none()
-                && !ctx.path.starts_with(ROUTE_PREFIX_TEMPS)
-            {
-                let host_has_route = self.upstream_resolver.has_custom_route(&ctx.host).await;
+            if Self::should_consult_admin_gate(&config, &ctx.path, ctx.preview_route.is_some()) {
+                let host_has_route = self.upstream_resolver.has_route_for_host(&ctx.host).await;
                 if !host_has_route {
                     let client_ip = ctx
                         .ip_address
@@ -3831,6 +3844,115 @@ impl ProxyHttp for LoadBalancer {
             error_code,
             can_reuse_downstream,
         }
+    }
+}
+
+#[cfg(test)]
+mod admin_gate_tests {
+    use super::*;
+    use temps_core::admin_gate::{AdminGateConfig, AdminGateSource};
+
+    fn gated(hosts: &[&str]) -> AdminGateConfig {
+        let owned: Vec<String> = hosts.iter().map(|s| s.to_string()).collect();
+        AdminGateConfig::from_parts(&[], &owned, false, AdminGateSource::Db)
+            .expect("valid gate config")
+    }
+
+    #[test]
+    fn noop_gate_short_circuits_consultation() {
+        let config = AdminGateConfig::from_parts(&[], &[], false, AdminGateSource::Default)
+            .expect("empty noop config");
+        assert!(config.is_noop());
+        assert!(!LoadBalancer::should_consult_admin_gate(
+            &config, "/", false,
+        ));
+    }
+
+    #[test]
+    fn preview_routes_bypass_gate() {
+        let config = gated(&["app.temps.kfs.es"]);
+        assert!(!LoadBalancer::should_consult_admin_gate(
+            &config,
+            "/some/path",
+            true,
+        ));
+    }
+
+    #[test]
+    fn temps_ingest_paths_bypass_gate() {
+        let config = gated(&["app.temps.kfs.es"]);
+        // Public ingest like /api/_temps/event must reach the console from any host.
+        assert!(!LoadBalancer::should_consult_admin_gate(
+            &config,
+            "/api/_temps/event",
+            false,
+        ));
+    }
+
+    #[test]
+    fn normal_request_consults_gate_when_configured() {
+        let config = gated(&["app.temps.kfs.es"]);
+        assert!(LoadBalancer::should_consult_admin_gate(&config, "/", false,));
+    }
+
+    // Regression: setting an admin host (e.g. `app.temps.kfs.es`) used to
+    // 404 every project deployment because the gate consulted
+    // `has_custom_route`, which only knows about operator-defined LB
+    // overrides — not the in-memory project route table. The fix is the
+    // new `has_route_for_host` trait method; this test pins the contract:
+    // a resolver that reports the host via `has_route_for_host` is treated
+    // as known, even when `has_custom_route` says no.
+    #[tokio::test]
+    async fn has_route_for_host_recognizes_project_hosts_outside_custom_routes() {
+        use crate::traits::{PeerSelection, UpstreamResolver};
+        use async_trait::async_trait;
+        use pingora_core::upstreams::peer::HttpPeer;
+        use std::collections::HashSet;
+
+        struct ProjectRouteOnlyResolver {
+            project_hosts: HashSet<String>,
+        }
+
+        #[async_trait]
+        impl UpstreamResolver for ProjectRouteOnlyResolver {
+            async fn resolve_peer(
+                &self,
+                _host: &str,
+                _path: &str,
+                _sni: Option<&str>,
+            ) -> pingora_core::Result<PeerSelection> {
+                Ok(PeerSelection {
+                    peer: Box::new(HttpPeer::new("127.0.0.1:1".to_string(), false, "".into())),
+                    container_id: None,
+                    container_name: None,
+                })
+            }
+
+            async fn has_custom_route(&self, _host: &str) -> bool {
+                // Simulates the old behavior: no entry in `custom_routes`.
+                false
+            }
+
+            async fn has_route_for_host(&self, host: &str) -> bool {
+                // Simulates the route_table check: project hosts are known here.
+                self.project_hosts.contains(host)
+            }
+
+            async fn get_lb_strategy(&self, _host: &str) -> Option<String> {
+                None
+            }
+        }
+
+        let resolver = ProjectRouteOnlyResolver {
+            project_hosts: ["myproject.example.com".to_string()].into_iter().collect(),
+        };
+
+        // Old check missed the project — would have triggered the gate deny path.
+        assert!(!resolver.has_custom_route("myproject.example.com").await);
+        // New check finds it — gate path correctly skips deny.
+        assert!(resolver.has_route_for_host("myproject.example.com").await);
+        // Truly unknown hosts still fall through and would hit the gate.
+        assert!(!resolver.has_route_for_host("evil.example.com").await);
     }
 }
 

@@ -228,6 +228,7 @@ export function AdminGateCard() {
         {editable && dirty && (
           <div className="flex justify-end pt-2">
             <Button
+              type="button"
               onClick={onSubmit}
               disabled={updateMutation.isPending}
               size="sm"

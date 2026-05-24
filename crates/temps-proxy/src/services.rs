@@ -165,6 +165,21 @@ impl UpstreamResolver for UpstreamResolverImpl {
         self.lb_service.get_route(host).await.is_ok()
     }
 
+    async fn has_route_for_host(&self, host: &str) -> bool {
+        // Project deployment hosts live in the in-memory route table
+        // (HTTP host map, SNI/TLS map, legacy lookup, wildcards). Operator
+        // overrides live in the `custom_routes` table. The admin gate must
+        // recognize a host as "known" if any of these match — otherwise it
+        // 404s real project traffic the moment an admin host is configured.
+        if self.route_table.get_route_by_host(host).is_some()
+            || self.route_table.get_route_by_sni(host).is_some()
+            || self.route_table.get_route(host).is_some()
+        {
+            return true;
+        }
+        self.lb_service.get_route(host).await.is_ok()
+    }
+
     async fn get_lb_strategy(&self, _host: &str) -> Option<String> {
         Some("round_robin".to_string())
     }

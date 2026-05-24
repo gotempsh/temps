@@ -13,7 +13,7 @@ import { Input } from '@/components/ui/input'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useForm } from 'react-hook-form'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import { toast } from 'sonner'
 import { useAuth } from '@/contexts/AuthContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
@@ -32,8 +32,17 @@ type FormValues = z.infer<typeof formSchema>
 export const MfaVerify = () => {
   usePageTitle('Verify MFA')
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
   const queryClient = useQueryClient()
   const { refetch } = useAuth()
+
+  // The OIDC callback handler may set `?return_to=` when SSO ran on
+  // a different tab / private window than the one that captured the
+  // deep-link target in sessionStorage. Query param wins because
+  // the server signed off on it (it round-tripped through
+  // sanitize_return_to in oidc_service.rs); sessionStorage is only
+  // a fallback for the same-tab login flow.
+  const queryReturnTo = searchParams.get('return_to')
 
   const form = useForm<FormValues>({
     resolver: zodResolver(formSchema),
@@ -52,8 +61,19 @@ export const MfaVerify = () => {
       // Invalidate and refetch user data
       await queryClient.invalidateQueries({ queryKey: ['getCurrentUser'] })
       await refetch()
-      // Navigate using React Router, honoring the pre-login return path if any
-      navigate(consumeReturnTo('/dashboard'), { replace: true })
+      // Navigate using React Router, honoring the pre-login return path if any.
+      // Server-supplied query param (set by the OIDC callback) wins over
+      // the sessionStorage fallback because it survives tab switches.
+      // Same allow-list as `validate_return_to` on the server: must
+      // start with `/`, must not be scheme-relative (`//`), and must
+      // not contain `\` (Chrome/Edge normalise `/\evil.com` to
+      // `//evil.com` and treat it as scheme-relative → open redirect).
+      const isSafeRelativePath = (p: string | null): p is string =>
+        !!p && p.startsWith('/') && !p.startsWith('//') && !p.includes('\\')
+      const target = isSafeRelativePath(queryReturnTo)
+        ? queryReturnTo
+        : consumeReturnTo('/dashboard')
+      navigate(target, { replace: true })
     },
   })
   const onSubmit = async (data: FormValues) => {

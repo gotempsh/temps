@@ -14,7 +14,10 @@ use temps_core::{AuditContext, RequestMetadata};
 use tracing::{error, warn};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
-use crate::audit::LoginAudit;
+use crate::audit::{
+    LoginAudit, OidcProviderCreatedAudit, OidcProviderDeletedAudit, OidcProviderUpdatedAudit,
+    OidcRoleMappingCreatedAudit, OidcRoleMappingDeletedAudit,
+};
 use crate::oidc_errors::OidcError;
 use crate::oidc_service::OidcService;
 use crate::oidc_types::{
@@ -141,14 +144,42 @@ pub async fn oidc_callback(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Response {
     if let Some(err) = query.error {
-        let reason = query.error_description.unwrap_or(err);
-        warn!("OIDC callback returned provider error: {}", reason);
-        return redirect_login_error(&reason);
+        // The IdP's `error` + `error_description` can carry detailed
+        // internal state ("user account locked since 2025-01-01", an
+        // internal IP address, a tenant-policy reason, etc.). Echoing
+        // the raw text into the redirect's `?reason=` query param puts
+        // it in the browser address bar, the history database, and any
+        // `Referer` header sent on subsequent navigations — a leak
+        // path a malicious or merely chatty IdP can exploit.
+        //
+        // Surface a short opaque code to the browser; keep the
+        // raw description in the server log where only operators see
+        // it. The login page maps `idp_error` to a friendly message.
+        let raw = query
+            .error_description
+            .clone()
+            .unwrap_or_else(|| err.clone());
+        warn!(
+            target: "temps_auth::oidc",
+            error = %err,
+            error_description = %raw,
+            "OIDC callback returned provider error"
+        );
+        return redirect_login_error("idp_error");
     }
 
     let (code, state_param) = match (query.code, query.state) {
         (Some(code), Some(state_param)) => (code, state_param),
-        _ => return redirect_login_error("missing code or state"),
+        _ => {
+            // Same opaque-code policy as the rest of this handler:
+            // never let internal details (here, "what query params
+            // arrived from the IdP") reach the browser URL bar.
+            warn!(
+                target: "temps_auth::oidc",
+                "OIDC callback missing code or state query parameter"
+            );
+            return redirect_login_error("callback_invalid");
+        }
     };
 
     match complete_oidc_login(&state, &metadata, &code, &state_param).await {
@@ -183,8 +214,40 @@ pub async fn oidc_callback(
                     warn!("OIDC callback failed: {}", err);
                 }
             }
-            redirect_login_error(&err.to_string())
+            // Don't reflect the raw error text into the browser URL.
+            // The full error already went to the server log above; the
+            // user sees a short, stable code that the login page can
+            // translate into a friendly message (and that won't leak
+            // IdP response bodies / discovery details into history,
+            // referrers, or shared screenshots).
+            redirect_login_error(login_error_code_for(&err))
         }
+    }
+}
+
+/// Map an `OidcError` into a short, stable, user-safe code that the
+/// login page can render as a friendly message. Anything the operator
+/// actually needs to debug is already in the server log via `warn!`
+/// in the callback handler; this is the public face of the failure.
+fn login_error_code_for(err: &OidcError) -> &'static str {
+    match err {
+        OidcError::StateNotFound { .. } => "state_invalid",
+        OidcError::StateExpired { .. } => "state_expired",
+        OidcError::DiscoveryFailed { .. } => "idp_unreachable",
+        OidcError::TokenExchangeFailed { .. } => "idp_rejected_code",
+        OidcError::IdTokenInvalid { .. } => "id_token_invalid",
+        OidcError::EmailClaimMissing => "email_missing",
+        OidcError::EmailNotVerified { .. } => "email_not_verified",
+        OidcError::UserNotProvisioned { .. } => "user_not_provisioned",
+        OidcError::ProviderDisabled { .. } => "provider_disabled",
+        OidcError::ProviderNotFound { .. } => "provider_not_found",
+        OidcError::NoProviderConfigured => "no_provider_configured",
+        OidcError::InvalidIssuer { .. } => "issuer_invalid",
+        OidcError::InvalidReturnTo => "return_to_invalid",
+        OidcError::InvalidRole { .. } => "role_invalid",
+        OidcError::RoleMappingNotFound { .. } => "role_mapping_not_found",
+        OidcError::ProviderAlreadyExists { .. } => "provider_conflict",
+        OidcError::Database(_) => "internal_error",
     }
 }
 
@@ -199,6 +262,19 @@ async fn complete_oidc_login(
         .oidc_service
         .get_provider(login_state.provider_id)
         .await?;
+
+    // Re-check `enabled` on the callback path. `start_login` already
+    // checks it before issuing the authorize URL, but an admin can
+    // disable a provider while a user has an in-flight login state
+    // (up to `LOGIN_STATE_TTL_MINUTES` later). Without this guard,
+    // an admin who disables a provider to revoke SSO access during
+    // an incident still lets every in-flight session complete.
+    if !provider.enabled {
+        return Err(OidcError::ProviderDisabled {
+            provider_id: login_state.provider_id,
+        });
+    }
+
     let redirect_uri = format!(
         "{}/api/auth/oidc/callback",
         metadata.base_url.trim_end_matches('/')
@@ -273,7 +349,21 @@ async fn complete_oidc_login(
             error!("Failed to create OIDC MFA-pending audit log: {}", e);
         }
 
-        return Ok((headers, Redirect::to("/mfa-verify")).into_response());
+        // Carry the IdP-supplied return_to through the MFA step.
+        // `OidcService::sanitize_return_to` already enforced that
+        // this is a same-origin relative path, so URL-encoding it
+        // as a query param can't be turned into an open redirect.
+        // The frontend's `MfaVerify` page prefers this query value
+        // over its sessionStorage fallback — important because
+        // sessionStorage doesn't survive a tab switch or a private
+        // window, both of which are common when the user reaches
+        // the IdP through an external link.
+        let target = if return_to == "/dashboard" {
+            "/mfa-verify".to_string()
+        } else {
+            format!("/mfa-verify?return_to={}", urlencoding::encode(&return_to))
+        };
+        return Ok((headers, Redirect::to(&target)).into_response());
     }
 
     let session_token = state
@@ -334,10 +424,32 @@ fn redirect_login_error(reason: &str) -> Response {
 pub async fn create_oidc_provider(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AuthState>>,
+    Extension(metadata): Extension<RequestMetadata>,
     Json(request): Json<CreateOidcProviderRequest>,
 ) -> Result<(StatusCode, Json<OidcProviderResponse>), Problem> {
     permission_guard!(auth, SettingsWrite);
     let provider = state.oidc_service.create_provider(request).await?;
+
+    if let Err(e) = state
+        .audit_service
+        .create_audit_log(&OidcProviderCreatedAudit {
+            context: AuditContext {
+                user_id: auth.user_id(),
+                ip_address: Some(metadata.ip_address.to_string()),
+                user_agent: metadata.user_agent.as_str().to_string(),
+            },
+            provider_id: provider.id,
+            name: provider.name.clone(),
+            issuer_url: provider.issuer_url.clone(),
+            template: provider.template.clone(),
+            enabled: provider.enabled,
+            jit_provisioning: provider.jit_provisioning,
+        })
+        .await
+    {
+        error!("Failed to create OIDC provider audit log: {}", e);
+    }
+
     Ok((StatusCode::CREATED, Json(provider_to_response(&provider))))
 }
 
@@ -372,14 +484,74 @@ pub async fn list_oidc_providers(
 pub async fn update_oidc_provider(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AuthState>>,
+    Extension(metadata): Extension<RequestMetadata>,
     Path(provider_id): Path<i32>,
     Json(request): Json<UpdateOidcProviderRequest>,
 ) -> Result<Json<OidcProviderResponse>, Problem> {
     permission_guard!(auth, SettingsWrite);
+
+    // Capture which fields the PATCH touched *before* moving the
+    // request into the service. The audit row is most useful when an
+    // auditor can answer "was the client_secret rotated?" without
+    // diffing the row history themselves. We don't log the new
+    // values here; the provider row is the source of truth.
+    let mut fields_changed = Vec::new();
+    if request.name.is_some() {
+        fields_changed.push("name".to_string());
+    }
+    if request.issuer_url.is_some() {
+        fields_changed.push("issuer_url".to_string());
+    }
+    if request.client_id.is_some() {
+        fields_changed.push("client_id".to_string());
+    }
+    if request.client_secret.is_some() {
+        fields_changed.push("client_secret".to_string());
+    }
+    if request.scopes.is_some() {
+        fields_changed.push("scopes".to_string());
+    }
+    if request.jit_provisioning.is_some() {
+        fields_changed.push("jit_provisioning".to_string());
+    }
+    if request.enabled.is_some() {
+        fields_changed.push("enabled".to_string());
+    }
+    if request.template.is_some() {
+        fields_changed.push("template".to_string());
+    }
+    if request.group_claim.is_some() {
+        fields_changed.push("group_claim".to_string());
+    }
+    if request.role_claim.is_some() {
+        fields_changed.push("role_claim".to_string());
+    }
+    if request.default_role.is_some() {
+        fields_changed.push("default_role".to_string());
+    }
+
     let provider = state
         .oidc_service
         .update_provider(provider_id, request)
         .await?;
+
+    if let Err(e) = state
+        .audit_service
+        .create_audit_log(&OidcProviderUpdatedAudit {
+            context: AuditContext {
+                user_id: auth.user_id(),
+                ip_address: Some(metadata.ip_address.to_string()),
+                user_agent: metadata.user_agent.as_str().to_string(),
+            },
+            provider_id: provider.id,
+            name: provider.name.clone(),
+            fields_changed,
+        })
+        .await
+    {
+        error!("Failed to create OIDC provider update audit log: {}", e);
+    }
+
     Ok(Json(provider_to_response(&provider)))
 }
 
@@ -393,10 +565,36 @@ pub async fn update_oidc_provider(
 pub async fn delete_oidc_provider(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AuthState>>,
+    Extension(metadata): Extension<RequestMetadata>,
     Path(provider_id): Path<i32>,
 ) -> Result<StatusCode, Problem> {
     permission_guard!(auth, SettingsWrite);
+
+    // Snapshot identity *before* deletion so the audit row carries
+    // the provider name + issuer even after the row is gone. We
+    // tolerate a 404 here only by letting it propagate through the
+    // delete call itself.
+    let provider = state.oidc_service.get_provider(provider_id).await?;
+
     state.oidc_service.delete_provider(provider_id).await?;
+
+    if let Err(e) = state
+        .audit_service
+        .create_audit_log(&OidcProviderDeletedAudit {
+            context: AuditContext {
+                user_id: auth.user_id(),
+                ip_address: Some(metadata.ip_address.to_string()),
+                user_agent: metadata.user_agent.as_str().to_string(),
+            },
+            provider_id: provider.id,
+            name: provider.name,
+            issuer_url: provider.issuer_url,
+        })
+        .await
+    {
+        error!("Failed to create OIDC provider delete audit log: {}", e);
+    }
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -485,6 +683,7 @@ pub async fn list_oidc_role_mappings(
 pub async fn create_oidc_role_mapping(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AuthState>>,
+    Extension(metadata): Extension<RequestMetadata>,
     Path(provider_id): Path<i32>,
     Json(request): Json<CreateOidcRoleMappingRequest>,
 ) -> Result<(StatusCode, Json<OidcRoleMappingResponse>), Problem> {
@@ -493,6 +692,26 @@ pub async fn create_oidc_role_mapping(
         .oidc_service
         .create_role_mapping(provider_id, request)
         .await?;
+
+    if let Err(e) = state
+        .audit_service
+        .create_audit_log(&OidcRoleMappingCreatedAudit {
+            context: AuditContext {
+                user_id: auth.user_id(),
+                ip_address: Some(metadata.ip_address.to_string()),
+                user_agent: metadata.user_agent.as_str().to_string(),
+            },
+            provider_id,
+            mapping_id: mapping.id,
+            idp_group: mapping.idp_group.clone(),
+            role: mapping.role.clone(),
+            priority: mapping.priority,
+        })
+        .await
+    {
+        error!("Failed to create OIDC role mapping audit log: {}", e);
+    }
+
     Ok((StatusCode::CREATED, Json(mapping)))
 }
 
@@ -506,10 +725,27 @@ pub async fn create_oidc_role_mapping(
 pub async fn delete_oidc_role_mapping(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AuthState>>,
+    Extension(metadata): Extension<RequestMetadata>,
     Path(mapping_id): Path<i32>,
 ) -> Result<StatusCode, Problem> {
     permission_guard!(auth, SettingsWrite);
     state.oidc_service.delete_role_mapping(mapping_id).await?;
+
+    if let Err(e) = state
+        .audit_service
+        .create_audit_log(&OidcRoleMappingDeletedAudit {
+            context: AuditContext {
+                user_id: auth.user_id(),
+                ip_address: Some(metadata.ip_address.to_string()),
+                user_agent: metadata.user_agent.as_str().to_string(),
+            },
+            mapping_id,
+        })
+        .await
+    {
+        error!("Failed to create OIDC role mapping delete audit log: {}", e);
+    }
+
     Ok(StatusCode::NO_CONTENT)
 }
 

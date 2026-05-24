@@ -31,6 +31,11 @@ pub enum OidcError {
     #[error("User {email} is not provisioned for OIDC login")]
     UserNotProvisioned { email: String },
 
+    #[error(
+        "Refusing to use OIDC identity for {email}: the IdP did not assert email_verified=true"
+    )]
+    EmailNotVerified { email: String },
+
     #[error("OIDC ID token is missing the email claim")]
     EmailClaimMissing,
 
@@ -95,6 +100,11 @@ impl From<OidcError> for Problem {
                 .with_detail(format!(
                     "No Temps account exists for {email} and just-in-time provisioning is disabled. Ask an administrator to create your account first."
                 )),
+            OidcError::EmailNotVerified { email } => problem_new(StatusCode::FORBIDDEN)
+                .with_title("Email Not Verified")
+                .with_detail(format!(
+                    "Your identity provider has not confirmed that {email} belongs to you. Verify the email at your IdP and try again, or ask an administrator to provision the account manually."
+                )),
             OidcError::EmailClaimMissing => problem_new(StatusCode::BAD_GATEWAY)
                 .with_title("OIDC Email Claim Missing")
                 .with_detail(
@@ -117,9 +127,19 @@ impl From<OidcError> for Problem {
                 .with_detail(format!(
                     "Role '{role}' is invalid for Temps SSO mapping (use 'admin' or 'user')"
                 )),
-            OidcError::Database(err) => problem_new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Database Error")
-                .with_detail(err.to_string()),
+            OidcError::Database(err) => {
+                // Don't return the raw Sea-ORM error text to the
+                // caller: it can include table names, column names,
+                // and snippets of failed SQL that help an attacker
+                // map the schema. Log the full error server-side
+                // and hand the operator a stable, generic message.
+                tracing::error!(target: "temps_auth::oidc", "OIDC database error: {err}");
+                problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Internal Server Error")
+                    .with_detail(
+                        "An internal database error occurred while processing the OIDC request. Check the server logs for details.",
+                    )
+            }
         }
     }
 }

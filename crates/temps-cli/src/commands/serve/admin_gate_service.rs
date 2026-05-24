@@ -24,7 +24,7 @@ use std::sync::Arc;
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection, EntityTrait};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::info;
 
 use super::admin_gate::{AdminGateConfig, AdminGateConfigError, AdminGateHandle, AdminGateSource};
 
@@ -118,14 +118,25 @@ impl AdminGateService {
                 }
                 Ok(None) => AdminGateConfig::from_parts(&[], &[], false, AdminGateSource::Default)?,
                 Err(e) => {
-                    // Don't fail boot just because the settings row is bad —
-                    // leave the gate open and warn. Operators can fix via
-                    // env vars in the meantime.
-                    warn!(
-                        "Admin gate: failed to load settings ({}) — gate disabled",
-                        e
+                    // SECURITY: fail-CLOSED on load error. Previously
+                    // we silently installed a noop config here, which
+                    // meant any DB problem (corrupt settings row,
+                    // transient DB outage, JSON parse failure) would
+                    // open the management surface to the world. That
+                    // turns "the gate config is broken" into a
+                    // privilege-escalation event for anyone who can
+                    // reach the box. Refuse to boot instead — the
+                    // operator must explicitly intervene (fix the
+                    // row, or set TEMPS_ADMIN_* env vars to bypass
+                    // the DB path).
+                    tracing::error!(
+                        target: "temps_cli::admin_gate",
+                        error = %e,
+                        "Admin gate: failed to load settings from DB. Refusing to start with an open gate. \
+                         Fix the `settings` row, or set TEMPS_ADMIN_ALLOWED_IPS / TEMPS_ADMIN_ALLOWED_HOSTS \
+                         to override via env."
                     );
-                    AdminGateConfig::from_parts(&[], &[], false, AdminGateSource::Default)?
+                    return Err(e);
                 }
             }
         };

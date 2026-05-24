@@ -9,11 +9,21 @@
 //!     TEMPS_RUN_LIVE_OIDC_TESTS=1 cargo test --test oidc_discovery_live -p temps-auth -- --nocapture
 
 use openidconnect::core::CoreProviderMetadata;
-use openidconnect::reqwest::async_http_client;
 use openidconnect::IssuerUrl;
 
 fn live_enabled() -> bool {
     std::env::var("TEMPS_RUN_LIVE_OIDC_TESTS").ok().as_deref() == Some("1")
+}
+
+/// Mirrors the production client config in
+/// `OidcService::new`: explicit timeout + no redirect following (so
+/// a malicious IdP can't 302 us to an internal URL on the first hop).
+fn build_test_http_client() -> reqwest::Client {
+    reqwest::ClientBuilder::new()
+        .timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("test reqwest client should build")
 }
 
 fn format_error_chain<E: std::error::Error>(err: &E) -> String {
@@ -39,8 +49,9 @@ async fn auth0_kungfusoftware_discovery_succeeds_with_trailing_slash() {
     // trailing slash or it will fail with DiscoveryError::Validation.
     let issuer =
         IssuerUrl::new("https://kungfusoftware.eu.auth0.com/".to_string()).expect("valid issuer");
+    let http_client = build_test_http_client();
 
-    let result = CoreProviderMetadata::discover_async(issuer, async_http_client).await;
+    let result = CoreProviderMetadata::discover_async(issuer, &http_client).await;
 
     match result {
         Ok(meta) => {
@@ -61,13 +72,15 @@ async fn auth0_kungfusoftware_discovery_fails_without_trailing_slash() {
         return;
     }
 
-    // This mirrors what `OidcService::normalize_issuer_url` currently
-    // does: it strips the trailing slash. The resulting URL is what gets
-    // passed to `discover_async`, and Auth0's response will mismatch.
+    // This is what the *old* `normalize_issuer_url` used to do (strip
+    // the trailing slash). Keeping the failure case as a guard: if
+    // someone re-introduces the slash strip, this test will be the
+    // canary that catches it.
     let issuer =
         IssuerUrl::new("https://kungfusoftware.eu.auth0.com".to_string()).expect("valid issuer");
+    let http_client = build_test_http_client();
 
-    let result = CoreProviderMetadata::discover_async(issuer, async_http_client).await;
+    let result = CoreProviderMetadata::discover_async(issuer, &http_client).await;
 
     let err = match result {
         Ok(meta) => {

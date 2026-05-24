@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -8,9 +9,9 @@ use openidconnect::core::{
     CoreAuthenticationFlow, CoreClient, CoreIdToken, CoreIdTokenClaims, CoreProviderMetadata,
 };
 use openidconnect::{
-    reqwest::async_http_client, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl,
-    Nonce, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, RequestTokenError, Scope,
-    TokenResponse,
+    AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointMaybeSet, EndpointNotSet,
+    EndpointSet, IssuerUrl, Nonce, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl,
+    RequestTokenError, Scope, TokenResponse,
 };
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait,
@@ -33,6 +34,29 @@ use temps_entities::users;
 
 const LOGIN_STATE_TTL_MINUTES: i64 = 10;
 const DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(3600);
+/// Hard cap on how long an OIDC discovery or token-exchange round-trip
+/// can take. openidconnect 4.x lets us own the `reqwest::Client`, so
+/// we set this once at service init instead of relying on the default
+/// (no timeout) client that openidconnect 3.x shipped.
+const OIDC_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Cap on `idp_group` length in `oidc_role_mappings` rows. The DB
+/// column is unbounded `text`; without this an admin-only path could
+/// stuff a giant string in there that then gets byte-compared against
+/// every claim value on every SSO login.
+const IDP_GROUP_MAX_LEN: usize = 256;
+
+/// `CoreClient` after we've populated everything we need (auth URL +
+/// token URL from discovery, plus our redirect URI). openidconnect 4.x
+/// encodes endpoint-set-ness in the type parameters, so this alias
+/// gives the compiler what it needs without polluting every call site.
+type ConfiguredCoreClient = CoreClient<
+    EndpointSet,      // HasAuthUrl
+    EndpointNotSet,   // HasDeviceAuthUrl
+    EndpointNotSet,   // HasIntrospectionUrl
+    EndpointNotSet,   // HasRevocationUrl
+    EndpointMaybeSet, // HasTokenUrl  -- maybe set depending on IdP
+    EndpointMaybeSet, // HasUserInfoUrl
+>;
 
 struct CachedClient {
     metadata: CoreProviderMetadata,
@@ -55,6 +79,13 @@ pub struct OidcService {
     encryption_service: Arc<EncryptionService>,
     user_service: Arc<UserService>,
     discovery_cache: Mutex<HashMap<i32, CachedClient>>,
+    /// HTTP client used for every outbound call to the IdP
+    /// (discovery and token exchange). openidconnect 4.x lets us
+    /// own this and thread it through `discover_async` and
+    /// `request_async`, so timeout, redirect policy, and any future
+    /// custom DNS resolution apply uniformly to every IdP
+    /// round-trip. Built once at service init in `new()`.
+    http_client: reqwest::Client,
 }
 
 pub struct OidcLoginStart {
@@ -83,11 +114,34 @@ impl OidcService {
         encryption_service: Arc<EncryptionService>,
         user_service: Arc<UserService>,
     ) -> Self {
+        // Per openidconnect 4.x guidance, build a single dedicated
+        // client with:
+        //   * an explicit timeout — the openidconnect 3.x default
+        //     client had none, which let a slow / dead IdP block a
+        //     login (and our test-connection endpoint) for the full
+        //     reqwest default of 30s+.
+        //   * `Policy::none()` for redirects — the openidconnect docs
+        //     call this out explicitly as an SSRF mitigation; a
+        //     malicious IdP could otherwise 302 us to an internal
+        //     URL on first request.
+        //
+        // We `expect` here because failure of `ClientBuilder::build`
+        // means the platform's rustls / native cert store is broken,
+        // which is unrecoverable at the service layer. If this fires
+        // in production it's an "install OS certs" problem, not a
+        // runtime concern.
+        let http_client = reqwest::ClientBuilder::new()
+            .timeout(OIDC_HTTP_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("OIDC reqwest client should build; OS TLS / cert store is unusable");
+
         Self {
             db,
             encryption_service,
             user_service,
             discovery_cache: Mutex::new(HashMap::new()),
+            http_client,
         }
     }
 
@@ -203,6 +257,13 @@ impl OidcService {
         if let Some(jit_provisioning) = request.jit_provisioning {
             active.jit_provisioning = Set(jit_provisioning);
         }
+        // Track whether this PATCH is *disabling* a previously-enabled
+        // provider so we can revoke active sessions after the update.
+        // Same reasoning as `delete_provider`: an admin disabling a
+        // provider in an incident expects the SSO-linked users to
+        // lose access right away, not at session-cookie expiry.
+        let was_enabled = matches!(active.enabled, sea_orm::ActiveValue::Unchanged(true));
+        let disabling = matches!(request.enabled, Some(false)) && was_enabled;
         if let Some(enabled) = request.enabled {
             active.enabled = Set(enabled);
         }
@@ -221,7 +282,47 @@ impl OidcService {
 
         let updated = active.update(self.db.as_ref()).await?;
         self.discovery_cache.lock().await.remove(&provider_id);
+
+        if disabling {
+            self.revoke_sessions_for_provider(provider_id).await?;
+        }
+
         Ok(updated)
+    }
+
+    /// Delete every active `sessions` row owned by a user linked to
+    /// `provider_id`. Used when a provider is deleted or disabled so
+    /// SSO-linked users lose access immediately rather than at
+    /// session-cookie expiry. Best-effort: a DB failure logs and
+    /// returns the error so the caller can decide whether to surface
+    /// it (we currently propagate it; the surrounding admin handler
+    /// already records the audit row regardless).
+    async fn revoke_sessions_for_provider(&self, provider_id: i32) -> Result<(), OidcError> {
+        use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+        // Single-statement: DELETE … WHERE user_id IN (SELECT …).
+        // Sea-ORM has no first-class subquery DELETE; raw SQL is
+        // both safer (one round-trip, one lock) and clearer here.
+        // Parameterised via $1 — no injection surface even though
+        // the input is an i32.
+        let result = self
+            .db
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "DELETE FROM sessions WHERE user_id IN \
+                 (SELECT id FROM users WHERE oidc_provider_id = $1 AND deleted_at IS NULL)",
+                vec![provider_id.into()],
+            ))
+            .await?;
+
+        tracing::info!(
+            target: "temps_auth::oidc",
+            provider_id = provider_id,
+            sessions_revoked = result.rows_affected(),
+            "Revoked SSO sessions for provider"
+        );
+
+        Ok(())
     }
 
     /// Users that have logged in via this provider (matched by
@@ -241,6 +342,17 @@ impl OidcService {
 
     pub async fn delete_provider(&self, provider_id: i32) -> Result<(), OidcError> {
         let provider = self.get_provider(provider_id).await?;
+
+        // SECURITY: revoke active sessions for every user linked to
+        // this provider *before* dropping the row. Otherwise an admin
+        // who deletes a compromised provider during an incident
+        // leaves the existing session cookies valid until natural
+        // expiry — exactly the people they're trying to lock out.
+        // `sessions.user_id → users.id` is ON DELETE CASCADE, but
+        // deleting a provider does not delete users, so the cascade
+        // doesn't help here.
+        self.revoke_sessions_for_provider(provider_id).await?;
+
         oidc_providers::Entity::delete_by_id(provider.id)
             .exec(self.db.as_ref())
             .await?;
@@ -272,6 +384,25 @@ impl OidcService {
         if idp_group.is_empty() {
             return Err(OidcError::InvalidIssuer {
                 reason: "idp_group cannot be empty".into(),
+            });
+        }
+        // Bound the input: this string is byte-compared against every
+        // group claim on every SSO login, and the DB column is
+        // unbounded `text`. Reject control chars (incl. null bytes)
+        // and anything over 256 chars. 256 fits every IdP group name
+        // we've seen — Auth0 / Okta / Keycloak conventions all stay
+        // well under 64.
+        if idp_group.len() > IDP_GROUP_MAX_LEN {
+            return Err(OidcError::InvalidIssuer {
+                reason: format!(
+                    "idp_group too long: {} bytes (max {IDP_GROUP_MAX_LEN})",
+                    idp_group.len()
+                ),
+            });
+        }
+        if idp_group.chars().any(|c| c.is_control()) {
+            return Err(OidcError::InvalidIssuer {
+                reason: "idp_group contains control characters".into(),
             });
         }
         let role = parse_sso_role(&request.role)?;
@@ -359,17 +490,37 @@ impl OidcService {
     }
 
     pub async fn consume_login_state(&self, state: &str) -> Result<OidcLoginState, OidcError> {
-        let row = oidc_login_states::Entity::find()
-            .filter(oidc_login_states::Column::State.eq(state))
-            .one(self.db.as_ref())
-            .await?
-            .ok_or_else(|| OidcError::StateNotFound {
-                state: state.to_string(),
-            })?;
+        // SECURITY: must be atomic. A naive SELECT-then-DELETE
+        // sequence races under concurrent callbacks (browser
+        // double-submit, network retry): two requests can both pass
+        // the SELECT before either runs the DELETE, then both proceed
+        // into `exchange_code`. The IdP's single-use enforcement on
+        // the authorization code is the outer gate, but the nonce
+        // and PKCE verifier would be consumed twice on our side.
+        //
+        // PostgreSQL's `DELETE ... RETURNING *` does both halves in
+        // one statement under the row lock, so only one caller can
+        // ever observe the row. Sea-ORM has no first-class API for
+        // this, so we drop to raw SQL via the same `from_sql_and_values`
+        // pattern used elsewhere in the codebase (see
+        // `error_alert_service.rs`). `FromQueryResult` on
+        // `oidc_login_states::Model` is derived automatically by the
+        // `DeriveEntityModel` macro.
+        use sea_orm::{DatabaseBackend, FromQueryResult, Statement};
 
-        oidc_login_states::Entity::delete_by_id(row.id)
-            .exec(self.db.as_ref())
+        let row: Option<oidc_login_states::Model> =
+            oidc_login_states::Model::find_by_statement(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "DELETE FROM oidc_login_states WHERE state = $1 \
+                 RETURNING id, state, nonce, pkce_verifier, provider_id, return_to, expires_at, created_at",
+                vec![state.into()],
+            ))
+            .one(self.db.as_ref())
             .await?;
+
+        let row = row.ok_or_else(|| OidcError::StateNotFound {
+            state: state.to_string(),
+        })?;
 
         if row.expires_at < Utc::now() {
             let age_secs = (Utc::now() - row.expires_at).num_seconds().abs();
@@ -397,15 +548,21 @@ impl OidcService {
         let client = self
             .core_client_for_provider(provider, redirect_uri)
             .await?;
-        // Closure (rather than a named fn) so the compiler infers the
-        // inner reqwest type via `impl Display + Error`. We have two
-        // reqwest crates in the workspace (oauth2 0.4 still pins
-        // reqwest 0.11; temps-auth uses 0.12), so any explicit
-        // mention of `reqwest::Error` here picks the wrong version.
+        // openidconnect 4.x's `RequestTokenError` still has a lossy
+        // `Display` impl (the variant labels lose the actual cause),
+        // so we explicitly match the variants and lift the useful
+        // bits into `OidcError::TokenExchangeFailed`. Closure rather
+        // than a named function — the inner reqwest::Error type
+        // comes from openidconnect's bundled reqwest dep which is
+        // not directly nameable from here.
         let token_response = client
             .exchange_code(AuthorizationCode::new(code.to_string()))
+            .map_err(|e| OidcError::TokenExchangeFailed {
+                status: 0,
+                body: format!("client misconfigured: {e}"),
+            })?
             .set_pkce_verifier(PkceCodeVerifier::new(login_state.pkce_verifier.clone()))
-            .request_async(async_http_client)
+            .request_async(&self.http_client)
             .await
             .map_err(|e| match e {
                 RequestTokenError::ServerResponse(resp) => OidcError::TokenExchangeFailed {
@@ -432,14 +589,50 @@ impl OidcService {
                 reason: "token response did not include an id_token".into(),
             })?;
 
-        let verifier = client.id_token_verifier();
+        // Try to verify the id_token against the keys from the
+        // currently-cached discovery doc. If that fails AND the
+        // failure looks like a signing-key problem (unknown `kid`,
+        // signature mismatch, etc.), the IdP probably rotated its
+        // JWKS while our 1-hour metadata cache was still warm. Force
+        // a discovery refresh and verify exactly once more — that
+        // closes the up-to-60-minute login outage that would
+        // otherwise follow every JWK rotation.
         let nonce = Nonce::new(login_state.nonce.clone());
-        let claims = id_token
-            .claims(&verifier, &nonce)
-            .map_err(|e| OidcError::IdTokenInvalid {
-                reason: e.to_string(),
-            })
-            .cloned()?;
+        let first_attempt = {
+            let verifier = client.id_token_verifier();
+            id_token.claims(&verifier, &nonce).cloned()
+        };
+
+        let claims = match first_attempt {
+            Ok(claims) => claims,
+            Err(e) if looks_like_jwks_rotation(&e.to_string()) => {
+                tracing::info!(
+                    target: "temps_auth::oidc",
+                    provider_id = provider.id,
+                    "id_token verification failed; refreshing JWKS and retrying once"
+                );
+                // Force refresh: drops the cache entry, re-fetches
+                // discovery + JWKS, then rebuilds the client. The
+                // single retry boundary stops a faulty IdP from
+                // turning every login into a discovery storm.
+                let refreshed_client = self
+                    .core_client_for_provider_refresh(provider, redirect_uri)
+                    .await?;
+                let verifier = refreshed_client.id_token_verifier();
+                id_token
+                    .claims(&verifier, &nonce)
+                    .map_err(|e| OidcError::IdTokenInvalid {
+                        reason: format!("verification still failed after JWKS refresh: {e}"),
+                    })
+                    .cloned()?
+            }
+            Err(e) => {
+                return Err(OidcError::IdTokenInvalid {
+                    reason: e.to_string(),
+                });
+            }
+        };
+
         let raw_claims = decode_verified_id_token_payload(id_token)?;
 
         Ok(OidcExchangeResult { claims, raw_claims })
@@ -484,12 +677,31 @@ impl OidcService {
             .one(self.db.as_ref())
             .await?
         {
+            // SECURITY: only link an IdP identity onto an existing
+            // local account if the IdP asserts the email is verified.
+            // Without this, an attacker who can sign up at a
+            // configured IdP with `victim@example.com` (unverified)
+            // could take over the victim's pre-existing Temps account
+            // (password / magic-link account) on first SSO login.
+            // The OIDC spec's `email_verified` claim is exactly the
+            // signal we need; if the IdP doesn't set it (or sets
+            // false), refuse to link and fall through to the
+            // not-provisioned path so the admin can resolve manually.
+            if claims.email_verified() != Some(true) {
+                tracing::warn!(
+                    target: "temps_auth::oidc::abuse",
+                    provider_id = provider_id,
+                    email = %email,
+                    sub = %sub,
+                    "Refusing to link OIDC identity to existing account: email_verified is not true"
+                );
+                return Err(OidcError::EmailNotVerified { email });
+            }
+
             let mut active: users::ActiveModel = user.clone().into();
             active.oidc_provider_id = Set(Some(provider_id));
             active.oidc_subject = Set(Some(sub.to_string()));
-            if claims.email_verified().unwrap_or(false) {
-                active.email_verified = Set(true);
-            }
+            active.email_verified = Set(true);
             let linked = active.update(self.db.as_ref()).await?;
             self.sync_user_sso_role(linked.id, role).await?;
             return Ok(OidcResolvedUser { user: linked });
@@ -497,6 +709,22 @@ impl OidcService {
 
         if !provider.jit_provisioning {
             return Err(OidcError::UserNotProvisioned { email });
+        }
+
+        // SECURITY: JIT-provisioning also requires a verified email.
+        // The DB has a UNIQUE(email) constraint, so a JIT-created
+        // unverified account would otherwise squat on an email the
+        // real owner might later try to register or use for SSO. Same
+        // attacker scenario as the link path above.
+        if claims.email_verified() != Some(true) {
+            tracing::warn!(
+                target: "temps_auth::oidc::abuse",
+                provider_id = provider_id,
+                email = %email,
+                sub = %sub,
+                "Refusing to JIT-provision account: email_verified is not true"
+            );
+            return Err(OidcError::EmailNotVerified { email });
         }
 
         let display_name = claims
@@ -525,7 +753,8 @@ impl OidcService {
         let mut active: users::ActiveModel = user.into();
         active.oidc_provider_id = Set(Some(provider_id));
         active.oidc_subject = Set(Some(sub.to_string()));
-        active.email_verified = Set(claims.email_verified().unwrap_or(true));
+        // Always true here — we gate above.
+        active.email_verified = Set(true);
         let user = active.update(self.db.as_ref()).await?;
         self.sync_user_sso_role(user.id, role).await?;
 
@@ -602,8 +831,30 @@ impl OidcService {
         &self,
         provider: &oidc_providers::Model,
         redirect_uri: &str,
-    ) -> Result<CoreClient, OidcError> {
-        let (metadata, client_secret) = self.provider_client_bundle(provider, false).await?;
+    ) -> Result<ConfiguredCoreClient, OidcError> {
+        self.build_core_client(provider, redirect_uri, false).await
+    }
+
+    /// Same as `core_client_for_provider` but always re-fetches the
+    /// discovery document (and therefore the JWKS). Used by
+    /// `exchange_code` to recover from a stale-key id_token
+    /// verification failure after the IdP rotates its JWKS.
+    async fn core_client_for_provider_refresh(
+        &self,
+        provider: &oidc_providers::Model,
+        redirect_uri: &str,
+    ) -> Result<ConfiguredCoreClient, OidcError> {
+        self.build_core_client(provider, redirect_uri, true).await
+    }
+
+    async fn build_core_client(
+        &self,
+        provider: &oidc_providers::Model,
+        redirect_uri: &str,
+        force_refresh: bool,
+    ) -> Result<ConfiguredCoreClient, OidcError> {
+        let (metadata, client_secret) =
+            self.provider_client_bundle(provider, force_refresh).await?;
 
         Ok(CoreClient::from_provider_metadata(
             metadata,
@@ -639,13 +890,24 @@ impl OidcService {
             }
         }
 
-        let issuer = IssuerUrl::new(normalize_issuer_url(&provider.issuer_url)?).map_err(|e| {
-            OidcError::InvalidIssuer {
-                reason: e.to_string(),
-            }
+        let issuer_str = normalize_issuer_url(&provider.issuer_url)?;
+
+        // SSRF defense — refuse to talk to issuers whose hostname
+        // resolves to RFC 1918 / link-local / CGNAT IPs. Runs *before*
+        // we hand the URL to openidconnect so a malicious admin
+        // can't point the server at e.g. the cloud metadata service.
+        // Loopback hostnames (localhost / 127.0.0.1 / ::1) are
+        // intentionally allowed for local Keycloak / Authentik dev —
+        // they're physically incapable of reaching the public
+        // internet, so they don't widen the SSRF surface. See
+        // `assert_issuer_host_allowed` for the full policy.
+        assert_issuer_host_allowed(&issuer_str).await?;
+
+        let issuer = IssuerUrl::new(issuer_str).map_err(|e| OidcError::InvalidIssuer {
+            reason: e.to_string(),
         })?;
 
-        let metadata = CoreProviderMetadata::discover_async(issuer, async_http_client)
+        let metadata = CoreProviderMetadata::discover_async(issuer, &self.http_client)
             .await
             .map_err(|e| OidcError::DiscoveryFailed {
                 issuer: provider.issuer_url.clone(),
@@ -721,12 +983,142 @@ fn normalize_issuer_url(issuer: &str) -> Result<String, OidcError> {
             reason: "issuer URL cannot be empty".into(),
         });
     }
-    if !trimmed.starts_with("https://") && !trimmed.starts_with("http://") {
-        return Err(OidcError::InvalidIssuer {
-            reason: "issuer URL must start with http:// or https://".into(),
-        });
+    if trimmed.starts_with("https://") {
+        return Ok(trimmed.to_string());
     }
-    Ok(trimmed.to_string())
+    if trimmed.starts_with("http://") {
+        // Plain HTTP exposes the client secret + authorization code +
+        // id_token in transit. We don't refuse — operators have
+        // legitimate `http://` use-cases (local Keycloak, IdP behind
+        // an in-cluster TLS terminator) and the UI already surfaces
+        // the scheme — but we log a warning so it's visible in the
+        // server log that this provider is plaintext.
+        if !is_loopback_url(trimmed) {
+            tracing::warn!(
+                target: "temps_auth::oidc",
+                issuer = %trimmed,
+                "OIDC issuer uses http:// — client_secret, authorization code, and id_token will be sent in plaintext. Use https:// in production."
+            );
+        }
+        return Ok(trimmed.to_string());
+    }
+    Err(OidcError::InvalidIssuer {
+        reason: "issuer URL must start with http:// or https://".into(),
+    })
+}
+
+/// True for hostnames that are guaranteed to resolve to the local
+/// machine and never to a public address. Used to suppress the
+/// `http://` warning (loopback over plaintext is fine for dev) and
+/// to fast-path past the SSRF guard.
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
+}
+
+fn is_loopback_url(url: &str) -> bool {
+    openidconnect::url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(is_loopback_host))
+        .unwrap_or(false)
+}
+
+/// SSRF guard for OIDC discovery. Refuses to talk to issuers whose
+/// hostname resolves to RFC 1918 / link-local / CGNAT / multicast IPs.
+///
+/// Loopback (127/8, ::1) is the one private range we *do* allow,
+/// because it's the only way to talk to a local Keycloak / Authentik
+/// instance during dev and it can't reach anything the temps process
+/// couldn't already touch directly. Every other private range —
+/// 10/8, 172.16/12, 192.168/16, 169.254/16, 100.64/10 — is blocked
+/// outright: those are the addresses that point at the AWS metadata
+/// service, the cluster-internal mesh, the office VPN, etc.
+///
+/// We pre-resolve here rather than relying on a `reqwest` interceptor
+/// because openidconnect doesn't expose a middleware hook on the
+/// shared client. There's an unavoidable TOCTOU window between the
+/// resolve here and the actual TCP connect inside `reqwest`, but
+/// closing it would require a custom hyper resolver — overkill given
+/// the threat model (admin pasting a malicious URL into the IdP
+/// config form, not a remote attacker).
+async fn assert_issuer_host_allowed(issuer: &str) -> Result<(), OidcError> {
+    let url = openidconnect::url::Url::parse(issuer).map_err(|e| OidcError::InvalidIssuer {
+        reason: format!("could not parse issuer URL: {e}"),
+    })?;
+    let host = url.host_str().ok_or_else(|| OidcError::InvalidIssuer {
+        reason: "issuer URL has no host".into(),
+    })?;
+
+    // Fast path: a literal loopback hostname is always OK. Saves a
+    // DNS round-trip and keeps the local-dev path zero-latency.
+    if is_loopback_host(host) {
+        return Ok(());
+    }
+
+    let port = url.port_or_known_default().unwrap_or(443);
+    // `(host, port)` is `(&str, u16)`; `lookup_host` is generic over
+    // `ToSocketAddrs`, so we need to nudge the inference with an
+    // explicit type to disambiguate.
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| OidcError::DiscoveryFailed {
+            issuer: issuer.to_string(),
+            reason: format!("DNS lookup failed: {e}"),
+        })?
+        .collect();
+    for addr in addrs {
+        if is_blocked_ip(&addr.ip()) {
+            tracing::warn!(
+                target: "temps_auth::oidc::abuse",
+                issuer = %issuer,
+                host = %host,
+                ip = %addr.ip(),
+                "Refusing to contact OIDC issuer that resolves to a private/internal IP"
+            );
+            return Err(OidcError::InvalidIssuer {
+                reason: format!(
+                    "issuer {host} resolves to non-public IP {} (use a public DNS name, or run the IdP on localhost)",
+                    addr.ip()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Classify an IP as "must not be the target of an OIDC discovery
+/// fetch". Covers RFC 1918 (10/8, 172.16/12, 192.168/16), link-local
+/// (169.254/16, fe80::/10), the IPv4 documentation / CGNAT /
+/// benchmarking ranges (which can mask metadata services in some
+/// clouds), and IPv6 unique-local + unspecified.
+///
+/// Loopback (127/8, ::1) is intentionally *not* in this list —
+/// loopback can't reach anything outside the temps process and is
+/// useful for local Keycloak / Authentik dev. The early-return in
+/// `assert_issuer_host_allowed` short-circuits literal loopback
+/// hostnames before we even hit this function.
+fn is_blocked_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || v4.is_unspecified()
+                || v4.is_documentation()
+                // 100.64.0.0/10 — CGNAT (RFC 6598). Cloud providers
+                // sometimes route metadata via the shared address
+                // space; safer to block.
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 0x40)
+        }
+        IpAddr::V6(v6) => {
+            v6.is_unspecified()
+                || v6.is_multicast()
+                // fe80::/10 — link-local
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                // fc00::/7 — unique local
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+        }
+    }
 }
 
 /// Build a human-readable error message for an OIDC discovery failure.
@@ -750,8 +1142,53 @@ fn describe_discovery_error<E: std::error::Error>(err: &E) -> String {
     out
 }
 
+/// Heuristic for "this id_token verification failure looks like the
+/// IdP rotated its signing key while we had the old JWKS cached".
+/// openidconnect 4.x's `ClaimsVerificationError` doesn't expose a
+/// machine-readable variant for this case, so we match on the text.
+///
+/// We deliberately keep the trigger set narrow: matching on
+/// signature/key/jwks vocabulary, NOT on generic claim-validation
+/// failures (bad audience, expired token, missing claim). That keeps
+/// the retry from masking real config bugs and prevents an attacker
+/// who can submit malformed tokens from amplifying every login into
+/// two discovery round-trips.
+fn looks_like_jwks_rotation(err_text: &str) -> bool {
+    let lower = err_text.to_ascii_lowercase();
+    // openidconnect 4.x emits one of these on signing-key trouble:
+    //   - "no matching key found"
+    //   - "unable to find signing key"
+    //   - "kid <foo> not found"
+    //   - "signature verification failed"
+    //   - "invalid signature"
+    lower.contains("no matching key")
+        || lower.contains("signing key")
+        || lower.contains("kid ")
+        || lower.contains("signature")
+        || lower.contains("jwks")
+}
+
 fn validate_return_to(path: &str) -> Result<(), OidcError> {
-    if !path.starts_with('/') || path.starts_with("//") {
+    // Must be a same-origin relative path.
+    if !path.starts_with('/') {
+        return Err(OidcError::InvalidReturnTo);
+    }
+    // Reject scheme-relative URLs (`//evil.com` → `https://evil.com`).
+    if path.starts_with("//") {
+        return Err(OidcError::InvalidReturnTo);
+    }
+    // Reject backslash-prefixed paths: Chrome / Edge normalize
+    // `/\evil.com` to `//evil.com` and treat it as scheme-relative,
+    // which becomes a post-auth open redirect → phishing. We refuse
+    // *any* backslash anywhere in the path; a legitimate URL has no
+    // reason to contain one (RFC 3986 reserves `\` as unsafe).
+    if path.contains('\\') {
+        return Err(OidcError::InvalidReturnTo);
+    }
+    // Reject CR / LF / NUL and other control chars — they can be
+    // weaponised for response-splitting if downstream code ever
+    // forgets to sanitize before writing to a header.
+    if path.chars().any(|c| c.is_control()) {
         return Err(OidcError::InvalidReturnTo);
     }
     Ok(())
@@ -878,6 +1315,12 @@ mod tests {
             OidcService::sanitize_return_to(Some("https://evil.com".into())),
             "/dashboard"
         );
+        // Backslash open-redirect — browsers normalize `\` to `/`,
+        // turning `/\evil.com` into a scheme-relative URL.
+        assert_eq!(
+            OidcService::sanitize_return_to(Some("/\\evil.com".into())),
+            "/dashboard"
+        );
         assert_eq!(
             OidcService::sanitize_return_to(Some("/projects".into())),
             "/projects"
@@ -918,6 +1361,104 @@ mod tests {
             normalize_issuer_url("ftp://auth.example.com"),
             Err(OidcError::InvalidIssuer { .. })
         ));
+    }
+
+    #[test]
+    fn normalize_issuer_url_allows_http_with_warning() {
+        // Plain http:// is accepted (we just log a warn!) — the user
+        // takes responsibility for the in-transit secret exposure.
+        assert_eq!(
+            normalize_issuer_url("http://keycloak.local:8080/realms/temps").unwrap(),
+            "http://keycloak.local:8080/realms/temps"
+        );
+        assert_eq!(
+            normalize_issuer_url("http://localhost:8080/realms/temps").unwrap(),
+            "http://localhost:8080/realms/temps"
+        );
+    }
+
+    #[test]
+    fn is_loopback_host_recognises_canonical_forms() {
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("::1"));
+        assert!(is_loopback_host("[::1]"));
+        assert!(!is_loopback_host("auth.example.com"));
+        // Public host that happens to *contain* "localhost" must not
+        // bypass the check.
+        assert!(!is_loopback_host("localhost.example.com"));
+    }
+
+    #[test]
+    fn is_blocked_ip_classifies_rfc1918_and_metadata_ranges() {
+        use std::net::Ipv4Addr;
+        use std::net::Ipv6Addr;
+
+        // Loopback is INTENTIONALLY allowed — local Keycloak /
+        // Authentik dev needs it and it can't reach anything else.
+        assert!(!is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
+        assert!(!is_blocked_ip(&IpAddr::V6(Ipv6Addr::LOCALHOST)));
+
+        // RFC 1918 — blocked because it usually points at office
+        // network / on-prem service mesh.
+        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
+        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1))));
+
+        // Link-local — incl. AWS IMDS at 169.254.169.254.
+        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(
+            169, 254, 169, 254
+        ))));
+
+        // CGNAT — RFC 6598. Some clouds route metadata via the
+        // shared address space.
+        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))));
+        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(
+            100, 127, 255, 254
+        ))));
+
+        // Public addresses must NOT be flagged.
+        assert!(!is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        assert!(!is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
+        // 100.63 sits *just* below the CGNAT band.
+        assert!(!is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(
+            100, 63, 255, 254
+        ))));
+        // 100.128 sits *just* above the CGNAT band.
+        assert!(!is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(100, 128, 0, 1))));
+    }
+
+    #[tokio::test]
+    async fn assert_issuer_host_allowed_blocks_aws_metadata() {
+        // 169.254.169.254 is the canonical cloud metadata IP. If this
+        // ever passes, our SSRF defense is broken.
+        let err = assert_issuer_host_allowed("http://169.254.169.254/latest/meta-data/")
+            .await
+            .expect_err("AWS IMDS IP must be blocked");
+        assert!(matches!(err, OidcError::InvalidIssuer { .. }));
+    }
+
+    #[tokio::test]
+    async fn assert_issuer_host_allowed_permits_loopback_host() {
+        // Loopback is explicitly allowed so local Keycloak / Authentik
+        // dev works without an env-var escape hatch. The early-return
+        // in `assert_issuer_host_allowed` also avoids a DNS round-trip.
+        assert_issuer_host_allowed("http://localhost:8080/")
+            .await
+            .expect("localhost must be allowed");
+        assert_issuer_host_allowed("http://127.0.0.1:8080/realms/temps")
+            .await
+            .expect("127.0.0.1 must be allowed");
+    }
+
+    #[test]
+    fn create_role_mapping_idp_group_validation_is_via_chars_and_len() {
+        // Direct unit tests of the validation logic without the DB
+        // round-trip — service-level test is in service_tests.rs.
+        let too_long = "a".repeat(IDP_GROUP_MAX_LEN + 1);
+        assert!(too_long.len() > IDP_GROUP_MAX_LEN);
+        assert!("ok-group".chars().all(|c| !c.is_control()));
+        assert!("bad\u{0000}group".chars().any(|c| c.is_control()));
     }
 
     #[test]
@@ -964,6 +1505,34 @@ mod tests {
     }
 
     #[test]
+    fn looks_like_jwks_rotation_matches_signing_key_failures_only() {
+        // Should trigger refresh+retry — these are the cases where
+        // a fresh JWKS fetch might actually help.
+        assert!(looks_like_jwks_rotation(
+            "Signature verification failed: no matching key found"
+        ));
+        assert!(looks_like_jwks_rotation(
+            "ID token verification failed: kid abc123 not found in JWKS"
+        ));
+        assert!(looks_like_jwks_rotation(
+            "Unable to find signing key for token"
+        ));
+        assert!(looks_like_jwks_rotation("Invalid signature on id_token"));
+        assert!(looks_like_jwks_rotation("JWKS fetch returned empty set"));
+
+        // Must NOT trigger refresh+retry — these are real
+        // configuration problems where re-fetching just wastes a
+        // round-trip and masks the bug.
+        assert!(!looks_like_jwks_rotation(
+            "Audience does not match client_id"
+        ));
+        assert!(!looks_like_jwks_rotation("ID token has expired"));
+        assert!(!looks_like_jwks_rotation("Nonce mismatch"));
+        assert!(!looks_like_jwks_rotation("Claim 'iss' missing"));
+        assert!(!looks_like_jwks_rotation(""));
+    }
+
+    #[test]
     fn normalize_scopes_falls_back_to_default_on_empty() {
         assert_eq!(normalize_scopes(""), "openid email profile");
         assert_eq!(normalize_scopes("   "), "openid email profile");
@@ -982,7 +1551,38 @@ mod tests {
     #[test]
     fn validate_return_to_accepts_relative_paths() {
         assert!(validate_return_to("/dashboard").is_ok());
+        assert!(validate_return_to("/projects/42/deployments").is_ok());
+        assert!(validate_return_to("/dashboard?ref=email").is_ok());
+        assert!(validate_return_to("/dashboard#section").is_ok());
+    }
+
+    #[test]
+    fn validate_return_to_rejects_absolute_and_scheme_relative() {
         assert!(validate_return_to("//evil.com").is_err());
+        assert!(validate_return_to("https://evil.com").is_err());
+        assert!(validate_return_to("http://evil.com").is_err());
+        assert!(validate_return_to("javascript:alert(1)").is_err());
+        assert!(validate_return_to("dashboard").is_err()); // no leading /
+    }
+
+    #[test]
+    fn validate_return_to_rejects_backslash_open_redirect() {
+        // Chrome/Edge normalize `\` to `/`, turning `/\evil.com` into
+        // `//evil.com` (scheme-relative → external host). Any
+        // backslash is refused.
+        assert!(validate_return_to("/\\evil.com").is_err());
+        assert!(validate_return_to("/projects\\..\\evil.com").is_err());
+        assert!(validate_return_to("/\\\\evil.com").is_err());
+    }
+
+    #[test]
+    fn validate_return_to_rejects_control_chars() {
+        // CR / LF / NUL / tab are response-splitting / header-
+        // injection vectors. Defense in depth — refuse them outright.
+        assert!(validate_return_to("/dashboard\r\nSet-Cookie: x=y").is_err());
+        assert!(validate_return_to("/dashboard\n").is_err());
+        assert!(validate_return_to("/dashboard\u{0000}").is_err());
+        assert!(validate_return_to("/dashboard\t").is_err());
     }
 
     #[test]

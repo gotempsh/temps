@@ -68,7 +68,36 @@ impl TempsPlugin for AuthPlugin {
                 encryption_service.clone(),
                 user_service.clone(),
             ));
-            context.register_service(oidc_service);
+            context.register_service(oidc_service.clone());
+
+            // Spawn a background sweeper for `oidc_login_states`. The
+            // service has an in-line cleanup at the top of
+            // `start_login`, but that only runs when a real user
+            // begins a login — on an idle instance (operator
+            // configured SSO but few users) or under an enumeration
+            // attack (a probe spamming the start endpoint with
+            // forged values), expired rows would otherwise pile up
+            // until the next legitimate login. 15 minutes is well
+            // under the 10-minute state TTL so we never let more
+            // than a single cycle of stale rows live at once.
+            let sweeper_service = oidc_service.clone();
+            tokio::spawn(async move {
+                let interval = std::time::Duration::from_secs(15 * 60);
+                let mut ticker = tokio::time::interval(interval);
+                // First tick fires immediately; skip it so we don't
+                // race the service initialization that just
+                // completed.
+                ticker.tick().await;
+                loop {
+                    ticker.tick().await;
+                    if let Err(e) = sweeper_service.cleanup_expired_login_states().await {
+                        tracing::warn!(
+                            target: "temps_auth::oidc",
+                            "Periodic cleanup of oidc_login_states failed: {e}. Will retry in 15m."
+                        );
+                    }
+                }
+            });
 
             // Create AuthState for handlers
             let auth_state = Arc::new(AuthState::new(

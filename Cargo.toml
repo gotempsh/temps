@@ -190,19 +190,28 @@ x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 sha2 = "0.10.9"
 base64 = "0.22"
 hex = "0.4.3"
-# NOTE: `rustls-tls` is required for HTTPS discovery (Auth0, Okta, etc.).
-# Without it, the `reqwest::Client` built by `async_http_client` has no
-# TLS connector and fails every https:// request inside hyper with
-# `invalid URL, scheme is not http`.
+# openidconnect 4.x — bumped from 3.x to clear three transitive
+# rustls-webpki CVEs (RUSTSEC-2026-0098/0099/0104) that came in via
+# oauth2 4 → reqwest 0.11 → rustls 0.21 → rustls-webpki 0.101. 4.x
+# pulls oauth2 5 → reqwest 0.12 → rustls 0.23 → webpki 0.103.x
+# (patched). API breaking changes: `discover_async` / `request_async`
+# now take a `&reqwest::Client` directly instead of an
+# `async_http_client` adapter — this lets us own the HTTP client and
+# apply our own timeout, redirect policy, and SSRF defenses (see
+# `oidc_http_client` in `crates/temps-auth/src/oidc_service.rs`).
 #
-# `accept-rfc3339-timestamps` is required for Auth0 compatibility:
-# Auth0 returns `updated_at` in id_tokens as an ISO 8601 string (e.g.
-# `"2026-05-24T11:07:42.800Z"`) when the upstream connection is
-# Google/social, instead of the Unix-seconds number the OIDC spec
-# requires. Without this feature openidconnect rejects the entire
-# token response with `data did not match any variant of untagged
-# enum Timestamp`.
-openidconnect = { version = "3", default-features = false, features = ["reqwest", "rustls-tls", "accept-rfc3339-timestamps"] }
+# `rustls-tls` — required so the reqwest::Client we build can speak
+# HTTPS. Without it, hyper-util's connector rejects every
+# https:// URL with "invalid URL, scheme is not http".
+#
+# `accept-rfc3339-timestamps` — required for Auth0 compatibility:
+# Auth0 returns `updated_at` in id_tokens as an ISO 8601 string
+# (e.g. `"2026-05-24T11:07:42.800Z"`) when the upstream connection
+# is Google/social, instead of the Unix-seconds number the OIDC
+# spec requires. Without this feature openidconnect rejects the
+# entire token response with `data did not match any variant of
+# untagged enum Timestamp`.
+openidconnect = { version = "4.0.1", default-features = false, features = ["reqwest", "rustls-tls", "accept-rfc3339-timestamps"] }
 
 # ============================================================================
 # TLS & Certificate Management
