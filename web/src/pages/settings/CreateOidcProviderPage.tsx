@@ -1,6 +1,5 @@
 import {
   createOidcProviderMutation,
-  listOidcProvidersOptions,
   listOidcProvidersQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import {
@@ -13,7 +12,6 @@ import {
   isOidcFormValid,
   problemMessage,
 } from '@/components/settings/oidc-provider-constants'
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -24,8 +22,8 @@ import {
 } from '@/components/ui/card'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { AlertCircle, ArrowLeft } from 'lucide-react'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { ArrowLeft } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { toast } from 'sonner'
@@ -69,8 +67,6 @@ export function CreateOidcProviderPage() {
   })
 
   const redirectUri = useMemo(() => getOidcRedirectUri(), [])
-  const providersQuery = useQuery(listOidcProvidersOptions())
-  const hasProvider = (providersQuery.data?.length ?? 0) > 0
 
   const createProvider = useMutation({
     ...createOidcProviderMutation(),
@@ -100,33 +96,6 @@ export function CreateOidcProviderPage() {
       return
     }
     createProvider.mutate({ body: createFormToRequest(form) })
-  }
-
-  if (providersQuery.isLoading) {
-    return (
-      <div className="text-sm text-muted-foreground">
-        Loading authentication settings...
-      </div>
-    )
-  }
-
-  if (hasProvider) {
-    return (
-      <div className="mx-auto max-w-2xl space-y-4 py-2">
-        <Alert>
-          <AlertCircle className="h-4 w-4" />
-          <AlertTitle>Provider already configured</AlertTitle>
-          <AlertDescription>
-            Temps supports one OIDC provider per install. Edit or delete the
-            existing provider on the authentication settings page.
-          </AlertDescription>
-        </Alert>
-        <Button variant="outline" onClick={() => navigate('/settings/auth')}>
-          <ArrowLeft className="mr-2 h-4 w-4" />
-          Back to authentication
-        </Button>
-      </div>
-    )
   }
 
   return (

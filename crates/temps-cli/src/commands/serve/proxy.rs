@@ -68,6 +68,7 @@ pub fn start_proxy_server(
     config: Arc<ServerConfig>,
     disable_https_redirect: bool,
     on_demand_manager: Option<Arc<OnDemandManager>>,
+    admin_gate: Option<temps_core::admin_gate::AdminGateHandle>,
 ) -> anyhow::Result<()> {
     let console_address = config.console_address.clone();
     // Create tokio runtime to fetch preview_domain from config service
@@ -129,6 +130,7 @@ pub fn start_proxy_server(
         shutdown_signal,
         config.clone(),
         on_demand_manager,
+        admin_gate,
     ) {
         Ok(_) => {
             info!("Proxy server exited");

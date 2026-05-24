@@ -9,7 +9,8 @@ use openidconnect::core::{
 };
 use openidconnect::{
     reqwest::async_http_client, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl,
-    Nonce, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, TokenResponse,
+    Nonce, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, RequestTokenError, Scope,
+    TokenResponse,
 };
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait,
@@ -121,11 +122,18 @@ impl OidcService {
         &self,
         request: CreateOidcProviderRequest,
     ) -> Result<oidc_providers::Model, OidcError> {
-        let existing = oidc_providers::Entity::find()
+        let name = request.name.trim().to_string();
+        if name.is_empty() {
+            return Err(OidcError::InvalidIssuer {
+                reason: "provider name cannot be empty".into(),
+            });
+        }
+        let name_collision = oidc_providers::Entity::find()
+            .filter(oidc_providers::Column::Name.eq(name.clone()))
             .count(self.db.as_ref())
             .await?;
-        if existing > 0 {
-            return Err(OidcError::ProviderAlreadyExists);
+        if name_collision > 0 {
+            return Err(OidcError::ProviderAlreadyExists { name: name.clone() });
         }
 
         validate_issuer_url(&request.issuer_url)?;
@@ -138,7 +146,7 @@ impl OidcService {
             })?;
 
         let provider = oidc_providers::ActiveModel {
-            name: Set(request.name.trim().to_string()),
+            name: Set(name),
             issuer_url: Set(normalize_issuer_url(&request.issuer_url)?),
             client_id: Set(request.client_id.trim().to_string()),
             client_secret_encrypted: Set(encrypted_secret),
@@ -214,6 +222,21 @@ impl OidcService {
         let updated = active.update(self.db.as_ref()).await?;
         self.discovery_cache.lock().await.remove(&provider_id);
         Ok(updated)
+    }
+
+    /// Users that have logged in via this provider (matched by
+    /// `users.oidc_provider_id`). Returns soft-deleted users filtered out.
+    pub async fn list_users_for_provider(
+        &self,
+        provider_id: i32,
+    ) -> Result<Vec<users::Model>, OidcError> {
+        self.get_provider(provider_id).await?;
+        Ok(users::Entity::find()
+            .filter(users::Column::OidcProviderId.eq(provider_id))
+            .filter(users::Column::DeletedAt.is_null())
+            .order_by_asc(users::Column::Email)
+            .all(self.db.as_ref())
+            .await?)
     }
 
     pub async fn delete_provider(&self, provider_id: i32) -> Result<(), OidcError> {
@@ -374,14 +397,33 @@ impl OidcService {
         let client = self
             .core_client_for_provider(provider, redirect_uri)
             .await?;
+        // Closure (rather than a named fn) so the compiler infers the
+        // inner reqwest type via `impl Display + Error`. We have two
+        // reqwest crates in the workspace (oauth2 0.4 still pins
+        // reqwest 0.11; temps-auth uses 0.12), so any explicit
+        // mention of `reqwest::Error` here picks the wrong version.
         let token_response = client
             .exchange_code(AuthorizationCode::new(code.to_string()))
             .set_pkce_verifier(PkceCodeVerifier::new(login_state.pkce_verifier.clone()))
             .request_async(async_http_client)
             .await
-            .map_err(|e| OidcError::TokenExchangeFailed {
-                status: 0,
-                body: e.to_string(),
+            .map_err(|e| match e {
+                RequestTokenError::ServerResponse(resp) => OidcError::TokenExchangeFailed {
+                    status: 400,
+                    body: resp.to_string(),
+                },
+                RequestTokenError::Parse(parse_err, body) => OidcError::TokenExchangeFailed {
+                    status: 0,
+                    body: format!("{parse_err}; body: {}", String::from_utf8_lossy(&body)),
+                },
+                RequestTokenError::Request(req_err) => OidcError::TokenExchangeFailed {
+                    status: 0,
+                    body: describe_discovery_error(&req_err),
+                },
+                RequestTokenError::Other(msg) => OidcError::TokenExchangeFailed {
+                    status: 0,
+                    body: msg,
+                },
             })?;
 
         let id_token = token_response
@@ -607,7 +649,7 @@ impl OidcService {
             .await
             .map_err(|e| OidcError::DiscoveryFailed {
                 issuer: provider.issuer_url.clone(),
-                reason: e.to_string(),
+                reason: describe_discovery_error(&e),
             })?;
 
         let client_secret = self
@@ -666,7 +708,14 @@ fn validate_issuer_url(issuer: &str) -> Result<(), OidcError> {
 }
 
 fn normalize_issuer_url(issuer: &str) -> Result<String, OidcError> {
-    let trimmed = issuer.trim().trim_end_matches('/');
+    // NOTE: do NOT strip a trailing slash. OIDC Core §16.13 / RFC 8414
+    // require the `issuer` field in the discovery document to match
+    // the issuer URL we asked about byte-for-byte. Auth0 publishes its
+    // issuer with a trailing slash (e.g.
+    // `https://tenant.eu.auth0.com/`); stripping it on our side makes
+    // `CoreProviderMetadata::discover_async` reject the response with
+    // `Validation error: unexpected issuer URI`.
+    let trimmed = issuer.trim();
     if trimmed.is_empty() {
         return Err(OidcError::InvalidIssuer {
             reason: "issuer URL cannot be empty".into(),
@@ -678,6 +727,27 @@ fn normalize_issuer_url(issuer: &str) -> Result<String, OidcError> {
         });
     }
     Ok(trimmed.to_string())
+}
+
+/// Build a human-readable error message for an OIDC discovery failure.
+///
+/// `openidconnect::DiscoveryError`'s `Display` impl only emits the
+/// top-line variant text (`"Failed to parse server response"`,
+/// `"Request failed"`, etc.) and pushes the actual cause behind
+/// `std::error::Error::source()`. The default `e.to_string()` therefore
+/// loses the only thing the operator actually needs (the URL that
+/// failed to parse, the reqwest error, the JSON path that didn't
+/// deserialize, …). We walk the source chain explicitly so the message
+/// surfaces on the test-connection screen.
+fn describe_discovery_error<E: std::error::Error>(err: &E) -> String {
+    let mut out = err.to_string();
+    let mut src: Option<&dyn std::error::Error> = err.source();
+    while let Some(cause) = src {
+        out.push_str(": ");
+        out.push_str(&cause.to_string());
+        src = cause.source();
+    }
+    out
 }
 
 fn validate_return_to(path: &str) -> Result<(), OidcError> {
@@ -815,11 +885,82 @@ mod tests {
     }
 
     #[test]
-    fn normalize_issuer_url_strips_trailing_slash() {
+    fn normalize_issuer_url_preserves_trailing_slash() {
+        // OIDC discovery requires the issuer URL to match the
+        // discovered `issuer` field byte-for-byte. Auth0 publishes
+        // its issuer with a trailing slash, so we must preserve it
+        // when present.
         assert_eq!(
-            normalize_issuer_url("https://auth.example.com/").unwrap(),
+            normalize_issuer_url("https://kungfusoftware.eu.auth0.com/").unwrap(),
+            "https://kungfusoftware.eu.auth0.com/"
+        );
+        assert_eq!(
+            normalize_issuer_url("https://auth.example.com").unwrap(),
             "https://auth.example.com"
         );
+    }
+
+    #[test]
+    fn normalize_issuer_url_trims_whitespace() {
+        assert_eq!(
+            normalize_issuer_url("  https://auth.example.com/  ").unwrap(),
+            "https://auth.example.com/"
+        );
+    }
+
+    #[test]
+    fn normalize_issuer_url_requires_scheme() {
+        assert!(matches!(
+            normalize_issuer_url("auth.example.com"),
+            Err(OidcError::InvalidIssuer { .. })
+        ));
+        assert!(matches!(
+            normalize_issuer_url("ftp://auth.example.com"),
+            Err(OidcError::InvalidIssuer { .. })
+        ));
+    }
+
+    #[test]
+    fn describe_discovery_error_walks_source_chain() {
+        // Hand-roll a 3-deep error chain to prove we don't stop at
+        // the top-line message the way `e.to_string()` does.
+        #[derive(Debug)]
+        struct Inner;
+        impl std::fmt::Display for Inner {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "inner cause")
+            }
+        }
+        impl std::error::Error for Inner {}
+
+        #[derive(Debug)]
+        struct Middle(Inner);
+        impl std::fmt::Display for Middle {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "middle")
+            }
+        }
+        impl std::error::Error for Middle {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        #[derive(Debug)]
+        struct Top(Middle);
+        impl std::fmt::Display for Top {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "top")
+            }
+        }
+        impl std::error::Error for Top {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let err = Top(Middle(Inner));
+        assert_eq!(describe_discovery_error(&err), "top: middle: inner cause");
     }
 
     #[test]

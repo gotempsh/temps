@@ -225,6 +225,11 @@ const CreateOidcProviderPage = lazy(() =>
     default: m.CreateOidcProviderPage,
   }))
 )
+const OidcProviderDetailPage = lazy(() =>
+  import('./pages/settings/OidcProviderDetailPage').then((m) => ({
+    default: m.OidcProviderDetailPage,
+  }))
+)
 const PluginsPage = lazy(() =>
   import('./pages/settings/PluginsPage').then((m) => ({
     default: m.PluginsPage,
@@ -402,6 +407,10 @@ const FullAppRoutes = () => {
                   <Route path="users/:userId" element={<UserDetail />} />
                   <Route path="auth" element={<AuthSettingsPage />} />
                   <Route path="auth/new" element={<CreateOidcProviderPage />} />
+                  <Route
+                    path="auth/providers/:providerId"
+                    element={<OidcProviderDetailPage />}
+                  />
                   <Route path="keys" element={<ApiKeys />} />
                   <Route path="keys/new" element={<ApiKeyCreate />} />
                   <Route path="keys/:id" element={<ApiKeyDetail />} />

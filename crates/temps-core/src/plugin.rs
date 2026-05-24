@@ -1205,8 +1205,11 @@ impl PluginManager {
         all_middleware
     }
 
-    /// Apply collected middleware to a router
-    fn apply_middleware_to_router(
+    /// Apply collected middleware to a router. Exposed so callers that merge
+    /// extra (non-plugin) routes onto the admin listener can re-apply the
+    /// same middleware stack — `Router::merge` doesn't propagate the parent
+    /// router's layers to merged-in routes.
+    pub fn apply_middleware_to_router(
         &self,
         mut router: Router,
         middleware: Vec<PluginMiddleware>,

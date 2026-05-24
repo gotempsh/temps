@@ -1,4 +1,6 @@
 mod admin_gate;
+mod admin_gate_handler;
+mod admin_gate_service;
 pub mod console;
 mod proxy;
 mod shutdown;
@@ -268,6 +270,30 @@ impl ServeCommand {
             temps_agents::preview_gateway::spawn_reconcile(&rt, docker, db.clone(), data_dir);
         }
 
+        // Build the admin-gate handle up-front so both the console listener
+        // and the Pingora proxy see the same source of truth. Env precedence
+        // is resolved here; the DB is consulted on first read inside the
+        // service (which the console code constructs separately).
+        let (admin_gate_service, admin_gate_handle) = rt
+            .block_on(admin_gate_service::AdminGateService::new(
+                db.clone(),
+                &serve_config.admin_allowed_ips,
+                &serve_config.admin_allowed_hosts,
+                serve_config.admin_trust_forwarded_for,
+            ))
+            .map_err(|e| anyhow::anyhow!("Failed to initialize admin gate: {}", e))?;
+        {
+            let snapshot = admin_gate_handle.current();
+            info!(
+                source = ?snapshot.source,
+                allowed_ips = ?snapshot.allowed_nets.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+                allowed_hosts = ?snapshot.allowed_hosts,
+                trust_forwarded_for = snapshot.trust_forwarded_for,
+                is_noop = snapshot.is_noop(),
+                "Admin gate initialized"
+            );
+        }
+
         // Start console API server in background (non-blocking).
         // The proxy does NOT wait for the console to be ready. This ensures that
         // deployed applications remain reachable even if console initialization
@@ -289,6 +315,8 @@ impl ServeCommand {
                 .clone()
                 .map(|m| m as Arc<dyn temps_core::OnDemandWaker>),
             extra_plugins,
+            admin_gate_service: Some(admin_gate_service),
+            admin_gate_handle: Some(admin_gate_handle.clone()),
         };
         rt.spawn(async move {
             match start_console_api(params).await {
@@ -342,6 +370,7 @@ impl ServeCommand {
             serve_config.clone(),
             self.disable_https_redirect,
             on_demand_manager,
+            Some(admin_gate_handle),
         )
     }
 }

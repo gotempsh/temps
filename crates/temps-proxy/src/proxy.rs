@@ -403,6 +403,11 @@ pub struct LoadBalancer {
     on_demand_manager: Option<Arc<OnDemandManager>>,
     file_store: Option<Arc<dyn temps_file_store::FileStore>>,
     preview_auth_limiter: Arc<PreviewAuthLimiter>,
+    /// Shared admin-gate snapshot. When set and non-noop, requests for
+    /// hosts that aren't in the route table are gated before falling back
+    /// to the console — see `request_filter`. When `None`, gate enforcement
+    /// is skipped entirely (used by older test harnesses).
+    admin_gate: Option<temps_core::admin_gate::AdminGateHandle>,
 }
 
 impl LoadBalancer {
@@ -435,7 +440,17 @@ impl LoadBalancer {
             on_demand_manager: None,
             file_store: None,
             preview_auth_limiter: Arc::new(PreviewAuthLimiter::new()),
+            admin_gate: None,
         }
+    }
+
+    /// Wire the shared admin-gate handle. When set, `request_filter`
+    /// short-circuits unknown-host requests with 404 unless the request
+    /// matches the gate (`/api/_temps/*` is always exempt because public
+    /// ingest must reach the console from any host).
+    pub fn with_admin_gate(mut self, handle: temps_core::admin_gate::AdminGateHandle) -> Self {
+        self.admin_gate = Some(handle);
+        self
     }
 
     /// Set the file store for path-keyed static asset serving.
@@ -3215,6 +3230,51 @@ impl ProxyHttp for LoadBalancer {
             if let Ok(true) = self.serve_asset_from_store(session, ctx, &url_path).await {
                 ctx.routing_status = "stale_chunk_fallback".to_string();
                 return Ok(true);
+            }
+        }
+
+        // Admin gate: when a non-noop gate is wired and the request is
+        // about to fall back to the console (no deployed app for this host,
+        // not a public ingest path under /api/_temps/*, not a preview),
+        // require the (IP, Host) tuple to pass the gate. If it doesn't,
+        // return a 404 from the proxy itself so the management surface is
+        // invisible from non-admin hosts.
+        if let Some(gate) = self.admin_gate.as_ref() {
+            let config = gate.current();
+            if !config.is_noop()
+                && ctx.preview_route.is_none()
+                && !ctx.path.starts_with(ROUTE_PREFIX_TEMPS)
+            {
+                let host_has_route = self.upstream_resolver.has_custom_route(&ctx.host).await;
+                if !host_has_route {
+                    let client_ip = ctx
+                        .ip_address
+                        .as_deref()
+                        .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+                        .unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]));
+                    if !config.would_allow(client_ip, Some(&ctx.host)) {
+                        warn!(
+                            host = %ctx.host,
+                            client_ip = %client_ip,
+                            path = %ctx.path,
+                            "admin gate denied request to non-admin host"
+                        );
+                        let mut response = ResponseHeader::build(StatusCode::NOT_FOUND, None)?;
+                        response.insert_header("Cache-Control", "no-store")?;
+                        response.insert_header("X-Request-ID", &ctx.request_id)?;
+                        response.insert_header("Content-Type", "text/html; charset=utf-8")?;
+                        let body = Bytes::from_static(
+                            b"<html><body><h1>404 - Not Found</h1></body></html>",
+                        );
+                        response.insert_header("Content-Length", body.len().to_string())?;
+                        session
+                            .write_response_header(Box::new(response), false)
+                            .await?;
+                        session.write_response_body(Some(body), true).await?;
+                        ctx.routing_status = "admin_gate_denied".to_string();
+                        return Ok(true);
+                    }
+                }
             }
         }
 

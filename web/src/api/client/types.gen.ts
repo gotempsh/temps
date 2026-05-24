@@ -218,6 +218,37 @@ export type AddManagedDomainApiRequest = {
     domain: string;
 };
 
+export type AdminGateResponse = {
+    /**
+     * `Host` header values allowed. Empty = any host.
+     */
+    allowed_hosts: Array<string>;
+    /**
+     * IPs / CIDRs allowed to reach the admin listener. Empty = any source.
+     */
+    allowed_ips: Array<string>;
+    /**
+     * True when the config is writable through this API. False when env
+     * vars are dictating the active config.
+     */
+    editable: boolean;
+    /**
+     * Where the active config came from.
+     */
+    source: AdminGateSource;
+    /**
+     * When true, the gate trusts `X-Forwarded-For` from loopback peers.
+     */
+    trust_forwarded_for: boolean;
+};
+
+/**
+ * Where the active gate configuration came from. Env-supplied configs are
+ * frozen at the process level — the UI shows them read-only and refuses to
+ * persist DB writes. DB-supplied configs are editable at runtime.
+ */
+export type AdminGateSource = 'default' | 'db' | 'env';
+
 /**
  * Response DTO for a single agent — masks the encrypted API key.
  */
@@ -7841,6 +7872,32 @@ export type OidcProviderResponse = {
 export type OidcProviderSummary = {
     id: number;
     name: string;
+    /**
+     * The template the provider was created from — e.g. `keycloak`,
+     * `okta`, `auth0`, `google`, `azure-ad`, or `generic`. Surfaced on
+     * the public login endpoint so the unauthenticated login page can
+     * render the right brand logo on the "Sign in with X" button.
+     * Never sensitive — the template name is part of the provider's
+     * public identity, not configuration.
+     */
+    template: string;
+};
+
+/**
+ * A user that has logged in via a given OIDC provider. Used by the
+ * admin "Users for provider" panel — the `oidc_subject` is the
+ * IdP-side identifier we matched on, useful when diagnosing why a
+ * user can or can't log in.
+ */
+export type OidcProviderUserResponse = {
+    created_at: string;
+    email: string;
+    email_verified: boolean;
+    id: number;
+    mfa_enabled: boolean;
+    name: string;
+    oidc_subject?: string | null;
+    updated_at: string;
 };
 
 export type OidcProvidersListResponse = {
@@ -13016,6 +13073,12 @@ export type UnsupportedFeature = {
     reason: string;
 };
 
+export type UpdateAdminGateRequest = {
+    allowed_hosts: Array<string>;
+    allowed_ips: Array<string>;
+    trust_forwarded_for: boolean;
+};
+
 /**
  * Body for `PATCH /settings/ai-providers/{provider_id}` — updates
  * provider-scoped settings (just the default model for now) without
@@ -15002,6 +15065,68 @@ export type UpdateSpeedMetricsResponses = {
 
 export type UpdateSpeedMetricsResponse = UpdateSpeedMetricsResponses[keyof UpdateSpeedMetricsResponses];
 
+export type GetAdminGateData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/admin/gate-settings';
+};
+
+export type GetAdminGateErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+};
+
+export type GetAdminGateResponses = {
+    /**
+     * Current admin gate config
+     */
+    200: AdminGateResponse;
+};
+
+export type GetAdminGateResponse = GetAdminGateResponses[keyof GetAdminGateResponses];
+
+export type PatchAdminGateData = {
+    body: UpdateAdminGateRequest;
+    path?: never;
+    query?: never;
+    url: '/admin/gate-settings';
+};
+
+export type PatchAdminGateErrors = {
+    /**
+     * Invalid IP/CIDR/host
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Env-overridden or would lock out caller
+     */
+    409: unknown;
+};
+
+export type PatchAdminGateResponses = {
+    /**
+     * Updated admin gate config
+     */
+    200: AdminGateResponse;
+};
+
+export type PatchAdminGateResponse = PatchAdminGateResponses[keyof PatchAdminGateResponses];
+
 export type ListOidcProvidersData = {
     body?: never;
     path?: never;
@@ -15027,7 +15152,7 @@ export type CreateOidcProviderData = {
 
 export type CreateOidcProviderErrors = {
     /**
-     * Provider already exists
+     * Another OIDC provider already uses that name
      */
     409: unknown;
 };
@@ -15130,6 +15255,34 @@ export type TestOidcProviderResponses = {
 };
 
 export type TestOidcProviderResponse = TestOidcProviderResponses[keyof TestOidcProviderResponses];
+
+export type ListOidcProviderUsersData = {
+    body?: never;
+    path: {
+        /**
+         * OIDC provider ID
+         */
+        provider_id: number;
+    };
+    query?: never;
+    url: '/admin/oidc/providers/{provider_id}/users';
+};
+
+export type ListOidcProviderUsersErrors = {
+    /**
+     * Provider not found
+     */
+    404: unknown;
+};
+
+export type ListOidcProviderUsersResponses = {
+    /**
+     * Users authenticated via this OIDC provider
+     */
+    200: Array<OidcProviderUserResponse>;
+};
+
+export type ListOidcProviderUsersResponse = ListOidcProviderUsersResponses[keyof ListOidcProviderUsersResponses];
 
 export type DeleteOidcRoleMappingData = {
     body?: never;

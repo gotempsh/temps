@@ -1,13 +1,14 @@
 import type { CreateOidcProviderRequest, OidcProviderResponse } from '@/api/client/types.gen'
 import type { OidcProviderFormValues } from '@/components/settings/OidcProviderForm'
 
-export const OIDC_TEMPLATE_DEFAULTS: Record<
-  string,
-  Pick<
-    CreateOidcProviderRequest,
-    'scopes' | 'group_claim' | 'role_claim' | 'default_role'
-  >
-> = {
+export type OidcTemplateDefaults = {
+  scopes: string
+  group_claim: string
+  role_claim: string
+  default_role: string
+}
+
+export const OIDC_TEMPLATE_DEFAULTS: Record<string, OidcTemplateDefaults> = {
   okta: {
     scopes: 'openid profile email groups',
     group_claim: 'groups',
@@ -44,6 +45,67 @@ export const OIDC_TEMPLATE_DEFAULTS: Record<
     role_claim: 'roles',
     default_role: 'user',
   },
+}
+
+export type OidcTemplatePlaceholders = {
+  name: string
+  issuer_url: string
+  scopes: string
+  role_claim: string
+  group_claim: string
+}
+
+export const OIDC_TEMPLATE_PLACEHOLDERS: Record<string, OidcTemplatePlaceholders> = {
+  okta: {
+    name: 'Okta — Production',
+    issuer_url: 'https://<TENANT>.okta.com/oauth2/default',
+    scopes: 'openid profile email groups',
+    role_claim: 'roles',
+    group_claim: 'groups',
+  },
+  auth0: {
+    name: 'Auth0 — Production',
+    issuer_url: 'https://<TENANT_NAME>.<REGION>.auth0.com',
+    scopes: 'openid profile email',
+    role_claim: 'https://temps.sh/roles',
+    group_claim: 'https://temps.sh/groups',
+  },
+  keycloak: {
+    name: 'Keycloak — Production',
+    issuer_url: 'https://<KEYCLOAK_HOST>/realms/<REALM>',
+    scopes: 'openid profile email roles',
+    role_claim: 'roles',
+    group_claim: 'groups',
+  },
+  google: {
+    name: 'Google Workspace',
+    issuer_url: 'https://accounts.google.com',
+    scopes: 'openid profile email',
+    role_claim: '',
+    group_claim: '',
+  },
+  'azure-ad': {
+    name: 'Azure AD — Production',
+    issuer_url: 'https://login.microsoftonline.com/<TENANT_ID>/v2.0',
+    scopes: 'openid profile email',
+    role_claim: 'roles',
+    group_claim: 'groups',
+  },
+  generic: {
+    name: 'My SSO Provider',
+    issuer_url: 'https://idp.example.com',
+    scopes: 'openid profile email',
+    role_claim: 'roles',
+    group_claim: 'groups',
+  },
+}
+
+export function getOidcTemplatePlaceholders(
+  template: string,
+): OidcTemplatePlaceholders {
+  return (
+    OIDC_TEMPLATE_PLACEHOLDERS[template] ?? OIDC_TEMPLATE_PLACEHOLDERS.generic
+  )
 }
 
 export const OIDC_TEMPLATE_OPTIONS = [

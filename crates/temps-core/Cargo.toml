@@ -40,6 +40,8 @@ log = { workspace = true }
 once_cell = { workspace = true }
 url = "2.5"  # For URL validation and SSRF prevention
 cookie = { workspace = true }
+ipnet = "2.10"
+arc-swap = "1.7"
 
 # Internal dependencies - only core dependencies to avoid cycles
 temps-memory = { path = "../temps-memory" }

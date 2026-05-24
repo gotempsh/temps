@@ -21,10 +21,9 @@ import {
   Webhook,
   Zap,
 } from 'lucide-react'
-import { useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { toast } from 'sonner'
-import { AgentSettingsDialog, type Agent } from './AgentSettingsDialog'
+import type { Agent } from './AgentEditPage'
 import {
   getAgentOptions,
   listAgentRunsOptions,
@@ -353,7 +352,6 @@ export function AgentDetailPage({ project }: AgentDetailPageProps) {
   const { agentSlug } = useParams()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
-  const [dialogOpen, setDialogOpen] = useState(false)
 
   const {
     data: agentRaw,
@@ -434,7 +432,15 @@ export function AgentDetailPage({ project }: AgentDetailPageProps) {
         </div>
         <div className="flex items-center gap-2">
           {agent.source !== 'yaml' && (
-            <Button variant="outline" size="sm" onClick={() => setDialogOpen(true)}>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() =>
+                navigate(
+                  `/projects/${project.slug}/agents/detail/${agentSlug}/edit`,
+                )
+              }
+            >
               <Pencil className="h-3 w-3 mr-1" />
               Edit
             </Button>
@@ -456,13 +462,6 @@ export function AgentDetailPage({ project }: AgentDetailPageProps) {
           )}
         </div>
       </div>
-
-      <AgentSettingsDialog
-        open={dialogOpen}
-        onOpenChange={setDialogOpen}
-        projectId={project.id}
-        agent={agent}
-      />
 
       {/* Properties */}
       <AgentProperties agent={agent} />

@@ -25,7 +25,7 @@ import { AlertTriangle, CheckCircle2, Loader2, Pencil, Play, Sparkles, Terminal 
 import { useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { toast } from 'sonner'
-import { AgentSettingsDialog, type Agent } from './AgentSettingsDialog'
+import type { Agent } from './AgentEditPage'
 import { CodeBlock } from '@/components/ui/code-block'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { cn } from '@/lib/utils'
@@ -311,8 +311,6 @@ function AgentCard({
 export function AutopilotPage({ project }: AutopilotPageProps) {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
-  const [dialogOpen, setDialogOpen] = useState(false)
-  const [editingAgent, setEditingAgent] = useState<Agent | null>(null)
 
   const {
     data: agentsData,
@@ -487,13 +485,6 @@ prompt: |
         <h1 className="text-xl font-semibold">Workflows</h1>
       </div>
 
-      <AgentSettingsDialog
-        open={dialogOpen}
-        onOpenChange={setDialogOpen}
-        projectId={project.id}
-        agent={editingAgent}
-      />
-
       {/* AI provider credential banner */}
       {providerCatalog && !hasCredential && (
         <Alert variant="destructive">
@@ -528,10 +519,9 @@ prompt: |
               agent={agent}
               projectId={project.id}
               queryClient={queryClient}
-              onEdit={(a) => {
-                setEditingAgent(a)
-                setDialogOpen(true)
-              }}
+              onEdit={(a) =>
+                navigate(`detail/${a.slug}/edit`)
+              }
               onNavigate={(slug) => navigate(`detail/${slug}`)}
             />
           ))}

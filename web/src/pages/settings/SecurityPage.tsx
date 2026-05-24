@@ -1,5 +1,6 @@
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
+import { AdminGateCard } from '@/components/settings/AdminGateCard'
 import { SecuritySettings } from '@/components/settings/SecuritySettings'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
@@ -120,6 +121,7 @@ export function SecurityPage() {
 
   return (
     <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
+      <AdminGateCard />
       <SecuritySettings
         control={control}
         register={register}

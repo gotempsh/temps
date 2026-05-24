@@ -445,6 +445,29 @@ pub struct WorkflowYamlConfig {
     /// (`AgentSandboxSettings.memory_limit_mb`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_limit_mb: Option<u64>,
+    /// Sandbox override. None = use platform default, Some(true) = force on.
+    /// Some(false) is rejected at sync time — sandbox execution is mandatory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<bool>,
+    /// Inline tool definitions available to the workflow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<AgentToolConfig>>,
+    /// MCP server slugs referencing project- or platform-level definitions.
+    /// Each slug is resolved at runtime and injected into the sandbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_servers: Option<Vec<String>>,
+    /// Skill slugs referencing project- or platform-level definitions.
+    /// Each slug is resolved at runtime and written to `.claude/skills/`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Vec<String>>,
+    /// Private config repo containing a `.claude/` directory (skills, MCP
+    /// servers, settings). Format: "owner/repo". Cloned at runtime and
+    /// overlaid into the sandbox's `/home/temps/.claude/` directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_repo: Option<String>,
+    /// Branch of the config repo to use (default: "main").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_repo_branch: Option<String>,
 }
 
 /// All possible workflow triggers.

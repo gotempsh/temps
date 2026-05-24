@@ -18,8 +18,9 @@ use crate::audit::LoginAudit;
 use crate::oidc_errors::OidcError;
 use crate::oidc_service::OidcService;
 use crate::oidc_types::{
-    provider_to_response, CreateOidcProviderRequest, CreateOidcRoleMappingRequest,
-    OidcProviderResponse, OidcProviderSummary, OidcRoleMappingResponse, OidcTestConnectionResponse,
+    provider_to_response, provider_user_to_response, CreateOidcProviderRequest,
+    CreateOidcRoleMappingRequest, OidcProviderResponse, OidcProviderSummary,
+    OidcProviderUserResponse, OidcRoleMappingResponse, OidcTestConnectionResponse,
     UpdateOidcProviderRequest,
 };
 use crate::permission_guard;
@@ -60,6 +61,10 @@ pub fn configure_oidc_routes() -> Router<Arc<AuthState>> {
         .route(
             "/admin/oidc/providers/{provider_id}/test",
             post(test_oidc_provider),
+        )
+        .route(
+            "/admin/oidc/providers/{provider_id}/users",
+            get(list_oidc_provider_users),
         )
         .route(
             "/admin/oidc/providers/{provider_id}/role-mappings",
@@ -321,7 +326,7 @@ fn redirect_login_error(reason: &str) -> Response {
     request_body = CreateOidcProviderRequest,
     responses(
         (status = 201, description = "OIDC provider created", body = OidcProviderResponse),
-        (status = 409, description = "Provider already exists")
+        (status = 409, description = "Another OIDC provider already uses that name")
     ),
     tag = "Authentication",
     security(("bearer_auth" = []))
@@ -424,6 +429,32 @@ pub async fn test_oidc_provider(
 
 #[utoipa::path(
     get,
+    path = "/admin/oidc/providers/{provider_id}/users",
+    params(
+        ("provider_id" = i32, Path, description = "OIDC provider ID")
+    ),
+    responses(
+        (status = 200, description = "Users authenticated via this OIDC provider", body = Vec<OidcProviderUserResponse>),
+        (status = 404, description = "Provider not found")
+    ),
+    tag = "Authentication",
+    security(("bearer_auth" = []))
+)]
+pub async fn list_oidc_provider_users(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AuthState>>,
+    Path(provider_id): Path<i32>,
+) -> Result<Json<Vec<OidcProviderUserResponse>>, Problem> {
+    permission_guard!(auth, SettingsWrite);
+    let users = state
+        .oidc_service
+        .list_users_for_provider(provider_id)
+        .await?;
+    Ok(Json(users.iter().map(provider_user_to_response).collect()))
+}
+
+#[utoipa::path(
+    get,
     path = "/admin/oidc/providers/{provider_id}/role-mappings",
     responses(
         (status = 200, description = "OIDC role mappings", body = Vec<OidcRoleMappingResponse>)
@@ -493,6 +524,7 @@ pub async fn delete_oidc_role_mapping(
         update_oidc_provider,
         delete_oidc_provider,
         test_oidc_provider,
+        list_oidc_provider_users,
         list_oidc_role_mappings,
         create_oidc_role_mapping,
         delete_oidc_role_mapping,
@@ -503,6 +535,7 @@ pub async fn delete_oidc_role_mapping(
             CreateOidcProviderRequest,
             OidcProviderResponse,
             OidcProviderSummary,
+            OidcProviderUserResponse,
             UpdateOidcProviderRequest,
             OidcTestConnectionResponse,
             OidcRoleMappingResponse,

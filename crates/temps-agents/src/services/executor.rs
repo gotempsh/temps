@@ -1674,11 +1674,28 @@ impl AgentExecutor {
             // the way in — we re-pin it here as defense in depth.
             deliverable: "report".to_string(),
             sandbox_enabled: Some(true),
-            mcp_servers_config: None,
-            skills_config: None,
-            tools_config: None,
-            config_repo_url: None,
-            config_repo_branch: None,
+            mcp_servers_config: yaml.mcp_servers.as_ref().map(|slugs| {
+                serde_json::Value::Array(
+                    slugs
+                        .iter()
+                        .map(|s| serde_json::Value::String(s.clone()))
+                        .collect(),
+                )
+            }),
+            skills_config: yaml.skills.as_ref().map(|slugs| {
+                serde_json::Value::Array(
+                    slugs
+                        .iter()
+                        .map(|s| serde_json::Value::String(s.clone()))
+                        .collect(),
+                )
+            }),
+            tools_config: yaml
+                .tools
+                .as_ref()
+                .and_then(|tools| serde_json::to_value(tools).ok()),
+            config_repo_url: yaml.config_repo.clone(),
+            config_repo_branch: yaml.config_repo_branch.clone(),
             webhook_id: None,
             webhook_token: None,
             created_at: now,

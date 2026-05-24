@@ -98,6 +98,37 @@ pub struct OidcTestConnectionResponse {
     pub message: String,
 }
 
+/// A user that has logged in via a given OIDC provider. Used by the
+/// admin "Users for provider" panel — the `oidc_subject` is the
+/// IdP-side identifier we matched on, useful when diagnosing why a
+/// user can or can't log in.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct OidcProviderUserResponse {
+    pub id: i32,
+    pub name: String,
+    pub email: String,
+    pub email_verified: bool,
+    pub mfa_enabled: bool,
+    pub oidc_subject: Option<String>,
+    #[schema(value_type = String, format = DateTime, example = "2024-01-15T14:30:00Z")]
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    #[schema(value_type = String, format = DateTime, example = "2024-01-15T14:30:00Z")]
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+pub fn provider_user_to_response(user: &temps_entities::users::Model) -> OidcProviderUserResponse {
+    OidcProviderUserResponse {
+        id: user.id,
+        name: user.name.clone(),
+        email: user.email.clone(),
+        email_verified: user.email_verified,
+        mfa_enabled: user.mfa_enabled,
+        oidc_subject: user.oidc_subject.clone(),
+        created_at: user.created_at,
+        updated_at: user.updated_at,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct OidcRoleMappingResponse {
     pub id: i32,

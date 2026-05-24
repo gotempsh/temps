@@ -1,5 +1,6 @@
 import {
   applyOidcTemplate,
+  getOidcTemplatePlaceholders,
   OIDC_TEMPLATE_OPTIONS,
   type OidcTemplateId,
 } from '@/components/settings/oidc-provider-constants'
@@ -16,7 +17,7 @@ import {
 import { Separator } from '@/components/ui/separator'
 import { Switch } from '@/components/ui/switch'
 import { Check, Copy } from 'lucide-react'
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 
 export type OidcProviderFormValues = {
   name: string
@@ -63,6 +64,11 @@ export function OidcProviderForm({
 }: OidcProviderFormProps) {
   const [copiedRedirect, setCopiedRedirect] = useState(false)
 
+  const placeholders = useMemo(
+    () => getOidcTemplatePlaceholders(value.template),
+    [value.template],
+  )
+
   const update = <K extends keyof OidcProviderFormValues>(
     key: K,
     next: OidcProviderFormValues[K],
@@ -107,7 +113,7 @@ export function OidcProviderForm({
               id="oidc-name"
               value={value.name}
               onChange={(event) => update('name', event.target.value)}
-              placeholder="Okta — Production"
+              placeholder={placeholders.name}
             />
           </div>
           <div className="space-y-2">
@@ -180,7 +186,7 @@ export function OidcProviderForm({
               id="oidc-issuer"
               value={value.issuer_url}
               onChange={(event) => update('issuer_url', event.target.value)}
-              placeholder="https://your-tenant.okta.com/oauth2/default"
+              placeholder={placeholders.issuer_url}
             />
           </div>
           <div className="space-y-2">
@@ -235,7 +241,7 @@ export function OidcProviderForm({
               id="oidc-scopes"
               value={value.scopes}
               onChange={(event) => update('scopes', event.target.value)}
-              placeholder="openid profile email"
+              placeholder={placeholders.scopes}
             />
           </div>
           <div className="space-y-2">
@@ -259,7 +265,7 @@ export function OidcProviderForm({
               id="oidc-role-claim"
               value={value.role_claim}
               onChange={(event) => update('role_claim', event.target.value)}
-              placeholder="roles"
+              placeholder={placeholders.role_claim || 'roles'}
             />
           </div>
           <div className="space-y-2">
@@ -268,7 +274,7 @@ export function OidcProviderForm({
               id="oidc-group-claim"
               value={value.group_claim}
               onChange={(event) => update('group_claim', event.target.value)}
-              placeholder="groups"
+              placeholder={placeholders.group_claim || 'groups'}
             />
           </div>
         </div>

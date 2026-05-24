@@ -396,6 +396,10 @@ fn create_openapi(plugin_manager: &PluginManager) -> anyhow::Result<utoipa::open
     let nodes_doc = <temps_deployments::handlers::nodes::NodesApiDoc as utoipa::OpenApi>::openapi();
     api_doc.merge(nodes_doc);
 
+    // Merge admin-gate management endpoints (also not part of the plugin system)
+    let gate_doc = <super::admin_gate_handler::AdminGateApiDoc as utoipa::OpenApi>::openapi();
+    api_doc.merge(gate_doc);
+
     Ok(api_doc)
 }
 
@@ -640,6 +644,12 @@ pub struct ConsoleApiParams {
     /// they observe every OSS service in the registry and can wrap or
     /// extend them. OSS callers pass an empty Vec.
     pub extra_plugins: Vec<Box<dyn TempsPlugin>>,
+    /// Pre-built admin-gate service (when the caller wired the gate up
+    /// outside the console). When `None`, the console builds its own.
+    pub admin_gate_service: Option<super::admin_gate_service::AdminGateService>,
+    /// Pre-built admin-gate handle. When `None`, the console derives one
+    /// from the freshly-constructed service above.
+    pub admin_gate_handle: Option<temps_core::admin_gate::AdminGateHandle>,
 }
 
 /// Initialize and start the console API server
@@ -655,6 +665,8 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         additional_templates,
         on_demand_waker,
         extra_plugins,
+        admin_gate_service: provided_admin_gate_service,
+        admin_gate_handle: provided_admin_gate_handle,
     } = params;
     // PRE-VALIDATE all plugin dependencies BEFORE initializing plugin manager
     // This ensures clear error messages if any critical resources are missing
@@ -1332,8 +1344,37 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     // the internet POST to them with bearer tokens).
     let public_router = split.public.merge(node_routes).merge(route_sync_routes);
 
-    // Swagger UI + the embedded SPA only live on the admin surface.
-    let admin_router = split.admin.merge(create_swagger_router(&plugin_manager)?);
+    // Use the caller-supplied admin-gate when present (so the proxy and the
+    // console share one source of truth) and otherwise build a fresh one.
+    let (admin_gate_service, admin_gate_handle) =
+        match (provided_admin_gate_service, provided_admin_gate_handle) {
+            (Some(svc), Some(handle)) => (svc, handle),
+            _ => super::admin_gate_service::AdminGateService::new(
+                db.clone(),
+                &config.admin_allowed_ips,
+                &config.admin_allowed_hosts,
+                config.admin_trust_forwarded_for,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to initialize admin gate: {}", e))?,
+        };
+    let admin_gate_state = Arc::new(super::admin_gate_handler::AdminGateAppState {
+        service: admin_gate_service,
+    });
+    // Re-apply the plugin middleware stack (auth, request metadata, audit)
+    // to our standalone admin-gate routes. Without this, RequireAuth finds
+    // no AuthContext injected and the route 401s for logged-in users —
+    // `Router::merge` does not propagate parent layers to merged routes.
+    let admin_gate_routes = super::admin_gate_handler::configure_routes(admin_gate_state);
+    let admin_gate_routes = plugin_manager
+        .apply_middleware_to_router(admin_gate_routes, plugin_manager.get_middleware());
+
+    // Swagger UI + the embedded SPA only live on the admin surface. So do
+    // the admin-gate management routes.
+    let admin_router = split
+        .admin
+        .merge(create_swagger_router(&plugin_manager)?)
+        .merge(admin_gate_routes);
 
     // Wrap each surface in /api like the original single-router did, except
     // for the SPA fallback which serves the dashboard at the document root.
@@ -1342,27 +1383,17 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         .nest("/api", admin_router)
         .fallback(serve_static_file);
 
-    // Optional defense-in-depth gate for the admin listener.
-    let admin_gate = super::admin_gate::AdminGateConfig::from_env(
-        &config.admin_allowed_ips,
-        &config.admin_allowed_hosts,
-        config.admin_trust_forwarded_for,
-    )
-    .map_err(|e| anyhow::anyhow!("Invalid admin gate config: {}", e))?;
-    let admin_app = if admin_gate.is_noop() {
-        admin_app
-    } else {
-        info!(
-            allowed_ips = ?config.admin_allowed_ips,
-            allowed_hosts = ?config.admin_allowed_hosts,
-            trust_forwarded_for = config.admin_trust_forwarded_for,
-            "Admin gate enabled"
-        );
-        admin_app.layer(axum::middleware::from_fn_with_state(
-            admin_gate,
-            super::admin_gate::admin_gate,
-        ))
-    };
+    // Defense-in-depth: the Pingora proxy is now the primary enforcer (it
+    // 404s gated requests before they ever reach this listener). The axum
+    // middleware below only matters when something connects to the console
+    // listener directly — e.g. loopback debugging, or a deployment where
+    // the operator points an external reverse-proxy at console_address
+    // instead of going through Pingora. The middleware short-circuits when
+    // the active config is a noop, so the perf cost is negligible.
+    let admin_app = admin_app.layer(axum::middleware::from_fn_with_state(
+        admin_gate_handle.clone(),
+        super::admin_gate::admin_gate,
+    ));
 
     info!("Plugin system initialized successfully with static file serving");
 

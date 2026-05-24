@@ -7,8 +7,8 @@ pub enum OidcError {
     #[error("No OIDC provider configured")]
     NoProviderConfigured,
 
-    #[error("OIDC provider already exists (Community tier allows one provider)")]
-    ProviderAlreadyExists,
+    #[error("OIDC provider with name '{name}' already exists")]
+    ProviderAlreadyExists { name: String },
 
     #[error("OIDC provider {provider_id} not found")]
     ProviderNotFound { provider_id: i32 },
@@ -59,11 +59,11 @@ impl From<OidcError> for Problem {
             OidcError::NoProviderConfigured => problem_new(StatusCode::NOT_FOUND)
                 .with_title("No OIDC Provider")
                 .with_detail("No OIDC provider is configured on this Temps instance"),
-            OidcError::ProviderAlreadyExists => problem_new(StatusCode::CONFLICT)
+            OidcError::ProviderAlreadyExists { name } => problem_new(StatusCode::CONFLICT)
                 .with_title("OIDC Provider Already Exists")
-                .with_detail(
-                    "Community tier supports one OIDC provider. Delete the existing provider before adding another.",
-                ),
+                .with_detail(format!(
+                    "An OIDC provider named '{name}' already exists. Pick a different name."
+                )),
             OidcError::ProviderNotFound { provider_id } => problem_new(StatusCode::NOT_FOUND)
                 .with_title("OIDC Provider Not Found")
                 .with_detail(format!("OIDC provider {provider_id} was not found")),
@@ -130,7 +130,10 @@ mod tests {
 
     #[test]
     fn provider_already_exists_maps_to_409() {
-        let problem: Problem = OidcError::ProviderAlreadyExists.into();
+        let problem: Problem = OidcError::ProviderAlreadyExists {
+            name: "Keycloak".into(),
+        }
+        .into();
         assert_eq!(problem.status_code, StatusCode::CONFLICT);
     }
 

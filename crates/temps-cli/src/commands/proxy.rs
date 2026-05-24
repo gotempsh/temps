@@ -273,6 +273,7 @@ impl ProxyCommand {
             shutdown_signal,
             config.clone(),
             None, // on-demand not available in standalone proxy mode
+            None, // admin gate not wired in standalone proxy mode
         ) {
             Ok(_) => {
                 info!("Proxy server exited");

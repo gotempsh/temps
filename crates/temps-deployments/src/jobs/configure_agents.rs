@@ -238,12 +238,12 @@ fn workflow_to_agent(workflow: WorkflowYamlConfig) -> AgentYamlConfig {
         branch_prefix: "workflows/".to_string(),
         deliverable: workflow.deliverable,
         enabled: workflow.enabled,
-        sandbox: None,
-        tools: None,
-        mcp_servers: None,
-        skills: None,
-        config_repo: None,
-        config_repo_branch: None,
+        sandbox: workflow.sandbox,
+        tools: workflow.tools,
+        mcp_servers: workflow.mcp_servers,
+        skills: workflow.skills,
+        config_repo: workflow.config_repo,
+        config_repo_branch: workflow.config_repo_branch,
     }
 }
 
