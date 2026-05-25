@@ -10762,6 +10762,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "cookie 0.18.1",
+ "hex",
  "image",
  "log",
  "openidconnect",

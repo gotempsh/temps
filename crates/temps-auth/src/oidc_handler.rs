@@ -51,6 +51,9 @@ pub struct OidcProvidersListResponse {
 pub fn configure_oidc_routes() -> Router<Arc<AuthState>> {
     Router::new()
         .route("/auth/oidc/providers", get(list_public_providers))
+        // Slug-based login — the slug is returned by /email-status and
+        // /auth/oidc/providers so the frontend never sees integer IDs.
+        .route("/auth/oidc/login/{slug}", get(start_oidc_login_by_slug))
         .route("/admin/oidc/providers", post(create_oidc_provider))
         .route("/admin/oidc/providers", get(list_oidc_providers))
         .route(
@@ -100,9 +103,9 @@ pub async fn list_public_providers(
 
 #[utoipa::path(
     get,
-    path = "/auth/oidc/login/{provider_id}",
+    path = "/auth/oidc/login/{slug}",
     params(
-        ("provider_id" = i32, Path, description = "OIDC provider ID"),
+        ("slug" = String, Path, description = "OIDC provider slug (from /email-status or /auth/oidc/providers)"),
         OidcLoginQuery
     ),
     responses(
@@ -112,19 +115,20 @@ pub async fn list_public_providers(
     ),
     tag = "Authentication"
 )]
-pub async fn start_oidc_login(
+pub async fn start_oidc_login_by_slug(
     State(state): State<Arc<AuthState>>,
-    Path(provider_id): Path<i32>,
+    Path(slug): Path<String>,
     Query(query): Query<OidcLoginQuery>,
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<Redirect, Problem> {
+    let provider = state.oidc_service.get_provider_by_slug(&slug).await?;
     let redirect_uri = format!(
         "{}/api/auth/oidc/callback",
         metadata.base_url.trim_end_matches('/')
     );
     let login = state
         .oidc_service
-        .start_login(provider_id, &redirect_uri, query.return_to)
+        .start_login(provider.id, &redirect_uri, query.return_to)
         .await?;
     Ok(Redirect::temporary(&login.authorize_url))
 }
@@ -753,7 +757,7 @@ pub async fn delete_oidc_role_mapping(
 #[openapi(
     paths(
         list_public_providers,
-        start_oidc_login,
+        start_oidc_login_by_slug,
         oidc_callback,
         create_oidc_provider,
         list_oidc_providers,

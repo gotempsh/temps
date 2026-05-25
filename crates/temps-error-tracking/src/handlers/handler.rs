@@ -297,6 +297,17 @@ impl axum::response::IntoResponse for ErrorTrackingError {
             ErrorTrackingError::ProjectNotFound => {
                 (StatusCode::NOT_FOUND, "Project not found".to_string())
             }
+            ErrorTrackingError::PayloadTooLarge {
+                field,
+                limit_bytes,
+                actual_bytes,
+            } => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "Payload too large: '{}' exceeds {} bytes (got {})",
+                    field, limit_bytes, actual_bytes
+                ),
+            ),
         };
 
         (

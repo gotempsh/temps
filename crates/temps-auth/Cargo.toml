@@ -33,6 +33,7 @@ uuid = { workspace = true }
 totp-rs = { workspace = true }
 base32 = "0.5.1"
 sha2 = { workspace = true }
+hex = { workspace = true }
 qrcode = "0.14.1"
 image = "0.25.6"
 base64 = { workspace = true }

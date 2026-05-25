@@ -21,8 +21,9 @@ use tokio::sync::Mutex;
 
 use crate::oidc_errors::OidcError;
 use crate::oidc_types::{
-    role_mapping_to_response, CreateOidcProviderRequest, CreateOidcRoleMappingRequest,
-    OidcProviderSummary, OidcRoleMappingResponse, UpdateOidcProviderRequest,
+    derive_provider_slug, role_mapping_to_response, CreateOidcProviderRequest,
+    CreateOidcRoleMappingRequest, OidcProviderSummary, OidcRoleMappingResponse,
+    UpdateOidcProviderRequest,
 };
 use crate::user_service::UserService;
 use temps_core::EncryptionService;
@@ -210,7 +211,7 @@ impl OidcService {
         Ok(providers
             .into_iter()
             .map(|p| OidcProviderSummary {
-                id: p.id,
+                slug: derive_provider_slug(p.id, &p.name),
                 name: p.name,
                 template: p.template,
             })
@@ -226,6 +227,23 @@ impl OidcService {
             .one(self.db.as_ref())
             .await?
             .ok_or(OidcError::ProviderNotFound { provider_id })
+    }
+
+    /// Resolve a provider from its public slug. The slug is derived
+    /// deterministically from `(id, name)` via `derive_provider_slug`, so we
+    /// fetch all providers, recompute each slug, and match — O(n) over the
+    /// provider count which is expected to be small (< 10).
+    ///
+    /// Returns `OidcError::ProviderNotFound` with a synthetic ID of 0 when no
+    /// match is found, so callers never learn which IDs actually exist.
+    pub async fn get_provider_by_slug(
+        &self,
+        slug: &str,
+    ) -> Result<oidc_providers::Model, OidcError> {
+        let all = oidc_providers::Entity::find().all(self.db.as_ref()).await?;
+        all.into_iter()
+            .find(|p| derive_provider_slug(p.id, &p.name) == slug)
+            .ok_or(OidcError::ProviderNotFound { provider_id: 0 })
     }
 
     pub async fn create_provider(

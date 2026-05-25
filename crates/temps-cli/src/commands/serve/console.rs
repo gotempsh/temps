@@ -403,9 +403,45 @@ fn create_openapi(plugin_manager: &PluginManager) -> anyhow::Result<utoipa::open
     Ok(api_doc)
 }
 
+/// Axum middleware that rejects unauthenticated requests to the Swagger UI
+/// and OpenAPI JSON endpoint. The auth middleware stack must have already run
+/// (i.e. be an outer layer) so the `AuthContext` extension is present for
+/// authenticated callers. Anonymous callers — with no valid session cookie or
+/// Bearer token — receive a 401 with a WWW-Authenticate hint.
+async fn require_auth_for_docs(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::header::WWW_AUTHENTICATE;
+    if req.extensions().get::<temps_auth::AuthContext>().is_some() {
+        next.run(req).await
+    } else {
+        Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header(WWW_AUTHENTICATE, "Bearer realm=\"temps\"")
+            .header(header::CONTENT_TYPE, "application/problem+json")
+            .body(Body::from(
+                r#"{"type":"about:blank","title":"Unauthorized","status":401,"detail":"Authentication required to access the API documentation."}"#,
+            ))
+            .unwrap_or_else(|_| Response::new(Body::empty()))
+    }
+}
+
 fn create_swagger_router(plugin_manager: &PluginManager) -> anyhow::Result<Router> {
     let api_doc = create_openapi(plugin_manager)?;
-    Ok(Router::new().merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", api_doc)))
+    // Build the raw Swagger router, then add the auth-guard as an inner layer
+    // (applied after the outer auth middleware has already run and injected the
+    // `AuthContext` extension). Axum applies `.layer()` calls in reverse order:
+    // the *last* `.layer()` wraps outermost (runs first).  Because
+    // `apply_middleware_to_router` is called after we add the guard here,
+    // the plugin auth middleware is the outermost shell → runs first →
+    // populates `AuthContext` → then the guard reads it.
+    let swagger =
+        Router::new().merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", api_doc));
+    // Add the auth-guard as the innermost layer (runs after auth middleware).
+    let swagger_guarded = swagger.layer(axum::middleware::from_fn(require_auth_for_docs));
+    // Wrap with the full plugin middleware stack (auth context injection, etc.).
+    Ok(plugin_manager.apply_middleware_to_router(swagger_guarded, plugin_manager.get_middleware()))
 }
 
 /// Static file handler for embedded website

@@ -350,6 +350,11 @@ impl From<SessionReplayError> for Problem {
         let (status, message) = match &error {
             SessionReplayError::VisitorNotFound(_) => (StatusCode::NOT_FOUND, "Visitor not found"),
             SessionReplayError::SessionNotFound(_) => (StatusCode::NOT_FOUND, "Session not found"),
+            // Cross-project access attempts are surfaced as 404 to avoid
+            // disclosing the existence of sessions belonging to other tenants.
+            SessionReplayError::CrossProjectAccess { .. } => {
+                (StatusCode::NOT_FOUND, "Session not found")
+            }
             SessionReplayError::InvalidPackedData(_) => {
                 (StatusCode::BAD_REQUEST, "Invalid packed data")
             }
@@ -634,9 +639,18 @@ pub async fn add_events(
         session_id, visitor_id
     );
 
+    // Resolve the project that owns this session so that add_session_events
+    // can enforce the project-ownership check consistently across both the
+    // public ingest path and the admin path.
+    let project_id = state
+        .session_replay_service
+        .get_project_id_for_session(&session_id)
+        .await
+        .map_err(Problem::from)?;
+
     match state
         .session_replay_service
-        .add_session_events(&session_id, &request.events)
+        .add_session_events(project_id, &session_id, &request.events)
         .await
     {
         Ok(event_count) => Ok(Json(AddEventsResponse {
@@ -767,6 +781,7 @@ pub async fn init_session_replay(
 )]
 pub async fn add_session_replay_events(
     State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
     Json(request): Json<SessionReplayEventsRequest>,
 ) -> Result<Json<AddEventsResponse>, Problem> {
     debug!(
@@ -774,9 +789,34 @@ pub async fn add_session_replay_events(
         request.session_id
     );
 
+    // Resolve the project from the Host header — the same path used by
+    // init_session_replay.  This binds the event-append operation to the
+    // project that owns the originating host, preventing a cross-tenant
+    // attacker from injecting rrweb events into another project's session.
+    let project_id = match state.route_table.get_route(&metadata.host) {
+        Some(route_info) => {
+            let Some(project) = route_info.project.as_ref() else {
+                return Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
+                    .title("No project associated with host")
+                    .detail(format!(
+                        "Host {} resolved but has no project (sandbox/orphan route)",
+                        metadata.host
+                    ))
+                    .build());
+            };
+            project.id
+        }
+        None => {
+            return Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
+                .title("Host not found in route table")
+                .detail(format!("Host {} not found", metadata.host))
+                .build());
+        }
+    };
+
     match state
         .session_replay_service
-        .add_session_events(&request.session_id, &request.events)
+        .add_session_events(project_id, &request.session_id, &request.events)
         .await
     {
         Ok(event_count) => {
@@ -875,6 +915,29 @@ mod tests {
         assert_eq!(
             problem.body.get("title").and_then(|v| v.as_str()),
             Some("Visitor not found")
+        );
+    }
+
+    /// CrossProjectAccess must produce HTTP 404, not 403, so that callers
+    /// cannot distinguish "session does not exist" from "session belongs to
+    /// another project" — preventing cross-tenant existence probing.
+    #[test]
+    fn cross_project_access_maps_to_404_not_403() {
+        let error = SessionReplayError::CrossProjectAccess {
+            session_replay_id: "some-session-id".to_string(),
+            project_id: 99,
+        };
+        let problem: Problem = error.into();
+
+        assert_eq!(
+            problem.status_code,
+            StatusCode::NOT_FOUND,
+            "CrossProjectAccess must return 404 to avoid existence disclosure"
+        );
+        assert_eq!(
+            problem.body.get("title").and_then(|v| v.as_str()),
+            Some("Session not found"),
+            "title must be identical to SessionNotFound title"
         );
     }
 }

@@ -29,6 +29,18 @@ pub enum SessionReplayError {
     #[error("Session not found: {0}")]
     SessionNotFound(String),
 
+    /// Returned when a caller supplies a session_replay_id that does not
+    /// belong to the project resolved from the request host.  We surface
+    /// this as SessionNotFound at the HTTP layer so that cross-project
+    /// probing receives a 404 rather than a disclosure-leaking 403.
+    #[error(
+        "Session {session_replay_id} does not belong to project {project_id} (cross-project access attempt)"
+    )]
+    CrossProjectAccess {
+        session_replay_id: String,
+        project_id: i32,
+    },
+
     #[error("Invalid packed data: {0}")]
     InvalidPackedData(String),
 
@@ -342,21 +354,44 @@ impl SessionReplayService {
         Ok(session_id.to_string())
     }
 
-    /// Add events to an existing session (events are already base64 encoded and compressed)
+    /// Add events to an existing session (events are already base64 encoded and compressed).
+    ///
+    /// `project_id` must match the project that owns the session.  If the
+    /// session exists but belongs to a different project, `CrossProjectAccess`
+    /// is returned so that the handler can surface a 404 — preventing
+    /// cross-tenant event injection and avoiding existence disclosure.
     pub async fn add_session_events(
         &self,
+        project_id: i32,
         session_id: &str,
         events_base64: &str,
     ) -> Result<usize, SessionReplayError> {
         info!("Adding events to session: {}", session_id);
 
-        // Verify session exists by session_replay_id
+        // Verify session exists by session_replay_id AND project_id to prevent
+        // cross-tenant injection: an attacker who guesses another tenant's
+        // session_replay_id must not be able to append events to it.
         let session = session_replay_sessions::Entity::find()
             .filter(session_replay_sessions::Column::SessionReplayId.eq(session_id))
             .filter(session_replay_sessions::Column::IsActive.eq(true))
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| SessionReplayError::SessionNotFound(session_id.to_string()))?;
+
+        // Enforce project ownership after the session is found so we return
+        // the same 404 path for both "not found" and "wrong project".
+        if session.project_id != project_id {
+            tracing::warn!(
+                session_replay_id = %session_id,
+                session_project_id = %session.project_id,
+                request_project_id = %project_id,
+                "Cross-project event injection attempt rejected"
+            );
+            return Err(SessionReplayError::CrossProjectAccess {
+                session_replay_id: session_id.to_string(),
+                project_id,
+            });
+        }
 
         // Decode and decompress events
         let compressed = STANDARD.decode(events_base64)?;
@@ -1455,5 +1490,171 @@ impl SessionReplayService {
             .await?;
 
         Ok(())
+    }
+
+    /// Return the project_id that owns the given session_replay_id string.
+    ///
+    /// Used by admin handlers that receive a string session_replay_id from
+    /// URL path parameters and need a project_id to call `add_session_events`
+    /// without doing an open cross-project lookup.
+    pub async fn get_project_id_for_session(
+        &self,
+        session_replay_id: &str,
+    ) -> Result<i32, SessionReplayError> {
+        let session = session_replay_sessions::Entity::find()
+            .filter(session_replay_sessions::Column::SessionReplayId.eq(session_replay_id))
+            .filter(session_replay_sessions::Column::IsActive.eq(true))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| SessionReplayError::SessionNotFound(session_replay_id.to_string()))?;
+
+        Ok(session.project_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sea_orm::{DatabaseBackend, MockDatabase};
+
+    fn make_session_model(
+        id: i32,
+        session_replay_id: &str,
+        project_id: i32,
+    ) -> session_replay_sessions::Model {
+        session_replay_sessions::Model {
+            id,
+            session_replay_id: session_replay_id.to_string(),
+            visitor_id: 1,
+            project_id,
+            environment_id: 1,
+            deployment_id: 1,
+            created_at: None,
+            user_agent: None,
+            browser: None,
+            browser_version: None,
+            operating_system: None,
+            operating_system_version: None,
+            device_type: None,
+            viewport_width: None,
+            viewport_height: None,
+            screen_width: None,
+            screen_height: None,
+            language: None,
+            timezone: None,
+            url: None,
+            duration: None,
+            is_active: true,
+        }
+    }
+
+    /// Cross-project injection attempt: session belongs to project 1 but
+    /// caller presents project 2's host.  Must return CrossProjectAccess
+    /// which the HTTP layer maps to 404 (no existence disclosure).
+    #[tokio::test]
+    async fn add_events_with_wrong_project_returns_not_found() {
+        // Session is owned by project 1
+        let session = make_session_model(42, "session-abc", 1);
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![session]])
+            .into_connection();
+
+        let service = SessionReplayService::new(Arc::new(db));
+
+        // Caller claims to be project 2
+        let result = service
+            .add_session_events(2, "session-abc", "dGVzdA==") // "test" in base64
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SessionReplayError::CrossProjectAccess {
+                    session_replay_id: ref sid,
+                    project_id: 2
+                } if sid == "session-abc"
+            ),
+            "Expected CrossProjectAccess, got: {:?}",
+            err
+        );
+    }
+
+    /// Session not found (wrong session_replay_id string).  Must return
+    /// SessionNotFound so the HTTP layer emits 404.
+    #[tokio::test]
+    async fn add_events_session_not_found_returns_not_found() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![] as Vec<session_replay_sessions::Model>])
+            .into_connection();
+
+        let service = SessionReplayService::new(Arc::new(db));
+
+        let result = service
+            .add_session_events(1, "does-not-exist", "dGVzdA==")
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), SessionReplayError::SessionNotFound(ref s) if s == "does-not-exist"),
+            "Expected SessionNotFound"
+        );
+    }
+
+    /// get_project_id_for_session returns the correct project_id when the
+    /// session exists.
+    #[tokio::test]
+    async fn get_project_id_for_session_returns_correct_id() {
+        let session = make_session_model(7, "session-xyz", 5);
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![session]])
+            .into_connection();
+
+        let service = SessionReplayService::new(Arc::new(db));
+        let project_id = service
+            .get_project_id_for_session("session-xyz")
+            .await
+            .expect("should find session");
+
+        assert_eq!(project_id, 5);
+    }
+
+    /// get_project_id_for_session returns SessionNotFound for an unknown ID.
+    #[tokio::test]
+    async fn get_project_id_for_session_not_found() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![] as Vec<session_replay_sessions::Model>])
+            .into_connection();
+
+        let service = SessionReplayService::new(Arc::new(db));
+        let result = service.get_project_id_for_session("no-such-session").await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            SessionReplayError::SessionNotFound(_)
+        ));
+    }
+
+    /// CrossProjectAccess error message includes both the session_replay_id
+    /// and project_id so that abuse can be detected from logs.
+    #[test]
+    fn cross_project_access_error_message_includes_identifiers() {
+        let err = SessionReplayError::CrossProjectAccess {
+            session_replay_id: "session-abc".to_string(),
+            project_id: 42,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("session-abc"),
+            "error message must include session_replay_id, got: {msg}"
+        );
+        assert!(
+            msg.contains("42"),
+            "error message must include project_id, got: {msg}"
+        );
     }
 }

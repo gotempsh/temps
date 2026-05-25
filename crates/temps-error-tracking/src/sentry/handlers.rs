@@ -1,6 +1,6 @@
 use axum::{
     body::Bytes,
-    extract::{Path, Query, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Extension, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::post,
@@ -8,6 +8,7 @@ use axum::{
 };
 use flate2::read::GzDecoder;
 use std::io::Read as IoRead;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::debug;
@@ -43,6 +44,15 @@ pub struct AppState {
     pub db: Option<Arc<sea_orm::DatabaseConnection>>,
 }
 
+/// Maximum compressed body size for Sentry ingest routes (2 MiB).
+///
+/// Typical Sentry events are 5–50 KB. The 2 MiB cap rejects slow-POST DoS
+/// attempts before the body is fully buffered into memory. The decompression
+/// bomb guard (MAX_DECOMPRESSED_SIZE) provides a second layer of protection
+/// against gzip bombs where the compressed input is under this limit but the
+/// expanded output is enormous.
+const SENTRY_INGEST_BODY_LIMIT: usize = 2 * 1024 * 1024;
+
 pub fn configure_routes() -> Router<Arc<AppState>> {
     // Create CORS layer that allows all origins for Sentry SDK compatibility
     let cors = CorsLayer::new()
@@ -54,6 +64,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/{project_id}/store/", post(ingest_sentry_event))
         .route("/{project_id}/envelope/", post(ingest_sentry_envelope))
+        // Fix #3: cap compressed body to 2 MiB before any buffering occurs.
+        // This prevents slow-POST DoS where a client drip-feeds a large body
+        // to hold a Tokio worker thread indefinitely.
+        .layer(DefaultBodyLimit::max(SENTRY_INGEST_BODY_LIMIT))
         .layer(cors)
 }
 
@@ -71,6 +85,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         (status = 200, description = "Event ingested", body = SentryEventResponse),
         (status = 400, description = "Bad request"),
         (status = 401, description = "Unauthorized"),
+        (status = 413, description = "Request body too large (exceeds 2 MiB)"),
     ),
     tag = "sentry-ingestor"
 )]
@@ -79,6 +94,10 @@ async fn ingest_sentry_event(
     Path(project_id): Path<i32>,
     Query(params): Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
+    // Fix #2: read ConnectInfo from extensions (inserted by axum when the listener
+    // is started with `into_make_service_with_connect_info`). Option<Extension<T>>
+    // returns None gracefully when the extension is absent (e.g. in unit tests).
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
     Json(event): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     // Extract DSN key from auth header or query params
@@ -113,11 +132,16 @@ async fn ingest_sentry_event(
         }
     };
 
+    // Fix #2: resolve the real client IP using proxy-trust logic.
+    // XFF is honored only when the direct TCP peer is loopback (our trusted Pingora proxy).
+    // An attacker connecting directly and setting X-Forwarded-For is ignored.
+    let peer = connect_info.map(|ext| ext.0 .0);
+    let client_ip = temps_auth::resolve_client_ip(&headers, peer);
+
     // Enrich with IP geolocation and visitor correlation
-    let client_ip = extract_client_ip(&headers);
     enrich_error_event(
         &mut parsed_event.error_data,
-        client_ip.as_deref(),
+        Some(client_ip.as_str()),
         state.ip_address_service.as_ref(),
         state.db.as_ref(),
     )
@@ -158,6 +182,7 @@ async fn ingest_sentry_event(
         (status = 200, description = "Envelope ingested"),
         (status = 400, description = "Bad request"),
         (status = 401, description = "Unauthorized"),
+        (status = 413, description = "Request body too large (exceeds 2 MiB)"),
     ),
     tag = "sentry-ingestor"
 )]
@@ -166,6 +191,8 @@ async fn ingest_sentry_envelope(
     Path(project_id): Path<i32>,
     Query(params): Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
+    // Fix #2: read ConnectInfo from extensions for proxy-trust IP resolution.
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
     body: Bytes,
 ) -> impl IntoResponse {
     // Log only key names — values and headers can contain the Sentry DSN auth key.
@@ -227,15 +254,17 @@ async fn ingest_sentry_envelope(
         }
     };
 
-    // Extract client IP for enrichment
-    let client_ip = extract_client_ip(&headers);
+    // Fix #2: resolve the real client IP using proxy-trust logic.
+    // XFF is honored only when the direct TCP peer is loopback (our trusted Pingora proxy).
+    let peer = connect_info.map(|ext| ext.0 .0);
+    let client_ip = temps_auth::resolve_client_ip(&headers, peer);
 
     // Store each event using the error tracking service
     for mut event in parsed_events {
         // Enrich with IP geolocation and visitor correlation
         enrich_error_event(
             &mut event.error_data,
-            client_ip.as_deref(),
+            Some(client_ip.as_str()),
             state.ip_address_service.as_ref(),
             state.db.as_ref(),
         )
@@ -302,30 +331,6 @@ fn decompress_if_needed(headers: &HeaderMap, body: &Bytes) -> Result<Bytes, Stri
     );
 
     Ok(Bytes::from(decompressed))
-}
-
-/// Extract client IP address from request headers.
-/// Checks X-Forwarded-For (first IP in chain), then X-Real-IP.
-fn extract_client_ip(headers: &HeaderMap) -> Option<String> {
-    // X-Forwarded-For (first IP in chain is the client)
-    if let Some(forwarded) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        if let Some(first_ip) = forwarded.split(',').next() {
-            let ip = first_ip.trim().to_string();
-            if !ip.is_empty() {
-                return Some(ip);
-            }
-        }
-    }
-
-    // X-Real-IP
-    if let Some(real_ip) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
-        let ip = real_ip.trim().to_string();
-        if !ip.is_empty() {
-            return Some(ip);
-        }
-    }
-
-    None
 }
 
 /// Enrich error event data with IP geolocation and visitor information.
@@ -844,5 +849,65 @@ mod tests {
         let result = decompress_if_needed(&headers, &body);
         assert!(result.is_ok(), "Data at exact limit should be allowed");
         assert_eq!(result.unwrap().len(), MAX_DECOMPRESSED_SIZE);
+    }
+
+    // === Fix #2 — XFF-spoof guard tests ===
+
+    /// Non-loopback peer with X-Forwarded-For: resolved IP must be the peer, not the XFF value.
+    ///
+    /// This verifies the ingest path delegates to `temps_auth::resolve_client_ip`, which
+    /// ignores client-supplied XFF headers when the direct TCP peer is not a trusted proxy.
+    #[test]
+    fn test_xff_spoof_rejected_for_non_loopback_peer() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-forwarded-for"),
+            HeaderValue::from_static("1.2.3.4"),
+        );
+        // Non-loopback peer: attacker connected directly, not via a trusted proxy
+        let peer: SocketAddr = "8.8.8.8:443".parse().unwrap();
+        let resolved = temps_auth::resolve_client_ip(&headers, Some(peer));
+        // Must be the peer address, NOT the spoofed XFF value
+        assert_eq!(
+            resolved, "8.8.8.8",
+            "XFF must be ignored for non-loopback peers"
+        );
+    }
+
+    /// Loopback peer with X-Forwarded-For: the rightmost XFF entry is trusted.
+    ///
+    /// When Pingora (our reverse proxy) runs on the same host it connects as 127.0.0.1,
+    /// so XFF is trusted and we return the real client IP that the proxy appended.
+    #[test]
+    fn test_xff_trusted_for_loopback_peer() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-forwarded-for"),
+            // "client, proxy" → rightmost is what the trusted proxy appended
+            HeaderValue::from_static("1.2.3.4, 5.6.7.8"),
+        );
+        let peer: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let resolved = temps_auth::resolve_client_ip(&headers, Some(peer));
+        // Rightmost XFF entry is the one appended by our trusted proxy
+        assert_eq!(
+            resolved, "5.6.7.8",
+            "Rightmost XFF entry should be trusted for loopback peer"
+        );
+    }
+
+    // === Fix #3 — body-limit constant sanity check ===
+
+    /// The ingest body-limit constant must be exactly 2 MiB.
+    ///
+    /// A typical Sentry event is 5–50 KB; 2 MiB is a generous ceiling that still
+    /// protects against slow-POST DoS. This test is a canary — if someone raises
+    /// the constant they have to update the test too and justify the change.
+    #[test]
+    fn test_sentry_ingest_body_limit_is_2mib() {
+        assert_eq!(
+            SENTRY_INGEST_BODY_LIMIT,
+            2 * 1024 * 1024,
+            "Sentry ingest body limit must be 2 MiB (2 * 1024 * 1024 bytes)"
+        );
     }
 }

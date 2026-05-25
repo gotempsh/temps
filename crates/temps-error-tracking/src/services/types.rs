@@ -43,6 +43,16 @@ pub enum ErrorTrackingError {
 
     #[error("Project not found")]
     ProjectNotFound,
+
+    /// Returned when an uploaded file or request body exceeds the allowed size.
+    ///
+    /// Maps to HTTP 413 Payload Too Large.
+    #[error("Payload too large: {field} exceeds {limit_bytes} bytes (got {actual_bytes})")]
+    PayloadTooLarge {
+        field: String,
+        limit_bytes: usize,
+        actual_bytes: usize,
+    },
 }
 
 /// Input data for creating a new error event

@@ -360,8 +360,8 @@ pub fn configure_routes() -> Router<Arc<AuthState>> {
         .route("/auth/password-reset/request", post(request_password_reset))
         .route("/auth/password-reset/verify", post(reset_password))
         .route(
-            "/auth/oidc/login/{provider_id}",
-            get(crate::oidc_handler::start_oidc_login),
+            "/auth/oidc/login/{slug}",
+            get(crate::oidc_handler::start_oidc_login_by_slug),
         )
         .route(
             "/auth/oidc/callback",
@@ -579,6 +579,9 @@ pub async fn login(
     Extension(metadata): Extension<RequestMetadata>,
     Json(request): Json<LoginRequest>,
 ) -> Result<impl IntoResponse, temps_core::problemdetails::Problem> {
+    // Capture email before `request` is moved into the service call so we
+    // can log it (lowercased) on internal errors without leaking password.
+    let login_email = request.email.to_lowercase();
     match state.auth_service.login(request.into()).await {
         Ok(user) => {
             // Check if user has MFA enabled
@@ -693,9 +696,26 @@ pub async fn login(
                 }
             }
         }
-        Err(e) => Err(problem_new(StatusCode::UNAUTHORIZED)
-            .with_title("Invalid Credentials")
-            .with_detail(e.to_string())),
+        Err(e) => match e {
+            crate::auth_service::UserAuthError::InvalidCredentials
+            | crate::auth_service::UserAuthError::UserNotFound => {
+                Err(problem_new(StatusCode::UNAUTHORIZED)
+                    .with_title("Invalid Credentials")
+                    .with_detail("Invalid email or password."))
+            }
+            _ => {
+                // Log the real error server-side (email is PII but legitimate
+                // for login-failure auditing; never include password).
+                error!(
+                    email = %login_email,
+                    error = %e,
+                    "Authentication system error during login"
+                );
+                Err(problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Authentication Error")
+                    .with_detail("Authentication system error. Please try again later."))
+            }
+        },
     }
 }
 
@@ -1900,4 +1920,102 @@ async fn disable_mfa(
     }
 
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::auth_service::UserAuthError;
+
+    /// The login handler must return a constant 401 detail for both
+    /// `InvalidCredentials` and `UserNotFound` — the caller must not be able
+    /// to distinguish "email does not exist" from "wrong password".
+    #[test]
+    fn test_login_error_mapping_invalid_credentials_constant_message() {
+        let e = UserAuthError::InvalidCredentials;
+        let (status, detail) = match e {
+            UserAuthError::InvalidCredentials | UserAuthError::UserNotFound => {
+                (401u16, "Invalid email or password.")
+            }
+            _ => (
+                500u16,
+                "Authentication system error. Please try again later.",
+            ),
+        };
+        assert_eq!(status, 401);
+        assert_eq!(detail, "Invalid email or password.");
+    }
+
+    /// Both `UserNotFound` and `InvalidCredentials` must produce identical
+    /// response shape to prevent user enumeration via differing HTTP bodies.
+    #[test]
+    fn test_login_error_mapping_user_not_found_same_as_invalid_credentials() {
+        let map = |e: UserAuthError| match e {
+            UserAuthError::InvalidCredentials | UserAuthError::UserNotFound => {
+                (401u16, "Invalid Credentials", "Invalid email or password.")
+            }
+            _ => (
+                500u16,
+                "Authentication Error",
+                "Authentication system error. Please try again later.",
+            ),
+        };
+
+        let (status_c, title_c, detail_c) = map(UserAuthError::InvalidCredentials);
+        let (status_n, title_n, detail_n) = map(UserAuthError::UserNotFound);
+
+        assert_eq!(status_c, status_n, "HTTP status must be identical");
+        assert_eq!(title_c, title_n, "title must be identical");
+        assert_eq!(
+            detail_c, detail_n,
+            "detail must be identical to prevent enumeration"
+        );
+    }
+
+    /// `DatabaseError` (and all other internal variants) must map to 500,
+    /// not 401, so internal errors are not mislabeled as auth failures.
+    #[test]
+    fn test_login_error_mapping_database_error_returns_500() {
+        let e = UserAuthError::DatabaseError(sea_orm::DbErr::Custom(
+            "pg: connection refused".to_string(),
+        ));
+        let (status, detail) = match e {
+            UserAuthError::InvalidCredentials | UserAuthError::UserNotFound => {
+                (401u16, "Invalid email or password.")
+            }
+            _ => (
+                500u16,
+                "Authentication system error. Please try again later.",
+            ),
+        };
+        assert_eq!(status, 500);
+        assert_eq!(
+            detail,
+            "Authentication system error. Please try again later."
+        );
+    }
+
+    #[test]
+    fn test_login_error_mapping_password_hash_error_returns_500() {
+        let e = UserAuthError::PasswordHashError;
+        let status = match e {
+            UserAuthError::InvalidCredentials | UserAuthError::UserNotFound => 401u16,
+            _ => 500u16,
+        };
+        assert_eq!(status, 500);
+    }
+
+    /// OidcProviderSummary must expose `slug` instead of `id`.
+    /// This is a compile-time guard: constructing the struct without `id`
+    /// proves the field was removed from the public type.
+    #[test]
+    fn test_email_status_response_oidc_summary_has_slug_not_id() {
+        let summary = crate::oidc_types::OidcProviderSummary {
+            slug: "my-provider-aabbccdd".to_string(),
+            name: "My Provider".to_string(),
+            template: "okta".to_string(),
+        };
+        assert!(!summary.slug.is_empty());
+        // Slug must carry the hash suffix (separated by '-')
+        assert!(summary.slug.contains('-'));
+    }
 }

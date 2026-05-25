@@ -18,7 +18,7 @@
 //! | `GET /api/0/organizations/{org}/chunk-upload/` | `chunk_upload_options` (stub) |
 
 use axum::{
-    extract::{Multipart, Path, State},
+    extract::{DefaultBodyLimit, Multipart, Path, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post, put},
@@ -117,7 +117,32 @@ pub struct SentryChunkUploadResponse {
 
 // --- Route configuration ---
 
+/// Maximum body size for the sentry-compat source map upload routes (50 MiB).
+///
+/// DSN public keys are semi-public (embedded in browser bundles), so we cannot
+/// rely on authentication alone to prevent abuse. The outer body limit rejects
+/// oversized uploads before they reach the multipart reader. A per-field inline
+/// check (`MAX_SOURCE_MAP_BYTES`) provides additional defense-in-depth.
+pub const SENTRY_UPLOAD_BODY_LIMIT: usize = 50 * 1024 * 1024;
+
+/// Maximum size for a single source map file field (50 MiB).
+///
+/// Applied after the compressed body has been received. This is a second line
+/// of defense: the outer `DefaultBodyLimit` cap fires first, but if multiple
+/// small files add up the per-field check catches any single oversized field.
+const MAX_SOURCE_MAP_BYTES: usize = 50 * 1024 * 1024;
+
 pub fn configure_sentry_compat_routes() -> Router<Arc<SentryCompatAppState>> {
+    // Fix #4: the upload route gets its own sub-router with a 50 MiB body limit.
+    // The other routes (create_release, finalize, list) use the default Axum
+    // body limit (2 MiB) which is fine for small JSON payloads.
+    let upload_routes = Router::new()
+        .route(
+            "/0/projects/{org_slug}/{project_slug}/releases/{version}/files/",
+            post(upload_release_file).get(list_release_files),
+        )
+        .layer(DefaultBodyLimit::max(SENTRY_UPLOAD_BODY_LIMIT));
+
     Router::new()
         .route(
             "/0/organizations/{org_slug}/releases/",
@@ -134,13 +159,10 @@ pub fn configure_sentry_compat_routes() -> Router<Arc<SentryCompatAppState>> {
             put(finalize_project_release),
         )
         .route(
-            "/0/projects/{org_slug}/{project_slug}/releases/{version}/files/",
-            post(upload_release_file).get(list_release_files),
-        )
-        .route(
             "/0/organizations/{org_slug}/chunk-upload/",
             get(chunk_upload_options),
         )
+        .merge(upload_routes)
 }
 
 // --- Auth helper ---
@@ -457,6 +479,9 @@ async fn finalize_project_release(
 ///
 /// Accepts the same multipart format as the Sentry release files API.
 /// The `name` field should be the URL path of the file (e.g., `~/dist/bundle.js.map`).
+///
+/// The route has a 50 MiB body limit applied at the router level (Fix #4).
+/// A per-field size check provides an additional defense-in-depth layer.
 #[utoipa::path(
     tag = "sentry-compat",
     post,
@@ -471,6 +496,7 @@ async fn finalize_project_release(
         (status = 400, description = "Bad request"),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Project not found"),
+        (status = 413, description = "Source map file exceeds the 50 MiB per-field limit"),
     ),
 )]
 async fn upload_release_file(
@@ -509,7 +535,33 @@ async fn upload_release_file(
                     }
                 }
                 match field.bytes().await {
-                    Ok(data) => file_data = Some(data.to_vec()),
+                    Ok(data) => {
+                        // Fix #4 — defense-in-depth per-field size cap.
+                        //
+                        // The route-level DefaultBodyLimit fires first (50 MiB for the whole
+                        // request). This per-field check is a second layer that catches a single
+                        // oversized field even if the overall request body somehow slips through
+                        // (e.g. when a future middleware changes the outer cap).
+                        if data.len() > MAX_SOURCE_MAP_BYTES {
+                            let field_name = file_name.as_deref().unwrap_or("<unknown>");
+                            warn!(
+                                field_name = field_name,
+                                size_bytes = data.len(),
+                                limit_bytes = MAX_SOURCE_MAP_BYTES,
+                                "source map upload rejected: field exceeds size limit"
+                            );
+                            return (
+                                StatusCode::PAYLOAD_TOO_LARGE,
+                                format!(
+                                    "source map exceeds {} bytes (got {})",
+                                    MAX_SOURCE_MAP_BYTES,
+                                    data.len()
+                                ),
+                            )
+                                .into_response();
+                        }
+                        file_data = Some(data.to_vec());
+                    }
                     Err(e) => {
                         return (
                             StatusCode::BAD_REQUEST,
@@ -740,6 +792,8 @@ async fn chunk_upload_options(Path(_org_slug): Path<String>) -> impl IntoRespons
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn test_bearer_token_extraction() {
         // Test that auth header parsing logic is correct
@@ -772,5 +826,34 @@ mod tests {
             short_version.to_string()
         };
         assert_eq!(short, "1.0.0");
+    }
+
+    // === Fix #4 — body-limit constant sanity checks ===
+
+    /// The upload body-limit constant must be exactly 50 MiB.
+    ///
+    /// Source maps for large production apps can be several MiB each. 50 MiB
+    /// is a reasonable ceiling for a full release upload while still bounding
+    /// abuse from unauthenticated or semi-authenticated callers.
+    #[test]
+    fn test_sentry_upload_body_limit_is_50mib() {
+        assert_eq!(
+            SENTRY_UPLOAD_BODY_LIMIT,
+            50 * 1024 * 1024,
+            "Sentry upload body limit must be 50 MiB"
+        );
+    }
+
+    /// The per-field cap must match the route-level cap.
+    ///
+    /// If MAX_SOURCE_MAP_BYTES were larger than SENTRY_UPLOAD_BODY_LIMIT, the
+    /// per-field check would never fire (the outer cap fires first). Keep them
+    /// equal so both layers are meaningful.
+    #[test]
+    fn test_per_field_cap_matches_route_cap() {
+        assert_eq!(
+            MAX_SOURCE_MAP_BYTES, SENTRY_UPLOAD_BODY_LIMIT,
+            "Per-field cap and route-level cap must be equal"
+        );
     }
 }

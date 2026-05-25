@@ -1,9 +1,49 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use utoipa::ToSchema;
+
+/// Derive a stable URL slug for an OIDC provider that can be shown to
+/// unauthenticated callers without leaking the internal integer primary key.
+///
+/// Algorithm: `lowercase-hyphenated-name` + `-` + first 4 bytes of
+/// `SHA-256(id_le_bytes || name_utf8)` as lowercase hex. The hash suffix
+/// makes the slug collision-resistant across providers that happen to share
+/// the same display name after slugification.
+pub fn derive_provider_slug(id: i32, name: &str) -> String {
+    // Slugify: lowercase, replace non-alphanumeric runs with hyphens, trim.
+    let base: String = name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+
+    // 4-byte hash suffix for collision resistance and to prevent reverse-
+    // mapping the integer ID from the slug alone.
+    let mut hasher = Sha256::new();
+    hasher.update(id.to_le_bytes());
+    hasher.update(name.as_bytes());
+    let digest = hasher.finalize();
+    let suffix = hex::encode(&digest[..4]);
+
+    if base.is_empty() {
+        // Degenerate name (all non-alphanumeric). Fall back to pure hash.
+        suffix
+    } else {
+        format!("{base}-{suffix}")
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct OidcProviderSummary {
-    pub id: i32,
+    /// Stable opaque slug — use this as the path parameter when initiating
+    /// OIDC login (`/auth/oidc/login/{slug}`). The integer database ID is
+    /// intentionally omitted from this public endpoint to prevent provider
+    /// enumeration.
+    pub slug: String,
     pub name: String,
     /// The template the provider was created from — e.g. `keycloak`,
     /// `okta`, `auth0`, `google`, `azure-ad`, or `generic`. Surfaced on
@@ -179,5 +219,58 @@ pub fn role_mapping_to_response(
         priority: mapping.priority,
         idp_group: mapping.idp_group.clone(),
         role: mapping.role.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_derive_provider_slug_basic() {
+        let slug = derive_provider_slug(1, "Corp Okta");
+        // Must start with slugified name
+        assert!(slug.starts_with("corp-okta-"), "slug: {slug}");
+        // Suffix must be 8 hex chars (4 bytes)
+        let suffix = slug.split('-').next_back().unwrap();
+        assert_eq!(suffix.len(), 8, "hex suffix length: {slug}");
+        assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_derive_provider_slug_deterministic() {
+        let a = derive_provider_slug(42, "Internal Keycloak");
+        let b = derive_provider_slug(42, "Internal Keycloak");
+        assert_eq!(a, b, "slug must be deterministic");
+    }
+
+    #[test]
+    fn test_derive_provider_slug_different_ids_differ() {
+        let a = derive_provider_slug(1, "Google");
+        let b = derive_provider_slug(2, "Google");
+        assert_ne!(
+            a, b,
+            "same name but different IDs must produce different slugs"
+        );
+    }
+
+    #[test]
+    fn test_derive_provider_slug_empty_name() {
+        // All non-alphanumeric name → pure 8-char hash
+        let slug = derive_provider_slug(5, "---");
+        assert_eq!(slug.len(), 8, "pure hash fallback: {slug}");
+    }
+
+    #[test]
+    fn test_oidc_provider_summary_no_id_field() {
+        // Compile-time check: OidcProviderSummary has `slug` but no `id`.
+        let summary = OidcProviderSummary {
+            slug: "test-slug-aabbccdd".to_string(),
+            name: "Test Provider".to_string(),
+            template: "generic".to_string(),
+        };
+        assert_eq!(summary.slug, "test-slug-aabbccdd");
+        // The following would be a compile error if `id` were present:
+        // let _ = summary.id;
     }
 }
