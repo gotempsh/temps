@@ -989,14 +989,7 @@ impl DockerSandboxProvider {
     ///
     /// The filter is **best-effort**: if iptables is unavailable (rootless Docker,
     /// macOS Docker Desktop, missing CAP_NET_ADMIN) a `WARN` is logged and sandbox
-    /// creation continues normally.
-    ///
-    /// To disable the filter on platforms that provide equivalent isolation at the
-    /// host or network layer, set the environment variable:
-    ///
-    ///   `TEMPS_SANDBOX_SKIP_EGRESS_FILTER=1`
-    ///
-    /// On macOS the filter is automatically skipped regardless of that variable
+    /// creation continues normally. On macOS the filter is automatically skipped
     /// because iptables is not available on the host (Docker Desktop runs inside a
     /// Linux VM that already isolates sandbox traffic from the macOS host network).
     async fn ensure_network(&self) -> Result<(), AgentError> {
@@ -2286,24 +2279,6 @@ impl SandboxProvider for DockerSandboxProvider {
 /// every call and uses `-D` before `-I` for the FORWARD hook, so running on
 /// every server start is safe and never accumulates duplicate rules.
 async fn apply_sandbox_egress_filter(docker: &Docker, network_id: &str) {
-    // Operator escape hatch: set TEMPS_SANDBOX_SKIP_EGRESS_FILTER=1 to disable
-    // iptables egress filtering entirely.  Use this on platforms where iptables
-    // is unavailable or managed externally (e.g. Docker Desktop on macOS, rootless
-    // Docker with a separate nftables policy, or CI environments without
-    // CAP_NET_ADMIN).  When skipped, sandboxes can reach RFC-1918 addresses —
-    // only set this if your deployment environment provides equivalent isolation
-    // at the host or network layer.
-    if std::env::var("TEMPS_SANDBOX_SKIP_EGRESS_FILTER").as_deref() == Ok("1") {
-        tracing::warn!(
-            network_id = network_id,
-            "TEMPS_SANDBOX_SKIP_EGRESS_FILTER=1 is set; sandbox egress filter will not \
-             be applied. Sandboxes may reach internal network addresses (RFC-1918, \
-             169.254/16, 127/8). Only set this if your environment provides equivalent \
-             isolation at the host or network layer."
-        );
-        return;
-    }
-
     // This is a Linux-only operation.  On macOS (developer machines running
     // Docker Desktop), iptables doesn't exist on the host — the sandbox runs
     // inside a VM and host-level filtering is irrelevant.

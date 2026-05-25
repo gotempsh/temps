@@ -13,10 +13,7 @@ use super::git_provider::{
     AuthMethod, GitProviderError, GitProviderFactory, GitProviderService, GitProviderType,
 };
 use temps_config::ConfigService;
-use temps_core::{
-    url_validation::{redact_url_password, validate_external_url},
-    JobQueue, UtcDateTime,
-};
+use temps_core::{JobQueue, UtcDateTime};
 use temps_entities::{git_provider_connections, git_providers, repositories};
 
 // OAuth scope constants
@@ -106,11 +103,6 @@ pub enum GitProviderManagerError {
 
     #[error("OAuth state not found or expired: {0}")]
     OAuthStateInvalid(String),
-
-    /// A caller-supplied provider URL (e.g. GitLab `base_url`) failed SSRF
-    /// validation (Fix #14).
-    #[error("Provider URL '{url}' is not permitted: {reason}")]
-    InvalidProviderUrl { url: String, reason: String },
 }
 
 /// Hard ceiling on a single sync run. If we haven't finished within this
@@ -1180,38 +1172,6 @@ impl GitProviderManager {
         Ok(provider)
     }
 
-    /// Validate a GitLab `base_url` supplied by the caller, honouring the
-    /// `TEMPS_GIT_ALLOW_PRIVATE_ENDPOINTS=1` escape hatch for operators who
-    /// run a self-hosted GitLab on a private LAN.
-    ///
-    /// When the env var is unset (the default) the URL is checked by
-    /// `validate_external_url`, which blocks private / loopback /
-    /// cloud-metadata addresses to prevent SSRF.  When the var is set the
-    /// check is skipped, but a `tracing::warn!` is emitted so the bypass is
-    /// always visible in structured logs.
-    fn validate_gitlab_base_url(url: &str) -> Result<(), GitProviderManagerError> {
-        if std::env::var("TEMPS_GIT_ALLOW_PRIVATE_ENDPOINTS")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-        {
-            // Escape hatch: operator explicitly opted in to private endpoints.
-            // Emit a structured warning that will appear in every log sink.
-            tracing::warn!(
-                url = %redact_url_password(url),
-                "TEMPS_GIT_ALLOW_PRIVATE_ENDPOINTS=1 is set — SSRF validation \
-                 bypassed for GitLab base_url; ensure this host is intentional"
-            );
-            return Ok(());
-        }
-
-        validate_external_url(url).map(|_| ()).map_err(|e| {
-            GitProviderManagerError::InvalidProviderUrl {
-                url: redact_url_password(url),
-                reason: e.to_string(),
-            }
-        })
-    }
-
     /// Create a git provider entry for GitLab PAT
     pub async fn create_gitlab_pat_provider(
         &self,
@@ -1220,12 +1180,6 @@ impl GitProviderManager {
         user_id: i32,
         base_url: Option<String>,
     ) -> Result<git_providers::Model, GitProviderManagerError> {
-        // SSRF guard (Fix #14): validate base_url before instantiating the provider.
-        // Respects TEMPS_GIT_ALLOW_PRIVATE_ENDPOINTS=1 for LAN-hosted GitLab.
-        if let Some(ref url) = base_url {
-            Self::validate_gitlab_base_url(url)?;
-        }
-
         let auth_method = AuthMethod::PersonalAccessToken {
             token: pat_token.clone(),
         };
@@ -1300,12 +1254,6 @@ impl GitProviderManager {
         redirect_uri: String,
         base_url: Option<String>,
     ) -> Result<git_providers::Model, GitProviderManagerError> {
-        // SSRF guard (Fix #14): validate base_url before instantiating the provider.
-        // Respects TEMPS_GIT_ALLOW_PRIVATE_ENDPOINTS=1 for LAN-hosted GitLab.
-        if let Some(ref url) = base_url {
-            Self::validate_gitlab_base_url(url)?;
-        }
-
         let auth_method = AuthMethod::OAuth {
             client_id,
             client_secret,
@@ -5486,151 +5434,5 @@ mod tests {
         // Verify the other template's files were not included
         assert!(!file_names.contains(&"main.py"));
         assert!(!file_names.contains(&"README.md"));
-    }
-
-    // Fix #14 — GitLab base_url SSRF validation (pure unit tests, no DB required)
-    //
-    // The `default_*` tests exercise the guard when
-    // TEMPS_GIT_ALLOW_PRIVATE_ENDPOINTS is unset (the production default).
-    // The `allow_private_*` tests set the env var to "1" and verify that
-    // the same URLs are accepted — important for LAN GitLab operators.
-    //
-    // IMPORTANT: these tests manipulate process-wide env vars, so each test
-    // that sets the env var must clean up before returning.  The tests also
-    // call `validate_gitlab_base_url` through a thin wrapper so we don't
-    // need a full service instance.
-    mod ssrf_base_url {
-        use super::super::GitProviderManager;
-        use super::super::GitProviderManagerError;
-        use std::sync::Mutex;
-
-        /// Serialise every test in this module that touches the env var.
-        /// `cargo test` runs tests in the same process in parallel by default;
-        /// without the lock, two tests can observe each other's env-var state.
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-        /// Thin wrapper so tests can call the private helper without
-        /// constructing a full `GitProviderManager`.
-        fn check(url: &str) -> Result<(), GitProviderManagerError> {
-            GitProviderManager::validate_gitlab_base_url(url)
-        }
-
-        // ---- Default mode (env var unset / "0") ----------------------------
-
-        #[test]
-        fn test_cloud_metadata_rejected_by_default() {
-            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            std::env::remove_var("TEMPS_GIT_ALLOW_PRIVATE_ENDPOINTS");
-            let result = check("http://169.254.169.254/latest/meta-data");
-            assert!(
-                result.is_err(),
-                "cloud metadata endpoint must be rejected when env var is unset"
-            );
-        }
-
-        #[test]
-        fn test_private_ip_rejected_by_default() {
-            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            std::env::remove_var("TEMPS_GIT_ALLOW_PRIVATE_ENDPOINTS");
-            let result = check("http://192.168.1.10/gitlab");
-            assert!(
-                result.is_err(),
-                "RFC-1918 address must be rejected when env var is unset"
-            );
-        }
-
-        #[test]
-        fn test_localhost_rejected_by_default() {
-            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            std::env::remove_var("TEMPS_GIT_ALLOW_PRIVATE_ENDPOINTS");
-            let result = check("http://localhost:8080");
-            assert!(
-                result.is_err(),
-                "loopback address must be rejected when env var is unset"
-            );
-        }
-
-        #[test]
-        fn test_gitlab_com_accepted_by_default() {
-            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            std::env::remove_var("TEMPS_GIT_ALLOW_PRIVATE_ENDPOINTS");
-            let result = check("https://gitlab.com");
-            assert!(result.is_ok(), "public gitlab.com should be accepted");
-        }
-
-        #[test]
-        fn test_self_hosted_public_domain_accepted_by_default() {
-            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            std::env::remove_var("TEMPS_GIT_ALLOW_PRIVATE_ENDPOINTS");
-            let result = check("https://gitlab.example.com");
-            assert!(
-                result.is_ok(),
-                "publicly routable self-hosted GitLab should be accepted"
-            );
-        }
-
-        // ---- Error message contains redacted URL ---------------------------
-
-        #[test]
-        fn test_error_message_redacts_password() {
-            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            std::env::remove_var("TEMPS_GIT_ALLOW_PRIVATE_ENDPOINTS");
-            let url_with_creds = "http://user:supersecret@192.168.1.10/gitlab";
-            let err = check(url_with_creds).unwrap_err();
-            let msg = err.to_string();
-            assert!(
-                !msg.contains("supersecret"),
-                "error message must not expose the plaintext password; got: {msg}"
-            );
-            assert!(
-                msg.contains("***"),
-                "error message should contain redacted placeholder; got: {msg}"
-            );
-        }
-
-        // ---- TEMPS_GIT_ALLOW_PRIVATE_ENDPOINTS=1 escape hatch --------------
-
-        #[test]
-        fn test_private_ip_allowed_when_escape_hatch_set() {
-            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            // RAII guard restores env var even if the assertion panics.
-            let _guard = EnvVarGuard::set("TEMPS_GIT_ALLOW_PRIVATE_ENDPOINTS", "1");
-            let result = check("http://192.168.1.10/gitlab");
-            assert!(
-                result.is_ok(),
-                "RFC-1918 address must be accepted when TEMPS_GIT_ALLOW_PRIVATE_ENDPOINTS=1"
-            );
-        }
-
-        #[test]
-        fn test_cloud_metadata_allowed_when_escape_hatch_set() {
-            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let _guard = EnvVarGuard::set("TEMPS_GIT_ALLOW_PRIVATE_ENDPOINTS", "1");
-            let result = check("http://169.254.169.254");
-            assert!(
-                result.is_ok(),
-                "cloud metadata must be accepted when TEMPS_GIT_ALLOW_PRIVATE_ENDPOINTS=1"
-            );
-        }
-
-        /// RAII guard that sets an env var and removes it on drop, so tests
-        /// that manipulate env vars cannot leak state into other tests even
-        /// if an assertion panics.
-        struct EnvVarGuard {
-            key: &'static str,
-        }
-
-        impl EnvVarGuard {
-            fn set(key: &'static str, value: &str) -> Self {
-                std::env::set_var(key, value);
-                Self { key }
-            }
-        }
-
-        impl Drop for EnvVarGuard {
-            fn drop(&mut self) {
-                std::env::remove_var(self.key);
-            }
-        }
     }
 }

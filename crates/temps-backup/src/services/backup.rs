@@ -5,8 +5,6 @@ use anyhow::Result;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::{Client as S3Client, Config};
 use chrono::{DateTime, Duration, Timelike, Utc};
-use temps_core::url_validation::validate_external_url;
-
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseBackend, DatabaseConnection, EntityTrait,
     FromQueryResult, IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, Statement,
@@ -406,39 +404,6 @@ pub enum BackupError {
          wait for it to finish before triggering a new run"
     )]
     ScheduleRunAlreadyInFlight { existing_run_id: i64 },
-
-    /// S3 endpoint failed SSRF validation (Fix #13).
-    ///
-    /// Returned on both the write path (`create_s3_source`) and the read path
-    /// (`create_s3_client` against a persisted record).  Set the env var
-    /// `TEMPS_S3_ALLOW_PRIVATE_ENDPOINTS=1` to bypass this check for
-    /// self-hosted MinIO / RustFS on a private LAN.
-    #[error(
-        "S3 endpoint '{endpoint}' is blocked by SSRF validation: {reason}. \
-             To allow private/loopback endpoints for self-hosted S3 (MinIO/RustFS), \
-             set TEMPS_S3_ALLOW_PRIVATE_ENDPOINTS=1 on the server."
-    )]
-    InvalidS3Endpoint { endpoint: String, reason: String },
-}
-
-/// Env-var-aware SSRF guard for S3 endpoints (Fix #13).
-///
-/// Calls `validate_external_url` unless `TEMPS_S3_ALLOW_PRIVATE_ENDPOINTS=1`
-/// is set in the environment.  When bypassed, the validation is skipped
-/// silently — the startup warning in `BackupPlugin` already told the operator.
-fn validate_s3_endpoint_url(endpoint_url: &str) -> Result<(), BackupError> {
-    if std::env::var("TEMPS_S3_ALLOW_PRIVATE_ENDPOINTS")
-        .map(|v| v == "1")
-        .unwrap_or(false)
-    {
-        return Ok(());
-    }
-    validate_external_url(endpoint_url)
-        .map(|_| ())
-        .map_err(|e| BackupError::InvalidS3Endpoint {
-            endpoint: endpoint_url.to_owned(),
-            reason: e.to_string(),
-        })
 }
 
 impl From<aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::put_object::PutObjectError>>
@@ -2051,11 +2016,6 @@ impl BackupService {
             } else {
                 format!("http://{}", endpoint)
             };
-            // SSRF guard (Fix #13) — read path: already-persisted endpoint.
-            // Validation failure here means the stored value is blocked;
-            // the operator must delete and re-create the S3 source or set
-            // TEMPS_S3_ALLOW_PRIVATE_ENDPOINTS=1.
-            validate_s3_endpoint_url(&endpoint_url)?;
             config_builder = config_builder.endpoint_url(endpoint_url);
         }
 
@@ -2091,8 +2051,6 @@ impl BackupService {
             } else {
                 format!("http://{}", endpoint)
             };
-            // SSRF guard (Fix #13) — pre-persistence test path.
-            validate_s3_endpoint_url(&endpoint_url)?;
             config_builder = config_builder.endpoint_url(endpoint_url);
         }
 
@@ -3702,19 +3660,6 @@ impl BackupService {
             return Err(BackupError::Validation(
                 "S3 source name cannot be empty".into(),
             ));
-        }
-
-        // SSRF guard (Fix #13): validate endpoint at write path so bad endpoints
-        // are never persisted to the database.
-        if let Some(ref endpoint) = request.endpoint {
-            if !endpoint.is_empty() {
-                let endpoint_url = if endpoint.starts_with("http") {
-                    endpoint.clone()
-                } else {
-                    format!("http://{}", endpoint)
-                };
-                validate_s3_endpoint_url(&endpoint_url)?;
-            }
         }
 
         // Test S3 connection and auto-create bucket before persisting
@@ -7433,13 +7378,6 @@ mod tests {
             println!("Docker not available, skipping test");
             return;
         }
-        // Allow the test's localhost MinIO endpoint through the SSRF guard.
-        // Safety: test-only; unit tests that check the "rejected" path skip
-        // themselves when they observe this variable set.
-        #[allow(unsafe_code)]
-        unsafe {
-            std::env::set_var("TEMPS_S3_ALLOW_PRIVATE_ENDPOINTS", "1");
-        }
 
         use temps_database::test_utils::TestDatabase;
         use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
@@ -7705,13 +7643,6 @@ mod tests {
         if bollard::Docker::connect_with_local_defaults().is_err() {
             println!("Docker not available, skipping test");
             return;
-        }
-        // Allow the test's localhost MinIO endpoint through the SSRF guard.
-        // Safety: test-only; unit tests that check the "rejected" path skip
-        // themselves when they observe this variable set.
-        #[allow(unsafe_code)]
-        unsafe {
-            std::env::set_var("TEMPS_S3_ALLOW_PRIVATE_ENDPOINTS", "1");
         }
 
         use temps_database::test_utils::TestDatabase;
@@ -9714,88 +9645,5 @@ mod tests {
             .await;
         // Silence unused warning on the QueryFilter / ColumnTrait imports.
         let _ = temps_entities::backup_schedule_services::Column::ScheduleId.eq(0);
-    }
-
-    // -----------------------------------------------------------------------
-    // Fix #13 — S3 endpoint SSRF validation via validate_s3_endpoint_url
-    //            (pure unit tests, no DB required)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_s3_endpoint_cloud_metadata_rejected() {
-        // Cloud-metadata endpoints (169.254.169.254) must be rejected.
-        // When TEMPS_S3_ALLOW_PRIVATE_ENDPOINTS=1 is set, validation is skipped
-        // entirely, so this endpoint would also be allowed. This test therefore
-        // skips when a concurrent Docker integration test has set the env var.
-        // In CI without Docker the race cannot occur.
-        if std::env::var("TEMPS_S3_ALLOW_PRIVATE_ENDPOINTS")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-        {
-            println!(
-                "Skipping test_s3_endpoint_cloud_metadata_rejected: \
-                 TEMPS_S3_ALLOW_PRIVATE_ENDPOINTS=1 is set (Docker integration test running)"
-            );
-            return;
-        }
-        let result = validate_s3_endpoint_url("http://169.254.169.254");
-        assert!(
-            result.is_err(),
-            "cloud metadata endpoint http://169.254.169.254 must be rejected"
-        );
-        assert!(
-            matches!(result.unwrap_err(), BackupError::InvalidS3Endpoint { .. }),
-            "must return InvalidS3Endpoint variant"
-        );
-    }
-
-    #[test]
-    fn test_s3_endpoint_localhost_rejected_without_env_var() {
-        // localhost:9000 (typical MinIO dev URL) must be rejected by default.
-        // Skip if the Docker integration tests have the env var set.
-        if std::env::var("TEMPS_S3_ALLOW_PRIVATE_ENDPOINTS")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-        {
-            println!(
-                "Skipping test_s3_endpoint_localhost_rejected_without_env_var: \
-                 TEMPS_S3_ALLOW_PRIVATE_ENDPOINTS=1 is set (Docker integration test running)"
-            );
-            return;
-        }
-        let result = validate_s3_endpoint_url("http://localhost:9000");
-        assert!(
-            result.is_err(),
-            "localhost S3 endpoint must be rejected when TEMPS_S3_ALLOW_PRIVATE_ENDPOINTS is unset"
-        );
-        assert!(
-            matches!(result.unwrap_err(), BackupError::InvalidS3Endpoint { .. }),
-            "must return InvalidS3Endpoint variant"
-        );
-    }
-
-    #[test]
-    fn test_s3_endpoint_localhost_accepted_with_env_var() {
-        // When TEMPS_S3_ALLOW_PRIVATE_ENDPOINTS=1 is set, operators running
-        // self-hosted MinIO/RustFS on a private LAN can use localhost endpoints.
-        //
-        // This test sets the env var temporarily. Concurrent tests that read
-        // the env var (localhost_rejected) will skip themselves if they observe
-        // it set, so there is no false-positive risk.
-        // Safety: test process; brief window of env-var mutation.
-        unsafe { std::env::set_var("TEMPS_S3_ALLOW_PRIVATE_ENDPOINTS", "1") };
-        let result = validate_s3_endpoint_url("http://localhost:9000");
-        unsafe { std::env::remove_var("TEMPS_S3_ALLOW_PRIVATE_ENDPOINTS") };
-        assert!(
-            result.is_ok(),
-            "localhost S3 endpoint must be accepted when TEMPS_S3_ALLOW_PRIVATE_ENDPOINTS=1"
-        );
-    }
-
-    #[test]
-    fn test_s3_endpoint_aws_public_accepted() {
-        // Canonical AWS S3 endpoint must always pass, regardless of env var.
-        let result = validate_s3_endpoint_url("https://s3.amazonaws.com");
-        assert!(result.is_ok(), "https://s3.amazonaws.com must be accepted");
     }
 }

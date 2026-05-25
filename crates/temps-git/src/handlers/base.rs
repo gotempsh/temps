@@ -101,11 +101,6 @@ impl From<GitProviderManagerError> for Problem {
             GitProviderManagerError::OAuthStateInvalid(msg) => problem_new(StatusCode::BAD_REQUEST)
                 .with_title("OAuth State Invalid")
                 .with_detail(msg),
-            GitProviderManagerError::InvalidProviderUrl { .. } => {
-                problem_new(StatusCode::BAD_REQUEST)
-                    .with_title("Invalid Provider URL")
-                    .with_detail(error.to_string())
-            }
         }
     }
 }

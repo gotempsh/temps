@@ -176,22 +176,6 @@ impl TempsPlugin for GitPlugin {
             );
             context.register_plugin_state("git", git_app_state);
 
-            // Security note: warn at startup if the SSRF bypass is active so it
-            // is always visible in structured logs, even when no GitLab provider
-            // creation triggers the per-call warning (Fix #14).
-            if std::env::var("TEMPS_GIT_ALLOW_PRIVATE_ENDPOINTS")
-                .map(|v| v == "1")
-                .unwrap_or(false)
-            {
-                tracing::warn!(
-                    env_var = "TEMPS_GIT_ALLOW_PRIVATE_ENDPOINTS",
-                    "SSRF validation for GitLab base_url is DISABLED — \
-                     private/loopback/cloud-metadata URLs are accepted. \
-                     Only set this if your GitLab instance is on a trusted \
-                     private network with no untrusted users."
-                );
-            }
-
             tracing::debug!("Git plugin services registered successfully");
             Ok(())
         })
