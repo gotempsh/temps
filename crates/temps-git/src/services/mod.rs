@@ -10,5 +10,7 @@ pub mod github;
 pub mod github_provider;
 pub mod gitlab_provider;
 pub mod gitlab_webhook;
+pub mod pr_comment_listener;
+pub mod pr_commenter;
 pub mod public_repo;
 pub mod repository;

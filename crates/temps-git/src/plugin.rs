@@ -74,7 +74,37 @@ impl TempsPlugin for GitPlugin {
             // Register as trait for other plugins to use
             let git_provider_trait: Arc<dyn crate::GitProviderManagerTrait> =
                 git_provider_manager.clone();
-            context.register_service(git_provider_trait);
+            context.register_service(git_provider_trait.clone());
+
+            // PR preview commenter — turns deployment lifecycle events into
+            // sticky PR/MR comments. Failures never block deploys (see
+            // GitPrCommenter::upsert_preview_comment).
+            let pr_commenter: Arc<dyn crate::PrCommenter> =
+                Arc::new(crate::GitPrCommenter::new(db.clone(), git_provider_trait));
+            context.register_service(pr_commenter.clone());
+
+            // Background listener: subscribes to DeploymentCreated /
+            // DeploymentSucceeded / DeploymentFailed and upserts the
+            // sticky comment for each phase. Self-contained — doesn't
+            // require any wiring in the deployment crate beyond the
+            // existing event broadcast.
+            let pr_comment_listener = Arc::new(
+                crate::services::pr_comment_listener::PrCommentListener::new(
+                    pr_commenter,
+                    db.clone(),
+                    queue_service.clone(),
+                ),
+            );
+            context.register_service(pr_comment_listener.clone());
+
+            tokio::spawn({
+                let listener = pr_comment_listener.clone();
+                async move {
+                    if let Err(e) = listener.start().await {
+                        tracing::error!("Failed to start PR comment listener: {}", e);
+                    }
+                }
+            });
 
             // Reset all git provider connections syncing flags to false at startup
             {

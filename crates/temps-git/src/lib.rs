@@ -20,3 +20,6 @@ pub use services::git_provider_manager_trait::{
     GitProviderManagerError, GitProviderManagerTrait, PullRequest, RepositoryInfo,
     ScopedTokenGrant, ScopedTokenOp,
 };
+pub use services::pr_commenter::{
+    CommentPhase, GitPrCommenter, PrCommenter, PrCommenterError, PreviewCommentContext,
+};
