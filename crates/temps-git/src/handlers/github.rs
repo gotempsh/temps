@@ -33,8 +33,6 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         ) // Installation callback
         .route("/webhook/git/github/events", post(github_webhook_events))
         .route("/webhook/git/github/install", get(github_install_webhook))
-        // Legacy webhook endpoints (kept for backward compatibility)
-        .route("/webhook/github", post(github_webhook))
         .route("/webhook/source/github/events", post(github_webhook_events))
         .route(
             "/webhook/source/github/install",
@@ -43,22 +41,6 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
 }
 
 // ===== Webhook Handlers =====
-
-#[derive(ToSchema, Serialize, Deserialize)]
-pub struct WebhookResponse {
-    message: String,
-}
-
-async fn github_webhook(Json(payload): Json<serde_json::Value>) -> Json<WebhookResponse> {
-    if let Some(event_type) = payload.get("event_type") {
-        if event_type == "push" {
-            info!("Received a GitHub push event");
-        }
-    }
-    Json(WebhookResponse {
-        message: "GitHub webhook received".to_string(),
-    })
-}
 
 #[derive(Deserialize)]
 #[allow(dead_code)] // Used for OAuth redirect query parsing
@@ -74,7 +56,6 @@ async fn handle_manifest_conversion_with_source(
     state: &Arc<AppState>,
     code: String,
     source: Option<String>,
-    headers: axum::http::HeaderMap,
 ) -> Result<(HeaderMap, Redirect), Problem> {
     info!(
         "Processing GitHub App manifest conversion with code: {} and source: {:?}",
@@ -123,23 +104,29 @@ async fn handle_manifest_conversion_with_source(
                 app.name, app.provider_id
             );
 
-            // Extract the host for redirect
-            let host = headers
-                .get("host")
-                .and_then(|h| h.to_str().ok())
-                .map(|host| {
-                    let scheme = headers
-                        .get("x-forwarded-proto")
-                        .and_then(|p| p.to_str().ok())
-                        .unwrap_or("https");
-                    format!("{}://{}", scheme, host)
-                })
-                .unwrap_or_else(|| "http://localhost:8080".to_string());
+            // Use the operator-configured external URL — never reflect client headers.
+            let external_url = state
+                .config_service
+                .get_external_url()
+                .await
+                .map_err(|e| {
+                    problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .with_title("Settings Unavailable")
+                        .with_detail(format!("Failed to load external URL: {}", e))
+                })?
+                .ok_or_else(|| {
+                    problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .with_title("External URL Not Configured")
+                        .with_detail(
+                            "Server external_url must be configured before completing GitHub App installation",
+                        )
+                })?;
+            let external_url = external_url.trim_end_matches('/');
 
             // Redirect to the git provider detail page with github_app_created flag
             let redirect_url = format!(
                 "{}/git-providers/{}?github_app_created=true",
-                host, app.provider_id
+                external_url, app.provider_id
             );
 
             let mut response_headers = HeaderMap::new();
@@ -616,7 +603,6 @@ async fn find_github_app_provider_for_installation(
 async fn github_app_auth_callback(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
-    headers: axum::http::HeaderMap,
 ) -> Result<(HeaderMap, Redirect), Problem> {
     let code = params.get("code").cloned().unwrap_or_default();
     let state_param = params.get("state").cloned();
@@ -639,17 +625,24 @@ async fn github_app_auth_callback(
             .with_detail("The 'code' parameter is required"));
     }
 
-    // Extract the host from the request headers for consistent redirect URLs
-    let host = headers
-        .get("host")
-        .and_then(|h| h.to_str().ok())
-        .map(|host| {
-            let scheme = headers
-                .get("x-forwarded-proto")
-                .and_then(|p| p.to_str().ok())
-                .unwrap_or("https");
-            format!("{}://{}", scheme, host)
-        });
+    // Use the operator-configured external URL — never reflect client headers.
+    let external_url = state
+        .config_service
+        .get_external_url()
+        .await
+        .map_err(|e| {
+            problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Settings Unavailable")
+                .with_detail(format!("Failed to load external URL: {}", e))
+        })?
+        .ok_or_else(|| {
+            problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("External URL Not Configured")
+                .with_detail(
+                    "Server external_url must be configured before completing GitHub App installation",
+                )
+        })?;
+    let external_url = external_url.trim_end_matches('/').to_string();
 
     // Determine the flow type based on parameters:
     // 1. Manifest flow: Only has 'code' and 'state' parameters
@@ -701,16 +694,12 @@ async fn github_app_auth_callback(
         let redirect_url = if let Some(pid) = provider_id {
             format!(
                 "{}/git-providers/{}?installation_id={}&github_installation_processing=true",
-                host.unwrap_or_else(|| "http://localhost:8080".to_string()),
-                pid,
-                installation_id
+                external_url, pid, installation_id
             )
         } else {
             format!(
-                "{}{}?installation_id={}&github_installation_processing=true",
-                host.unwrap_or_else(|| "http://localhost:8080".to_string()),
-                "/git-sources",
-                installation_id
+                "{}/git-sources?installation_id={}&github_installation_processing=true",
+                external_url, installation_id
             )
         };
 
@@ -730,13 +719,13 @@ async fn github_app_auth_callback(
             state_param
         );
         // This is a manifest conversion - the code needs to be exchanged for a GitHub App
-        return handle_manifest_conversion_with_source(&state, code, state_param, headers).await;
+        return handle_manifest_conversion_with_source(&state, code, state_param).await;
     }
 
     // For auth-only flow (no installation_id yet), redirect and wait for webhook
     info!("OAuth authorization code received without installation_id - waiting for installation webhook");
 
-    let redirect_url = host.unwrap_or_else(|| "http://localhost:8080".to_string()) + "/dashboard";
+    let redirect_url = format!("{}/dashboard", external_url);
 
     let mut response_headers = HeaderMap::new();
     response_headers.insert("Cache-Control", "no-store".parse().unwrap());
@@ -763,9 +752,8 @@ async fn github_app_auth_callback(
     tag = "Git Providers"
 )]
 async fn github_app_installation_callback(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
-    headers: axum::http::HeaderMap,
 ) -> Result<(HeaderMap, Redirect), Problem> {
     // Installation callback may or may not have a code
     let code = params.get("code").cloned();
@@ -773,18 +761,6 @@ async fn github_app_installation_callback(
         .get("installation_id")
         .and_then(|id| id.parse::<i64>().ok());
     let setup_action = params.get("setup_action").cloned();
-
-    // Extract the host from the request headers for consistent callback URL generation
-    let host = headers
-        .get("host")
-        .and_then(|h| h.to_str().ok())
-        .map(|host| {
-            let scheme = headers
-                .get("x-forwarded-proto")
-                .and_then(|p| p.to_str().ok())
-                .unwrap_or("https");
-            format!("{}://{}/api", scheme, host)
-        });
 
     // Log the received parameters for debugging
     info!(
@@ -823,8 +799,27 @@ async fn github_app_installation_callback(
         installation_id
     );
 
+    // Use the operator-configured external URL — never reflect client headers.
+    let external_url = state
+        .config_service
+        .get_external_url()
+        .await
+        .map_err(|e| {
+            problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Settings Unavailable")
+                .with_detail(format!("Failed to load external URL: {}", e))
+        })?
+        .ok_or_else(|| {
+            problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("External URL Not Configured")
+                .with_detail(
+                    "Server external_url must be configured before completing GitHub App installation",
+                )
+        })?;
+    let external_url = external_url.trim_end_matches('/');
+
     // Redirect to dashboard - let the webhook handle installation creation
-    let redirect_url = host.unwrap_or_else(|| "http://localhost:8080".to_string()) + "/dashboard";
+    let redirect_url = format!("{}/dashboard", external_url);
 
     let mut response_headers = HeaderMap::new();
     response_headers.insert("Cache-Control", "no-store".parse().unwrap());

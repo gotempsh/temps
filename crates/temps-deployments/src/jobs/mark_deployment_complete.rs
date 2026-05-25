@@ -900,14 +900,15 @@ impl MarkDeploymentCompleteJob {
                     "deployment_id": deployment_id,
                     "timestamp": chrono::Utc::now().to_rfc3339()
                 });
-                let notify_sql = format!(
-                    "SELECT pg_notify('project_route_change', '{}')",
-                    notify_payload.to_string().replace('\'', "''")
-                );
+                // Use a bound parameter for the payload to avoid any risk of SQL
+                // injection if a user-controlled field (e.g. project name, branch)
+                // is ever added to notify_payload upstream. The channel name is a
+                // hardcoded string literal and cannot be parameterised in libpq.
                 if let Err(e) = db
-                    .execute(sea_orm::Statement::from_string(
+                    .execute(sea_orm::Statement::from_sql_and_values(
                         sea_orm::DatabaseBackend::Postgres,
-                        notify_sql,
+                        "SELECT pg_notify('project_route_change', $1)",
+                        [notify_payload.to_string().into()],
                     ))
                     .await
                 {
@@ -1037,6 +1038,10 @@ impl MarkDeploymentCompleteJob {
         struct Gen {
             current: Option<i64>,
         }
+        // `table` is always a &'static str supplied by the two call-sites below
+        // ("route_generation", "dns_generation") — never user-supplied input.
+        // Statement::from_string is therefore safe here; no bound parameter is
+        // needed because the identifier cannot be parameterised in PostgreSQL.
         let load_singleton = |table: &'static str| async move {
             Gen::find_by_statement(Statement::from_string(
                 sea_orm::DatabaseBackend::Postgres,

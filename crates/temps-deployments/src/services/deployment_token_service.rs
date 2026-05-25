@@ -429,6 +429,38 @@ impl DeploymentTokenService {
         Ok(())
     }
 
+    /// Revoke a token immediately by setting its expiry to the current time.
+    ///
+    /// Used by the agent executor to invalidate run-scoped tokens the moment a
+    /// run completes, fails, or is cancelled, so that the remaining time in the
+    /// original expiry window cannot be exploited.
+    ///
+    /// Silently succeeds if the token does not exist — the caller (executor
+    /// cleanup) should not fail a completed run because revocation missed.
+    pub async fn revoke_token_by_id(
+        &self,
+        token_id: i32,
+    ) -> Result<(), DeploymentTokenServiceError> {
+        let token = DeploymentTokenEntity::find_by_id(token_id)
+            .one(self.db.as_ref())
+            .await?;
+
+        let Some(token) = token else {
+            // Already deleted or never existed — treat as success.
+            return Ok(());
+        };
+
+        let mut active: DeploymentTokenActiveModel = token.into();
+        // Set expires_at to now() so every subsequent validate_token call
+        // hits the "token has expired" branch and returns Unauthorized.
+        active.expires_at = Set(Some(Utc::now()));
+        active.is_active = Set(false);
+        active.updated_at = Set(Utc::now());
+        active.update(self.db.as_ref()).await?;
+
+        Ok(())
+    }
+
     /// Validate a deployment token and return project info and permissions
     /// Returns (project_id, environment_id, permissions)
     pub async fn validate_token(
@@ -1555,6 +1587,84 @@ mod tests {
         assert_eq!(
             first, second,
             "get_or_create should reuse the existing permanent token"
+        );
+    }
+
+    // ── Security: run token revocation ────────────────────────────────────────
+
+    /// After `revoke_token_by_id` is called, `validate_token` must reject
+    /// the same token — verifying that immediate revocation works end-to-end.
+    ///
+    /// This is the integration test required for security fix #2:
+    /// run-scoped tokens are now revoked at run completion so the remaining
+    /// expiry window cannot be abused.
+    #[tokio::test]
+    async fn test_revoke_token_by_id_makes_token_invalid() {
+        let Some((_db, service, project)) = setup_test_env().await else {
+            return;
+        };
+
+        // Mint a run-scoped token exactly as the executor does.
+        let created = service
+            .create_token(
+                project.id,
+                None,
+                CreateDeploymentTokenRequest {
+                    name: "workflow-run-test-agent-1".to_string(),
+                    environment_id: None,
+                    deployment_id: None,
+                    // FullAccess ("*") as issued by the executor.
+                    permissions: Some(vec!["*".to_string()]),
+                    expires_at: Some(Utc::now() + Duration::seconds(720)),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Token must be valid immediately after creation.
+        assert!(
+            service.validate_token(&created.token).await.is_ok(),
+            "token must validate before revocation"
+        );
+
+        // The executor-issued token must NOT use plain wildcard as its sole
+        // protection — verify the permissions field is ["*"] (FullAccess) as
+        // expected by the current implementation.
+        let perms = created.permissions.as_deref().unwrap_or(&[]);
+        assert_eq!(
+            perms,
+            &["*".to_string()],
+            "run token must carry FullAccess permission"
+        );
+
+        // Revoke the token by its database ID.
+        service.revoke_token_by_id(created.id).await.unwrap();
+
+        // After revocation, validate_token must return Unauthorized.
+        let result = service.validate_token(&created.token).await;
+        assert!(result.is_err(), "token must be rejected after revocation");
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                DeploymentTokenServiceError::Unauthorized(_)
+            ),
+            "rejection must be Unauthorized, not a database error"
+        );
+    }
+
+    /// `revoke_token_by_id` on a non-existent token must silently succeed —
+    /// the executor cleanup path must not fail a completed run because the
+    /// token was already cleaned up.
+    #[tokio::test]
+    async fn test_revoke_token_by_id_nonexistent_is_noop() {
+        let Some((_db, service, _project)) = setup_test_env().await else {
+            return;
+        };
+
+        let result = service.revoke_token_by_id(99999).await;
+        assert!(
+            result.is_ok(),
+            "revoking a non-existent token must not return an error"
         );
     }
 }

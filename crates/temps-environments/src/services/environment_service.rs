@@ -661,6 +661,9 @@ impl EnvironmentService {
             || settings.idle_timeout_seconds.is_some()
             || settings.wake_timeout_seconds.is_some();
         if on_demand_changed {
+            // "NOTIFY route_table_changes" is a fully hardcoded string — no
+            // user-controlled data is interpolated. Statement::from_string is
+            // safe here; PostgreSQL does not support parameterised NOTIFY.
             if let Err(e) = self
                 .db
                 .execute(sea_orm::Statement::from_string(

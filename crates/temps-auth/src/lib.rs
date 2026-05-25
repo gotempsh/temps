@@ -8,6 +8,7 @@ mod auth_service;
 mod avatar;
 pub mod cli_auth_handler;
 pub mod cli_device_handler;
+pub mod client_ip;
 pub mod context;
 mod decorators;
 mod deployment_token_service;
@@ -30,6 +31,7 @@ mod temps_middleware;
 mod types;
 mod user_service;
 
+pub use client_ip::resolve_client_ip;
 pub use decorators::*;
 pub use macros::*;
 pub use middleware::*;

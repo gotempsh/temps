@@ -318,6 +318,13 @@ fn error_to_response(error: AiGatewayError) -> impl IntoResponse {
                 OpenAiErrorResponse::server_error(message, "upstream_error"),
             )
         }
+        AiGatewayError::InvalidProviderUrl { reason } => (
+            StatusCode::BAD_REQUEST,
+            OpenAiErrorResponse::invalid_request(
+                format!("Invalid X-Provider-Base-URL: {}", reason),
+                "invalid_provider_url",
+            ),
+        ),
         _ => (
             StatusCode::INTERNAL_SERVER_ERROR,
             OpenAiErrorResponse::server_error(error.to_string(), "internal_error"),

@@ -333,6 +333,152 @@ fn sha256_hash(token: &str) -> String {
     format!("{:x}", digest)
 }
 
+// ---------------------------------------------------------------------------
+// Node address validation — SSRF guard on registration
+// ---------------------------------------------------------------------------
+
+/// Error returned when a node registration supplies a reserved or unparsable address.
+#[derive(Debug)]
+pub enum NodeAddressError {
+    /// The string could not be parsed as a bare IP (or IP with optional port).
+    Unparsable { addr: String },
+    /// The IP fell into a reserved special-purpose range.
+    ReservedRange { addr: String, reason: &'static str },
+}
+
+impl std::fmt::Display for NodeAddressError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NodeAddressError::Unparsable { addr } => write!(
+                f,
+                "private_address '{}' could not be parsed as an IP address; \
+                 workers must register with a bare IP (e.g. 10.0.5.20 or 10.0.5.20:8443)",
+                addr
+            ),
+            NodeAddressError::ReservedRange { addr, reason } => write!(
+                f,
+                "private_address '{}' is in a reserved range ({}) and cannot be \
+                 registered as a node address",
+                addr, reason
+            ),
+        }
+    }
+}
+
+/// Validate a worker-supplied `private_address` field.
+///
+/// Accepts `host` or `host:port` where `host` is a bare IPv4 or IPv6 address.
+/// Rejects loopback, link-local, unspecified, multicast, and broadcast.
+/// Accepts RFC-1918 private space, unique-local IPv6, and public IPs.
+///
+/// Workers that use public IPs with a WireGuard underlay are intentionally
+/// allowed — the goal is to block dangerous special-purpose ranges, not enforce
+/// private-only addressing.
+fn validate_node_private_address(addr: &str) -> Result<(), NodeAddressError> {
+    use std::net::IpAddr;
+
+    // Strip an optional port suffix (handles both "10.0.5.20" and "10.0.5.20:8443").
+    // For IPv6 with port the form is "[::1]:port", but workers register with bare
+    // IPv6 addresses ("fc00::1") or with a port as "[fc00::1]:8443".
+    let host = if let Some(stripped) = addr.strip_prefix('[') {
+        // Bracketed IPv6 — either "[::1]" or "[::1]:port"
+        stripped.split(']').next().unwrap_or(addr)
+    } else {
+        // Plain IPv4 or bare IPv6: split on last ':' to strip port, but only
+        // if what remains before the ':' parses as an IP (so we don't strip
+        // the last group of a bare IPv6 address like "fc00::1").
+        if let Some((before, _after)) = addr.rsplit_once(':') {
+            if before.parse::<IpAddr>().is_ok() {
+                before
+            } else {
+                addr
+            }
+        } else {
+            addr
+        }
+    };
+
+    let ip: IpAddr = host.parse().map_err(|_| NodeAddressError::Unparsable {
+        addr: addr.to_string(),
+    })?;
+
+    match ip {
+        IpAddr::V4(v4) => {
+            if v4.is_loopback() {
+                return Err(NodeAddressError::ReservedRange {
+                    addr: addr.to_string(),
+                    reason: "loopback",
+                });
+            }
+            if v4.is_link_local() {
+                return Err(NodeAddressError::ReservedRange {
+                    addr: addr.to_string(),
+                    reason: "link-local / cloud metadata",
+                });
+            }
+            if v4.is_unspecified() {
+                return Err(NodeAddressError::ReservedRange {
+                    addr: addr.to_string(),
+                    reason: "unspecified (0.0.0.0)",
+                });
+            }
+            if v4.is_multicast() {
+                return Err(NodeAddressError::ReservedRange {
+                    addr: addr.to_string(),
+                    reason: "multicast",
+                });
+            }
+            if v4.is_broadcast() {
+                return Err(NodeAddressError::ReservedRange {
+                    addr: addr.to_string(),
+                    reason: "broadcast",
+                });
+            }
+            // Documentation ranges: 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
+            let octets = v4.octets();
+            let is_documentation = (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+                || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+                || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113);
+            if is_documentation {
+                return Err(NodeAddressError::ReservedRange {
+                    addr: addr.to_string(),
+                    reason: "documentation range (RFC 5737)",
+                });
+            }
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() {
+                return Err(NodeAddressError::ReservedRange {
+                    addr: addr.to_string(),
+                    reason: "loopback (::1)",
+                });
+            }
+            if v6.is_unspecified() {
+                return Err(NodeAddressError::ReservedRange {
+                    addr: addr.to_string(),
+                    reason: "unspecified (::)",
+                });
+            }
+            if v6.is_multicast() {
+                return Err(NodeAddressError::ReservedRange {
+                    addr: addr.to_string(),
+                    reason: "multicast",
+                });
+            }
+            // Link-local: fe80::/10
+            let seg = v6.segments();
+            if (seg[0] & 0xffc0) == 0xfe80 {
+                return Err(NodeAddressError::ReservedRange {
+                    addr: addr.to_string(),
+                    reason: "link-local (fe80::/10)",
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Constant-time comparison of two byte slices to prevent timing attacks on token hashes.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -471,6 +617,41 @@ async fn register_node(
     }
 
     let token_hash = sha256_hash(&request.token);
+
+    // ── Address validation (SSRF guard) ──────────────────────────────────────
+    // Reject private_address values in reserved/dangerous ranges before they
+    // can be persisted and later used to build health-check URLs.
+    validate_node_private_address(request.private_address.trim()).map_err(|e| {
+        warn!(
+            "Node registration rejected: invalid private_address '{}': {}",
+            request.private_address.trim(),
+            e
+        );
+        problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Node Address")
+            .with_detail(e.to_string())
+    })?;
+
+    // The `address` field is also user-supplied (used as the deployer agent URL).
+    // Extract the host portion and apply the same check.
+    {
+        let raw_address = request.address.trim();
+        // Strip URL scheme if present (e.g. "https://10.0.0.2:3100" -> "10.0.0.2:3100")
+        let without_scheme = raw_address
+            .strip_prefix("https://")
+            .or_else(|| raw_address.strip_prefix("http://"))
+            .unwrap_or(raw_address);
+        // validate_node_private_address accepts host or host:port
+        validate_node_private_address(without_scheme).map_err(|e| {
+            warn!(
+                "Node registration rejected: invalid address '{}': {}",
+                raw_address, e
+            );
+            problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid Node Address")
+                .with_detail(e.to_string())
+        })?;
+    }
 
     // Encrypt the plaintext token so the control plane can authenticate
     // with the agent for remote deployments
@@ -2587,5 +2768,172 @@ mod tests {
     #[test]
     fn test_is_safe_api_address_blocks_unspecified() {
         assert!(!is_safe_api_address("0.0.0.0:3200"));
+    }
+
+    // ── validate_node_private_address ─────────────────────────────────────
+
+    #[test]
+    fn test_validate_node_private_address_rejects_loopback() {
+        let err = validate_node_private_address("127.0.0.1").unwrap_err();
+        assert!(
+            matches!(err, NodeAddressError::ReservedRange { .. }),
+            "127.0.0.1 must be rejected as loopback"
+        );
+    }
+
+    #[test]
+    fn test_validate_node_private_address_rejects_link_local_metadata() {
+        // AWS/GCP/Azure metadata endpoint and the broader link-local range
+        let err = validate_node_private_address("169.254.169.254").unwrap_err();
+        assert!(
+            matches!(err, NodeAddressError::ReservedRange { .. }),
+            "169.254.169.254 must be rejected as link-local"
+        );
+    }
+
+    #[test]
+    fn test_validate_node_private_address_rejects_unspecified() {
+        let err = validate_node_private_address("0.0.0.0").unwrap_err();
+        assert!(
+            matches!(err, NodeAddressError::ReservedRange { .. }),
+            "0.0.0.0 must be rejected as unspecified"
+        );
+    }
+
+    #[test]
+    fn test_validate_node_private_address_rejects_multicast() {
+        let err = validate_node_private_address("224.0.0.1").unwrap_err();
+        assert!(
+            matches!(err, NodeAddressError::ReservedRange { .. }),
+            "224.0.0.1 must be rejected as multicast"
+        );
+    }
+
+    #[test]
+    fn test_validate_node_private_address_accepts_rfc1918_with_port() {
+        // RFC-1918 private space with port suffix — typical worker registration
+        assert!(
+            validate_node_private_address("10.0.5.20:8443").is_ok(),
+            "10.0.5.20:8443 must be accepted (RFC-1918 with port)"
+        );
+    }
+
+    #[test]
+    fn test_validate_node_private_address_accepts_rfc1918_bare() {
+        assert!(
+            validate_node_private_address("192.168.1.50").is_ok(),
+            "192.168.1.50 must be accepted (RFC-1918)"
+        );
+    }
+
+    #[test]
+    fn test_validate_node_private_address_accepts_public_ip() {
+        // Operators may run nodes across the public internet with a WireGuard underlay
+        assert!(
+            validate_node_private_address("8.8.8.8").is_ok(),
+            "8.8.8.8 must be accepted (public IP, valid WireGuard underlay use case)"
+        );
+    }
+
+    #[test]
+    fn test_validate_node_private_address_rejects_non_ip() {
+        let err = validate_node_private_address("not-an-ip").unwrap_err();
+        assert!(
+            matches!(err, NodeAddressError::Unparsable { .. }),
+            "non-IP string must be rejected as unparsable"
+        );
+    }
+
+    #[test]
+    fn test_validate_node_private_address_rejects_ipv6_loopback() {
+        let err = validate_node_private_address("::1").unwrap_err();
+        assert!(
+            matches!(err, NodeAddressError::ReservedRange { .. }),
+            "::1 must be rejected as IPv6 loopback"
+        );
+    }
+
+    #[test]
+    fn test_validate_node_private_address_rejects_ipv6_link_local() {
+        let err = validate_node_private_address("fe80::1").unwrap_err();
+        assert!(
+            matches!(err, NodeAddressError::ReservedRange { .. }),
+            "fe80::1 must be rejected as IPv6 link-local"
+        );
+    }
+
+    #[test]
+    fn test_validate_node_private_address_accepts_unique_local_ipv6() {
+        // fc00::/7 — unique-local IPv6, valid for private networks
+        assert!(
+            validate_node_private_address("fc00::1").is_ok(),
+            "fc00::1 must be accepted (unique-local IPv6)"
+        );
+    }
+
+    #[test]
+    fn test_validate_node_private_address_rejects_ipv6_unspecified() {
+        let err = validate_node_private_address("::").unwrap_err();
+        assert!(
+            matches!(err, NodeAddressError::ReservedRange { .. }),
+            ":: must be rejected as IPv6 unspecified"
+        );
+    }
+
+    // Integration: registration handler rejects reserved private_address with HTTP 400
+    #[tokio::test]
+    async fn test_register_node_rejects_loopback_private_address() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let app = make_app_with_settings(db, settings_with_join_token());
+
+        let body = serde_json::json!({
+            "name": "evil-worker",
+            "token": "test-token",
+            "join_token": "test-join-token",
+            "address": "https://10.100.0.2:3100",
+            "private_address": "127.0.0.1"
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/nodes/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_register_node_rejects_metadata_private_address() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let app = make_app_with_settings(db, settings_with_join_token());
+
+        let body = serde_json::json!({
+            "name": "evil-worker",
+            "token": "test-token",
+            "join_token": "test-join-token",
+            "address": "https://10.100.0.2:3100",
+            "private_address": "169.254.169.254"
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/nodes/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

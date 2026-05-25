@@ -536,6 +536,10 @@ impl AutofixerService {
                 )
                 .await?;
 
+            // Revoke the run-scoped deployment token before releasing the sandbox.
+            if let Some(token_id) = self.executor.run_token_ids.write().await.remove(&run_id) {
+                self.executor.revoke_run_token(run_id, token_id).await;
+            }
             // Clean up sandbox + work dir since there's nothing to create a PR from
             let _ = self.sandbox_registry.release(run_id).await;
             let _ = fs::remove_dir_all(&work_dir).await;
@@ -814,6 +818,10 @@ impl AutofixerService {
             pr.url
         );
 
+        // Revoke the run-scoped deployment token before releasing the sandbox.
+        if let Some(token_id) = self.executor.run_token_ids.write().await.remove(&run_id) {
+            self.executor.revoke_run_token(run_id, token_id).await;
+        }
         // Release sandbox, then clean up temp dir
         let _ = self.sandbox_registry.release(run_id).await;
         if let Err(e) = fs::remove_dir_all(&work_dir).await {
@@ -1056,6 +1064,10 @@ impl AutofixerService {
             .append_log(run_id, "info", "Run cancelled by user", None)
             .await?;
 
+        // Revoke the run-scoped deployment token before releasing the sandbox.
+        if let Some(token_id) = self.executor.run_token_ids.write().await.remove(&run_id) {
+            self.executor.revoke_run_token(run_id, token_id).await;
+        }
         // Release sandbox, then clean up temp dir
         let _ = self.sandbox_registry.release(run_id).await;
         let work_dir = Self::work_dir(run_id);

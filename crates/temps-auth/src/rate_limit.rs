@@ -3,6 +3,7 @@
 //! Provides a simple sliding-window rate limiter to prevent brute force attacks
 //! on login, password reset, magic link, and MFA verification endpoints.
 
+use crate::client_ip::resolve_client_ip;
 use axum::{
     extract::ConnectInfo,
     http::{Request, StatusCode},
@@ -100,43 +101,6 @@ impl AuthRateLimiter {
     }
 }
 
-/// Resolve the rate-limit key for a request.
-///
-/// SECURITY: `X-Forwarded-For` and `X-Real-IP` are honored ONLY when the
-/// immediate TCP peer is a trusted proxy (loopback). Otherwise an attacker
-/// could rotate the header value per request and bypass the limiter entirely.
-///
-/// When the peer is loopback (Pingora reverse proxy on the same host), we use
-/// the rightmost X-Forwarded-For entry — that's the one appended by our
-/// trusted proxy and reflects the real client. When the peer is not loopback,
-/// we use the peer's own address and ignore client-supplied headers.
-fn resolve_rate_limit_ip(headers: &axum::http::HeaderMap, peer: Option<SocketAddr>) -> String {
-    let peer_is_trusted = peer.is_some_and(|addr| addr.ip().is_loopback());
-
-    if peer_is_trusted {
-        if let Some(ip) = headers
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.rsplit(',').next())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-        {
-            return ip;
-        }
-        if let Some(ip) = headers
-            .get("x-real-ip")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-        {
-            return ip;
-        }
-    }
-
-    peer.map(|p| p.ip().to_string())
-        .unwrap_or_else(|| "unknown".to_string())
-}
-
 /// Axum middleware function for rate limiting auth endpoints.
 ///
 /// Extracts the client IP from the immediate peer address. Only trusts
@@ -158,7 +122,7 @@ pub async fn auth_rate_limit_middleware(
         }
     };
 
-    let ip = resolve_rate_limit_ip(request.headers(), Some(peer));
+    let ip = resolve_client_ip(request.headers(), Some(peer));
 
     match limiter.check(&ip).await {
         Ok(()) => next.run(request).await,
@@ -298,13 +262,13 @@ mod tests {
         let headers = make_headers(&[("x-forwarded-for", "1.2.3.4, 5.6.7.8")]);
 
         // Loopback peer (trusted reverse proxy): use rightmost XFF (5.6.7.8)
-        let ip = resolve_rate_limit_ip(&headers, Some(parse_addr("127.0.0.1:1234")));
+        let ip = resolve_client_ip(&headers, Some(parse_addr("127.0.0.1:1234")));
         assert_eq!(ip, "5.6.7.8");
 
         // Non-loopback peer (attacker reaching console API directly):
         // ignore the spoofed XFF and use the actual peer address.
         let peer = parse_addr("198.51.100.7:9999");
-        let ip = resolve_rate_limit_ip(&headers, Some(peer));
+        let ip = resolve_client_ip(&headers, Some(peer));
         assert_eq!(ip, "198.51.100.7");
     }
 
@@ -317,29 +281,29 @@ mod tests {
         let h2 = make_headers(&[("x-forwarded-for", "2.2.2.2")]);
         let h3 = make_headers(&[("x-real-ip", "9.9.9.9")]);
 
-        assert_eq!(resolve_rate_limit_ip(&h1, Some(peer)), "203.0.113.5");
-        assert_eq!(resolve_rate_limit_ip(&h2, Some(peer)), "203.0.113.5");
-        assert_eq!(resolve_rate_limit_ip(&h3, Some(peer)), "203.0.113.5");
+        assert_eq!(resolve_client_ip(&h1, Some(peer)), "203.0.113.5");
+        assert_eq!(resolve_client_ip(&h2, Some(peer)), "203.0.113.5");
+        assert_eq!(resolve_client_ip(&h3, Some(peer)), "203.0.113.5");
     }
 
     #[test]
     fn rate_limit_ip_falls_back_to_peer_when_no_headers() {
         let headers = make_headers(&[]);
         let peer = parse_addr("127.0.0.1:5555");
-        assert_eq!(resolve_rate_limit_ip(&headers, Some(peer)), "127.0.0.1");
+        assert_eq!(resolve_client_ip(&headers, Some(peer)), "127.0.0.1");
     }
 
     #[test]
     fn rate_limit_ip_xff_ipv6_peer_is_loopback() {
         let headers = make_headers(&[("x-forwarded-for", "10.0.0.1")]);
         let peer = parse_addr("[::1]:1234");
-        assert_eq!(resolve_rate_limit_ip(&headers, Some(peer)), "10.0.0.1");
+        assert_eq!(resolve_client_ip(&headers, Some(peer)), "10.0.0.1");
     }
 
     #[test]
     fn rate_limit_ip_unknown_when_no_peer_no_headers() {
         let headers = make_headers(&[]);
-        assert_eq!(resolve_rate_limit_ip(&headers, None), "unknown");
+        assert_eq!(resolve_client_ip(&headers, None), "unknown");
     }
 
     #[test]
@@ -347,7 +311,7 @@ mod tests {
         // Without a peer we can't verify the proxy is trusted — must NOT
         // honor headers (defense in depth).
         let headers = make_headers(&[("x-forwarded-for", "1.1.1.1")]);
-        assert_eq!(resolve_rate_limit_ip(&headers, None), "unknown");
+        assert_eq!(resolve_client_ip(&headers, None), "unknown");
     }
 
     #[tokio::test]

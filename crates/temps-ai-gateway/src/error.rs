@@ -41,10 +41,16 @@ pub enum AiGatewayError {
 
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
+
+    #[error("Invalid provider base URL: {reason}")]
+    InvalidProviderUrl { reason: String },
 }
 
 impl From<reqwest::Error> for AiGatewayError {
     fn from(error: reqwest::Error) -> Self {
-        AiGatewayError::HttpClient(error.to_string())
+        // Strip the request URL before converting to string — the URL may contain
+        // embedded credentials (BYOK base_url) that must not appear in logs.
+        let scrubbed = error.without_url();
+        AiGatewayError::HttpClient(scrubbed.to_string())
     }
 }

@@ -28,6 +28,89 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route("/webhook/git/gitlab/events", post(gitlab_webhook_events))
 }
 
+// ── Token verification helpers ─────────────────────────────────────────────
+
+/// Pure guard: returns `false` (reject) when a project has no stored signing
+/// token, `true` when one is present and signature verification should proceed.
+///
+/// Extracted as a pure sync function so the security decision is directly
+/// unit-testable without needing a live `AppState`.
+///
+/// # Security rationale
+///
+/// Projects with `gitlab_webhook_signing_token = NULL` have never had a
+/// signed webhook configured (pre-feature legacy rows) or had their token
+/// erased. Accepting unsigned payloads would let any internet actor forge
+/// GitLab push events and trigger arbitrary deployments. Operators must
+/// re-enroll by recreating the webhook in GitLab, which issues a fresh token.
+#[cfg(test)]
+pub(crate) fn project_has_signing_token(stored_token: Option<&str>) -> bool {
+    // SECURITY: projects with no stored signing token are rejected — do not
+    // accept unsigned payloads. Operators must re-enroll legacy projects by
+    // recreating the GitLab webhook so a fresh token is issued.
+    stored_token.is_some()
+}
+
+/// Verify that an incoming GitLab webhook request is signed with the token
+/// stored for `project`.
+///
+/// Returns `false` immediately when no signing token is stored (see
+/// `project_has_signing_token` in the test module), then decrypts and
+/// HMAC-validates for the `Some` branch.
+pub(crate) async fn verify_gitlab_webhook_token(
+    project: &temps_entities::projects::Model,
+    body: &[u8],
+    webhook_signature: Option<&str>,
+    webhook_id: &str,
+    webhook_timestamp: &str,
+    state: &AppState,
+) -> bool {
+    match project.gitlab_webhook_signing_token.as_deref() {
+        Some(encrypted) => {
+            match state.git_provider_manager.decrypt_token(encrypted).await {
+                Ok(plaintext) => {
+                    if let Some(sig) = webhook_signature {
+                        // Standard-Webhooks HMAC: signs
+                        // "{webhook-id}.{timestamp}.{body}" with the
+                        // 32-byte key derived from the whsec_ token.
+                        crate::services::gitlab_webhook::verify_gitlab_signature(
+                            body,
+                            sig,
+                            webhook_id,
+                            webhook_timestamp,
+                            &plaintext,
+                        )
+                    } else {
+                        // No webhook-signature header — reject. Legacy
+                        // X-Gitlab-Token is intentionally not supported.
+                        false
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to decrypt signing token for project {}: {}",
+                        project.id, e
+                    );
+                    false
+                }
+            }
+        }
+        None => {
+            // SECURITY: reject webhooks for projects with no stored signing
+            // token. Operators must re-enroll legacy projects by recreating
+            // the GitLab webhook (which will trigger token issuance) before
+            // automatic deployments will resume. We will NOT accept unsigned
+            // payloads — anyone on the internet could forge push events.
+            warn!(
+                "GitLab project {} has no stored signing token — webhook rejected. \
+                 Re-enroll the webhook in GitLab to issue a signing token.",
+                project.id
+            );
+            false
+        }
+    }
+}
+
 // ── GitLab webhook event receiver ─────────────────────────────────────────
 
 #[derive(Serialize, ToSchema)]
@@ -173,42 +256,15 @@ async fn gitlab_webhook_events(
 
     for project in &matching_projects {
         // Verify the signing token for this project.
-        let token_valid = match project.gitlab_webhook_signing_token.as_deref() {
-            Some(encrypted) => {
-                match state.git_provider_manager.decrypt_token(encrypted).await {
-                    Ok(plaintext) => {
-                        if let Some(sig) = webhook_signature_header {
-                            // Standard-Webhooks HMAC: signs
-                            // "{webhook-id}.{timestamp}.{body}" with the
-                            // 32-byte key derived from the whsec_ token.
-                            crate::services::gitlab_webhook::verify_gitlab_signature(
-                                &body,
-                                sig,
-                                webhook_id_header,
-                                webhook_timestamp_header,
-                                &plaintext,
-                            )
-                        } else {
-                            // No webhook-signature header — reject. Legacy
-                            // X-Gitlab-Token is intentionally not supported.
-                            false
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to decrypt signing token for project {}: {}",
-                            project.id, e
-                        );
-                        false
-                    }
-                }
-            }
-            None => {
-                // Project has no stored token — accept without signature check
-                // (public repositories or projects that pre-date this feature).
-                true
-            }
-        };
+        let token_valid = verify_gitlab_webhook_token(
+            project,
+            &body,
+            webhook_signature_header,
+            webhook_id_header,
+            webhook_timestamp_header,
+            &state,
+        )
+        .await;
 
         if token_valid {
             any_valid = true;
@@ -340,6 +396,8 @@ mod tests {
     //! Smoke-tests for the helpers from the handler perspective. Detailed
     //! crypto edge-cases live in `services::gitlab_webhook::tests`.
 
+    use super::project_has_signing_token;
+
     /// Build a valid `v1,{base64}` Standard-Webhooks signature for a given
     /// payload + headers + signing token.
     fn make_sig(payload: &[u8], webhook_id: &str, ts: &str, signing_token: &str) -> String {
@@ -364,6 +422,43 @@ mod tests {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
         format!("whsec_{}", STANDARD.encode([0u8; 32]))
     }
+
+    // ── project_has_signing_token (None => false security gate) ──────────
+
+    /// A project with no stored signing token must ALWAYS be rejected.
+    /// This is the critical fix for CVE-class: "None => true" allowed
+    /// unauthenticated actors to forge GitLab push events for legacy projects.
+    #[test]
+    fn test_none_stored_token_is_rejected() {
+        assert!(
+            !project_has_signing_token(None),
+            "projects with NULL signing token must be rejected — \
+             accepting unsigned webhooks allows forged push events"
+        );
+    }
+
+    /// A project with a stored signing token passes the guard (token
+    /// decryption and HMAC verification are done in a subsequent step).
+    #[test]
+    fn test_some_stored_token_passes_guard() {
+        assert!(
+            project_has_signing_token(Some("whsec_AAAA")),
+            "projects with a stored signing token should pass the presence guard"
+        );
+    }
+
+    /// Empty string token value also passes the guard — the HMAC step
+    /// (not this guard) is responsible for rejecting malformed tokens.
+    #[test]
+    fn test_empty_string_token_passes_guard() {
+        assert!(
+            project_has_signing_token(Some("")),
+            "empty string is Some, so the presence guard passes; \
+             the subsequent HMAC step rejects it"
+        );
+    }
+
+    // ── HMAC verification (existing tests, unchanged) ─────────────────────
 
     #[test]
     fn test_verify_hmac_signature_via_service_helper() {

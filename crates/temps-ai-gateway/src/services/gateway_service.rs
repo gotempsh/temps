@@ -73,6 +73,17 @@ impl GatewayService {
 
         // BYOK: caller supplied their own key — skip DB lookup entirely
         if let Some(ref user_key) = byok.api_key {
+            // Validate the caller-supplied base URL to prevent SSRF.
+            // An authenticated user must not be able to point the gateway at
+            // internal services (cloud metadata, Docker daemon, private subnets, etc.).
+            if let Some(ref base_url) = byok.base_url {
+                temps_core::url_validation::validate_external_url(base_url).map_err(|e| {
+                    AiGatewayError::InvalidProviderUrl {
+                        reason: e.to_string(),
+                    }
+                })?;
+            }
+
             debug!(
                 provider = provider_id,
                 model = model,
@@ -254,10 +265,104 @@ impl GatewayService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use temps_core::url_validation::validate_external_url;
 
-    // GatewayService tests that don't hit real APIs are covered via
-    // the handler-level acceptance tests in handlers/gateway.rs
-    // Provider routing is tested in providers/mod.rs
+    // -------------------------------------------------------------------------
+    // Fix #3 — SSRF guard: validate_external_url rejects every dangerous URL
+    // that a BYOK caller might inject via X-Provider-Base-URL.
+    // We call the helper directly because wiring up a full GatewayService
+    // requires a real DatabaseConnection; the guard lives one call-site above,
+    // so unit-testing the validator is equivalent and faster.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_byok_base_url_rejects_cloud_metadata() {
+        // AWS/GCP/Azure IMDS endpoint — the most critical SSRF target
+        assert!(
+            validate_external_url("http://169.254.169.254/").is_err(),
+            "Cloud metadata service must be rejected"
+        );
+        assert!(
+            validate_external_url(
+                "http://169.254.169.254/latest/meta-data/iam/security-credentials/role"
+            )
+            .is_err(),
+            "Cloud metadata deep path must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_byok_base_url_rejects_localhost() {
+        assert!(
+            validate_external_url("http://localhost:8080").is_err(),
+            "localhost must be rejected"
+        );
+        assert!(
+            validate_external_url("http://localhost/").is_err(),
+            "localhost root must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_byok_base_url_rejects_loopback_ip() {
+        assert!(
+            validate_external_url("http://127.0.0.1").is_err(),
+            "IPv4 loopback must be rejected"
+        );
+        assert!(
+            validate_external_url("http://127.0.0.1:2375/").is_err(),
+            "Docker daemon on loopback must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_byok_base_url_rejects_rfc1918_private() {
+        assert!(
+            validate_external_url("http://10.0.0.1").is_err(),
+            "RFC 1918 10.x must be rejected"
+        );
+        assert!(
+            validate_external_url("http://192.168.1.100/v1").is_err(),
+            "RFC 1918 192.168.x must be rejected"
+        );
+        assert!(
+            validate_external_url("http://172.16.0.1/api").is_err(),
+            "RFC 1918 172.16.x must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_byok_base_url_accepts_public_providers() {
+        // These are valid external provider base URLs and must not be blocked
+        assert!(
+            validate_external_url("https://api.anthropic.com").is_ok(),
+            "Anthropic API must be accepted"
+        );
+        assert!(
+            validate_external_url("https://api.openai.com/v1").is_ok(),
+            "OpenAI API must be accepted"
+        );
+        assert!(
+            validate_external_url("https://openrouter.ai/api/v1").is_ok(),
+            "OpenRouter must be accepted"
+        );
+    }
+
+    #[test]
+    fn test_byok_base_url_rejects_non_http_scheme() {
+        assert!(
+            validate_external_url("ftp://external.example.com/").is_err(),
+            "FTP scheme must be rejected"
+        );
+        assert!(
+            validate_external_url("file:///etc/passwd").is_err(),
+            "file:// scheme must be rejected"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Existing tests
+    // -------------------------------------------------------------------------
 
     #[test]
     fn test_gateway_service_has_all_providers() {

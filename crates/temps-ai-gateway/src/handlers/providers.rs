@@ -68,6 +68,11 @@ impl From<AiGatewayError> for Problem {
                     .with_title("Internal Error")
                     .with_detail(error.to_string())
             }
+            AiGatewayError::InvalidProviderUrl { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Invalid Provider URL")
+                    .with_detail(error.to_string())
+            }
         }
     }
 }

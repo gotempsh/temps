@@ -1,13 +1,15 @@
+use crate::client_ip::resolve_client_ip;
 use crate::permissions::Role;
 use crate::{
     auth_service::AuthService, context::AuthContext, user_service::UserService, AuthState,
 };
 use axum::{
-    extract::{Request, State},
+    extract::{ConnectInfo, Request, State},
     http::{HeaderMap, StatusCode},
     middleware::Next,
 };
 use cookie::Cookie;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use temps_core::{CookieCrypto, RequestMetadata};
 use tracing::warn;
@@ -67,15 +69,17 @@ pub async fn auth_middleware(
     let base_url = format!("{}://{}", scheme, raw_host);
     let host = temps_core::host_without_port(&raw_host).to_string();
 
+    // Extract the direct TCP peer address so we can decide whether to trust
+    // proxy headers. ConnectInfo is inserted by Axum when the listener is
+    // configured with `into_make_service_with_connect_info`.
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0);
+
     // Create RequestMetadata
     let metadata = RequestMetadata {
-        ip_address: req
-            .headers()
-            .get("x-forwarded-for")
-            .and_then(|h| h.to_str().ok())
-            .and_then(|s| s.split(',').next())
-            .unwrap_or("unknown")
-            .to_string(),
+        ip_address: resolve_client_ip(req.headers(), peer),
         user_agent: req
             .headers()
             .get("user-agent")

@@ -60,6 +60,32 @@ impl AgentSyncService for AgentConfigSyncAdapter {
 /// Maximum number of simultaneous active runs per project.
 const MAX_CONCURRENT_RUNS_PER_PROJECT: u64 = 5;
 
+/// Narrow a list of trigger-matching agents down to the agent the trigger
+/// actually identifies, when the trigger type encodes a single source.
+///
+/// Scheduled triggers come from `AgentCronScheduler::tick`, which emits one
+/// job per agent whose cron matched the current minute, tagged with
+/// `trigger_source_type = "agent_schedule"` and `trigger_source_id = <agent.id>`.
+/// Without this filter, every scheduled agent in the project would run on
+/// every other agent's tick — e.g. a daily 07:00 report would also fire at
+/// every 2-hour docs pass.
+///
+/// Non-schedule triggers (errors, deploys, monitoring, manual) keep the
+/// existing fan-out behaviour: all agents subscribed to that trigger type
+/// get a chance to run.
+fn filter_agents_for_trigger(
+    trigger: &AutopilotTriggerJob,
+    agents: &mut Vec<project_agents::Model>,
+) {
+    if trigger.trigger_type == "schedule"
+        && trigger.trigger_source_type.as_deref() == Some("agent_schedule")
+    {
+        if let Some(agent_id) = trigger.trigger_source_id {
+            agents.retain(|a| a.id == agent_id);
+        }
+    }
+}
+
 /// Guarded constructor for `LocalSandboxProvider`. The local provider runs
 /// agent-executed commands **directly on the host** with no namespace
 /// isolation, no resource limits, and no capability dropping — it is safe
@@ -253,7 +279,7 @@ impl AgentsPlugin {
                             );
 
                             // Load all agents that match this trigger type
-                            let agents = match config_service
+                            let mut agents = match config_service
                                 .list_agents_for_trigger(trigger.project_id, &trigger.trigger_type)
                                 .await
                             {
@@ -267,6 +293,8 @@ impl AgentsPlugin {
                                     continue;
                                 }
                             };
+
+                            filter_agents_for_trigger(&trigger, &mut agents);
 
                             if agents.is_empty() {
                                 tracing::debug!(
@@ -908,5 +936,118 @@ mod tests {
             result.is_ok(),
             "zero daily_budget_cents should mean unlimited"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // filter_agents_for_trigger tests
+    //
+    // Regression coverage for the bug where a 2-hour scheduled workflow
+    // (e.g. "Docs Auto-Improve" at `17 */2 * * *`) was dragging every other
+    // scheduled agent in the project along with it — including a daily 07:00
+    // report — because `list_agents_for_trigger` returns every agent that has
+    // any cron, and the dispatch loop wasn't narrowing back down to the agent
+    // identified by `trigger_source_id`.
+    // ---------------------------------------------------------------------------
+
+    fn schedule_trigger(project_id: i32, source_agent_id: i32) -> AutopilotTriggerJob {
+        AutopilotTriggerJob {
+            project_id,
+            trigger_type: "schedule".to_string(),
+            trigger_source_id: Some(source_agent_id),
+            trigger_source_type: Some("agent_schedule".to_string()),
+            error_group_id: None,
+        }
+    }
+
+    fn with_id(mut config: project_agents::Model, id: i32) -> project_agents::Model {
+        config.id = id;
+        config
+    }
+
+    #[test]
+    fn test_filter_schedule_trigger_keeps_only_source_agent() {
+        let trigger = schedule_trigger(42, 10);
+        let mut agents = vec![
+            with_id(make_config(42, true), 10),
+            with_id(make_config(42, true), 11),
+            with_id(make_config(42, true), 12),
+        ];
+
+        filter_agents_for_trigger(&trigger, &mut agents);
+
+        assert_eq!(agents.len(), 1, "only the firing agent should remain");
+        assert_eq!(agents[0].id, 10);
+    }
+
+    #[test]
+    fn test_filter_schedule_trigger_drops_all_when_source_missing() {
+        // Source agent id refers to an agent that no longer matches the trigger
+        // (e.g. it was disabled between cron tick and dispatch). The siblings
+        // must NOT be promoted as a fallback.
+        let trigger = schedule_trigger(42, 99);
+        let mut agents = vec![
+            with_id(make_config(42, true), 10),
+            with_id(make_config(42, true), 11),
+        ];
+
+        filter_agents_for_trigger(&trigger, &mut agents);
+
+        assert!(
+            agents.is_empty(),
+            "no agent matches source id 99 — siblings must not run"
+        );
+    }
+
+    #[test]
+    fn test_filter_schedule_trigger_without_source_keeps_all() {
+        // Defensive: a malformed schedule trigger with no source id keeps the
+        // existing fan-out behaviour rather than silently dropping every
+        // candidate. Real cron ticks always set the source id.
+        let mut trigger = schedule_trigger(42, 0);
+        trigger.trigger_source_id = None;
+        let mut agents = vec![
+            with_id(make_config(42, true), 10),
+            with_id(make_config(42, true), 11),
+        ];
+
+        filter_agents_for_trigger(&trigger, &mut agents);
+
+        assert_eq!(agents.len(), 2);
+    }
+
+    #[test]
+    fn test_filter_non_schedule_trigger_keeps_all() {
+        // Error triggers, deploy triggers, manual, etc. fan out — every
+        // subscribed agent runs. The filter must not touch them.
+        let trigger = make_trigger(42, "new_issue");
+        let mut agents = vec![
+            with_id(make_config(42, true), 10),
+            with_id(make_config(42, true), 11),
+        ];
+
+        filter_agents_for_trigger(&trigger, &mut agents);
+
+        assert_eq!(
+            agents.len(),
+            2,
+            "non-schedule triggers must keep their fan-out semantics"
+        );
+    }
+
+    #[test]
+    fn test_filter_schedule_trigger_ignores_non_agent_schedule_source() {
+        // If a future trigger source emits trigger_type="schedule" with a
+        // different source type (e.g. an external scheduler), do not narrow —
+        // we'd be filtering on an id that doesn't refer to a project_agents row.
+        let mut trigger = schedule_trigger(42, 10);
+        trigger.trigger_source_type = Some("external_scheduler".to_string());
+        let mut agents = vec![
+            with_id(make_config(42, true), 10),
+            with_id(make_config(42, true), 11),
+        ];
+
+        filter_agents_for_trigger(&trigger, &mut agents);
+
+        assert_eq!(agents.len(), 2);
     }
 }
