@@ -210,7 +210,14 @@ impl PrCommentListener {
 
 #[cfg(test)]
 mod tests {
+    use super::super::pr_commenter::PrCommenterError;
     use super::*;
+    use async_trait::async_trait;
+    use sea_orm::{DatabaseBackend, MockDatabase};
+    use std::sync::Mutex;
+    use temps_core::{
+        DeploymentCreatedJob, DeploymentFailedJob, DeploymentReadyJob, DeploymentSucceededJob,
+    };
 
     #[test]
     fn short_sha_truncates_long_commit() {
@@ -227,5 +234,321 @@ mod tests {
     #[test]
     fn short_sha_handles_missing_commit() {
         assert_eq!(short_sha(None), "unknown");
+    }
+
+    /// PrCommenter test double that records every context it's called with
+    /// so individual tests can assert which phase the listener produced.
+    struct RecordingCommenter {
+        calls: Mutex<Vec<PreviewCommentContext>>,
+    }
+
+    impl RecordingCommenter {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn calls(&self) -> Vec<PreviewCommentContext> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl PrCommenter for RecordingCommenter {
+        async fn upsert_preview_comment(
+            &self,
+            ctx: PreviewCommentContext,
+        ) -> Result<(), PrCommenterError> {
+            self.calls.lock().unwrap().push(ctx);
+            Ok(())
+        }
+    }
+
+    fn empty_db() -> Arc<sea_orm::DatabaseConnection> {
+        Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection())
+    }
+
+    fn deployment_with_branch(
+        id: i32,
+        branch: Option<&str>,
+        commit: Option<&str>,
+    ) -> temps_entities::deployments::Model {
+        let now = chrono::Utc::now();
+        temps_entities::deployments::Model {
+            id,
+            project_id: 1,
+            environment_id: 1,
+            created_at: now,
+            updated_at: now,
+            slug: format!("d-{id}"),
+            state: "completed".to_string(),
+            metadata: None,
+            deploying_at: None,
+            ready_at: None,
+            started_at: None,
+            finished_at: None,
+            context_vars: None,
+            branch_ref: branch.map(|s| s.to_string()),
+            tag_ref: None,
+            commit_sha: commit.map(|s| s.to_string()),
+            commit_message: None,
+            commit_author: None,
+            commit_json: None,
+            cancelled_reason: None,
+            static_dir_location: None,
+            screenshot_location: None,
+            image_name: None,
+            deployment_config: None,
+            promoted_from_deployment_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn created_event_with_branch_triggers_started_comment() {
+        let recorder = RecordingCommenter::new();
+        let commenter: Arc<dyn PrCommenter> = recorder.clone();
+        let db = empty_db();
+
+        let job = Job::DeploymentCreated(DeploymentCreatedJob {
+            deployment_id: 10,
+            project_id: 42,
+            environment_id: 7,
+            environment_name: "preview".into(),
+            commit_sha: Some("abcdef1234567890".into()),
+            branch: Some("feature/x".into()),
+        });
+
+        PrCommentListener::handle_job(&commenter, &db, &job)
+            .await
+            .unwrap();
+
+        let calls = recorder.calls();
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].project_id, 42);
+        assert_eq!(calls[0].environment_id, 7);
+        assert_eq!(calls[0].branch, "feature/x");
+        match &calls[0].phase {
+            CommentPhase::Started { commit_short_sha } => {
+                assert_eq!(commit_short_sha, "abcdef1");
+            }
+            _ => panic!("expected Started, got {:?}", calls[0].phase),
+        }
+    }
+
+    #[tokio::test]
+    async fn created_event_without_branch_skips_comment() {
+        let recorder = RecordingCommenter::new();
+        let commenter: Arc<dyn PrCommenter> = recorder.clone();
+        let db = empty_db();
+
+        let job = Job::DeploymentCreated(DeploymentCreatedJob {
+            deployment_id: 10,
+            project_id: 42,
+            environment_id: 7,
+            environment_name: "preview".into(),
+            commit_sha: Some("abc".into()),
+            branch: None,
+        });
+
+        PrCommentListener::handle_job(&commenter, &db, &job)
+            .await
+            .unwrap();
+
+        let calls = recorder.calls();
+        assert!(calls.is_empty(), "expected no comment, got {:?}", calls);
+    }
+
+    #[tokio::test]
+    async fn created_event_with_empty_branch_skips_comment() {
+        let recorder = RecordingCommenter::new();
+        let commenter: Arc<dyn PrCommenter> = recorder.clone();
+        let db = empty_db();
+
+        let job = Job::DeploymentCreated(DeploymentCreatedJob {
+            deployment_id: 10,
+            project_id: 42,
+            environment_id: 7,
+            environment_name: "preview".into(),
+            commit_sha: Some("abc".into()),
+            branch: Some(String::new()),
+        });
+
+        PrCommentListener::handle_job(&commenter, &db, &job)
+            .await
+            .unwrap();
+
+        let calls = recorder.calls();
+        assert!(calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn succeeded_event_with_url_and_branch_triggers_ready_comment() {
+        let recorder = RecordingCommenter::new();
+        let commenter: Arc<dyn PrCommenter> = recorder.clone();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![deployment_with_branch(
+                    10,
+                    Some("feature/x"),
+                    Some("abcdef1234"),
+                )]])
+                .into_connection(),
+        );
+
+        let job = Job::DeploymentSucceeded(DeploymentSucceededJob {
+            deployment_id: 10,
+            project_id: 42,
+            environment_id: 7,
+            environment_name: "preview".into(),
+            commit_sha: Some("abcdef1234".into()),
+            url: Some("https://feature-x.preview.temps.app".into()),
+            health_check_path: None,
+        });
+
+        PrCommentListener::handle_job(&commenter, &db, &job)
+            .await
+            .unwrap();
+
+        let calls = recorder.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].branch, "feature/x");
+        match &calls[0].phase {
+            CommentPhase::Ready {
+                commit_short_sha,
+                env_url,
+                deployment_url,
+            } => {
+                assert_eq!(commit_short_sha, "abcdef1");
+                assert_eq!(env_url, "https://feature-x.preview.temps.app");
+                assert!(deployment_url.is_none());
+            }
+            _ => panic!("expected Ready, got {:?}", calls[0].phase),
+        }
+    }
+
+    #[tokio::test]
+    async fn succeeded_event_without_url_skips_comment() {
+        let recorder = RecordingCommenter::new();
+        let commenter: Arc<dyn PrCommenter> = recorder.clone();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![deployment_with_branch(
+                    10,
+                    Some("feature/x"),
+                    Some("abc"),
+                )]])
+                .into_connection(),
+        );
+
+        let job = Job::DeploymentSucceeded(DeploymentSucceededJob {
+            deployment_id: 10,
+            project_id: 42,
+            environment_id: 7,
+            environment_name: "preview".into(),
+            commit_sha: Some("abc".into()),
+            url: None,
+            health_check_path: None,
+        });
+
+        PrCommentListener::handle_job(&commenter, &db, &job)
+            .await
+            .unwrap();
+
+        let calls = recorder.calls();
+        assert!(calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn succeeded_event_with_missing_deployment_is_noop() {
+        let recorder = RecordingCommenter::new();
+        let commenter: Arc<dyn PrCommenter> = recorder.clone();
+        // Empty query result -> deployment not found
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![Vec::<temps_entities::deployments::Model>::new()])
+                .into_connection(),
+        );
+
+        let job = Job::DeploymentSucceeded(DeploymentSucceededJob {
+            deployment_id: 10,
+            project_id: 42,
+            environment_id: 7,
+            environment_name: "preview".into(),
+            commit_sha: Some("abc".into()),
+            url: Some("https://x.example.com".into()),
+            health_check_path: None,
+        });
+
+        PrCommentListener::handle_job(&commenter, &db, &job)
+            .await
+            .unwrap();
+
+        let calls = recorder.calls();
+        assert!(calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_event_with_branch_triggers_failed_comment() {
+        let recorder = RecordingCommenter::new();
+        let commenter: Arc<dyn PrCommenter> = recorder.clone();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![deployment_with_branch(
+                    10,
+                    Some("feature/x"),
+                    Some("abcdef1234"),
+                )]])
+                .into_connection(),
+        );
+
+        let job = Job::DeploymentFailed(DeploymentFailedJob {
+            deployment_id: 10,
+            project_id: 42,
+            environment_id: 7,
+            environment_name: "preview".into(),
+            error_message: Some("build failed".into()),
+        });
+
+        PrCommentListener::handle_job(&commenter, &db, &job)
+            .await
+            .unwrap();
+
+        let calls = recorder.calls();
+        assert_eq!(calls.len(), 1);
+        match &calls[0].phase {
+            CommentPhase::Failed {
+                commit_short_sha,
+                deployment_url,
+            } => {
+                assert_eq!(commit_short_sha, "abcdef1");
+                assert!(deployment_url.is_none());
+            }
+            _ => panic!("expected Failed, got {:?}", calls[0].phase),
+        }
+    }
+
+    #[tokio::test]
+    async fn unrelated_event_is_ignored() {
+        let recorder = RecordingCommenter::new();
+        let commenter: Arc<dyn PrCommenter> = recorder.clone();
+        let db = empty_db();
+
+        // DeploymentReady is not one of the events the listener subscribes to.
+        let job = Job::DeploymentReady(DeploymentReadyJob {
+            deployment_id: 10,
+            project_id: 42,
+            environment_id: 7,
+            environment_name: "preview".into(),
+            url: Some("https://x".into()),
+        });
+
+        PrCommentListener::handle_job(&commenter, &db, &job)
+            .await
+            .unwrap();
+
+        let calls = recorder.calls();
+        assert!(calls.is_empty());
     }
 }

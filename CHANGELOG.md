@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
--
+- **Vercel-style sticky PR/MR preview comments**: when a deployment for a branch with an open pull request (GitHub) or merge request (GitLab) moves through created → succeeded/failed, Temps posts or updates a single sticky comment with the preview URL. The comment is keyed by a hidden HTML marker (`<!-- temps-preview:project=N:env=N -->`) scoped per `(project, environment)` so subsequent updates edit in place rather than spam the PR. New `temps-git::PrCommenter` trait + `GitPrCommenter` impl dispatches to GitHub REST (`/repos/.../pulls` + issue comments) or GitLab REST (`/merge_requests` + notes). A background `PrCommentListener` subscribes to existing `Job::DeploymentCreated` / `DeploymentSucceeded` / `DeploymentFailed` broadcasts — no schema changes, no new event types, no wiring required in `temps-deployments`. Graceful degradation: missing git connection, no open PR, unsupported provider, or 403/401 from the provider all log at warn/debug and never block deploys. Newly-created GitHub Apps already request `pull_requests:write` in the manifest; existing installations without that scope hit a logged 403 and would need to upgrade their app permissions.
 
 ### Changed
 -
