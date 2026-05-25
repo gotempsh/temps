@@ -260,27 +260,37 @@ fn is_unique_local_ipv6(ip: &Ipv6Addr) -> bool {
 
 /// Validate a user-supplied git remote URL (Fix #12 — SSRF via libgit2).
 ///
-/// libgit2 will happily clone from any scheme it understands, including
-/// `file://`, `ssh://`, `git://`, `git@host:repo`, and `http://internal/`.
-/// Each of those is a path to SSRF or local-file disclosure when the
-/// remote target is attacker-controlled.
+/// libgit2 will happily clone from any scheme it understands. Each of these
+/// is a footgun and is rejected:
+/// - `file://` — local-file disclosure (read `/etc/passwd` via clone)
+/// - `ssh://` / `git@host:repo` — internal-host probing + key/cred leakage
+/// - `git://` — unauthenticated, unencrypted, MITM-vulnerable git daemon
+///   protocol (deprecated by GitHub in 2022; see
+///   <https://github.blog/2021-09-01-improving-git-protocol-security-github/>)
+/// - `http://` — plaintext credentials in URL get sniffed; no host
+///   authenticity check
 ///
-/// This validator enforces:
-/// - The URL parses as a URL
-/// - The scheme is `https` or `http` (no `file`, `git`, `ssh`, `git+ssh`, etc.)
-/// - The host passes the same IP/loopback/cloud-metadata checks
-///   `validate_external_url` applies (private/loopback/link-local/cloud-metadata IPs rejected)
-/// - SCP-style `git@host:repo` syntax is rejected explicitly because it
-///   does not have a URL scheme and `Url::parse` would treat it as a
-///   relative path
+/// Only `https://` is accepted. Self-hosted git on plain HTTP or an
+/// internal git daemon should put TLS in front (caddy/nginx) — there is no
+/// legitimate reason to clone deployment source over an unauthenticated or
+/// plaintext transport in 2026.
+///
+/// After scheme validation, the host is run through `validate_external_url`
+/// so private/loopback/link-local/cloud-metadata IPs are still rejected.
 pub fn validate_git_url(url: &str) -> Result<Url, UrlValidationError> {
-    // Reject SCP-style `git@host:path` before parsing — these have no scheme
-    // and Url::parse would mishandle them.
+    // Reject SCP-style `git@host:path` before parsing — no scheme present,
+    // `Url::parse` would treat it as a relative path.
     if !url.contains("://") {
         return Err(UrlValidationError::InvalidScheme);
     }
-    // Reuse the external-URL validator: it already enforces https/http +
-    // private-IP / metadata / loopback rejection.
+    // Require https scheme explicitly. `validate_external_url` would allow
+    // http; for git clone we are stricter.
+    let parsed =
+        Url::parse(url).map_err(|e| UrlValidationError::InvalidFormat(format!("{}", e)))?;
+    if parsed.scheme() != "https" {
+        return Err(UrlValidationError::InvalidScheme);
+    }
+    // Reuse the external-URL validator for the host/IP checks.
     validate_external_url(url)
 }
 
@@ -485,5 +495,64 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    // ── validate_git_url: only https:// is accepted ──────────────────────
+
+    #[test]
+    fn test_validate_git_url_accepts_https() {
+        assert!(validate_git_url("https://github.com/foo/bar.git").is_ok());
+        assert!(validate_git_url("https://gitlab.example.com/team/repo.git").is_ok());
+    }
+
+    #[test]
+    fn test_validate_git_url_rejects_http() {
+        // Plaintext http leaks credentials in the URL and has no host auth.
+        assert!(matches!(
+            validate_git_url("http://github.com/foo/bar.git"),
+            Err(UrlValidationError::InvalidScheme)
+        ));
+    }
+
+    #[test]
+    fn test_validate_git_url_rejects_git_scheme() {
+        // git:// (port 9418) is unauthenticated + unencrypted + MITM-vulnerable.
+        assert!(matches!(
+            validate_git_url("git://github.com/foo/bar.git"),
+            Err(UrlValidationError::InvalidScheme)
+        ));
+    }
+
+    #[test]
+    fn test_validate_git_url_rejects_ssh_scheme() {
+        assert!(matches!(
+            validate_git_url("ssh://git@host/repo.git"),
+            Err(UrlValidationError::InvalidScheme)
+        ));
+    }
+
+    #[test]
+    fn test_validate_git_url_rejects_file_scheme() {
+        // file:// = local-file read primitive via clone.
+        assert!(matches!(
+            validate_git_url("file:///etc/passwd"),
+            Err(UrlValidationError::InvalidScheme)
+        ));
+    }
+
+    #[test]
+    fn test_validate_git_url_rejects_scp_style() {
+        // No scheme at all — Url::parse would mishandle this.
+        assert!(matches!(
+            validate_git_url("git@github.com:foo/bar.git"),
+            Err(UrlValidationError::InvalidScheme)
+        ));
+    }
+
+    #[test]
+    fn test_validate_git_url_rejects_private_https() {
+        // https + private IP must still be rejected via the IP host check.
+        assert!(validate_git_url("https://169.254.169.254/repo.git").is_err());
+        assert!(validate_git_url("https://localhost/repo.git").is_err());
     }
 }
