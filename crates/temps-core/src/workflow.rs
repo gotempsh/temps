@@ -38,6 +38,21 @@ pub enum WorkflowError {
 
     #[error("Other error: {0}")]
     Other(String),
+
+    /// Fix #17/#18: invalid archive entry path (path traversal, absolute path, etc.).
+    /// Maps to HTTP 400.
+    #[error("Invalid archive entry '{path}': {reason}")]
+    InvalidArchiveEntry { path: String, reason: String },
+
+    /// Fix #27: archive decompressed size exceeds the allowed limit.
+    /// Maps to HTTP 413.
+    #[error("Archive exceeds maximum allowed decompressed size of {limit_bytes} bytes")]
+    ArchiveTooLarge { limit_bytes: u64 },
+
+    /// Fix: bundle path escapes the data directory.
+    /// Maps to HTTP 400.
+    #[error("Invalid bundle path '{path}': {reason}")]
+    InvalidBundlePath { path: String, reason: String },
 }
 
 /// Trait for writing logs in real-time during workflow execution

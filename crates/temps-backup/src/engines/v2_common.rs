@@ -24,6 +24,7 @@ use serde_json::{json, Value};
 use tracing::warn;
 
 use temps_backup_core::engine_v2::BackupError;
+use temps_core::url_validation::validate_external_url;
 use temps_core::EncryptionService;
 
 /// Shared HTTPS client backed by the Mozilla CA bundle compiled in via
@@ -375,6 +376,23 @@ pub fn build_s3_client(
         } else {
             format!("http://{}", endpoint)
         };
+        // SSRF guard (Fix #13) — engine read path.
+        // Skip if TEMPS_S3_ALLOW_PRIVATE_ENDPOINTS=1 (operator opt-in for
+        // self-hosted MinIO/RustFS on a private LAN).
+        let allow_private = std::env::var("TEMPS_S3_ALLOW_PRIVATE_ENDPOINTS")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        if !allow_private {
+            validate_external_url(&url).map_err(|e| BackupError::PermanentFailure {
+                reason: format!(
+                    "S3 endpoint '{}' is blocked by SSRF validation: {}. \
+                     To allow private/loopback endpoints set \
+                     TEMPS_S3_ALLOW_PRIVATE_ENDPOINTS=1 and restart the server, \
+                     or delete and re-create the S3 source with a public endpoint.",
+                    url, e
+                ),
+            })?;
+        }
         builder = builder.endpoint_url(url);
     }
 

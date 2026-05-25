@@ -6,7 +6,7 @@ use temps_backup_core::BackupExecutorBuilder;
 use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
@@ -105,6 +105,20 @@ impl TempsPlugin for BackupPlugin {
                 log_service,
             ));
             context.register_service(pg_upgrade_service.clone());
+
+            // Security (Fix #13): warn operators who have opted out of SSRF
+            // validation for S3 endpoints so the choice is visible in logs.
+            if std::env::var("TEMPS_S3_ALLOW_PRIVATE_ENDPOINTS")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+            {
+                warn!(
+                    env_var = "TEMPS_S3_ALLOW_PRIVATE_ENDPOINTS",
+                    "SSRF validation for S3 endpoints is DISABLED. Private and loopback \
+                     endpoints are permitted. Only set this if all S3 sources are \
+                     operator-controlled (e.g. MinIO/RustFS on a private LAN)."
+                );
+            }
 
             // ── BackupExecutor: registers all 7 engines ──────────────────────
             let executor_max_concurrent = std::env::var("TEMPS_BACKUP_EXECUTOR_MAX_CONCURRENT")

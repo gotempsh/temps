@@ -6,6 +6,7 @@ use sea_orm::{DatabaseConnection, EntityTrait};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
+use temps_core::url_validation::validate_external_url;
 use temps_import_types::{
     ImportCredentials, ImportPlan, ImportSelector, ImportSource, ValidationReport,
     WorkloadDescriptor, WorkloadId, WorkloadImporter,
@@ -140,6 +141,15 @@ impl ImportOrchestrator {
     ) -> ImportServiceResult<Vec<WorkloadDescriptor>> {
         debug!("Discovering workloads from source: {}", source);
 
+        // SSRF guard (Fix #16): validate base_url before forwarding credentials
+        // to the importer, which would make outbound HTTP requests.
+        if let Some(ref url) = credentials.base_url {
+            validate_external_url(url).map_err(|e| ImportServiceError::InvalidBaseUrl {
+                url: url.clone(),
+                reason: e.to_string(),
+            })?;
+        }
+
         let importer = self.get_importer(source)?;
         let workloads = importer.discover(credentials, selector).await?;
 
@@ -160,6 +170,15 @@ impl ImportOrchestrator {
             "Creating import plan for workload: {} from source: {} (repository: {:?})",
             workload_id, source, repository_id
         );
+
+        // SSRF guard (Fix #16): validate base_url before forwarding credentials
+        // to the importer, which would make outbound HTTP requests.
+        if let Some(ref url) = credentials.base_url {
+            validate_external_url(url).map_err(|e| ImportServiceError::InvalidBaseUrl {
+                url: url.clone(),
+                reason: e.to_string(),
+            })?;
+        }
 
         let importer = self.get_importer(source)?;
 
@@ -1013,4 +1032,77 @@ mod tests {
         assert_eq!(status.warnings[0], "This is a warning");
     }
     */
+
+    // -----------------------------------------------------------------------
+    // Fix #16 — ImportCredentials base_url SSRF validation
+    //
+    // These tests bypass the full orchestrator construction (which requires
+    // real DB + service wiring) and call validate_external_url directly,
+    // mirroring the check inserted at the top of discover() and create_plan().
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_import_base_url_cloud_metadata_rejected() {
+        let credentials = ImportCredentials {
+            base_url: Some("http://169.254.169.254".to_string()),
+            ..Default::default()
+        };
+        if let Some(ref url) = credentials.base_url {
+            let result = validate_external_url(url);
+            assert!(
+                result.is_err(),
+                "cloud metadata base_url must be rejected before reaching importer"
+            );
+        }
+    }
+
+    #[test]
+    fn test_import_base_url_localhost_rejected() {
+        let credentials = ImportCredentials {
+            base_url: Some("http://localhost".to_string()),
+            ..Default::default()
+        };
+        if let Some(ref url) = credentials.base_url {
+            let result = validate_external_url(url);
+            assert!(result.is_err(), "localhost base_url must be rejected");
+        }
+    }
+
+    #[test]
+    fn test_import_base_url_private_ip_rejected() {
+        let credentials = ImportCredentials {
+            base_url: Some("http://10.0.0.1".to_string()),
+            ..Default::default()
+        };
+        if let Some(ref url) = credentials.base_url {
+            let result = validate_external_url(url);
+            assert!(result.is_err(), "private IP base_url must be rejected");
+        }
+    }
+
+    #[test]
+    fn test_import_base_url_public_accepted() {
+        let credentials = ImportCredentials {
+            base_url: Some("https://coolify.example.com".to_string()),
+            ..Default::default()
+        };
+        if let Some(ref url) = credentials.base_url {
+            let result = validate_external_url(url);
+            assert!(
+                result.is_ok(),
+                "public HTTPS base_url must be accepted; got: {:?}",
+                result
+            );
+        }
+    }
+
+    #[test]
+    fn test_import_base_url_none_is_allowed() {
+        let credentials = ImportCredentials {
+            base_url: None,
+            ..Default::default()
+        };
+        // No validation should occur when base_url is absent.
+        assert!(credentials.base_url.is_none());
+    }
 }

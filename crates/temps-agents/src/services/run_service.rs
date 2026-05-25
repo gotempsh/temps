@@ -340,6 +340,40 @@ impl AgentRunService {
             .ok_or(AgentError::RunNotFound { run_id })
     }
 
+    /// Verify that `run_id` belongs to `project_id`.
+    ///
+    /// Returns `Ok(())` when the run exists and its `project_id` matches.
+    /// Returns `Err(AgentError::RunNotFound)` in every other case — including
+    /// when the run exists but belongs to a *different* project — so that
+    /// cross-project callers cannot infer the existence of foreign runs from
+    /// the error (no information-disclosure via 403 vs 404 distinction).
+    pub async fn ensure_run_in_project(
+        &self,
+        run_id: i32,
+        project_id: i32,
+    ) -> Result<(), AgentError> {
+        let run = agent_runs::Entity::find_by_id(run_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(AgentError::Database)?
+            .ok_or(AgentError::RunNotFound { run_id })?;
+
+        if run.project_id != project_id {
+            tracing::warn!(
+                run_id,
+                run_project_id = run.project_id,
+                requested_project_id = project_id,
+                "Cross-project run access rejected: run belongs to project {}, \
+                 caller presented project {}",
+                run.project_id,
+                project_id
+            );
+            return Err(AgentError::RunNotFound { run_id });
+        }
+
+        Ok(())
+    }
+
     pub async fn get_run_with_logs(&self, run_id: i32) -> Result<RunWithLogs, AgentError> {
         let run = self.get_run(run_id).await?;
 
@@ -744,6 +778,38 @@ mod tests {
         let result = svc.count_active_runs(10).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_ensure_run_in_project_matches() {
+        // Run belongs to project 42 — same project presented by caller.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![make_run(10, 42)]])
+            .into_connection();
+        let svc = AgentRunService::new(Arc::new(db));
+
+        let result = svc.ensure_run_in_project(10, 42).await;
+        assert!(
+            result.is_ok(),
+            "should succeed when project_id matches run.project_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ensure_run_in_project_mismatch_returns_run_not_found() {
+        // Run belongs to project 42, but caller claims project 99.
+        // The helper must return RunNotFound (not Forbidden) to avoid
+        // leaking that the run exists in another project.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![make_run(10, 42)]])
+            .into_connection();
+        let svc = AgentRunService::new(Arc::new(db));
+
+        let result = svc.ensure_run_in_project(10, 99).await;
+        assert!(
+            matches!(result.unwrap_err(), AgentError::RunNotFound { run_id: 10 }),
+            "cross-project access must return RunNotFound, not Forbidden"
+        );
     }
 
     // Verify that all expected active statuses are logically present.

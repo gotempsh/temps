@@ -258,6 +258,51 @@ fn is_unique_local_ipv6(ip: &Ipv6Addr) -> bool {
     (segments[0] & 0xfe00) == 0xfc00
 }
 
+/// Validate a user-supplied git remote URL (Fix #12 — SSRF via libgit2).
+///
+/// libgit2 will happily clone from any scheme it understands, including
+/// `file://`, `ssh://`, `git://`, `git@host:repo`, and `http://internal/`.
+/// Each of those is a path to SSRF or local-file disclosure when the
+/// remote target is attacker-controlled.
+///
+/// This validator enforces:
+/// - The URL parses as a URL
+/// - The scheme is `https` or `http` (no `file`, `git`, `ssh`, `git+ssh`, etc.)
+/// - The host passes the same IP/loopback/cloud-metadata checks
+///   `validate_external_url` applies (private/loopback/link-local/cloud-metadata IPs rejected)
+/// - SCP-style `git@host:repo` syntax is rejected explicitly because it
+///   does not have a URL scheme and `Url::parse` would treat it as a
+///   relative path
+pub fn validate_git_url(url: &str) -> Result<Url, UrlValidationError> {
+    // Reject SCP-style `git@host:path` before parsing — these have no scheme
+    // and Url::parse would mishandle them.
+    if !url.contains("://") {
+        return Err(UrlValidationError::InvalidScheme);
+    }
+    // Reuse the external-URL validator: it already enforces https/http +
+    // private-IP / metadata / loopback rejection.
+    validate_external_url(url)
+}
+
+/// Redact the password portion of a URL so it is safe to include in
+/// error messages and structured logs (Fix #12 — credentials in errors).
+///
+/// Examples:
+/// - `https://user:secret@host/repo` → `https://user:***@host/repo`
+/// - `https://host/repo`             → `https://host/repo`
+/// - non-URL strings are returned unchanged
+pub fn redact_url_password(url: &str) -> String {
+    match Url::parse(url) {
+        Ok(mut parsed) => {
+            if parsed.password().is_some() {
+                let _ = parsed.set_password(Some("***"));
+            }
+            parsed.to_string()
+        }
+        Err(_) => url.to_string(),
+    }
+}
+
 /// Asynchronous DNS resolution and validation for domains
 ///
 /// This function resolves the domain name and validates all resolved IP addresses

@@ -13,8 +13,8 @@ use tokio::time::sleep;
 use tracing::{debug, error, warn};
 
 use super::types::{
-    CreateMonitorRequest, MonitorResponse, MonitorStatus, StatusCheckResponse, StatusPageError,
-    UptimeDataPoint, UptimeHistoryResponse,
+    validate_check_path, CreateMonitorRequest, MonitorResponse, MonitorStatus, StatusCheckResponse,
+    StatusPageError, UptimeDataPoint, UptimeHistoryResponse,
 };
 
 /// Service for managing status monitors and their health checks
@@ -244,6 +244,10 @@ impl MonitorService {
         project_id: i32,
         request: CreateMonitorRequest,
     ) -> Result<MonitorResponse, StatusPageError> {
+        if let Some(ref path) = request.check_path {
+            validate_check_path(path)?;
+        }
+
         let monitor = status_monitors::ActiveModel {
             project_id: Set(project_id),
             environment_id: Set(Some(request.environment_id)),
@@ -419,6 +423,8 @@ impl MonitorService {
         environment_id: i32,
         check_path: &str,
     ) -> Result<(), StatusPageError> {
+        validate_check_path(check_path)?;
+
         let monitors = status_monitors::Entity::find()
             .filter(status_monitors::Column::ProjectId.eq(project_id))
             .filter(status_monitors::Column::EnvironmentId.eq(Some(environment_id)))

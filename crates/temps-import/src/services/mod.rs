@@ -37,6 +37,10 @@ pub enum ImportServiceError {
 
     #[error("Internal error: {0}")]
     Internal(String),
+
+    /// SSRF guard rejected a user-supplied importer `base_url` (Fix #16).
+    #[error("Invalid importer base URL '{url}': {reason}")]
+    InvalidBaseUrl { url: String, reason: String },
 }
 
 /// Result type for import services
@@ -81,6 +85,11 @@ impl From<ImportServiceError> for Problem {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
                     .with_detail(msg)
+            }
+            ImportServiceError::InvalidBaseUrl { url, reason } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Invalid Importer Base URL")
+                    .with_detail(format!("base_url '{url}' rejected: {reason}"))
             }
         }
     }

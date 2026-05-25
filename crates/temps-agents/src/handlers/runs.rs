@@ -427,9 +427,15 @@ pub async fn list_agent_runs(
 pub async fn get_run_with_logs(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AppState>>,
-    Path((_project_id, run_id)): Path<(i32, i32)>,
+    Path((project_id, run_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsRead);
+
+    app_state
+        .run_service
+        .ensure_run_in_project(run_id, project_id)
+        .await
+        .map_err(Problem::from)?;
 
     let run_with_logs = app_state
         .run_service
@@ -486,9 +492,15 @@ pub async fn get_run_with_logs(
 pub async fn stream_run_events(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AppState>>,
-    Path((_project_id, run_id)): Path<(i32, i32)>,
+    Path((project_id, run_id)): Path<(i32, i32)>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, Problem> {
     permission_guard!(auth, ProjectsRead);
+
+    app_state
+        .run_service
+        .ensure_run_in_project(run_id, project_id)
+        .await
+        .map_err(Problem::from)?;
 
     let run_service = app_state.run_service.clone();
 
@@ -580,6 +592,12 @@ pub async fn cancel_run(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
 
+    app_state
+        .run_service
+        .ensure_run_in_project(run_id, project_id)
+        .await
+        .map_err(Problem::from)?;
+
     let run = app_state
         .run_service
         .cancel_run(run_id)
@@ -623,9 +641,15 @@ pub async fn cancel_run(
 pub async fn retry_run(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AppState>>,
-    Path((_project_id, run_id)): Path<(i32, i32)>,
+    Path((project_id, run_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+
+    app_state
+        .run_service
+        .ensure_run_in_project(run_id, project_id)
+        .await
+        .map_err(Problem::from)?;
 
     // Load the original run
     let original = app_state

@@ -321,9 +321,15 @@ pub async fn start_analysis(
 pub async fn get_run(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AppState>>,
-    Path((_project_id, run_id)): Path<(i32, i32)>,
+    Path((project_id, run_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsRead);
+
+    app_state
+        .run_service
+        .ensure_run_in_project(run_id, project_id)
+        .await
+        .map_err(Problem::from)?;
 
     let run_with_logs = app_state
         .run_service
@@ -363,9 +369,15 @@ pub async fn get_run(
 pub async fn stream_events(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AppState>>,
-    Path((_project_id, run_id)): Path<(i32, i32)>,
+    Path((project_id, run_id)): Path<(i32, i32)>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, Problem> {
     permission_guard!(auth, ProjectsRead);
+
+    app_state
+        .run_service
+        .ensure_run_in_project(run_id, project_id)
+        .await
+        .map_err(Problem::from)?;
 
     let run_service = app_state.run_service.clone();
 
@@ -467,10 +479,16 @@ fn sse_keep_alive() -> KeepAlive {
 pub async fn add_context(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AppState>>,
-    Path((_project_id, run_id)): Path<(i32, i32)>,
+    Path((project_id, run_id)): Path<(i32, i32)>,
     Json(request): Json<AddContextRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+
+    app_state
+        .run_service
+        .ensure_run_in_project(run_id, project_id)
+        .await
+        .map_err(Problem::from)?;
 
     if request.message.trim().is_empty() {
         return Err(Problem::from(AgentError::Validation {
@@ -514,6 +532,12 @@ pub async fn start_fix(
     Path((project_id, run_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+
+    app_state
+        .run_service
+        .ensure_run_in_project(run_id, project_id)
+        .await
+        .map_err(Problem::from)?;
 
     // Verify the run exists and is in the right phase before spawning
     let run = app_state
@@ -588,6 +612,12 @@ pub async fn create_pr(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
 
+    app_state
+        .run_service
+        .ensure_run_in_project(run_id, project_id)
+        .await
+        .map_err(Problem::from)?;
+
     let pr = app_state
         .autofixer_service
         .create_pr(run_id)
@@ -656,9 +686,15 @@ pub async fn create_pr(
 pub async fn re_analyze(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AppState>>,
-    Path((_project_id, run_id)): Path<(i32, i32)>,
+    Path((project_id, run_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+
+    app_state
+        .run_service
+        .ensure_run_in_project(run_id, project_id)
+        .await
+        .map_err(Problem::from)?;
 
     // Verify the run is in the right phase
     let run = app_state
@@ -708,9 +744,15 @@ pub async fn re_analyze(
 pub async fn cancel(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AppState>>,
-    Path((_project_id, run_id)): Path<(i32, i32)>,
+    Path((project_id, run_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+
+    app_state
+        .run_service
+        .ensure_run_in_project(run_id, project_id)
+        .await
+        .map_err(Problem::from)?;
 
     app_state
         .autofixer_service

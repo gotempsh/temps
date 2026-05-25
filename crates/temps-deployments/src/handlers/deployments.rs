@@ -245,6 +245,11 @@ impl From<crate::services::services::DeploymentError> for Problem {
                     .with_title("Deployment Error")
                     .with_detail(msg)
             }
+            DeploymentError::InvalidBundlePath { path, reason } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Invalid Bundle Path")
+                    .with_detail(format!("Bundle path '{path}' is invalid: {reason}"))
+            }
             DeploymentError::Other(msg) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Internal Server Error")
                 .with_detail(msg),

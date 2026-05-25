@@ -1426,6 +1426,26 @@ pub async fn upload_static_bundle(
 
     let blob_path = format!("static-bundles/{}.{}", bundle_id, extension);
 
+    // Sanity-check: the constructed path must match the expected pattern
+    // `static-bundles/<uuid>.<ext>`.  This prevents future regressions where
+    // an attacker-controlled value might slip in via a code change.
+    {
+        let parts: Vec<&str> = blob_path.splitn(2, '/').collect();
+        let valid = parts.len() == 2
+            && parts[0] == "static-bundles"
+            && matches!(extension, "tar.gz" | "tgz" | "zip" | "tar")
+            && parts[1] == format!("{}.{}", bundle_id, extension).as_str();
+        if !valid {
+            error!(
+                blob_path = %blob_path,
+                "Constructed bundle path does not match expected pattern; rejecting upload"
+            );
+            return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Upload Failed")
+                .with_detail("Internal error: generated bundle path failed validation"));
+        }
+    }
+
     // Calculate checksum
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();

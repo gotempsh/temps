@@ -18,6 +18,90 @@ pub enum StatusPageError {
     Internal(String),
 }
 
+/// Validate a status-monitor `check_path` to prevent URL/header injection
+/// when constructing the probe URL (Fix #25).
+///
+/// Rules:
+/// - Must start with `/`
+/// - Must not contain `@` (prevents userinfo injection turning the probe
+///   into a request against a different host)
+/// - Must not contain `://` (prevents scheme injection)
+/// - Must not contain CR, LF, NUL, or tab (prevents request smuggling)
+/// - Capped at 2048 bytes
+pub fn validate_check_path(path: &str) -> Result<(), StatusPageError> {
+    if path.len() > 2048 {
+        return Err(StatusPageError::Validation(format!(
+            "check_path length {} exceeds 2048 byte limit",
+            path.len()
+        )));
+    }
+    if !path.starts_with('/') {
+        return Err(StatusPageError::Validation(
+            "check_path must start with '/'".to_string(),
+        ));
+    }
+    if path.contains('@') {
+        return Err(StatusPageError::Validation(
+            "check_path must not contain '@' (userinfo injection)".to_string(),
+        ));
+    }
+    if path.contains("://") {
+        return Err(StatusPageError::Validation(
+            "check_path must not contain '://' (scheme injection)".to_string(),
+        ));
+    }
+    if path
+        .chars()
+        .any(|c| c == '\r' || c == '\n' || c == '\0' || c == '\t')
+    {
+        return Err(StatusPageError::Validation(
+            "check_path must not contain control characters".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod check_path_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_no_leading_slash() {
+        assert!(validate_check_path("health").is_err());
+    }
+
+    #[test]
+    fn rejects_userinfo_injection() {
+        assert!(validate_check_path("/foo@evil.com/bar").is_err());
+    }
+
+    #[test]
+    fn rejects_scheme_injection() {
+        assert!(validate_check_path("/x://attacker.com/y").is_err());
+    }
+
+    #[test]
+    fn rejects_crlf() {
+        assert!(validate_check_path("/foo\r\nHost: evil").is_err());
+    }
+
+    #[test]
+    fn rejects_too_long() {
+        let long = format!("/{}", "a".repeat(2048));
+        assert!(validate_check_path(&long).is_err());
+    }
+
+    #[test]
+    fn accepts_simple_path() {
+        assert!(validate_check_path("/health").is_ok());
+    }
+
+    #[test]
+    fn accepts_path_with_query_chars() {
+        assert!(validate_check_path("/api/v1/health?check=1&deep=true").is_ok());
+    }
+}
+
 // Request/Response DTOs
 #[derive(Debug, Default, Serialize, Deserialize, ToSchema)]
 pub struct CreateMonitorRequest {

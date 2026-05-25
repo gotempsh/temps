@@ -74,6 +74,55 @@ struct CachedClient {
     cached_at: Instant,
 }
 
+/// A reqwest `Resolve` implementation that calls the system DNS resolver and
+/// then rejects any address that `is_blocked_ip` considers private/internal.
+///
+/// This closes the TOCTOU window between `assert_issuer_host_allowed` (which
+/// resolves the hostname before any HTTP is attempted) and the actual TCP
+/// `connect()` inside reqwest/hyper. With short-TTL DNS records an attacker
+/// who controls DNS can return a public IP for the pre-check and then a
+/// private IP (e.g. `169.254.169.254`) by the time the real connection is
+/// made. Installing this resolver on the OIDC `reqwest::Client` means the IP
+/// is re-validated at connect time, eliminating the window.
+///
+/// Loopback addresses (`127.x`, `::1`) are **not** blocked here for parity
+/// with `assert_issuer_host_allowed`, which explicitly allows loopback so
+/// local Keycloak / Authentik dev continues to work.
+struct BlocklistResolver;
+
+impl reqwest::dns::Resolve for BlocklistResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            // `lookup_host` accepts `(host, port)` but we only care about IPs;
+            // port 0 is fine because reqwest overwrites it from the URL.
+            let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
+                .collect();
+
+            // Reject the entire resolution if any returned address is blocked.
+            // We refuse the whole set rather than silently filtering so that
+            // misconfigured round-robin DNS (mix of public + private) fails
+            // loudly instead of silently succeeding on the private IP.
+            for addr in &addrs {
+                if is_blocked_ip(&addr.ip()) {
+                    return Err(format!(
+                        "OIDC issuer '{}' resolved to a blocked private/internal IP ({}) at \
+                         connect time; possible DNS rebinding attack",
+                        host,
+                        addr.ip()
+                    )
+                    .into());
+                }
+            }
+
+            let addrs_iter: reqwest::dns::Addrs = Box::new(addrs.into_iter());
+            Ok(addrs_iter)
+        })
+    }
+}
+
 pub struct OidcService {
     db: Arc<DatabaseConnection>,
     encryption_service: Arc<EncryptionService>,
@@ -130,9 +179,16 @@ impl OidcService {
         // which is unrecoverable at the service layer. If this fires
         // in production it's an "install OS certs" problem, not a
         // runtime concern.
+        // `BlocklistResolver` re-validates every resolved IP at connect time,
+        // closing the TOCTOU window between `assert_issuer_host_allowed`
+        // (which runs before the HTTP attempt) and the actual TCP connect
+        // inside hyper. An attacker with short-TTL DNS can return a public IP
+        // at check time and `169.254.169.254` at connect time; the resolver
+        // catches the second lookup and aborts the connection.
         let http_client = reqwest::ClientBuilder::new()
             .timeout(OIDC_HTTP_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
+            .dns_resolver(Arc::new(BlocklistResolver))
             .build()
             .expect("OIDC reqwest client should build; OS TLS / cert store is unusable");
 
@@ -1033,13 +1089,13 @@ fn is_loopback_url(url: &str) -> bool {
 /// outright: those are the addresses that point at the AWS metadata
 /// service, the cluster-internal mesh, the office VPN, etc.
 ///
-/// We pre-resolve here rather than relying on a `reqwest` interceptor
-/// because openidconnect doesn't expose a middleware hook on the
-/// shared client. There's an unavoidable TOCTOU window between the
-/// resolve here and the actual TCP connect inside `reqwest`, but
-/// closing it would require a custom hyper resolver — overkill given
-/// the threat model (admin pasting a malicious URL into the IdP
-/// config form, not a remote attacker).
+/// This function acts as defense-in-depth at the admin-save / test-connection
+/// call site — it runs synchronously before any HTTP is attempted and produces
+/// a human-readable error for the UI. The TOCTOU window that previously existed
+/// between this pre-check and the actual TCP connect inside reqwest is now closed
+/// by `BlocklistResolver`, which re-validates every resolved IP at connect time.
+/// An attacker with short-TTL DNS that returns a public IP here and then
+/// `169.254.169.254` at connect time will be blocked by the resolver.
 async fn assert_issuer_host_allowed(issuer: &str) -> Result<(), OidcError> {
     let url = openidconnect::url::Url::parse(issuer).map_err(|e| OidcError::InvalidIssuer {
         reason: format!("could not parse issuer URL: {e}"),
@@ -1669,6 +1725,72 @@ mod tests {
                 &serde_json::json!({ "roles": ["admin"] })
             ),
             RoleType::Admin
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // BlocklistResolver
+    // ---------------------------------------------------------------------------
+    //
+    // These tests call the resolver directly without spinning up an HTTP server.
+    // We verify:
+    //   1. Known-blocked IPs (169.254.169.254, 10.x.x.x) are rejected.
+    //   2. Loopback (`localhost`) is allowed (same policy as
+    //      `assert_issuer_host_allowed`).
+    //
+    // We don't attempt to simulate a live DNS-rebind (that requires real DNS
+    // infrastructure), but these tests prove the resolver rejects the addresses
+    // that matter for the threat model at connect time.
+
+    #[tokio::test]
+    async fn blocklist_resolver_rejects_aws_imds_literal_ip() {
+        use reqwest::dns::Resolve;
+        use std::str::FromStr;
+
+        let resolver = BlocklistResolver;
+        let name = reqwest::dns::Name::from_str("169.254.169.254").unwrap();
+        let result = resolver.resolve(name).await;
+        assert!(
+            result.is_err(),
+            "BlocklistResolver must reject 169.254.169.254 (AWS IMDS)"
+        );
+        // Use `.err()` instead of `.unwrap_err()` because `reqwest::dns::Addrs`
+        // is a `Box<dyn Iterator<…>>` that doesn't implement `Debug`.
+        let err_msg = result.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            err_msg.contains("blocked") || err_msg.contains("rebind"),
+            "Error message should mention blocking: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn blocklist_resolver_rejects_rfc1918_literal_ip() {
+        use reqwest::dns::Resolve;
+        use std::str::FromStr;
+
+        let resolver = BlocklistResolver;
+        let name = reqwest::dns::Name::from_str("10.0.0.1").unwrap();
+        let result = resolver.resolve(name).await;
+        assert!(
+            result.is_err(),
+            "BlocklistResolver must reject 10.0.0.1 (RFC 1918)"
+        );
+    }
+
+    #[tokio::test]
+    async fn blocklist_resolver_allows_loopback() {
+        use reqwest::dns::Resolve;
+        use std::str::FromStr;
+
+        // `localhost` resolves to 127.0.0.1 / ::1 on virtually all systems.
+        // is_blocked_ip deliberately allows loopback so local Keycloak works.
+        let resolver = BlocklistResolver;
+        let name = reqwest::dns::Name::from_str("localhost").unwrap();
+        let result = resolver.resolve(name).await;
+        assert!(
+            result.is_ok(),
+            "BlocklistResolver must allow localhost (loopback): {}",
+            result.err().map(|e| e.to_string()).unwrap_or_default()
         );
     }
 }

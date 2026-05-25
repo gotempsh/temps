@@ -377,6 +377,28 @@ async fn blob_download(
         .download(project_id, &params.path)
         .await?;
 
+    // Derive a safe filename for the Content-Disposition header.
+    // Take only the final path component, strip CR/LF, and percent-encode
+    // non-ASCII characters (RFC 5987) to prevent header injection and XSS.
+    let raw_filename = std::path::Path::new(&params.path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("download");
+    // Strip CR, LF, and NUL bytes that could inject additional headers.
+    let sanitized: String = raw_filename
+        .chars()
+        .filter(|c| *c != '\r' && *c != '\n' && *c != '\0')
+        .collect();
+    let encoded_filename = urlencoding::encode(&sanitized);
+    let content_disposition = format!("attachment; filename=\"{encoded_filename}\"");
+
+    info!(
+        blob_path = %params.path,
+        filename = %sanitized,
+        size = %size,
+        "blob download requested"
+    );
+
     // Convert the stream to axum Body
     let body = Body::from_stream(stream.map_err(std::io::Error::other));
 
@@ -385,6 +407,14 @@ async fn blob_download(
         [
             (header::CONTENT_TYPE, content_type),
             (header::CONTENT_LENGTH, size.to_string()),
+            // Defense: force browser to download rather than render active content
+            // (prevents stored-XSS via text/html, image/svg+xml, application/javascript).
+            (header::CONTENT_DISPOSITION, content_disposition),
+            // Defense: prevent browser MIME-sniffing that could re-enable rendering.
+            (
+                header::HeaderName::from_static("x-content-type-options"),
+                "nosniff".to_string(),
+            ),
         ],
         body,
     ))
@@ -845,4 +875,71 @@ pub async fn blob_disable(
         success: true,
         message: "Blob service disabled successfully".to_string(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    /// Replicates the filename-sanitization logic used in `blob_download` so it
+    /// can be tested without spinning up Axum or a real BlobService.
+    fn sanitize_download_filename(path: &str) -> String {
+        let raw_filename = std::path::Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("download");
+        let sanitized: String = raw_filename
+            .chars()
+            .filter(|c| *c != '\r' && *c != '\n' && *c != '\0')
+            .collect();
+        urlencoding::encode(&sanitized).into_owned()
+    }
+
+    #[test]
+    fn test_download_filename_strips_path_components() {
+        // An attacker-supplied path must not let the basename traverse directories.
+        assert_eq!(
+            sanitize_download_filename("evil/../../passwd.html"),
+            "passwd.html"
+        );
+    }
+
+    #[test]
+    fn test_download_filename_strips_cr_lf() {
+        // CR / LF in filenames can inject additional HTTP headers.
+        let input = "file\r\nX-Injected: bad\r\n.html";
+        let result = sanitize_download_filename(input);
+        assert!(!result.contains('\r'));
+        assert!(!result.contains('\n'));
+    }
+
+    #[test]
+    fn test_download_filename_strips_nul() {
+        let input = "evil\0.html";
+        let result = sanitize_download_filename(input);
+        assert!(!result.contains('\0'));
+    }
+
+    #[test]
+    fn test_download_filename_percent_encodes_non_ascii() {
+        // Non-ASCII characters must be percent-encoded (RFC 5987).
+        let result = sanitize_download_filename("résumé.pdf");
+        // urlencoding turns é -> %C3%A9
+        assert!(
+            result.contains('%'),
+            "expected percent-encoding in {result}"
+        );
+        assert!(!result.contains('é'));
+    }
+
+    #[test]
+    fn test_download_filename_simple_ascii_unchanged() {
+        assert_eq!(sanitize_download_filename("report.pdf"), "report.pdf");
+    }
+
+    #[test]
+    fn test_download_filename_falls_back_when_no_file_component() {
+        // A path of just "/" or "" has no file_name; must not panic.
+        let result = sanitize_download_filename("/");
+        // The fallback is "download"
+        assert_eq!(result, "download");
+    }
 }

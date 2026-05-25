@@ -10,7 +10,7 @@ use temps_entities::{
 use tokio::time::{sleep, timeout};
 use tracing::{debug, error, info, warn};
 
-use super::types::StatusPageError;
+use super::types::{validate_check_path, StatusPageError};
 
 /// Service for performing health checks on monitored environments
 pub struct HealthCheckService {
@@ -133,16 +133,25 @@ impl HealthCheckService {
         {
             Ok(public_url) => {
                 debug!("Using public URL for health check: {}", public_url);
-                // Use custom check_path if set, otherwise fall back to monitor_type logic
+                // Use custom check_path if set, otherwise fall back to monitor_type logic.
+                // Defense-in-depth: re-validate the stored path at use time so that any
+                // rows written before write-time validation was added (or written by a
+                // future migration/import path) cannot inject a manipulated URL.
                 let base = public_url.trim_end_matches('/');
                 match &monitor.check_path {
                     Some(path) if !path.is_empty() && path != "/" => {
-                        let path = if path.starts_with('/') {
-                            path.to_string()
+                        if let Err(e) = validate_check_path(path) {
+                            warn!(
+                                monitor_id = monitor.id,
+                                check_path = %path,
+                                error = %e,
+                                "Stored check_path failed validation; falling back to default URL"
+                            );
+                            public_url
                         } else {
-                            format!("/{}", path)
-                        };
-                        format!("{}{}", base, path)
+                            // Path is guaranteed to start with '/' by validate_check_path.
+                            format!("{}{}", base, path)
+                        }
                     }
                     _ if monitor.monitor_type == "health" => {
                         format!("{}/health", base)

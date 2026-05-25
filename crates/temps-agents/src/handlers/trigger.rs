@@ -770,7 +770,14 @@ pub async fn smoke_test_agent(
             cpu_limit: Some(1.0),
             memory_limit_mb: Some(512),
             pids_limit: None,
-            network_mode: Some("host".to_string()),
+            // Use the default egress-filtered bridge network (same as production
+            // sandboxes).  The old "host" override was a security hole: it gave
+            // the smoke-test container unrestricted access to all host-network
+            // services including localhost:8080 (control plane), the DB port,
+            // and cloud-metadata endpoints.  Control-plane connectivity checks
+            // must be done from outside the container by polling agent_run
+            // status from the test harness, not from inside via localhost.
+            network_mode: None,
             env_vars: test_env,
             idle_timeout: std::time::Duration::from_secs(60),
         };

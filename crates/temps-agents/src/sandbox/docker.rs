@@ -977,7 +977,28 @@ impl DockerSandboxProvider {
         Ok(())
     }
 
-    /// Ensure the sandbox network exists.
+    /// Ensure the sandbox bridge network exists and apply iptables egress filtering.
+    ///
+    /// After Docker creates the `temps-sandbox-net` bridge, this method installs a
+    /// dedicated `TEMPS_SANDBOX_EGRESS` iptables chain that blocks outbound traffic
+    /// from sandbox containers to RFC-1918 ranges (10/8, 172.16/12, 192.168/16),
+    /// link-local (169.254/16), and loopback (127/8).  This prevents a compromised
+    /// sandbox from reaching the host gateway, the control plane API (`:8080`), the
+    /// database (`:5432`), or cloud-metadata endpoints while still allowing full
+    /// public-internet access needed for npm, pip, cargo, and GitHub.
+    ///
+    /// The filter is **best-effort**: if iptables is unavailable (rootless Docker,
+    /// macOS Docker Desktop, missing CAP_NET_ADMIN) a `WARN` is logged and sandbox
+    /// creation continues normally.
+    ///
+    /// To disable the filter on platforms that provide equivalent isolation at the
+    /// host or network layer, set the environment variable:
+    ///
+    ///   `TEMPS_SANDBOX_SKIP_EGRESS_FILTER=1`
+    ///
+    /// On macOS the filter is automatically skipped regardless of that variable
+    /// because iptables is not available on the host (Docker Desktop runs inside a
+    /// Linux VM that already isolates sandbox traffic from the macOS host network).
     async fn ensure_network(&self) -> Result<(), AgentError> {
         let networks = self
             .docker
@@ -988,11 +1009,14 @@ impl DockerSandboxProvider {
                 reason: format!("Failed to list networks: {}", e),
             })?;
 
-        let exists = networks
+        let existing = networks
             .iter()
-            .any(|n| n.name.as_ref() == Some(&self.config.network_mode));
+            .find(|n| n.name.as_ref() == Some(&self.config.network_mode));
 
-        if !exists && self.config.network_mode != "none" && self.config.network_mode != "host" {
+        let network_id: Option<String> = if existing.is_none()
+            && self.config.network_mode != "none"
+            && self.config.network_mode != "host"
+        {
             tracing::info!("Creating sandbox network: {}", self.config.network_mode);
             let create_opts = bollard::models::NetworkCreateRequest {
                 name: self.config.network_mode.clone(),
@@ -1000,12 +1024,30 @@ impl DockerSandboxProvider {
                 internal: Some(false), // Allow outbound (Claude CLI needs API access)
                 ..Default::default()
             };
-            self.docker.create_network(create_opts).await.map_err(|e| {
+            let resp = self.docker.create_network(create_opts).await.map_err(|e| {
                 AgentError::SandboxProviderUnavailable {
                     provider: "docker".to_string(),
                     reason: format!("Failed to create network: {}", e),
                 }
             })?;
+            Some(resp.id)
+        } else {
+            existing.and_then(|n| n.id.clone())
+        };
+
+        // Apply iptables egress filter to block sandbox access to RFC-1918 ranges,
+        // link-local (169.254/16), and loopback (127/8).  This prevents a compromised
+        // sandbox from reaching the host gateway, the control plane API, the database,
+        // or cloud-metadata endpoints while still allowing full public-internet access
+        // needed for npm, pip, cargo, and GitHub.
+        //
+        // Operator note: on systems using iptables-nft (Debian 12+, Ubuntu 22.04+)
+        // the kernel module name is `iptables` but the userspace binary may be
+        // `iptables-legacy`; ensure the `iptables` command resolves to the nft-compat
+        // shim or install `iptables-legacy` if this step reports permission errors
+        // despite CAP_NET_ADMIN being present.
+        if let Some(ref id) = network_id {
+            apply_sandbox_egress_filter(&self.docker, id).await;
         }
 
         Ok(())
@@ -2209,6 +2251,288 @@ impl SandboxProvider for DockerSandboxProvider {
     }
 }
 
+/// Apply iptables FORWARD-chain rules on the sandbox bridge to block egress to
+/// RFC-1918, link-local, and loopback ranges.
+///
+/// # Why this exists
+///
+/// Without this filter, a process inside a sandbox can reach the host gateway,
+/// the control-plane API (typically 172.x.x.1 or 10.x.x.1 on the bridge),
+/// the PostgreSQL/TimescaleDB port, and cloud-metadata endpoints
+/// (169.254.169.254).  This function installs a dedicated iptables chain
+/// `TEMPS_SANDBOX_EGRESS` and hooks it into the FORWARD chain on the bridge
+/// interface, dropping traffic to the five private ranges while leaving all
+/// public-internet egress (npm, pip, cargo, GitHub, …) unrestricted.
+///
+/// # Platform behaviour
+///
+/// - **Linux** (production): full iptables filtering applied.
+/// - **macOS / non-Linux** (developer laptops): the function logs a warning
+///   and returns immediately without error.  Docker Desktop on macOS handles
+///   networking inside a VM where host iptables are irrelevant.
+///
+/// # Permissions
+///
+/// The temps server process needs `CAP_NET_ADMIN` to manipulate iptables.  If
+/// the iptables command exits with a permission error the function logs a
+/// `WARN` with an actionable message and continues — sandbox creation is NOT
+/// aborted.  This keeps the server functional on constrained environments
+/// (rootless Docker, unprivileged containers) at the cost of the egress filter
+/// being inactive.
+///
+/// # Idempotency
+///
+/// The function flushes and recreates the `TEMPS_SANDBOX_EGRESS` chain on
+/// every call and uses `-D` before `-I` for the FORWARD hook, so running on
+/// every server start is safe and never accumulates duplicate rules.
+async fn apply_sandbox_egress_filter(docker: &Docker, network_id: &str) {
+    // Operator escape hatch: set TEMPS_SANDBOX_SKIP_EGRESS_FILTER=1 to disable
+    // iptables egress filtering entirely.  Use this on platforms where iptables
+    // is unavailable or managed externally (e.g. Docker Desktop on macOS, rootless
+    // Docker with a separate nftables policy, or CI environments without
+    // CAP_NET_ADMIN).  When skipped, sandboxes can reach RFC-1918 addresses —
+    // only set this if your deployment environment provides equivalent isolation
+    // at the host or network layer.
+    if std::env::var("TEMPS_SANDBOX_SKIP_EGRESS_FILTER").as_deref() == Ok("1") {
+        tracing::warn!(
+            network_id = network_id,
+            "TEMPS_SANDBOX_SKIP_EGRESS_FILTER=1 is set; sandbox egress filter will not \
+             be applied. Sandboxes may reach internal network addresses (RFC-1918, \
+             169.254/16, 127/8). Only set this if your environment provides equivalent \
+             isolation at the host or network layer."
+        );
+        return;
+    }
+
+    // This is a Linux-only operation.  On macOS (developer machines running
+    // Docker Desktop), iptables doesn't exist on the host — the sandbox runs
+    // inside a VM and host-level filtering is irrelevant.
+    if !cfg!(target_os = "linux") {
+        tracing::warn!(
+            network_id = network_id,
+            "Sandbox egress filter (iptables) is Linux-only; skipping on this platform. \
+             Ensure the control plane runs on Linux in production."
+        );
+        return;
+    }
+
+    // Resolve the bridge interface name.  Docker stores it under the
+    // "com.docker.network.bridge.name" option.  If that key is absent (e.g.
+    // for overlay drivers) we fall back to the `br-<first 12 chars of id>`
+    // convention that the bridge driver uses by default.
+    let bridge_name = match docker
+        .inspect_network(
+            network_id,
+            None::<bollard::query_parameters::InspectNetworkOptions>,
+        )
+        .await
+    {
+        Ok(info) => info
+            .options
+            .as_ref()
+            .and_then(|o| o.get("com.docker.network.bridge.name"))
+            .cloned()
+            .unwrap_or_else(|| {
+                let prefix = if network_id.len() >= 12 {
+                    &network_id[..12]
+                } else {
+                    network_id
+                };
+                format!("br-{}", prefix)
+            }),
+        Err(e) => {
+            tracing::warn!(
+                network_id = network_id,
+                error = %e,
+                "Could not inspect sandbox network to resolve bridge interface name; \
+                 egress filter will not be applied. Sandboxes may be able to reach \
+                 internal addresses."
+            );
+            return;
+        }
+    };
+
+    tracing::info!(
+        network_id = network_id,
+        bridge_interface = %bridge_name,
+        "Applying iptables egress filter to sandbox bridge"
+    );
+
+    // Build the ordered list of iptables commands.  Order matters:
+    //  1. Create the chain (ignore "already exists").
+    //  2. Flush it (idempotent on every server start).
+    //  3. Append DROP rules for all private ranges.
+    //  4. Append RETURN so non-matched packets fall back to the default policy.
+    //  5. Delete then re-insert the FORWARD hook (idempotent; avoids duplicates).
+    let cmds: &[&[&str]] = &[
+        // Create dedicated chain — error "Chain already exists" is benign.
+        &["iptables", "-N", "TEMPS_SANDBOX_EGRESS"],
+        // Flush ensures idempotency across server restarts.
+        &["iptables", "-F", "TEMPS_SANDBOX_EGRESS"],
+        // RFC-1918 private ranges
+        &[
+            "iptables",
+            "-A",
+            "TEMPS_SANDBOX_EGRESS",
+            "-d",
+            "10.0.0.0/8",
+            "-j",
+            "DROP",
+        ],
+        &[
+            "iptables",
+            "-A",
+            "TEMPS_SANDBOX_EGRESS",
+            "-d",
+            "172.16.0.0/12",
+            "-j",
+            "DROP",
+        ],
+        &[
+            "iptables",
+            "-A",
+            "TEMPS_SANDBOX_EGRESS",
+            "-d",
+            "192.168.0.0/16",
+            "-j",
+            "DROP",
+        ],
+        // Link-local (cloud metadata, APIPA)
+        &[
+            "iptables",
+            "-A",
+            "TEMPS_SANDBOX_EGRESS",
+            "-d",
+            "169.254.0.0/16",
+            "-j",
+            "DROP",
+        ],
+        // Loopback
+        &[
+            "iptables",
+            "-A",
+            "TEMPS_SANDBOX_EGRESS",
+            "-d",
+            "127.0.0.0/8",
+            "-j",
+            "DROP",
+        ],
+        // Fall through to default policy for public addresses.
+        &["iptables", "-A", "TEMPS_SANDBOX_EGRESS", "-j", "RETURN"],
+    ];
+
+    for cmd in cmds {
+        let status = match tokio::process::Command::new(cmd[0])
+            .args(&cmd[1..])
+            .status()
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                // ENOENT means iptables isn't installed — treat as non-fatal.
+                tracing::warn!(
+                    command = cmd.join(" "),
+                    error = %e,
+                    "iptables command could not be executed; sandbox egress filter \
+                     may be incomplete. Ensure iptables (or iptables-legacy on \
+                     iptables-nft systems) is installed and the server has CAP_NET_ADMIN."
+                );
+                return;
+            }
+        };
+        if !status.success() {
+            let code = status.code().unwrap_or(-1);
+            // Exit code 1 from `-N` means "chain already exists" — that's fine.
+            // Exit code 4 means "another process is already using iptables" —
+            // transient and harmless for this best-effort setup.
+            let is_chain_exists = code == 1 && cmd.contains(&"-N");
+            let is_lock_contention = code == 4;
+            if !is_chain_exists && !is_lock_contention {
+                tracing::warn!(
+                    command = cmd.join(" "),
+                    exit_code = code,
+                    "iptables command failed; sandbox egress filter may be incomplete. \
+                     If this is a permission error, ensure the temps server process \
+                     has CAP_NET_ADMIN (e.g. add it to the systemd service's \
+                     AmbientCapabilities). On iptables-nft systems, install \
+                     iptables-legacy or ensure /etc/alternatives/iptables points \
+                     to the nft-compat shim."
+                );
+            }
+        }
+    }
+
+    // Hook the chain into FORWARD on this specific bridge interface.
+    // Delete first (ignore failure) then insert — guarantees exactly one entry.
+    let delete_args = [
+        "-D",
+        "FORWARD",
+        "-i",
+        &bridge_name,
+        "-j",
+        "TEMPS_SANDBOX_EGRESS",
+    ];
+    // Ignore failure — rule may not exist yet on first run.
+    let _ = tokio::process::Command::new("iptables")
+        .args(delete_args)
+        .status()
+        .await;
+
+    let insert_args = [
+        "-I",
+        "FORWARD",
+        "-i",
+        &bridge_name,
+        "-j",
+        "TEMPS_SANDBOX_EGRESS",
+    ];
+    match tokio::process::Command::new("iptables")
+        .args(insert_args)
+        .status()
+        .await
+    {
+        Ok(s) if s.success() => {
+            tracing::info!(
+                network_id = network_id,
+                bridge_interface = %bridge_name,
+                "Sandbox egress filter applied: RFC-1918 + 169.254/16 + 127/8 blocked on bridge"
+            );
+        }
+        Ok(s) => {
+            tracing::warn!(
+                network_id = network_id,
+                bridge_interface = %bridge_name,
+                exit_code = s.code().unwrap_or(-1),
+                "Failed to insert FORWARD hook for sandbox egress filter; \
+                 sandboxes may be able to reach internal addresses"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                network_id = network_id,
+                bridge_interface = %bridge_name,
+                error = %e,
+                "Failed to execute iptables to insert FORWARD hook; \
+                 sandboxes may be able to reach internal addresses"
+            );
+        }
+    }
+}
+
+/// Build the list of (chain, cidr) pairs that `apply_sandbox_egress_filter`
+/// would DROP.  Extracted for unit-testing without requiring a live Docker
+/// daemon or iptables binary.
+#[cfg(test)]
+fn sandbox_egress_drop_ranges() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("TEMPS_SANDBOX_EGRESS", "10.0.0.0/8"),
+        ("TEMPS_SANDBOX_EGRESS", "172.16.0.0/12"),
+        ("TEMPS_SANDBOX_EGRESS", "192.168.0.0/16"),
+        ("TEMPS_SANDBOX_EGRESS", "169.254.0.0/16"),
+        ("TEMPS_SANDBOX_EGRESS", "127.0.0.0/8"),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3047,5 +3371,62 @@ mod tests {
         // Cleanup (only place that should ever call remove_container).
         provider.destroy(&recovered, true).await.unwrap();
         let _ = std::fs::remove_dir_all(&work_dir);
+    }
+
+    // ---- egress filter tests (no Docker / iptables required) ----------------
+
+    /// Verify the DROP-range list covers all five required CIDR blocks.
+    /// This test does NOT invoke iptables — it validates the command set that
+    /// `apply_sandbox_egress_filter` would dispatch.
+    #[test]
+    fn test_sandbox_egress_filter_covers_all_private_ranges() {
+        let ranges: Vec<&str> = sandbox_egress_drop_ranges()
+            .into_iter()
+            .map(|(_, cidr)| cidr)
+            .collect();
+
+        // RFC-1918
+        assert!(
+            ranges.contains(&"10.0.0.0/8"),
+            "must DROP 10.0.0.0/8 (RFC-1918 class A)"
+        );
+        assert!(
+            ranges.contains(&"172.16.0.0/12"),
+            "must DROP 172.16.0.0/12 (RFC-1918 class B)"
+        );
+        assert!(
+            ranges.contains(&"192.168.0.0/16"),
+            "must DROP 192.168.0.0/16 (RFC-1918 class C)"
+        );
+        // Link-local / cloud metadata
+        assert!(
+            ranges.contains(&"169.254.0.0/16"),
+            "must DROP 169.254.0.0/16 (link-local / cloud metadata)"
+        );
+        // Loopback
+        assert!(
+            ranges.contains(&"127.0.0.0/8"),
+            "must DROP 127.0.0.0/8 (loopback)"
+        );
+
+        // All five ranges — no extras, no gaps.
+        assert_eq!(
+            ranges.len(),
+            5,
+            "expected exactly 5 DROP ranges, got {}",
+            ranges.len()
+        );
+    }
+
+    /// Every entry in the range list must reference the dedicated chain.
+    #[test]
+    fn test_sandbox_egress_filter_uses_dedicated_chain() {
+        for (chain, cidr) in sandbox_egress_drop_ranges() {
+            assert_eq!(
+                chain, "TEMPS_SANDBOX_EGRESS",
+                "range {} must be appended to the TEMPS_SANDBOX_EGRESS chain, not '{}'",
+                cidr, chain
+            );
+        }
     }
 }

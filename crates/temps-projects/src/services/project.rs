@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use temps_core::url_validation::{redact_url_password, validate_git_url};
 use tracing::{info, warn};
 
 use sea_orm::{
@@ -177,6 +178,14 @@ impl ProjectService {
             automatic_deploy: request.automatic_deploy,
             ..Default::default()
         });
+
+        // SSRF guard: validate git_url before persisting (Fix #12).
+        if let Some(ref git_url) = request.git_url {
+            validate_git_url(git_url).map_err(|e| ProjectError::InvalidGitUrl {
+                url: redact_url_password(git_url),
+                reason: e.to_string(),
+            })?;
+        }
 
         let project = projects::ActiveModel {
             name: Set(request.name),
@@ -1024,8 +1033,13 @@ impl ProjectService {
             }
         };
 
-        if let Some(url) = git_url {
-            active_project.git_url = Set(Some(url));
+        if let Some(ref url) = git_url {
+            // SSRF guard: validate before persisting (Fix #12).
+            validate_git_url(url).map_err(|e| ProjectError::InvalidGitUrl {
+                url: redact_url_password(url),
+                reason: e.to_string(),
+            })?;
+            active_project.git_url = Set(Some(url.clone()));
         }
 
         if let Some(is_public) = is_public_repo {

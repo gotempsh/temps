@@ -830,6 +830,10 @@ impl From<ProjectError> for Problem {
             ProjectError::Other(msg) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Internal Server Error")
                 .with_detail(msg),
+
+            ProjectError::InvalidGitUrl { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid Git URL")
+                .with_detail(error.to_string()),
         }
     }
 }

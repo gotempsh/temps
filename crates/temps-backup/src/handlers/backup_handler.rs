@@ -76,6 +76,10 @@ impl From<BackupError> for Problem {
                     ))
             }
 
+            BackupError::InvalidS3Endpoint { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid S3 Endpoint")
+                .with_detail(error.to_string()),
+
             BackupError::Database(_)
             | BackupError::S3(_)
             | BackupError::Configuration(_)

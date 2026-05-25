@@ -5,6 +5,7 @@
 use async_trait::async_trait;
 use std::path::PathBuf;
 use std::sync::Arc;
+use temps_core::url_validation::{redact_url_password, validate_git_url};
 use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_git::GitProviderManagerTrait;
 use temps_logs::{LogLevel, LogService};
@@ -346,6 +347,19 @@ impl DownloadRepoJob {
         // Handle public repos differently - use direct git clone
         if self.is_public_repo {
             if let Some(ref git_url) = self.git_url {
+                // Defense-in-depth SSRF guard (Fix #12).
+                if let Err(e) = validate_git_url(git_url) {
+                    let safe_url = redact_url_password(git_url);
+                    tracing::error!(
+                        git_url = %safe_url,
+                        error = %e,
+                        "Refusing to clone: git_url failed SSRF validation"
+                    );
+                    return Err(WorkflowError::JobExecutionFailed(format!(
+                        "git_url '{}' is not permitted: {}",
+                        safe_url, e
+                    )));
+                }
                 self.clone_public_repository(context, git_url, &repo_dir)
                     .await?;
                 return Ok(repo_dir);

@@ -1799,6 +1799,7 @@ pub async fn write_file(
 }
 
 /// One extracted tar entry. We only carry what `fs_write` needs.
+#[derive(Debug)]
 struct TarEntry {
     name: String,
     content: Vec<u8>,
@@ -1817,13 +1818,36 @@ struct TarEntry {
 /// segments to begin with.
 fn extract_tar_gz(body: &[u8]) -> Result<Vec<TarEntry>, String> {
     use std::io::Read;
+    // Fix #27: decompression-bomb limits.
+    // Sandbox uploads are tighter than deployment bundles (200 MiB total / 50 MiB per entry)
+    // because sandboxes are interactive containers with tighter resource envelopes.
+    const MAX_TOTAL_BYTES: u64 = 200 * 1024 * 1024; //  200 MiB aggregate
+    const MAX_ENTRY_BYTES: u64 = 50 * 1024 * 1024; //   50 MiB per entry
     let gz = flate2::read::GzDecoder::new(body);
     let mut archive = tar::Archive::new(gz);
     let mut out = Vec::new();
+    let mut total_bytes: u64 = 0;
     for entry in archive.entries().map_err(|e| e.to_string())? {
         let mut entry = entry.map_err(|e| e.to_string())?;
         let header = entry.header();
-        if header.entry_type().is_dir() {
+        let entry_type = header.entry_type();
+        if entry_type.is_dir() {
+            continue;
+        }
+        // Fix #19: skip symlinks and hardlinks — they can reference paths outside
+        // the container's working directory and be followed by the file-serving layer.
+        if entry_type.is_symlink() || entry_type.is_hard_link() {
+            tracing::warn!(
+                entry_type = ?entry_type,
+                "Skipping symlink/hardlink entry in sandbox tar upload (security)"
+            );
+            continue;
+        }
+        if !entry_type.is_file() {
+            tracing::warn!(
+                entry_type = ?entry_type,
+                "Skipping non-regular tar entry in sandbox upload"
+            );
             continue;
         }
         let name = entry
@@ -1846,8 +1870,23 @@ fn extract_tar_gz(body: &[u8]) -> Result<Vec<TarEntry>, String> {
                 name
             ));
         }
+        // Fix #27: per-entry size check on declared header size (fires before reading content).
+        let entry_size = header.size().unwrap_or(0);
+        if entry_size > MAX_ENTRY_BYTES {
+            return Err(format!(
+                "tar entry '{}' declared size {} exceeds per-entry limit of {} bytes",
+                name, entry_size, MAX_ENTRY_BYTES
+            ));
+        }
+        total_bytes = total_bytes.saturating_add(entry_size);
+        if total_bytes > MAX_TOTAL_BYTES {
+            return Err(format!(
+                "tar archive total decompressed size exceeds limit of {} bytes",
+                MAX_TOTAL_BYTES
+            ));
+        }
         let mode = header.mode().map_err(|e| e.to_string())? & 0o7777;
-        let mut content = Vec::with_capacity(header.size().unwrap_or(0) as usize);
+        let mut content = Vec::with_capacity(entry_size as usize);
         entry.read_to_end(&mut content).map_err(|e| e.to_string())?;
         out.push(TarEntry {
             name,
@@ -2487,5 +2526,146 @@ mod tests {
             git_connection_id: None,
         };
         assert!(body.validate().is_ok());
+    }
+
+    // ── Security: Fix #19 + #27 for sandbox extract_tar_gz ───────────────────
+
+    /// Build a raw POSIX ustar 512-byte header entry, bypassing the tar crate's
+    /// own `set_path`/`set_link_name` validation that rejects `..` components.
+    fn build_raw_ustar_entry(
+        entry_path: &str,
+        typeflag: u8,
+        link_target: &str,
+        data: &[u8],
+    ) -> Vec<u8> {
+        const BLOCK: usize = 512;
+        let mut header = [0u8; BLOCK];
+        let name = entry_path.as_bytes();
+        header[..name.len().min(100)].copy_from_slice(&name[..name.len().min(100)]);
+        header[100..108].copy_from_slice(b"0000644\0");
+        let size_str = format!("{:011o} ", data.len());
+        header[124..136].copy_from_slice(size_str.as_bytes());
+        header[136..148].copy_from_slice(b"00000000000 ");
+        header[156] = typeflag;
+        let link = link_target.as_bytes();
+        header[157..157 + link.len().min(100)].copy_from_slice(&link[..link.len().min(100)]);
+        header[257..265].copy_from_slice(b"ustar  \0");
+        header[148..156].copy_from_slice(b"        ");
+        let cksum: u32 = header.iter().map(|&b| b as u32).sum();
+        let ck = format!("{:06o}\0 ", cksum);
+        header[148..156].copy_from_slice(ck.as_bytes());
+        let mut out = Vec::new();
+        out.extend_from_slice(&header);
+        out.extend_from_slice(data);
+        let pad = (BLOCK - data.len() % BLOCK) % BLOCK;
+        out.extend_from_slice(&vec![0u8; pad]);
+        out.extend_from_slice(&[0u8; BLOCK * 2]);
+        out
+    }
+
+    /// Compress raw tar bytes with gzip.
+    fn gzip_compress(data: &[u8]) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+        let mut enc = GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// Fix #19: symlink entries must be silently skipped, not extracted.
+    #[test]
+    fn extract_tar_gz_skips_symlink_entry() {
+        let raw = build_raw_ustar_entry("evil_link", b'2', "../../../etc/shadow", &[]);
+        let body = gzip_compress(&raw);
+        let entries = extract_tar_gz(&body).expect("should succeed (entry skipped)");
+        assert_eq!(
+            entries.len(),
+            0,
+            "symlink entry must be skipped, not extracted"
+        );
+    }
+
+    /// Fix #19: hardlink entries must also be silently skipped.
+    #[test]
+    fn extract_tar_gz_skips_hardlink_entry() {
+        let raw = build_raw_ustar_entry("hard_link", b'1', "../../../etc/passwd", &[]);
+        let body = gzip_compress(&raw);
+        let entries = extract_tar_gz(&body).expect("should succeed (entry skipped)");
+        assert_eq!(entries.len(), 0, "hardlink entry must be skipped");
+    }
+
+    /// Fix #27: a single entry whose declared header size exceeds MAX_ENTRY_BYTES (50 MiB)
+    /// must be rejected before any content is read.
+    #[test]
+    fn extract_tar_gz_rejects_oversized_single_entry() {
+        const MAX_ENTRY_BYTES: u64 = 50 * 1024 * 1024;
+        let huge: u64 = MAX_ENTRY_BYTES + 1;
+        const BLOCK: usize = 512;
+        let mut header = [0u8; BLOCK];
+        let name = b"huge.bin";
+        header[..name.len()].copy_from_slice(name);
+        header[100..108].copy_from_slice(b"0000644\0");
+        let size_str = format!("{:011o} ", huge);
+        header[124..136].copy_from_slice(size_str.as_bytes());
+        header[136..148].copy_from_slice(b"00000000000 ");
+        header[156] = b'0';
+        header[257..265].copy_from_slice(b"ustar  \0");
+        header[148..156].copy_from_slice(b"        ");
+        let cksum: u32 = header.iter().map(|&b| b as u32).sum();
+        let ck = format!("{:06o}\0 ", cksum);
+        header[148..156].copy_from_slice(ck.as_bytes());
+        let mut raw = header.to_vec();
+        raw.extend_from_slice(&[0u8; BLOCK * 2]);
+        let body = gzip_compress(&raw);
+        let err = extract_tar_gz(&body).unwrap_err();
+        assert!(
+            err.contains("per-entry limit") || err.contains("exceeds"),
+            "expected per-entry limit error, got: {err}"
+        );
+    }
+
+    /// Fix #27: an archive whose aggregate declared size exceeds 200 MiB total
+    /// must be rejected. We use two entries each claiming 110 MiB (header-only,
+    /// no actual data blocks) so the aggregate triggers before any I/O.
+    #[test]
+    fn extract_tar_gz_rejects_aggregate_size_bomb() {
+        // Build a tar with two entries, each claiming 110 MiB (> 50 MiB per-entry limit).
+        // The first entry alone will exceed MAX_ENTRY_BYTES, so we need entries that are
+        // individually under 50 MiB but together exceed 200 MiB.
+        // Use 8 entries × 30 MiB each = 240 MiB (each entry has real data so tar advances).
+        let chunk_size = 30 * 1024 * 1024usize; // 30 MiB of zeros
+        let zeros = vec![0u8; chunk_size];
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        {
+            let mut builder = tar::Builder::new(&mut gz);
+            for i in 0..8usize {
+                let name = format!("chunk_{}.bin", i);
+                let mut h = tar::Header::new_gnu();
+                h.set_path(&name).unwrap();
+                h.set_size(chunk_size as u64);
+                h.set_mode(0o644);
+                h.set_cksum();
+                builder.append(&h, zeros.as_slice()).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        let body = gz.finish().unwrap();
+        let err = extract_tar_gz(&body).unwrap_err();
+        assert!(
+            err.contains("total") || err.contains("limit"),
+            "expected aggregate size limit error, got: {err}"
+        );
+    }
+
+    /// Fix #17 (existing behaviour preserved): parent-dir traversal is still rejected.
+    #[test]
+    fn extract_tar_gz_still_rejects_parent_dir_traversal() {
+        let raw = build_raw_ustar_entry("../escape.txt", b'0', "", b"pwned");
+        let body = gzip_compress(&raw);
+        let err = extract_tar_gz(&body).unwrap_err();
+        assert!(
+            err.contains("traversal") || err.contains(".."),
+            "expected traversal error, got: {err}"
+        );
     }
 }

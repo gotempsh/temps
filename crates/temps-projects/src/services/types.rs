@@ -165,6 +165,9 @@ pub enum ProjectError {
 
     #[error("Pipeline error: {0}")]
     PipelineError(String),
+
+    #[error("Invalid git URL '{url}': {reason}")]
+    InvalidGitUrl { url: String, reason: String },
 }
 
 /// Detect a Postgres unique-violation regardless of the variant Sea-ORM

@@ -64,6 +64,12 @@ pub enum DeploymentError {
     #[error("Queue error: {0}")]
     QueueError(String),
 
+    /// Bundle path (read from DB and joined to data_dir) resolved outside the
+    /// data directory.  `path` is the offending resolved path; `reason`
+    /// explains how the check failed.
+    #[error("Invalid bundle path '{path}': {reason}")]
+    InvalidBundlePath { path: String, reason: String },
+
     #[error("Other error: {0}")]
     Other(String),
 }
