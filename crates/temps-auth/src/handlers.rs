@@ -1926,6 +1926,28 @@ async fn disable_mfa(
 mod tests {
     use crate::auth_service::UserAuthError;
 
+    /// Regression test for the CI/CD panic
+    /// `Overlapping method route. Handler for "GET /auth/oidc/login/{slug}" already exists`
+    ///
+    /// Both `handlers::configure_routes()` (rate-limited) and
+    /// `oidc_handler::configure_oidc_routes()` were registering the same
+    /// path; Axum panics on `Router::merge` when this happens. The
+    /// production fix lives in oidc_handler.rs (route removed there,
+    /// kept in handlers.rs so it stays inside the rate-limit group).
+    /// This test exercises the merge to catch any future re-introduction.
+    #[test]
+    fn test_no_overlapping_routes_between_configurators() {
+        // Build both routers without state so we can merge them without
+        // wiring up AuthState. State is unrelated to route registration.
+        let auth_routes: axum::Router<std::sync::Arc<crate::state::AuthState>> =
+            super::configure_routes();
+        let oidc_routes: axum::Router<std::sync::Arc<crate::state::AuthState>> =
+            crate::oidc_handler::configure_oidc_routes();
+        // This call panics if any route overlaps. Just performing the merge
+        // is the assertion — no need to inspect the result.
+        let _merged = auth_routes.merge(oidc_routes);
+    }
+
     /// The login handler must return a constant 401 detail for both
     /// `InvalidCredentials` and `UserNotFound` — the caller must not be able
     /// to distinguish "email does not exist" from "wrong password".

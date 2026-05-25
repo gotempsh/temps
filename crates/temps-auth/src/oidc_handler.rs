@@ -51,9 +51,9 @@ pub struct OidcProvidersListResponse {
 pub fn configure_oidc_routes() -> Router<Arc<AuthState>> {
     Router::new()
         .route("/auth/oidc/providers", get(list_public_providers))
-        // Slug-based login — the slug is returned by /email-status and
-        // /auth/oidc/providers so the frontend never sees integer IDs.
-        .route("/auth/oidc/login/{slug}", get(start_oidc_login_by_slug))
+        // NOTE: `/auth/oidc/login/{slug}` is registered in `handlers.rs`
+        // inside the rate-limited /auth/* router group. Do NOT add it here
+        // — Axum will panic with "Overlapping method route" at startup.
         .route("/admin/oidc/providers", post(create_oidc_provider))
         .route("/admin/oidc/providers", get(list_oidc_providers))
         .route(
