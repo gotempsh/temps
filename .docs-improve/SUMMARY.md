@@ -1,20 +1,19 @@
-## Pass summary — run 2026-05-26T18:16
+## Pass summary — run 20260526-200000
 
-This pass filled two high-value stub pages. `reference/troubleshooting` is the first stop for users hitting problems; it now covers 18 concrete failure scenarios across build failures, health check failures, runtime errors, SSL/domain issues, environment variable problems, database connection errors, cron job failures, performance problems, and CLI/API errors — each with diagnosis steps and working fixes. `advanced/performance` was also a stub; it now provides a structured optimization guide covering resource sizing, build layer caching, multi-stage Dockerfiles, HTTP/memory/Redis caching, database query profiling and indexing, horizontal scaling prerequisites, CDN/static-asset offloading, and OpenTelemetry tracing setup. Both pages match the voice and structural conventions (lead paragraph, anchored section headers, Properties blocks, code examples) used across the completed docs.
+This pass filled the Teams & Collaboration stub with accurate, sourced content drawn from the permissions.rs Role enum (six roles: Admin, User, Reader, ApiReader, Mcp, Custom), the audit_logs entity, and the OIDC handler — covering roles, permissions matrix, user creation from dashboard/CLI/API, API key scoping, audit log, and SSO/OIDC. It also rewrote the Security Features page, which had incorrect role names (Owner/Admin/Member/Viewer instead of Admin/User/Reader), wrong permission strings (read:projects instead of projects:read), missing lead paragraph and anchor IDs, and informal prose ("That's It").
 
 ### Risk
 REVIEW
 
 ### Files changed
-- `docs/reference/troubleshooting/page.mdx` — Stub filled: 18 failure scenarios with causes and fixes
-- `docs/advanced/performance/page.mdx` — Stub filled: end-to-end performance guide (diagnose → resource sizing → build → caching → DB → scaling → CDN → tracing)
+- `docs/features/teams/page.mdx` — Stub filled: complete Teams & Collaboration guide sourced from codebase permissions.rs, auth schema, and audit_logs entity
+- `docs/architecture/security/page.mdx` — Clarity rewrite: corrected role names and permission string format, added lead paragraph and section anchors, rewrote informal prose, replaced deprecated whitelist/blacklist terminology, added admin listener isolation section
 
 ### Stub filled
-- `troubleshooting` — Self-serve solutions to the most common build, runtime, SSL, env-var, database, cron, and CLI failure patterns
-- `performance` — Structured performance guide from bottleneck diagnosis through resource sizing, caching, database optimization, and OpenTelemetry tracing
+features/teams — full Teams & Collaboration guide covering the six built-in roles with sourced permissions, user creation (dashboard/CLI/API), scoped API keys with concrete permission sets, audit log, and OIDC/SSO
 
 ### Clarity rewrite
-none this pass
+architecture/security — fixed incorrect role names and permission format, added frontmatter sections array, lead paragraph, and anchor IDs; replaced informal headings and deprecated allow/deny list terminology; corrected security headers table
 
 ### Stale refs fixed
 none this pass

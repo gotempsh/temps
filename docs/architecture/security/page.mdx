@@ -6,215 +6,203 @@ export const metadata = {
   },
 }
 
+export const sections = [
+  { title: 'Transport security', id: 'transport-security' },
+  { title: 'Access control', id: 'access-control' },
+  { title: 'Bot protection', id: 'bot-protection' },
+  { title: 'Authentication', id: 'authentication' },
+  { title: 'Role-based access control', id: 'rbac' },
+  { title: 'Data protection', id: 'data-protection' },
+  { title: 'Security headers', id: 'security-headers' },
+  { title: 'Monitoring and audit log', id: 'monitoring-audit-log' },
+  { title: 'Best practices', id: 'best-practices' },
+  { title: 'Reporting security issues', id: 'reporting-security-issues' },
+]
+
 # Security Features
 
-Temps provides multiple layers of security to protect your applications, data, and infrastructure. Here's what's available and how you can use it.
+Temps provides defence-in-depth security across transport, access control, authentication, and application layers. This page describes what is built in and how to configure it. {{ className: 'lead' }}
 
-## Transport Security
+---
 
-### Automatic SSL/TLS
-- **Free SSL Certificates** - Automatic Let's Encrypt certificates
-- **Auto-Renewal** - Certificates renew automatically before expiration
-- **TLS 1.3** - Latest encryption standards
-- **Multiple Domains** - Support for unlimited domains
-- **HSTS** - Automatic security headers to enforce HTTPS
+## Transport security {{ anchor: true, id: 'transport-security' }}
 
-### What You Need to Do
-- **Point Your Domain** - Point your domain to your Temps server
-- **That's It** - SSL is configured automatically
+### Automatic TLS with Let's Encrypt
 
-## Access Control
+Every domain you add to Temps gets a free TLS certificate from Let's Encrypt, issued automatically and renewed before expiration. The proxy (Pingora) terminates TLS and enforces:
 
-### Control Plane Admin Surface
-The Temps control plane can split its HTTP surface across two listeners so admin/management routes bind to a private interface while public ingest endpoints stay reachable. See the [Admin Listener](/docs/admin-listener) guide for configuration, deployment recipes (SSH tunnel, Tailscale, reverse proxy), and the route classification.
+- **TLS 1.2 minimum**, TLS 1.3 preferred
+- **HSTS** (`Strict-Transport-Security`) on all HTTPS responses
+- **Automatic HTTP→HTTPS redirect** on port 80
 
-### IP Access Control
-Control who can access your applications:
+You do not need to manage certificates manually. Point your domain at your server, add it in the Temps dashboard, and TLS is provisioned within seconds via the ACME protocol.
 
-**Allow List (Whitelist)**
-- Only allow specific IP addresses or ranges
-- Perfect for internal tools or restricted access
-- Example: Only allow your office IP addresses
+### Admin listener isolation
 
-**Block List (Blacklist)**
-- Block known bad IPs
-- Protect against attacks from specific sources
-- Example: Block IPs that have attacked you before
+The Temps control plane can split its HTTP surface across two listeners so admin and management routes bind to a private interface while public ingest endpoints stay reachable over the internet. This means the dashboard and API are never exposed to public traffic unless you explicitly route them that way.
 
-### How to Use
-- Configure in the dashboard per project
-- Add IP addresses or CIDR ranges
-- Works immediately, no restart needed
+See the [Admin Listener](/docs/admin-listener) guide for configuration details, including SSH tunnel, Tailscale, and reverse-proxy deployment recipes.
 
-## Bot Protection
+---
 
-### CAPTCHA Challenge
-Protect your applications from bots:
+## Access control {{ anchor: true, id: 'access-control' }}
 
-- **Automatic Detection** - Triggers on suspicious traffic patterns
-- **Manual Trigger** - Enable for specific projects or domains
-- **User-Friendly** - Only shows when needed
-- **Session-Based** - Users only solve once per session
+### IP allow lists
 
-### When It Triggers
-- High request rates from single IP
-- Suspicious traffic patterns
-- Manual configuration
-- Failed login attempts
+Restrict access to a project's environments to specific IP addresses or CIDR ranges. Any request from an address outside the allow list is rejected at the proxy layer before it reaches your application.
 
-## Authentication
+Configure per project in **Settings > Security > IP Restrictions**. Changes take effect immediately without restarting containers.
 
-### Multiple Login Methods
-Choose how you want to log in:
+### IP deny lists
 
-**Email + Password**
-- Traditional login
-- Secure password hashing
-- Password strength requirements
+Block specific IP addresses or CIDR ranges outright. Useful for blocking known attackers or geographic regions. Deny-list entries are evaluated before allow-list entries — a denied address is always rejected, even if it also appears in the allow list.
 
-**Magic Links**
-- Passwordless login
-- Click link in email to log in
-- More secure than passwords
+---
 
-**Two-Factor Authentication (2FA)**
-- Extra security layer
-- Works with authenticator apps (Google Authenticator, Authy)
-- Required for sensitive operations
+## Bot protection {{ anchor: true, id: 'bot-protection' }}
 
-**API Keys**
-- For programmatic access
-- Scoped permissions
-- Can be revoked anytime
+Temps includes a CAPTCHA challenge layer that can be enabled per project. When a request is flagged as suspicious, the proxy intercepts it and presents a CAPTCHA before forwarding to your application.
 
-### Account Security
-- **Secure Password Storage** - Passwords never stored, only hashes
-- **Session Management** - Secure session handling
-- **Token Expiration** - Tokens expire automatically
-- **Account Lockout** - Protection against brute force
+**When the challenge triggers:**
 
-## Authorization
+- High request rates from a single IP (configurable threshold)
+- Traffic patterns that match known bot signatures
+- Manual activation — enable for any project at any time from the dashboard
 
-### Role-Based Access Control
-Control who can do what:
+**Session-based:** a user who solves the CAPTCHA is not challenged again for the duration of their session. Legitimate users typically see the challenge once per day at most.
 
-**Project Roles**
-- **Owner** - Full control, can delete project
-- **Admin** - Manage everything except deletion
-- **Member** - Can deploy and view analytics
-- **Viewer** - Read-only access
+Enable via **Settings > Security > Bot Protection** or through the [Attack Mode](/docs/attack-mode) feature for a full lockdown.
 
-**Permissions**
-- Fine-grained control per project
-- Different permissions for different environments
-- Team member management
+---
 
-### API Key Scopes
-When using API keys, control what they can do:
+## Authentication {{ anchor: true, id: 'authentication' }}
 
-- **read:projects** - View projects
-- **write:projects** - Create/modify projects
-- **read:deployments** - View deployments
-- **write:deployments** - Create/manage deployments
-- **read:analytics** - View analytics data
-- **admin:project** - Full project access
+Temps supports multiple authentication methods for the dashboard and API:
 
-## Data Protection
+| Method | Description |
+|--------|-------------|
+| **Email + password** | Standard login with Argon2-hashed passwords. Password reset via email. |
+| **Passwordless / magic link** | A time-limited login link is emailed to the user. No password to remember or leak. |
+| **TOTP (2FA)** | Time-based one-time passwords via any authenticator app (Google Authenticator, Authy, 1Password). Can be made mandatory for Admin users. |
+| **OIDC / SSO** | OpenID Connect for enterprise identity providers (Okta, Azure AD, Google Workspace, Keycloak). Users are provisioned on first login. |
+| **API keys** | Long-lived tokens for programmatic access. Scoped to specific permissions. See [Manage Team Access](/docs/manage-team-access). |
+| **CLI device flow** | OAuth 2.0 Device Authorization Grant. The CLI displays a code; you approve in your browser. Credentials are never typed into the terminal. |
 
-### Encryption
-- **Encrypted Storage** - Sensitive data encrypted at rest
-- **Encrypted Transit** - All data encrypted in transit (TLS)
-- **Encrypted Secrets** - Environment variables and secrets encrypted
-- **Secure Key Management** - Keys stored securely
+### Account security defaults
 
-### What's Encrypted
+- Passwords are stored as Argon2 hashes — the plaintext is never persisted.
+- Sessions expire and tokens have configurable lifetimes.
+- Rate limiting is applied to login endpoints to prevent brute-force attacks.
+- MFA recovery codes are generated at enrollment and stored encrypted.
+
+---
+
+## Role-based access control {{ anchor: true, id: 'rbac' }}
+
+Every request to the Temps API is evaluated against the requesting user's role. Temps ships with six built-in roles:
+
+| Role | Access level |
+|------|-------------|
+| **Admin** | Full platform access, including user management and system settings |
+| **User** | Create and manage projects, deploy, manage env vars and domains. Cannot manage users or system settings. |
+| **Reader** | Read-only access to all resources |
+| **ApiReader** | Read-only API access (projects, deployments, analytics) |
+| **Mcp** | MCP server access — deploy and manage projects via the Model Context Protocol |
+| **Custom** | No default permissions. Used for API keys where you grant only the permissions needed. |
+
+Permissions follow the `resource:action` pattern (e.g. `deployments:create`, `logs:read`, `users:write`). API keys with the **Custom** role can be granted any subset of the 80+ defined permissions.
+
+See [Teams & Collaboration](/docs/teams) for the full permissions matrix and instructions for creating users and API keys.
+
+---
+
+## Data protection {{ anchor: true, id: 'data-protection' }}
+
+### Encryption at rest
+
+Sensitive values stored in the database are encrypted before persistence:
+
 - Environment variable values (secrets)
 - TLS certificate private keys
-- API keys and tokens
-- User passwords (hashed, not encrypted)
+- API key hashes (keys are shown only once at creation)
+- MFA secrets and recovery codes
 
-## Application Security
+Passwords are hashed (Argon2id), not encrypted — the plaintext is never recoverable.
 
-### Automatic Protection
-Temps automatically protects your applications:
+### Encryption in transit
 
-- **Security Headers** - Added to all responses
-- **Input Validation** - All inputs validated
-- **SQL Injection Prevention** - Protected by design
-- **XSS Protection** - Cross-site scripting protection
-- **CSRF Protection** - Cross-site request forgery protection
+All traffic between clients and Temps is encrypted with TLS. Internal service-to-service communication (control plane to worker nodes) uses mutual TLS when WireGuard is not in use.
 
-### Security Headers
-These headers are automatically added:
+---
 
-- **X-Content-Type-Options: nosniff** - Prevent MIME type sniffing
-- **X-Frame-Options: DENY** - Prevent clickjacking
-- **X-XSS-Protection** - Enable XSS filter
-- **Strict-Transport-Security** - Force HTTPS
+## Security headers {{ anchor: true, id: 'security-headers' }}
 
-## Monitoring & Alerts
+The Pingora proxy adds the following security headers to every response:
 
-### Security Monitoring
-- **Failed Login Attempts** - Track and alert on suspicious activity
-- **Unauthorized Access** - Monitor access attempts
-- **Certificate Expiry** - Alerts before certificates expire
-- **Security Events** - Audit log of security-related actions
+| Header | Value | Purpose |
+|--------|-------|---------|
+| `Strict-Transport-Security` | `max-age=31536000; includeSubDomains` | Force HTTPS for one year |
+| `X-Content-Type-Options` | `nosniff` | Prevent MIME-type sniffing |
+| `X-Frame-Options` | `SAMEORIGIN` | Prevent clickjacking via iframes |
+| `Referrer-Policy` | `strict-origin-when-cross-origin` | Limit referrer leakage |
 
-### Audit Logging
-Track important security events:
+Custom headers (including `Content-Security-Policy`) can be added per-project in environment settings.
 
-- User logins and logouts
-- Permission changes
-- API key creation/deletion
-- Security setting changes
-- Failed authentication attempts
+---
 
-## Best Practices
+## Monitoring and audit log {{ anchor: true, id: 'monitoring-audit-log' }}
 
-### For Your Account
-- **Use Strong Passwords** - Or use magic links
-- **Enable 2FA** - Extra security for your account
-- **Review API Keys** - Regularly review and revoke unused keys
-- **Monitor Audit Logs** - Check for suspicious activity
+### Audit log
 
-### For Your Applications
-- **Use IP Allow Lists** - Restrict access when possible
-- **Enable CAPTCHA** - For public-facing apps under attack
-- **Use Secrets** - Don't put sensitive data in regular env vars
-- **Regular Updates** - Keep Temps updated
-- **Monitor Errors** - Watch for security-related errors
+Every action performed through the dashboard or API is recorded. Each entry captures the user, operation type, IP address (with geolocation), timestamp, and a JSON payload with the affected resource.
 
-### For Your Infrastructure
-- **Keep Temps Updated** - Security updates included
-- **Secure Database** - Use strong database passwords
-- **Network Security** - Use VPN for admin access
-- **Backup Regularly** - Have backups of your data
+Recorded events include:
 
-## Compliance
+- User logins, logouts, and failed authentication attempts
+- Role changes and user creation/deletion
+- API key creation and revocation
+- Deployment creation, cancellation, and rollback
+- Environment variable changes
+- Domain additions and removals
+- System setting changes
 
-### Data Privacy
-- **Self-Hosted** - You control all data
-- **Data Location** - Data stays on your infrastructure
-- **Data Export** - Export your data anytime
-- **Data Deletion** - Delete data when needed
+Access the audit log at **Settings > Audit Log**. Users with the `audit:read` permission (Admin and User roles) can view entries.
 
-### GDPR & Privacy
-- **Data Minimization** - Only collect what you need
-- **User Consent** - Integrate consent management
-- **Right to Access** - Export user data
-- **Right to Deletion** - Delete user data
-- **Data Portability** - Export data in standard formats
+### Uptime and health monitoring
 
-## Reporting Security Issues
+Use [Monitoring](/docs/monitoring) to set up HTTP health checks for your applications. Monitors alert you when an endpoint becomes unreachable and track uptime over time.
 
-If you find a security vulnerability:
+---
 
-- **Report Privately** - Don't post publicly
-- **Responsible Disclosure** - Give time to fix
-- **Security Email** - Contact security@temps.sh
+## Best practices {{ anchor: true, id: 'best-practices' }}
 
-## Next Steps
+<Properties>
+  <Property name="Enable 2FA for Admin accounts">
+    Require TOTP for all users with the Admin role. A compromised admin account grants full platform access.
+  </Property>
+  <Property name="Use IP allow lists for internal tools">
+    If a project is only accessed from your office or VPN, add an IP allow list. This eliminates exposure to the public internet entirely.
+  </Property>
+  <Property name="Use scoped API keys">
+    Create one API key per integration with only the permissions that integration needs. Revoke keys that are no longer in use.
+  </Property>
+  <Property name="Bind the admin listener to a private interface">
+    Use the `TEMPS_CONSOLE_ADMIN_ADDRESS` flag to expose the dashboard only on a private network interface or loopback. Combine with an SSH tunnel or VPN for remote access.
+  </Property>
+  <Property name="Review the audit log regularly">
+    Check for unexpected logins, role changes, or deployments — especially after team changes or security incidents.
+  </Property>
+  <Property name="Keep Temps updated">
+    New releases fix security issues. Subscribe to GitHub releases or the changelog to stay current.
+  </Property>
+</Properties>
 
-- **[Overview](/docs/overview)** - System capabilities
-- **[Deployment Pipeline](/docs/deployment)** - How deployments work
-- **[Analytics & Data](/docs/data-flow)** - Analytics features
+---
+
+## Reporting security issues {{ anchor: true, id: 'reporting-security-issues' }}
+
+If you discover a security vulnerability in Temps, please report it privately before public disclosure. This gives the team time to investigate and release a fix.
+
+**Contact:** security@temps.sh
+
+Please include a description of the vulnerability, steps to reproduce, and the potential impact. We aim to acknowledge reports within 48 hours and release a fix within 14 days for critical issues.

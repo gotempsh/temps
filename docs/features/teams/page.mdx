@@ -6,10 +6,242 @@ export const metadata = {
   },
 }
 
+export const sections = [
+  { title: 'Overview', id: 'overview' },
+  { title: 'Built-in roles', id: 'built-in-roles' },
+  { title: 'Role permissions at a glance', id: 'role-permissions-at-a-glance' },
+  { title: 'Adding team members', id: 'adding-team-members' },
+  { title: 'Assigning and changing roles', id: 'assigning-and-changing-roles' },
+  { title: 'API keys for integrations', id: 'api-keys-for-integrations' },
+  { title: 'Audit log', id: 'audit-log' },
+  { title: 'SSO and OIDC', id: 'sso-and-oidc' },
+]
 
 # Teams & Collaboration
-## Page Goal
-Enable team collaboration with proper access controls.
-## Target Persona
-**Team Lead Terry** - Managing multiple developers, needs access control, wants collaboration features.
-## Key Content: Team invitations, role-based permissions, project sharing, audit logs, SSO (if applicable)
+
+Temps ships with a role-based access control system and unlimited seats. Add as many team members as you need, grant each person the right level of access, and audit every action — all without per-seat fees. {{ className: 'lead' }}
+
+---
+
+## Overview {{ anchor: true, id: 'overview' }}
+
+<Row>
+  <Col>
+    **What's included**
+    - Six built-in roles covering every access level
+    - Granular, scope-specific permissions (80+ permission strings)
+    - Scoped API keys for CI/CD and integrations
+    - Per-deployment tokens injected into containers
+    - Full audit log with IP geolocation
+    - OIDC/SSO for enterprise login
+  </Col>
+  <Col>
+    **Key properties**
+    - Unlimited team members — no per-seat pricing
+    - Role changes take effect immediately, no re-login required
+    - API keys follow the principle of least privilege by default
+    - The first admin account cannot be downgraded
+  </Col>
+</Row>
+
+---
+
+## Built-in roles {{ anchor: true, id: 'built-in-roles' }}
+
+Temps defines six roles. Each carries a fixed set of permissions — there is no way to add or remove permissions from a built-in role. Use the **Custom** role (via API keys) when you need a subset of permissions for a specific integration.
+
+| Role | Intended for | Permissions |
+|------|-------------|-------------|
+| **Admin** | Platform owners and operators | Full access — projects, deployments, environments, users, system settings, backups, MCP, and all feature areas |
+| **User** | Developers and contributors | Create and manage projects, deploy, manage env vars, domains, backups, cron jobs, and most features. Cannot delete system-critical resources or manage other users. |
+| **Reader** | Stakeholders, auditors, view-only users | Read access to all resources — projects, deployments, logs, analytics, error tracking. Cannot make any changes. |
+| **ApiReader** | Monitoring and reporting integrations | Read-only API access scoped to projects, deployments, and analytics |
+| **Mcp** | Model Context Protocol servers | Deploy and manage projects and deployments via MCP. Includes `mcp:connect`, `mcp:execute`, `mcp:read`, `mcp:write`. |
+| **Custom** | API keys with specific scopes | No default permissions. You explicitly grant only the permission strings the integration needs. |
+
+<Note>
+The **Admin** role also includes `system:admin` — the only role that can manage users, configure system settings, and access administrative endpoints. The initial admin account created during setup cannot have its role changed.
+</Note>
+
+---
+
+## Role permissions at a glance {{ anchor: true, id: 'role-permissions-at-a-glance' }}
+
+Permissions follow the pattern `resource:action` (e.g. `deployments:create`, `logs:read`). Here are the key differences between Admin, User, and Reader:
+
+| Capability | Admin | User | Reader |
+|-----------|:-----:|:----:|:------:|
+| View projects and deployments | Yes | Yes | Yes |
+| View logs and analytics | Yes | Yes | Yes |
+| View error tracking | Yes | Yes | Yes |
+| Create and deploy projects | Yes | Yes | No |
+| Manage environment variables | Yes | Yes | No |
+| Manage domains | Yes | Yes | No |
+| Create and manage API keys | Yes | Yes | No |
+| Configure backups | Yes | Yes | No |
+| Configure cron jobs | Yes | Yes | No |
+| Manage external services | Yes | Yes | No |
+| Delete projects | Yes | No | No |
+| Manage users and roles | Yes | No | No |
+| System settings | Yes | No | No |
+| Delete critical resources | Yes | No | No |
+
+The Reader role is equivalent to having every `*:read` permission and nothing else.
+
+---
+
+## Adding team members {{ anchor: true, id: 'adding-team-members' }}
+
+### From the dashboard
+
+1. In the sidebar, click **Settings**
+2. Go to **Users**
+3. Click **Add User**
+4. Enter the user's name and email address
+5. Set a temporary password (the user should change it on first login)
+6. Select a role
+7. Click **Create**
+
+The user can immediately log in at your Temps instance URL with the provided credentials. Email verification is optional and configurable via SMTP settings.
+
+### From the CLI
+
+```bash
+# Create a new user with the User role
+bunx @temps-sdk/cli users create \
+  --name "Jane Smith" \
+  --email "jane@example.com" \
+  --role user
+
+# Create a read-only user
+bunx @temps-sdk/cli users create \
+  --name "Stakeholder" \
+  --email "cto@example.com" \
+  --role reader
+```
+
+### From the API
+
+```bash
+curl -X POST "https://your-temps-instance/api/users" \
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Jane Smith",
+    "email": "jane@example.com",
+    "password": "temp-password-change-me",
+    "role": "user"
+  }'
+```
+
+<Note>
+If you have OIDC/SSO configured, users can also sign up by authenticating through your identity provider — no manual account creation is required.
+</Note>
+
+---
+
+## Assigning and changing roles {{ anchor: true, id: 'assigning-and-changing-roles' }}
+
+To change a user's role:
+
+1. Go to **Settings > Users**
+2. Find the user
+3. Click the actions menu or **Edit**
+4. Select the new role
+5. Save
+
+Role changes take effect immediately on the user's next API call or page load. Active browser sessions do not need to log out and back in — the permission check happens on every request.
+
+---
+
+## API keys for integrations {{ anchor: true, id: 'api-keys-for-integrations' }}
+
+API keys are the right tool for CI/CD pipelines, automation scripts, and external integrations. Unlike user accounts, API keys use the **Custom** role, so you grant only the exact permissions needed.
+
+### Create an API key
+
+1. Go to **Settings > API Keys**
+2. Click **Create API Key**
+3. Enter a descriptive name (e.g. `github-actions-deploy`, `monitoring-readonly`)
+4. Select the permissions to grant
+5. Click **Create**
+6. Copy the key — it is shown only once
+
+Use the key in the `Authorization` header:
+
+```bash
+curl -H "Authorization: Bearer tk_your_api_key" \
+  "https://your-temps-instance/api/projects"
+```
+
+### Common permission sets
+
+**CI/CD deployment key** — trigger deployments and check status:
+
+```
+deployments:create  deployments:read
+projects:read       environments:read
+```
+
+**Read-only monitoring key** — for dashboards and status pages:
+
+```
+projects:read    deployments:read
+analytics:read   metrics:read
+```
+
+**Full project management key** — for administrative scripts (use sparingly):
+
+```
+projects:*  deployments:*  environments:*  domains:*
+```
+
+<Note>
+Create a separate API key for each integration. If a key is compromised, revoke it without affecting other systems. Name keys descriptively so you know which key belongs to which integration.
+</Note>
+
+### Deployment tokens (per-environment)
+
+In addition to manually created API keys, Temps automatically generates a **deployment token** for every project environment. This token is injected as `TEMPS_API_TOKEN` in your running application container. It allows your application to call the Temps API (e.g. to push analytics events or upload source maps) without any manual key management. Deployment tokens are:
+
+- Auto-generated and rotated on each deployment
+- Scoped to the specific project and environment
+- Not visible in the API Keys management UI
+
+---
+
+## Audit log {{ anchor: true, id: 'audit-log' }}
+
+Every action performed through the dashboard or API is recorded in the audit log. Each entry captures:
+
+- **User** — who performed the action
+- **Operation type** — what was done (e.g. `deployment.created`, `user.role_changed`)
+- **IP address** — with geolocation lookup
+- **Timestamp** — when the action occurred
+- **Data** — a JSON payload with the relevant resource identifiers and before/after values
+
+To view the audit log:
+
+1. Go to **Settings > Audit Log**
+2. Filter by user, operation type, or date range
+
+The audit log is read-only. All users with the `audit:read` permission (Admin and User roles) can view it. Only Admin-role users can see audit log entries related to user management and system settings.
+
+---
+
+## SSO and OIDC {{ anchor: true, id: 'sso-and-oidc' }}
+
+Temps supports OpenID Connect (OIDC) for enterprise single sign-on. Configure your identity provider (Okta, Auth0, Azure AD, Google Workspace, Keycloak, etc.) once, and your users authenticate through their existing corporate credentials.
+
+### Configure OIDC
+
+1. Go to **Settings > Authentication > OIDC Providers**
+2. Click **Add OIDC Provider**
+3. Enter your provider's **Issuer URL**, **Client ID**, and **Client Secret**
+4. Save
+
+When OIDC is enabled, users can log in with **Sign in with [Your Provider]** on the login page. Accounts are provisioned on first login — no manual user creation needed.
+
+<Note>
+OIDC-authenticated users are created with the **User** role by default. An Admin must manually promote them to Admin if needed.
+</Note>
