@@ -3276,9 +3276,8 @@ impl ProxyHttp for LoadBalancer {
                         response.insert_header("Cache-Control", "no-store")?;
                         response.insert_header("X-Request-ID", &ctx.request_id)?;
                         response.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                        let body = Bytes::from_static(
-                            b"<html><body><h1>404 - Not Found</h1></body></html>",
-                        );
+                        let body =
+                            Bytes::from(crate::branded_404::render(&ctx.host, &ctx.request_id));
                         response.insert_header("Content-Length", body.len().to_string())?;
                         session
                             .write_response_header(Box::new(response), false)
