@@ -1,19 +1,18 @@
-## Pass summary — run 20260526-200000
+## Pass summary — run 20260526-221600
 
-This pass filled the Teams & Collaboration stub with accurate, sourced content drawn from the permissions.rs Role enum (six roles: Admin, User, Reader, ApiReader, Mcp, Custom), the audit_logs entity, and the OIDC handler — covering roles, permissions matrix, user creation from dashboard/CLI/API, API key scoping, audit log, and SSO/OIDC. It also rewrote the Security Features page, which had incorrect role names (Owner/Admin/Member/Viewer instead of Admin/User/Reader), wrong permission strings (read:projects instead of projects:read), missing lead paragraph and anchor IDs, and informal prose ("That's It").
+Filled the `advanced/custom-buildpacks` stub with a complete guide covering the Nixpacks auto-detection priority order, `.nixpacks.toml` configuration (build/start command override, runtime version pins, system packages, multi-step builds), Procfile compatibility, custom Dockerfiles and when to prefer them over Nixpacks, multi-stage build patterns with Node.js and Rust examples, Docker layer caching strategies, monorepo app-directory configuration, and per-project build-settings overrides from the dashboard. Content sourced from `docs/reference/supported-frameworks/page.mdx`, `docs/reference/troubleshooting/page.mdx`, and `docs/migrate/from-{heroku,railway}/page.mdx`. No typos, broken links, or stale version strings were found this pass.
 
 ### Risk
 REVIEW
 
 ### Files changed
-- `docs/features/teams/page.mdx` — Stub filled: complete Teams & Collaboration guide sourced from codebase permissions.rs, auth schema, and audit_logs entity
-- `docs/architecture/security/page.mdx` — Clarity rewrite: corrected role names and permission string format, added lead paragraph and section anchors, rewrote informal prose, replaced deprecated whitelist/blacklist terminology, added admin listener isolation section
+- `docs/advanced/custom-buildpacks/page.mdx` — Stub replaced with complete Nixpacks/Dockerfile/multi-stage/caching guide
 
 ### Stub filled
-features/teams — full Teams & Collaboration guide covering the six built-in roles with sourced permissions, user creation (dashboard/CLI/API), scoped API keys with concrete permission sets, audit log, and OIDC/SSO
+advanced/custom-buildpacks — end-to-end guide for customizing the build pipeline with `.nixpacks.toml`, custom Dockerfiles, multi-stage builds, and layer caching best practices
 
 ### Clarity rewrite
-architecture/security — fixed incorrect role names and permission format, added frontmatter sections array, lead paragraph, and anchor IDs; replaced informal headings and deprecated allow/deny list terminology; corrected security headers table
+none this pass
 
 ### Stale refs fixed
 none this pass

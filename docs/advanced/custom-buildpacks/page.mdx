@@ -6,10 +6,255 @@ export const metadata = {
   },
 }
 
+export const sections = [
+  { title: 'How builds work', id: 'how-builds-work' },
+  { title: 'Nixpacks auto-detection', id: 'nixpacks-auto-detection' },
+  { title: 'Customizing with .nixpacks.toml', id: 'customizing-with-nixpacks-toml' },
+  { title: 'Custom Dockerfiles', id: 'custom-dockerfiles' },
+  { title: 'Multi-stage builds', id: 'multi-stage-builds' },
+  { title: 'Build caching', id: 'build-caching' },
+  { title: 'Monorepo configuration', id: 'monorepo-configuration' },
+  { title: 'Override build settings', id: 'override-build-settings' },
+]
 
 # Custom Buildpacks
-## Page Goal
-Enable advanced users to customize build process for complex requirements.
-## Target Persona
-**Advanced Adam** - Complex app requirements, needs build customization, comfortable with Docker/buildpacks.
-## Key Content: Nixpacks, custom Dockerfiles, build configuration, multi-stage builds, caching strategies
+
+Temps builds your application automatically from source using Nixpacks — a build system that generates a Docker image without requiring a Dockerfile. For complex requirements, you can customize the build with a `.nixpacks.toml` configuration file, bring your own Dockerfile, or use multi-stage builds to keep image sizes small. {{ className: 'lead' }}
+
+---
+
+## How builds work {{ anchor: true, id: 'how-builds-work' }}
+
+Every Temps deployment runs inside a Docker container. When you push code, Temps decides how to build the image using this priority order:
+
+1. **Dockerfile present** — If a `Dockerfile` exists in the repository root (or the configured app directory), Temps uses it directly. Nixpacks is skipped entirely.
+2. **Nixpacks auto-detection** — If no `Dockerfile` is found, Temps runs Nixpacks, which inspects your repository and generates a build plan automatically.
+3. **Static fallback** — If the only file present is `index.html` with no `package.json`, Temps serves it directly without building a container.
+
+The build runs on your Temps server inside an isolated container. Logs stream to the dashboard in real time.
+
+---
+
+## Nixpacks auto-detection {{ anchor: true, id: 'nixpacks-auto-detection' }}
+
+[Nixpacks](https://nixpacks.com/) inspects files in the repository root (or app directory) to choose the build plan. Detection runs in this order:
+
+| Priority | Signal | Result |
+|----------|--------|--------|
+| 1 | `Dockerfile` | Direct Docker build (Nixpacks skipped) |
+| 2 | `next.config.js`, `vite.config.ts`, `nuxt.config.ts`, … | Framework-specific preset |
+| 3 | `package.json`, `requirements.txt`, `go.mod`, `Cargo.toml`, `Gemfile`, `composer.json`, … | Language preset |
+| 4 | `index.html` only | Static file serving |
+
+For the full list of supported frameworks and their detection signals, see the [Supported Frameworks](/docs/supported-frameworks) reference.
+
+Nixpacks also reads version pins from your project files — for example, `engines.node` in `package.json`, `.python-version`, `go.mod`, or `rust-toolchain.toml` — so you do not need to configure the runtime version separately.
+
+---
+
+## Customizing with .nixpacks.toml {{ anchor: true, id: 'customizing-with-nixpacks-toml' }}
+
+If Nixpacks detects the wrong framework, or your build needs adjustments that the preset does not cover, add a `.nixpacks.toml` file to your repository root (or app directory). Temps respects this file during the Nixpacks build phase.
+
+### Override build and start commands
+
+```toml
+# .nixpacks.toml
+[phases.build]
+cmds = ["npm run build"]
+
+[start]
+cmd = "node dist/server.js"
+```
+
+### Pin a specific runtime version
+
+```toml
+# .nixpacks.toml — pin Node.js 20
+[variables]
+NODE_VERSION = "20"
+```
+
+### Add system packages
+
+Some applications require system libraries (for example, `libvips` for image processing, or `ffmpeg` for video). You can install them in the setup phase:
+
+```toml
+# .nixpacks.toml
+[phases.setup]
+nixPkgs = ["vips", "ffmpeg"]
+```
+
+### Run multiple build steps
+
+```toml
+# .nixpacks.toml
+[phases.build]
+cmds = [
+  "npm run generate",
+  "npm run build"
+]
+
+[start]
+cmd = "npm start"
+```
+
+### Procfile compatibility
+
+If your repository contains a `Procfile` (common in Heroku apps), Temps reads the `web:` entry automatically during the Nixpacks build phase:
+
+```
+# Procfile
+web: node server.js
+release: node scripts/migrate.js
+```
+
+The `release` command runs before the container starts, making it a good place for database migrations.
+
+---
+
+## Custom Dockerfiles {{ anchor: true, id: 'custom-dockerfiles' }}
+
+For full control over the build environment, add a `Dockerfile` to your repository root. Temps uses it directly and skips Nixpacks entirely.
+
+```dockerfile
+FROM node:20-alpine
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --production
+COPY . .
+EXPOSE 3000
+CMD ["node", "server.js"]
+```
+
+The `EXPOSE` directive tells Temps which port to route traffic to. If `EXPOSE` is not present, Temps falls back to the project's configured `exposed_port` setting (default: `3000`).
+
+<Note>
+Place the `Dockerfile` in the repository root, or in the **App Directory** configured in project settings for monorepos. Temps does not recursively search subdirectories for Dockerfiles.
+</Note>
+
+### When to use a Dockerfile instead of Nixpacks
+
+Use a custom Dockerfile when:
+
+- Your application requires specific system packages (native extensions, binary dependencies)
+- You need a runtime environment that Nixpacks does not support
+- You want to precisely control every layer for security or compliance reasons
+- You need to run as a specific non-root user
+- You are deploying a pre-compiled binary or a language not supported by Nixpacks
+
+---
+
+## Multi-stage builds {{ anchor: true, id: 'multi-stage-builds' }}
+
+Multi-stage Dockerfiles work without any special configuration. They are the recommended approach for compiled languages (Go, Rust) or any project where the build toolchain is large but the runtime is small.
+
+```dockerfile
+FROM node:20 AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+FROM node:20-alpine
+WORKDIR /app
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/node_modules ./node_modules
+EXPOSE 3000
+CMD ["node", "dist/server.js"]
+```
+
+**Why multi-stage?** The builder image installs all dev dependencies and runs the build. The final image copies only the compiled output, keeping the deployed container lean and reducing the attack surface.
+
+For Go and Rust, a typical pattern compiles a static binary in the builder stage and copies it into a minimal `debian:bookworm-slim` or `scratch` base image:
+
+```dockerfile
+FROM rust:1.80 AS builder
+WORKDIR /app
+COPY . .
+RUN cargo build --release
+
+FROM debian:bookworm-slim
+COPY --from=builder /app/target/release/my-app /usr/local/bin/my-app
+EXPOSE 8080
+CMD ["my-app"]
+```
+
+---
+
+## Build caching {{ anchor: true, id: 'build-caching' }}
+
+Nixpacks caches the package manager layer between builds. If only your application code changes — not `package.json`, `requirements.txt`, or other dependency manifests — the dependency installation step is skipped on the next build, significantly reducing build time.
+
+To take advantage of caching:
+
+- **Commit lockfiles.** Always commit `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `bun.lockb`, `Pipfile.lock`, `Cargo.lock`, or `go.sum`. Without a lockfile, the dependency layer cannot be cached effectively.
+- **Separate dependency installation from code copying.** In custom Dockerfiles, copy dependency files and run the install step *before* copying the rest of your source. Docker rebuilds only the layers below the first changed layer.
+
+```dockerfile
+# Cache-friendly Dockerfile — dependency layer is separate from source
+FROM node:20-alpine
+WORKDIR /app
+
+# Copy only dependency files first — this layer is cached until package.json changes
+COPY package.json package-lock.json ./
+RUN npm ci --production
+
+# Copy the rest of the source — changes here don't invalidate the install layer
+COPY . .
+EXPOSE 3000
+CMD ["node", "server.js"]
+```
+
+If your builds are slow because of dependency installs, verify that your lockfile is committed and that your install command uses the lockfile exactly (`npm ci`, not `npm install`).
+
+---
+
+## Monorepo configuration {{ anchor: true, id: 'monorepo-configuration' }}
+
+For monorepos containing multiple applications, set the **App Directory** in project settings to the subdirectory that contains your application:
+
+1. Open your project in the dashboard
+2. Go to **Settings**
+3. Set **App Directory** to the path of your application (for example, `apps/web` or `packages/api`)
+4. Save
+
+Temps sets the build context to that directory. Nixpacks scans for framework detection files relative to the app directory. If you have a `.nixpacks.toml`, place it inside the app directory, not the repository root.
+
+If different applications in the same monorepo need different base images or build steps, use a per-app `Dockerfile` inside each application's directory.
+
+---
+
+## Override build settings {{ anchor: true, id: 'override-build-settings' }}
+
+You can override the auto-detected build configuration from the dashboard without editing any files:
+
+1. Open your project in the dashboard
+2. Go to **Settings**
+3. Under **Build Configuration**, you can set:
+
+<Properties>
+  <Property name="Framework Preset">
+    Force a specific framework (e.g. Next.js, Vite, Node.js) instead of letting Temps auto-detect. Useful when detection picks the wrong preset.
+  </Property>
+  <Property name="Build Command">
+    Override the default build command. For example, `npm run build:prod` instead of `npm run build`.
+  </Property>
+  <Property name="Start Command">
+    Override the default start command. For example, `node dist/server.js` instead of `npm start`.
+  </Property>
+  <Property name="App Directory">
+    The subdirectory containing your application. Required for monorepos. Leave empty for single-project repositories.
+  </Property>
+</Properties>
+
+Changes to build settings take effect on the next deployment. Push a new commit or click **Redeploy** to trigger a build with the updated configuration.
+
+---
+
+## Next steps
+
+- **[Supported Frameworks](/docs/supported-frameworks)** — Full list of auto-detected languages and frameworks
+- **[Debug a Failed Deployment](/docs/debug-a-failed-deployment)** — Diagnose build failures
+- **[Performance](/docs/performance)** — Optimize build times and container startup
