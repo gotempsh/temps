@@ -8,7 +8,7 @@ export const metadata = {
 
 # KV Storage
 
-Temps includes a built-in key-value store powered by Redis. Use it for caching, session storage, feature flags, rate limiting, and any data that benefits from fast key-value access -- all without provisioning external services. {{ className: 'lead' }}
+Temps includes a built-in key-value store powered by Redis. Use it for caching, session storage, feature flags, rate limiting, and any data that benefits from fast key-value access — all without provisioning external services. {{ className: 'lead' }}
 
 ---
 
@@ -196,7 +196,7 @@ KV operations support two authentication methods:
 
 <Properties>
   <Property name="Deployment Token">
-    Tokens prefixed with `dt_`. Automatically scoped to the project the token belongs to -- the `project_id` field in requests is ignored for security.
+    Tokens prefixed with `dt_`. Automatically scoped to the project the token belongs to — the `project_id` field in requests is ignored for security.
   </Property>
   <Property name="API Key">
     Tokens prefixed with `tk_`. Requires `project_id` in the request body to specify which project's KV store to access.

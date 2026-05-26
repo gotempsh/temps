@@ -6,11 +6,22 @@ export const metadata = {
   },
 }
 
+export const sections = [
+  { title: 'Event structure', id: 'event-structure' },
+  { title: 'Event types', id: 'event-types' },
+  { title: 'Managing webhooks', id: 'managing-webhooks' },
+  { title: 'Security', id: 'security' },
+  { title: 'Testing', id: 'testing' },
+  { title: 'Data structures', id: 'data-structures' },
+]
+
 # Webhooks
 
-Webhooks allow you to receive real-time notifications about events in your Temps projects. When an event occurs (like a deployment succeeding or a domain being provisioned), Temps will send an HTTP POST request to your configured webhook URL with a JSON payload containing event details.
+Webhooks deliver real-time HTTP notifications to your endpoint whenever something happens in a Temps project — a deployment succeeds, a domain is provisioned, a project is deleted. Configure a URL once and Temps posts a signed JSON payload for each matching event. {{ className: 'lead' }}
 
-## Webhook Event Structure
+---
+
+## Event structure {{ anchor: true, id: 'event-structure' }}
 
 All webhook events follow this base structure:
 
@@ -36,7 +47,7 @@ All webhook events follow this base structure:
 | `project_id` | `number` or `null` | ID of the project this event relates to |
 | `payload` | `object` | Event-specific data (structure varies by event type) |
 
-## Event Types
+## Event types {{ anchor: true, id: 'event-types' }}
 
 ### Deployment Events
 
@@ -271,7 +282,7 @@ Triggered when SSL is provisioned for a domain (via Let's Encrypt).
 }
 ```
 
-## API Endpoints
+## Managing webhooks {{ anchor: true, id: 'managing-webhooks' }}
 
 ### List Available Event Types
 
@@ -524,7 +535,7 @@ Authorization: Bearer {token}
 }
 ```
 
-## Security
+## Security {{ anchor: true, id: 'security' }}
 
 ### HMAC Signature Verification
 
@@ -617,28 +628,30 @@ def webhook():
 5. **Process asynchronously** - Queue long-running tasks instead of processing them in the webhook handler
 6. **Handle retries idempotently** - Failed deliveries may be retried, so use the `event_id` to deduplicate
 
-## Testing Webhooks
+## Testing {{ anchor: true, id: 'testing' }}
 
-### Error Messages
+### Delivery errors
 
-When a webhook delivery fails, you'll receive detailed error messages:
+When a webhook delivery fails, Temps surfaces error details in the delivery log. Common errors and their causes:
 
-**Connection Errors:**
+**Connection error** — the server at the configured URL was unreachable (port closed, DNS failure, firewall):
 ```
-Connection failed to http://localhost:3020/test. The service may not be running or the URL is incorrect. Please verify the endpoint is accessible and listening on the correct port.
-```
-
-**Timeout Errors:**
-```
-Request timeout after 30 seconds. The endpoint at https://example.com/webhook did not respond in time. Check if the service is running and responding quickly enough.
+Connection failed to http://localhost:3020/test. The service may not be running or the URL is incorrect.
 ```
 
-**HTTP Errors:**
+**Timeout error** — the endpoint did not respond within 30 seconds. Return a 2xx immediately and process the payload asynchronously:
 ```
-HTTP 500 error from https://example.com/webhook: Internal Server Error. The endpoint rejected the webhook request.
+Request timeout after 30 seconds. The endpoint at https://example.com/webhook did not respond in time.
 ```
 
-### Local Testing with ngrok
+**HTTP error** — the endpoint returned a non-2xx status. Check your handler for unhandled exceptions:
+```
+HTTP 500 error from https://example.com/webhook: Internal Server Error.
+```
+
+Failed deliveries can be retried from the delivery log in the dashboard or via the [retry API endpoint](#managing-webhooks).
+
+### Local testing with ngrok
 
 For local development, use [ngrok](https://ngrok.com/) to expose your local server:
 
@@ -653,7 +666,7 @@ ngrok http 3000
 # e.g., https://abc123.ngrok.io/webhook
 ```
 
-### Testing with RequestBin
+### Testing with RequestBin or Webhook.site
 
 Use [RequestBin](https://requestbin.com/) or [Webhook.site](https://webhook.site/) to inspect webhook payloads:
 
@@ -663,7 +676,7 @@ Use [RequestBin](https://requestbin.com/) or [Webhook.site](https://webhook.site
 4. Trigger an event in Temps
 5. View the received payload in RequestBin
 
-## Data Structures (Rust)
+## Data structures {{ anchor: true, id: 'data-structures' }}
 
 For reference, here are the Rust type definitions:
 

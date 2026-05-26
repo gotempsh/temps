@@ -29,7 +29,7 @@ Managed services are databases and storage systems that Temps provisions as Dock
 | **PostgreSQL** | `gotempsh/postgres-walg:18-bookworm` | Primary database with WAL-G streaming backups |
 | **Redis** | `gotempsh/redis-walg:8-bookworm` | Caching, sessions, pub/sub, and queues |
 | **MongoDB** | `gotempsh/mongodb-walg:8.0` | Document database |
-| **S3 Storage** | `rustfs/rustfs:1.0.0-alpha.78` | S3-compatible object storage (powered by RustFS) |
+| **S3 Storage** | `rustfs/rustfs:1.0.0-alpha.98` | S3-compatible object storage (powered by RustFS) |
 
 Temps also provides higher-level abstractions built on these services:
 
@@ -104,7 +104,7 @@ curl -X POST "https://your-temps-instance/api/external-services" \
 |-----------|---------|----------------------|
 | `port` | Auto-assigned from 9000 | Yes |
 | `console_port` | Auto-assigned from 9001 | Yes |
-| `docker_image` | `rustfs/rustfs:1.0.0-alpha.78` | Yes |
+| `docker_image` | `rustfs/rustfs:1.0.0-alpha.98` | Yes |
 | `access_key` | Auto-generated | No (read-only) |
 | `secret_key` | Auto-generated | No (read-only) |
 

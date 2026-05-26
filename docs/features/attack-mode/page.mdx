@@ -20,23 +20,23 @@ export const sections = [
 
 # Attack Mode
 
-Protect your deployed applications from DDoS attacks and bot traffic with a built-in proof-of-work challenge system. No third-party CAPTCHA services, no external dependencies -- everything runs on your infrastructure. {{ className: 'lead' }}
+Protect your deployed applications from DDoS attacks and bot traffic with a built-in proof-of-work challenge system. No third-party CAPTCHA services, no external dependencies — everything runs on your infrastructure. {{ className: 'lead' }}
 
 ---
 
 ## Overview {{ anchor: true, id: 'overview' }}
 
-Attack Mode is Temps's self-hosted alternative to Cloudflare's "Under Attack Mode." When enabled, every visitor must complete a proof-of-work (PoW) challenge before accessing your application. The challenge is solved automatically in the visitor's browser using a WebAssembly solver -- no user interaction required.
+Attack Mode is Temps's self-hosted alternative to Cloudflare's "Under Attack Mode." When enabled, every visitor must complete a proof-of-work (PoW) challenge before accessing your application. The challenge is solved automatically in the visitor's browser using a WebAssembly solver — no user interaction required.
 
 <Row>
   <Col>
     **Key Features:**
-    - **Zero dependencies** -- no third-party CAPTCHA services or API keys
-    - **Automatic solving** -- visitors see a brief checkpoint page while their browser solves the challenge (2-5 seconds)
-    - **24-hour sessions** -- once verified, visitors can browse freely for 24 hours
-    - **TLS fingerprinting** -- sessions are tied to JA4 TLS fingerprints for stronger identity binding
-    - **WASM-powered** -- Rust compiled to WebAssembly for 30-50x faster solving than JavaScript
-    - **Per-project control** -- enable or disable per project from the dashboard, CLI, or API
+    - **Zero dependencies** — no third-party CAPTCHA services or API keys
+    - **Automatic solving** — visitors see a brief checkpoint page while their browser solves the challenge (2-5 seconds)
+    - **24-hour sessions** — once verified, visitors can browse freely for 24 hours
+    - **TLS fingerprinting** — sessions are tied to JA4 TLS fingerprints for stronger identity binding
+    - **WASM-powered** — Rust compiled to WebAssembly for 30-50x faster solving than JavaScript
+    - **Per-project control** — enable or disable per project from the dashboard, CLI, or API
   </Col>
   <Col>
     **When to use Attack Mode:**
@@ -47,7 +47,7 @@ Attack Mode is Temps's self-hosted alternative to Cloudflare's "Under Attack Mod
 
     **When not to use it:**
     - For API endpoints consumed by other services (they can't solve PoW challenges)
-    - Permanently on production -- it adds latency for first-time visitors
+    - Permanently on production — it adds latency for first-time visitors
     - For applications that need to be crawled by search engines
 
   </Col>
@@ -62,19 +62,19 @@ When a visitor requests a page on a project with Attack Mode enabled, the Temps 
 ### Challenge Flow
 
 1. **Request arrives** at the Pingora-based reverse proxy
-2. **Session check** -- the proxy looks up the visitor's JA4 TLS fingerprint (or IP address as fallback) in the `challenge_sessions` table
-3. **If valid session exists** -- the request passes through to your application normally
-4. **If no valid session** -- the proxy returns a **403 response** with an HTML challenge page
-5. **Browser solves challenge** -- the embedded WASM solver finds a nonce such that `SHA-256(challenge + nonce)` has at least 20 leading zero bits (~1 million hash attempts, takes 2-5 seconds)
-6. **Solution submitted** -- the browser POSTs the solution to `/api/_temps/captcha/verify`
-7. **Server verifies** -- the proxy recomputes the hash and checks the leading zero bits
-8. **Session created** -- a 24-hour session is stored in the database, keyed to the visitor's TLS fingerprint
-9. **Page loads** -- the browser redirects to the original URL
+2. **Session check** — the proxy looks up the visitor's JA4 TLS fingerprint (or IP address as fallback) in the `challenge_sessions` table
+3. **If valid session exists** — the request passes through to your application normally
+4. **If no valid session** — the proxy returns a **403 response** with an HTML challenge page
+5. **Browser solves challenge** — the embedded WASM solver finds a nonce such that `SHA-256(challenge + nonce)` has at least 20 leading zero bits (~1 million hash attempts, takes 2-5 seconds)
+6. **Solution submitted** — the browser POSTs the solution to `/api/_temps/captcha/verify`
+7. **Server verifies** — the proxy recomputes the hash and checks the leading zero bits
+8. **Session created** — a 24-hour session is stored in the database, keyed to the visitor's TLS fingerprint
+9. **Page loads** — the browser redirects to the original URL
 
 <Note>
   Attack Mode requires HTTPS. HTTP requests return a **426 Upgrade Required**
-  response because JA4 TLS fingerprinting -- used to identify visitors across
-  requests -- is only available on TLS connections.
+  response because JA4 TLS fingerprinting — used to identify visitors across
+  requests — is only available on TLS connections.
 </Note>
 
 ### Proof-of-Work Details
@@ -89,7 +89,7 @@ The challenge uses SHA-256 hashing with a difficulty of **20 leading zero bits**
   </Property>
   <Property name="Difficulty" type="20 bits">
     20 leading zero bits means the hash must start with at least 5 hex zeros
-    (e.g., `00000a3f...`). This takes ~1M attempts on average -- enough to deter
+    (e.g., `00000a3f...`). This takes ~1M attempts on average — enough to deter
     bots while remaining fast for browsers.
   </Property>
   <Property name="WASM Solver" type="Rust → WebAssembly">
@@ -125,7 +125,7 @@ Attack Mode can be enabled from the dashboard, CLI, or API.
 
 When enabled, an orange banner appears on the project detail page:
 
-> **Attack Mode is enabled for this project** -- with a quick-access **Disable** button to turn it off immediately.
+> **Attack Mode is enabled for this project** — with a quick-access **Disable** button to turn it off immediately.
 
 ### Via CLI
 
@@ -290,7 +290,7 @@ Control access to your Temps instance at the infrastructure level with IP-based 
     3. Enter the IP address or CIDR range
     4. Select **Block** or **Allow**
     5. Optionally add a reason
-    6. Save -- rules take effect immediately
+    6. Save — rules take effect immediately
 
     ### Via API
 
@@ -388,9 +388,9 @@ Temps automatically scans your deployed Docker images for known vulnerabilities 
 
 ### What Gets Scanned
 
-- **OS packages** (Alpine, Debian, Ubuntu, etc.) -- detects CVEs in system libraries
-- **Language packages** (npm, pip, Go modules, etc.) -- detects CVEs in application dependencies
-- **Container configuration** -- checks for security misconfigurations
+- **OS packages** (Alpine, Debian, Ubuntu, etc.) — detects CVEs in system libraries
+- **Language packages** (npm, pip, Go modules, etc.) — detects CVEs in application dependencies
+- **Container configuration** — checks for security misconfigurations
 
 ### Severity Levels
 
@@ -485,7 +485,7 @@ Global Settings  →  Project Settings  →  Environment Settings
 
 ## Next Steps
 
-- [Monitoring](/docs/monitoring) -- Monitor application health and resource usage
-- [Error Tracking](/docs/error-tracking) -- Track and debug application errors
-- [Logs](/docs/logs) -- View application and deployment logs
-- [Architecture: Security](/docs/security) -- Security architecture overview
+- [Monitoring](/docs/monitoring) — Monitor application health and resource usage
+- [Error Tracking](/docs/error-tracking) — Track and debug application errors
+- [Logs](/docs/logs) — View application and deployment logs
+- [Architecture: Security](/docs/security) — Security architecture overview

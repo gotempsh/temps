@@ -6,10 +6,232 @@ export const metadata = {
   },
 }
 
+export const sections = [
+  { title: 'Before you start', id: 'before-you-start' },
+  { title: 'How Railway concepts map to Temps', id: 'concept-mapping' },
+  { title: 'Step 1: Export environment variables', id: 'export-env-vars' },
+  { title: 'Step 2: Prepare your app', id: 'prepare-your-app' },
+  { title: 'Step 3: Migrate your database', id: 'migrate-your-database' },
+  { title: 'Step 4: Create the project in Temps', id: 'create-project' },
+  { title: 'Step 5: Import environment variables', id: 'import-env-vars' },
+  { title: 'Step 6: Transfer your domain', id: 'transfer-domain' },
+  { title: 'Service replacements', id: 'service-replacements' },
+  { title: 'Rollback plan', id: 'rollback-plan' },
+]
 
 # Migrate from Railway
-## Page Goal
-Show Railway users how to migrate while explaining database differences.
-## Target Persona
-**Railway Refugee** - Cost concerns, loves simplicity, needs to understand database migration.
-## Key Content: Application migration, database migration to external provider, environment variables, nixpacks compatibility, templates
+
+This guide walks you through moving a Railway application to a self-hosted Temps instance. After the migration, your app runs on infrastructure you own — no usage-based pricing, no platform fee increases, no vendor lock-in. {{ className: 'lead' }}
+
+---
+
+## Before you start {{ anchor: true, id: 'before-you-start' }}
+
+What you need before migrating:
+
+- A running Temps instance. If you have not installed Temps yet, follow the [installation guide](/docs/installation) first.
+- The Railway CLI installed and logged in (`railway login`)
+- Access to your Railway project
+- 30–60 minutes
+
+<Note>
+Keep your Railway project running until you have verified traffic is flowing correctly through Temps. Railway bills by usage, so you can let the app idle at near-zero cost while you verify the migration.
+</Note>
+
+---
+
+## How Railway concepts map to Temps {{ anchor: true, id: 'concept-mapping' }}
+
+| Railway | Temps equivalent |
+|---------|-----------------|
+| Project | Project |
+| Service (app) | Container (replica) |
+| Environment (production, staging) | Environments within a project |
+| PR environment / ephemeral environment | Preview environment (auto-created per branch) |
+| Variable | Environment variable |
+| Railway Postgres | Managed PostgreSQL service |
+| Railway Redis | Managed Redis service / KV Storage |
+| Railway Volume | Not directly equivalent — use S3-compatible managed storage or a dedicated volume mount |
+| Cron job | Built-in cron scheduler via `.temps.yaml` |
+| Railway CLI | Temps CLI |
+
+---
+
+## Step 1: Export environment variables {{ anchor: true, id: 'export-env-vars' }}
+
+Download your Railway environment variables so you can import them into Temps:
+
+```bash
+railway variables --json > railway-vars.json
+```
+
+If you use multiple Railway environments (production, staging), run this once per environment and save each to a separate file:
+
+```bash
+railway variables --environment production --json > railway-vars-production.json
+railway variables --environment staging --json   > railway-vars-staging.json
+```
+
+Keep these files handy — you will import them in step 5.
+
+---
+
+## Step 2: Prepare your app {{ anchor: true, id: 'prepare-your-app' }}
+
+Temps builds most apps with Nixpacks — the same build system Railway uses. In most cases your app will build without any changes.
+
+### Binding to the correct host and port
+
+Temps injects a `PORT` environment variable, the same as Railway. Make sure your application binds to `0.0.0.0` (not `localhost` or `127.0.0.1`):
+
+```javascript
+// Node.js — correct
+const port = process.env.PORT || 3000;
+app.listen(port, '0.0.0.0');
+```
+
+```python
+# Python/Gunicorn — pass --bind to the start command
+# web: gunicorn app:app --bind 0.0.0.0:$PORT
+```
+
+### Dockerfile
+
+If your app already has a `Dockerfile`, Temps uses it directly. No changes are needed unless the Dockerfile hard-codes a port number instead of reading `$PORT`.
+
+### railway.toml and Nixpacks config
+
+Railway-specific configuration in `railway.toml` (build command, start command, healthcheck path) does not transfer automatically. Temps reads the same values from its project configuration UI — review and set them when you create the project in step 4.
+
+If you have a `nixpacks.toml` in your repository, Temps respects it during the Nixpacks build phase. This is the most portable way to carry build configuration across platforms.
+
+---
+
+## Step 3: Migrate your database {{ anchor: true, id: 'migrate-your-database' }}
+
+### Create a managed PostgreSQL service in Temps
+
+1. In the Temps dashboard, go to **Services** → **Add Service**
+2. Choose **PostgreSQL**
+3. Give the service a name (e.g. `my-app-db`) and create it
+
+Temps starts a PostgreSQL container and injects `POSTGRES_URL` (and related variables) into your project automatically once you link the service.
+
+### Export data from Railway Postgres
+
+Railway Postgres runs a standard PostgreSQL instance. Export a dump using `pg_dump`:
+
+```bash
+# Get your Railway database URL from the Variables tab of your database service
+pg_dump \
+  --format=custom \
+  --no-owner \
+  --no-acl \
+  "$RAILWAY_DATABASE_URL" \
+  > railway-backup.dump
+```
+
+<Note>
+You can find the `RAILWAY_DATABASE_URL` (or `DATABASE_URL`) for your Railway Postgres service in the **Variables** tab of the database service in the Railway dashboard.
+</Note>
+
+### Import into the Temps PostgreSQL service
+
+Get the connection string for your new Temps database from **Services → your service → Connection Details**, then restore:
+
+```bash
+pg_restore \
+  --no-owner \
+  --no-acl \
+  --dbname "postgresql://postgres:YOUR_PASSWORD@YOUR_TEMPS_HOST:5432/YOUR_DB" \
+  railway-backup.dump
+```
+
+If `pg_restore` reports role errors, the `--no-owner` and `--no-acl` flags strip Railway-specific ownership metadata that does not exist on the new database. These flags are safe to use.
+
+---
+
+## Step 4: Create the project in Temps {{ anchor: true, id: 'create-project' }}
+
+1. Open the Temps dashboard and click **New Project**
+2. Connect your Git provider and select the repository
+3. Select the branch you deploy to production (usually `main` or `master`)
+4. Temps auto-detects the framework — verify the preset matches your app
+5. Set the build command and start command to match what you had in Railway
+6. Under **Linked Services**, attach the PostgreSQL service from step 3
+
+Do not deploy yet. Set your environment variables first.
+
+---
+
+## Step 5: Import environment variables {{ anchor: true, id: 'import-env-vars' }}
+
+Open the project in Temps, go to **Environment Variables**, and add the variables from `railway-vars-production.json`.
+
+Handle these variables specially:
+
+| Railway variable | Action in Temps |
+|-----------------|----------------|
+| `DATABASE_URL` | **Remove it.** Temps injects `POSTGRES_URL` from the linked service. If your code expects `DATABASE_URL`, add it as `DATABASE_URL=$(POSTGRES_URL)`. |
+| `REDIS_URL` | **Remove it.** Add a managed Redis service first, then use the injected `REDIS_URL`. |
+| `PORT` | **Remove it.** Temps injects `PORT` automatically. |
+| `RAILWAY_ENVIRONMENT` | Remove. Replace with `TEMPS_ENVIRONMENT` or a custom variable if your code branches on environment name. |
+| `RAILWAY_SERVICE_NAME` | Remove. Replace with a custom variable if your app references the service name. |
+| `RAILWAY_PROJECT_ID` | Remove. Not applicable to Temps. |
+| All other custom variables | Copy as-is. |
+
+After saving, click **Deploy** to trigger the first deployment.
+
+---
+
+## Step 6: Transfer your domain {{ anchor: true, id: 'transfer-domain' }}
+
+### Smoke test on the Temps subdomain first
+
+Verify the app works on the auto-assigned Temps URL (e.g. `my-app.yourdomain.com`) before cutting over DNS:
+
+- The app loads and renders correctly
+- Database reads and writes work
+- All environment variables are present (`/api/health` or a similar diagnostic endpoint is a good check)
+
+### Cut over DNS
+
+When you are satisfied, update your domain's DNS record to point to your Temps server's IP address:
+
+```
+my-app.example.com  A  YOUR_TEMPS_SERVER_IP
+```
+
+Temps will automatically provision a Let's Encrypt SSL certificate within a few minutes of DNS propagation. See [Add a Custom Domain](/docs/add-a-custom-domain) for detailed DNS instructions.
+
+<Note>
+Railway custom domains use a CNAME record pointing to Railway's edge network. Temps uses an A record pointing directly to your server's IP address. You need to change the record **type** (CNAME → A) as well as the value when cutting over.
+</Note>
+
+---
+
+## Service replacements {{ anchor: true, id: 'service-replacements' }}
+
+| Railway service | Temps equivalent |
+|----------------|-----------------|
+| Railway Postgres | Built-in managed PostgreSQL service |
+| Railway Redis | Built-in managed Redis service or [KV Storage](/docs/kv-storage) |
+| Railway MongoDB | Built-in managed MongoDB service |
+| Railway Volume | S3-compatible managed storage (RustFS) or a volume mount in your container |
+| Railway observability | Built-in metrics dashboard — [Monitoring](/docs/monitoring) |
+| Railway logging | Built-in log aggregation — [Logs & Debugging](/docs/logs) |
+| Railway Cron | Built-in cron scheduler via `.temps.yaml` — [Cron Jobs](/docs/cron-jobs) |
+| Upstash (via Railway) | Built-in [KV Storage](/docs/kv-storage) via the Temps SDK |
+
+---
+
+## Rollback plan {{ anchor: true, id: 'rollback-plan' }}
+
+If something goes wrong after the DNS cutover:
+
+1. **Point DNS back to Railway.** Update the record to the original Railway CNAME target. Changes take effect within seconds to minutes depending on your TTL.
+2. **Verify the Railway deployment is still active** — Railway does not stop deployments automatically when you remove a custom domain.
+
+Your Railway project and Railway Postgres data are untouched throughout this process — nothing is deleted until you choose to remove the Railway project.
+
+Once you have diagnosed and fixed the issue in Temps, retry the cutover. Check the [deployment logs](/docs/logs) and [debug guide](/docs/debug-a-failed-deployment) if the Temps deployment itself failed.
