@@ -6,10 +6,357 @@ export const metadata = {
   },
 }
 
+export const sections = [
+  { title: 'Diagnose before optimizing', id: 'diagnose-before-optimizing' },
+  { title: 'Resource sizing', id: 'resource-sizing' },
+  { title: 'Build optimization', id: 'build-optimization' },
+  { title: 'Caching strategies', id: 'caching-strategies' },
+  { title: 'Database optimization', id: 'database-optimization' },
+  { title: 'Horizontal scaling', id: 'horizontal-scaling' },
+  { title: 'Static assets and CDN', id: 'static-assets-and-cdn' },
+  { title: 'Application-level tracing', id: 'application-level-tracing' },
+]
 
 # Performance Optimization
-## Page Goal
-Help users maximize application performance.
-## Target Persona
-**Performance Pete** - Needs fast response times, optimizing for scale, cost-conscious.
-## Key Content: Caching strategies, CDN integration, build optimization, resource limits, profiling, database optimization
+
+A systematic approach to making your Temps-hosted application faster: measure first, then fix the right thing. {{ className: 'lead' }}
+
+---
+
+## Diagnose before optimizing {{ anchor: true, id: 'diagnose-before-optimizing' }}
+
+Fixing the wrong bottleneck wastes time. Before making changes, measure where the time is actually going.
+
+### Identify the bottleneck
+
+Open **Project → Monitoring** and look at these signals:
+
+| Signal | What it points to |
+|--------|-------------------|
+| CPU sustained near 100% | CPU-bound code (tight loops, blocking crypto, unoptimized rendering) |
+| Memory growing over time | Memory leak — fix in code, not by raising the limit |
+| Memory near limit (stable) | Application genuinely needs more RAM — increase the limit |
+| Fast CPU + high latency | I/O-bound: slow database queries, external API calls, disk reads |
+| High network throughput | Large response payloads — compress, paginate, or cache |
+
+### Measure end-user latency
+
+1. Open **Project → Analytics → Performance** for Core Web Vitals (LCP, CLS, INP) and Time to First Byte (TTFB) broken down by page.
+2. A high server-side TTFB (> 500 ms) points to slow backend processing. A low TTFB with poor LCP points to client-side rendering or large assets.
+
+### Profile with tracing
+
+Temps injects `OTEL_*` environment variables automatically for every container. Add the OpenTelemetry SDK to your application and traces appear in **Monitoring → Traces** with per-span timings.
+
+For Node.js:
+
+```bash
+npm install @opentelemetry/auto-instrumentations-node
+```
+
+```javascript
+// instrument.js — loaded before your app
+require('@opentelemetry/auto-instrumentations-node/register');
+```
+
+```bash
+# In your start command
+node --require ./instrument.js server.js
+```
+
+Spans will appear for HTTP requests, database queries, and outbound HTTP calls with no additional code changes.
+
+---
+
+## Resource sizing {{ anchor: true, id: 'resource-sizing' }}
+
+The most common performance problem is simply under-provisioned resources. Use the Monitoring dashboard to guide sizing.
+
+### CPU
+
+CPU is measured in millicores (1000 millicores = 1 core). Set limits in **Environment Settings → Resources**.
+
+| Sustained CPU usage | Action |
+|---------------------|--------|
+| < 50% | Resources are comfortable — no change needed |
+| 50–80% | Plan to increase before traffic grows |
+| > 80% | Increase `cpu_limit` or add replicas now |
+| 100% (throttled) | Application is CPU-starved — increase immediately |
+
+CPU throttling does not kill the container, but it slows every request proportionally. A container sitting at the CPU limit will have request latencies 2–10× higher than one with headroom.
+
+### Memory
+
+Memory is measured in megabytes. Exceeding `memory_limit` causes a hard kill (OOM).
+
+Rule of thumb: set `memory_limit` to **150% of the steady-state working set**. Measure the working set after the application has been running for at least an hour under production traffic.
+
+```bash
+# Check current memory usage via the API
+curl "https://your-temps-instance/api/projects/{id}/environments/{id}/containers/{id}/metrics" \
+  -H "Authorization: Bearer YOUR_TOKEN"
+```
+
+---
+
+## Build optimization {{ anchor: true, id: 'build-optimization' }}
+
+Slow builds delay deployments and waste resources. Nixpacks caches the package manager layer between builds — if only application code changes, the dependency install step is skipped.
+
+### Minimize layer invalidation
+
+Place `package.json` and the lockfile early in your build so Docker can cache the `npm install` layer:
+
+```dockerfile
+# Dockerfile — cache-friendly layout
+FROM node:20-slim
+WORKDIR /app
+
+# Copy manifests first — this layer is cached unless dependencies change
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+
+# Copy source after — only invalidates the layer above when app code changes
+COPY . .
+RUN npm run build
+
+CMD ["node", "dist/server.js"]
+```
+
+### Reduce image size
+
+Smaller images pull faster and start faster:
+
+- Use a slim base image (`node:20-slim`, `python:3.12-slim`) instead of the full distribution.
+- Use multi-stage builds to exclude build tools from the final image:
+
+```dockerfile
+# Multi-stage build
+FROM node:20 AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+FROM node:20-slim AS runner
+WORKDIR /app
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/node_modules ./node_modules
+CMD ["node", "dist/server.js"]
+```
+
+For a Next.js application using the standalone output mode, the final image shrinks from ~400 MB to ~80 MB.
+
+### Pre-build in CI
+
+If build times exceed 5 minutes, consider building the Docker image in GitHub Actions and pushing it to Temps via the `deploy/image` endpoint:
+
+```yaml
+# .github/workflows/deploy.yml
+- name: Build and push
+  run: |
+    docker build -t myapp:${{ github.sha }} .
+    docker save myapp:${{ github.sha }} | gzip > image.tar.gz
+    curl -X POST "https://your-temps-instance/api/projects/$PROJECT_ID/deploy/image-upload" \
+      -H "Authorization: Bearer $TEMPS_API_KEY" \
+      -F "image=@image.tar.gz" \
+      -F "tag=myapp:${{ github.sha }}"
+```
+
+---
+
+## Caching strategies {{ anchor: true, id: 'caching-strategies' }}
+
+### HTTP response caching
+
+Set `Cache-Control` headers on responses that are safe to cache:
+
+```javascript
+// Express.js — cache API responses for 60 seconds
+app.get('/api/products', (req, res) => {
+  res.set('Cache-Control', 'public, max-age=60, stale-while-revalidate=300');
+  res.json(products);
+});
+```
+
+Temps's reverse proxy (Pingora) does not perform response caching today — headers pass through to the client browser or an upstream CDN.
+
+### In-memory caching
+
+For data that is expensive to compute and changes infrequently, cache results in application memory:
+
+```javascript
+import { LRUCache } from 'lru-cache';
+
+const cache = new LRUCache({ max: 500, ttl: 1000 * 60 * 5 }); // 5 min TTL
+
+async function getPopularProducts() {
+  if (cache.has('popular')) return cache.get('popular');
+  const products = await db.query('SELECT ... ORDER BY sales DESC LIMIT 20');
+  cache.set('popular', products);
+  return products;
+}
+```
+
+<Note>
+In-memory caches are per-container. With multiple replicas, each replica has its own cache. This is fine for read-heavy data. For shared mutable state (rate limits, distributed locks), use the managed Redis service.
+</Note>
+
+### Redis caching
+
+Use the managed Redis service for caches shared across replicas:
+
+```javascript
+import { createClient } from 'redis';
+
+const redis = createClient({ url: process.env.REDIS_URL });
+
+async function getCachedValue(key, fetchFn, ttlSeconds = 300) {
+  const cached = await redis.get(key);
+  if (cached) return JSON.parse(cached);
+
+  const value = await fetchFn();
+  await redis.set(key, JSON.stringify(value), { EX: ttlSeconds });
+  return value;
+}
+```
+
+---
+
+## Database optimization {{ anchor: true, id: 'database-optimization' }}
+
+Database queries are the most common source of high server-side latency. Identify slow queries before adding indexes or caches.
+
+### Find slow queries
+
+Enable the slow query log on the managed PostgreSQL service. Queries taking more than 100 ms are candidates for optimization.
+
+From the database container:
+
+```sql
+-- Show the 10 slowest query types (requires pg_stat_statements)
+SELECT query, calls, mean_exec_time, total_exec_time
+FROM pg_stat_statements
+ORDER BY mean_exec_time DESC
+LIMIT 10;
+```
+
+### Add indexes
+
+Most slow queries are caused by sequential table scans on large tables. `EXPLAIN ANALYZE` shows whether an index is being used:
+
+```sql
+EXPLAIN ANALYZE
+SELECT * FROM orders WHERE user_id = $1 AND created_at > $2;
+```
+
+If the plan shows `Seq Scan`, add a composite index:
+
+```sql
+CREATE INDEX CONCURRENTLY idx_orders_user_created
+ON orders (user_id, created_at DESC);
+```
+
+Use `CONCURRENTLY` to avoid locking the table during index creation on a live database.
+
+### Connection pooling
+
+Each application container opens its own connection pool. With multiple replicas, total connections multiply. Set pool size conservatively per instance:
+
+```javascript
+// Drizzle / node-postgres
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 5,         // maximum 5 connections per container replica
+  idleTimeoutMillis: 30_000,
+});
+```
+
+For high replica counts, run PgBouncer in front of PostgreSQL. The managed PostgreSQL service accepts PgBouncer as a linked sidecar container.
+
+---
+
+## Horizontal scaling {{ anchor: true, id: 'horizontal-scaling' }}
+
+Adding replicas multiplies throughput for CPU-bound and I/O-concurrent workloads. Before adding replicas:
+
+1. **Ensure your application is stateless.** Each replica has its own memory space. Sessions, in-memory caches, and temporary files must live outside the container (Redis, database, S3).
+2. **Ensure your database can handle the connection count.** Each replica opens its own pool. Three replicas with `max: 10` each means 30 connections — plan accordingly.
+3. **Test locally with multiple instances.** Run two copies of your application and send traffic to both. Fix any race conditions or shared-state bugs before scaling in production.
+
+Set the replica count in **Environment Settings → Replicas** or via the API:
+
+```bash
+curl -X PATCH "https://your-temps-instance/api/projects/{id}/environments/{id}" \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"deployment_config": {"replicas": 3}}'
+```
+
+---
+
+## Static assets and CDN {{ anchor: true, id: 'static-assets-and-cdn' }}
+
+Serving static assets (JS, CSS, images, fonts) through your application container adds unnecessary load and latency. Offload them to a CDN.
+
+### Option 1: Use a CDN in front of Temps
+
+Place Cloudflare (or any CDN) in front of your Temps domain. Configure cache rules to cache assets at the edge:
+
+- Cache `/assets/*`, `/_next/static/*`, `/static/*` with a long TTL (1 year)
+- Pass through `/api/*` and dynamic pages uncached
+
+### Option 2: Serve assets from an external bucket
+
+Upload your build output's static assets to an S3-compatible bucket (Temps managed storage) and configure your application to reference the CDN URL:
+
+```javascript
+// next.config.js
+module.exports = {
+  assetPrefix: process.env.CDN_URL || '',
+};
+```
+
+### Option 3: Enable response compression
+
+If you are not using a CDN, enable gzip/brotli compression in your application. Most frameworks have middleware for this:
+
+```javascript
+// Express.js
+import compression from 'compression';
+app.use(compression());
+```
+
+```python
+# FastAPI
+from fastapi.middleware.gzip import GZipMiddleware
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+```
+
+---
+
+## Application-level tracing {{ anchor: true, id: 'application-level-tracing' }}
+
+Distributed tracing shows exactly where time is spent on a per-request basis. Temps auto-injects the following environment variables into every container:
+
+| Variable | Value |
+|----------|-------|
+| `OTEL_SERVICE_NAME` | Your project's name |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Temps's built-in OTLP collector |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf` |
+
+Add the OpenTelemetry SDK and you get traces with no manual span creation needed for HTTP requests, database calls, and outbound HTTP:
+
+```bash
+# Python (FastAPI)
+pip install opentelemetry-distro opentelemetry-exporter-otlp
+opentelemetry-bootstrap -a install
+```
+
+```bash
+# Start command with auto-instrumentation
+opentelemetry-instrument uvicorn app.main:app --host 0.0.0.0 --port $PORT
+```
+
+View traces in **Project → Monitoring → Traces**. Each trace shows the full request lifecycle with per-span timings, allowing you to pinpoint which database query or downstream call is responsible for elevated latency.

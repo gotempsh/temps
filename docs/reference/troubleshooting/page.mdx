@@ -7,14 +7,357 @@ export const metadata = {
   },
 };
 
+export const sections = [
+  { title: 'Build failures', id: 'build-failures' },
+  { title: 'Health check failures', id: 'health-check-failures' },
+  { title: 'Runtime errors', id: 'runtime-errors' },
+  { title: 'SSL and domain issues', id: 'ssl-and-domain-issues' },
+  { title: 'Environment variables', id: 'environment-variables' },
+  { title: 'Database connection errors', id: 'database-connection-errors' },
+  { title: 'Cron jobs not running', id: 'cron-jobs-not-running' },
+  { title: 'Performance problems', id: 'performance-problems' },
+  { title: 'CLI and API errors', id: 'cli-and-api-errors' },
+  { title: 'Getting more help', id: 'getting-more-help' },
+]
+
 # Troubleshooting
 
-## Page Goal
+Solutions to the most common problems you will encounter when running Temps. Each section describes the symptom, the most likely cause, and the exact fix. {{ className: 'lead' }}
 
-Help users self-serve solutions to common problems.
+<Note>
+For deployment-specific failures, the fastest starting point is always the build logs. Open the failed deployment, expand the first red job, and read to the bottom. The last few lines almost always name the problem precisely.
+</Note>
 
-## Target Persona
+---
 
-**Stuck Steve** - Has a problem, wants quick solution, searching for error messages.
+## Build failures {{ anchor: true, id: 'build-failures' }}
 
-## Key Content: Build errors, deployment errors, runtime errors, DNS issues, SSL problems, performance issues, FAQs
+<Properties>
+  <Property name="'npm install' exits with non-zero status">
+    **Cause:** Missing or mis-matched dependencies, wrong Node.js version, or a corrupt/missing lockfile.
+
+    **Fix:**
+    - Commit your lockfile (`package-lock.json`, `yarn.lock`, or `pnpm-lock.yaml`). Temps runs `npm ci` (not `npm install`) when a lockfile is present, which is reproducible and faster.
+    - Pin a specific Node.js version with a `.node-version` file in your repository root (e.g. `20.11.0`).
+    - Run `npm ci` locally and fix any errors before pushing.
+  </Property>
+
+  <Property name="'Dockerfile not found'">
+    **Cause:** Temps detected a Docker-based project but cannot find a `Dockerfile`.
+
+    **Fix:** Either add a `Dockerfile` to your repository root (or project sub-directory for monorepos), or go to **Project Settings → Build** and override the framework preset to the correct one (e.g. Next.js, Vite). Temps auto-detects frameworks based on file presence — when detection is wrong, the override is authoritative.
+  </Property>
+
+  <Property name="Out of memory during build (OOM kill)">
+    **Cause:** The build process exceeded the container's memory limit. Common with large Next.js or Webpack builds.
+
+    **Fix:**
+    - Increase the build memory limit in **Environment Settings → Resources**.
+    - For Next.js, set `NODE_OPTIONS=--max-old-space-size=4096` as an environment variable scoped to the build step.
+    - Consider running the heavy build step in CI (e.g. GitHub Actions) and pushing a pre-built Docker image to Temps via `deploy/image` instead.
+  </Property>
+
+  <Property name="Nixpacks cannot detect framework">
+    **Cause:** Nixpacks uses file-based heuristics. A monorepo root that contains multiple `package.json` files, or a project with an unusual structure, can confuse detection.
+
+    **Fix:** Place a `.nixpacks.toml` in the project directory to explicitly specify the build and start commands:
+
+    ```toml
+    # .nixpacks.toml
+    [phases.build]
+    cmds = ["npm run build"]
+
+    [start]
+    cmd = "node dist/server.js"
+    ```
+
+    Alternatively, add a `Dockerfile` to take full control of the build.
+  </Property>
+
+  <Property name="Python: 'No module named X' during build">
+    **Cause:** Dependency not listed in `requirements.txt` or `pyproject.toml`, or a platform-specific wheel is unavailable.
+
+    **Fix:** Add the missing package to your dependency file and commit. For binary dependencies that require system libraries, use a `Dockerfile` and install the system packages with `apt-get` before `pip install`.
+  </Property>
+</Properties>
+
+---
+
+## Health check failures {{ anchor: true, id: 'health-check-failures' }}
+
+A health check failure means the container started but did not respond with a 2xx status code before the deadline. The build log will show `Health check failed after N attempts`.
+
+<Properties>
+  <Property name="Application not listening on the expected port">
+    **Cause:** Temps injects a `PORT` environment variable (default `8080`). If your application ignores it and hardcodes a different port, the health check has nowhere to connect.
+
+    **Fix:** Read `PORT` from the environment:
+
+    ```javascript
+    // Node.js
+    const port = process.env.PORT || 3000;
+    server.listen(port, '0.0.0.0');
+    ```
+
+    ```python
+    # Python (FastAPI / uvicorn)
+    import os
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
+    ```
+  </Property>
+
+  <Property name="Application bound to 127.0.0.1 instead of 0.0.0.0">
+    **Cause:** Binding to `localhost` makes the port unreachable from outside the container (including the Temps health-check probe).
+
+    **Fix:** Change your server's bind address to `0.0.0.0`. See the framework-specific tutorials for the correct configuration for Express, Fastify, Django, FastAPI, Rails, and others.
+  </Property>
+
+  <Property name="Slow startup — health check times out before the app is ready">
+    **Cause:** Database migrations, asset compilation, or cache warming on startup push the ready time past the health check deadline.
+
+    **Fix:**
+    - Run migrations in a separate step before starting the web process (e.g. a `release` script separate from `web`).
+    - Increase the health check timeout in **Environment Settings → Health Check**.
+    - Stream startup logs to see which step is slow: `temps logs --project my-app --follow`.
+  </Property>
+
+  <Property name="Application crashes on startup (exits immediately)">
+    **Cause:** Unhandled exception, missing required environment variable, or a file that is expected to exist but does not.
+
+    **Fix:** Open the deployment's **Logs** tab and look for the process exit message and stack trace. Common causes:
+    - `DATABASE_URL` not set — check **Environment Variables** in the dashboard.
+    - A config file (`.env`, `config.json`) committed to the repo but not present in the Docker image — embed it as an environment variable instead.
+  </Property>
+</Properties>
+
+---
+
+## Runtime errors {{ anchor: true, id: 'runtime-errors' }}
+
+<Properties>
+  <Property name="Application returns 502 Bad Gateway">
+    **Cause:** The reverse proxy (Pingora) can reach the container but the container rejected the connection or closed it immediately.
+
+    **Fix:**
+    - Check container logs in **Project → Logs** for crash reports.
+    - Verify the application is still running: the container may have crashed after the health check passed (race condition with memory leak, OOM, or unhandled rejection).
+    - Increase the memory limit if you see OOM kills in the system journal.
+  </Property>
+
+  <Property name="Application returns 503 Service Unavailable">
+    **Cause:** No healthy container is currently registered for the route. This can happen during a deployment (expected, brief) or if all replicas have crashed.
+
+    **Fix:**
+    - Wait 30 seconds after a new deployment — the old container is replaced by the new one during this window.
+    - If the 503 persists, check **Deployments** to see if the latest deployment succeeded.
+    - Check container logs for crash loops.
+  </Property>
+
+  <Property name="Memory leak / container killed by OOM">
+    **Cause:** The container exceeded its memory limit. Docker sends SIGKILL; Temps detects the unexpected exit and restarts the container.
+
+    **Fix:**
+    - View memory usage in **Project → Monitoring**.
+    - Increase the memory limit temporarily to confirm the cause: if the restart cycle stops, it was OOM.
+    - Profile the application to find the leak.
+    - Set a memory limit that gives ~50% headroom above the working set.
+  </Property>
+</Properties>
+
+---
+
+## SSL and domain issues {{ anchor: true, id: 'ssl-and-domain-issues' }}
+
+<Properties>
+  <Property name="SSL certificate not provisioned / 'Not Secure' warning">
+    **Cause:** Temps uses Let's Encrypt to provision certificates automatically. The DNS record must point to your Temps server before the ACME challenge can succeed.
+
+    **Timeline:** After you update DNS, allow up to 15 minutes for propagation before the certificate is issued. The domain status in **Project → Domains** will update from `Pending` to `Active`.
+
+    **Fix:**
+    - Confirm your A/CNAME record points to the correct IP or hostname with `dig +short yourdomain.com`.
+    - If the domain stays `Pending` beyond 15 minutes, check **Project → Domains** for the error message. Common causes: firewall blocking port 80 (required for the HTTP-01 challenge), or the CAA DNS record restricting Let's Encrypt.
+    - Ensure port 80 is open on your server. Temps must be able to answer `/.well-known/acme-challenge/` requests on port 80 even if your application redirects to HTTPS.
+  </Property>
+
+  <Property name="Custom domain returns the wrong application">
+    **Cause:** The domain was added to more than one project, or a stale DNS cache is routing to an old deployment.
+
+    **Fix:**
+    - A domain can only be assigned to one Temps project. Remove it from the old project before adding it to the new one.
+    - Clear your local DNS cache (`sudo dscacheutil -flushcache` on macOS, `ipconfig /flushdns` on Windows) and retry.
+  </Property>
+
+  <Property name="HTTPS redirect loop">
+    **Cause:** The application performs its own HTTP→HTTPS redirect, but it receives the request as HTTP because Temps terminates TLS and forwards to the container over plain HTTP internally.
+
+    **Fix:** Trust the `X-Forwarded-Proto` header to detect the original scheme, and only redirect when `X-Forwarded-Proto: http`:
+
+    ```javascript
+    // Express.js
+    app.set('trust proxy', 1);
+    app.use((req, res, next) => {
+      if (req.headers['x-forwarded-proto'] !== 'https') {
+        return res.redirect(301, `https://${req.hostname}${req.url}`);
+      }
+      next();
+    });
+    ```
+  </Property>
+</Properties>
+
+---
+
+## Environment variables {{ anchor: true, id: 'environment-variables' }}
+
+<Properties>
+  <Property name="Environment variable not visible inside container">
+    **Cause:** Environment variables are injected at deploy time, not at runtime config reload. A variable added after the last deployment is not present until you redeploy.
+
+    **Fix:** After adding or changing an environment variable in **Environment Settings → Variables**, click **Redeploy** (or push a new commit) to pick up the change.
+  </Property>
+
+  <Property name="Variable set in dashboard but process.env reads undefined">
+    **Cause:** Framework-specific build-time variable baking. Next.js, Vite, and Create React App only expose variables prefixed with `NEXT_PUBLIC_`, `VITE_`, or `REACT_APP_` respectively to client-side code. Other variables are server-side only.
+
+    **Fix:** Prefix client-side variables correctly. Server-side variables (API keys, database URLs) should never be prefixed — they are only available to the Node.js/Python/Go server process, not in browser bundles.
+  </Property>
+
+  <Property name="Secret value contains special characters and behaves unexpectedly">
+    **Cause:** Values entered via the Temps dashboard are stored as-is with no shell interpretation. However, some frameworks or ORMs interpolate `$VAR` references inside connection strings at startup.
+
+    **Fix:** Use the API or CLI to set values with literal special characters. If a `$` in a password causes issues, escape it or use a base64-encoded secret decoded at startup.
+  </Property>
+</Properties>
+
+---
+
+## Database connection errors {{ anchor: true, id: 'database-connection-errors' }}
+
+<Properties>
+  <Property name="'Connection refused' to managed PostgreSQL or Redis">
+    **Cause:** The container is not linked to the managed service, or the service is not running.
+
+    **Fix:**
+    - Go to **Project → Managed Services** and verify the service is in a running state.
+    - Confirm the `DATABASE_URL` (or `REDIS_URL`) environment variable is injected — it should appear automatically once the service is linked to the environment.
+    - Managed services communicate over Docker's internal network. Do not use the host's public IP — use the injected hostname (e.g. `postgres-my-db`).
+  </Property>
+
+  <Property name="'Too many connections' on PostgreSQL">
+    **Cause:** Each container replica opens its own connection pool. With multiple replicas, the total connection count can exceed `max_connections` on the PostgreSQL instance.
+
+    **Fix:** Use PgBouncer in front of PostgreSQL, or reduce pool size per replica. The managed PostgreSQL service defaults to `max_connections = 100`; increase it in the service settings if needed.
+  </Property>
+
+  <Property name="Database migrations fail during deployment">
+    **Cause:** The migration command runs inside the application container after it starts, and if it fails the deployment is marked as failed.
+
+    **Fix:**
+    - Run migrations as a `release` command before the web process starts (configure this in your Dockerfile `CMD` or `.temps.yaml` start command).
+    - Test migrations against a staging environment first with the same migration tool and database version.
+    - Check migration logs in **Deployments → [latest] → Logs** for the exact SQL error.
+  </Property>
+</Properties>
+
+---
+
+## Cron jobs not running {{ anchor: true, id: 'cron-jobs-not-running' }}
+
+<Properties>
+  <Property name="Cron job never executes">
+    **Cause:** The `.temps.yaml` file was not present at deploy time, or has a YAML syntax error, or the cron expression is invalid.
+
+    **Fix:**
+    - Validate your cron expression at [crontab.guru](https://crontab.guru).
+    - Validate your YAML syntax with a linter — indentation errors are common.
+    - Ensure `.temps.yaml` is in the project directory (the root of the repository, or the configured sub-directory for monorepos).
+    - Redeploy after fixing `.temps.yaml` — cron jobs are configured by the `ConfigureCronsJob` that runs after every deployment.
+    - Check **Project Settings → Cron Jobs** to confirm the jobs are registered.
+  </Property>
+
+  <Property name="Cron endpoint returns 401 Unauthorized">
+    **Cause:** The endpoint checks `CRON_SECRET` but is reading it incorrectly.
+
+    **Fix:** `CRON_SECRET` is injected automatically. You do not need to set it. Verify your endpoint checks `Authorization: Bearer <value of process.env.CRON_SECRET>`. See the [Cron Jobs](/docs/cron-jobs) page for verified examples in Node.js, Python, and Go.
+  </Property>
+
+  <Property name="Cron job runs but does nothing">
+    **Cause:** The endpoint returns 200 but performs no work — often a guard clause that short-circuits silently.
+
+    **Fix:** Add structured logging at the start of the endpoint handler. Check **Project → Logs** for the log output from the cron request. Look for the `Authorization` header in the incoming request to confirm it matches.
+  </Property>
+</Properties>
+
+---
+
+## Performance problems {{ anchor: true, id: 'performance-problems' }}
+
+<Properties>
+  <Property name="High response times / slow pages">
+    **Diagnosis:**
+    1. Open **Project → Monitoring** and check CPU and memory usage. Sustained high CPU usually means under-provisioned resources or an inefficient query.
+    2. Check **Project → Analytics → Performance** for Core Web Vitals and Time to First Byte (TTFB) by page.
+    3. Enable OpenTelemetry tracing — Temps injects `OTEL_*` environment variables automatically. Add the OpenTelemetry SDK to your application and the traces will appear in **Monitoring → Traces**.
+
+    **Fix:**
+    - If CPU is the bottleneck, increase the CPU limit or add replicas.
+    - If TTFB is high server-side, profile the slowest database queries (`EXPLAIN ANALYZE`).
+    - For static assets, serve them from a CDN rather than your application container.
+  </Property>
+
+  <Property name="Container restarts frequently (crash loop)">
+    **Cause:** The application crashes (OOM kill, unhandled exception, or non-zero exit code) and Temps restarts it automatically.
+
+    **Fix:**
+    - Check **Project → Logs** for the exit reason.
+    - If it is an OOM kill, you will see `Killed` as the last log line. Increase memory.
+    - If it is an unhandled exception, add a global error handler and log the full stack trace before exiting.
+    - View the restart count in **Monitoring → Containers**.
+  </Property>
+</Properties>
+
+---
+
+## CLI and API errors {{ anchor: true, id: 'cli-and-api-errors' }}
+
+<Properties>
+  <Property name="'Unauthorized' (401) from the API or CLI">
+    **Cause:** The API token is invalid, expired, or missing the required permission scope.
+
+    **Fix:**
+    - Run `temps auth login` to re-authenticate.
+    - If using a static API key, go to **Settings → API Keys** and verify the key is active and has the permissions the operation requires.
+    - For CI/CD, ensure the `TEMPS_API_KEY` or `--api-key` flag is set correctly.
+  </Property>
+
+  <Property name="CLI: 'server unreachable' or connection timeout">
+    **Cause:** The CLI cannot reach your Temps instance. Common after the server IP changes or a firewall rule update.
+
+    **Fix:**
+    - Confirm the server is running: `temps doctor` (or check the Temps process on the server).
+    - Run `temps config set server-url https://your-instance-url` if the URL has changed.
+    - Verify ports 80 and 443 are open on the server's firewall.
+  </Property>
+
+  <Property name="'Not Found' (404) for a project or deployment">
+    **Cause:** The ID in the request does not exist, or you are querying the wrong Temps instance.
+
+    **Fix:** Use `temps projects list` or the dashboard to retrieve valid IDs. IDs are not portable between Temps instances.
+  </Property>
+</Properties>
+
+---
+
+## Getting more help {{ anchor: true, id: 'getting-more-help' }}
+
+If the above sections do not solve your problem:
+
+1. **Run `temps doctor`** — outputs a full diagnostics report (versions, connectivity, database status, recent errors) that you can paste into a support request.
+2. **Collect the relevant logs:**
+   - Build logs: from the deployment detail page
+   - Container logs: `temps logs --project my-app --environment production --tail 200`
+   - Server logs: on the host, `journalctl -u temps -n 500`
+3. **Check the [Debug a Failed Deployment](/docs/debug-a-failed-deployment) guide** for step-by-step log navigation.
+4. **Open an issue** on [GitHub](https://github.com/gotempsh/temps/issues) with the `temps doctor` output and the logs.

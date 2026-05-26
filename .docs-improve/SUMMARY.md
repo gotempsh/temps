@@ -1,19 +1,20 @@
-## Pass summary — run 20260526-162642
+## Pass summary — run 2026-05-26T18:16
 
-Filled the `from-netlify` migration stub with a complete guide matching the style of `from-vercel` and `from-railway`: concept mapping table, five migration steps (env-var export, app prep including Functions→containers translation, project creation, env-var import with Netlify platform variable translation table, DNS cutover), feature replacement table, and rollback plan. Performed a clarity pass on `architecture/overview`: replaced a vague marketing description and missing lead paragraph with an accurate architecture-focused summary, and updated the metadata description to match the page title.
+This pass filled two high-value stub pages. `reference/troubleshooting` is the first stop for users hitting problems; it now covers 18 concrete failure scenarios across build failures, health check failures, runtime errors, SSL/domain issues, environment variable problems, database connection errors, cron job failures, performance problems, and CLI/API errors — each with diagnosis steps and working fixes. `advanced/performance` was also a stub; it now provides a structured optimization guide covering resource sizing, build layer caching, multi-stage Dockerfiles, HTTP/memory/Redis caching, database query profiling and indexing, horizontal scaling prerequisites, CDN/static-asset offloading, and OpenTelemetry tracing setup. Both pages match the voice and structural conventions (lead paragraph, anchored section headers, Properties blocks, code examples) used across the completed docs.
 
 ### Risk
 REVIEW
 
 ### Files changed
-- `docs/migrate/from-netlify/page.mdx` — stub filled: complete Netlify migration guide
-- `docs/architecture/overview/page.mdx` — clarity pass: added lead paragraph, replaced vague description with architecture-accurate summary
+- `docs/reference/troubleshooting/page.mdx` — Stub filled: 18 failure scenarios with causes and fixes
+- `docs/advanced/performance/page.mdx` — Stub filled: end-to-end performance guide (diagnose → resource sizing → build → caching → DB → scaling → CDN → tracing)
 
 ### Stub filled
-from-netlify — step-by-step guide to migrating from Netlify covering concept mapping, env-var translation, netlify.toml handling, Functions→container migration, DNS cutover, feature replacements, and rollback plan
+- `troubleshooting` — Self-serve solutions to the most common build, runtime, SSL, env-var, database, cron, and CLI failure patterns
+- `performance` — Structured performance guide from bottleneck diagnosis through resource sizing, caching, database optimization, and OpenTelemetry tracing
 
 ### Clarity rewrite
-architecture/overview — replaced a missing lead paragraph and a description ("Learn what Temps can do for you") that did not match the page title ("Architecture Overview") with an accurate single-binary architecture summary and a proper lead paragraph
+none this pass
 
 ### Stale refs fixed
 none this pass
