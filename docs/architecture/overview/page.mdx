@@ -1,6 +1,6 @@
 export const metadata = {
   title: 'Architecture Overview',
-  description: 'Learn what Temps can do for you and how it helps you deploy and manage applications.',
+  description: 'How Temps is structured: the reverse proxy, deployment engine, analytics pipeline, and storage layer that power a self-hosted deployment platform.',
   alternates: {
     canonical: '/docs/overview',
   },
@@ -8,9 +8,7 @@ export const metadata = {
 
 # Architecture Overview
 
-## What Temps Does For You
-
-Temps is a self-hosted deployment platform that gives you everything you need to deploy, monitor, and manage applications from Git repositories. You get built-in analytics, error tracking, monitoring, and security features—all in one platform.
+Temps is a single Rust binary that combines a reverse proxy, deployment engine, analytics pipeline, error tracking service, and uptime monitor. All components share one PostgreSQL database and run on the same server you control. {{ className: 'lead' }}
 
 <Mermaid chart={`
 graph TB

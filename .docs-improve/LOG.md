@@ -68,3 +68,27 @@
 - Stale RustFS `1.0.0-alpha.78` in set-up-managed-services and deploy-with-database — fixed in pass 2
 - Double-dash `--` em-dash typos in attack-mode, kv-storage, skills — fixed in pass 2
 - `from-vercel` migration stub — filled in pass 3
+
+## Pass 4 — run 20260526-162642
+
+**Date:** 2026-05-26
+**Risk:** REVIEW
+
+### Changes
+
+| File | Change |
+|------|--------|
+| `docs/migrate/from-netlify/page.mdx` | Stub filled: complete Netlify migration guide (concept mapping, env-var translation, netlify.toml handling, Functions→container migration, DNS cutover, feature replacements, rollback plan) |
+| `docs/architecture/overview/page.mdx` | Clarity pass: added `{{ className: 'lead' }}` lead paragraph, replaced vague description with architecture-accurate summary |
+
+### Already done (do not repeat)
+- `from-heroku` migration stub — filled in pass 1
+- Monitoring page Property blocks — rewritten in pass 1
+- Stale version `v0.0.6` in upgrade-temps page — fixed in pass 1
+- `from-railway` migration stub — filled in pass 2
+- Webhooks page structure — rewritten in pass 2
+- Stale RustFS `1.0.0-alpha.78` in set-up-managed-services and deploy-with-database — fixed in pass 2
+- Double-dash `--` em-dash typos in attack-mode, kv-storage, skills — fixed in pass 2
+- `from-vercel` migration stub — filled in pass 3
+- `from-netlify` migration stub — filled in pass 4
+- `architecture/overview` lead paragraph and description — rewritten in pass 4

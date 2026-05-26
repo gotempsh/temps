@@ -1,18 +1,19 @@
-## Pass summary — run 20260526-143000
+## Pass summary — run 20260526-162642
 
-This pass filled the high-value `from-vercel` migration stub with a complete ten-section guide covering concept mapping (Vercel → Temps equivalents), environment-variable export and translation (including how to handle `VERCEL_URL`, `VERCEL_ENV`, Vercel Postgres/KV/Blob replacements), project creation, DNS cutover, a dedicated Next.js on Temps section (App Router, ISR, standalone output Dockerfile), a full feature-replacement table, and a rollback plan — following the same structure and voice as the existing `from-heroku` and `from-railway` guides. Typo/grammar scanning across the full docs corpus found no new issues; all internal link checks returned clean; no new stale version references were found beyond those fixed in prior passes.
+Filled the `from-netlify` migration stub with a complete guide matching the style of `from-vercel` and `from-railway`: concept mapping table, five migration steps (env-var export, app prep including Functions→containers translation, project creation, env-var import with Netlify platform variable translation table, DNS cutover), feature replacement table, and rollback plan. Performed a clarity pass on `architecture/overview`: replaced a vague marketing description and missing lead paragraph with an accurate architecture-focused summary, and updated the metadata description to match the page title.
 
 ### Risk
 REVIEW
 
 ### Files changed
-- `docs/migrate/from-vercel/page.mdx` — stub filled with complete Vercel-to-Temps migration guide
+- `docs/migrate/from-netlify/page.mdx` — stub filled: complete Netlify migration guide
+- `docs/architecture/overview/page.mdx` — clarity pass: added lead paragraph, replaced vague description with architecture-accurate summary
 
 ### Stub filled
-`from-vercel` — complete step-by-step Vercel-to-Temps migration guide covering concept mapping, env-var export and translation, DNS cutover, Next.js-specific notes (ISR, standalone output, image optimization), feature replacements for Vercel Analytics/KV/Blob/Cron/Postgres, and a rollback plan.
+from-netlify — step-by-step guide to migrating from Netlify covering concept mapping, env-var translation, netlify.toml handling, Functions→container migration, DNS cutover, feature replacements, and rollback plan
 
 ### Clarity rewrite
-none this pass
+architecture/overview — replaced a missing lead paragraph and a description ("Learn what Temps can do for you") that did not match the page title ("Architecture Overview") with an accurate single-binary architecture summary and a proper lead paragraph
 
 ### Stale refs fixed
 none this pass

@@ -1,15 +1,254 @@
 export const metadata = {
   title: 'Migrate from Netlify',
-  description: 'Migrate from Netlify to Temps step by step. Convert netlify.toml config, move static sites, migrate functions, and set up redirects and build settings.',
+  description: 'Step-by-step guide to migrating from Netlify to Temps. Convert netlify.toml config, migrate static sites and functions, set up redirects, and transfer your domain.',
   alternates: {
     canonical: '/docs/from-netlify',
   },
 }
 
+export const sections = [
+  { title: 'Before you start', id: 'before-you-start' },
+  { title: 'How Netlify concepts map to Temps', id: 'concept-mapping' },
+  { title: 'Step 1: Export environment variables', id: 'export-env-vars' },
+  { title: 'Step 2: Prepare your app', id: 'prepare-your-app' },
+  { title: 'Step 3: Create the project in Temps', id: 'create-project' },
+  { title: 'Step 4: Import environment variables', id: 'import-env-vars' },
+  { title: 'Step 5: Transfer your domain', id: 'transfer-domain' },
+  { title: 'Feature replacements', id: 'feature-replacements' },
+  { title: 'Rollback plan', id: 'rollback-plan' },
+]
 
 # Migrate from Netlify
-## Page Goal
-Make Netlify migration simple and show expanded capabilities with Temps.
-## Target Persona
-**Netlify User** - Using for static sites, wants more flexibility, hitting limits.
-## Key Content: Static site migration, netlify.toml → Temps config, forms alternatives, functions migration, redirects, build settings
+
+This guide walks you through moving a Netlify site to a self-hosted Temps instance. After the migration, your app runs on infrastructure you control — no bandwidth caps, no build-minute limits, no seat-based pricing. {{ className: 'lead' }}
+
+---
+
+## Before you start {{ anchor: true, id: 'before-you-start' }}
+
+What you need before migrating:
+
+- A running Temps instance. If you have not installed Temps yet, follow the [installation guide](/docs/installation) first.
+- The Netlify CLI installed and logged in (`netlify login`)
+- Access to your Netlify site's Git repository
+- 30–60 minutes
+
+<Note>
+Keep your Netlify site running until you have verified traffic is flowing correctly through Temps. You can lock a Netlify deploy to a specific version at any time, so there is no rush to delete the site.
+</Note>
+
+---
+
+## How Netlify concepts map to Temps {{ anchor: true, id: 'concept-mapping' }}
+
+| Netlify | Temps equivalent |
+|---------|-----------------|
+| Site | Project |
+| Deploy | Deployment |
+| Branch deploy / Deploy Preview | Preview environment (auto-created per branch) |
+| Production environment | Production environment |
+| Environment variables (production / deploy preview / branch) | Environment variables per environment |
+| Netlify Functions | Long-running containers (Node.js, Python, etc.) |
+| Netlify Edge Functions | Long-running containers with a CDN in front |
+| `netlify.toml` build settings | Build settings in the Temps dashboard |
+| `netlify.toml` redirects | Handled in your application code or reverse-proxy config |
+| Netlify Forms | Third-party form service (e.g. Formspree, your own backend endpoint) |
+| Netlify Identity | Your own auth service or a managed alternative |
+| Netlify Blobs | S3-compatible managed storage (RustFS) |
+| Branch deploys | Preview environments (auto-created per branch) |
+| Netlify Analytics | Built-in [Analytics](/docs/analytics) (page views, Web Vitals, custom events) |
+| Scheduled Functions | Built-in cron scheduler via `.temps.yaml` |
+
+---
+
+## Step 1: Export environment variables {{ anchor: true, id: 'export-env-vars' }}
+
+Download your Netlify environment variables so you can import them into Temps:
+
+```bash
+# List all environment variables for a site
+netlify env:list --context production > netlify-env-production.txt
+
+# Or export via the Netlify API
+curl -H "Authorization: Bearer $NETLIFY_AUTH_TOKEN" \
+  "https://api.netlify.com/api/v1/sites/$NETLIFY_SITE_ID/env" \
+  -o netlify-env.json
+```
+
+Keep the exported values handy — you will import the production set in step 4.
+
+<Note>
+Netlify injects several platform variables at build and run time (`NETLIFY`, `CONTEXT`, `DEPLOY_URL`, etc.). You do not need to copy these — Temps injects its own equivalents. See step 4 for the full translation table.
+</Note>
+
+---
+
+## Step 2: Prepare your app {{ anchor: true, id: 'prepare-your-app' }}
+
+Temps builds applications with Nixpacks and supports Dockerfiles directly. Most Netlify sites need only minor adjustments.
+
+### Static sites
+
+If your site is a pure static build (React with Vite, Vue, Angular, Astro in static mode, etc.), Temps auto-detects the framework and serves the output directly from the proxy — no container runs at runtime.
+
+Verify the build output directory matches what Temps expects. Common static output paths:
+
+| Framework | Default output |
+|-----------|---------------|
+| Vite (React, Vue, Svelte) | `dist/` |
+| Create React App | `build/` |
+| Astro (static) | `dist/` |
+| Angular | `dist/` |
+| Nuxt (static) | `dist/` |
+
+If your `netlify.toml` specifies a custom `publish` directory, note the path — you may need to set the **Output Directory** in Temps project settings.
+
+### Removing Netlify-specific configuration
+
+Most `netlify.toml` settings have no equivalent in Temps and can be left in place (they are ignored during a Temps build) or removed to keep the repository tidy:
+
+- `[[redirects]]` and `[[headers]]` — implement these in your application's router, or add a `_redirects` file handled by your framework. For complex routing, use middleware in your framework (e.g. Next.js `middleware.ts`, Express router, Caddy reverse proxy rules).
+- `[build]` `command` and `publish` — set the equivalent values in Temps project settings (step 3).
+- `[functions]` — Netlify Functions migrate to server-side route handlers (see below).
+
+### Netlify Functions → long-running containers
+
+Netlify Functions run as ephemeral Lambda invocations. On Temps the same code runs inside a persistent container. For most function code this is transparent:
+
+- In-memory state (cache objects, database connection pools) persists between requests — this is a feature, not a bug
+- Cold start latency does not exist
+- There are no function size limits or 10-second timeouts
+
+To migrate a Netlify Function at `netlify/functions/submit.js`:
+
+```javascript
+// Before: netlify/functions/submit.js (Netlify Function format)
+exports.handler = async (event, context) => {
+  const body = JSON.parse(event.body);
+  // ...
+  return { statusCode: 200, body: JSON.stringify({ ok: true }) };
+};
+```
+
+```javascript
+// After: src/routes/submit.js (Express route)
+const express = require('express');
+const router = express.Router();
+
+router.post('/api/submit', async (req, res) => {
+  const body = req.body;
+  // same logic as before
+  res.json({ ok: true });
+});
+
+module.exports = router;
+```
+
+If you used Netlify Functions for a Next.js, Nuxt, or SvelteKit project, no migration is needed — those frameworks handle API routes internally and work on Temps without changes.
+
+### Binding to the correct port
+
+Temps injects a `PORT` environment variable. Ensure your server listens on it and binds to `0.0.0.0`:
+
+```javascript
+// Node.js / Express
+const port = process.env.PORT || 3000;
+app.listen(port, '0.0.0.0');
+```
+
+<Note>
+Static deployments (no server) do not need a `PORT` binding. Only projects with a running server process need this adjustment.
+</Note>
+
+---
+
+## Step 3: Create the project in Temps {{ anchor: true, id: 'create-project' }}
+
+1. Open the Temps dashboard and click **New Project**
+2. Connect your Git provider and select the repository
+3. Select the branch you deploy to production (usually `main`)
+4. Temps auto-detects the framework — verify the preset matches your site
+5. Set the build command to match what Netlify runs (from your `netlify.toml` `[build] command`)
+6. If your static output goes to a non-default directory, set **Output Directory** to match your `netlify.toml` `publish` value
+
+Do not deploy yet. Import your environment variables first.
+
+---
+
+## Step 4: Import environment variables {{ anchor: true, id: 'import-env-vars' }}
+
+Open the project in Temps, go to **Environment Variables**, and add the variables exported in step 1.
+
+Handle these Netlify-injected variables specially:
+
+| Netlify variable | Action in Temps |
+|-----------------|----------------|
+| `NETLIFY` | **Remove it.** Not applicable to Temps. |
+| `CONTEXT` | **Remove it.** Temps injects `TEMPS_ENVIRONMENT` (`production`, `preview`, `development`). |
+| `DEPLOY_URL` | **Remove it.** Temps injects `TEMPS_URL` with the deployment's public URL. |
+| `URL` | **Remove it.** Temps injects `TEMPS_URL`. Update any code reading `URL` to use `TEMPS_URL` or `process.env.NEXT_PUBLIC_APP_URL`. |
+| `DEPLOY_PRIME_URL` | **Remove it.** Temps injects `TEMPS_URL`. |
+| `NETLIFY_IMAGES_CDN_DOMAIN` | Remove. Use your own CDN or built-in image optimization instead. |
+| `COMMIT_REF` | **Remove it.** Temps injects `TEMPS_GIT_COMMIT_SHA`. |
+| `REPOSITORY_URL` | Remove. Temps injects `TEMPS_GIT_REPO`. |
+| All other custom variables | Copy as-is. |
+
+After saving, click **Deploy** to trigger the first deployment.
+
+---
+
+## Step 5: Transfer your domain {{ anchor: true, id: 'transfer-domain' }}
+
+### Smoke test on the Temps subdomain first
+
+Verify the site works on the auto-assigned Temps URL (e.g. `my-site.yourdomain.com`) before cutting over DNS:
+
+- The site loads and all pages render correctly
+- Redirects and routing behave as expected
+- Any API calls or form submissions work
+
+### Cut over DNS
+
+When you are satisfied, update your domain's DNS record to point to your Temps server's IP address:
+
+```
+my-site.example.com  A  YOUR_TEMPS_SERVER_IP
+```
+
+Temps automatically provisions a Let's Encrypt SSL certificate within a few minutes of DNS propagation. See [Add a Custom Domain](/docs/add-a-custom-domain) for detailed DNS instructions.
+
+<Note>
+Netlify custom domains use a CNAME record pointing to Netlify's load balancers (or an ALIAS record at the root). Temps uses an A record pointing directly to your server's IP. You will need to change the record **type** as well as the value when cutting over.
+</Note>
+
+---
+
+## Feature replacements {{ anchor: true, id: 'feature-replacements' }}
+
+| Netlify feature | Temps equivalent |
+|----------------|-----------------|
+| Netlify Analytics | Built-in [Analytics](/docs/analytics) (page views, Web Vitals, custom events) |
+| Netlify Functions | Long-running containers — API routes in your framework (Next.js, Express, FastAPI) |
+| Netlify Edge Functions | Long-running containers with a CDN in front |
+| Netlify Blobs | S3-compatible managed storage (RustFS) via [Managed Services](/docs/managed-services) |
+| Netlify Forms | Build your own form endpoint or use a third-party service |
+| Netlify Identity | Use your own auth library (e.g. better-auth, Auth.js, Supabase Auth) |
+| Netlify Scheduled Functions | Built-in cron scheduler via `.temps.yaml` — [Cron Jobs](/docs/cron-jobs) |
+| Deploy Previews | Auto-created preview environments per branch — [Preview Deployments](/docs/set-up-preview-deployments) |
+| Branch deploys | Preview environments per branch |
+| Netlify Monitoring | Built-in [Monitoring](/docs/monitoring) with uptime checks and alerting |
+| Netlify Log Drains | Built-in [Logs & Debugging](/docs/logs) with persistent log storage |
+| Team members | [Manage Team Access](/docs/manage-team-access) with role-based permissions |
+
+---
+
+## Rollback plan {{ anchor: true, id: 'rollback-plan' }}
+
+If something goes wrong after the DNS cutover:
+
+1. **Point DNS back to Netlify.** Update the record to Netlify's CNAME target (usually `*.netlify.app` or your site's Netlify load-balancer hostname). Changes take effect within seconds to minutes depending on your TTL.
+2. **Verify your Netlify deploy is still live** — Netlify keeps your last production deploy active until you explicitly delete the site or lock it.
+
+Your Netlify site and all its data are untouched throughout this process — nothing is deleted until you choose to remove the Netlify site.
+
+Once you have diagnosed and fixed the issue in Temps, retry the cutover. Check the [deployment logs](/docs/logs) and the [debug guide](/docs/debug-a-failed-deployment) if the Temps deployment itself failed.
