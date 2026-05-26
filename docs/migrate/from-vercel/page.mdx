@@ -7,14 +7,249 @@ export const metadata = {
   },
 };
 
+export const sections = [
+  { title: 'Before you start', id: 'before-you-start' },
+  { title: 'How Vercel concepts map to Temps', id: 'concept-mapping' },
+  { title: 'Step 1: Export environment variables', id: 'export-env-vars' },
+  { title: 'Step 2: Prepare your app', id: 'prepare-your-app' },
+  { title: 'Step 3: Create the project in Temps', id: 'create-project' },
+  { title: 'Step 4: Import environment variables', id: 'import-env-vars' },
+  { title: 'Step 5: Transfer your domain', id: 'transfer-domain' },
+  { title: 'Next.js on Temps', id: 'nextjs-on-temps' },
+  { title: 'Feature replacements', id: 'feature-replacements' },
+  { title: 'Rollback plan', id: 'rollback-plan' },
+]
+
 # Migrate from Vercel
 
-## Page Goal
+This guide walks you through moving a Vercel project to a self-hosted Temps instance. After the migration, your app runs on infrastructure you control — no per-seat charges, no bandwidth overages, no function invocation limits. {{ className: 'lead' }}
 
-Convert Vercel users by making migration painless and clear. HIGH-VALUE conversion page.
+---
 
-## Target Persona
+## Before you start {{ anchor: true, id: 'before-you-start' }}
 
-**Vercel Veteran** - Frustrated with Vercel pricing, loves the DX, hesitant to migrate, needs confidence it will work.
+What you need before migrating:
 
-## Key Content: Pre-migration checklist, what transfers easily, what changes, Next.js migration, env variables, domains, DNS, step-by-step migration, rollback plan
+- A running Temps instance. If you have not installed Temps yet, follow the [installation guide](/docs/installation) first.
+- The Vercel CLI installed and logged in (`vercel login`)
+- Access to your Vercel project's Git repository
+- 30–60 minutes
+
+<Note>
+Keep your Vercel project running until you have verified traffic is flowing correctly through Temps. You can pause a Vercel project in its settings at any time, so there is no rush to delete it.
+</Note>
+
+---
+
+## How Vercel concepts map to Temps {{ anchor: true, id: 'concept-mapping' }}
+
+| Vercel | Temps equivalent |
+|--------|-----------------|
+| Project | Project |
+| Deployment | Deployment |
+| Preview deployment (branch) | Preview environment (auto-created per branch) |
+| Production environment | Production environment |
+| Environment variables (Production / Preview / Development) | Environment variables per environment |
+| Vercel Postgres / Neon | Managed PostgreSQL service |
+| Vercel KV (Upstash Redis) | Managed Redis service or [KV Storage](/docs/kv-storage) |
+| Vercel Blob | S3-compatible managed storage (RustFS) |
+| Cron jobs (`vercel.json` crons) | Built-in cron scheduler via `.temps.yaml` |
+| Vercel Analytics | Built-in analytics — [Analytics](/docs/analytics) |
+| Serverless Functions | Long-running containers (Node.js, Python, etc.) |
+| Edge Functions | Long-running containers with a CDN in front |
+| `vercel.json` rewrites / redirects | Handled in your application code or via Nixpacks config |
+
+---
+
+## Step 1: Export environment variables {{ anchor: true, id: 'export-env-vars' }}
+
+Download your Vercel environment variables so you can import them into Temps:
+
+```bash
+# Pull all environments into a local .env file
+vercel env pull .env.vercel-production --environment production
+vercel env pull .env.vercel-preview    --environment preview
+```
+
+Keep these files handy — you will import the production set in step 4.
+
+<Note>
+The Vercel CLI writes `# Created by Vercel CLI` comments at the top of the pulled file. Those comment lines are harmless and can be left in place when you paste into Temps.
+</Note>
+
+---
+
+## Step 2: Prepare your app {{ anchor: true, id: 'prepare-your-app' }}
+
+Temps builds applications with Nixpacks and supports Dockerfiles directly. Most Vercel projects need only minor adjustments.
+
+### Binding to the correct port
+
+Temps injects a `PORT` environment variable. Make sure your app listens on it and binds to `0.0.0.0`:
+
+```javascript
+// Node.js / Next.js custom server
+const port = process.env.PORT || 3000;
+server.listen(port, '0.0.0.0');
+```
+
+For Next.js with the built-in server, no change is needed — the `PORT` variable is respected automatically.
+
+### Removing Vercel-specific configuration
+
+Some `vercel.json` settings have no equivalent in Temps and can be left in place (they are ignored) or removed to keep the repository tidy:
+
+- `rewrites` and `redirects` — implement these in your application's router or a reverse-proxy config instead
+- `headers` — add custom response headers in your application middleware
+- `regions` — not applicable; Temps deploys to the server you choose
+
+Build and install commands in `vercel.json` (`buildCommand`, `installCommand`) are not read by Temps. Set the equivalent values in the project's build settings in the Temps dashboard (step 3).
+
+### Serverless Functions → long-running containers
+
+Vercel Serverless Functions (files under `api/` or `app/api/`) run as ephemeral invocations. On Temps the same code runs inside a persistent container. This is generally transparent for HTTP handler code, but be aware:
+
+- In-memory state persists between requests (a feature, not a bug)
+- Cold start latency does not exist
+- Function timeouts do not apply — connections are limited only by your reverse-proxy configuration
+
+---
+
+## Step 3: Create the project in Temps {{ anchor: true, id: 'create-project' }}
+
+1. Open the Temps dashboard and click **New Project**
+2. Connect your Git provider and select the repository
+3. Select the branch you deploy to production (usually `main`)
+4. Temps auto-detects the framework — verify the preset matches your app
+5. Set the build command to match what Vercel runs (e.g. `npm run build`)
+6. Set the start command if your app needs one (Next.js: `npm start`)
+
+Do not deploy yet. Import your environment variables first.
+
+---
+
+## Step 4: Import environment variables {{ anchor: true, id: 'import-env-vars' }}
+
+Open the project in Temps, go to **Environment Variables**, and add the variables from `.env.vercel-production`.
+
+Handle these Vercel-injected variables specially:
+
+| Vercel variable | Action in Temps |
+|----------------|----------------|
+| `VERCEL_URL` | **Remove it.** Temps injects `TEMPS_URL` with the deployment's public URL. Update any code that reads `VERCEL_URL` to fall back to `TEMPS_URL` or `process.env.NEXT_PUBLIC_APP_URL`. |
+| `VERCEL_ENV` | **Remove it.** Temps injects `TEMPS_ENVIRONMENT` (`production`, `preview`, `development`). |
+| `VERCEL_REGION` | Remove. Not applicable to Temps. |
+| `VERCEL_GIT_COMMIT_SHA` | Remove. Temps injects `TEMPS_GIT_COMMIT_SHA`. |
+| `VERCEL_GIT_REPO_SLUG` | Remove. Temps injects `TEMPS_GIT_REPO`. |
+| `DATABASE_URL` (Vercel Postgres) | **Replace.** Add a managed PostgreSQL service in Temps (see [deploy with database](/docs/deploy-with-database)) and use the injected `POSTGRES_URL`. |
+| `KV_URL` (Vercel KV) | **Replace.** Add a managed Redis service and use the injected `REDIS_URL`, or switch to [KV Storage](/docs/kv-storage). |
+| `BLOB_READ_WRITE_TOKEN` | **Replace.** Use RustFS managed storage and an S3-compatible SDK instead. |
+| All other custom variables | Copy as-is. |
+
+After saving, click **Deploy** to trigger the first deployment.
+
+---
+
+## Step 5: Transfer your domain {{ anchor: true, id: 'transfer-domain' }}
+
+### Smoke test on the Temps subdomain first
+
+Verify the app works on the auto-assigned Temps URL (e.g. `my-app.yourdomain.com`) before cutting over DNS:
+
+- The app loads and all pages render correctly
+- Any database reads and writes work
+- Environment variables are present (check your `/api/health` endpoint or the deployment logs)
+
+### Cut over DNS
+
+When you are satisfied, update your domain's DNS record to point to your Temps server's IP address:
+
+```
+my-app.example.com  A  YOUR_TEMPS_SERVER_IP
+```
+
+Temps automatically provisions a Let's Encrypt SSL certificate within a few minutes of DNS propagation. See [Add a Custom Domain](/docs/add-a-custom-domain) for detailed DNS instructions.
+
+<Note>
+Vercel custom domains use a CNAME record pointing to Vercel's edge network (or an A record to Vercel's Anycast IP). Temps uses an A record pointing directly to your server's IP. You will need to change the record **type** (CNAME → A) as well as the value when cutting over.
+</Note>
+
+---
+
+## Next.js on Temps {{ anchor: true, id: 'nextjs-on-temps' }}
+
+Next.js is one of the most common Vercel workloads and works well on Temps with a few notes.
+
+### App Router and Pages Router
+
+Both are fully supported. Temps runs `next build && next start` inside a container, which supports SSR, API routes, Route Handlers, Server Actions, and Middleware.
+
+### Image Optimization
+
+Next.js image optimization (`next/image`) works out of the box. Temps does not cache optimized images at the CDN layer the way Vercel does, so you may want to configure a dedicated image CDN for high-traffic sites.
+
+### Incremental Static Regeneration (ISR)
+
+ISR works in the same process as the Next.js server, so revalidation happens locally within the container. In a multi-replica setup, each replica maintains its own cache — use `revalidatePath` / `revalidateTag` or a shared Redis cache to keep replicas consistent.
+
+### Example Dockerfile (optional)
+
+For full control over the Next.js build, you can add a `Dockerfile` to your repository:
+
+```dockerfile
+FROM node:22-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+FROM node:22-alpine AS runner
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=builder /app/.next/standalone ./
+COPY --from=builder /app/.next/static ./.next/static
+COPY --from=builder /app/public ./public
+EXPOSE 3000
+CMD ["node", "server.js"]
+```
+
+Enable Next.js [standalone output](https://nextjs.org/docs/app/api-reference/next-config-js/output) in `next.config.js` to use this Dockerfile:
+
+```javascript
+// next.config.js
+module.exports = {
+  output: 'standalone',
+};
+```
+
+---
+
+## Feature replacements {{ anchor: true, id: 'feature-replacements' }}
+
+| Vercel feature | Temps equivalent |
+|---------------|-----------------|
+| Vercel Analytics | Built-in [Analytics](/docs/analytics) (page views, Web Vitals, custom events) |
+| Vercel Speed Insights | Built-in Web Vitals tracking via the analytics SDK |
+| Vercel Log Drains | Built-in [Logs & Debugging](/docs/logs) with persistent log storage |
+| Vercel Monitoring (uptime) | Built-in [Monitoring](/docs/monitoring) with uptime checks and alerting |
+| Vercel Error tracking (via Sentry) | Built-in [Error Tracking](/docs/error-tracking) (Sentry-compatible DSN) |
+| Vercel Postgres (Neon) | Built-in managed PostgreSQL via [Deploy with Database](/docs/deploy-with-database) |
+| Vercel KV (Upstash Redis) | Built-in managed Redis or [KV Storage](/docs/kv-storage) |
+| Vercel Blob | S3-compatible managed storage (RustFS) via [Managed Services](/docs/managed-services) |
+| Vercel Cron Jobs | Built-in cron scheduler via `.temps.yaml` — [Cron Jobs](/docs/cron-jobs) |
+| Preview deployments | Auto-created preview environments per branch — [Preview Deployments](/docs/set-up-preview-deployments) |
+| Team members | [Manage Team Access](/docs/manage-team-access) with role-based permissions |
+
+---
+
+## Rollback plan {{ anchor: true, id: 'rollback-plan' }}
+
+If something goes wrong after the DNS cutover:
+
+1. **Point DNS back to Vercel.** Update the record to Vercel's CNAME target (e.g. `cname.vercel-dns.com`) or the original Vercel Anycast IP. Changes take effect within seconds to minutes depending on your TTL.
+2. **Verify the Vercel deployment is still active** — Vercel keeps your last production deployment running until you explicitly delete the project or overwrite it.
+
+Your Vercel project and all its data are untouched throughout this process — nothing is deleted until you choose to remove the Vercel project.
+
+Once you have diagnosed and fixed the issue in Temps, retry the cutover. Check the [deployment logs](/docs/logs) and the [debug guide](/docs/debug-a-failed-deployment) if the Temps deployment itself failed.

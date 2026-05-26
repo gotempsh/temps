@@ -47,3 +47,24 @@
 - Webhooks page structure — rewritten in pass 2
 - Stale RustFS `1.0.0-alpha.78` in set-up-managed-services and deploy-with-database — fixed in pass 2
 - Double-dash `--` em-dash typos in attack-mode, kv-storage, skills — fixed in pass 2
+
+## Pass 3 — run 20260526-143000
+
+**Date:** 2026-05-26
+**Risk:** REVIEW
+
+### Changes
+
+| File | Change |
+|------|--------|
+| `docs/migrate/from-vercel/page.mdx` | Stub filled: complete Vercel migration guide (concept mapping, env-var export and translation, DNS cutover, Next.js notes, feature replacements, rollback plan) |
+
+### Already done (do not repeat)
+- `from-heroku` migration stub — filled in pass 1
+- Monitoring page Property blocks — rewritten in pass 1
+- Stale version `v0.0.6` in upgrade-temps page — fixed in pass 1
+- `from-railway` migration stub — filled in pass 2
+- Webhooks page structure — rewritten in pass 2
+- Stale RustFS `1.0.0-alpha.78` in set-up-managed-services and deploy-with-database — fixed in pass 2
+- Double-dash `--` em-dash typos in attack-mode, kv-storage, skills — fixed in pass 2
+- `from-vercel` migration stub — filled in pass 3
