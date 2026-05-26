@@ -86,37 +86,49 @@ The API returns:
 
 <Properties>
   <Property name="Requests">
-    **What it shows:** Total number of requests and request rate over time
-    **When to worry:** - Sudden spikes in traffic - Unusually high error rates - Request rate exceeds expected capacity
-    **Action:** Monitor traffic patterns and scale resources if needed
+    Total number of HTTP requests and the current request rate. Use this to
+    understand your traffic volume and spot sudden spikes or drops.
+
+    **Investigate when:** request rate spikes unexpectedly, or drops to zero
+    (possible outage).
   </Property>
 
   <Property name="Response Time">
-    **What it shows:** Average time to process requests in milliseconds
-    **When to worry:** - Consistently above 500ms may indicate performance issues - Sudden spikes in response time
-    **Action:** - Optimize application code - Add caching - Review database queries - Consider scaling
+    Average time to process a request, in milliseconds. A healthy web application
+    typically responds in under 200 ms for API calls and under 500 ms for
+    server-rendered pages.
+
+    **Investigate when:** average response time climbs above 500 ms consistently.
+    Common causes: slow database queries, missing indexes, or insufficient CPU.
   </Property>
 
   <Property name="CPU Usage">
-    **What it shows:** Percentage of CPU resources your container is using
-    **When to worry:** - Consistently above 80% may indicate performance issues
-    - Spikes above 90% during traffic surges are normal
-    - Sustained 100% usage suggests you need more CPU resources
-    **Action:** If CPU is consistently high, consider: - Increasing CPU allocation in project settings - Optimizing application code
+    Percentage of the CPU allocation your container is using. Occasional spikes
+    above 90% during traffic bursts are normal. Sustained high CPU means the
+    container is throttled and requests are queuing.
+
+    **Investigate when:** CPU stays above 80% for more than a few minutes. Either
+    increase the CPU limit in project settings or profile the application for
+    hot paths.
   </Property>
 
   <Property name="Memory Usage">
-    **What it shows:** RAM consumption in bytes and percentage of allocated memory
-    **When to worry:** - Approaching 90% of allocated memory
-    - Memory usage continuously growing (potential memory leak)
-    - Container restarts due to OOM (Out of Memory) errors
-    **Action:** If memory is high: - Increase memory allocation - Investigate memory leaks in your code
+    RAM consumption in bytes and as a percentage of the memory limit. When a
+    container exceeds its limit Docker kills it (OOM kill) and Temps restarts it
+    automatically.
+
+    **Investigate when:** memory is above 85% of the limit, or usage grows
+    steadily over time (memory leak). Increase the limit or profile the
+    application with a heap dump.
   </Property>
 
   <Property name="Network I/O">
-    **What it shows:** Data transfer rates (inbound and outbound) in bytes per second
-    **What to monitor:** - Unusual spikes in traffic - Asymmetric patterns (high outbound, low inbound) - Network saturation
-    **Action:** High network usage is usually normal for web applications, but monitor for: - DDoS attacks (sudden massive spikes) - Data exfiltration (unusual outbound patterns)
+    Inbound and outbound data transfer in bytes per second. High outbound traffic
+    is normal for media-heavy applications. Sudden massive spikes in either
+    direction can indicate a DDoS attack or runaway polling loop.
+
+    **Investigate when:** outbound traffic spikes without a matching increase in
+    requests (possible data exfiltration or misconfigured client).
   </Property>
 </Properties>
 
@@ -167,28 +179,36 @@ def health():
 
 <Properties>
   <Property name="Set Resource Limits">
-    Configure appropriate CPU and memory limits based on your application's
-    needs. Monitor actual usage and adjust as needed. **How to set:** 1. Project
-    Settings → Deployment → Resources 2. Set CPU (millicores) and Memory (MB) 3.
-    Monitor for a few days 4. Adjust based on actual usage patterns
+    Configure explicit CPU and memory limits so one container cannot starve
+    others. Start with the defaults, deploy, then check actual usage after a day
+    of real traffic. Adjust the limits to leave a 20–30 % headroom above peak.
+
+    **Where to set:** Project Settings → Deployment → Resources.
   </Property>
 
-  <Property name="Monitor Trends">
-    Don't just look at current values—watch for trends: - Gradual memory
-    increases (memory leaks) - CPU spikes during specific times (traffic
-    patterns) - Network anomalies (security issues)
+  <Property name="Watch Trends, Not Just Snapshots">
+    Spot-checking a single value tells you little. Look at 1-hour and 24-hour
+    graphs to identify: gradual memory growth (memory leak), CPU spikes at the
+    same time each day (scheduled jobs), or network anomalies (security events).
   </Property>
 
-  <Property name="Set Up Alerts">
-    Configure alerts for critical thresholds: - CPU > 90% for 5 minutes - Memory
-    > 85% of allocation - Container restarts - Health check failures Alerts can
-    notify you via email, webhooks, or integrations.
+  <Property name="Set Up Alerts Early">
+    Configure alerts before you have an incident, not during one. Recommended
+    thresholds to start with:
+
+    - CPU above 90% for 5 consecutive minutes
+    - Memory above 85% of the allocation
+    - Container restarts (any)
+    - Health check failures
+
+    Alerts can be delivered via email, webhooks, or Slack integrations.
   </Property>
 
   <Property name="Compare Environments">
-    Compare metrics across environments to identify issues: - Production vs
-    staging performance - Preview environment resource usage - Before/after
-    deployment comparisons
+    Run the same workload on staging and production and compare the resource
+    graphs side by side. Unexpectedly higher CPU or memory in production
+    typically reveals a configuration difference (missing cache, more replicas,
+    larger dataset) rather than a code bug.
   </Property>
 </Properties>
 
@@ -198,32 +218,55 @@ def health():
 
 <Properties>
   <Property name="High CPU Usage">
-    **Symptoms:** CPU consistently above 80-90% **Possible causes:** -
-    Inefficient code or algorithms - Too many concurrent requests - Insufficient
-    CPU allocation **Solutions:** 1. Increase CPU allocation in project settings
-    2. Optimize application code 3. Add caching to reduce computation 4. Scale
-    horizontally (multiple containers)
+    **Symptoms:** CPU graph consistently above 80–90 %.
+
+    **Possible causes:** inefficient algorithms, too many concurrent requests,
+    or insufficient CPU allocation.
+
+    **Solutions:**
+    1. Increase the CPU limit in Project Settings → Deployment → Resources
+    2. Optimize hot code paths (profile with `perf`, `py-spy`, or your
+       language's built-in profiler)
+    3. Add caching (Redis, in-memory) to reduce repeated computation
+    4. Scale horizontally by increasing the replica count
   </Property>
 
   <Property name="High Memory Usage">
-    **Symptoms:** Memory approaching allocation limit, container restarts
-    **Possible causes:** - Memory leaks in application code - Insufficient
-    memory allocation - Large data structures in memory **Solutions:** 1.
-    Increase memory allocation 2. Profile application for memory leaks 3.
-    Implement pagination for large datasets 4. Use streaming for large file
-    operations
+    **Symptoms:** Memory approaching the allocation limit, or container
+    restarting with OOM errors.
+
+    **Possible causes:** memory leaks, insufficient allocation, or large
+    in-memory data structures.
+
+    **Solutions:**
+    1. Increase the memory limit in project settings
+    2. Profile the application for leaks (heap dump, `valgrind`, etc.)
+    3. Add pagination for large dataset queries
+    4. Use streaming for large file reads and writes
   </Property>
 
-<Property name="Container Restarts">
-    **Symptoms:** Frequent container restarts, deployment failures
-    **Possible causes:** - Out of memory (OOM) errors - Application crashes - Health check failures
-    **Solutions:** 1. Check deployment logs for error messages 2. Review memory usage patterns 3. Verify health check endpoint is working 4. Check application error logs
+  <Property name="Container Restarts">
+    **Symptoms:** Container restart counter increasing; logs show `OOMKilled` or
+    an unhandled exception at exit.
+
+    **Solutions:**
+    1. Open the deployment logs and search for the last error before the restart
+    2. Check the memory graph — a usage spike right before each restart points
+       to OOM; increase the memory limit
+    3. Verify the health check endpoint responds within the configured timeout
+    4. Fix any unhandled exceptions logged at shutdown
   </Property>
 
-<Property name="Metrics Not Updating">
-    **Symptoms:** Monitoring dashboard showing stale data or errors
-    **Possible causes:** - No active deployments - Network connectivity issues - Service unavailable
-    **Solutions:** 1. Verify a deployment is running 2. Check deployment status 3. Refresh the monitoring page 4. Contact support if issue persists
+  <Property name="Metrics Not Updating">
+    **Symptoms:** Monitoring dashboard shows stale values or a "no data"
+    message.
+
+    **Solutions:**
+    1. Confirm a deployment is in the `ready` or `deployed` state — metrics
+       only stream from running containers
+    2. Hard-refresh the dashboard (Ctrl+Shift+R) to reconnect the SSE stream
+    3. Check that the container is not in a crash-restart loop (rapid restarts
+       disconnect the metric stream)
   </Property>
 </Properties>
 

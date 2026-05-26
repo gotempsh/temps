@@ -6,10 +6,238 @@ export const metadata = {
   },
 }
 
+export const sections = [
+  { title: 'Before you start', id: 'before-you-start' },
+  { title: 'How Heroku concepts map to Temps', id: 'concept-mapping' },
+  { title: 'Step 1: Export config vars', id: 'export-config-vars' },
+  { title: 'Step 2: Prepare your app', id: 'prepare-your-app' },
+  { title: 'Step 3: Migrate your database', id: 'migrate-your-database' },
+  { title: 'Step 4: Create the project in Temps', id: 'create-project' },
+  { title: 'Step 5: Import environment variables', id: 'import-env-vars' },
+  { title: 'Step 6: Transfer your domain', id: 'transfer-domain' },
+  { title: 'Add-on replacements', id: 'addon-replacements' },
+  { title: 'Rollback plan', id: 'rollback-plan' },
+]
 
 # Migrate from Heroku
-## Page Goal
-Help Heroku users (especially after pricing changes) migrate to Temps.
-## Target Persona
-**Heroku Holdout** - Long-time Heroku user, forced to find alternatives due to cost/changes.
-## Key Content: Procfile → Temps config, buildpacks, addons alternatives, Heroku Postgres migration, environment variables, domains
+
+This guide walks you through moving a Heroku application to a self-hosted Temps instance. After the migration, your app runs on infrastructure you control — no dynos, no add-on fees, no sleep-after-30-minutes. {{ className: 'lead' }}
+
+---
+
+## Before you start {{ anchor: true, id: 'before-you-start' }}
+
+What you need before migrating:
+
+- A running Temps instance. If you have not installed Temps yet, follow the [installation guide](/docs/installation) first.
+- The Heroku CLI installed and logged in (`heroku login`)
+- Access to your Heroku app's Git repository
+- 30–60 minutes
+
+<Note>
+Keep your Heroku app running until you have verified traffic is flowing correctly through Temps. Heroku lets you scale dynos to zero at any time, so there is no rush to delete the app.
+</Note>
+
+---
+
+## How Heroku concepts map to Temps {{ anchor: true, id: 'concept-mapping' }}
+
+| Heroku | Temps equivalent |
+|--------|-----------------|
+| App | Project |
+| Dyno | Container (replica) |
+| Pipeline (staging/production) | Environments within a project |
+| Review app | Preview environment (auto-created per branch) |
+| Config vars | Environment variables |
+| Heroku Postgres | Managed PostgreSQL service |
+| Heroku Redis | Managed Redis service / KV Storage |
+| Release phase (`Procfile`) | Run migrations in your container's start command or CI |
+| `Procfile` web process | Your application's start command (auto-detected) |
+| Add-ons | Managed services or self-hosted equivalents |
+| Heroku CI | Any CI system + Temps API (see [CI/CD guide](/docs/set-up-ci-cd-pipeline)) |
+
+---
+
+## Step 1: Export config vars {{ anchor: true, id: 'export-config-vars' }}
+
+Download all your Heroku config vars so you can import them into Temps:
+
+```bash
+heroku config --app YOUR_APP_NAME --json > heroku-config.json
+```
+
+Keep this file handy. You will import it in step 5.
+
+---
+
+## Step 2: Prepare your app {{ anchor: true, id: 'prepare-your-app' }}
+
+Temps auto-detects most frameworks using Nixpacks — the same system that Heroku uses for common stacks. A few things to check before deploying:
+
+### Procfile and start command
+
+Temps reads the `web:` entry from your `Procfile` automatically when building with Nixpacks.
+
+```procfile
+# Temps uses the "web" process type
+web: node server.js
+release: bundle exec rails db:migrate
+```
+
+<Note>
+  The `release` process type (used for tasks like database migrations) does not
+  map directly to a Temps lifecycle hook. Move migration commands into your
+  container's startup sequence or run them as a pre-deploy step in your CI
+  pipeline.
+</Note>
+
+### Binding to the correct host and port
+
+Temps injects a `PORT` environment variable, the same as Heroku. Make sure your application binds to `0.0.0.0` (not `localhost` or `127.0.0.1`):
+
+```javascript
+// Node.js — correct
+const port = process.env.PORT || 3000;
+app.listen(port, '0.0.0.0');
+```
+
+```python
+# Python/Gunicorn — pass --bind to the start command
+# web: gunicorn app:app --bind 0.0.0.0:$PORT
+```
+
+### Dockerfile (optional but recommended)
+
+If your app already has a `Dockerfile`, Temps will use it directly. No changes are needed unless the Dockerfile hard-codes a port number instead of reading `$PORT`.
+
+### Buildpacks
+
+Heroku buildpacks are not used by Temps. Nixpacks auto-detects the language from `package.json`, `requirements.txt`, `go.mod`, `Cargo.toml`, `Gemfile`, etc. If auto-detection fails, add a `Dockerfile` for explicit control.
+
+---
+
+## Step 3: Migrate your database {{ anchor: true, id: 'migrate-your-database' }}
+
+### Create a managed PostgreSQL service in Temps
+
+1. In the Temps dashboard, go to **Services** → **Add Service**
+2. Choose **PostgreSQL**
+3. Give the service a name (e.g. `my-app-db`) and create it
+
+Temps starts a PostgreSQL container and injects `POSTGRES_URL` (and related variables) into your project automatically once you link the service.
+
+### Export data from Heroku Postgres
+
+```bash
+# Create a backup on Heroku
+heroku pg:backups:capture --app YOUR_APP_NAME
+
+# Download the backup (saved as latest.dump)
+heroku pg:backups:download --app YOUR_APP_NAME
+```
+
+### Import into the Temps PostgreSQL service
+
+Get the connection string for your new Temps database from **Services → your service → Connection Details**, then restore:
+
+```bash
+pg_restore \
+  --no-owner \
+  --no-acl \
+  --dbname "postgresql://postgres:YOUR_PASSWORD@YOUR_TEMPS_HOST:5432/YOUR_DB" \
+  latest.dump
+```
+
+<Note>
+  If `pg_restore` reports role errors, the `--no-owner` and `--no-acl` flags
+  strip Heroku-specific ownership metadata that does not exist on the new
+  database. These flags are safe to use.
+</Note>
+
+---
+
+## Step 4: Create the project in Temps {{ anchor: true, id: 'create-project' }}
+
+1. Open the Temps dashboard and click **New Project**
+2. Connect your Git provider and select the repository
+3. Select the branch you deploy to production (usually `main` or `master`)
+4. Temps auto-detects the framework — verify the preset matches your app
+5. Under **Linked Services**, attach the PostgreSQL service from step 3
+
+Do not deploy yet. Set your environment variables first.
+
+---
+
+## Step 5: Import environment variables {{ anchor: true, id: 'import-env-vars' }}
+
+Open the project in Temps, go to **Environment Variables**, and add the variables from `heroku-config.json`.
+
+Handle these variables specially:
+
+| Heroku variable | Action in Temps |
+|----------------|----------------|
+| `DATABASE_URL` | **Remove it.** Temps injects `POSTGRES_URL` from the linked service. If your code expects `DATABASE_URL`, add it as `DATABASE_URL=$(POSTGRES_URL)`. |
+| `REDIS_URL` | **Remove it.** Add a managed Redis service first, then use the injected `REDIS_URL`. |
+| `PORT` | **Remove it.** Temps injects `PORT` automatically. |
+| `HEROKU_APP_NAME` | Remove. Replace with a custom variable if your app references it. |
+| `SECRET_KEY_BASE` | Copy as-is. |
+| `RAILS_ENV` / `NODE_ENV` / `DJANGO_SETTINGS_MODULE` | Copy as-is. |
+
+After saving, click **Deploy** to trigger the first deployment.
+
+---
+
+## Step 6: Transfer your domain {{ anchor: true, id: 'transfer-domain' }}
+
+### Smoke test on the Temps subdomain first
+
+Verify the app works on the auto-assigned Temps URL (e.g. `my-app.yourdomain.com`) before cutting over DNS:
+
+- The app loads and renders correctly
+- Database reads and writes work
+- All environment variables are present (`/api/health` or a similar diagnostic endpoint is a good check)
+
+### Cut over DNS
+
+When you are satisfied, update your domain's DNS record to point to your Temps server's IP address:
+
+```
+my-app.example.com  A  YOUR_TEMPS_SERVER_IP
+```
+
+Temps will automatically provision a Let's Encrypt SSL certificate within a few minutes of DNS propagation. See [Add a Custom Domain](/docs/add-a-custom-domain) for detailed DNS instructions.
+
+<Note>
+  Heroku uses a CNAME record (e.g. `your-app.herokudns.com`) for custom
+  domains. Temps uses an A record pointing directly to your server's IP address.
+  You need to change the record **type** (CNAME → A) as well as the value when
+  cutting over.
+</Note>
+
+---
+
+## Add-on replacements {{ anchor: true, id: 'addon-replacements' }}
+
+| Heroku add-on | Temps equivalent |
+|--------------|-----------------|
+| Heroku Postgres | Built-in managed PostgreSQL service |
+| Heroku Redis / Data for Redis | Built-in managed Redis service or [KV Storage](/docs/kv-storage) |
+| Papertrail / Logentries | Built-in log aggregation — [Logs & Debugging](/docs/logs) |
+| New Relic / Scout APM | Built-in metrics dashboard — [Monitoring](/docs/monitoring) |
+| Sentry | Built-in Sentry-compatible error tracking — [Error Tracking](/docs/error-tracking) |
+| Heroku Scheduler | Built-in cron jobs via `.temps.yaml` — [Cron Jobs](/docs/cron-jobs) |
+| Sendgrid | Self-managed SMTP — inject `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS` as environment variables |
+| Cloudinary / S3 | Built-in S3-compatible object storage managed service |
+
+---
+
+## Rollback plan {{ anchor: true, id: 'rollback-plan' }}
+
+If something goes wrong after the DNS cutover:
+
+1. **Point DNS back to Heroku.** Update the record to the original Heroku DNS target. Changes take effect within seconds to minutes depending on your TTL.
+2. **Scale Heroku dynos back up** if you had scaled them to zero.
+
+Your Heroku app and Heroku Postgres database are untouched throughout this process — nothing is deleted until you choose to remove the Heroku app.
+
+Once you have diagnosed and fixed the issue in Temps, retry the cutover. Check the [deployment logs](/docs/logs) and [debug guide](/docs/debug-a-failed-deployment) if the Temps deployment itself failed.
