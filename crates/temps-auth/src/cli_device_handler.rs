@@ -180,6 +180,10 @@ pub enum CliDeviceFlowError {
     ApiKeyMintFailed { user_id: i32, reason: String },
     #[error("Failed to load user {user_id}: {reason}")]
     UserLoadFailed { user_id: i32, reason: String },
+    #[error("Failed to encrypt CLI session API key for user {user_id}: {reason}")]
+    EncryptionFailed { user_id: i32, reason: String },
+    #[error("Failed to decrypt CLI session API key for session {session_id}: {reason}")]
+    DecryptionFailed { session_id: i32, reason: String },
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
 }
@@ -202,6 +206,8 @@ impl From<CliDeviceFlowError> for Problem {
                 .with_detail(err.to_string()),
             CliDeviceFlowError::ApiKeyMintFailed { .. }
             | CliDeviceFlowError::UserLoadFailed { .. }
+            | CliDeviceFlowError::EncryptionFailed { .. }
+            | CliDeviceFlowError::DecryptionFailed { .. }
             | CliDeviceFlowError::Database(_) => problem_new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Internal Server Error")
                 .with_detail(err.to_string()),
@@ -343,7 +349,7 @@ pub async fn cli_device_poll(
     match session.status.as_str() {
         status::PENDING => Ok(Json(CliDevicePollResponse::AuthorizationPending)),
         status::DENIED => Ok(Json(CliDevicePollResponse::AccessDenied)),
-        status::APPROVED => deliver_approved(&state.db, session).await,
+        status::APPROVED => deliver_approved(&state.db, &state.encryption_service, session).await,
         other => {
             error!(
                 "cli device poll: session {} has unexpected status {}",
@@ -469,14 +475,26 @@ pub async fn cli_device_approve(
             },
         )?;
 
-    // Flip the row to approved and stash the plaintext key for the next poll.
+    // Encrypt the minted API key before persisting it. The column name
+    // (`api_key_plaintext`) is historical — the value is now AES-256-GCM
+    // ciphertext via EncryptionService. A DB read alone (leaked backup,
+    // future SQLi, nosy DBA) no longer yields a usable token.
+    let encrypted_api_key = state
+        .encryption_service
+        .encrypt_string(&created.api_key)
+        .map_err(|e| CliDeviceFlowError::EncryptionFailed {
+            user_id: user.id,
+            reason: e.to_string(),
+        })?;
+
+    // Flip the row to approved and stash the (encrypted) key for the next poll.
     let session_id = session.id;
     let update = temps_entities::cli_login_sessions::ActiveModel {
         id: Set(session_id),
         status: Set(status::APPROVED.to_string()),
         user_id: Set(Some(user.id)),
         api_key_id: Set(Some(created.id)),
-        api_key_plaintext: Set(Some(created.api_key.clone())),
+        api_key_plaintext: Set(Some(encrypted_api_key)),
         approved_at: Set(Some(now)),
         ..Default::default()
     };
@@ -583,22 +601,31 @@ async fn load_by_user_code(
         })
 }
 
-/// Deliver the minted key to the CLI exactly once. Reads the plaintext from
-/// the session row, clears it, and returns it. If the plaintext was already
-/// consumed by a prior poll we treat the session as expired — the CLI
-/// already has its key, and re-delivery would let another caller steal it.
+/// Deliver the minted key to the CLI exactly once. Reads the ciphertext from
+/// the session row, clears it, decrypts it via EncryptionService, and returns
+/// the plaintext. If the ciphertext was already consumed by a prior poll we
+/// treat the session as expired — the CLI already has its key, and
+/// re-delivery would let another caller steal it.
 async fn deliver_approved(
     db: &Arc<DatabaseConnection>,
+    encryption_service: &Arc<temps_core::EncryptionService>,
     session: temps_entities::cli_login_sessions::Model,
 ) -> Result<Json<CliDevicePollResponse>, Problem> {
     let session_id = session.id;
-    let Some(api_key) = session.api_key_plaintext.clone() else {
+    let Some(encrypted_api_key) = session.api_key_plaintext.clone() else {
         warn!(
-            "cli device poll: session {} approved but plaintext already consumed",
+            "cli device poll: session {} approved but ciphertext already consumed",
             session_id
         );
         return Ok(Json(CliDevicePollResponse::ExpiredToken));
     };
+
+    let api_key = encryption_service
+        .decrypt_string(&encrypted_api_key)
+        .map_err(|e| CliDeviceFlowError::DecryptionFailed {
+            session_id,
+            reason: e.to_string(),
+        })?;
 
     let user_id = session
         .user_id
@@ -842,5 +869,92 @@ mod tests {
 
         let p: Problem = CliDeviceFlowError::NoRoleAssigned { user_id: 7 }.into();
         assert_eq!(p.status_code, StatusCode::FORBIDDEN);
+
+        // Encryption/decryption failures from the 0.1.0 hardening pass —
+        // both must be 500. Returning anything more specific would leak
+        // crypto state to the CLI/browser.
+        let p: Problem = CliDeviceFlowError::EncryptionFailed {
+            user_id: 7,
+            reason: "ciphertext too large".into(),
+        }
+        .into();
+        assert_eq!(p.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+
+        let p: Problem = CliDeviceFlowError::DecryptionFailed {
+            session_id: 42,
+            reason: "tag mismatch".into(),
+        }
+        .into();
+        assert_eq!(p.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// Regression test for the 0.1.0 hardening pass.
+    ///
+    /// Before the fix, the CLI device flow stored the freshly-minted API
+    /// key as plaintext in `cli_login_sessions.api_key_plaintext`. A
+    /// snapshot of the DB (leaked backup, future SQLi, nosy DBA) would
+    /// yield directly-usable API tokens.
+    ///
+    /// The fix is: encrypt with `EncryptionService` before persisting,
+    /// decrypt only when delivering to the polling CLI. This test pins
+    /// the round-trip invariant AND asserts that the ciphertext does NOT
+    /// contain the plaintext token — so a future refactor can't
+    /// accidentally regress to plaintext storage.
+    #[test]
+    fn api_key_encryption_round_trips_and_hides_plaintext() {
+        let svc = temps_core::EncryptionService::new_from_password(
+            "test-master-key-for-cli-device-blocker-tests",
+        );
+        // Realistic-shaped API key (40-char `tk_` prefix is the production
+        // format — see apikey_service.rs).
+        let plaintext = "tk_abcdefghijklmnopqrstuvwxyz0123456789abcd";
+
+        let ciphertext = svc.encrypt_string(plaintext).expect("encrypt");
+        assert_ne!(
+            ciphertext, plaintext,
+            "ciphertext must differ from plaintext"
+        );
+        assert!(
+            !ciphertext.contains(plaintext),
+            "ciphertext must not contain the plaintext substring; got {ciphertext:?}"
+        );
+        // Crude entropy check: AES-256-GCM + base64 produces a
+        // non-trivially longer output. If somebody silently swaps
+        // EncryptionService for a no-op shim, the length collapses.
+        assert!(
+            ciphertext.len() >= plaintext.len() + 16,
+            "ciphertext suspiciously short: {} vs {}",
+            ciphertext.len(),
+            plaintext.len()
+        );
+
+        let decrypted = svc.decrypt_string(&ciphertext).expect("decrypt");
+        assert_eq!(decrypted, plaintext, "round-trip must be lossless");
+    }
+
+    /// Pins the AES-GCM authentication property: a tampered ciphertext
+    /// must NOT decrypt to anything. Important because the CLI flow
+    /// trusts whatever it reads back from the DB — if a DBA flipped a
+    /// byte, we must fail closed rather than hand the CLI a corrupted
+    /// "token".
+    #[test]
+    fn api_key_ciphertext_is_aead_authenticated() {
+        let svc = temps_core::EncryptionService::new_from_password(
+            "test-master-key-for-cli-device-blocker-tests",
+        );
+        let plaintext = "tk_abcdefghijklmnopqrstuvwxyz0123456789abcd";
+        let mut ciphertext = svc.encrypt_string(plaintext).expect("encrypt");
+        // Flip a character somewhere past the IV/nonce prefix.
+        let mid = ciphertext.len() / 2;
+        let orig = ciphertext.chars().nth(mid).unwrap();
+        let replacement = if orig == 'A' { 'B' } else { 'A' };
+        ciphertext.replace_range(mid..mid + 1, &replacement.to_string());
+
+        let result = svc.decrypt_string(&ciphertext);
+        assert!(
+            result.is_err(),
+            "tampered ciphertext must NOT decrypt, got Ok({:?})",
+            result.ok()
+        );
     }
 }

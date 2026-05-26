@@ -360,20 +360,41 @@ async fn run_walg_exec(
     })
 }
 
+/// Build the (cmd, env) pair for the `pg_current_wal_lsn()` probe.
+///
+/// Critically: **credentials never appear in `cmd`**. They go through env
+/// (`PGUSER`, `PGPASSWORD`, `PGDATABASE`) so a password containing
+/// `'; rm -rf /; #` can't break out of the shell. Tests below assert this
+/// invariant — do not regress it.
+fn build_lsn_exec_args(pg: &PgParams) -> (Vec<String>, Vec<String>) {
+    let cmd = vec![
+        "psql".to_string(),
+        "-t".to_string(),
+        "-c".to_string(),
+        "SELECT pg_current_wal_lsn()".to_string(),
+    ];
+    let env = vec![
+        format!("PGUSER={}", pg.username),
+        format!("PGPASSWORD={}", pg.password),
+        format!("PGDATABASE={}", pg.database),
+    ];
+    (cmd, env)
+}
+
 async fn query_current_wal_lsn(
     docker: &bollard::Docker,
     container_name: &str,
     pg: &PgParams,
 ) -> Result<String, BackupError> {
-    let cmd = format!(
-        "PGPASSWORD={} psql -U {} -d {} -t -c 'SELECT pg_current_wal_lsn()'",
-        pg.password, pg.username, pg.database
-    );
+    let (cmd_owned, env_owned) = build_lsn_exec_args(pg);
+    let cmd_refs: Vec<&str> = cmd_owned.iter().map(|s| s.as_str()).collect();
+    let env_refs: Vec<&str> = env_owned.iter().map(|s| s.as_str()).collect();
     let exec = docker
         .create_exec(
             container_name,
             bollard::exec::CreateExecOptions {
-                cmd: Some(vec!["sh", "-c", &cmd]),
+                cmd: Some(cmd_refs),
+                env: Some(env_refs),
                 attach_stdout: Some(true),
                 attach_stderr: Some(false),
                 ..Default::default()
@@ -425,4 +446,51 @@ async fn list_total_s3_size(
         }
     }
     Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for the 0.1.0 hardening pass. See the matching
+    /// tests in postgres_walg.rs for the full rationale — both files
+    /// shared the same shell-injection vector and both share the same
+    /// fix (credentials via env, never in the cmd vector).
+    #[test]
+    fn build_lsn_exec_args_keeps_credentials_out_of_cmd() {
+        let pg = PgParams {
+            username: "alice".to_string(),
+            password: "p4ss'; rm -rf /; #".to_string(),
+            database: "production".to_string(),
+        };
+
+        let (cmd, _env) = build_lsn_exec_args(&pg);
+
+        for arg in &cmd {
+            assert!(!arg.contains("alice"), "username leaked: {}", arg);
+            assert!(!arg.contains("p4ss"), "password leaked: {}", arg);
+            assert!(!arg.contains("production"), "database leaked: {}", arg);
+        }
+        // No `sh` wrapper — that wrapper plus shell-interpolated creds
+        // was the vulnerable shape. (`-c` is fine here: it's `psql -c
+        // <query>`, NOT `sh -c <shellstring>`.)
+        assert!(!cmd.iter().any(|a| a == "sh"));
+        assert!(!cmd.iter().any(|a| a == "bash"));
+        assert_eq!(cmd.first().map(|s| s.as_str()), Some("psql"));
+    }
+
+    #[test]
+    fn build_lsn_exec_args_passes_credentials_via_env_verbatim() {
+        let pg = PgParams {
+            username: "alice".to_string(),
+            password: "p4ss'; rm -rf /; #".to_string(),
+            database: "production".to_string(),
+        };
+
+        let (_cmd, env) = build_lsn_exec_args(&pg);
+        assert!(env.contains(&"PGUSER=alice".to_string()));
+        assert!(env.contains(&"PGPASSWORD=p4ss'; rm -rf /; #".to_string()));
+        assert!(env.contains(&"PGDATABASE=production".to_string()));
+        assert_eq!(env.len(), 3);
+    }
 }
