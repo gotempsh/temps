@@ -34,7 +34,7 @@ For deployment-specific failures, the fastest starting point is always the build
 
 <Properties>
   <Property name="'npm install' exits with non-zero status">
-    **Cause:** Missing or mis-matched dependencies, wrong Node.js version, or a corrupt/missing lockfile.
+    **Cause:** Missing or mismatched dependencies, wrong Node.js version, or a corrupt/missing lockfile.
 
     **Fix:**
     - Commit your lockfile (`package-lock.json`, `yarn.lock`, or `pnpm-lock.yaml`). Temps runs `npm ci` (not `npm install`) when a lockfile is present, which is reproducible and faster.
@@ -89,7 +89,7 @@ A health check failure means the container started but did not respond with a 2x
 
 <Properties>
   <Property name="Application not listening on the expected port">
-    **Cause:** Temps injects a `PORT` environment variable (default `8080`). If your application ignores it and hardcodes a different port, the health check has nowhere to connect.
+    **Cause:** Temps injects a `PORT` environment variable (default `3000`). If your application ignores it and hardcodes a different port, the health check has nowhere to connect.
 
     **Fix:** Read `PORT` from the environment:
 
@@ -119,7 +119,7 @@ A health check failure means the container started but did not respond with a 2x
     **Fix:**
     - Run migrations in a separate step before starting the web process (e.g. a `release` script separate from `web`).
     - Increase the health check timeout in **Environment Settings → Health Check**.
-    - Stream startup logs to see which step is slow: `temps logs --project my-app --follow`.
+    - Stream startup logs to see which step is slow: `bunx @temps-sdk/cli deployments logs -p my-app -f`.
   </Property>
 
   <Property name="Application crashes on startup (exits immediately)">
@@ -327,7 +327,7 @@ A health check failure means the container started but did not respond with a 2x
     **Cause:** The API token is invalid, expired, or missing the required permission scope.
 
     **Fix:**
-    - Run `temps auth login` to re-authenticate.
+    - Run `bunx @temps-sdk/cli auth login` to re-authenticate.
     - If using a static API key, go to **Settings → API Keys** and verify the key is active and has the permissions the operation requires.
     - For CI/CD, ensure the `TEMPS_API_KEY` or `--api-key` flag is set correctly.
   </Property>
@@ -336,15 +336,15 @@ A health check failure means the container started but did not respond with a 2x
     **Cause:** The CLI cannot reach your Temps instance. Common after the server IP changes or a firewall rule update.
 
     **Fix:**
-    - Confirm the server is running: `temps doctor` (or check the Temps process on the server).
-    - Run `temps config set server-url https://your-instance-url` if the URL has changed.
+    - On the server, confirm the binary is healthy: `temps doctor` (or check the Temps process).
+    - Re-run `bunx @temps-sdk/cli auth login` against the new URL if it has changed.
     - Verify ports 80 and 443 are open on the server's firewall.
   </Property>
 
   <Property name="'Not Found' (404) for a project or deployment">
     **Cause:** The ID in the request does not exist, or you are querying the wrong Temps instance.
 
-    **Fix:** Use `temps projects list` or the dashboard to retrieve valid IDs. IDs are not portable between Temps instances.
+    **Fix:** Use `bunx @temps-sdk/cli projects list` or the dashboard to retrieve valid IDs. IDs are not portable between Temps instances.
   </Property>
 </Properties>
 
@@ -357,7 +357,7 @@ If the above sections do not solve your problem:
 1. **Run `temps doctor`** — outputs a full diagnostics report (versions, connectivity, database status, recent errors) that you can paste into a support request.
 2. **Collect the relevant logs:**
    - Build logs: from the deployment detail page
-   - Container logs: `temps logs --project my-app --environment production --tail 200`
+   - Container logs: `bunx @temps-sdk/cli deployments logs -p my-app -e production -n 200`
    - Server logs: on the host, `journalctl -u temps -n 500`
 3. **Check the [Debug a Failed Deployment](/docs/debug-a-failed-deployment) guide** for step-by-step log navigation.
 4. **Open an issue** on [GitHub](https://github.com/gotempsh/temps/issues) with the `temps doctor` output and the logs.

@@ -157,17 +157,17 @@ curl -X POST "https://your-temps-instance/api/projects/{id}/environments/{id}/de
 
 ### CLI
 
-The `temps` CLI wraps the REST API for interactive and scripted use:
+The `@temps-sdk/cli` package wraps the REST API for interactive and scripted use. Invoke it via `bunx` so there is no ambiguity with the `temps` server binary on `$PATH`:
 
 ```bash
 # Deploy from the command line
-temps deploy git --project my-app --environment production
+bunx @temps-sdk/cli deploy -p my-app -e production
 
-# Roll back the latest deployment
-temps deployments rollback --project my-app
+# Roll back the latest deployment in production
+bunx @temps-sdk/cli deployments rollback -p my-app -e production
 
 # View live container logs
-temps logs --project my-app --environment production --follow
+bunx @temps-sdk/cli deployments logs -p my-app -e production -f
 ```
 
 See the [CLI reference](/docs/cli) for the full command list.
@@ -177,19 +177,21 @@ See the [CLI reference](/docs/cli) for the full command list.
 For Node.js applications, the SDK provides a typed client:
 
 ```bash
-npm install @temps-sdk/node
+npm install @temps-sdk/node-sdk
 ```
 
 ```typescript
-import { TempsClient } from '@temps-sdk/node';
+import { TempsClient } from '@temps-sdk/node-sdk';
 
 const client = new TempsClient({
-  baseUrl: process.env.TEMPS_API_URL,
-  token: process.env.TEMPS_API_TOKEN,
+  baseUrl: process.env.TEMPS_API_URL!,
+  apiKey: process.env.TEMPS_API_TOKEN,
 });
 
-// Trigger a deployment
-await client.projects.triggerPipeline(projectId, { branch: 'main' });
+// Trigger a deployment for project ID 42
+await client.projects.triggerPipeline({
+  path: { id: 42 },
+});
 ```
 
 See the [Node SDK reference](/docs/node-sdk) for all available methods.

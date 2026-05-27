@@ -158,7 +158,7 @@ If build times exceed 5 minutes, consider building the Docker image in GitHub Ac
   run: |
     docker build -t myapp:${{ github.sha }} .
     docker save myapp:${{ github.sha }} | gzip > image.tar.gz
-    curl -X POST "https://your-temps-instance/api/projects/$PROJECT_ID/deploy/image-upload" \
+    curl -X POST "https://your-temps-instance/api/projects/$PROJECT_ID/environments/$ENVIRONMENT_ID/deploy/image-upload" \
       -H "Authorization: Bearer $TEMPS_API_KEY" \
       -F "image=@image.tar.gz" \
       -F "tag=myapp:${{ github.sha }}"

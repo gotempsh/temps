@@ -32,8 +32,8 @@ Temps provides defence-in-depth security across transport, access control, authe
 Every domain you add to Temps gets a free TLS certificate from Let's Encrypt, issued automatically and renewed before expiration. The proxy (Pingora) terminates TLS and enforces:
 
 - **TLS 1.2 minimum**, TLS 1.3 preferred
-- **HSTS** (`Strict-Transport-Security`) on all HTTPS responses
 - **Automatic HTTP→HTTPS redirect** on port 80
+- Optional **HSTS** (`Strict-Transport-Security`) and other response headers, configurable per project (see [Security headers](#security-headers) below)
 
 You do not need to manage certificates manually. Point your domain at your server, add it in the Temps dashboard, and TLS is provisioned within seconds via the ACME protocol.
 
@@ -137,16 +137,16 @@ All traffic between clients and Temps is encrypted with TLS. Internal service-to
 
 ## Security headers {{ anchor: true, id: 'security-headers' }}
 
-The Pingora proxy adds the following security headers to every response:
+The Pingora proxy can add the following security headers to responses. None are sent by default — each is opt-in and configured per project under **Environment Settings → Security Headers**. Leave a field blank to skip the header for that project.
 
-| Header | Value | Purpose |
-|--------|-------|---------|
+| Header | Example value | Purpose |
+|--------|--------------|---------|
 | `Strict-Transport-Security` | `max-age=31536000; includeSubDomains` | Force HTTPS for one year |
-| `X-Content-Type-Options` | `nosniff` | Prevent MIME-type sniffing |
 | `X-Frame-Options` | `SAMEORIGIN` | Prevent clickjacking via iframes |
 | `Referrer-Policy` | `strict-origin-when-cross-origin` | Limit referrer leakage |
+| `Content-Security-Policy` | `default-src 'self'` | Restrict resource origins |
 
-Custom headers (including `Content-Security-Policy`) can be added per-project in environment settings.
+Set the headers your application actually needs — there is no project-wide default that you can rely on.
 
 ---
 

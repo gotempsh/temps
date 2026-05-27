@@ -175,10 +175,8 @@ When worker nodes are not on the same private network as the control plane (for 
 When you run `temps join` on a worker node, pass the WireGuard IP as the private address so the control plane routes proxy traffic through the tunnel:
 
 ```bash
-# On the worker node
-temps join \
-  --control-plane-url https://10.8.0.1:8080 \
-  --token <join-token> \
+# On the worker node — target and token are positional
+temps join https://10.8.0.1:8080 <join-token> \
   --private-address 10.8.0.2
 ```
 

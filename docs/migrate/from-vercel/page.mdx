@@ -136,11 +136,11 @@ Handle these Vercel-injected variables specially:
 
 | Vercel variable | Action in Temps |
 |----------------|----------------|
-| `VERCEL_URL` | **Remove it.** Temps injects `TEMPS_URL` with the deployment's public URL. Update any code that reads `VERCEL_URL` to fall back to `TEMPS_URL` or `process.env.NEXT_PUBLIC_APP_URL`. |
-| `VERCEL_ENV` | **Remove it.** Temps injects `TEMPS_ENVIRONMENT` (`production`, `preview`, `development`). |
+| `VERCEL_URL` | **Remove it.** There is no equivalent injected variable in Temps — set your own (e.g. `NEXT_PUBLIC_APP_URL`) and reference it from your code. |
+| `VERCEL_ENV` | **Remove it.** Set an explicit variable per environment in Temps (e.g. `APP_ENV=production`) — Temps does not inject an environment-name variable. |
 | `VERCEL_REGION` | Remove. Not applicable to Temps. |
-| `VERCEL_GIT_COMMIT_SHA` | Remove. Temps injects `TEMPS_GIT_COMMIT_SHA`. |
-| `VERCEL_GIT_REPO_SLUG` | Remove. Temps injects `TEMPS_GIT_REPO`. |
+| `VERCEL_GIT_COMMIT_SHA` | Remove. Inject your own commit SHA at build time (e.g. via `--build-arg GIT_SHA=$(git rev-parse HEAD)`) if your app needs it. |
+| `VERCEL_GIT_REPO_SLUG` | Remove. Hard-code the repo identifier as a regular environment variable if your app reads it. |
 | `DATABASE_URL` (Vercel Postgres) | **Replace.** Add a managed PostgreSQL service in Temps (see [deploy with database](/docs/deploy-with-database)) and use the injected `POSTGRES_URL`. |
 | `KV_URL` (Vercel KV) | **Replace.** Add a managed Redis service and use the injected `REDIS_URL`, or switch to [KV Storage](/docs/kv-storage). |
 | `BLOB_READ_WRITE_TOKEN` | **Replace.** Use RustFS managed storage and an S3-compatible SDK instead. |

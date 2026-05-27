@@ -397,3 +397,27 @@
 - `reference/cli-getting-started` "Here's" informal — fixed in pass 11
 - `features/session-replay` sections/anchor-IDs/lead paragraph — rewritten in pass 12
 - Stale `0.1.0-beta.21` version example in upgrade-temps — updated to `0.1.0-beta.22` in pass 12
+
+---
+
+## Pass 13 — run 2026-05-27T11:30Z
+
+**Date:** 2026-05-27
+**Risk:** REVIEW
+
+### Changes
+
+Correctness pass: review of earlier passes found seven fabricated or wrong technical claims. Each fix was verified against the source code in the same commit.
+
+| File | Change |
+|------|--------|
+| `docs/migrate/from-vercel/page.mdx` | Removed fabricated injected env vars `TEMPS_URL`, `TEMPS_ENVIRONMENT`, `TEMPS_GIT_COMMIT_SHA`, `TEMPS_GIT_REPO`. Only `HOST`, `PORT`, `TEMPS_PROJECT_ID`, `TEMPS_ENVIRONMENT_ID`, `TEMPS_DEPLOYMENT_ID` are real (per `crates/temps-deployer/src/lib.rs` and `docs/reference/environment-variables`). |
+| `docs/reference/troubleshooting/page.mdx` | Fixed wrong `PORT` default `8080` → `3000` (per `temps-deployer/src/lib.rs:691`). Replaced fabricated server-binary commands (`temps logs`, `temps auth login`, `temps config set`, `temps projects list`) with the real `bunx @temps-sdk/cli ...` equivalents. |
+| `docs/features/api/page.mdx` | CLI block: replaced fabricated `temps deploy git`, `temps deployments rollback`, `temps logs` with `bunx @temps-sdk/cli deploy / deployments rollback / deployments logs`. Node SDK: package name `@temps-sdk/node` → `@temps-sdk/node-sdk` (actual published name), config `token` → `apiKey`, fixed `triggerPipeline` call shape to match generated SDK signature. |
+| `docs/advanced/networking/page.mdx` | `temps join` example: `--control-plane-url` / `--token` flags do not exist. `target` and `token` are positional args (per `JoinCommand` in `crates/temps-cli/src/commands/join.rs`). |
+| `docs/features/teams/page.mdx` | User-create CLI: `--name` → `--username`, `--role` → `--roles` (per `apps/temps-cli/src/commands/users/index.ts`). API body: `"name"` → `"username"`, `"role": "user"` → `"roles": ["user"]` (per `CreateUserRequest` in `crates/temps-auth/src/types.rs`). |
+| `docs/architecture/security/page.mdx` | Security headers table over-promised: claimed Pingora adds HSTS/X-Frame-Options/Referrer-Policy/X-Content-Type-Options to every response with hard-coded values. Per `crates/temps-proxy/src/proxy.rs:1000-1056` these are all opt-in per project, and `X-Content-Type-Options` is not implemented at all. Removed `nosniff`, reframed table as configurable example values rather than defaults. |
+| `docs/advanced/performance/page.mdx` | Image-upload URL: `/api/projects/$PROJECT_ID/deploy/image-upload` → `/api/projects/$PROJECT_ID/environments/$ENVIRONMENT_ID/deploy/image-upload` (per `crates/temps-deployments/src/handlers/remote_deployments.rs:806`). |
+
+### Already done (do not repeat)
+- All blockers identified during the pass-13 review — see the Changes table above. Do not re-introduce `TEMPS_URL`/`TEMPS_ENVIRONMENT`/`TEMPS_GIT_*` claims, the `PORT=8080` default, server-binary CLI subcommands beyond those in `crates/temps-cli/src/lib.rs`, the `--control-plane-url`/`--token` flag form for `temps join`, the `--name`/`--role` form for `users create`, the `@temps-sdk/node` package name, the security-headers-as-defaults framing, or the `/deploy/image-upload` path without an `/environments/{id}` segment.

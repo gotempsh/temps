@@ -109,15 +109,21 @@ The user can immediately log in at your Temps instance URL with the provided cre
 ```bash
 # Create a new user with the User role
 bunx @temps-sdk/cli users create \
-  --name "Jane Smith" \
+  --username jsmith \
   --email "jane@example.com" \
-  --role user
+  --roles user
 
 # Create a read-only user
 bunx @temps-sdk/cli users create \
-  --name "Stakeholder" \
+  --username stakeholder \
   --email "cto@example.com" \
-  --role reader
+  --roles reader
+
+# Assign multiple roles by separating with commas
+bunx @temps-sdk/cli users create \
+  --username ops \
+  --email "ops@example.com" \
+  --roles user,api_reader
 ```
 
 ### From the API
@@ -127,10 +133,10 @@ curl -X POST "https://your-temps-instance/api/users" \
   -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "name": "Jane Smith",
+    "username": "jsmith",
     "email": "jane@example.com",
     "password": "temp-password-change-me",
-    "role": "user"
+    "roles": ["user"]
   }'
 ```
 
