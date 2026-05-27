@@ -6,92 +6,98 @@ export const metadata = {
   },
 }
 
+export const sections = [
+  { title: 'Overview', id: 'overview' },
+  { title: 'Features', id: 'features' },
+  { title: 'Privacy controls', id: 'privacy-controls' },
+  { title: 'Setup', id: 'setup' },
+  { title: 'Replay player', id: 'replay-player' },
+]
+
 # Session Replay
 
-Record and replay user sessions to understand how users interact with your application. Debug issues faster by watching exactly what users experienced. {{ className: 'lead' }}
+Watch recordings of real user sessions to reproduce bugs, understand drop-off points, and validate UX changes — all stored on your own server. {{ className: 'lead' }}
 
 ---
 
-## Overview
+## Overview {{ anchor: true, id: 'overview' }}
 
-Session replay captures user interactions with your application, allowing you to replay sessions to understand user behavior and debug issues. Unlike external services, Temps session replay is fully self-hosted with complete data ownership.
+Session replay captures DOM snapshots and mutations, user interactions, console output, and network activity. Unlike third-party services, Temps session replay is fully self-hosted: recordings never leave your infrastructure.
 
 <Row>
   <Col>
-    **Key Features**
-    - DOM recording with mutations
-    - Event timeline visualization
-    - Console log capture
-    - Network activity recording
-    - Error correlation
-    - Privacy controls
+    **What is recorded**
+    - DOM mutations and CSS changes
+    - Clicks, scrolls, and keyboard events
+    - Navigation and page transitions
+    - Console log output
+    - Network requests (optional)
+    - JavaScript errors
   </Col>
   <Col>
-    **Benefits**
-    - Debug issues faster
-    - Understand user behavior
-    - Complete data ownership
-    - No external dependencies
-    - GDPR compliant
-    - Unlimited recordings
+    **Platform properties**
+    - Complete data ownership — no third-party uploads
+    - GDPR-compliant with configurable redaction
+    - Unlimited recordings (storage is on your server)
+    - Error correlation — link sessions to error events
+    - Configurable sampling rate to control volume
   </Col>
 </Row>
 
 ---
 
-## Features
+## Features {{ anchor: true, id: 'features' }}
 
 <Properties>
   <Property name="DOM Recording">
-    Captures DOM snapshots and mutations, CSS styles, input events (with privacy controls)
+    Captures DOM snapshots and mutations, CSS styles, and input events (with privacy controls applied before capture)
   </Property>
   <Property name="Event Timeline">
-    Visual timeline of all interactions (clicks, scrolls, navigation, errors)
+    Visual timeline of all interactions — clicks, scrolls, navigation, and errors
   </Property>
   <Property name="Console Logs">
-    Captures browser console output during session
+    Browser console output captured during the session and shown alongside the recording
   </Property>
   <Property name="Network Activity">
-    Records API requests and responses (optional)
+    API requests and responses recorded optionally — disable per-domain if needed
   </Property>
   <Property name="Performance Metrics">
-    FPS, memory usage, page load times
+    FPS, memory usage, and page load times overlaid on the timeline
   </Property>
   <Property name="Error Correlation">
-    Links sessions to error events for debugging
+    Sessions linked to error events so you can jump directly to the recording where an error occurred
   </Property>
 </Properties>
 
 ---
 
-## Privacy Controls
+## Privacy controls {{ anchor: true, id: 'privacy-controls' }}
 
-Session replay includes comprehensive privacy controls to protect user data.
+Session replay applies redaction before data leaves the browser — sensitive content is never transmitted.
 
 <Row>
   <Col>
-    **Automatic Redaction**
-    - Password inputs (always masked)
-    - Credit card fields (always masked)
-    - Email addresses (configurable)
-    - Phone numbers (configurable)
-    - Custom selectors
+    **Automatic redaction**
+    - Password inputs — always masked
+    - Credit card fields — always masked
+    - Email and phone — configurable
+    - Custom CSS selectors via `blockClass` and `maskTextSelector`
   </Col>
   <Col>
-    **User Consent**
-    - Opt-in mode (user consent required)
-    - Opt-out mode (user can disable)
-    - Geo-based rules (GDPR compliance)
-    - Sampling rate (record % of sessions)
+    **Consent and sampling**
+    - Opt-in mode — recording starts only after user consent
+    - Opt-out mode — user can disable recording
+    - Geo-based rules for GDPR regions
+    - `sessionSampleRate` to record a fraction of sessions
   </Col>
 </Row>
 
 ---
 
-## Setup
+## Setup {{ anchor: true, id: 'setup' }}
 
 <CodeGroup title="Configure Session Replay">
-```typescript {{ title: 'React Setup' }}
+```typescript {{ title: 'React' }}
 import { TempsAnalyticsProvider } from '@temps-sdk/react-analytics';
 
 function App() {
@@ -99,10 +105,10 @@ function App() {
     <TempsAnalyticsProvider
       enableSessionRecording={true}
       sessionRecordingConfig={{
-        sessionSampleRate: 0.1, // Record 10% of sessions
+        sessionSampleRate: 0.1,        // record 10% of sessions
         maskAllInputs: false,
-        blockClass: 'sensitive-data',
-        maskTextSelector: 'input[type="password"], input[type="email"]'
+        blockClass: 'sensitive-data',  // add this class to hide elements
+        maskTextSelector: 'input[type="password"], input[type="email"]',
       }}
     >
       <YourApp />
@@ -112,7 +118,6 @@ function App() {
 ```
 
 ```javascript {{ title: 'Vanilla JS' }}
-// Initialize session replay
 temps.init({
   projectId: 'my-app',
   sessionReplay: {
@@ -120,41 +125,45 @@ temps.init({
     sampling: 0.1,
     privacy: {
       maskAllInputs: false,
-      blockClass: 'no-record',
-      maskClass: 'mask-content'
-    }
-  }
+      blockClass: 'no-record',   // elements with this class are blocked
+      maskClass: 'mask-content', // elements with this class are masked
+    },
+  },
 });
 ```
 </CodeGroup>
 
----
-
-## Replay Player
-
-The replay player provides a full-featured interface for watching session recordings.
-
-**Player Features:**
-- Playback controls (play, pause, speed adjustment)
-- Timeline scrubber
-- Event markers (clicks, navigation, errors)
-- Console panel
-- Network panel
-- Device viewport emulation
-
 <Note>
-  **Storage Optimization:** Session recordings are compressed using efficient algorithms. Average session (~5 minutes) uses ~500KB storage.
+  For a full walkthrough including GDPR opt-in flows, see [Add Observability](/docs/add-observability).
 </Note>
 
 ---
 
-## Additional Resources
+## Replay player {{ anchor: true, id: 'replay-player' }}
+
+The replay player in the Temps dashboard provides a full-featured interface for watching recordings.
+
+**Player controls:**
+- Play, pause, and variable-speed playback
+- Timeline scrubber with event markers (clicks, navigation, errors)
+- Console panel showing log output at each timestamp
+- Network panel showing requests and responses
+- Device viewport emulation to match the user's screen size
+
+<Note>
+  Session recordings are compressed before storage. A typical five-minute session uses approximately 500 KB.
+</Note>
+
+---
 
 <div className="not-prose">
   <Button href="/docs/analytics" variant="text" arrow="right">
-    Analytics Overview
+    Analytics overview
   </Button>
   <Button href="/docs/error-tracking" variant="text" arrow="right">
-    Error Tracking
+    Error tracking
+  </Button>
+  <Button href="/docs/add-observability" variant="text" arrow="right">
+    Add observability tutorial
   </Button>
 </div>

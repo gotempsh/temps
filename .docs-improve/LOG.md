@@ -347,3 +347,53 @@
 - `features/analytics` "Here's" informal — fixed in pass 11
 - `features/mcp` "Here's" informal — fixed in pass 11
 - `reference/cli-getting-started` "Here's" informal — fixed in pass 11
+
+---
+
+## Pass 12 — run 2026-05-27T08:16Z
+
+**Date:** 2026-05-27
+**Risk:** REVIEW
+
+### Changes
+
+| File | Change |
+|------|--------|
+| `docs/features/session-replay/page.mdx` | Clarity pass: added `export const sections`, `{{ anchor: true, id }}` on all H2 headings, rewrote lead paragraph (was a verbatim copy of the metadata description), tightened Overview intro to remove triple-repeated sentence |
+| `docs/howto/upgrade-temps/page.mdx` | Stale version example updated from `0.1.0-beta.21` (set by pass 1) to `0.1.0-beta.22` (current release per CHANGELOG) |
+
+### Already done (do not repeat)
+- `from-heroku` migration stub — filled in pass 1
+- Monitoring page Property blocks — rewritten in pass 1
+- Stale version `v0.0.6` in upgrade-temps page — fixed in pass 1
+- `from-railway` migration stub — filled in pass 2
+- Webhooks page structure — rewritten in pass 2
+- Stale RustFS `1.0.0-alpha.78` in set-up-managed-services and deploy-with-database — fixed in pass 2
+- Double-dash `--` em-dash typos in attack-mode, kv-storage, skills — fixed in pass 2
+- `from-vercel` migration stub — filled in pass 3
+- `from-netlify` migration stub — filled in pass 4
+- `architecture/overview` lead paragraph and description — rewritten in pass 4
+- `reference/troubleshooting` stub — filled in pass 5
+- `advanced/performance` stub — filled in pass 5
+- `features/teams` stub — filled in pass 6
+- `architecture/security` role names, permission strings, informal prose — rewritten in pass 6
+- `advanced/custom-buildpacks` stub — filled in pass 7
+- `advanced/networking` stub — filled in pass 8
+- `architecture/data-flow` sections export and lead paragraph — rewritten in pass 8
+- "Competitive Advantage" Note blocks in cron-jobs and managed-services — fixed in pass 8
+- `features/api` stub — filled in pass 9
+- `features/rollbacks` sections/anchors/dividers, broken link — fixed in pass 9
+- `architecture/deployment` clarity rewrite (sections, anchors, lead paragraph, formal prose) — fixed in pass 10
+- `advanced/security` whitelist → allowlist in prose — fixed in pass 10
+- Contractions in backups, error-tracking, admin-listener, upgrade, enable-clickhouse-analytics, cli-login, introduction — fixed in pass 10
+- `features/attack-mode` Block List/Allow List → Blocklist/Allowlist in headings and Note — fixed in pass 11
+- `architecture/request-flow` Block List/Allow List → Blocklist/Allowlist — fixed in pass 11
+- `architecture/overview` IP Whitelisting → IP Allowlisting — fixed in pass 11
+- `features/cron-jobs` contractions — fixed in pass 11
+- `architecture/plugins` "it's live" contraction — fixed in pass 11
+- `errors` "We recommend" first-person plural — fixed in pass 11
+- `features/analytics` "Here's" informal — fixed in pass 11
+- `features/mcp` "Here's" informal — fixed in pass 11
+- `reference/cli-getting-started` "Here's" informal — fixed in pass 11
+- `features/session-replay` sections/anchor-IDs/lead paragraph — rewritten in pass 12
+- Stale `0.1.0-beta.21` version example in upgrade-temps — updated to `0.1.0-beta.22` in pass 12
