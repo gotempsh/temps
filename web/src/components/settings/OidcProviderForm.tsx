@@ -31,6 +31,7 @@ export type OidcProviderFormValues = {
   role_claim: string
   group_claim: string
   jit_provisioning: boolean
+  trust_idp_email: boolean
 }
 
 type OidcProviderFormProps = {
@@ -297,6 +298,37 @@ export function OidcProviderForm({
             id="oidc-jit"
             checked={value.jit_provisioning}
             onCheckedChange={(checked) => update('jit_provisioning', checked)}
+          />
+        </div>
+        <div className="flex items-center justify-between rounded-lg border border-amber-200 bg-amber-50/40 p-4 dark:border-amber-900/60 dark:bg-amber-950/20">
+          <div className="space-y-1 pr-4">
+            <Label htmlFor="oidc-trust-idp-email">
+              Trust IdP email without{' '}
+              <code className="rounded bg-muted px-1 py-0.5 text-xs">
+                email_verified
+              </code>{' '}
+              claim
+            </Label>
+            <p className="text-xs text-muted-foreground">
+              Enable only for corporate IdPs where an admin controls user
+              provisioning — e.g. Okta Org Authorization Server, Azure AD,
+              internal SSO. <strong>Do not enable</strong> for public IdPs
+              that allow self-signup (Auth0 social logins, Google consumer
+              accounts).
+            </p>
+            <p className="text-xs text-amber-700 dark:text-amber-300">
+              Security risk: if an attacker can register{' '}
+              <code className="rounded bg-muted px-1 py-0.5 text-xs">
+                victim@example.com
+              </code>{' '}
+              at the IdP without verifying it, they can take over the
+              victim&apos;s existing Temps account on first SSO login.
+            </p>
+          </div>
+          <Switch
+            id="oidc-trust-idp-email"
+            checked={value.trust_idp_email}
+            onCheckedChange={(checked) => update('trust_idp_email', checked)}
           />
         </div>
       </section>

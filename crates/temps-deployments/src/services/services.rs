@@ -2814,6 +2814,10 @@ impl DeploymentService {
             }
         }
 
+        // Snapshot fields we'll need *after* the move into ActiveModel for
+        // the queue event below — the active model takes ownership of the row.
+        let environment_id = deployment.environment_id;
+
         // Update deployment to cancelled state
         let mut active_deployment: deployments::ActiveModel = deployment.into();
         active_deployment.state = Set("cancelled".to_string());
@@ -2821,6 +2825,36 @@ impl DeploymentService {
         active_deployment.finished_at = Set(Some(chrono::Utc::now()));
         active_deployment.updated_at = Set(chrono::Utc::now());
         active_deployment.update(self.db.as_ref()).await?;
+
+        // Publish a DeploymentCancelled event so downstream listeners (PR
+        // commenter, notifications, audit consumers) can react. The workflow
+        // executor publishes the same event when it transitions to Cancelled
+        // mid-pipeline; this site covers user-initiated cancels from the UI /
+        // API, which previously left the PR comment stuck on "Deploying preview".
+        //
+        // Best-effort: a queue failure here must NOT undo the cancellation —
+        // log and move on, mirroring how DeploymentFailed/Succeeded handle it
+        // elsewhere in this file.
+        let environment_name =
+            match temps_entities::environments::Entity::find_by_id(environment_id)
+                .one(self.db.as_ref())
+                .await
+            {
+                Ok(Some(env)) => env.name,
+                _ => String::new(),
+            };
+        let event = temps_core::Job::DeploymentCancelled(temps_core::DeploymentCancelledJob {
+            deployment_id,
+            project_id,
+            environment_id,
+            environment_name,
+        });
+        if let Err(e) = self.queue_service.send(event).await {
+            warn!(
+                "Failed to send DeploymentCancelled event for deployment {}: {}",
+                deployment_id, e
+            );
+        }
 
         info!(
             "Successfully cancelled deployment {} for project {} - workflow will stop at next checkpoint",

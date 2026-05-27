@@ -215,6 +215,11 @@ const DiskMonitoringPage = lazy(() =>
     default: m.DiskMonitoringPage,
   }))
 )
+const BuildLimitsPage = lazy(() =>
+  import('./pages/settings/BuildLimitsPage').then((m) => ({
+    default: m.BuildLimitsPage,
+  }))
+)
 const AuthSettingsPage = lazy(() =>
   import('./pages/settings/AuthSettingsPage').then((m) => ({
     default: m.AuthSettingsPage,
@@ -422,6 +427,7 @@ const FullAppRoutes = () => {
                   <Route path="security" element={<SecurityPage />} />
                   <Route path="rate-limiting" element={<RateLimitingPage />} />
                   <Route path="disk-monitoring" element={<DiskMonitoringPage />} />
+                  <Route path="build-limits" element={<BuildLimitsPage />} />
                   <Route path="nodes" element={<NodesPage />} />
                   <Route path="nodes/:nodeId" element={<NodeDetailPage />} />
                   <Route path="plugins" element={<PluginsPage />} />

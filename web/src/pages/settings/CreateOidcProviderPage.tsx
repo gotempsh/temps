@@ -41,6 +41,7 @@ function createFormToRequest(form: OidcProviderFormValues) {
     group_claim: form.group_claim.trim(),
     role_claim: form.role_claim.trim(),
     default_role: form.default_role,
+    trust_idp_email: form.trust_idp_email,
   }
 }
 
@@ -63,6 +64,7 @@ export function CreateOidcProviderPage() {
       role_claim: defaults.role_claim ?? 'roles',
       group_claim: defaults.group_claim ?? 'groups',
       jit_provisioning: defaults.jit_provisioning ?? true,
+      trust_idp_email: defaults.trust_idp_email ?? false,
     }
   })
 

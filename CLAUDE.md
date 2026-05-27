@@ -22,6 +22,7 @@ Guidance for Claude Code when working with the Temps codebase.
 - Expose internal dependencies via public accessors (e.g. `service.db()`) -- pass dependencies directly via constructor or AppState
 - Use `Option<T>` for dependencies that are required -- use `Arc<T>` and fail at startup if missing
 - Use `get_service` for required dependencies in plugins -- use `require_service` which fails fast with a clear error
+- Add new runtime configuration as environment variables -- ALWAYS model it as a column on the relevant entity row (e.g. `oidc_providers.trust_idp_email`, not `TEMPS_OIDC_SKIP_EMAIL_VERIFIED`) so the admin can change it per-record at runtime via the API/UI, gets audit logging for free, and operators don't have to restart the binary to change a single tenant's behaviour
 
 ### ALWAYS
 - Run `cargo check --lib` after every modification

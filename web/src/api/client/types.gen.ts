@@ -620,6 +620,13 @@ export type ApiKeyResponse = {
 export type AppSettings = {
     agent_sandbox?: AgentSandboxSettings;
     ai_config?: AiConfigSettings;
+    /**
+     * Build-time resource limits applied on the control plane to prevent
+     * `docker build` from saturating host CPU/RAM. Worker nodes are
+     * intentionally NOT subject to these limits (each worker is dedicated
+     * hardware that already has its own per-host headroom).
+     */
+    build_limits?: BuildLimitsSettings;
     container_logs?: ContainerLogSettings;
     disk_space_alert?: DiskSpaceAlertSettings;
     dns_provider?: DnsProviderSettings;
@@ -1129,6 +1136,39 @@ export type BuildConfiguration = {
      * Target stage (for multi-stage builds)
      */
     target?: string | null;
+};
+
+/**
+ * Control-plane build resource limits.
+ *
+ * Caps how many builds run concurrently AND how much CPU/memory each build
+ * is allowed to consume. A single global semaphore in the deployer crate
+ * gates every `DockerRuntime::build_image` call to `max_concurrent`. When
+ * the semaphore is full, additional builds queue and wait — they do not
+ * fail. Per-build CPU/memory caps are forwarded to Docker via
+ * `BuildImageOptions { memory, cpuquota, cpuperiod }`.
+ *
+ * `cpu_limit_cores = 0.0` or `memory_limit_mb = 0` means "no explicit cap"
+ * — fall back to the legacy 50%-of-host heuristic for backwards
+ * compatibility with operators who never visit the settings page.
+ */
+export type BuildLimitsSettings = {
+    /**
+     * CPU cores allowed per build (float, e.g. 2.0 = 2 cores, 0.5 = half
+     * a core). 0 means "use the legacy 50%-of-host default".
+     */
+    cpu_limit_cores?: number;
+    /**
+     * Maximum number of `docker build` operations allowed to run at the
+     * same time on the control plane. Additional builds queue. Min 1.
+     */
+    max_concurrent?: number;
+    /**
+     * Memory allowed per build, in megabytes. 0 means "use the legacy
+     * 50%-of-host default". Docker enforces this as a hard cap — builds
+     * that exceed it OOM-kill.
+     */
+    memory_limit_mb?: number;
 };
 
 /**
@@ -2450,6 +2490,14 @@ export type CreateOidcProviderRequest = {
     role_claim?: string;
     scopes?: string;
     template?: string;
+    /**
+     * Defaults false. Set to true only for IdPs where an admin
+     * controls user provisioning (corporate Okta, Azure AD) and
+     * self-signup of arbitrary emails is not possible — see the
+     * `trust_idp_email` field on `oidc_providers::Model` for the
+     * security tradeoff this enables.
+     */
+    trust_idp_email?: boolean;
 };
 
 export type CreateOidcRoleMappingRequest = {
@@ -7867,11 +7915,23 @@ export type OidcProviderResponse = {
     role_claim: string;
     scopes: string;
     template: string;
+    /**
+     * When true, the resolver skips the `email_verified` claim gate
+     * during SSO login. Only safe for IdPs where an admin controls
+     * user provisioning — see `oidc_providers::Model::trust_idp_email`.
+     */
+    trust_idp_email: boolean;
 };
 
 export type OidcProviderSummary = {
-    id: number;
     name: string;
+    /**
+     * Stable opaque slug — use this as the path parameter when initiating
+     * OIDC login (`/auth/oidc/login/{slug}`). The integer database ID is
+     * intentionally omitted from this public endpoint to prevent provider
+     * enumeration.
+     */
+    slug: string;
     /**
      * The template the provider was created from — e.g. `keycloak`,
      * `okta`, `auth0`, `google`, `azure-ad`, or `generic`. Surfaced on
@@ -9213,6 +9273,19 @@ export type ProjectResponse = {
      * Preset-specific configuration (Dockerfile path, build context, etc.)
      */
     preset_config?: unknown;
+    /**
+     * Idle timeout (seconds) for on-demand preview environments.
+     */
+    preview_envs_idle_timeout_seconds: number;
+    /**
+     * When true, newly-created preview environments default to on-demand mode
+     * (containers stop after the configured idle timeout to save resources).
+     */
+    preview_envs_on_demand: boolean;
+    /**
+     * Wake timeout (seconds) for on-demand preview environments.
+     */
+    preview_envs_wake_timeout_seconds: number;
     repo_name?: string | null;
     repo_owner?: string | null;
     slug: string;
@@ -13473,6 +13546,7 @@ export type UpdateOidcProviderRequest = {
     role_claim?: string | null;
     scopes?: string | null;
     template?: string | null;
+    trust_idp_email?: boolean | null;
 };
 
 export type UpdatePreferencesRequest = {
@@ -13507,6 +13581,18 @@ export type UpdateProjectSettingsRequest = {
     main_branch?: string | null;
     preset?: string | null;
     preset_config?: null | PresetConfigSchema;
+    /**
+     * Idle timeout (seconds, 60..=86400) for on-demand preview environments.
+     */
+    preview_envs_idle_timeout_seconds?: number | null;
+    /**
+     * When true, newly-created preview environments default to on-demand mode.
+     */
+    preview_envs_on_demand?: boolean | null;
+    /**
+     * Wake timeout (seconds, 5..=120) for on-demand preview environments.
+     */
+    preview_envs_wake_timeout_seconds?: number | null;
     repo_name?: string | null;
     repo_owner?: string | null;
     slug?: string | null;
@@ -14899,6 +14985,10 @@ export type UploadReleaseFileErrors = {
      * Project not found
      */
     404: unknown;
+    /**
+     * Source map file exceeds the 50 MiB per-field limit
+     */
+    413: unknown;
 };
 
 export type UploadReleaseFileResponses = {
@@ -17982,21 +18072,21 @@ export type OidcCallbackData = {
     url: '/auth/oidc/callback';
 };
 
-export type StartOidcLoginData = {
+export type StartOidcLoginBySlugData = {
     body?: never;
     path: {
         /**
-         * OIDC provider ID
+         * OIDC provider slug (from /email-status or /auth/oidc/providers)
          */
-        provider_id: number;
+        slug: string;
     };
     query?: {
         return_to?: string | null;
     };
-    url: '/auth/oidc/login/{provider_id}';
+    url: '/auth/oidc/login/{slug}';
 };
 
-export type StartOidcLoginErrors = {
+export type StartOidcLoginBySlugErrors = {
     /**
      * Provider not found
      */
@@ -39747,6 +39837,10 @@ export type IngestSentryEnvelopeErrors = {
      * Unauthorized
      */
     401: unknown;
+    /**
+     * Request body too large (exceeds 2 MiB)
+     */
+    413: unknown;
 };
 
 export type IngestSentryEnvelopeResponses = {
@@ -39777,6 +39871,10 @@ export type IngestSentryEventErrors = {
      * Unauthorized
      */
     401: unknown;
+    /**
+     * Request body too large (exceeds 2 MiB)
+     */
+    413: unknown;
 };
 
 export type IngestSentryEventResponses = {

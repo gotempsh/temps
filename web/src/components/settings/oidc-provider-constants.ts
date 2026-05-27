@@ -160,6 +160,7 @@ export function createDefaultOidcProviderForm(
     group_claim: defaults.group_claim,
     role_claim: defaults.role_claim,
     default_role: defaults.default_role,
+    trust_idp_email: false,
   }
 }
 
@@ -178,6 +179,7 @@ export function providerToFormValues(
     role_claim: provider.role_claim,
     group_claim: provider.group_claim,
     jit_provisioning: provider.jit_provisioning,
+    trust_idp_email: provider.trust_idp_email,
   }
 }
 

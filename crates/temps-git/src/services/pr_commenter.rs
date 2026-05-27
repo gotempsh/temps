@@ -45,6 +45,12 @@ pub enum CommentPhase {
         commit_short_sha: String,
         deployment_url: Option<String>,
     },
+    /// Deployment was cancelled (either by user or workflow). Optional
+    /// `deployment_url` links to the deployment detail / logs page.
+    Cancelled {
+        commit_short_sha: String,
+        deployment_url: Option<String>,
+    },
 }
 
 /// Context required to post a sticky PR/MR comment.
@@ -297,6 +303,18 @@ fn render_body(project_id: i32, environment_id: i32, phase: &CommentPhase) -> St
                 .unwrap_or_default();
             format!(
                 "{marker}\n## ❌ Preview build failed\n\n**Commit:** `{commit_short_sha}`{logs}",
+            )
+        }
+        CommentPhase::Cancelled {
+            commit_short_sha,
+            deployment_url,
+        } => {
+            let logs = deployment_url
+                .as_ref()
+                .map(|u| format!("\n\n[View deployment logs]({u})"))
+                .unwrap_or_default();
+            format!(
+                "{marker}\n## ⛔ Preview deployment cancelled\n\n**Commit:** `{commit_short_sha}`{logs}",
             )
         }
     }
@@ -743,6 +761,36 @@ mod tests {
         assert!(body.contains("https://feature-x.preview.temps.app"));
         assert!(body.contains("Preview ready"));
         assert!(body.contains("dashboard.temps.app"));
+    }
+
+    #[test]
+    fn render_cancelled_includes_marker_and_sha() {
+        let body = render_body(
+            42,
+            7,
+            &CommentPhase::Cancelled {
+                commit_short_sha: "abc1234".to_string(),
+                deployment_url: Some("https://dashboard.temps.app/d/1".to_string()),
+            },
+        );
+        assert!(body.contains("<!-- temps-preview:project=42:env=7 -->"));
+        assert!(body.contains("abc1234"));
+        assert!(body.contains("cancelled"));
+        assert!(body.contains("dashboard.temps.app"));
+    }
+
+    #[test]
+    fn render_cancelled_works_without_log_url() {
+        let body = render_body(
+            42,
+            7,
+            &CommentPhase::Cancelled {
+                commit_short_sha: "abc1234".to_string(),
+                deployment_url: None,
+            },
+        );
+        assert!(body.contains("cancelled"));
+        assert!(!body.contains("View deployment logs"));
     }
 
     #[test]

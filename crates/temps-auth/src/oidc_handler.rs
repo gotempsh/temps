@@ -448,6 +448,7 @@ pub async fn create_oidc_provider(
             template: provider.template.clone(),
             enabled: provider.enabled,
             jit_provisioning: provider.jit_provisioning,
+            trust_idp_email: provider.trust_idp_email,
         })
         .await
     {
@@ -532,6 +533,9 @@ pub async fn update_oidc_provider(
     }
     if request.default_role.is_some() {
         fields_changed.push("default_role".to_string());
+    }
+    if request.trust_idp_email.is_some() {
+        fields_changed.push("trust_idp_email".to_string());
     }
 
     let provider = state

@@ -118,12 +118,54 @@ impl TempsPlugin for DeployerPlugin {
             let use_buildkit = Self::detect_buildkit().await;
             tracing::debug!("Using buildkit: {}", use_buildkit);
 
+            // Load build limits from settings. Only the control plane has
+            // a ConfigService registered (workers run DockerRuntime through
+            // `temps cli agent` which never reaches this plugin), so this
+            // is naturally scoped to control-plane builds. On the rare
+            // path where settings can't be read (fresh install before
+            // first save, DB hiccup), we log a warning and fall back to
+            // the legacy unbounded behaviour rather than fail plugin
+            // startup — builds must keep working.
+            let config_service = context.require_service::<temps_config::ConfigService>();
+            let build_limits = match config_service.get_settings().await {
+                Ok(settings) => Some(settings.build_limits),
+                Err(e) => {
+                    tracing::warn!(
+                        "Could not read build_limits from settings ({}). \
+                         Builds will run with the legacy unbounded behaviour \
+                         until settings are saved.",
+                        e
+                    );
+                    None
+                }
+            };
+
             // Create DockerRuntime service
-            let docker_runtime = Arc::new(DockerRuntime::new(
+            let mut docker_runtime = DockerRuntime::new(
                 docker.clone(),
                 use_buildkit,
                 temps_core::NETWORK_NAME.to_string(),
-            ));
+            );
+            if let Some(limits) = build_limits {
+                let resource_caps = if limits.cpu_limit_cores > 0.0 && limits.memory_limit_mb > 0 {
+                    Some(crate::docker::BuildResourceLimits {
+                        cpu_cores: limits.cpu_limit_cores,
+                        memory_mb: limits.memory_limit_mb,
+                    })
+                } else {
+                    None
+                };
+                docker_runtime =
+                    docker_runtime.with_build_limits(limits.max_concurrent, resource_caps);
+                tracing::info!(
+                    "DockerRuntime: build concurrency={}, per-build cpu={} cores, mem={} MB \
+                     (0 = legacy 50%-of-host heuristic)",
+                    limits.max_concurrent,
+                    limits.cpu_limit_cores,
+                    limits.memory_limit_mb
+                );
+            }
+            let docker_runtime = Arc::new(docker_runtime);
 
             // Register the concrete service
             context.register_service(docker_runtime.clone());

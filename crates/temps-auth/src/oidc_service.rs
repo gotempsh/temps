@@ -285,6 +285,7 @@ impl OidcService {
             group_claim: Set(normalize_claim_name(&request.group_claim, "groups")),
             role_claim: Set(normalize_claim_name(&request.role_claim, "roles")),
             default_role: Set(parse_sso_role(&request.default_role)?.as_str().to_string()),
+            trust_idp_email: Set(request.trust_idp_email),
             ..Default::default()
         }
         .insert(self.db.as_ref())
@@ -352,6 +353,9 @@ impl OidcService {
         }
         if let Some(default_role) = request.default_role {
             active.default_role = Set(parse_sso_role(&default_role)?.as_str().to_string());
+        }
+        if let Some(trust_idp_email) = request.trust_idp_email {
+            active.trust_idp_email = Set(trust_idp_email);
         }
 
         let updated = active.update(self.db.as_ref()).await?;
@@ -761,21 +765,47 @@ impl OidcService {
             // signal we need; if the IdP doesn't set it (or sets
             // false), refuse to link and fall through to the
             // not-provisioned path so the admin can resolve manually.
+            //
+            // `trust_idp_email` lets an admin opt out per-provider
+            // when the IdP is corporate (admin-controlled
+            // provisioning, no self-signup) and the gate is purely
+            // noise — e.g. Okta Org AS, which doesn't emit
+            // `email_verified` at all. We still warn-log every bypass
+            // so it's visible in operations and reviewable from logs.
             if claims.email_verified() != Some(true) {
-                tracing::warn!(
-                    target: "temps_auth::oidc::abuse",
-                    provider_id = provider_id,
-                    email = %email,
-                    sub = %sub,
-                    "Refusing to link OIDC identity to existing account: email_verified is not true"
-                );
-                return Err(OidcError::EmailNotVerified { email });
+                if provider.trust_idp_email {
+                    tracing::warn!(
+                        target: "temps_auth::oidc::trust_bypass",
+                        provider_id = provider_id,
+                        email = %email,
+                        sub = %sub,
+                        "Linking OIDC identity without verified email (trust_idp_email=true)"
+                    );
+                } else {
+                    tracing::warn!(
+                        target: "temps_auth::oidc::abuse",
+                        provider_id = provider_id,
+                        email = %email,
+                        sub = %sub,
+                        "Refusing to link OIDC identity to existing account: email_verified is not true"
+                    );
+                    return Err(OidcError::EmailNotVerified { email });
+                }
             }
 
+            // Only mark the local user as email-verified when the IdP
+            // actually asserted it. Under `trust_idp_email=true` we
+            // accept the login without the claim, but we should not
+            // silently elevate the user's verification state — leave
+            // `email_verified` untouched so the DB still records the
+            // truth as we observed it from the IdP.
+            let idp_verified = claims.email_verified() == Some(true);
             let mut active: users::ActiveModel = user.clone().into();
             active.oidc_provider_id = Set(Some(provider_id));
             active.oidc_subject = Set(Some(sub.to_string()));
-            active.email_verified = Set(true);
+            if idp_verified {
+                active.email_verified = Set(true);
+            }
             let linked = active.update(self.db.as_ref()).await?;
             self.sync_user_sso_role(linked.id, role).await?;
             return Ok(OidcResolvedUser { user: linked });
@@ -790,15 +820,28 @@ impl OidcService {
         // unverified account would otherwise squat on an email the
         // real owner might later try to register or use for SSO. Same
         // attacker scenario as the link path above.
+        //
+        // `trust_idp_email` lets an admin opt out per-provider for
+        // corporate IdPs — same rationale as the linking gate above.
         if claims.email_verified() != Some(true) {
-            tracing::warn!(
-                target: "temps_auth::oidc::abuse",
-                provider_id = provider_id,
-                email = %email,
-                sub = %sub,
-                "Refusing to JIT-provision account: email_verified is not true"
-            );
-            return Err(OidcError::EmailNotVerified { email });
+            if provider.trust_idp_email {
+                tracing::warn!(
+                    target: "temps_auth::oidc::trust_bypass",
+                    provider_id = provider_id,
+                    email = %email,
+                    sub = %sub,
+                    "JIT-provisioning account without verified email (trust_idp_email=true)"
+                );
+            } else {
+                tracing::warn!(
+                    target: "temps_auth::oidc::abuse",
+                    provider_id = provider_id,
+                    email = %email,
+                    sub = %sub,
+                    "Refusing to JIT-provision account: email_verified is not true"
+                );
+                return Err(OidcError::EmailNotVerified { email });
+            }
         }
 
         let display_name = claims
@@ -824,11 +867,17 @@ impl OidcService {
                 reason: format!("JIT user {} not found after creation", created.user.id),
             })?;
 
+        // Same rule as the link path above: only flip
+        // `email_verified` to true when the IdP actually asserted it.
+        // Under `trust_idp_email=true` the gate is bypassed but the
+        // local state should still reflect what the IdP said.
+        let idp_verified = claims.email_verified() == Some(true);
         let mut active: users::ActiveModel = user.into();
         active.oidc_provider_id = Set(Some(provider_id));
         active.oidc_subject = Set(Some(sub.to_string()));
-        // Always true here — we gate above.
-        active.email_verified = Set(true);
+        if idp_verified {
+            active.email_verified = Set(true);
+        }
         let user = active.update(self.db.as_ref()).await?;
         self.sync_user_sso_role(user.id, role).await?;
 
@@ -1674,6 +1723,7 @@ mod tests {
             group_claim: "groups".into(),
             role_claim: "roles".into(),
             default_role: "user".into(),
+            trust_idp_email: false,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -1731,6 +1781,7 @@ mod tests {
             group_claim: "groups".into(),
             role_claim: "roles".into(),
             default_role: "user".into(),
+            trust_idp_email: false,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };

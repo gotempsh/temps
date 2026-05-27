@@ -64,6 +64,12 @@ pub struct Project {
     pub deployment_config: Option<temps_entities::prelude::DeploymentConfig>,
     pub attack_mode: bool,
     pub enable_preview_environments: bool,
+    /// When true, newly-created preview environments default to on-demand mode.
+    pub preview_envs_on_demand: bool,
+    /// Idle timeout (seconds) for on-demand preview environments.
+    pub preview_envs_idle_timeout_seconds: i32,
+    /// Wake timeout (seconds) for on-demand preview environments.
+    pub preview_envs_wake_timeout_seconds: i32,
     /// Source type for deployments (git, docker_image, or static_files)
     pub source_type: SourceType,
     /// GitLab webhook ID installed on the connected repository, if any.

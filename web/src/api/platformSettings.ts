@@ -41,6 +41,16 @@ export interface DiskSpaceAlertSettings {
   monitor_path: string | null
 }
 
+/// Control-plane build resource limits. Mirrors the Rust
+/// `BuildLimitsSettings` struct. `cpu_limit_cores = 0` or `memory_limit_mb
+/// = 0` means "fall back to the legacy 50%-of-host heuristic" so admins
+/// can enable concurrency without committing to specific resource caps.
+export interface BuildLimitsSettings {
+  max_concurrent: number
+  cpu_limit_cores: number
+  memory_limit_mb: number
+}
+
 /// Per-provider config as returned by GET /api/settings. The `credentials_encrypted`
 /// blob is never sent over the wire — the server replaces it with a boolean
 /// `credential_saved` so we never ship ciphertext to the browser. On PUT the
@@ -104,6 +114,7 @@ export interface PlatformSettings extends AppSettings {
   multi_node: MultiNodeSettings
   insecure_tls: boolean
   attack_mode?: boolean
+  build_limits: BuildLimitsSettings
 }
 
 /**

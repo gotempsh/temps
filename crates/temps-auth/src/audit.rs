@@ -134,6 +134,13 @@ pub struct OidcProviderCreatedAudit {
     pub template: String,
     pub enabled: bool,
     pub jit_provisioning: bool,
+    /// Records whether the provider was created with the
+    /// `email_verified` claim gate disabled. Worth a dedicated field
+    /// in the audit row because it's the single most security-relevant
+    /// knob on an OIDC provider — an auditor reviewing "why did a
+    /// non-Okta user get an account auto-linked?" should be able to
+    /// answer it from this payload alone.
+    pub trust_idp_email: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

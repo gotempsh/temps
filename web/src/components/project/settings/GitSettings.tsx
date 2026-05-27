@@ -34,6 +34,7 @@ import {
 } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import GithubIcon from '@/icons/Github'
+import GitlabIcon from '@/icons/Gitlab'
 import { cn } from '@/lib/utils'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import {
@@ -310,8 +311,14 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
     )
   }
 
+  // Build a link to the upstream repo. Prefer the stored git_url; fall back
+  // to a provider-aware constructed URL so GitLab projects don't land on
+  // github.com/<owner>/<repo> when git_url wasn't populated.
   const ghHref =
-    project.git_url || `https://github.com/${project.repo_owner}/${project.repo_name}`
+    project.git_url ||
+    (currentProvider?.provider_type === 'gitlab'
+      ? `https://gitlab.com/${project.repo_owner}/${project.repo_name}`
+      : `https://github.com/${project.repo_owner}/${project.repo_name}`)
 
   // Helper for displaying short SHA
   const shortSha = (sha: string) => sha?.slice(0, 7)
@@ -325,7 +332,11 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
         <CardContent className="p-6 space-y-4">
           <div className="flex items-start gap-4">
             <div className="flex size-10 shrink-0 items-center justify-center rounded-md border bg-muted/40">
-              <GithubIcon className="size-5" />
+              {currentProvider?.provider_type === 'gitlab' ? (
+                <GitlabIcon className="size-5" />
+              ) : (
+                <GithubIcon className="size-5" />
+              )}
             </div>
             <div className="flex-1 min-w-0 space-y-1">
               <div className="flex flex-wrap items-center gap-2">

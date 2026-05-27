@@ -293,6 +293,7 @@ function ProviderEditor({
     group_claim: string
     role_claim: string
     default_role: string
+    trust_idp_email: boolean
   }) => void
   saving: boolean
   onTest: () => void
@@ -326,6 +327,7 @@ function ProviderEditor({
       group_claim: form.group_claim.trim(),
       role_claim: form.role_claim.trim(),
       default_role: form.default_role,
+      trust_idp_email: form.trust_idp_email,
     })
   }
 

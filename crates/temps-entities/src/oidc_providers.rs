@@ -21,6 +21,14 @@ pub struct Model {
     pub group_claim: String,
     pub role_claim: String,
     pub default_role: String,
+    /// When true, `resolve_user` skips the `email_verified` claim gate
+    /// before linking or JIT-provisioning users. Only safe for IdPs
+    /// where an administrator controls user provisioning (corporate
+    /// Okta, Azure AD). Defaults false; admins opt in per provider via
+    /// the OIDC provider edit form. See
+    /// `temps_auth::oidc_service::resolve_user` for the security
+    /// rationale this flag bypasses.
+    pub trust_idp_email: bool,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }

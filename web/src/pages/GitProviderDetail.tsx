@@ -144,17 +144,18 @@ export default function GitProviderDetail() {
 
   const deleteMutation = useMutation({
     ...deleteGitProviderMutation(),
+    // Failures surface via the global mutation error handler in App.tsx,
+    // which renders Problem Details as a toast: errorTitle becomes the
+    // toast title and the API's `detail` becomes the description (e.g.
+    // "Cannot delete provider X because it has N connection(s)").
+    meta: { errorTitle: 'Failed to delete provider' },
     onSuccess: () => {
       toast.success('Git provider deleted successfully')
       queryClient.invalidateQueries({ queryKey: ['listGitProviders'] })
       queryClient.invalidateQueries({ queryKey: ['listConnections'] })
-      setShowDeleteDialog(false)
       navigate('/git-providers')
     },
-    onError: (err: Error) => {
-      showError(`Failed to delete provider: ${err?.message || 'Unknown error'}`)
-      setShowDeleteDialog(false)
-    },
+    onSettled: () => setShowDeleteDialog(false),
   })
 
   const handleDelete = () => {

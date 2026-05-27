@@ -267,6 +267,13 @@ pub struct ProjectResponse {
     pub attack_mode: bool,
     /// Enable automatic preview environment creation for each branch
     pub enable_preview_environments: bool,
+    /// When true, newly-created preview environments default to on-demand mode
+    /// (containers stop after the configured idle timeout to save resources).
+    pub preview_envs_on_demand: bool,
+    /// Idle timeout (seconds) for on-demand preview environments.
+    pub preview_envs_idle_timeout_seconds: i32,
+    /// Wake timeout (seconds) for on-demand preview environments.
+    pub preview_envs_wake_timeout_seconds: i32,
     /// Source type for deployments (git, docker_image, or static_files)
     pub source_type: SourceType,
     /// GitLab webhook ID installed on the connected repository.
@@ -303,6 +310,9 @@ impl ProjectResponse {
             git_url: project.git_url,
             attack_mode: project.attack_mode,
             enable_preview_environments: project.enable_preview_environments,
+            preview_envs_on_demand: project.preview_envs_on_demand,
+            preview_envs_idle_timeout_seconds: project.preview_envs_idle_timeout_seconds,
+            preview_envs_wake_timeout_seconds: project.preview_envs_wake_timeout_seconds,
             source_type: project.source_type,
             gitlab_webhook_id: project.gitlab_webhook_id,
             deployment_config: DeploymentConfig {
@@ -517,6 +527,12 @@ pub struct UpdateProjectSettingsRequest {
     pub attack_mode: Option<bool>,
     /// Enable automatic preview environment creation for each branch
     pub enable_preview_environments: Option<bool>,
+    /// When true, newly-created preview environments default to on-demand mode.
+    pub preview_envs_on_demand: Option<bool>,
+    /// Idle timeout (seconds, 60..=86400) for on-demand preview environments.
+    pub preview_envs_idle_timeout_seconds: Option<i32>,
+    /// Wake timeout (seconds, 5..=120) for on-demand preview environments.
+    pub preview_envs_wake_timeout_seconds: Option<i32>,
     /// Preset-specific configuration (e.g., Dockerfile path for Docker preset)
     ///
     /// Example for Dockerfile preset:

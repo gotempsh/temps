@@ -42,6 +42,20 @@ pub struct Model {
     pub attack_mode: bool,
     /// Enable automatic preview environment creation for each branch
     pub enable_preview_environments: bool,
+    /// When true, preview environments auto-created for branches are
+    /// configured in on-demand mode (containers stopped after
+    /// `preview_envs_idle_timeout_seconds` of inactivity).
+    /// Only applies to newly-created previews.
+    #[sea_orm(default_value = "false")]
+    pub preview_envs_on_demand: bool,
+    /// Idle timeout (seconds) applied to on-demand preview environments.
+    /// Only used when `preview_envs_on_demand` is true.
+    #[sea_orm(default_value = "300")]
+    pub preview_envs_idle_timeout_seconds: i32,
+    /// Wake timeout (seconds) applied to on-demand preview environments.
+    /// Only used when `preview_envs_on_demand` is true.
+    #[sea_orm(default_value = "30")]
+    pub preview_envs_wake_timeout_seconds: i32,
     /// Source type - determines how deployments are triggered and executed
     /// Defaults to 'git' for backward compatibility
     #[sea_orm(default_value = "git")]

@@ -888,11 +888,12 @@ WHERE project_id = $1
         ];
         let mut values: Vec<sea_orm::Value> =
             vec![project_id.into(), start_date.into(), end_date.into()];
-        let param_index = 4;
+        let mut param_index = 4;
 
         if let Some(env_id) = environment_id {
             where_conditions.push(format!("environment_id = ${}", param_index));
             values.push(env_id.into());
+            param_index += 1;
         }
 
         // Determine aggregation based on level

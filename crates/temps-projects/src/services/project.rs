@@ -660,8 +660,31 @@ impl ProjectService {
         directory: Option<String>,
         attack_mode: Option<bool>,
         enable_preview_environments: Option<bool>,
+        preview_envs_on_demand: Option<bool>,
+        preview_envs_idle_timeout_seconds: Option<i32>,
+        preview_envs_wake_timeout_seconds: Option<i32>,
         preset_config: Option<serde_json::Value>,
     ) -> Result<Project, ProjectError> {
+        // Validate preview env on-demand timeouts before touching the DB.
+        // Mirrors DeploymentConfig::validate so the project-level defaults are
+        // never out of range.
+        if let Some(idle) = preview_envs_idle_timeout_seconds {
+            if !(60..=86400).contains(&idle) {
+                return Err(ProjectError::InvalidInput(format!(
+                    "preview_envs_idle_timeout_seconds {} is not in valid range (60-86400)",
+                    idle
+                )));
+            }
+        }
+        if let Some(wake) = preview_envs_wake_timeout_seconds {
+            if !(5..=120).contains(&wake) {
+                return Err(ProjectError::InvalidInput(format!(
+                    "preview_envs_wake_timeout_seconds {} is not in valid range (5-120)",
+                    wake
+                )));
+            }
+        }
+
         // Get the current project
         let mut project = projects::Entity::find_by_id(project_id)
             .one(self.db.as_ref())
@@ -771,7 +794,10 @@ impl ProjectService {
         }
 
         // Update preview environment settings if any are provided
-        let needs_preview_update = enable_preview_environments.is_some();
+        let needs_preview_update = enable_preview_environments.is_some()
+            || preview_envs_on_demand.is_some()
+            || preview_envs_idle_timeout_seconds.is_some()
+            || preview_envs_wake_timeout_seconds.is_some();
 
         if needs_preview_update {
             // Reload project to ensure we have the latest state
@@ -787,6 +813,15 @@ impl ProjectService {
 
             if let Some(enable_preview) = enable_preview_environments {
                 active_project.enable_preview_environments = Set(enable_preview);
+            }
+            if let Some(on_demand) = preview_envs_on_demand {
+                active_project.preview_envs_on_demand = Set(on_demand);
+            }
+            if let Some(idle) = preview_envs_idle_timeout_seconds {
+                active_project.preview_envs_idle_timeout_seconds = Set(idle);
+            }
+            if let Some(wake) = preview_envs_wake_timeout_seconds {
+                active_project.preview_envs_wake_timeout_seconds = Set(wake);
             }
 
             active_project.update(self.db.as_ref()).await?;
@@ -1662,6 +1697,9 @@ impl ProjectService {
             deployment_config: deployment_config.clone(),
             attack_mode: db_project.attack_mode,
             enable_preview_environments: db_project.enable_preview_environments,
+            preview_envs_on_demand: db_project.preview_envs_on_demand,
+            preview_envs_idle_timeout_seconds: db_project.preview_envs_idle_timeout_seconds,
+            preview_envs_wake_timeout_seconds: db_project.preview_envs_wake_timeout_seconds,
             source_type: db_project.source_type,
             gitlab_webhook_id: db_project.gitlab_webhook_id,
         }
@@ -2181,6 +2219,9 @@ mod tests {
                 None,
                 None,
                 Some(Preset::Nixpacks.to_string()),
+                None,
+                None,
+                None,
                 None,
                 None,
                 None,

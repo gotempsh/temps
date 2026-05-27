@@ -52,6 +52,57 @@ pub struct AppSettings {
     /// internet must keep this `false` — otherwise a MitM steals the join token.
     #[serde(default)]
     pub insecure_tls: bool,
+
+    /// Build-time resource limits applied on the control plane to prevent
+    /// `docker build` from saturating host CPU/RAM. Worker nodes are
+    /// intentionally NOT subject to these limits (each worker is dedicated
+    /// hardware that already has its own per-host headroom).
+    pub build_limits: BuildLimitsSettings,
+}
+
+/// Control-plane build resource limits.
+///
+/// Caps how many builds run concurrently AND how much CPU/memory each build
+/// is allowed to consume. A single global semaphore in the deployer crate
+/// gates every `DockerRuntime::build_image` call to `max_concurrent`. When
+/// the semaphore is full, additional builds queue and wait — they do not
+/// fail. Per-build CPU/memory caps are forwarded to Docker via
+/// `BuildImageOptions { memory, cpuquota, cpuperiod }`.
+///
+/// `cpu_limit_cores = 0.0` or `memory_limit_mb = 0` means "no explicit cap"
+/// — fall back to the legacy 50%-of-host heuristic for backwards
+/// compatibility with operators who never visit the settings page.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct BuildLimitsSettings {
+    /// Maximum number of `docker build` operations allowed to run at the
+    /// same time on the control plane. Additional builds queue. Min 1.
+    #[schema(minimum = 1, example = 2)]
+    pub max_concurrent: u32,
+
+    /// CPU cores allowed per build (float, e.g. 2.0 = 2 cores, 0.5 = half
+    /// a core). 0 means "use the legacy 50%-of-host default".
+    #[schema(minimum = 0.0, example = 2.0)]
+    pub cpu_limit_cores: f32,
+
+    /// Memory allowed per build, in megabytes. 0 means "use the legacy
+    /// 50%-of-host default". Docker enforces this as a hard cap — builds
+    /// that exceed it OOM-kill.
+    #[schema(minimum = 0, example = 2048)]
+    pub memory_limit_mb: u32,
+}
+
+impl Default for BuildLimitsSettings {
+    fn default() -> Self {
+        Self {
+            max_concurrent: 2,
+            // 0 = inherit the legacy 50%-of-host heuristic so existing
+            // installs see no behaviour change until an operator sets a
+            // real value via the settings page.
+            cpu_limit_cores: 0.0,
+            memory_limit_mb: 0,
+        }
+    }
 }
 
 /// Docker container log rotation settings
@@ -398,6 +449,7 @@ impl Default for AppSettings {
             preview_gateway: PreviewGatewaySettings::default(),
             ai_config: AiConfigSettings::default(),
             insecure_tls: false,
+            build_limits: BuildLimitsSettings::default(),
         }
     }
 }

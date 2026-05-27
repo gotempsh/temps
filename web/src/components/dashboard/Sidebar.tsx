@@ -168,6 +168,7 @@ const settingsGroups: SettingsGroupDef[] = [
     items: [
       { title: 'Load Balancer', url: '/settings/load-balancer', icon: Server },
       { title: 'Docker Registry', url: '/settings/docker-registry', icon: Boxes },
+      { title: 'Build Limits', url: '/settings/build-limits', icon: Gauge },
       { title: 'Worker Nodes', url: '/settings/nodes', icon: Network },
       { title: 'Plugins', url: '/settings/plugins', icon: Puzzle },
     ],

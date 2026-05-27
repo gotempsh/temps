@@ -69,6 +69,10 @@ pub struct OidcProviderResponse {
     pub group_claim: String,
     pub role_claim: String,
     pub default_role: String,
+    /// When true, the resolver skips the `email_verified` claim gate
+    /// during SSO login. Only safe for IdPs where an admin controls
+    /// user provisioning — see `oidc_providers::Model::trust_idp_email`.
+    pub trust_idp_email: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -91,6 +95,13 @@ pub struct CreateOidcProviderRequest {
     pub role_claim: String,
     #[serde(default = "default_role")]
     pub default_role: String,
+    /// Defaults false. Set to true only for IdPs where an admin
+    /// controls user provisioning (corporate Okta, Azure AD) and
+    /// self-signup of arbitrary emails is not possible — see the
+    /// `trust_idp_email` field on `oidc_providers::Model` for the
+    /// security tradeoff this enables.
+    #[serde(default)]
+    pub trust_idp_email: bool,
 }
 
 fn default_scopes() -> String {
@@ -130,6 +141,7 @@ pub struct UpdateOidcProviderRequest {
     pub group_claim: Option<String>,
     pub role_claim: Option<String>,
     pub default_role: Option<String>,
+    pub trust_idp_email: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -207,6 +219,7 @@ pub fn provider_to_response(
         group_claim: provider.group_claim.clone(),
         role_claim: provider.role_claim.clone(),
         default_role: provider.default_role.clone(),
+        trust_idp_email: provider.trust_idp_email,
     }
 }
 
@@ -259,6 +272,67 @@ mod tests {
         // All non-alphanumeric name → pure 8-char hash
         let slug = derive_provider_slug(5, "---");
         assert_eq!(slug.len(), 8, "pure hash fallback: {slug}");
+    }
+
+    #[test]
+    fn create_request_trust_idp_email_defaults_false() {
+        // SECURITY-CRITICAL: a missing field must default to `false`,
+        // so an admin POSTing an existing payload (e.g. via the API)
+        // can never accidentally end up with the email_verified gate
+        // disabled. If this test ever fails because someone changed
+        // the default to `true`, that change reintroduces the
+        // account-takeover vector documented on `oidc_providers::Model::trust_idp_email`.
+        let json = r#"{
+            "name": "Corp",
+            "issuer_url": "https://idp.example.com",
+            "client_id": "abc",
+            "client_secret": "shh"
+        }"#;
+        let req: CreateOidcProviderRequest = serde_json::from_str(json).unwrap();
+        assert!(
+            !req.trust_idp_email,
+            "trust_idp_email must default to false when omitted"
+        );
+    }
+
+    #[test]
+    fn create_request_trust_idp_email_round_trip_true() {
+        // Confirms the field is wired through serde (typo in
+        // `#[serde]` attrs would silently drop it).
+        let json = r#"{
+            "name": "Corp",
+            "issuer_url": "https://idp.example.com",
+            "client_id": "abc",
+            "client_secret": "shh",
+            "trust_idp_email": true
+        }"#;
+        let req: CreateOidcProviderRequest = serde_json::from_str(json).unwrap();
+        assert!(req.trust_idp_email);
+    }
+
+    #[test]
+    fn provider_to_response_round_trips_trust_idp_email() {
+        let model = temps_entities::oidc_providers::Model {
+            id: 7,
+            name: "okta".into(),
+            issuer_url: "https://gala.okta.com".into(),
+            client_id: "client".into(),
+            client_secret_encrypted: "ciphertext".into(),
+            scopes: "openid email profile".into(),
+            jit_provisioning: true,
+            enabled: true,
+            template: "okta".into(),
+            group_claim: "groups".into(),
+            role_claim: "roles".into(),
+            default_role: "user".into(),
+            trust_idp_email: true,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let resp = provider_to_response(&model);
+        assert!(resp.trust_idp_email);
+        // Sanity: secret is always masked.
+        assert_eq!(resp.client_secret, "***");
     }
 
     #[test]

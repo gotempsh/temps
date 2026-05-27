@@ -522,6 +522,9 @@ pub async fn update_project_settings(
             settings.directory.clone(),
             settings.attack_mode,
             settings.enable_preview_environments,
+            settings.preview_envs_on_demand,
+            settings.preview_envs_idle_timeout_seconds,
+            settings.preview_envs_wake_timeout_seconds,
             settings.preset_config.clone(),
         )
         .await

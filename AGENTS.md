@@ -83,6 +83,28 @@ Already in CLAUDE.md, but reinforced here because it's a hard rule:
 `revert`. Scope is the affected crate or area (`backup`, `web`,
 `deployments`, etc.).
 
+## Per-record config columns, not env vars
+
+When adding a new runtime knob, default to a column on the relevant
+entity table — never a new `TEMPS_*` env var. Examples of the kind of
+config this covers: per-OIDC-provider `trust_idp_email`, per-project
+feature toggles, per-service quota overrides.
+
+Why:
+- Env vars are global and process-scoped. Changing one for *one*
+  provider/project/tenant forces a binary restart and accidentally
+  changes everyone else's behaviour too.
+- DB columns are per-record, mutable at runtime via the API/UI, and
+  get audit-logged through the normal handler write path.
+- The setting survives binary upgrades and re-installs without
+  operators having to re-export shell variables.
+
+If the knob is *truly* installation-wide (e.g. the listen address of
+the binary itself), env vars are still fine — but the bar is "this
+setting can only have one value per running process, ever". Almost
+nothing meets that bar. If you're tempted to add `TEMPS_FOO_BAR=1`,
+ask first whether `entity.foo_bar bool` would do the job.
+
 ## Don't sweep unrelated dirty files into your commits
 
 If you arrive at a working tree that's already dirty (because a

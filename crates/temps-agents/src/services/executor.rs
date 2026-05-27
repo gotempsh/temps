@@ -4074,6 +4074,9 @@ mod tests {
             gitlab_webhook_signing_token: None,
             attack_mode: false,
             enable_preview_environments: true,
+            preview_envs_on_demand: false,
+            preview_envs_idle_timeout_seconds: 300,
+            preview_envs_wake_timeout_seconds: 30,
             source_type: temps_entities::source_type::SourceType::Git,
         }
     }

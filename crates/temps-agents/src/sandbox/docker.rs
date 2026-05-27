@@ -2511,7 +2511,22 @@ fn sandbox_egress_drop_ranges() -> Vec<(&'static str, &'static str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
     use std::time::Duration;
+    use tokio::sync::Mutex;
+
+    /// Serializes Docker integration tests that mutate the shared sandbox
+    /// image (`ghcr.io/gotempsh/temps-sandbox-node:<version>`). Without
+    /// this, `test_pull_fallback_on_missing_hub_image` (which deletes the
+    /// image, forces a rebuild, then inspects it) can race with
+    /// `test_docker_sandbox_e2e_lifecycle` (which creates a container
+    /// from that same image) and produce
+    ///   `unable to find image "sha256:..."`
+    /// when the delete lands mid-create.
+    fn docker_image_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn test_container_name_format() {
@@ -2696,6 +2711,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_docker_sandbox_e2e_lifecycle() {
+        // Serialize against other tests that delete/rebuild the shared
+        // sandbox image; see `docker_image_lock`.
+        let _guard = docker_image_lock().lock().await;
         // Full lifecycle: create → exec → is_alive → recover → destroy
         let docker = match Docker::connect_with_local_defaults() {
             Ok(d) => d,
@@ -2958,6 +2976,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_pull_fallback_on_missing_hub_image() {
+        // Serialize against other tests that build/use the shared sandbox
+        // image; this test deletes it mid-suite which would otherwise race
+        // with `test_docker_sandbox_e2e_lifecycle` and produce a
+        // `unable to find image "sha256:..."` container-create failure.
+        let _guard = docker_image_lock().lock().await;
         // Verify that ensure_image_for_runtime succeeds even when the
         // Docker Hub image doesn't exist — it should fall back to a
         // local build. We test by pointing at a non-existent hub image
@@ -2977,7 +3000,14 @@ mod tests {
 
         let provider = DockerSandboxProvider::new(docker.clone(), DockerSandboxConfig::default());
 
-        let local_image = format!("temps-sandbox-node:{SANDBOX_IMAGE_VERSION}");
+        // `ensure_image_for_runtime` tags both the pulled and the
+        // locally-built image with the fully-qualified GHCR name including
+        // the channel suffix — that's the string we must remove beforehand
+        // and inspect afterwards. An earlier version of this test used the
+        // short `temps-sandbox-node:{version}` name; that name has never
+        // been produced by the provider, so the post-build inspect would
+        // always fail.
+        let local_image = image_name_for_runtime("node");
 
         // Delete the local image first (if any) so we exercise the
         // pull→fail→build path. Ignore errors if it doesn't exist.
@@ -2999,12 +3029,15 @@ mod tests {
             result.err()
         );
 
-        // Image should now exist locally
+        // Image should now exist locally under its GHCR-qualified name.
         assert!(docker.inspect_image(&local_image).await.is_ok());
     }
 
     #[tokio::test]
     async fn test_kill_processes_term_and_kill() {
+        // Serialize against other tests that build/delete the shared
+        // sandbox image; see `docker_image_lock`.
+        let _guard = docker_image_lock().lock().await;
         // Integration test: create a sandbox, spawn a `sleep` process,
         // kill it with SIGTERM, verify it's gone. Then spawn another,
         // kill with SIGKILL, verify it's gone.

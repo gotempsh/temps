@@ -1,6 +1,7 @@
 use anyhow::Result;
 use hickory_resolver::config::*;
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::system_conf::read_system_conf;
 use hickory_resolver::Resolver;
 
 /// Result of a DNS A record lookup
@@ -28,20 +29,35 @@ impl DnsService {
         Self
     }
 
-    /// Create a fresh resolver with no caching
+    /// Create a fresh resolver with no caching.
+    ///
+    /// `ResolverConfig::default()` in hickory 0.26 has no name servers —
+    /// it returns an empty config, so a resolver built from it fails
+    /// every query with `no connections available`. The previous
+    /// (hickory 0.25) `ResolverConfig::default()` mirrored Google's
+    /// public DNS, which is why this regressed silently during the 0.26
+    /// upgrade. Read `/etc/resolv.conf` first (so we honour the user's
+    /// configured resolvers in production); fall back to Cloudflare's
+    /// public 1.1.1.1 / 1.0.0.1 if the system file is unreadable or
+    /// empty (containers, restricted CI environments).
     async fn create_resolver(&self) -> Result<(Resolver<TokioRuntimeProvider>, Vec<String>)> {
-        let config = ResolverConfig::default();
-        let mut opts = ResolverOpts::default();
+        let (mut config, mut opts) = match read_system_conf() {
+            Ok((cfg, opts)) if !cfg.name_servers().is_empty() => (cfg, opts),
+            _ => {
+                let mut cfg = ResolverConfig::default();
+                cfg.add_name_server(NameServerConfig::udp_and_tcp(std::net::IpAddr::V4(
+                    std::net::Ipv4Addr::new(1, 1, 1, 1),
+                )));
+                cfg.add_name_server(NameServerConfig::udp_and_tcp(std::net::IpAddr::V4(
+                    std::net::Ipv4Addr::new(1, 0, 0, 1),
+                )));
+                (cfg, ResolverOpts::default())
+            }
+        };
 
         // Disable caching to get fresh data
         opts.cache_size = 0;
         opts.use_hosts_file = ResolveHosts::Never;
-
-        let resolver =
-            Resolver::builder_with_config(config.clone(), TokioRuntimeProvider::default())
-                .with_options(opts)
-                .build()
-                .map_err(|e| anyhow::anyhow!("failed to build DNS resolver: {}", e))?;
 
         // Extract DNS server addresses (hickory 0.26: NameServerConfig.ip).
         let dns_servers: Vec<String> = config
@@ -49,6 +65,14 @@ impl DnsService {
             .iter()
             .map(|ns| ns.ip.to_string())
             .collect();
+
+        // `config` ends here — clone for the builder isn't necessary since we
+        // already snapshotted `dns_servers`; pass it by move.
+        let _ = &mut config; // silence "unused mut" if optimised away
+        let resolver = Resolver::builder_with_config(config, TokioRuntimeProvider::default())
+            .with_options(opts)
+            .build()
+            .map_err(|e| anyhow::anyhow!("failed to build DNS resolver: {}", e))?;
 
         Ok((resolver, dns_servers))
     }

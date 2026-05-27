@@ -65,6 +65,27 @@ pub struct DockerRuntime {
     /// which is tmpfs on most Linux distros and got wiped on every
     /// reboot, forcing a redeploy. Override via [`Self::with_secrets_root`].
     secrets_root: PathBuf,
+    /// Optional global cap on concurrent `build_image` calls. Set via
+    /// [`Self::with_build_limits`] on the control plane to prevent N
+    /// simultaneous deploys from each grabbing 50% of host CPU/RAM and
+    /// taking down the box. None on worker nodes and in tests — they get
+    /// the legacy unbounded behaviour.
+    build_semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    /// Per-build resource override forwarded to `BuildImageOptions`. None
+    /// preserves the legacy 50%-of-host heuristic in `get_resource_limits`.
+    build_resource_override: Option<BuildResourceLimits>,
+}
+
+/// Explicit per-build resource caps, set by the control plane from
+/// `AppSettings.build_limits`. Both fields use the same units the rest of
+/// the deployer code already uses (cores + MB) so there's no conversion
+/// surface between settings and the Docker API call.
+#[derive(Debug, Clone, Copy)]
+pub struct BuildResourceLimits {
+    /// CPU cores allowed per build, e.g. `2.0` = 2 full cores.
+    pub cpu_cores: f32,
+    /// Memory allowed per build, in megabytes.
+    pub memory_mb: u32,
 }
 
 /// Map a POSIX exit code (>= 128 means "killed by signal N - 128") to a human
@@ -336,7 +357,31 @@ impl DockerRuntime {
             overlay_dns_slot: None,
             overlay_peers: None,
             secrets_root,
+            build_semaphore: None,
+            build_resource_override: None,
         }
+    }
+
+    /// Apply build concurrency + per-build resource caps. Called by the
+    /// control-plane deployer plugin after reading `AppSettings.build_limits`;
+    /// worker nodes and tests leave this unset and inherit the legacy
+    /// 50%-of-host heuristic.
+    ///
+    /// `max_concurrent` is clamped to a minimum of 1 — a zero-size semaphore
+    /// would deadlock every build. `resource_limits` is only honoured when
+    /// `cpu_cores > 0` AND `memory_mb > 0`; either zero means "leave that
+    /// dimension on the legacy heuristic" so admins can tune one without
+    /// the other.
+    pub fn with_build_limits(
+        mut self,
+        max_concurrent: u32,
+        resource_limits: Option<BuildResourceLimits>,
+    ) -> Self {
+        let permits = max_concurrent.max(1) as usize;
+        self.build_semaphore = Some(Arc::new(tokio::sync::Semaphore::new(permits)));
+        self.build_resource_override =
+            resource_limits.filter(|r| r.cpu_cores > 0.0 && r.memory_mb > 0);
+        self
     }
 
     /// Override the secrets host root. Tests use this to scope writes to
@@ -609,6 +654,31 @@ impl DockerRuntime {
         (cpu_limit, memory_limit)
     }
 
+    /// Resolve the per-build `(memory_bytes, cpu_quota_us, cpu_period_us)`
+    /// triplet that gets forwarded to `BuildImageOptions`.
+    ///
+    /// Priority:
+    /// 1. Explicit override set via [`Self::with_build_limits`] (control
+    ///    plane reads `AppSettings.build_limits`).
+    /// 2. Legacy 50%-of-host heuristic in `get_resource_limits` — kept so
+    ///    worker nodes, tests, and fresh installs that haven't visited
+    ///    the settings page see the same behaviour as before.
+    ///
+    /// Always uses `cpu_period_us = 100_000` (100 ms) — Docker's standard
+    /// period. CPU quota for N cores is `N * cpu_period_us`.
+    fn resolve_build_resource_caps(&self) -> (i64, i32, i32) {
+        const CPU_PERIOD_US: i32 = 100_000;
+        if let Some(override_caps) = self.build_resource_override {
+            let memory_bytes = (override_caps.memory_mb as i64) * 1024 * 1024;
+            let cpu_quota_us = (override_caps.cpu_cores * CPU_PERIOD_US as f32).round() as i32;
+            return (memory_bytes, cpu_quota_us, CPU_PERIOD_US);
+        }
+        let (cpu_cores, memory_gb) = Self::get_resource_limits();
+        let memory_bytes = (memory_gb as i64) * 1024 * 1024 * 1024;
+        let cpu_quota_us = (cpu_cores as i32) * CPU_PERIOD_US;
+        (memory_bytes, cpu_quota_us, CPU_PERIOD_US)
+    }
+
     /// Detect the native platform for Docker builds
     /// Returns the platform string in the format "linux/arch"
     fn detect_native_platform() -> String {
@@ -717,6 +787,30 @@ impl ImageBuilder for DockerRuntime {
             }
         );
 
+        // Gate on the build concurrency semaphore when one is configured.
+        // The permit is held for the entire build duration — dropped at end
+        // of function via `_build_permit` so the next queued build can
+        // start as soon as this one finishes (success OR failure). When no
+        // semaphore is set (worker nodes, tests), builds run unbounded as
+        // before.
+        let _build_permit = if let Some(sem) = self.build_semaphore.as_ref() {
+            let available = sem.available_permits();
+            if available == 0 {
+                info!(
+                    "Build for {} queued: all build slots in use, waiting for a slot",
+                    request.image_name
+                );
+            }
+            Some(
+                sem.clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|e| BuilderError::Other(format!("Build semaphore closed: {}", e)))?,
+            )
+        } else {
+            None
+        };
+
         let start_time = Instant::now();
 
         self.ensure_network_exists()
@@ -739,7 +833,14 @@ impl ImageBuilder for DockerRuntime {
             build_args.insert(key.to_string(), value.to_string());
         }
 
-        let (cpu_limit, memory_limit) = Self::get_resource_limits();
+        // Resolve effective build caps from settings (or fall back to the
+        // legacy 50%-of-host heuristic when no override is set). Note that
+        // Bollard's `BuildImageOptions.memory` field is `Option<i32>` so
+        // any limit above i32::MAX (≈ 2 GiB) gets silently clamped here —
+        // matches the historical behaviour (the `& 0x7FFFFFFF` mask) and
+        // is a known upstream Bollard limitation.
+        let (memory_bytes, cpu_quota_us, cpu_period_us) = self.resolve_build_resource_caps();
+        let memory_i32 = memory_bytes.min(i32::MAX as i64) as i32;
 
         let mut labels = HashMap::new();
         labels.insert("built-by".to_string(), "temps".to_string());
@@ -767,9 +868,9 @@ impl ImageBuilder for DockerRuntime {
             platform: request
                 .platform
                 .unwrap_or_else(Self::detect_native_platform),
-            memory: Some(((memory_limit * 1024 * 1024 * 1024) & 0x7FFFFFFF) as i32), // Convert GB to bytes
-            cpuquota: Some((cpu_limit * 100000) as i32), // CPU quota in microseconds (cpu_limit * 100ms)
-            cpuperiod: Some(100000),                     // CPU period in microseconds (100ms)
+            memory: Some(memory_i32),
+            cpuquota: Some(cpu_quota_us),
+            cpuperiod: Some(cpu_period_us),
             version: if self.use_buildkit {
                 BuilderVersion::BuilderBuildKit
             } else {
@@ -877,6 +978,29 @@ impl ImageBuilder for DockerRuntime {
             }
         );
 
+        // Gate on the build concurrency semaphore (see build_image above for
+        // the rationale). This is the path the workflow executor actually
+        // uses, so the semaphore would be ineffective without this branch.
+        let _build_permit = if let Some(sem) = self.build_semaphore.as_ref() {
+            if sem.available_permits() == 0 {
+                info!(
+                    "Build for {} queued: all build slots in use, waiting for a slot",
+                    request.image_name
+                );
+                if let Some(ref cb) = log_callback {
+                    cb("[BUILD QUEUED] Waiting for an available build slot...".to_string()).await;
+                }
+            }
+            Some(
+                sem.clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|e| BuilderError::Other(format!("Build semaphore closed: {}", e)))?,
+            )
+        } else {
+            None
+        };
+
         let start_time = Instant::now();
 
         self.ensure_network_exists()
@@ -899,7 +1023,8 @@ impl ImageBuilder for DockerRuntime {
             build_args.insert(key.to_string(), value.to_string());
         }
 
-        let (cpu_limit, memory_limit) = Self::get_resource_limits();
+        let (memory_bytes, cpu_quota_us, cpu_period_us) = self.resolve_build_resource_caps();
+        let memory_i32 = memory_bytes.min(i32::MAX as i64) as i32;
 
         let mut labels = HashMap::new();
         labels.insert("built-by".to_string(), "temps".to_string());
@@ -924,9 +1049,9 @@ impl ImageBuilder for DockerRuntime {
             platform: request
                 .platform
                 .unwrap_or_else(Self::detect_native_platform),
-            memory: Some(((memory_limit * 1024 * 1024 * 1024) & 0x7FFFFFFF) as i32), // Convert GB to bytes
-            cpuquota: Some((cpu_limit * 100000) as i32), // CPU quota in microseconds (cpu_limit * 100ms)
-            cpuperiod: Some(100000),                     // CPU period in microseconds (100ms)
+            memory: Some(memory_i32),
+            cpuquota: Some(cpu_quota_us),
+            cpuperiod: Some(cpu_period_us),
             version: if self.use_buildkit {
                 BuilderVersion::BuilderBuildKit
             } else {
@@ -3025,5 +3150,84 @@ CMD ["cat", "/hello.txt"]
             Some(("cache", 10 * 1024 * 1024 * 1024)),
         );
         assert_eq!(memory_usage_excluding_cache(&mem).unwrap(), 1024 * 1024);
+    }
+
+    /// Without an override, build caps follow the legacy 50%-of-host
+    /// heuristic — preserving behaviour for worker nodes and tests that
+    /// don't go through the deployer plugin.
+    #[test]
+    fn resolve_build_resource_caps_falls_back_to_legacy_heuristic() {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => Arc::new(d),
+            Err(_) => return, // No docker, skip
+        };
+        let rt = DockerRuntime::new(docker, false, "test-network".to_string());
+        let (memory_bytes, cpu_quota_us, cpu_period_us) = rt.resolve_build_resource_caps();
+
+        // Legacy heuristic uses GB integer × 1 GiB. So memory_bytes must
+        // be a multiple of 1 GiB, and cpu_quota_us a multiple of 100_000.
+        assert_eq!(cpu_period_us, 100_000);
+        assert_eq!(memory_bytes % (1024 * 1024 * 1024), 0);
+        assert_eq!(cpu_quota_us % 100_000, 0);
+        // Heuristic enforces a 2 core / 2 GiB floor.
+        assert!(memory_bytes >= 2 * 1024 * 1024 * 1024);
+        assert!(cpu_quota_us >= 200_000); // 2 cores at 100ms period
+    }
+
+    /// An explicit override (control plane reading `AppSettings.build_limits`)
+    /// produces exact byte/microsecond values regardless of host size.
+    #[test]
+    fn resolve_build_resource_caps_honours_override() {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => Arc::new(d),
+            Err(_) => return, // No docker, skip
+        };
+        let rt = DockerRuntime::new(docker, false, "test-network".to_string()).with_build_limits(
+            4,
+            Some(BuildResourceLimits {
+                cpu_cores: 1.5,
+                memory_mb: 1024,
+            }),
+        );
+        let (memory_bytes, cpu_quota_us, cpu_period_us) = rt.resolve_build_resource_caps();
+        assert_eq!(memory_bytes, 1024 * 1024 * 1024); // 1024 MB exactly
+        assert_eq!(cpu_quota_us, 150_000); // 1.5 × 100ms
+        assert_eq!(cpu_period_us, 100_000);
+    }
+
+    /// `with_build_limits(0, ..)` must NOT create a zero-permit semaphore
+    /// — that would deadlock every build. Clamp to 1.
+    #[test]
+    fn with_build_limits_clamps_max_concurrent_to_at_least_one() {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => Arc::new(d),
+            Err(_) => return,
+        };
+        let rt = DockerRuntime::new(docker, false, "test-network".to_string())
+            .with_build_limits(0, None);
+        let sem = rt
+            .build_semaphore
+            .as_ref()
+            .expect("with_build_limits sets a semaphore");
+        assert_eq!(sem.available_permits(), 1);
+    }
+
+    /// A partial override (cpu set, memory zero) must be discarded entirely
+    /// so admins don't accidentally pin only one dimension and starve the
+    /// build on the other.
+    #[test]
+    fn with_build_limits_drops_override_when_either_dimension_is_zero() {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => Arc::new(d),
+            Err(_) => return,
+        };
+        let rt = DockerRuntime::new(docker, false, "test-network".to_string()).with_build_limits(
+            2,
+            Some(BuildResourceLimits {
+                cpu_cores: 1.5,
+                memory_mb: 0,
+            }),
+        );
+        assert!(rt.build_resource_override.is_none());
     }
 }

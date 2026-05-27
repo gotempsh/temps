@@ -67,9 +67,32 @@ const deploymentConfigSchema = z.object({
 
 type DeploymentConfigFormValues = z.infer<typeof deploymentConfigSchema>
 
-const previewEnvironmentsSchema = z.object({
-  enablePreviewEnvironments: z.boolean(),
-})
+const previewEnvironmentsSchema = z
+  .object({
+    enablePreviewEnvironments: z.boolean(),
+    previewEnvsOnDemand: z.boolean(),
+    previewEnvsIdleTimeoutSeconds: z.string(),
+    previewEnvsWakeTimeoutSeconds: z.string(),
+  })
+  .superRefine((values, ctx) => {
+    if (!values.previewEnvsOnDemand) return
+    const idle = parseInt(values.previewEnvsIdleTimeoutSeconds, 10)
+    if (Number.isNaN(idle) || idle < 60 || idle > 86400) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['previewEnvsIdleTimeoutSeconds'],
+        message: 'Must be between 60 and 86400 seconds',
+      })
+    }
+    const wake = parseInt(values.previewEnvsWakeTimeoutSeconds, 10)
+    if (Number.isNaN(wake) || wake < 5 || wake > 120) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['previewEnvsWakeTimeoutSeconds'],
+        message: 'Must be between 5 and 120 seconds',
+      })
+    }
+  })
 
 type PreviewEnvironmentsFormValues = z.infer<typeof previewEnvironmentsSchema>
 
@@ -124,8 +147,18 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
     resolver: zodResolver(previewEnvironmentsSchema),
     defaultValues: {
       enablePreviewEnvironments: project?.enable_preview_environments ?? false,
+      previewEnvsOnDemand: project?.preview_envs_on_demand ?? false,
+      previewEnvsIdleTimeoutSeconds: (
+        project?.preview_envs_idle_timeout_seconds ?? 300
+      ).toString(),
+      previewEnvsWakeTimeoutSeconds: (
+        project?.preview_envs_wake_timeout_seconds ?? 30
+      ).toString(),
     },
   })
+
+  const previewEnabled = previewForm.watch('enablePreviewEnvironments')
+  const onDemandEnabled = previewForm.watch('previewEnvsOnDemand')
 
   const handleSaveProject = async (values: ProjectFormValues) => {
     if (!project?.id) return
@@ -204,6 +237,15 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
         path: { project_id: project.id! },
         body: {
           enable_preview_environments: values.enablePreviewEnvironments,
+          preview_envs_on_demand: values.previewEnvsOnDemand,
+          preview_envs_idle_timeout_seconds: parseInt(
+            values.previewEnvsIdleTimeoutSeconds,
+            10
+          ),
+          preview_envs_wake_timeout_seconds: parseInt(
+            values.previewEnvsWakeTimeoutSeconds,
+            10
+          ),
         },
       }),
       {
@@ -562,6 +604,80 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
                   </FormItem>
                 )}
               />
+
+              <FormField
+                control={previewForm.control}
+                name="previewEnvsOnDemand"
+                render={({ field }) => (
+                  <FormItem className="flex flex-row items-center justify-between rounded-lg border p-4">
+                    <div className="space-y-0.5">
+                      <FormLabel className="text-base">
+                        On-Demand Preview Environments
+                      </FormLabel>
+                      <FormDescription>
+                        Save resources by sleeping preview environments when
+                        idle. Containers stop after the idle timeout and start
+                        again on the next request. Applies only to previews
+                        created after this is enabled.
+                      </FormDescription>
+                    </div>
+                    <FormControl>
+                      <Switch
+                        checked={field.value}
+                        onCheckedChange={field.onChange}
+                        disabled={!previewEnabled}
+                      />
+                    </FormControl>
+                  </FormItem>
+                )}
+              />
+
+              {onDemandEnabled && previewEnabled && (
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <FormField
+                    control={previewForm.control}
+                    name="previewEnvsIdleTimeoutSeconds"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Idle timeout (seconds)</FormLabel>
+                        <FormControl>
+                          <Input
+                            type="number"
+                            min={60}
+                            max={86400}
+                            {...field}
+                          />
+                        </FormControl>
+                        <FormDescription>
+                          Seconds of inactivity before containers are stopped.
+                          Min 60, max 86400 (24h). Default 300 (5 min).
+                        </FormDescription>
+                      </FormItem>
+                    )}
+                  />
+                  <FormField
+                    control={previewForm.control}
+                    name="previewEnvsWakeTimeoutSeconds"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Wake timeout (seconds)</FormLabel>
+                        <FormControl>
+                          <Input
+                            type="number"
+                            min={5}
+                            max={120}
+                            {...field}
+                          />
+                        </FormControl>
+                        <FormDescription>
+                          Max time to wait for containers to start on wake.
+                          Min 5, max 120. Default 30.
+                        </FormDescription>
+                      </FormItem>
+                    )}
+                  />
+                </div>
+              )}
             </CardContent>
             <CardFooter>
               <Button type="submit" disabled={updateProjectSettings.isPending}>

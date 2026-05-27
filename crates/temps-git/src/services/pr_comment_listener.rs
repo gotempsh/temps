@@ -202,6 +202,35 @@ impl PrCommentListener {
                     );
                 }
             }
+            Job::DeploymentCancelled(e) => {
+                let deployment = match deployments::Entity::find_by_id(e.deployment_id)
+                    .one(db.as_ref())
+                    .await
+                {
+                    Ok(Some(d)) => d,
+                    Ok(None) => return Ok(()),
+                    Err(_) => return Ok(()),
+                };
+                let branch = match deployment.branch_ref.clone() {
+                    Some(b) if !b.is_empty() => b,
+                    _ => return Ok(()),
+                };
+                let ctx = PreviewCommentContext {
+                    project_id: e.project_id,
+                    environment_id: e.environment_id,
+                    branch,
+                    phase: CommentPhase::Cancelled {
+                        commit_short_sha: short_sha(deployment.commit_sha.as_ref()),
+                        deployment_url: None,
+                    },
+                };
+                if let Err(err) = commenter.upsert_preview_comment(ctx).await {
+                    warn!(
+                        deployment_id = e.deployment_id,
+                        "PR comment (Cancelled) failed: {}", err
+                    );
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -216,7 +245,8 @@ mod tests {
     use sea_orm::{DatabaseBackend, MockDatabase};
     use std::sync::Mutex;
     use temps_core::{
-        DeploymentCreatedJob, DeploymentFailedJob, DeploymentReadyJob, DeploymentSucceededJob,
+        DeploymentCancelledJob, DeploymentCreatedJob, DeploymentFailedJob, DeploymentReadyJob,
+        DeploymentSucceededJob,
     };
 
     #[test]
@@ -527,6 +557,70 @@ mod tests {
             }
             _ => panic!("expected Failed, got {:?}", calls[0].phase),
         }
+    }
+
+    #[tokio::test]
+    async fn cancelled_event_with_branch_triggers_cancelled_comment() {
+        let recorder = RecordingCommenter::new();
+        let commenter: Arc<dyn PrCommenter> = recorder.clone();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![deployment_with_branch(
+                    10,
+                    Some("feature/x"),
+                    Some("abcdef1234"),
+                )]])
+                .into_connection(),
+        );
+
+        let job = Job::DeploymentCancelled(DeploymentCancelledJob {
+            deployment_id: 10,
+            project_id: 42,
+            environment_id: 7,
+            environment_name: "preview".into(),
+        });
+
+        PrCommentListener::handle_job(&commenter, &db, &job)
+            .await
+            .unwrap();
+
+        let calls = recorder.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].branch, "feature/x");
+        match &calls[0].phase {
+            CommentPhase::Cancelled {
+                commit_short_sha,
+                deployment_url,
+            } => {
+                assert_eq!(commit_short_sha, "abcdef1");
+                assert!(deployment_url.is_none());
+            }
+            _ => panic!("expected Cancelled, got {:?}", calls[0].phase),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_event_without_branch_skips_comment() {
+        let recorder = RecordingCommenter::new();
+        let commenter: Arc<dyn PrCommenter> = recorder.clone();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![deployment_with_branch(10, None, Some("abc"))]])
+                .into_connection(),
+        );
+
+        let job = Job::DeploymentCancelled(DeploymentCancelledJob {
+            deployment_id: 10,
+            project_id: 42,
+            environment_id: 7,
+            environment_name: "preview".into(),
+        });
+
+        PrCommentListener::handle_job(&commenter, &db, &job)
+            .await
+            .unwrap();
+
+        assert!(recorder.calls().is_empty());
     }
 
     #[tokio::test]
