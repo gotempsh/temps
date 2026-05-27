@@ -3,7 +3,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use lettre::{
-    message::{header::ContentType, Mailbox},
+    message::{header::ContentType, Mailbox, MultiPart, SinglePart},
     transport::smtp::{authentication::Credentials, client::TlsParametersBuilder},
     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
 };
@@ -464,33 +464,204 @@ impl EmailProvider {
     }
 
     async fn email_health_check(&self) -> Result<bool> {
-        if let Some(mailer) = &self.mailer {
-            let test_email = Message::builder()
-                .from(
-                    format!(
-                        "{} <{}>",
-                        self.from_name.clone().unwrap_or("".to_string()),
-                        self.from_address
-                    )
-                    .parse()?,
-                )
-                .to(self.to_addresses[0].parse()?)
-                .subject("Health Check")
-                .body(String::from("Health check email"))?;
+        let Some(mailer) = &self.mailer else {
+            return Ok(false);
+        };
 
-            match mailer.test_connection().await {
-                Ok(_) => {
-                    mailer.send(test_email).await?;
-                    Ok(true)
-                }
-                Err(e) => {
-                    error!("Email provider health check failed: {}", e);
-                    Ok(false)
-                }
-            }
-        } else {
-            Ok(false)
+        // First, prove the SMTP connection itself works. If this fails we
+        // return Ok(false) (the contract of health_check) rather than bubble
+        // an error — operators see "provider unhealthy" instead of a 500.
+        if let Err(e) = mailer.test_connection().await {
+            error!(
+                "Email provider health check failed at connection stage ({}): {}",
+                self.smtp_host, e
+            );
+            return Ok(false);
         }
+
+        // The send-path needs at least one recipient. Connection-only success
+        // is still a useful signal, so we report healthy without bouncing an
+        // unaddressable email.
+        let Some(recipient) = self.to_addresses.first() else {
+            return Ok(true);
+        };
+        let to_mailbox = match recipient.parse::<Mailbox>() {
+            Ok(m) => m,
+            Err(e) => {
+                error!(
+                    "Health check skipped send: recipient '{}' is not a valid email: {}",
+                    recipient, e
+                );
+                // The connection is fine; the misconfiguration is on the recipient list.
+                return Ok(true);
+            }
+        };
+
+        let from = Mailbox::new(self.from_name.clone(), self.from_address.parse()?);
+        let timestamp = chrono::Utc::now()
+            .format("%b %d, %Y at %H:%M UTC")
+            .to_string();
+        // Best-effort identifier of which Temps instance sent the email.
+        // `TEMPS_HOSTNAME` is set by the deploy scripts; falls back to the
+        // public address if configured, then a generic label.
+        let host = std::env::var("TEMPS_HOSTNAME")
+            .or_else(|_| std::env::var("TEMPS_PUBLIC_HOSTNAME"))
+            .unwrap_or_else(|_| "temps instance".to_string());
+
+        let subject = "[Temps] Notification provider health check";
+        let plain_body = format!(
+            "Temps notification provider health check\n\
+             \n\
+             This is an automated message confirming that the email notification provider \
+             is reachable and authorised to send mail.\n\
+             \n\
+             Sent from:  {host}\n\
+             SMTP host:  {smtp_host}:{smtp_port}\n\
+             From:       {from_address}\n\
+             Timestamp:  {timestamp}\n\
+             \n\
+             If you didn't expect this email, an operator triggered a health check from \
+             the Temps notifications dashboard. No action is required.\n",
+            host = host,
+            smtp_host = self.smtp_host,
+            smtp_port = self.smtp_port,
+            from_address = self.from_address,
+            timestamp = timestamp,
+        );
+        let html_body = Self::render_health_check_email(
+            &host,
+            &self.smtp_host,
+            self.smtp_port,
+            &self.from_address,
+            &timestamp,
+        );
+
+        let message = Message::builder()
+            .from(from)
+            .to(to_mailbox)
+            .subject(subject)
+            .multipart(
+                MultiPart::alternative()
+                    .singlepart(
+                        SinglePart::builder()
+                            .header(ContentType::TEXT_PLAIN)
+                            .body(plain_body),
+                    )
+                    .singlepart(
+                        SinglePart::builder()
+                            .header(ContentType::TEXT_HTML)
+                            .body(html_body),
+                    ),
+            )?;
+
+        match mailer.send(message).await {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                error!(
+                    "Email provider health check failed at send stage ({} → {}): {}",
+                    self.smtp_host, recipient, e
+                );
+                Ok(false)
+            }
+        }
+    }
+
+    /// Render the HTML body for the health-check email. Visually matches the
+    /// regular notification template (`render_notification_email`) so it lands
+    /// in the inbox looking like a real Temps message rather than a debug ping.
+    fn render_health_check_email(
+        host: &str,
+        smtp_host: &str,
+        smtp_port: u16,
+        from_address: &str,
+        timestamp: &str,
+    ) -> String {
+        // "Info" priority palette — same colors as NotificationPriority::Normal.
+        let accent_color = "#2563eb";
+        let bg_color = "#eff6ff";
+        format!(
+            r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Notification provider health check</title>
+</head>
+<body style="margin: 0; padding: 0; background-color: #f3f4f6; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; -webkit-font-smoothing: antialiased;">
+    <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #f3f4f6; padding: 32px 16px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;">
+        <tr><td align="center">
+            <table width="600" cellpadding="0" cellspacing="0" style="max-width: 600px; width: 100%;">
+                <!-- Header -->
+                <tr><td style="padding: 24px 32px; background: #0f172a; border-radius: 8px 8px 0 0;">
+                    <table width="100%" cellpadding="0" cellspacing="0">
+                        <tr>
+                            <td style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 18px; font-weight: 700; color: #ffffff; letter-spacing: -0.02em;">Temps</td>
+                            <td align="right" style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 12px; color: #94a3b8;">{timestamp}</td>
+                        </tr>
+                    </table>
+                </td></tr>
+
+                <!-- Status Badge -->
+                <tr><td style="padding: 24px 32px 0; background: #ffffff;">
+                    <table cellpadding="0" cellspacing="0">
+                        <tr><td style="padding: 4px 12px; background: {bg_color}; border: 1px solid {accent_color}22; border-radius: 100px;">
+                            <span style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 12px; font-weight: 600; color: {accent_color};">&#9432; Health check</span>
+                        </td></tr>
+                    </table>
+                </td></tr>
+
+                <!-- Title -->
+                <tr><td style="padding: 12px 32px 0; background: #ffffff;">
+                    <h1 style="margin: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 20px; font-weight: 600; color: #111827; line-height: 1.4;">Notification provider is reachable</h1>
+                </td></tr>
+
+                <!-- Message -->
+                <tr><td style="padding: 16px 32px 8px; background: #ffffff;">
+                    <p style="margin: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 14px; color: #374151; line-height: 1.7;">
+                        Your Temps instance just verified that this email notification provider can authenticate against the SMTP relay and deliver mail to the configured recipients. No action is required &mdash; if you didn&rsquo;t trigger this check from the dashboard, you can safely ignore the message.
+                    </p>
+                </td></tr>
+
+                <!-- Connection details -->
+                <tr><td style="padding: 12px 32px 24px; background: #ffffff;">
+                    <table width="100%" cellpadding="0" cellspacing="0" style="background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 6px;">
+                        <tr>
+                            <td style="padding: 10px 14px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 12px; color: #6b7280; white-space: nowrap; vertical-align: top; width: 110px;">Instance</td>
+                            <td style="padding: 10px 14px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 13px; color: #111827; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; word-break: break-all;">{host}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 10px 14px; border-top: 1px solid #e5e7eb; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 12px; color: #6b7280; white-space: nowrap; vertical-align: top;">SMTP relay</td>
+                            <td style="padding: 10px 14px; border-top: 1px solid #e5e7eb; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 13px; color: #111827; word-break: break-all;">{smtp_host}:{smtp_port}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 10px 14px; border-top: 1px solid #e5e7eb; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 12px; color: #6b7280; white-space: nowrap; vertical-align: top;">From</td>
+                            <td style="padding: 10px 14px; border-top: 1px solid #e5e7eb; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 13px; color: #111827; word-break: break-all;">{from_address}</td>
+                        </tr>
+                    </table>
+                </td></tr>
+
+                <!-- Footer -->
+                <tr><td style="padding: 16px 32px; background: #f9fafb; border-top: 1px solid #e5e7eb; border-radius: 0 0 8px 8px;">
+                    <table width="100%" cellpadding="0" cellspacing="0">
+                        <tr>
+                            <td style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 12px; color: #9ca3af;">Sent by Temps &middot; Self-hosted PaaS</td>
+                            <td align="right" style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 12px; color: #9ca3af;">Automated health check</td>
+                        </tr>
+                    </table>
+                </td></tr>
+            </table>
+        </td></tr>
+    </table>
+</body>
+</html>"#,
+            host = host,
+            smtp_host = smtp_host,
+            smtp_port = smtp_port,
+            from_address = from_address,
+            timestamp = timestamp,
+            accent_color = accent_color,
+            bg_color = bg_color,
+        )
     }
 }
 
@@ -2077,5 +2248,62 @@ mod tests {
         let db = Arc::new(MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection());
         let result = webhook.initialize(db).await;
         assert!(result.is_err(), "Must reject DELETE method");
+    }
+
+    // ========== Health-check email rendering ==========
+
+    #[test]
+    fn test_health_check_email_renders_branded_html() {
+        let html = EmailProvider::render_health_check_email(
+            "deploy.example.com",
+            "email-smtp.eu-west-1.amazonaws.com",
+            587,
+            "noreply@example.com",
+            "Jan 01, 2026 at 12:00 UTC",
+        );
+
+        // Branding: header bar and footer must be present so the message
+        // reads as a real Temps email, not a debug ping.
+        assert!(html.contains(">Temps<"), "expected Temps brand header");
+        assert!(
+            html.contains("Sent by Temps"),
+            "expected footer attribution"
+        );
+        assert!(html.contains("Health check"), "expected status badge");
+        assert!(
+            html.contains("Notification provider is reachable"),
+            "expected human-readable title"
+        );
+
+        // Connection details must surface the values the operator needs to
+        // confirm the provider is set up correctly.
+        assert!(
+            html.contains("deploy.example.com"),
+            "expected instance hostname in body"
+        );
+        assert!(
+            html.contains("email-smtp.eu-west-1.amazonaws.com:587"),
+            "expected smtp host:port in body"
+        );
+        assert!(
+            html.contains("noreply@example.com"),
+            "expected from-address in body"
+        );
+        assert!(
+            html.contains("Jan 01, 2026 at 12:00 UTC"),
+            "expected timestamp in body"
+        );
+    }
+
+    #[test]
+    fn test_health_check_email_has_valid_html_document_shape() {
+        let html = EmailProvider::render_health_check_email("a", "b", 1, "c@d.e", "t");
+        assert!(html.starts_with("<!DOCTYPE html>"));
+        assert!(html.trim_end().ends_with("</html>"));
+        // Inline-styled <table> layout (email-client compatible) — must not
+        // accidentally drift to a flex/grid layout that breaks in Outlook.
+        assert!(html.contains("<table"));
+        assert!(!html.contains("display: flex"));
+        assert!(!html.contains("display: grid"));
     }
 }
