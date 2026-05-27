@@ -7,14 +7,189 @@ export const metadata = {
   },
 };
 
+export const sections = [
+  { title: 'Authentication', id: 'authentication' },
+  { title: 'What you can automate', id: 'what-you-can-automate' },
+  { title: 'Trigger a deployment', id: 'trigger-a-deployment' },
+  { title: 'Check deployment status', id: 'check-deployment-status' },
+  { title: 'Manage environment variables', id: 'manage-environment-variables' },
+  { title: 'Deploy without Git', id: 'deploy-without-git' },
+  { title: 'CLI and SDKs', id: 'cli-and-sdks' },
+]
+
 # API
 
-## Page Goal
+The Temps REST API gives you programmatic access to everything in the dashboard: trigger deployments, read logs, manage environment variables, scale containers, and more. {{ className: 'lead' }}
 
-Enable programmatic control of Temps for advanced automation.
+---
 
-## Target Persona
+## Authentication {{ anchor: true, id: 'authentication' }}
 
-**API Andy** - Needs programmatic access, building custom tooling, wants CI/CD integration.
+All API requests use a Bearer token in the `Authorization` header:
 
-## Key Content: API authentication, endpoints, deployment API, webhooks API, CLI tool, SDKs
+```bash
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+  "https://your-temps-instance/api/projects"
+```
+
+**Get a token:** Open the dashboard → **Settings → API Keys → New API Key**. Tokens can be scoped to specific permissions.
+
+**Deployed apps** automatically receive a `TEMPS_API_TOKEN` environment variable. Use it to call the Temps API from within your application without storing a token separately.
+
+<Note>
+  The base URL for all endpoints is `https://your-temps-instance/api/`. Replace
+  `your-temps-instance` with the domain you set up during installation.
+</Note>
+
+---
+
+## What you can automate {{ anchor: true, id: 'what-you-can-automate' }}
+
+| Resource | What you can do |
+|----------|----------------|
+| **Projects** | List, create, update, delete, trigger deployments |
+| **Deployments** | List, inspect, cancel, rollback, pause, resume, teardown |
+| **Environments** | Create, update settings (CPU, memory, replicas, port), delete |
+| **Environment variables** | List, create, update, delete, read values |
+| **Domains** | Add, remove, and inspect custom domains |
+| **Containers** | List, start, stop, restart, read real-time metrics |
+| **Managed services** | List external services linked to a project |
+| **Backups** | Trigger manual backups |
+| **Webhooks** | Configure delivery endpoints for deployment events |
+
+For the full endpoint list, see the [REST API Reference](/docs/api).
+
+---
+
+## Trigger a deployment {{ anchor: true, id: 'trigger-a-deployment' }}
+
+The most common automation is triggering a deployment from your CI/CD pipeline after tests pass:
+
+```bash
+# Trigger a deployment from the current Git branch
+curl -X POST "https://your-temps-instance/api/projects/{project_id}/trigger-pipeline" \
+  -H "Authorization: Bearer $TEMPS_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"branch": "main", "environment_id": 1}'
+```
+
+This is equivalent to pushing to the tracked branch but gives you explicit control over when deployments fire. See [CI/CD setup](/docs/set-up-ci-cd-pipeline) for a complete pipeline example.
+
+---
+
+## Check deployment status {{ anchor: true, id: 'check-deployment-status' }}
+
+Poll the deployment until it reaches a terminal state (`completed`, `failed`, or `cancelled`):
+
+```bash
+# List recent deployments for a project
+curl "https://your-temps-instance/api/projects/{project_id}/deployments" \
+  -H "Authorization: Bearer $TEMPS_API_TOKEN"
+
+# Get details for a specific deployment
+curl "https://your-temps-instance/api/projects/{project_id}/deployments/{deployment_id}" \
+  -H "Authorization: Bearer $TEMPS_API_TOKEN"
+
+# Get logs for a specific job within a deployment
+curl "https://your-temps-instance/api/projects/{project_id}/deployments/{deployment_id}/jobs/{job_id}/logs" \
+  -H "Authorization: Bearer $TEMPS_API_TOKEN"
+```
+
+The response includes `status`, `started_at`, `finished_at`, and a list of jobs with their individual statuses. See [Debug a failed deployment](/docs/debug-a-failed-deployment) for the full list of job types and status values.
+
+---
+
+## Manage environment variables {{ anchor: true, id: 'manage-environment-variables' }}
+
+Add or update a variable for a specific environment:
+
+```bash
+# Create a variable (scoped to the production environment)
+curl -X POST "https://your-temps-instance/api/projects/{project_id}/env-vars" \
+  -H "Authorization: Bearer $TEMPS_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "key": "STRIPE_SECRET_KEY",
+    "value": "sk_live_...",
+    "environment_id": 1
+  }'
+
+# Update an existing variable
+curl -X PUT "https://your-temps-instance/api/projects/{project_id}/env-vars/{var_id}" \
+  -H "Authorization: Bearer $TEMPS_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"value": "sk_live_updated..."}'
+```
+
+<Note>
+  Changing environment variables does not automatically redeploy your application.
+  Trigger a new deployment after updating variables if you need the new values to
+  take effect immediately.
+</Note>
+
+---
+
+## Deploy without Git {{ anchor: true, id: 'deploy-without-git' }}
+
+Three endpoints let you deploy without a Git push — useful for uploading pre-built artifacts from a CI system:
+
+```bash
+# Deploy from a container registry image
+curl -X POST "https://your-temps-instance/api/projects/{id}/environments/{id}/deploy/image" \
+  -H "Authorization: Bearer $TEMPS_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"image": "ghcr.io/your-org/your-app:latest"}'
+
+# Upload and deploy a Docker image tarball (max 1 GB)
+curl -X POST "https://your-temps-instance/api/projects/{id}/environments/{id}/deploy/image-upload" \
+  -H "Authorization: Bearer $TEMPS_API_TOKEN" \
+  -F "file=@my-app.tar"
+
+# Upload and deploy a pre-built static site (max 500 MB)
+curl -X POST "https://your-temps-instance/api/projects/{id}/environments/{id}/deploy/static" \
+  -H "Authorization: Bearer $TEMPS_API_TOKEN" \
+  -F "file=@dist.tar.gz"
+```
+
+---
+
+## CLI and SDKs {{ anchor: true, id: 'cli-and-sdks' }}
+
+### CLI
+
+The `temps` CLI wraps the REST API for interactive and scripted use:
+
+```bash
+# Deploy from the command line
+temps deploy git --project my-app --environment production
+
+# Roll back the latest deployment
+temps deployments rollback --project my-app
+
+# View live container logs
+temps logs --project my-app --environment production --follow
+```
+
+See the [CLI reference](/docs/cli) for the full command list.
+
+### Node.js SDK
+
+For Node.js applications, the SDK provides a typed client:
+
+```bash
+npm install @temps-sdk/node
+```
+
+```typescript
+import { TempsClient } from '@temps-sdk/node';
+
+const client = new TempsClient({
+  baseUrl: process.env.TEMPS_API_URL,
+  token: process.env.TEMPS_API_TOKEN,
+});
+
+// Trigger a deployment
+await client.projects.triggerPipeline(projectId, { branch: 'main' });
+```
+
+See the [Node SDK reference](/docs/node-sdk) for all available methods.

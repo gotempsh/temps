@@ -210,3 +210,39 @@
 - `advanced/networking` stub — filled in pass 8
 - `architecture/data-flow` sections export and lead paragraph — rewritten in pass 8
 - "Competitive Advantage" Note blocks in cron-jobs and managed-services — fixed in pass 8
+
+---
+
+## Pass 9 — run 2026-05-27T02:16:00Z
+
+**Date:** 2026-05-27
+**Risk:** REVIEW
+
+### Changes
+
+| File | Change |
+|------|--------|
+| `docs/features/api/page.mdx` | Stub filled: API overview guide covering authentication, capabilities table, trigger-deployment curl example, deployment status polling, env-var management, artifact-upload endpoints, and CLI/SDK quick-starts |
+| `docs/features/rollbacks/page.mdx` | Clarity pass: added `export const sections`, `{{ className: 'lead' }}` on intro paragraph, `---` section dividers, and `{{ anchor: true, id }}` on all H2 headers; fixed broken link `/docs/deployment` → `/docs/deployments`; updated stale example dates to 2026-05-24 |
+
+### Already done (do not repeat)
+- `from-heroku` migration stub — filled in pass 1
+- Monitoring page Property blocks — rewritten in pass 1
+- Stale version `v0.0.6` in upgrade-temps page — fixed in pass 1
+- `from-railway` migration stub — filled in pass 2
+- Webhooks page structure — rewritten in pass 2
+- Stale RustFS `1.0.0-alpha.78` in set-up-managed-services and deploy-with-database — fixed in pass 2
+- Double-dash `--` em-dash typos in attack-mode, kv-storage, skills — fixed in pass 2
+- `from-vercel` migration stub — filled in pass 3
+- `from-netlify` migration stub — filled in pass 4
+- `architecture/overview` lead paragraph and description — rewritten in pass 4
+- `reference/troubleshooting` stub — filled in pass 5
+- `advanced/performance` stub — filled in pass 5
+- `features/teams` stub — filled in pass 6
+- `architecture/security` role names, permission strings, informal prose — rewritten in pass 6
+- `advanced/custom-buildpacks` stub — filled in pass 7
+- `advanced/networking` stub — filled in pass 8
+- `architecture/data-flow` sections export and lead paragraph — rewritten in pass 8
+- "Competitive Advantage" Note blocks in cron-jobs and managed-services — fixed in pass 8
+- `features/api` stub — filled in pass 9
+- `features/rollbacks` sections/anchors/dividers, broken link — fixed in pass 9

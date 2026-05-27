@@ -7,9 +7,19 @@ export const metadata = {
   },
 };
 
+export const sections = [
+  { title: 'Quick rollback', id: 'quick-rollback' },
+  { title: 'How rollbacks work', id: 'how-rollbacks-work' },
+  { title: 'Rollback strategies', id: 'rollback-strategies' },
+  { title: 'Deployment history', id: 'deployment-history' },
+  { title: 'After rollback', id: 'after-rollback' },
+  { title: 'Best practices', id: 'best-practices' },
+  { title: 'Rollback limitations', id: 'rollback-limitations' },
+]
+
 # Rollbacks
 
-When a deployment has issues, roll back to a previous working version instantly—no downtime, no data loss, just a quick recovery.
+When a deployment has issues, roll back to a previous working version instantly — no downtime, no data loss, just a quick recovery. {{ className: 'lead' }}
 
 <Mermaid
   chart={`
@@ -31,7 +41,9 @@ sequenceDiagram
 `}
 />
 
-## Quick Rollback
+---
+
+## Quick rollback {{ anchor: true, id: 'quick-rollback' }}
 
 ### From Dashboard
 
@@ -53,7 +65,9 @@ temps deployments rollback --project my-app
 temps deployments rollback --project my-app --deployment-id abc123
 ```
 
-## How Rollbacks Work
+---
+
+## How rollbacks work {{ anchor: true, id: 'how-rollbacks-work' }}
 
 ### Zero-Downtime Process
 
@@ -77,7 +91,9 @@ temps deployments rollback --project my-app --deployment-id abc123
 - **Environment settings** - Project-level settings unchanged
 - **SSL certificates** - Certificates remain valid
 
-## Rollback Strategies
+---
+
+## Rollback strategies {{ anchor: true, id: 'rollback-strategies' }}
 
 ### Immediate Rollback
 
@@ -131,7 +147,9 @@ temps deployments rollback --project my-app --canary 50
 - Gradual migration back
 - A/B testing scenarios
 
-## Deployment History
+---
+
+## Deployment history {{ anchor: true, id: 'deployment-history' }}
 
 ### View History
 
@@ -143,9 +161,9 @@ temps deployments list --project my-app
 
 # Output:
 # ID       Status    Created              Version
-# abc123   ACTIVE    2024-01-15 10:30    v1.2.0
-# def456   STOPPED   2024-01-15 09:15    v1.1.9
-# ghi789   STOPPED   2024-01-15 08:00    v1.1.8
+# abc123   ACTIVE    2026-05-24 10:30    v1.2.0
+# def456   STOPPED   2026-05-24 09:15    v1.1.9
+# ghi789   STOPPED   2026-05-24 08:00    v1.1.8
 ```
 
 ### Compare Deployments
@@ -167,7 +185,9 @@ temps deployments compare \
 - Resource limit changes
 - Configuration differences
 
-## After Rollback
+---
+
+## After rollback {{ anchor: true, id: 'after-rollback' }}
 
 ### Investigate the Issue
 
@@ -193,7 +213,9 @@ The previous deployment stays available for:
 - **Quick rollback** - Roll back again if needed
 - **Debugging** - Investigate what changed
 
-## Best Practices
+---
+
+## Best practices {{ anchor: true, id: 'best-practices' }}
 
 ### Before Deploying
 
@@ -216,7 +238,9 @@ The previous deployment stays available for:
 - **Test critical paths** - Verify important features
 - **Keep previous deployment** - Don't delete it immediately
 
-## Rollback Limitations
+---
+
+## Rollback limitations {{ anchor: true, id: 'rollback-limitations' }}
 
 ### What Can't Be Rolled Back
 
@@ -235,6 +259,6 @@ Some changes require manual fixes:
 
 ## Next Steps
 
-- **[Deployment Pipeline](/docs/deployment)** - Understand how deployments work
+- **[Deployments](/docs/deployments)** - Understand how deployments work
 - **[Monitoring](/docs/monitoring)** - Set up alerts for deployments
 - **[Error Tracking](/docs/error-tracking)** - Track deployment errors
