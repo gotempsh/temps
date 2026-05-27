@@ -2,6 +2,7 @@
 
 mod scaleway;
 mod ses;
+mod smtp;
 mod traits;
 
 #[cfg(test)]
@@ -9,6 +10,7 @@ pub mod mock;
 
 pub use scaleway::{ScalewayCredentials, ScalewayProvider};
 pub use ses::{SesCredentials, SesProvider};
+pub use smtp::{SmtpCredentials, SmtpEncryption, SmtpProvider};
 pub use traits::*;
 
 #[cfg(test)]

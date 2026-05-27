@@ -19,13 +19,14 @@ use tracing::error;
 
 use super::audit::{
     EmailProviderCreatedAudit, EmailProviderDeletedAudit, EmailProviderTestedAudit,
+    EmailProviderUpdatedAudit,
 };
 use super::types::{
     AppState, CreateEmailProviderRequest, EmailProviderResponse, EmailProviderTypeRoute,
-    TestEmailRequest, TestEmailResponse,
+    TestEmailRequest, TestEmailResponse, UpdateEmailProviderRequest,
 };
-use crate::providers::{EmailProviderType, ScalewayCredentials, SesCredentials};
-use crate::services::{CreateProviderRequest, ProviderCredentials};
+use crate::providers::{EmailProviderType, ScalewayCredentials, SesCredentials, SmtpCredentials};
+use crate::services::{CreateProviderRequest, ProviderCredentials, UpdateProviderRequest};
 
 /// Configure provider routes
 pub fn routes() -> Router<Arc<AppState>> {
@@ -36,7 +37,9 @@ pub fn routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/email-providers/{id}",
-            get(get_email_provider).delete(delete_email_provider),
+            get(get_email_provider)
+                .patch(update_email_provider)
+                .delete(delete_email_provider),
         )
         .route("/email-providers/{id}/test", post(test_provider))
 }
@@ -87,6 +90,31 @@ pub async fn create_email_provider(
             ProviderCredentials::Scaleway(ScalewayCredentials {
                 api_key: scw_creds.api_key,
                 project_id: scw_creds.project_id,
+            })
+        }
+        EmailProviderTypeRoute::Smtp => {
+            let smtp_creds = request.smtp_credentials.ok_or_else(|| {
+                bad_request()
+                    .detail("smtp_credentials required for SMTP provider")
+                    .build()
+            })?;
+            if smtp_creds.host.trim().is_empty() {
+                return Err(bad_request()
+                    .detail("smtp_credentials.host is required")
+                    .build());
+            }
+            if smtp_creds.port == 0 {
+                return Err(bad_request()
+                    .detail("smtp_credentials.port must be greater than 0")
+                    .build());
+            }
+            ProviderCredentials::Smtp(SmtpCredentials {
+                host: smtp_creds.host,
+                port: smtp_creds.port,
+                username: smtp_creds.username.filter(|s| !s.is_empty()),
+                password: smtp_creds.password.filter(|s| !s.is_empty()),
+                encryption: smtp_creds.encryption.into(),
+                accept_invalid_certs: smtp_creds.accept_invalid_certs,
             })
         }
     };
@@ -248,6 +276,181 @@ pub async fn get_email_provider(
     };
 
     Ok(Json(response))
+}
+
+/// Update an email provider
+///
+/// Partial update — any field left out keeps its current value. Most importantly,
+/// omitting the credential block (`ses_credentials`/`scaleway_credentials`/`smtp_credentials`)
+/// preserves the stored secret, so operators can rename a provider without re-typing
+/// passwords. `provider_type` is immutable; to switch providers, delete and recreate.
+#[utoipa::path(
+    tag = "Email Providers",
+    patch,
+    path = "/email-providers/{id}",
+    request_body = UpdateEmailProviderRequest,
+    responses(
+        (status = 200, description = "Provider updated", body = EmailProviderResponse),
+        (status = 400, description = "Validation error"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Provider not found"),
+        (status = 409, description = "Provider type mismatch"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("id" = i32, Path, description = "Provider ID")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn update_email_provider(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(id): Path<i32>,
+    Json(request): Json<UpdateEmailProviderRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, EmailProvidersWrite);
+
+    // Look up the existing provider so we know its type, and so we can reject
+    // mismatched credential payloads with a clear message instead of a 404.
+    let existing = state.provider_service.get(id).await.map_err(|e| {
+        error!("Failed to look up email provider {} for update: {}", id, e);
+        not_found().detail("Provider not found").build()
+    })?;
+    let existing_type = EmailProviderType::from_str(&existing.provider_type).map_err(|e| {
+        error!(
+            "Stored provider {} has invalid provider_type '{}': {}",
+            id, existing.provider_type, e
+        );
+        internal_server_error()
+            .detail("Stored provider has an unrecognised provider_type")
+            .build()
+    })?;
+
+    // Only one credential block is allowed at a time, and it must match the
+    // existing provider's type. Reject extras up-front so the service layer's
+    // mismatch error doesn't surprise the caller.
+    let supplied_blocks = [
+        request.ses_credentials.is_some(),
+        request.scaleway_credentials.is_some(),
+        request.smtp_credentials.is_some(),
+    ]
+    .iter()
+    .filter(|b| **b)
+    .count();
+    if supplied_blocks > 1 {
+        return Err(bad_request()
+            .detail("Only one credential block (ses/scaleway/smtp) may be supplied per update")
+            .build());
+    }
+
+    let credentials: Option<ProviderCredentials> = match (
+        existing_type,
+        request.ses_credentials,
+        request.scaleway_credentials,
+        request.smtp_credentials,
+    ) {
+        (_, None, None, None) => None,
+        (EmailProviderType::Ses, Some(c), None, None) => {
+            Some(ProviderCredentials::Ses(SesCredentials {
+                access_key_id: c.access_key_id,
+                secret_access_key: c.secret_access_key,
+                endpoint_url: None,
+            }))
+        }
+        (EmailProviderType::Scaleway, None, Some(c), None) => {
+            Some(ProviderCredentials::Scaleway(ScalewayCredentials {
+                api_key: c.api_key,
+                project_id: c.project_id,
+            }))
+        }
+        (EmailProviderType::Smtp, None, None, Some(c)) => {
+            if c.host.trim().is_empty() {
+                return Err(bad_request()
+                    .detail("smtp_credentials.host is required")
+                    .build());
+            }
+            if c.port == 0 {
+                return Err(bad_request()
+                    .detail("smtp_credentials.port must be greater than 0")
+                    .build());
+            }
+            Some(ProviderCredentials::Smtp(SmtpCredentials {
+                host: c.host,
+                port: c.port,
+                username: c.username.filter(|s| !s.is_empty()),
+                password: c.password.filter(|s| !s.is_empty()),
+                encryption: c.encryption.into(),
+                accept_invalid_certs: c.accept_invalid_certs,
+            }))
+        }
+        (existing, _, _, _) => {
+            return Err(bad_request()
+                .detail(format!(
+                    "Credential block does not match existing provider type ({})",
+                    existing
+                ))
+                .build());
+        }
+    };
+
+    let update_request = UpdateProviderRequest {
+        name: request.name,
+        region: request.region,
+        is_active: request.is_active,
+        credentials,
+    };
+
+    let outcome = state
+        .provider_service
+        .update(id, update_request)
+        .await
+        .map_err(|e: crate::errors::EmailError| -> Problem {
+            error!("Failed to update email provider {}: {}", id, e);
+            // Service-level validation errors (empty name, type mismatch) become 400.
+            // Everything else goes through the general From<EmailError> mapping.
+            e.into()
+        })?;
+
+    let provider = outcome.provider;
+    let masked_credentials = state
+        .provider_service
+        .get_masked_credentials(&provider)
+        .unwrap_or_else(|_| serde_json::json!({}));
+
+    // Only emit an audit log if something actually changed.
+    if !outcome.changed_fields.is_empty() {
+        let audit = EmailProviderUpdatedAudit {
+            context: AuditContext {
+                user_id: auth.user_id(),
+                ip_address: Some(metadata.ip_address.clone()),
+                user_agent: metadata.user_agent.clone(),
+            },
+            provider_id: provider.id,
+            name: provider.name.clone(),
+            provider_type: provider.provider_type.clone(),
+            changed_fields: outcome.changed_fields,
+        };
+        if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+            error!("Failed to create audit log: {}", e);
+        }
+    }
+
+    let response = EmailProviderResponse {
+        id: provider.id,
+        name: provider.name,
+        provider_type: EmailProviderType::from_str(&provider.provider_type)
+            .map(EmailProviderTypeRoute::from)
+            .unwrap_or(EmailProviderTypeRoute::Ses),
+        region: provider.region,
+        is_active: provider.is_active,
+        credentials: masked_credentials,
+        created_at: provider.created_at.to_rfc3339(),
+        updated_at: provider.updated_at.to_rfc3339(),
+    };
+
+    Ok((StatusCode::OK, Json(response)))
 }
 
 /// Delete an email provider

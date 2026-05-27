@@ -15,6 +15,7 @@ pub use email_service::{
 };
 pub use provider_service::{
     CreateProviderRequest, ProviderCredentials, ProviderService, TestEmailResult,
+    UpdateProviderOutcome, UpdateProviderRequest,
 };
 pub use tracking_service::{ExtractedLink, TrackingEvent, TrackingService, TransformResult};
 pub use validation::{

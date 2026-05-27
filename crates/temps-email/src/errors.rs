@@ -43,6 +43,9 @@ pub enum EmailError {
     #[error("Scaleway error: {0}")]
     Scaleway(String),
 
+    #[error("SMTP error: {0}")]
+    Smtp(String),
+
     #[error("Serialization error: {0}")]
     Serialization(String),
 

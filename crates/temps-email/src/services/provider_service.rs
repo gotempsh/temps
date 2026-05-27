@@ -12,7 +12,7 @@ use tracing::{debug, error};
 use crate::errors::EmailError;
 use crate::providers::{
     EmailProvider, EmailProviderType, ScalewayCredentials, ScalewayProvider, SesCredentials,
-    SesProvider,
+    SesProvider, SmtpCredentials, SmtpProvider,
 };
 
 /// Service for managing email providers
@@ -36,6 +36,39 @@ pub struct CreateProviderRequest {
 pub enum ProviderCredentials {
     Ses(SesCredentials),
     Scaleway(ScalewayCredentials),
+    Smtp(SmtpCredentials),
+}
+
+impl ProviderCredentials {
+    /// Get the provider type that owns these credentials.
+    pub fn provider_type(&self) -> EmailProviderType {
+        match self {
+            ProviderCredentials::Ses(_) => EmailProviderType::Ses,
+            ProviderCredentials::Scaleway(_) => EmailProviderType::Scaleway,
+            ProviderCredentials::Smtp(_) => EmailProviderType::Smtp,
+        }
+    }
+}
+
+/// Request to update an existing email provider. All fields are optional —
+/// `None` means "leave this field unchanged". `provider_type` cannot be
+/// changed (the stored credentials format is fixed at creation time).
+#[derive(Debug, Clone, Default)]
+pub struct UpdateProviderRequest {
+    pub name: Option<String>,
+    pub region: Option<String>,
+    /// New credentials. Must match the existing provider's type or the
+    /// update is rejected. `None` keeps the encrypted blob as-is — this is
+    /// how operators rotate `name`/`region` without re-typing secrets.
+    pub credentials: Option<ProviderCredentials>,
+    pub is_active: Option<bool>,
+}
+
+/// Summary of what changed during an update. Used for audit logging.
+#[derive(Debug, Clone)]
+pub struct UpdateProviderOutcome {
+    pub provider: email_providers::Model,
+    pub changed_fields: Vec<String>,
 }
 
 /// Result of sending a test email
@@ -73,6 +106,7 @@ impl ProviderService {
         let credentials_json = match &request.credentials {
             ProviderCredentials::Ses(creds) => serde_json::to_string(creds)?,
             ProviderCredentials::Scaleway(creds) => serde_json::to_string(creds)?,
+            ProviderCredentials::Smtp(creds) => serde_json::to_string(creds)?,
         };
 
         // Encrypt credentials
@@ -160,6 +194,91 @@ impl ProviderService {
         Ok(result)
     }
 
+    /// Update an existing provider. Returns the updated row plus the list of
+    /// fields that actually changed (used by handlers for audit logging).
+    ///
+    /// `provider_type` is immutable. If `request.credentials` is `Some` and the
+    /// variant doesn't match the existing provider's type, the call fails with
+    /// `EmailError::Validation` rather than silently corrupting the row.
+    pub async fn update(
+        &self,
+        id: i32,
+        request: UpdateProviderRequest,
+    ) -> Result<UpdateProviderOutcome, EmailError> {
+        debug!("Updating email provider {}", id);
+
+        let existing = self.get(id).await?;
+        let existing_type = EmailProviderType::from_str(&existing.provider_type)?;
+        let mut changed_fields: Vec<String> = Vec::new();
+
+        let mut active: email_providers::ActiveModel = existing.clone().into();
+
+        if let Some(name) = request.name {
+            if name.trim().is_empty() {
+                return Err(EmailError::Validation(
+                    "Provider name cannot be empty".to_string(),
+                ));
+            }
+            if name != existing.name {
+                active.name = Set(name);
+                changed_fields.push("name".to_string());
+            }
+        }
+
+        if let Some(region) = request.region {
+            if region != existing.region {
+                active.region = Set(region);
+                changed_fields.push("region".to_string());
+            }
+        }
+
+        if let Some(is_active) = request.is_active {
+            if is_active != existing.is_active {
+                active.is_active = Set(is_active);
+                changed_fields.push("is_active".to_string());
+            }
+        }
+
+        if let Some(new_credentials) = request.credentials {
+            let new_type = new_credentials.provider_type();
+            if new_type != existing_type {
+                return Err(EmailError::Validation(format!(
+                    "Cannot change provider type from {} to {} on existing provider (id={})",
+                    existing_type, new_type, id
+                )));
+            }
+            let credentials_json = match &new_credentials {
+                ProviderCredentials::Ses(c) => serde_json::to_string(c)?,
+                ProviderCredentials::Scaleway(c) => serde_json::to_string(c)?,
+                ProviderCredentials::Smtp(c) => serde_json::to_string(c)?,
+            };
+            let encrypted = self
+                .encryption_service
+                .encrypt_string(&credentials_json)
+                .map_err(|e| EmailError::Encryption(e.to_string()))?;
+            active.credentials = Set(encrypted);
+            changed_fields.push("credentials".to_string());
+        }
+
+        // Skip the DB roundtrip if nothing changed.
+        if changed_fields.is_empty() {
+            return Ok(UpdateProviderOutcome {
+                provider: existing,
+                changed_fields,
+            });
+        }
+
+        let updated = active.update(self.db.as_ref()).await?;
+        debug!(
+            "Updated email provider {} (changed fields: {:?})",
+            id, changed_fields
+        );
+        Ok(UpdateProviderOutcome {
+            provider: updated,
+            changed_fields,
+        })
+    }
+
     /// Create an email provider instance from a database model
     pub async fn create_provider_instance(
         &self,
@@ -192,6 +311,14 @@ impl ProviderService {
                         e
                     })?;
                 Ok(Box::new(scaleway_provider))
+            }
+            EmailProviderType::Smtp => {
+                let credentials: SmtpCredentials = serde_json::from_str(&credentials_json)?;
+                let smtp_provider = SmtpProvider::new(&credentials).map_err(|e| {
+                    error!("Failed to create SMTP provider: {}", e);
+                    e
+                })?;
+                Ok(Box::new(smtp_provider))
             }
         }
     }
@@ -347,6 +474,21 @@ impl ProviderService {
                 Ok(serde_json::json!({
                     "api_key": "***",
                     "project_id": credentials.project_id
+                }))
+            }
+            EmailProviderType::Smtp => {
+                let credentials: SmtpCredentials = serde_json::from_str(&credentials_json)?;
+                Ok(serde_json::json!({
+                    "host": credentials.host,
+                    "port": credentials.port,
+                    "username": credentials
+                        .username
+                        .as_deref()
+                        .map(mask_string)
+                        .unwrap_or_default(),
+                    "password": credentials.password.as_ref().map(|_| "***".to_string()),
+                    "encryption": credentials.encryption,
+                    "accept_invalid_certs": credentials.accept_invalid_certs,
                 }))
             }
         }
@@ -723,6 +865,232 @@ mod tests {
         assert!(result.is_ok());
         let updated = result.unwrap();
         assert!(updated.is_active);
+    }
+
+    // ========== Tests for update() ==========
+
+    fn ses_creds() -> ProviderCredentials {
+        ProviderCredentials::Ses(SesCredentials {
+            access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+            endpoint_url: None,
+        })
+    }
+
+    #[test]
+    fn test_provider_credentials_type_helper() {
+        assert_eq!(ses_creds().provider_type(), EmailProviderType::Ses);
+        assert_eq!(
+            ProviderCredentials::Scaleway(ScalewayCredentials {
+                api_key: "k".to_string(),
+                project_id: "p".to_string(),
+            })
+            .provider_type(),
+            EmailProviderType::Scaleway,
+        );
+        assert_eq!(
+            ProviderCredentials::Smtp(crate::providers::SmtpCredentials {
+                host: "h".to_string(),
+                port: 587,
+                username: None,
+                password: None,
+                encryption: crate::providers::SmtpEncryption::Starttls,
+                accept_invalid_certs: false,
+            })
+            .provider_type(),
+            EmailProviderType::Smtp,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_renames_provider() {
+        let (_db, service) = setup_test_env().await;
+        let created = service
+            .create(CreateProviderRequest {
+                name: "Original".to_string(),
+                provider_type: EmailProviderType::Ses,
+                region: "us-east-1".to_string(),
+                credentials: ses_creds(),
+            })
+            .await
+            .unwrap();
+
+        let outcome = service
+            .update(
+                created.id,
+                UpdateProviderRequest {
+                    name: Some("Renamed".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.provider.name, "Renamed");
+        assert_eq!(outcome.changed_fields, vec!["name".to_string()]);
+        // Credentials blob must not change when only name is updated.
+        assert_eq!(outcome.provider.credentials, created.credentials);
+    }
+
+    #[tokio::test]
+    async fn test_update_with_no_changes_is_noop() {
+        let (_db, service) = setup_test_env().await;
+        let created = service
+            .create(CreateProviderRequest {
+                name: "Same".to_string(),
+                provider_type: EmailProviderType::Ses,
+                region: "us-east-1".to_string(),
+                credentials: ses_creds(),
+            })
+            .await
+            .unwrap();
+
+        let outcome = service
+            .update(
+                created.id,
+                UpdateProviderRequest {
+                    name: Some("Same".to_string()),
+                    region: Some("us-east-1".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(outcome.changed_fields.is_empty());
+        assert_eq!(outcome.provider.id, created.id);
+    }
+
+    #[tokio::test]
+    async fn test_update_rejects_empty_name() {
+        let (_db, service) = setup_test_env().await;
+        let created = service
+            .create(CreateProviderRequest {
+                name: "Original".to_string(),
+                provider_type: EmailProviderType::Ses,
+                region: "us-east-1".to_string(),
+                credentials: ses_creds(),
+            })
+            .await
+            .unwrap();
+
+        let err = service
+            .update(
+                created.id,
+                UpdateProviderRequest {
+                    name: Some("   ".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EmailError::Validation(_)));
+    }
+
+    #[tokio::test]
+    async fn test_update_rejects_provider_type_mismatch() {
+        let (_db, service) = setup_test_env().await;
+        let created = service
+            .create(CreateProviderRequest {
+                name: "SES provider".to_string(),
+                provider_type: EmailProviderType::Ses,
+                region: "us-east-1".to_string(),
+                credentials: ses_creds(),
+            })
+            .await
+            .unwrap();
+
+        // Try to swap SES credentials for Scaleway ones — must fail.
+        let err = service
+            .update(
+                created.id,
+                UpdateProviderRequest {
+                    credentials: Some(ProviderCredentials::Scaleway(ScalewayCredentials {
+                        api_key: "k".to_string(),
+                        project_id: "p".to_string(),
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EmailError::Validation(_)));
+    }
+
+    #[tokio::test]
+    async fn test_update_rotates_credentials_when_supplied() {
+        let (_db, service) = setup_test_env().await;
+        let created = service
+            .create(CreateProviderRequest {
+                name: "SES".to_string(),
+                provider_type: EmailProviderType::Ses,
+                region: "us-east-1".to_string(),
+                credentials: ses_creds(),
+            })
+            .await
+            .unwrap();
+
+        let new_creds = ProviderCredentials::Ses(SesCredentials {
+            access_key_id: "AKIAROTATEDKEY123456".to_string(),
+            secret_access_key: "newsecretrotatedvaluevaluevaluevaluevalue".to_string(),
+            endpoint_url: None,
+        });
+
+        let outcome = service
+            .update(
+                created.id,
+                UpdateProviderRequest {
+                    credentials: Some(new_creds),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.changed_fields, vec!["credentials".to_string()]);
+        assert_ne!(
+            outcome.provider.credentials, created.credentials,
+            "rotated credentials should re-encrypt to a different ciphertext"
+        );
+
+        // The masked response should expose the new prefix.
+        let masked = service.get_masked_credentials(&outcome.provider).unwrap();
+        assert_eq!(masked["access_key_id"], "AKIA...3456");
+    }
+
+    #[tokio::test]
+    async fn test_update_preserves_credentials_when_omitted() {
+        let (_db, service) = setup_test_env().await;
+        let created = service
+            .create(CreateProviderRequest {
+                name: "SES".to_string(),
+                provider_type: EmailProviderType::Ses,
+                region: "us-east-1".to_string(),
+                credentials: ses_creds(),
+            })
+            .await
+            .unwrap();
+
+        let outcome = service
+            .update(
+                created.id,
+                UpdateProviderRequest {
+                    region: Some("eu-west-1".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(outcome.changed_fields.contains(&"region".to_string()));
+        assert!(
+            !outcome.changed_fields.contains(&"credentials".to_string()),
+            "credentials must not be listed when caller didn't supply them"
+        );
+        assert_eq!(
+            outcome.provider.credentials, created.credentials,
+            "encrypted blob must be byte-identical when caller omits credentials"
+        );
     }
 
     // ========== Unit Tests for TestEmailResult ==========

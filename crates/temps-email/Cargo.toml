@@ -34,6 +34,9 @@ reqwest = { workspace = true }
 aws-sdk-sesv2 = { version = "1", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 aws-config = { workspace = true }
 
+# Generic SMTP transport
+lettre = { workspace = true }
+
 # Web framework
 axum = { workspace = true }
 axum-macros = { workspace = true }

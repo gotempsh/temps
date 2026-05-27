@@ -1,6 +1,6 @@
 //! Handler types for the email service
 
-use crate::providers::EmailProviderType;
+use crate::providers::{EmailProviderType, SmtpEncryption};
 use crate::services::{
     DomainService, EmailService, ProviderService, TrackingService, ValidationService,
 };
@@ -32,6 +32,7 @@ pub struct AppState {
 pub enum EmailProviderTypeRoute {
     Ses,
     Scaleway,
+    Smtp,
 }
 
 impl std::fmt::Display for EmailProviderTypeRoute {
@@ -39,6 +40,7 @@ impl std::fmt::Display for EmailProviderTypeRoute {
         match self {
             EmailProviderTypeRoute::Ses => write!(f, "ses"),
             EmailProviderTypeRoute::Scaleway => write!(f, "scaleway"),
+            EmailProviderTypeRoute::Smtp => write!(f, "smtp"),
         }
     }
 }
@@ -48,6 +50,7 @@ impl From<EmailProviderType> for EmailProviderTypeRoute {
         match t {
             EmailProviderType::Ses => EmailProviderTypeRoute::Ses,
             EmailProviderType::Scaleway => EmailProviderTypeRoute::Scaleway,
+            EmailProviderType::Smtp => EmailProviderTypeRoute::Smtp,
         }
     }
 }
@@ -57,6 +60,7 @@ impl From<EmailProviderTypeRoute> for EmailProviderType {
         match t {
             EmailProviderTypeRoute::Ses => EmailProviderType::Ses,
             EmailProviderTypeRoute::Scaleway => EmailProviderType::Scaleway,
+            EmailProviderTypeRoute::Smtp => EmailProviderType::Smtp,
         }
     }
 }
@@ -77,6 +81,57 @@ pub struct ScalewayCredentialsRequest {
     pub project_id: String,
 }
 
+/// TLS mode for the SMTP relay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, ToSchema, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SmtpEncryptionRoute {
+    /// STARTTLS — start plain then upgrade. Default; used by AWS SES SMTP, Sendgrid, Mailgun.
+    #[default]
+    Starttls,
+    /// Implicit TLS / SMTPS — TLS from byte 0 (typically port 465).
+    Tls,
+    /// No encryption. Only for local testing (Mailhog, etc.).
+    None,
+}
+
+impl From<SmtpEncryptionRoute> for SmtpEncryption {
+    fn from(t: SmtpEncryptionRoute) -> Self {
+        match t {
+            SmtpEncryptionRoute::Starttls => SmtpEncryption::Starttls,
+            SmtpEncryptionRoute::Tls => SmtpEncryption::Tls,
+            SmtpEncryptionRoute::None => SmtpEncryption::None,
+        }
+    }
+}
+
+/// Generic SMTP credentials request body.
+///
+/// Works with any SMTP relay — AWS SES SMTP endpoints, Sendgrid, Mailgun,
+/// Postmark, or a self-hosted Postfix. Use this when you only have SMTP
+/// credentials (i.e. you cannot create identities via the upstream API).
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SmtpCredentialsRequest {
+    /// SMTP host, e.g. `email-smtp.eu-west-1.amazonaws.com`.
+    #[schema(example = "email-smtp.eu-west-1.amazonaws.com")]
+    pub host: String,
+    /// SMTP port (587 for STARTTLS, 465 for implicit TLS, 25/1025 for plain).
+    #[schema(example = 587)]
+    pub port: u16,
+    /// SMTP username. Leave empty for unauthenticated relays.
+    #[serde(default)]
+    #[schema(example = "AKIAIOSFODNN7EXAMPLE")]
+    pub username: Option<String>,
+    /// SMTP password / API token. Required when `username` is set.
+    #[serde(default)]
+    pub password: Option<String>,
+    /// TLS mode. Defaults to STARTTLS.
+    #[serde(default)]
+    pub encryption: SmtpEncryptionRoute,
+    /// Accept self-signed certificates. Only safe for local testing.
+    #[serde(default)]
+    pub accept_invalid_certs: bool,
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateEmailProviderRequest {
     /// User-friendly name for the provider
@@ -84,7 +139,7 @@ pub struct CreateEmailProviderRequest {
     pub name: String,
     /// Provider type
     pub provider_type: EmailProviderTypeRoute,
-    /// Cloud region
+    /// Cloud region. For SMTP this is informational only — the host/port carry the real routing.
     #[schema(example = "us-east-1")]
     pub region: String,
     /// AWS SES credentials (required if provider_type is ses)
@@ -93,6 +148,35 @@ pub struct CreateEmailProviderRequest {
     /// Scaleway credentials (required if provider_type is scaleway)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scaleway_credentials: Option<ScalewayCredentialsRequest>,
+    /// Generic SMTP credentials (required if provider_type is smtp). Use when
+    /// you only have SMTP creds and want to import an already-set-up domain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub smtp_credentials: Option<SmtpCredentialsRequest>,
+}
+
+/// Request body for `PATCH /email-providers/{id}`.
+///
+/// All fields are optional. Omit any field to leave it unchanged. The
+/// `provider_type` is immutable — to switch providers, delete the row and
+/// create a new one. For credentials, supplying any credential variant
+/// re-encrypts the stored blob; omitting them preserves the existing secret
+/// (so operators can rename without re-typing passwords).
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateEmailProviderRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "My AWS SES")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "us-east-1")]
+    pub region: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_active: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ses_credentials: Option<SesCredentialsRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scaleway_credentials: Option<ScalewayCredentialsRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smtp_credentials: Option<SmtpCredentialsRequest>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]

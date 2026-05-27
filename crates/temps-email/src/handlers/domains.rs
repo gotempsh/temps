@@ -58,6 +58,7 @@ impl From<EmailError> for Problem {
             | EmailError::Configuration(_)
             | EmailError::AwsSes(_)
             | EmailError::Scaleway(_)
+            | EmailError::Smtp(_)
             | EmailError::Serialization(_)
             | EmailError::TrackingRewrite { .. } => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)

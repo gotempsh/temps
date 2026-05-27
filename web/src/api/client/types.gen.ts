@@ -2329,11 +2329,12 @@ export type CreateEmailProviderRequest = {
      */
     provider_type: EmailProviderTypeRoute;
     /**
-     * Cloud region
+     * Cloud region. For SMTP this is informational only — the host/port carry the real routing.
      */
     region: string;
     scaleway_credentials?: null | ScalewayCredentialsRequest;
     ses_credentials?: null | SesCredentialsRequest;
+    smtp_credentials?: null | SmtpCredentialsRequest;
 };
 
 export type CreateEnvironmentRequest = {
@@ -4122,7 +4123,7 @@ export type EmailProviderResponse = {
     updated_at: string;
 };
 
-export type EmailProviderTypeRoute = 'ses' | 'scaleway';
+export type EmailProviderTypeRoute = 'ses' | 'scaleway' | 'smtp';
 
 export type EmailResponse = {
     bcc_addresses?: Array<string> | null;
@@ -12092,6 +12093,45 @@ export type SmokeTestResponse = {
 };
 
 /**
+ * Generic SMTP credentials request body.
+ *
+ * Works with any SMTP relay — AWS SES SMTP endpoints, Sendgrid, Mailgun,
+ * Postmark, or a self-hosted Postfix. Use this when you only have SMTP
+ * credentials (i.e. you cannot create identities via the upstream API).
+ */
+export type SmtpCredentialsRequest = {
+    /**
+     * Accept self-signed certificates. Only safe for local testing.
+     */
+    accept_invalid_certs?: boolean;
+    /**
+     * TLS mode. Defaults to STARTTLS.
+     */
+    encryption?: SmtpEncryptionRoute;
+    /**
+     * SMTP host, e.g. `email-smtp.eu-west-1.amazonaws.com`.
+     */
+    host: string;
+    /**
+     * SMTP password / API token. Required when `username` is set.
+     */
+    password?: string | null;
+    /**
+     * SMTP port (587 for STARTTLS, 465 for implicit TLS, 25/1025 for plain).
+     */
+    port: number;
+    /**
+     * SMTP username. Leave empty for unauthenticated relays.
+     */
+    username?: string | null;
+};
+
+/**
+ * TLS mode for the SMTP relay.
+ */
+export type SmtpEncryptionRoute = 'starttls' | 'tls' | 'none';
+
+/**
  * SMTP validation result
  */
 export type SmtpResult = {
@@ -13324,6 +13364,24 @@ export type UpdateDnsProviderRequest = {
      * New name
      */
     name?: string | null;
+};
+
+/**
+ * Request body for `PATCH /email-providers/{id}`.
+ *
+ * All fields are optional. Omit any field to leave it unchanged. The
+ * `provider_type` is immutable — to switch providers, delete the row and
+ * create a new one. For credentials, supplying any credential variant
+ * re-encrypts the stored blob; omitting them preserves the existing secret
+ * (so operators can rename without re-typing passwords).
+ */
+export type UpdateEmailProviderRequest = {
+    is_active?: boolean | null;
+    name?: string | null;
+    region?: string | null;
+    scaleway_credentials?: null | ScalewayCredentialsRequest;
+    ses_credentials?: null | SesCredentialsRequest;
+    smtp_credentials?: null | SmtpCredentialsRequest;
 };
 
 export type UpdateEnvironmentSettingsRequest = {
@@ -21221,6 +21279,54 @@ export type GetEmailProviderResponses = {
 
 export type GetEmailProviderResponse = GetEmailProviderResponses[keyof GetEmailProviderResponses];
 
+export type UpdateEmailProviderData = {
+    body: UpdateEmailProviderRequest;
+    path: {
+        /**
+         * Provider ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/email-providers/{id}';
+};
+
+export type UpdateEmailProviderErrors = {
+    /**
+     * Validation error
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Provider not found
+     */
+    404: unknown;
+    /**
+     * Provider type mismatch
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateEmailProviderResponses = {
+    /**
+     * Provider updated
+     */
+    200: EmailProviderResponse;
+};
+
+export type UpdateEmailProviderResponse = UpdateEmailProviderResponses[keyof UpdateEmailProviderResponses];
+
 export type TestProviderData = {
     body: TestEmailRequest;
     path: {
@@ -26764,7 +26870,7 @@ export type CreateNotificationEmailProviderResponses = {
 
 export type CreateNotificationEmailProviderResponse = CreateNotificationEmailProviderResponses[keyof CreateNotificationEmailProviderResponses];
 
-export type UpdateEmailProviderData = {
+export type UpdateEmailProvider2Data = {
     body: UpdateNotificationEmailProviderRequest;
     path: {
         /**
@@ -26776,7 +26882,7 @@ export type UpdateEmailProviderData = {
     url: '/notification-providers/email/{id}';
 };
 
-export type UpdateEmailProviderErrors = {
+export type UpdateEmailProvider2Errors = {
     /**
      * Provider not found
      */
@@ -26787,14 +26893,14 @@ export type UpdateEmailProviderErrors = {
     500: unknown;
 };
 
-export type UpdateEmailProviderResponses = {
+export type UpdateEmailProvider2Responses = {
     /**
      * Successfully updated Email provider
      */
     200: NotificationProviderResponse;
 };
 
-export type UpdateEmailProviderResponse = UpdateEmailProviderResponses[keyof UpdateEmailProviderResponses];
+export type UpdateEmailProvider2Response = UpdateEmailProvider2Responses[keyof UpdateEmailProvider2Responses];
 
 export type CreateSlackProviderData = {
     body: CreateSlackProviderRequest;

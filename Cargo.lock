@@ -11342,6 +11342,7 @@ dependencies = [
  "hickory-resolver",
  "http 1.4.0",
  "http-body-util",
+ "lettre",
  "md5",
  "reqwest",
  "sea-orm",

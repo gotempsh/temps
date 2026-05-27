@@ -38,6 +38,7 @@ pub fn configure_public_routes() -> Router<Arc<AppState>> {
         providers::create_email_provider,
         providers::list_email_providers,
         providers::get_email_provider,
+        providers::update_email_provider,
         providers::delete_email_provider,
         providers::test_provider,
         // Domains
@@ -69,10 +70,13 @@ pub fn configure_public_routes() -> Router<Arc<AppState>> {
         schemas(
             // Provider types
             types::CreateEmailProviderRequest,
+            types::UpdateEmailProviderRequest,
             types::EmailProviderResponse,
             types::EmailProviderTypeRoute,
             types::SesCredentialsRequest,
             types::ScalewayCredentialsRequest,
+            types::SmtpCredentialsRequest,
+            types::SmtpEncryptionRoute,
             types::TestEmailResponse,
             // Domain types
             types::CreateEmailDomainRequest,

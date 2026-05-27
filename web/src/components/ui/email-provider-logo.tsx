@@ -1,8 +1,9 @@
 import { AWSIcon } from '@/components/icons/AWSIcon'
 import { ScalewayIcon } from '@/components/icons/ScalewayIcon'
 import { cn } from '@/lib/utils'
+import { Mail } from 'lucide-react'
 
-export type EmailProviderType = 'ses' | 'scaleway'
+export type EmailProviderType = 'ses' | 'scaleway' | 'smtp'
 
 interface ProviderConfig {
   icon: React.ComponentType<{ className?: string; width?: number; height?: number }>
@@ -20,6 +21,11 @@ const emailProviderConfig: Record<EmailProviderType, ProviderConfig> = {
     icon: ScalewayIcon,
     label: 'Scaleway',
     color: 'text-[#4F0599]',
+  },
+  smtp: {
+    icon: Mail,
+    label: 'SMTP',
+    color: 'text-slate-600 dark:text-slate-300',
   },
 }
 

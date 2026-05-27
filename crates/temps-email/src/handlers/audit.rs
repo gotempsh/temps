@@ -39,6 +39,39 @@ impl AuditOperation for EmailProviderCreatedAudit {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct EmailProviderUpdatedAudit {
+    pub context: AuditContext,
+    pub provider_id: i32,
+    pub name: String,
+    pub provider_type: String,
+    /// Names of fields that changed (e.g. ["name", "region", "credentials"]).
+    /// Listing fields — not values — keeps the audit log free of secret material.
+    pub changed_fields: Vec<String>,
+}
+
+impl AuditOperation for EmailProviderUpdatedAudit {
+    fn operation_type(&self) -> String {
+        "EMAIL_PROVIDER_UPDATED".to_string()
+    }
+
+    fn user_id(&self) -> i32 {
+        self.context.user_id
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self).map_err(|e| anyhow::anyhow!("Failed to serialize: {}", e))
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct EmailProviderDeletedAudit {
     pub context: AuditContext,
     pub provider_id: i32,

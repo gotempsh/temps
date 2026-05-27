@@ -14,6 +14,8 @@ pub enum EmailProviderType {
     Ses,
     /// Scaleway Transactional Email
     Scaleway,
+    /// Generic SMTP relay (AWS SES SMTP, Sendgrid, Mailgun, Postmark, self-hosted, …)
+    Smtp,
 }
 
 impl std::fmt::Display for EmailProviderType {
@@ -21,6 +23,7 @@ impl std::fmt::Display for EmailProviderType {
         match self {
             EmailProviderType::Ses => write!(f, "ses"),
             EmailProviderType::Scaleway => write!(f, "scaleway"),
+            EmailProviderType::Smtp => write!(f, "smtp"),
         }
     }
 }
@@ -31,6 +34,7 @@ impl EmailProviderType {
         match s.to_lowercase().as_str() {
             "ses" | "aws_ses" | "aws-ses" => Ok(EmailProviderType::Ses),
             "scaleway" | "scw" => Ok(EmailProviderType::Scaleway),
+            "smtp" => Ok(EmailProviderType::Smtp),
             _ => Err(EmailError::InvalidProviderType(s.to_string())),
         }
     }
@@ -226,6 +230,14 @@ mod tests {
             EmailProviderType::from_str("scw").unwrap(),
             EmailProviderType::Scaleway
         );
+        assert_eq!(
+            EmailProviderType::from_str("smtp").unwrap(),
+            EmailProviderType::Smtp
+        );
+        assert_eq!(
+            EmailProviderType::from_str("SMTP").unwrap(),
+            EmailProviderType::Smtp
+        );
         assert!(EmailProviderType::from_str("invalid").is_err());
     }
 
@@ -233,6 +245,7 @@ mod tests {
     fn test_provider_type_display() {
         assert_eq!(EmailProviderType::Ses.to_string(), "ses");
         assert_eq!(EmailProviderType::Scaleway.to_string(), "scaleway");
+        assert_eq!(EmailProviderType::Smtp.to_string(), "smtp");
     }
 
     #[test]
