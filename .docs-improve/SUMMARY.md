@@ -1,26 +1,29 @@
-## Pass summary — run 2026-05-27T10:00:00Z
+## Pass summary — run 2026-05-27-run
 
-This pass completed a grammar and clarity sweep across nine MDX files. The `architecture/deployment` page received a full clarity rewrite: `export const sections` and `{{ anchor: true, id }}` attributes were added to all H2 headings, the lead paragraph was updated to match the site's standard `{{ className: 'lead' }}` pattern, `---` section dividers were inserted, and all informal contractions and style inconsistencies (dashes as hyphens, CamelCase bullets, "Here's", "don't", "you'll") were corrected. The `advanced/security` page had deprecated `whitelist` terminology replaced with `allowlist` in prose and CLI comments. Contractions were eliminated from seven additional pages: `introduction`, `upgrade`, `features/backups`, `features/error-tracking`, `howto/admin-listener`, `howto/enable-clickhouse-analytics`, and `howto/cli-login`.
+This pass completed a terminology-consistency sweep replacing deprecated whitelist/blocklist/allowlist language in prose across several pages that were not covered by pass 10, fixed contractions in prose sections of `features/cron-jobs` and `architecture/plugins`, and replaced informal first-person constructions ("We recommend", "Here's") with formal alternatives in `errors`, `features/analytics`, `features/mcp`, and `reference/cli-getting-started`.
 
 ### Risk
-REVIEW
+SAFE
 
 ### Files changed
-- `docs/architecture/deployment/page.mdx` — clarity rewrite: added sections export, lead paragraph, anchor IDs, section dividers, em dashes, formal prose
-- `docs/advanced/security/page.mdx` — replaced deprecated "whitelist" terminology with "allowlist" in prose and CLI comments
-- `docs/features/backups/page.mdx` — fixed contractions ("If you're" → "If you are", "Doesn't" → "does not")
-- `docs/features/error-tracking/page.mdx` — fixed contractions ("you'll find" → "you will find", "don't want" → "do not want")
-- `docs/howto/admin-listener/page.mdx` — fixed contractions across six prose lines
-- `docs/upgrade/page.mdx` — fixed contractions ("it's" → "it is", "that's" → "that has", "isn't" → "is not")
-- `docs/howto/enable-clickhouse-analytics/page.mdx` — fixed contractions ("don't want", "don't need", "isn't running", "doesn't speak")
-- `docs/howto/cli-login/page.mdx` — fixed contractions ("aren't", "don't act", "doesn't need", "can't sit")
-- `docs/introduction/page.mdx` — fixed contractions ("you're ready", "don't have", "it's running", "it's likely")
+- `docs/features/attack-mode/page.mdx` — "Block List"/"Allow List" headings → "Blocklist"/"Allowlist"; Note "whitelist and blacklist IPs" → "allowlist and blocklist IPs"; table rows updated
+- `docs/architecture/request-flow/page.mdx` — "Block List"/"Allow List" bullets → "Blocklist"/"Allowlist"
+- `docs/architecture/overview/page.mdx` — "IP Whitelisting" → "IP Allowlisting"
+- `docs/features/cron-jobs/page.mdx` — four prose contractions expanded ("don't" → "do not", "doesn't" → "does not")
+- `docs/architecture/plugins/page.mdx` — prose contraction "it's live" → "it is live"
+- `docs/errors/page.mdx` — "We recommend handling errors" → "Handle errors" (removed first-person plural)
+- `docs/features/analytics/page.mdx` — "Here's a complete example" → formal phrasing
+- `docs/features/mcp/page.mdx` — "Here's a summary" → "The following table summarises"
+- `docs/reference/cli-getting-started/page.mdx` — "Here's a quick workflow" → formal phrasing
 
 ### Stub filled
 none this pass
 
 ### Clarity rewrite
-`architecture/deployment` — added sections export, lead paragraph, anchor IDs, section dividers, em dashes, formal prose
+none this pass
 
 ### Stale refs fixed
-none this pass
+- "Block List" → "Blocklist" (in `docs/features/attack-mode/page.mdx`, `docs/architecture/request-flow/page.mdx`)
+- "Allow List" → "Allowlist" (in `docs/features/attack-mode/page.mdx`, `docs/architecture/request-flow/page.mdx`)
+- "IP Whitelisting" → "IP Allowlisting" (in `docs/architecture/overview/page.mdx`)
+- "whitelist and blacklist IPs" → "allowlist and blocklist IPs" (in `docs/features/attack-mode/page.mdx`)

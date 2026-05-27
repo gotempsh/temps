@@ -266,7 +266,7 @@ Control access to your Temps instance at the infrastructure level with IP-based 
 
 <Row>
   <Col>
-    ### Block List
+    ### Blocklist
     Block known bad actors by IP address or CIDR range:
 
     - Block individual IPs (e.g., `192.168.1.100`)
@@ -274,7 +274,7 @@ Control access to your Temps instance at the infrastructure level with IP-based 
     - Add a reason for each rule for audit purposes
     - Blocked requests receive a `403 Forbidden` response
 
-    ### Allow List
+    ### Allowlist
     Restrict access to only trusted IPs:
 
     - Allow specific office or VPN IPs
@@ -374,7 +374,7 @@ curl -X PATCH "https://your-temps-instance.com/api/projects/{project_id}/setting
 </CodeGroup>
 
 <Note>
-  When rate limiting is configured at multiple levels, whitelist and blacklist
+  When rate limiting is configured at multiple levels, allowlist and blocklist
   IPs are **additive** (merged from all levels), while numeric limits use the
   most specific configuration (environment overrides project, project overrides
   global).
@@ -477,8 +477,8 @@ Global Settings  →  Project Settings  →  Environment Settings
 | ------------------------ | -------------------------------------------------------- |
 | Security headers preset  | Child overrides parent (most specific wins)              |
 | Rate limit numbers       | Child overrides parent                                   |
-| Rate limit whitelist IPs | Additive (merged across all levels)                      |
-| Rate limit blacklist IPs | Additive (merged across all levels)                      |
+| Rate limit allowlist IPs | Additive (merged across all levels)                      |
+| Rate limit blocklist IPs | Additive (merged across all levels)                      |
 | Attack mode              | Can be set at project or environment level independently |
 
 ---

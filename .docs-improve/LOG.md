@@ -292,3 +292,58 @@
 - `architecture/deployment` clarity rewrite (sections, anchors, lead paragraph, formal prose) — fixed in pass 10
 - `advanced/security` whitelist → allowlist in prose — fixed in pass 10
 - Contractions in backups, error-tracking, admin-listener, upgrade, enable-clickhouse-analytics, cli-login, introduction — fixed in pass 10
+
+---
+
+## Pass 11 — run 2026-05-27-run
+
+**Date:** 2026-05-27
+**Risk:** SAFE
+
+### Changes
+
+| File | Change |
+|------|--------|
+| `docs/features/attack-mode/page.mdx` | "Block List"/"Allow List" prose headings → "Blocklist"/"Allowlist"; Note "whitelist and blacklist IPs" → "allowlist and blocklist IPs"; table rows updated |
+| `docs/architecture/request-flow/page.mdx` | "Block List"/"Allow List" bullets → "Blocklist"/"Allowlist" |
+| `docs/architecture/overview/page.mdx` | "IP Whitelisting" → "IP Allowlisting" |
+| `docs/features/cron-jobs/page.mdx` | Four prose contractions expanded ("don't" → "do not", "doesn't" → "does not") |
+| `docs/architecture/plugins/page.mdx` | Prose contraction "it's live" → "it is live" |
+| `docs/errors/page.mdx` | "We recommend handling errors" → "Handle errors" (removed first-person plural) |
+| `docs/features/analytics/page.mdx` | "Here's a complete example" → formal phrasing |
+| `docs/features/mcp/page.mdx` | "Here's a summary" → "The following table summarises" |
+| `docs/reference/cli-getting-started/page.mdx` | "Here's a quick workflow" → formal phrasing |
+
+### Already done (do not repeat)
+- `from-heroku` migration stub — filled in pass 1
+- Monitoring page Property blocks — rewritten in pass 1
+- Stale version `v0.0.6` in upgrade-temps page — fixed in pass 1
+- `from-railway` migration stub — filled in pass 2
+- Webhooks page structure — rewritten in pass 2
+- Stale RustFS `1.0.0-alpha.78` in set-up-managed-services and deploy-with-database — fixed in pass 2
+- Double-dash `--` em-dash typos in attack-mode, kv-storage, skills — fixed in pass 2
+- `from-vercel` migration stub — filled in pass 3
+- `from-netlify` migration stub — filled in pass 4
+- `architecture/overview` lead paragraph and description — rewritten in pass 4
+- `reference/troubleshooting` stub — filled in pass 5
+- `advanced/performance` stub — filled in pass 5
+- `features/teams` stub — filled in pass 6
+- `architecture/security` role names, permission strings, informal prose — rewritten in pass 6
+- `advanced/custom-buildpacks` stub — filled in pass 7
+- `advanced/networking` stub — filled in pass 8
+- `architecture/data-flow` sections export and lead paragraph — rewritten in pass 8
+- "Competitive Advantage" Note blocks in cron-jobs and managed-services — fixed in pass 8
+- `features/api` stub — filled in pass 9
+- `features/rollbacks` sections/anchors/dividers, broken link — fixed in pass 9
+- `architecture/deployment` clarity rewrite (sections, anchors, lead paragraph, formal prose) — fixed in pass 10
+- `advanced/security` whitelist → allowlist in prose — fixed in pass 10
+- Contractions in backups, error-tracking, admin-listener, upgrade, enable-clickhouse-analytics, cli-login, introduction — fixed in pass 10
+- `features/attack-mode` Block List/Allow List → Blocklist/Allowlist in headings and Note — fixed in pass 11
+- `architecture/request-flow` Block List/Allow List → Blocklist/Allowlist — fixed in pass 11
+- `architecture/overview` IP Whitelisting → IP Allowlisting — fixed in pass 11
+- `features/cron-jobs` contractions — fixed in pass 11
+- `architecture/plugins` "it's live" contraction — fixed in pass 11
+- `errors` "We recommend" first-person plural — fixed in pass 11
+- `features/analytics` "Here's" informal — fixed in pass 11
+- `features/mcp` "Here's" informal — fixed in pass 11
+- `reference/cli-getting-started` "Here's" informal — fixed in pass 11

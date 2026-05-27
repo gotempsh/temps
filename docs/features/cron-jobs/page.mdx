@@ -254,7 +254,7 @@ Temps automatically handles cron authentication for you:
 Authorization: Bearer <CRON_SECRET>
 ```
 
-You don't need to configure anything. The secret is generated per project/environment and stays stable across redeployments.
+No configuration is required. The secret is generated per project/environment and stays stable across redeployments.
 
 **Verify in your endpoint:**
 
@@ -330,7 +330,7 @@ Cron jobs defined in `.temps.yaml` are configured **per environment** when you d
 
 - **Same `.temps.yaml` file** - The file is shared across all environments
 - **Environment-specific execution** - Each environment (dev, staging, production) runs its own cron jobs
-- **Isolated execution** - Production and staging crons don't interfere with each other
+- **Isolated execution** - Production and staging crons do not interfere with each other
 - **Configured after deployment** - Cron jobs are set up automatically after each deployment completes
 
 ### Example: Different Behavior Per Environment
@@ -625,7 +625,7 @@ For long-running tasks, consider:
     **Possible causes:**
     - Invalid cron expression (use [crontab.guru](https://crontab.guru))
     - `.temps.yaml` file not in correct location (should match project directory)
-    - Endpoint path doesn't match
+    - Endpoint path does not match
     - Environment not deployed
     - YAML syntax error in `.temps.yaml`
 
@@ -641,7 +641,7 @@ For long-running tasks, consider:
     **Cause:** Your endpoint is not reading the `CRON_SECRET` environment variable correctly.
 
     **Solution:**
-    - `CRON_SECRET` is automatically injected by Temps on every deployment. You don't need to set it manually.
+    - `CRON_SECRET` is automatically injected by Temps on every deployment. You do not need to set it manually.
     - Verify your endpoint reads `process.env.CRON_SECRET` (Node.js) or `os.environ['CRON_SECRET']` (Python)
     - Check that your auth check compares against `Bearer ${process.env.CRON_SECRET}`
     - Redeploy your application if the secret was not injected (older deployments before this feature may not have it)
