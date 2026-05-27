@@ -7,14 +7,254 @@ export const metadata = {
   },
 };
 
+export const sections = [
+  { title: "Port configuration", id: "port-configuration" },
+  { title: "Internal networking", id: "internal-networking" },
+  { title: "Proxy configuration", id: "proxy-configuration" },
+  { title: "IP access control", id: "ip-access-control" },
+  { title: "WireGuard private tunnels", id: "wireguard" },
+  { title: "Load balancing and replicas", id: "load-balancing" },
+  { title: "Firewall rules", id: "firewall-rules" },
+];
+
 # Networking
 
-## Page Goal
+Configure ports, internal networking between containers, reverse-proxy split-listener mode, IP allowlists, WireGuard tunnels for multi-node clusters, and replica-level load balancing. {{ className: 'lead' }}
 
-Cover advanced networking for complex deployments.
+---
 
-## Target Persona
+## Port configuration {{ anchor: true, id: 'port-configuration' }}
 
-**Network Nick** - Needs VPNs, private networks, firewall config, advanced networking.
+Every container deployed on Temps must listen on the port supplied in the `PORT` environment variable. Temps injects this value automatically at deploy time and routes all inbound traffic to it.
 
-## Key Content: Port configuration, internal networking, VPC, firewall rules, proxy configuration, load balancing
+```javascript {{ title: 'Node.js' }}
+const port = process.env.PORT || 3000;
+app.listen(port, '0.0.0.0');
+```
+
+```python {{ title: 'Python' }}
+import os
+port = int(os.environ.get('PORT', 8000))
+```
+
+```go {{ title: 'Go' }}
+port := os.Getenv("PORT")
+if port == "" {
+    port = "8080"
+}
+http.ListenAndServe("0.0.0.0:" + port, router)
+```
+
+<Note>
+  Bind to `0.0.0.0`, not `localhost` or `127.0.0.1`. A container that binds only to loopback is unreachable from outside its own network namespace — Temps cannot route traffic to it.
+</Note>
+
+### Overriding the exposed port
+
+Temps auto-detects the default port for common frameworks (Next.js → 3000, Go → 8080, Python → 8000). If your app listens on a different port, override it from **Project → Environment → Settings → Exposed Port**, or via the API:
+
+```bash
+curl -X PUT "https://your-instance/api/projects/{id}/environments/{env_id}/settings" \
+  -H "Authorization: Bearer TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"exposed_port": 9000}'
+```
+
+---
+
+## Internal networking {{ anchor: true, id: 'internal-networking' }}
+
+### Container-to-container communication
+
+Containers in the same environment run inside an isolated Docker bridge network. They can reach each other by container name over the bridge, but are not exposed to the public internet except through the Pingora reverse proxy on ports 80 and 443.
+
+If you need two services to communicate (for example, a web container reaching a background worker), link them as separate Temps projects and call the other project's public URL, or use a shared managed service (Redis, PostgreSQL) as the communication channel.
+
+### Managed service networking
+
+When you link a managed service (PostgreSQL, Redis, MongoDB) to a project, Temps injects connection-string environment variables into each environment automatically. Managed services run in an isolated network and are not publicly exposed — only containers within the same Temps installation can reach them.
+
+For details on the injected variables, see [Deploy with a Database](/docs/deploy-with-database).
+
+### Multi-node networking
+
+In a multi-node cluster, worker nodes communicate with the control plane over HTTP on port 3100 (the `temps agent` listener). The control plane routes proxy traffic to containers on remote workers using each node's `private_address` field — the IP address the control plane uses to reach that worker on your internal network.
+
+See [Multi-Node Deployment](/docs/multi-node) for setup instructions.
+
+---
+
+## Proxy configuration {{ anchor: true, id: 'proxy-configuration' }}
+
+Temps' reverse proxy (built on Pingora) listens on ports 80 and 443 and terminates TLS. All traffic entering your server on those ports flows through Pingora, which resolves the `Host` header to the correct container and forwards the request.
+
+### Single-listener mode (default)
+
+By default, the Temps control plane binds one listener that handles both the admin/management surface and the public ingest endpoints (analytics SDKs, error tracking, AI gateway, worker registration):
+
+```bash
+export TEMPS_CONSOLE_ADDRESS=0.0.0.0:8080
+```
+
+### Split-listener mode
+
+For production deployments where you want to keep the admin surface off the public internet, configure a second bind address for admin-only routes:
+
+```bash
+# Public ingest endpoints — reachable from the internet
+export TEMPS_CONSOLE_ADDRESS=0.0.0.0:8080
+
+# Admin/management routes — only reachable from your VPN or loopback
+export TEMPS_CONSOLE_ADMIN_ADDRESS=127.0.0.1:8081
+
+# Optional: restrict by source IP (CIDR notation, comma-separated)
+export TEMPS_ADMIN_ALLOWED_IPS=127.0.0.1/32,10.0.0.0/8
+
+# Optional: restrict by Host header
+export TEMPS_ADMIN_ALLOWED_HOSTS=admin.internal.example.com
+
+# Optional: trust X-Forwarded-For from loopback peers (e.g. nginx in front)
+export TEMPS_ADMIN_TRUST_FORWARDED_FOR=true
+```
+
+Denials from the admin gate return `404 Not Found` rather than `403 Forbidden` so that a probing client cannot fingerprint the admin surface.
+
+See the [Admin Listener guide](/docs/admin-listener) for the full route classification table and deployment recipes.
+
+### Running behind a reverse proxy (nginx / Caddy)
+
+If you place nginx or Caddy in front of Temps, pass the standard forwarding headers so that Temps can reconstruct the real client IP for rate limiting and audit logs:
+
+```nginx
+location / {
+    proxy_pass          http://localhost:8080;
+    proxy_http_version  1.1;
+    proxy_set_header    Host              $host;
+    proxy_set_header    X-Real-IP         $remote_addr;
+    proxy_set_header    X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header    X-Forwarded-Proto $scheme;
+}
+```
+
+Set `TEMPS_ADMIN_TRUST_FORWARDED_FOR=true` only when the direct TCP peer is loopback (that is, when nginx runs on the same host as Temps). Enabling it with an internet-facing peer allows clients to spoof the IP recorded in audit logs.
+
+---
+
+## IP access control {{ anchor: true, id: 'ip-access-control' }}
+
+Temps lets you restrict which IP addresses can reach a specific project. Rules are checked by the Pingora proxy before the request reaches your container.
+
+| Rule type | Effect |
+|-----------|--------|
+| **Allow list** | Only the specified IPs or CIDRs can access this project |
+| **Block list** | The specified IPs or CIDRs are denied with `403 Forbidden` |
+| **No rules** | All IPs are allowed (default) |
+
+Configure rules from the dashboard under **Project → Security → IP Access Control**, or via the API.
+
+### Attack Mode (proof-of-work CAPTCHA)
+
+For DDoS mitigation, Attack Mode adds a proof-of-work challenge that is solved automatically in the visitor's browser (2–5 seconds, no user interaction required). Enable it per-project from **Project → Security → Attack Mode**. It is not suitable for API endpoints consumed by other services.
+
+See [Attack Mode](/docs/attack-mode) for full documentation.
+
+---
+
+## WireGuard private tunnels {{ anchor: true, id: 'wireguard' }}
+
+When worker nodes are not on the same private network as the control plane (for example, nodes in different data centers), you can connect them over a WireGuard tunnel so that inter-node traffic travels over an encrypted private link rather than the public internet.
+
+### Requirements
+
+- WireGuard installed on both the control plane and all worker nodes
+- A WireGuard interface configured on each machine (e.g. `wg0`)
+- Each machine assigned a WireGuard private IP (e.g. `10.8.0.1/24` for the control plane, `10.8.0.2/24` for the first worker)
+
+### Worker registration over WireGuard
+
+When you run `temps join` on a worker node, pass the WireGuard IP as the private address so the control plane routes proxy traffic through the tunnel:
+
+```bash
+# On the worker node
+temps join \
+  --control-plane-url https://10.8.0.1:8080 \
+  --token <join-token> \
+  --private-address 10.8.0.2
+```
+
+The control plane records `10.8.0.2` as the node's `private_address`. When a request arrives for a container on that worker, Pingora forwards it to `10.8.0.2:<container_port>` over the WireGuard interface.
+
+<Note>
+  The `temps agent` HTTP server listens on port 3100. Ensure each worker's WireGuard peer configuration allows inbound TCP on port 3100 from the control plane's WireGuard IP.
+</Note>
+
+---
+
+## Load balancing and replicas {{ anchor: true, id: 'load-balancing' }}
+
+### Horizontal scaling (replicas)
+
+Increase the replica count for an environment to run multiple containers behind the Pingora proxy. Temps round-robins requests across healthy replicas automatically — no external load balancer is needed.
+
+Configure replicas from **Project → Environment → Settings** or via the API:
+
+```bash
+curl -X PUT "https://your-instance/api/projects/{id}/environments/{env_id}/settings" \
+  -H "Authorization: Bearer TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"replicas": 3}'
+```
+
+### Multi-node replica distribution
+
+When worker nodes are registered, the scheduler distributes replicas across all active nodes using round-robin. A node is considered active if it has sent a heartbeat within the last 90 seconds. If no active workers exist, all replicas run locally on the control plane.
+
+### Session affinity
+
+Temps does not implement session affinity (sticky sessions) at the proxy layer. If your application requires session affinity, store session state in a shared managed service (Redis or PostgreSQL) so any replica can serve any request.
+
+### Health checks
+
+Pingora removes a container from rotation if its health check endpoint returns a non-2xx response or times out. Configure the health check path and interval from **Project → Environment → Settings**. The default health check polls the root path (`/`) every 30 seconds.
+
+---
+
+## Firewall rules {{ anchor: true, id: 'firewall-rules' }}
+
+The Temps proxy enforces IP access rules at the application layer, but you should also configure your host firewall (`ufw`, `iptables`, or your cloud provider's security groups) to limit which ports are reachable from the internet.
+
+### Recommended host firewall rules
+
+| Port | Protocol | Source | Purpose |
+|------|----------|--------|---------|
+| 22 | TCP | Your IPs only | SSH |
+| 80 | TCP | `0.0.0.0/0` | HTTP (Let's Encrypt + redirect) |
+| 443 | TCP | `0.0.0.0/0` | HTTPS |
+| 8080 | TCP | `0.0.0.0/0` | Temps public ingest (analytics, AI gateway, error tracking) |
+| 8081 | TCP | VPN/loopback only | Temps admin surface (split-listener mode) |
+| 3100 | TCP | Worker node IPs only | `temps agent` (multi-node) |
+
+```bash {{ title: 'ufw example' }}
+# Allow SSH, HTTP, HTTPS, and Temps public port
+sudo ufw allow 22/tcp
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+sudo ufw allow 8080/tcp
+
+# Restrict admin port to loopback (split-listener mode)
+sudo ufw allow from 127.0.0.1 to any port 8081
+
+# Allow worker nodes to reach the agent port
+sudo ufw allow from 10.8.0.0/24 to any port 3100
+
+sudo ufw enable
+```
+
+---
+
+## What to explore next
+
+<Button href="/docs/admin-listener">Admin Listener guide</Button>
+<Button href="/docs/multi-node">Multi-Node Deployment</Button>
+<Button href="/docs/attack-mode">Attack Mode</Button>
+<Button href="/docs/scale-for-traffic">Scale for Traffic</Button>

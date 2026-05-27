@@ -6,9 +6,24 @@ export const metadata = {
   },
 }
 
+export const sections = [
+  { title: 'Data flow overview', id: 'data-flow-overview' },
+  { title: 'Data structures', id: 'data-structures' },
+  { title: 'React/Next.js integration', id: 'react-nextjs-integration' },
+  { title: 'Tracking custom events', id: 'tracking-custom-events' },
+  { title: 'Identifying users', id: 'identifying-users' },
+  { title: 'What gets tracked automatically', id: 'what-gets-tracked-automatically' },
+  { title: 'What you can do with this data', id: 'what-you-can-do-with-this-data' },
+  { title: 'Data privacy and control', id: 'data-privacy-and-control' },
+]
+
 # Analytics & Data
 
-Temps automatically tracks and analyzes data from your applications, giving you insights into user behavior, performance, and errors. Here's what gets tracked and how to integrate with your React or Next.js application.
+Every event captured by a Temps-hosted application flows through a browser SDK, an ingest endpoint, a PostgreSQL/TimescaleDB store, and finally a dashboard query. This page describes that pipeline, the data structures written at each step, and how to wire the React SDK into your application. {{ className: 'lead' }}
+
+---
+
+## Data flow overview {{ anchor: true, id: 'data-flow-overview' }}
 
 <Mermaid chart={`
 sequenceDiagram
@@ -35,7 +50,9 @@ sequenceDiagram
     Temps->>Dashboard: Alert User
 `} />
 
-## Data Structures
+---
+
+## Data structures {{ anchor: true, id: 'data-structures' }}
 
 ### Analytics Events
 
@@ -196,7 +213,9 @@ interface ErrorEvent {
 }
 ```
 
-## React/Next.js Integration
+---
+
+## React/Next.js integration {{ anchor: true, id: 'react-nextjs-integration' }}
 
 ### Installation
 
@@ -354,7 +373,9 @@ NEXT_PUBLIC_PROJECT_SLUG=your-project-slug
 NEXT_PUBLIC_TEMPS_API_URL=https://your-temps-instance.com
 ```
 
-## Tracking Custom Events
+---
+
+## Tracking custom events {{ anchor: true, id: 'tracking-custom-events' }}
 
 Use the `useAnalytics` hook to track custom events:
 
@@ -380,7 +401,9 @@ function MyComponent() {
 }
 ```
 
-## Identifying Users
+---
+
+## Identifying users {{ anchor: true, id: 'identifying-users' }}
 
 Associate analytics with specific users:
 
@@ -405,7 +428,9 @@ function UserProfile({ user }) {
 }
 ```
 
-## What Gets Tracked Automatically
+---
+
+## What gets tracked automatically {{ anchor: true, id: 'what-gets-tracked-automatically' }}
 
 Once integrated, Temps automatically tracks:
 
@@ -417,7 +442,9 @@ Once integrated, Temps automatically tracks:
 - **Traffic Sources** - UTM parameters, referrer
 - **Geographic Data** - Location based on IP (cached)
 
-## What You Can Do With This Data
+---
+
+## What you can do with this data {{ anchor: true, id: 'what-you-can-do-with-this-data' }}
 
 ### Analytics Dashboard
 - **Real-Time Views** - See activity as it happens
@@ -440,7 +467,9 @@ Once integrated, Temps automatically tracks:
 - **Browser Comparison** - Performance by browser
 - **Alerts** - Get notified when performance degrades
 
-## Data Privacy & Control
+---
+
+## Data privacy and control {{ anchor: true, id: 'data-privacy-and-control' }}
 
 ### Your Data, Your Control
 - **Self-Hosted** - All data stays on your infrastructure

@@ -174,3 +174,39 @@
 - `features/teams` stub — filled in pass 6
 - `architecture/security` role names, permission strings, informal prose — rewritten in pass 6
 - `advanced/custom-buildpacks` stub — filled in pass 7
+
+---
+
+## Pass 8 — run-2026-05-27-001
+
+**Date:** 2026-05-27
+**Risk:** REVIEW
+
+### Changes
+
+| File | Change |
+|------|--------|
+| `docs/advanced/networking/page.mdx` | Stub filled: complete networking guide (ports, internal networking, split-listener proxy, IP ACLs, WireGuard tunnels, load balancing, host firewall rules) |
+| `docs/architecture/data-flow/page.mdx` | Clarity pass: added sections export, lead paragraph, `---` dividers, lowercase anchor headings matching site conventions |
+| `docs/features/cron-jobs/page.mdx` | Grammar fix: removed "Competitive Advantage" marketing label from Note block |
+| `docs/features/managed-services/page.mdx` | Grammar fix: removed "Competitive Advantage" marketing label from Note block |
+
+### Already done (do not repeat)
+- `from-heroku` migration stub — filled in pass 1
+- Monitoring page Property blocks — rewritten in pass 1
+- Stale version `v0.0.6` in upgrade-temps page — fixed in pass 1
+- `from-railway` migration stub — filled in pass 2
+- Webhooks page structure — rewritten in pass 2
+- Stale RustFS `1.0.0-alpha.78` in set-up-managed-services and deploy-with-database — fixed in pass 2
+- Double-dash `--` em-dash typos in attack-mode, kv-storage, skills — fixed in pass 2
+- `from-vercel` migration stub — filled in pass 3
+- `from-netlify` migration stub — filled in pass 4
+- `architecture/overview` lead paragraph and description — rewritten in pass 4
+- `reference/troubleshooting` stub — filled in pass 5
+- `advanced/performance` stub — filled in pass 5
+- `features/teams` stub — filled in pass 6
+- `architecture/security` role names, permission strings, informal prose — rewritten in pass 6
+- `advanced/custom-buildpacks` stub — filled in pass 7
+- `advanced/networking` stub — filled in pass 8
+- `architecture/data-flow` sections export and lead paragraph — rewritten in pass 8
+- "Competitive Advantage" Note blocks in cron-jobs and managed-services — fixed in pass 8
