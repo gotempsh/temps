@@ -17,7 +17,7 @@ This guide covers how to upgrade your self-hosted Temps instance to the latest v
 
 ### Back Up Your Data
 
-While Temps handles migrations automatically, it's good practice to back up before upgrading:
+While Temps handles migrations automatically, it is good practice to back up before upgrading:
 
 ```bash
 # 1. Back up the database
@@ -138,7 +138,7 @@ When Temps starts after a binary upgrade:
 3. **Reloads configuration** from the existing data directory
 4. **Resumes serving** with zero manual intervention
 
-Database migrations are **idempotent** — re-running a version that's already migrated is safe and has no effect.
+Database migrations are **idempotent** — re-running a version that has already been migrated is safe and has no effect.
 
 ---
 
@@ -233,7 +233,7 @@ docker exec temps-timescaledb pg_isready -U temps
 docker logs temps-timescaledb --tail 50
 ```
 
-If the database container isn't running, start it first:
+If the database container is not running, start it first:
 
 ```bash
 docker start temps-timescaledb

@@ -154,7 +154,7 @@ await fetch('/api/firewall/blocked-ips', {
 
 #### Allowed IP Addresses
 
-Restrict access to specific IP addresses (whitelist mode):
+Restrict access to specific IP addresses (allowlist mode):
 
 <CodeGroup title="Configure Allowed IPs">
 ```yaml {{ title: 'Config File' }}
@@ -173,8 +173,8 @@ security:
 # Add IP to allowlist
 temps firewall allow --ip 203.0.113.0/24
 
-# Enable whitelist mode (blocks all IPs not on allowlist)
-temps firewall whitelist-mode --enable
+# Enable allowlist mode (blocks all IPs not on allowlist)
+temps firewall allowlist-mode --enable
 
 # List allowed IPs
 temps firewall list-allowed
@@ -246,8 +246,8 @@ security:
         requests_per_minute: 100
         requests_per_hour: 2000
 
-    # IP whitelist (bypass rate limits)
-    whitelist_ips:
+    # IP allowlist (bypass rate limits)
+    allowlist_ips:
       - "203.0.113.0/24"
       - "198.51.100.10"
 ```

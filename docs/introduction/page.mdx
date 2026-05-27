@@ -35,7 +35,7 @@ The wizard walks you through each step interactively:
   idempotent — you can re-run it safely if something fails.
 </Note>
 
-Once complete, open the console URL shown at the end and you're ready to deploy.
+Once complete, open the console URL shown at the end and you are ready to deploy.
 
 ---
 
@@ -52,7 +52,7 @@ If you prefer full control, you can install each component yourself.
 - **Cloudflare token** (optional, for automatic DNS management)
 
 <Note>
-  If you don't have Docker installed, run: `curl -fsSL https://get.docker.com |
+  If you do not have Docker installed, run: `curl -fsSL https://get.docker.com |
   sh`
 </Note>
 
@@ -76,7 +76,7 @@ docker run -d \
   timescale/timescaledb-ha:pg18
 ```
 
-Wait a few seconds for the database to initialize, then verify it's running:
+Wait a few seconds for the database to initialize, then verify it is running:
 
 ```bash
 docker logs temps-postgres
@@ -210,7 +210,7 @@ sudo systemctl enable --now temps
 
 ### Server hangs on startup
 
-If Temps hangs during startup, it's likely waiting for the screenshot provider to initialize. Disable it with:
+If Temps hangs during startup, it is likely waiting for the screenshot provider to initialize. Disable it with:
 
 ```bash
 export TEMPS_SCREENSHOT_PROVIDER=noop

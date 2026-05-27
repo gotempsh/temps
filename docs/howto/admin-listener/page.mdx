@@ -27,11 +27,11 @@ The Temps control plane serves two very different kinds of traffic on the same p
 
 Enable the admin listener if any of these apply:
 
-- You expose the Temps control plane on a public IP and don't want random scanners hitting `/api/auth/login`.
+- You expose the Temps control plane on a public IP and do not want random scanners hitting `/api/auth/login`.
 - You front Temps with a reverse proxy and want admin access gated to a separate hostname or IP range.
 - Your compliance posture requires admin interfaces to be unreachable from the public internet.
 
-If you're running Temps on a private network with no public exposure, the default single-listener mode is fine — leave `TEMPS_CONSOLE_ADMIN_ADDRESS` unset.
+If you are running Temps on a private network with no public exposure, the default single-listener mode is fine — leave `TEMPS_CONSOLE_ADMIN_ADDRESS` unset.
 
 ---
 
@@ -40,9 +40,9 @@ If you're running Temps on a private network with no public exposure, the defaul
 Each plugin in the Temps control plane declares two route sets:
 
 - `configure_routes` — the **admin** surface. Auth, dashboard queries, CRUD, settings, the SPA, Swagger UI.
-- `configure_public_routes` — the **public** surface. SDK ingest endpoints, webhook delivery targets, worker-facing APIs. These handlers authenticate themselves (API key, DSN token, Host-header lookup) — they don't rely on session auth.
+- `configure_public_routes` — the **public** surface. SDK ingest endpoints, webhook delivery targets, worker-facing APIs. These handlers authenticate themselves (API key, DSN token, Host-header lookup) — they do not rely on session auth.
 
-When `TEMPS_CONSOLE_ADMIN_ADDRESS` is set, the server binds both routers on separate `axum::serve` listeners. When it's unset, both routers are merged onto `TEMPS_CONSOLE_ADDRESS` for backwards compatibility.
+When `TEMPS_CONSOLE_ADMIN_ADDRESS` is set, the server binds both routers on separate `axum::serve` listeners. When it is unset, both routers are merged onto `TEMPS_CONSOLE_ADDRESS` for backwards compatibility.
 
 The admin gate (CIDR + Host allowlists) is layered on top of the admin listener as defense in depth. Denials return `404 Not Found`, not `403 Forbidden`, so a probing client cannot fingerprint the admin surface.
 
@@ -70,7 +70,7 @@ Everything else — `/api/auth/*`, `/api/projects/...`, settings, deployments, a
 <Note>
   **Webhooks are public on purpose.** GitHub, Stripe, and AWS SES must reach
   webhook endpoints from arbitrary IPs. Each webhook handler verifies its own
-  signature, so the public listener doesn't weaken the security model.
+  signature, so the public listener does not weaken the security model.
 </Note>
 
 ---
@@ -203,7 +203,7 @@ admin gate denied: Host header not in allowlist  host=evil.example path=/api/aut
 What the admin listener defends against:
 
 - **Drive-by scanning** of `/api/auth/login` and other admin endpoints by internet-wide scanners.
-- **Credential-stuffing attacks** that don't know the admin surface exists.
+- **Credential-stuffing attacks** that do not know the admin surface exists.
 - **Operator mistakes** like a misconfigured CORS allowlist that would otherwise expose admin APIs.
 
 What it does **not** defend against:

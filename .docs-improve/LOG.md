@@ -246,3 +246,49 @@
 - "Competitive Advantage" Note blocks in cron-jobs and managed-services — fixed in pass 8
 - `features/api` stub — filled in pass 9
 - `features/rollbacks` sections/anchors/dividers, broken link — fixed in pass 9
+
+---
+
+## Pass 10 — run 2026-05-27T10:00:00Z
+
+**Date:** 2026-05-27
+**Risk:** REVIEW
+
+### Changes
+
+| File | Change |
+|------|--------|
+| `docs/architecture/deployment/page.mdx` | Clarity rewrite: added sections export, lead paragraph, anchor IDs on all H2s, section dividers, em dashes for bullet separators, formal prose (removed "Here's", "don't", "you'll", CamelCase headers) |
+| `docs/advanced/security/page.mdx` | Replaced deprecated "whitelist" terminology with "allowlist" in prose and CLI comments (config YAML keys left unchanged) |
+| `docs/features/backups/page.mdx` | Fixed contractions: "If you're" → "If you are", "What Doesn't Get Restored" → "What does not get restored" |
+| `docs/features/error-tracking/page.mdx` | Fixed contractions: "you'll find" → "you will find", "don't want" → "do not want" |
+| `docs/howto/admin-listener/page.mdx` | Fixed contractions: "don't want", "If you're running", "they don't rely", "it's unset", "doesn't weaken", "don't know" |
+| `docs/upgrade/page.mdx` | Fixed contractions: "it's good practice", "that's already migrated", "isn't running" |
+| `docs/howto/enable-clickhouse-analytics/page.mdx` | Fixed contractions: "don't want", "don't need", "isn't running", "doesn't speak" |
+| `docs/howto/cli-login/page.mdx` | Fixed contractions: "aren't already", "don't act", "doesn't need", "can't sit" |
+| `docs/introduction/page.mdx` | Fixed contractions: "you're ready", "don't have", "it's running", "it's likely" |
+
+### Already done (do not repeat)
+- `from-heroku` migration stub — filled in pass 1
+- Monitoring page Property blocks — rewritten in pass 1
+- Stale version `v0.0.6` in upgrade-temps page — fixed in pass 1
+- `from-railway` migration stub — filled in pass 2
+- Webhooks page structure — rewritten in pass 2
+- Stale RustFS `1.0.0-alpha.78` in set-up-managed-services and deploy-with-database — fixed in pass 2
+- Double-dash `--` em-dash typos in attack-mode, kv-storage, skills — fixed in pass 2
+- `from-vercel` migration stub — filled in pass 3
+- `from-netlify` migration stub — filled in pass 4
+- `architecture/overview` lead paragraph and description — rewritten in pass 4
+- `reference/troubleshooting` stub — filled in pass 5
+- `advanced/performance` stub — filled in pass 5
+- `features/teams` stub — filled in pass 6
+- `architecture/security` role names, permission strings, informal prose — rewritten in pass 6
+- `advanced/custom-buildpacks` stub — filled in pass 7
+- `advanced/networking` stub — filled in pass 8
+- `architecture/data-flow` sections export and lead paragraph — rewritten in pass 8
+- "Competitive Advantage" Note blocks in cron-jobs and managed-services — fixed in pass 8
+- `features/api` stub — filled in pass 9
+- `features/rollbacks` sections/anchors/dividers, broken link — fixed in pass 9
+- `architecture/deployment` clarity rewrite (sections, anchors, lead paragraph, formal prose) — fixed in pass 10
+- `advanced/security` whitelist → allowlist in prose — fixed in pass 10
+- Contractions in backups, error-tracking, admin-listener, upgrade, enable-clickhouse-analytics, cli-login, introduction — fixed in pass 10

@@ -31,9 +31,9 @@ Switch on ClickHouse when:
 
 - The `events` hypertable in Postgres exceeds **~50M rows / month** ingested.
 - Dashboard queries (event counts, timelines, property breakdowns) take **>2s** on warm cache.
-- You already operate a ClickHouse cluster and don't want a second analytical store.
+- You already operate a ClickHouse cluster and do not want a second analytical store.
 
-You don't need it for indie-hacker-scale installs. The Postgres path stays fast up to single-digit millions of events per month on a modest VPS.
+You do not need it for indie-hacker-scale installs. The Postgres path stays fast up to single-digit millions of events per month on a modest VPS.
 
 ## Prerequisites {#prerequisites}
 
@@ -103,7 +103,7 @@ SELECT
 FROM events_ch_outbox;
 ```
 
-Expect `pending` to be small (≤ batch_size) and `dead_lettered` to be `0`. If `pending` is growing without bound, the worker isn't running or CH is unreachable — check `temps serve` logs for `ch_fanout` warnings.
+Expect `pending` to be small (≤ batch_size) and `dead_lettered` to be `0`. If `pending` is growing without bound, the worker is not running or CH is unreachable — check `temps serve` logs for `ch_fanout` warnings.
 
 **3. CH is serving reads.** Hit any analytics endpoint with a project that has events. The response should match what Postgres would return (within ~1% on `uniq()`-based metrics — see Known Limitations).
 
@@ -190,5 +190,5 @@ These are documented divergences in the v1 ClickHouse backend. None block typica
 - **`uniq()` is HLL-approximate**. CH's `uniq(visitor_id)` returns within ~1% of the true distinct count, vs Postgres's exact `COUNT(DISTINCT)`. Numbers will not match to the unit when comparing dashboards across backends.
 - **Self-referral filter on `referrer_hostname` is PG-only**. The Postgres property breakdown filters out a project's own custom domains when grouping by referrer; the CH path does not have `project_custom_domains` replicated, so apps will see their own domain in the referrer breakdown. Will be fixed via a CH `Dictionary` in a follow-up.
 - **`Analytics` trait stays on PG**. Visitor / session / journey / page-flow endpoints continue to read from Postgres even when CH is enabled (see [What is on each backend](#whats-on-each)). The only trait that switches is `AnalyticsEvents`.
-- **No CH cluster mode (yet)**. The current backend is a single-target HTTP client. Sharded CH clusters work behind a load balancer (CHProxy, ClickHouse Keeper-aware proxy) but Temps doesn't speak to the cluster topology directly.
+- **No CH cluster mode (yet)**. The current backend is a single-target HTTP client. Sharded CH clusters work behind a load balancer (CHProxy, ClickHouse Keeper-aware proxy) but Temps does not speak to the cluster topology directly.
 - **Retention is hard-coded to 5 years on CH and 7 days on the PG outbox**. Per-project retention is on the roadmap; for now, edit the migration SQL and run `ALTER TABLE events MODIFY TTL ...` manually if you need different windows.

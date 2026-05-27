@@ -36,10 +36,10 @@ There is no password prompt in the terminal. The CLI works for password accounts
 
 1. The CLI asks the server for a `device_code` and a short, human-readable `user_code`.
 2. The CLI prints the approval URL and tries to open it in your default browser.
-3. You sign in to the Temps web app (if you aren't already), then approve the device — the page shows the `user_code` so you can confirm it matches the CLI.
+3. You sign in to the Temps web app (if you are not already signed in), then approve the device — the page shows the `user_code` so you can confirm it matches the CLI.
 4. Once you approve, the server mints a CLI API key. The CLI is polling in the background; it picks up the key and stores it locally.
 
-You see the plaintext API key exactly once — the CLI persists it to your credential store and the server never returns it again. Approvals expire after 15 minutes if you don't act on them.
+You see the plaintext API key exactly once — the CLI persists it to your credential store and the server never returns it again. Approvals expire after 15 minutes if you do not act on them.
 
 ---
 
@@ -137,9 +137,9 @@ If you want to skip the browser-open attempt entirely (for example, in a `tmux` 
 
 ## MFA and SSO {{ anchor: true, id: 'mfa-and-sso' }}
 
-The browser flow handles MFA and SSO transparently — the `/login` page already prompts for your TOTP code when MFA is enabled, and bounces SSO users through their identity provider. Complete the prompt in the browser before approving the device; the CLI doesn't need to know which authentication factors were involved.
+The browser flow handles MFA and SSO transparently — the `/login` page already prompts for your TOTP code when MFA is enabled, and bounces SSO users through their identity provider. Complete the prompt in the browser before approving the device; the CLI does not need to know which authentication factors were involved.
 
-For automated jobs that can't sit through an MFA prompt, generate an API key from the dashboard and use the headless path described above. The key inherits the role of the user who created it.
+For automated jobs that cannot sit through an MFA prompt, generate an API key from the dashboard and use the headless path described above. The key inherits the role of the user who created it.
 
 ---
 

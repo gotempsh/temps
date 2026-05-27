@@ -7,9 +7,18 @@ export const metadata = {
   },
 };
 
+export const sections = [
+  { title: 'What happens when you deploy', id: 'what-happens-when-you-deploy' },
+  { title: 'What you can control', id: 'what-you-can-control' },
+  { title: 'Deployment states', id: 'deployment-states' },
+  { title: 'Rollback', id: 'rollback' },
+  { title: 'Build failures', id: 'build-failures' },
+  { title: 'Monitoring deployments', id: 'monitoring-deployments' },
+]
+
 # Deployment Pipeline
 
-When you deploy an application, Temps automatically handles the entire process from Git to production. Here's what happens and what you can control.
+When you deploy an application, Temps automatically handles the entire process from Git to production — cloning the repository, building a container image, running health checks, and routing traffic. {{ className: 'lead' }}
 
 <Mermaid
   chart={`
@@ -36,15 +45,17 @@ sequenceDiagram
 `}
 />
 
-## What Happens When You Deploy
+---
 
-### Step 1: Connect Your Repository
+## What happens when you deploy {{ anchor: true, id: 'what-happens-when-you-deploy' }}
+
+### Step 1: Connect your repository
 
 - Link your GitHub, GitLab, or other Git repository
 - Temps clones your code
 - Automatically detects your language and framework
 
-### Step 2: Build Your Application
+### Step 2: Build your application
 
 **If you have a Dockerfile:**
 
@@ -52,65 +63,69 @@ sequenceDiagram
 - Supports all Docker features and build arguments
 - Optimized builds with layer caching
 
-**If you don't have a Dockerfile:**
+**If you do not have a Dockerfile:**
 
 - Temps automatically detects your language
 - Generates an appropriate Dockerfile for you
 - Works for Node.js, Python, Rust, Go, Java, Ruby, PHP, and more
 - Zero configuration needed
 
-### Step 3: Configure Environment
+### Step 3: Configure your environment
 
 - Set environment variables in the dashboard
 - Use secrets for sensitive data (encrypted storage)
 - Different variables for dev, staging, and production
 - Automatic database credentials if using managed databases
 
-### Step 4: Deploy Container
+### Step 4: Deploy the container
 
 - Container starts with your environment variables
 - Health checks ensure your app is running
 - Automatic retries if startup fails
 - Resource limits (CPU, memory) as configured
 
-### Step 5: Set Up Domain & SSL
+### Step 5: Set up domain and SSL
 
 - Assign a custom domain or use auto-generated subdomain
 - Automatic SSL certificate from Let's Encrypt
 - Certificates renew automatically
 - Your app is live and secure
 
-## What You Can Control
+---
 
-### Build Configuration
+## What you can control {{ anchor: true, id: 'what-you-can-control' }}
 
-- **Use Your Dockerfile** - Full control with custom Dockerfiles
-- **Auto-Detection** - Let Temps figure it out automatically
-- **Build Arguments** - Pass custom build-time variables
-- **Build Logs** - See exactly what's happening during build
+### Build configuration
 
-### Environment Variables
+- **Use your Dockerfile** — Full control with custom Dockerfiles
+- **Auto-detection** — Let Temps figure it out automatically
+- **Build arguments** — Pass custom build-time variables
+- **Build logs** — See exactly what is happening during the build
 
-- **Project-Level** - Variables shared across all environments
-- **Environment-Level** - Specific to dev/staging/production
-- **Secrets** - Encrypted storage for passwords and API keys
-- **Override** - Override variables for specific deployments
+### Environment variables
 
-### Resource Limits
+- **Project-level** — Variables shared across all environments
+- **Environment-level** — Specific to development, staging, or production
+- **Secrets** — Encrypted storage for passwords and API keys
+- **Override** — Override variables for specific deployments
 
-- **Memory** - Set how much RAM your app can use
-- **CPU** - Limit CPU usage
-- **Disk** - Storage limits
-- **Timeouts** - Request timeout settings
+### Resource limits
 
-### Deployment Settings
+- **Memory** — Set how much RAM your application can use
+- **CPU** — Limit CPU usage
+- **Disk** — Storage limits
+- **Timeouts** — Request timeout settings
 
-- **Port Configuration** - Which port your app listens on
-- **Health Check Path** - Custom health check endpoint
-- **Restart Policy** - Automatic restarts on failure
-- **Rollback** - Instantly revert to previous deployment
+### Deployment settings
 
-## Deployment States
+- **Port configuration** — Which port your application listens on
+- **Health check path** — Custom health check endpoint
+- **Restart policy** — Automatic restarts on failure
+- **Rollback** — Instantly revert to a previous deployment
+
+---
+
+## Deployment states {{ anchor: true, id: 'deployment-states' }}
 
 Your deployment goes through these states:
 
@@ -131,67 +146,75 @@ stateDiagram-v2
 `}
 />
 
-**PENDING** - Deployment queued
-**BUILDING** - Building your container
-**BUILT** - Container image created
-**DEPLOYING** - Starting the container
-**RUNNING** - Container is running
-**ACTIVE** - Receiving live traffic
+**PENDING** — Deployment queued
+**BUILDING** — Building your container
+**BUILT** — Container image created
+**DEPLOYING** — Starting the container
+**RUNNING** — Container is running
+**ACTIVE** — Receiving live traffic
 
-If something goes wrong, the state becomes **FAILED** and you'll see error details.
+If something goes wrong, the state becomes **FAILED** and the deployment detail page shows error details.
 
-## Rollback
+---
+
+## Rollback {{ anchor: true, id: 'rollback' }}
 
 If a deployment has issues:
 
 1. **Previous deployment** is still running
-2. **Switch routing** - Point domain back to previous version
-3. **Zero downtime** - Users see the working version immediately
-4. **Debug** - Investigate the failed deployment
-5. **Delete** - Remove the failed deployment when ready
+2. **Switch routing** — Point the domain back to the previous version
+3. **Zero downtime** — Users see the working version immediately
+4. **Debug** — Investigate the failed deployment
+5. **Delete** — Remove the failed deployment when ready
 
-## Build Failures
+---
 
-### Common Issues and Solutions
+## Build failures {{ anchor: true, id: 'build-failures' }}
 
-**Language Detection Failed**
+### Common issues and solutions
+
+**Language detection failed**
 
 - **Solution:** Provide a Dockerfile
-- **Why:** Temps couldn't detect your project type
+- **Why:** Temps could not detect your project type
 
-**Dependency Installation Failed**
+**Dependency installation failed**
 
-- **Solution:** Check your package.json, requirements.txt, go.mod, etc.
+- **Solution:** Check your `package.json`, `requirements.txt`, `go.mod`, etc.
 - **Why:** Missing or incorrect dependency files
 
-**Port Binding Failed**
+**Port binding failed**
 
-- **Solution:** Set PORT environment variable
-- **Why:** App trying to use a port that's already in use
+- **Solution:** Set the `PORT` environment variable
+- **Why:** The application is trying to use a port that is already in use
 
-**Memory Exceeded**
+**Memory exceeded**
 
-- **Solution:** Increase memory limit in deployment settings
-- **Why:** App needs more memory than allocated
+- **Solution:** Increase the memory limit in deployment settings
+- **Why:** The application needs more memory than allocated
 
-## Monitoring Deployments
+---
 
-### Real-Time Information
+## Monitoring deployments {{ anchor: true, id: 'monitoring-deployments' }}
 
-- **Build Logs** - Watch build progress in real-time
-- **Deployment Logs** - See application startup logs
-- **Health Status** - Know when your app is healthy
-- **Resource Usage** - Monitor CPU, memory, disk usage
+### Real-time information
 
-### After Deployment
+- **Build logs** — Watch build progress in real-time
+- **Deployment logs** — See application startup logs
+- **Health status** — Know when your application is healthy
+- **Resource usage** — Monitor CPU, memory, and disk usage
 
-- **Analytics** - Track request volume and performance
-- **Error Tracking** - See errors as they happen
-- **Uptime** - Monitor availability
-- **Performance** - Track response times
+### After deployment
 
-## Next Steps
+- **Analytics** — Track request volume and performance
+- **Error tracking** — See errors as they happen
+- **Uptime** — Monitor availability
+- **Performance** — Track response times
 
-- **[Overview](/docs/overview)** - System capabilities
-- **[Data Flow](/docs/data-flow)** - Analytics and monitoring
-- **[Security Architecture](/docs/security)** - Security features
+---
+
+## Next steps
+
+- **[Overview](/docs/overview)** — System capabilities
+- **[Data Flow](/docs/data-flow)** — Analytics and monitoring
+- **[Security Architecture](/docs/security)** — Security features
