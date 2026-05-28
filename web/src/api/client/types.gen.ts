@@ -3509,6 +3509,62 @@ export type DiscoverResponse = {
 };
 
 /**
+ * Disk space information for a single disk/partition
+ */
+export type DiskInfo = {
+    /**
+     * Available space in bytes
+     */
+    available_bytes: number;
+    /**
+     * File system type (e.g., "ext4", "apfs")
+     */
+    file_system: string;
+    /**
+     * Mount point of the disk
+     */
+    mount_point: string;
+    /**
+     * Total space in bytes
+     */
+    total_bytes: number;
+    /**
+     * Usage percentage (0-100)
+     */
+    usage_percent: number;
+    /**
+     * Used space in bytes
+     */
+    used_bytes: number;
+};
+
+/**
+ * Alert for a disk that exceeds the threshold
+ */
+export type DiskSpaceAlert = {
+    /**
+     * Available space in bytes
+     */
+    available_bytes: number;
+    /**
+     * Human-readable available space
+     */
+    available_human: string;
+    /**
+     * Mount point of the disk
+     */
+    mount_point: string;
+    /**
+     * Configured threshold percentage
+     */
+    threshold_percent: number;
+    /**
+     * Current usage percentage
+     */
+    usage_percent: number;
+};
+
+/**
  * Disk space alert settings for monitoring disk usage
  */
 export type DiskSpaceAlertSettings = {
@@ -3528,6 +3584,32 @@ export type DiskSpaceAlertSettings = {
      * Threshold percentage (0-100) at which to trigger alerts
      */
     threshold_percent?: number;
+};
+
+/**
+ * Result of a disk space check
+ */
+export type DiskSpaceCheckResult = {
+    /**
+     * Disks that meet or exceed the threshold
+     */
+    alerts: Array<DiskSpaceAlert>;
+    /**
+     * Timestamp of the check (ISO 8601, UTC)
+     */
+    checked_at: string;
+    /**
+     * List of all monitored disks
+     */
+    disks: Array<DiskInfo>;
+    /**
+     * Whether disk space monitoring is enabled in settings
+     */
+    enabled: boolean;
+    /**
+     * Configured alert threshold percentage (0-100)
+     */
+    threshold_percent: number;
 };
 
 export type DnsAckRequest = {
@@ -37571,6 +37653,33 @@ export type SaveAiProviderCredentialResponses = {
 };
 
 export type SaveAiProviderCredentialResponse = SaveAiProviderCredentialResponses[keyof SaveAiProviderCredentialResponses];
+
+export type GetDiskStatusData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/settings/disk-status';
+};
+
+export type GetDiskStatusErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetDiskStatusResponses = {
+    /**
+     * Current disk usage and threshold alerts
+     */
+    200: DiskSpaceCheckResult;
+};
+
+export type GetDiskStatusResponse = GetDiskStatusResponses[keyof GetDiskStatusResponses];
 
 export type RevokeJoinTokenData = {
     body?: never;

@@ -28,6 +28,7 @@ rand = { workspace = true }
 serde_derive = { workspace = true }
 uuid = { workspace = true }
 utoipa = { workspace = true }
+sysinfo = "0.33"
 axum = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }

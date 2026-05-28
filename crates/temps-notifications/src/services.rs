@@ -324,6 +324,69 @@ impl NotificationProvider for EmailProvider {
 }
 
 impl EmailProvider {
+    /// Send a transactional email to explicit recipients.
+    ///
+    /// Unlike [`NotificationProvider::send`], this does NOT pull in the
+    /// configured `to_addresses` or admin users — it delivers only to the
+    /// addresses passed in (e.g. the user who requested a password reset).
+    /// The From defaults to the provider's configured sender unless
+    /// `from_override` is supplied. The body is sent as-is when it's a full
+    /// HTML document, matching the notification send-path behaviour.
+    async fn send_to(
+        &self,
+        recipients: &[String],
+        subject: &str,
+        html_body: &str,
+        from_override: Option<&str>,
+    ) -> Result<()> {
+        let mailer = self
+            .mailer
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Email provider not initialized"))?;
+
+        let from_address = from_override.unwrap_or(&self.from_address);
+        let from = Mailbox::new(self.from_name.clone(), from_address.parse()?);
+
+        if recipients.is_empty() {
+            return Err(anyhow::anyhow!("No recipient for transactional email"));
+        }
+
+        let mut last_err: Option<anyhow::Error> = None;
+        let mut delivered = false;
+        for addr in recipients {
+            let to_mailbox = match addr.parse::<Mailbox>() {
+                Ok(m) => m,
+                Err(e) => {
+                    error!("Invalid transactional email recipient {}: {}", addr, e);
+                    last_err = Some(anyhow::anyhow!("Invalid recipient {}: {}", addr, e));
+                    continue;
+                }
+            };
+
+            let email_msg = Message::builder()
+                .from(from.clone())
+                .to(to_mailbox)
+                .subject(subject)
+                .header(ContentType::TEXT_HTML)
+                .body(html_body.to_string())?;
+
+            match mailer.send(email_msg).await {
+                Ok(_) => delivered = true,
+                Err(e) => {
+                    error!("Failed to send transactional email to {}: {}", addr, e);
+                    last_err = Some(anyhow::anyhow!("SMTP send failed for {}: {}", addr, e));
+                }
+            }
+        }
+
+        if delivered {
+            Ok(())
+        } else {
+            Err(last_err
+                .unwrap_or_else(|| anyhow::anyhow!("Transactional email could not be delivered")))
+        }
+    }
+
     fn render_notification_email(notification: &Notification) -> String {
         let (accent_color, bg_color, icon, label) = match notification.priority {
             NotificationPriority::Low => ("#6b7280", "#f9fafb", "&#8505;", "Info"),
@@ -885,6 +948,41 @@ impl NotificationService {
         Ok(providers)
     }
 
+    /// Load only enabled `email`-type providers, initialized and ready to
+    /// send. Used by the transactional email path so reset/verification
+    /// links never route to Slack/webhook providers.
+    async fn get_enabled_email_providers(&self) -> Result<Vec<EmailProvider>> {
+        let records = notification_providers::Entity::find()
+            .filter(notification_providers::Column::Enabled.eq(true))
+            .filter(notification_providers::Column::ProviderType.eq("email"))
+            .all(self.db.as_ref())
+            .await?;
+
+        let mut providers = Vec::new();
+        for record in records {
+            let decrypted_config = match self.encryption_service.decrypt_string(&record.config) {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("Failed to decrypt email provider {}: {}", record.name, e);
+                    continue;
+                }
+            };
+            let mut config: EmailProvider = match serde_json::from_str(&decrypted_config) {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("Failed to parse email provider {}: {}", record.name, e);
+                    continue;
+                }
+            };
+            if let Err(e) = config.initialize(self.db.clone()).await {
+                error!("Failed to initialize email provider {}: {}", record.name, e);
+                continue;
+            }
+            providers.push(config);
+        }
+        Ok(providers)
+    }
+
     /// Returns the base delay between notifications for a given priority.
     /// This is the gap after the very first notification — subsequent gaps
     /// grow exponentially (see `get_next_allowed_time`).
@@ -1251,6 +1349,72 @@ impl CoreNotificationService for NotificationService {
             Ok(_) => Ok(()),
             Err(e) => Err(CoreNotificationError::SendError(e.to_string())),
         }
+    }
+
+    async fn send_transactional_email(
+        &self,
+        message: EmailMessage,
+    ) -> Result<(), CoreNotificationError> {
+        if message.to.is_empty() {
+            return Err(CoreNotificationError::InvalidRecipient(
+                "Transactional email has no recipients".to_string(),
+            ));
+        }
+
+        let providers = self
+            .get_enabled_email_providers()
+            .await
+            .map_err(|e| CoreNotificationError::ConfigurationError(e.to_string()))?;
+
+        if providers.is_empty() {
+            return Err(CoreNotificationError::ServiceUnavailable(
+                "No enabled email provider is configured".to_string(),
+            ));
+        }
+
+        // Prefer the HTML body; fall back to the plain-text body so we never
+        // send an empty message.
+        let body = message
+            .html_body
+            .clone()
+            .unwrap_or_else(|| message.body.clone());
+
+        // Try each email provider until one delivers. We don't fan out to
+        // all of them — a transactional message should arrive once.
+        let mut last_err: Option<anyhow::Error> = None;
+        for provider in &providers {
+            match provider
+                .send_to(
+                    &message.to,
+                    &message.subject,
+                    &body,
+                    message.from.as_deref(),
+                )
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    error!("Transactional email provider failed: {}", e);
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        Err(CoreNotificationError::SendError(
+            last_err
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "All email providers failed".to_string()),
+        ))
+    }
+
+    async fn is_email_provider_configured(&self) -> Result<bool, CoreNotificationError> {
+        let count = notification_providers::Entity::find()
+            .filter(notification_providers::Column::Enabled.eq(true))
+            .filter(notification_providers::Column::ProviderType.eq("email"))
+            .count(self.db.as_ref())
+            .await
+            .map_err(|e| CoreNotificationError::ConfigurationError(e.to_string()))?;
+        Ok(count > 0)
     }
 
     async fn send_notification(

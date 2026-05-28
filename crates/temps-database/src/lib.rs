@@ -1,8 +1,10 @@
 //! Database connection and query utilities
 
 pub use sea_orm;
+pub mod approx_count;
 mod connection;
 
+pub use approx_count::{approximate_row_count, count_for_pagination, CountKind};
 pub use connection::{establish_connection, DbConnection};
 
 // Export test utilities for use by other crates in their tests

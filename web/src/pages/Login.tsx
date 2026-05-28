@@ -134,6 +134,7 @@ export const Login = () => {
           onSubmit={handleSubmit}
           isLoading={isLoading || login.isPending}
           oidcProviders={emailStatus?.oidc_providers ?? []}
+          passwordResetAvailable={emailStatus?.password_reset_available ?? false}
         />
       </div>
     </div>

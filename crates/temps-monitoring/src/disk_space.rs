@@ -4,10 +4,7 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 use std::sync::Arc;
-use sysinfo::Disks;
 use temps_config::ConfigService;
 use temps_core::notifications::{
     NotificationData, NotificationPriority, NotificationService, NotificationType,
@@ -17,48 +14,13 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-/// Disk space information for a single disk/partition
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiskInfo {
-    /// Mount point of the disk
-    pub mount_point: String,
-    /// Total space in bytes
-    pub total_bytes: u64,
-    /// Used space in bytes
-    pub used_bytes: u64,
-    /// Available space in bytes
-    pub available_bytes: u64,
-    /// Usage percentage (0-100)
-    pub usage_percent: f64,
-    /// File system type (e.g., "ext4", "apfs")
-    pub file_system: String,
-}
-
-/// Result of a disk space check
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiskSpaceCheckResult {
-    /// Timestamp of the check
-    pub checked_at: DateTime<Utc>,
-    /// List of all monitored disks
-    pub disks: Vec<DiskInfo>,
-    /// Disks that exceed the threshold
-    pub alerts: Vec<DiskSpaceAlert>,
-}
-
-/// Alert for a disk that exceeds the threshold
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiskSpaceAlert {
-    /// Mount point of the disk
-    pub mount_point: String,
-    /// Current usage percentage
-    pub usage_percent: f64,
-    /// Configured threshold percentage
-    pub threshold_percent: u32,
-    /// Available space in bytes
-    pub available_bytes: u64,
-    /// Human-readable available space
-    pub available_human: String,
-}
+// Disk inspection types and pure collection logic live in `temps-config` so the
+// read-only Settings API endpoint can reuse them without depending on this
+// (notification-bearing) crate. Re-exported here for back-compat.
+pub use temps_config::disk_status::{
+    collect_disk_status, format_bytes, get_disk_info, DiskInfo, DiskSpaceAlert,
+    DiskSpaceCheckResult,
+};
 
 #[derive(Debug, Error)]
 pub enum DiskSpaceError {
@@ -74,21 +36,22 @@ pub enum DiskSpaceError {
 pub struct DiskSpaceMonitor {
     config_service: Arc<ConfigService>,
     notification_service: Arc<dyn NotificationService>,
-    data_dir: PathBuf,
     last_alert_time: RwLock<Option<DateTime<Utc>>>,
 }
 
 impl DiskSpaceMonitor {
-    /// Create a new disk space monitor
+    /// Create a new disk space monitor.
+    ///
+    /// The monitored path is resolved from settings (`disk_space_alert.monitor_path`,
+    /// falling back to the configured data directory) via the shared
+    /// `temps_config::disk_status` collector — no separate data-dir argument is needed.
     pub fn new(
         config_service: Arc<ConfigService>,
         notification_service: Arc<dyn NotificationService>,
-        data_dir: PathBuf,
     ) -> Self {
         Self {
             config_service,
             notification_service,
-            data_dir,
             last_alert_time: RwLock::new(None),
         }
     }
@@ -105,78 +68,14 @@ impl DiskSpaceMonitor {
 
     /// Get disk information for all disks or a specific path
     pub fn get_disk_info(&self, path: Option<&str>) -> Result<Vec<DiskInfo>, DiskSpaceError> {
-        let disks = Disks::new_with_refreshed_list();
-        let mut disk_infos = Vec::new();
-
-        for disk in disks.list() {
-            let mount_point = disk.mount_point().to_string_lossy().to_string();
-            let total = disk.total_space();
-            let available = disk.available_space();
-            let used = total.saturating_sub(available);
-            let usage_percent = if total > 0 {
-                (used as f64 / total as f64) * 100.0
-            } else {
-                0.0
-            };
-
-            // Filter by path if specified
-            if let Some(target_path) = path {
-                // Check if the target path is under this mount point
-                if !target_path.starts_with(&mount_point) && mount_point != "/" {
-                    continue;
-                }
-            }
-
-            disk_infos.push(DiskInfo {
-                mount_point,
-                total_bytes: total,
-                used_bytes: used,
-                available_bytes: available,
-                usage_percent,
-                file_system: disk.file_system().to_string_lossy().to_string(),
-            });
-        }
-
-        // If we have a specific path and multiple matches, return only the most specific one
-        if path.is_some() && disk_infos.len() > 1 {
-            // Sort by mount point length (longest = most specific) and take the first
-            disk_infos.sort_by_key(|d| std::cmp::Reverse(d.mount_point.len()));
-            disk_infos.truncate(1);
-        }
-
-        Ok(disk_infos)
+        Ok(get_disk_info(path))
     }
 
     /// Check disk space against the configured threshold
     pub async fn check_disk_space(&self) -> Result<DiskSpaceCheckResult, DiskSpaceError> {
-        let settings = self.get_settings().await?;
-
-        // Determine which path to monitor
-        let monitor_path = settings
-            .monitor_path
-            .as_deref()
-            .unwrap_or_else(|| self.data_dir.to_str().unwrap_or("/"));
-
-        let disks = self.get_disk_info(Some(monitor_path))?;
-        let mut alerts = Vec::new();
-
-        for disk in &disks {
-            if disk.usage_percent >= settings.threshold_percent as f64 {
-                alerts.push(DiskSpaceAlert {
-                    mount_point: disk.mount_point.clone(),
-                    usage_percent: disk.usage_percent,
-                    threshold_percent: settings.threshold_percent,
-                    available_bytes: disk.available_bytes,
-                    available_human: format_bytes(disk.available_bytes),
-                });
-            }
-        }
-
-        Ok(DiskSpaceCheckResult {
-            checked_at: Utc::now(),
-            disks,
-            alerts,
-        })
+        collect_disk_status(&self.config_service)
+            .await
+            .map_err(|e| DiskSpaceError::Configuration(e.to_string()))
     }
 
     /// Check disk space and send notifications if threshold is exceeded
@@ -187,6 +86,8 @@ impl DiskSpaceMonitor {
             debug!("Disk space monitoring is disabled");
             return Ok(DiskSpaceCheckResult {
                 checked_at: Utc::now(),
+                enabled: false,
+                threshold_percent: settings.threshold_percent,
                 disks: vec![],
                 alerts: vec![],
             });
@@ -339,26 +240,6 @@ impl DiskSpaceMonitor {
     }
 }
 
-/// Format bytes into a human-readable string
-fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-    const TB: u64 = GB * 1024;
-
-    if bytes >= TB {
-        format!("{:.2} TB", bytes as f64 / TB as f64)
-    } else if bytes >= GB {
-        format!("{:.2} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.2} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.2} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{} bytes", bytes)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,80 +247,13 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Mutex;
 
-    #[test]
-    fn test_format_bytes() {
-        assert_eq!(format_bytes(0), "0 bytes");
-        assert_eq!(format_bytes(512), "512 bytes");
-        assert_eq!(format_bytes(1024), "1.00 KB");
-        assert_eq!(format_bytes(1536), "1.50 KB");
-        assert_eq!(format_bytes(1024 * 1024), "1.00 MB");
-        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.00 GB");
-        assert_eq!(format_bytes(1024 * 1024 * 1024 * 1024), "1.00 TB");
-    }
-
-    #[test]
-    fn test_format_bytes_edge_cases() {
-        // Test boundary values
-        assert_eq!(format_bytes(1023), "1023 bytes");
-        assert_eq!(format_bytes(1024 * 1024 - 1), "1024.00 KB");
-
-        // Test large values
-        let five_tb = 5 * 1024 * 1024 * 1024 * 1024u64;
-        assert_eq!(format_bytes(five_tb), "5.00 TB");
-    }
-
-    #[test]
-    fn test_disk_info_creation() {
-        let info = DiskInfo {
-            mount_point: "/".to_string(),
-            total_bytes: 1024 * 1024 * 1024 * 100,    // 100 GB
-            used_bytes: 1024 * 1024 * 1024 * 80,      // 80 GB
-            available_bytes: 1024 * 1024 * 1024 * 20, // 20 GB
-            usage_percent: 80.0,
-            file_system: "apfs".to_string(),
-        };
-
-        assert_eq!(info.mount_point, "/");
-        assert_eq!(info.usage_percent, 80.0);
-        assert_eq!(info.total_bytes, info.used_bytes + info.available_bytes);
-    }
-
-    #[test]
-    fn test_disk_info_usage_calculation() {
-        // Test usage percentage calculation
-        let total: u64 = 1024 * 1024 * 1024 * 100; // 100 GB
-        let used: u64 = 1024 * 1024 * 1024 * 85; // 85 GB
-        let available = total - used;
-        let usage_percent = (used as f64 / total as f64) * 100.0;
-
-        let info = DiskInfo {
-            mount_point: "/data".to_string(),
-            total_bytes: total,
-            used_bytes: used,
-            available_bytes: available,
-            usage_percent,
-            file_system: "ext4".to_string(),
-        };
-
-        assert!((info.usage_percent - 85.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_disk_space_alert_creation() {
-        let alert = DiskSpaceAlert {
-            mount_point: "/".to_string(),
-            usage_percent: 85.5,
-            threshold_percent: 80,
-            available_bytes: 1024 * 1024 * 1024 * 15,
-            available_human: "15.00 GB".to_string(),
-        };
-
-        assert!(alert.usage_percent > alert.threshold_percent as f64);
-    }
+    // NOTE: disk inspection + threshold/format logic is owned and unit-tested in
+    // `temps_config::disk_status`. The tests here cover only the
+    // notification-bearing behaviour that lives in this crate.
 
     #[test]
     fn test_disk_space_alert_severity_levels() {
-        // Test that severity levels are correctly determined based on usage
+        // Severity is derived from usage_percent in `send_alerts`.
         let create_alert = |usage: f64| DiskSpaceAlert {
             mount_point: "/".to_string(),
             usage_percent: usage,
@@ -448,75 +262,14 @@ mod tests {
             available_human: "1.00 GB".to_string(),
         };
 
-        // Normal priority (80-89%)
         let normal_alert = create_alert(85.0);
         assert!(normal_alert.usage_percent < 90.0);
 
-        // High priority (90-94%)
         let high_alert = create_alert(92.0);
         assert!(high_alert.usage_percent >= 90.0 && high_alert.usage_percent < 95.0);
 
-        // Critical priority (95%+)
         let critical_alert = create_alert(97.0);
         assert!(critical_alert.usage_percent >= 95.0);
-    }
-
-    #[test]
-    fn test_disk_space_check_result() {
-        let disks = vec![
-            DiskInfo {
-                mount_point: "/".to_string(),
-                total_bytes: 100 * 1024 * 1024 * 1024,
-                used_bytes: 75 * 1024 * 1024 * 1024,
-                available_bytes: 25 * 1024 * 1024 * 1024,
-                usage_percent: 75.0,
-                file_system: "apfs".to_string(),
-            },
-            DiskInfo {
-                mount_point: "/data".to_string(),
-                total_bytes: 500 * 1024 * 1024 * 1024,
-                used_bytes: 450 * 1024 * 1024 * 1024,
-                available_bytes: 50 * 1024 * 1024 * 1024,
-                usage_percent: 90.0,
-                file_system: "ext4".to_string(),
-            },
-        ];
-
-        let alerts = vec![DiskSpaceAlert {
-            mount_point: "/data".to_string(),
-            usage_percent: 90.0,
-            threshold_percent: 80,
-            available_bytes: 50 * 1024 * 1024 * 1024,
-            available_human: "50.00 GB".to_string(),
-        }];
-
-        let result = DiskSpaceCheckResult {
-            checked_at: Utc::now(),
-            disks,
-            alerts,
-        };
-
-        assert_eq!(result.disks.len(), 2);
-        assert_eq!(result.alerts.len(), 1);
-        assert_eq!(result.alerts[0].mount_point, "/data");
-    }
-
-    #[test]
-    fn test_alert_threshold_boundary() {
-        // Test exactly at threshold (should trigger)
-        let at_threshold = DiskSpaceAlert {
-            mount_point: "/".to_string(),
-            usage_percent: 80.0,
-            threshold_percent: 80,
-            available_bytes: 20 * 1024 * 1024 * 1024,
-            available_human: "20.00 GB".to_string(),
-        };
-        assert!(at_threshold.usage_percent >= at_threshold.threshold_percent as f64);
-
-        // Test just below threshold (should not trigger in real check)
-        let below_threshold_usage = 79.9;
-        let threshold = 80;
-        assert!(below_threshold_usage < threshold as f64);
     }
 
     // Mock notification service for testing
@@ -563,73 +316,6 @@ mod tests {
             &self,
         ) -> std::result::Result<bool, temps_core::notifications::NotificationError> {
             Ok(self.is_configured)
-        }
-    }
-
-    #[test]
-    fn test_get_disk_info_using_sysinfo_directly() {
-        // Test disk info retrieval using sysinfo directly (same logic as get_disk_info)
-        let disks = Disks::new_with_refreshed_list();
-
-        // Should have at least one disk on any system
-        assert!(
-            !disks.list().is_empty(),
-            "System should have at least one disk"
-        );
-
-        for disk in disks.list() {
-            let mount_point = disk.mount_point().to_string_lossy().to_string();
-            let total = disk.total_space();
-            let available = disk.available_space();
-            let used = total.saturating_sub(available);
-            let usage_percent = if total > 0 {
-                (used as f64 / total as f64) * 100.0
-            } else {
-                0.0
-            };
-
-            // Validate values
-            assert!(!mount_point.is_empty(), "Mount point should not be empty");
-            assert!(
-                (0.0..=100.0).contains(&usage_percent),
-                "Usage percent should be between 0 and 100, got {}",
-                usage_percent
-            );
-        }
-    }
-
-    #[test]
-    fn test_disk_info_from_raw_values() {
-        // Test the DiskInfo struct creation with realistic values from a disk
-        let disks = Disks::new_with_refreshed_list();
-
-        if let Some(disk) = disks.list().first() {
-            let mount_point = disk.mount_point().to_string_lossy().to_string();
-            let total = disk.total_space();
-            let available = disk.available_space();
-            let used = total.saturating_sub(available);
-            let usage_percent = if total > 0 {
-                (used as f64 / total as f64) * 100.0
-            } else {
-                0.0
-            };
-            let file_system = disk.file_system().to_string_lossy().to_string();
-
-            let info = DiskInfo {
-                mount_point: mount_point.clone(),
-                total_bytes: total,
-                used_bytes: used,
-                available_bytes: available,
-                usage_percent,
-                file_system,
-            };
-
-            assert_eq!(info.mount_point, mount_point);
-            assert!(info.total_bytes > 0, "Total bytes should be positive");
-            assert!(
-                info.usage_percent >= 0.0 && info.usage_percent <= 100.0,
-                "Usage percent should be valid"
-            );
         }
     }
 

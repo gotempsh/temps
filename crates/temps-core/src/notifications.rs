@@ -21,6 +21,45 @@ pub trait NotificationService: Send + Sync {
         notification: NotificationData,
     ) -> Result<(), NotificationError>;
     async fn is_configured(&self) -> Result<bool, NotificationError>;
+
+    /// Send a one-to-one transactional email to the exact recipients in
+    /// `message.to`.
+    ///
+    /// Unlike [`send_email`], which routes through the alerting pipeline
+    /// (fan-out to every enabled provider — Slack/webhook/email — and
+    /// delivery to the admin alert list, with batching/throttling), this
+    /// path is for per-user mail like password resets and email
+    /// verification. It MUST:
+    ///   - use email providers only (never Slack/webhook),
+    ///   - deliver to `message.to` (the requesting user), not the
+    ///     configured alert recipients or admins,
+    ///   - bypass notification throttling.
+    ///
+    /// The `from`/`from_name` come from the email provider's own config
+    /// unless `message.from` overrides them.
+    ///
+    /// Default impl errors as unavailable so a misconfigured service fails
+    /// loudly rather than silently leaking a reset link to an alert channel.
+    async fn send_transactional_email(
+        &self,
+        _message: EmailMessage,
+    ) -> Result<(), NotificationError> {
+        Err(NotificationError::ServiceUnavailable(
+            "Transactional email is not supported by this notification service".to_string(),
+        ))
+    }
+
+    /// Whether an enabled **email** provider exists specifically.
+    ///
+    /// [`is_configured`] returns true if *any* notification provider is
+    /// enabled (including a Slack-only setup), which is the wrong gate for
+    /// features that genuinely require email delivery (password reset,
+    /// magic links, verification). Default impl conservatively returns
+    /// false so callers don't advertise email-only features without a real
+    /// email provider.
+    async fn is_email_provider_configured(&self) -> Result<bool, NotificationError> {
+        Ok(false)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -252,6 +252,45 @@ impl ProxyLogService {
     ) -> Result<(Vec<proxy_logs::Model>, u64), ProxyLogServiceError> {
         let mut query = proxy_logs::Entity::find();
 
+        // Whether any narrowing predicate is set. When nothing is filtered,
+        // the pagination total is just the whole-table row count, which on
+        // this hypertable we can read from planner stats in microseconds via
+        // `approximate_row_count` instead of scanning every chunk with
+        // `COUNT(*)`. Sort/pagination fields do not narrow the result set, so
+        // they are excluded. Computed up front, before the blocks below
+        // consume the owned filter fields.
+        let has_filters = start_date.is_some()
+            || end_date.is_some()
+            || filters.project_id.is_some()
+            || filters.environment_id.is_some()
+            || filters.deployment_id.is_some()
+            || filters.session_id.is_some()
+            || filters.visitor_id.is_some()
+            || filters.method.is_some()
+            || filters.host.is_some()
+            || filters.path.is_some()
+            || filters.client_ip.is_some()
+            || filters.status_code.is_some()
+            || filters.response_time_min.is_some()
+            || filters.response_time_max.is_some()
+            || filters.routing_status.is_some()
+            || filters.request_source.is_some()
+            || filters.is_system_request.is_some()
+            || filters.user_agent.is_some()
+            || filters.browser.is_some()
+            || filters.operating_system.is_some()
+            || filters.device_type.is_some()
+            || filters.is_bot.is_some()
+            || filters.bot_name.is_some()
+            || filters.request_size_min.is_some()
+            || filters.request_size_max.is_some()
+            || filters.response_size_min.is_some()
+            || filters.response_size_max.is_some()
+            || filters.cache_status.is_some()
+            || filters.container_id.is_some()
+            || filters.upstream_host.is_some()
+            || filters.has_error.is_some();
+
         // Project/Environment/Deployment filters
         if let Some(pid) = filters.project_id {
             query = query.filter(proxy_logs::Column::ProjectId.eq(pid));
@@ -405,7 +444,13 @@ impl ProxyLogService {
         };
 
         let paginator = query.paginate(self.db.as_ref(), page_size);
-        let total = paginator.num_items().await?;
+        let (total, _) = temps_database::count_for_pagination(
+            self.db.as_ref(),
+            "proxy_logs",
+            has_filters,
+            || async { paginator.num_items().await },
+        )
+        .await?;
         let items = paginator.fetch_page(page - 1).await?;
 
         Ok((items, total))

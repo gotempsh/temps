@@ -20,6 +20,7 @@ import { Cloud, Loader2, Lock } from 'lucide-react'
 import type { ComponentType, SVGProps } from 'react'
 import { useForm } from 'react-hook-form'
 import { SiAuth0, SiGoogle, SiKeycloak, SiOkta } from 'react-icons/si'
+import { Link } from 'react-router-dom'
 import { z } from 'zod'
 
 const loginSchema = z.object({
@@ -30,7 +31,13 @@ const loginSchema = z.object({
 type LoginFormData = z.infer<typeof loginSchema>
 
 export type OidcProviderOption = {
-  id: number
+  /**
+   * Stable opaque slug — used as the path parameter for
+   * `/api/auth/oidc/login/{slug}`. The integer database ID is
+   * intentionally omitted from the public providers endpoint to
+   * prevent provider enumeration, so we route by slug here.
+   */
+  slug: string
   name: string
   /**
    * The provider template the admin selected when creating it (e.g.
@@ -89,6 +96,12 @@ interface LoginFormProps {
    * the <form> entirely instead of relying on validation.
    */
   passwordLoginEnabled?: boolean
+  /**
+   * Show the "Forgot password?" link next to the password field. Only
+   * true when the server has an email provider configured (reset links
+   * are emailed), so we don't link users to a flow that can't deliver.
+   */
+  passwordResetAvailable?: boolean
 }
 
 export function LoginForm({
@@ -96,6 +109,7 @@ export function LoginForm({
   isLoading,
   oidcProviders = [],
   passwordLoginEnabled = true,
+  passwordResetAvailable = false,
 }: LoginFormProps) {
   const form = useForm<LoginFormData>({
     resolver: zodResolver(loginSchema),
@@ -109,8 +123,8 @@ export function LoginForm({
     await onSubmit(data)
   }
 
-  const startOidcLogin = (providerId: number) => {
-    window.location.href = `/api/auth/oidc/login/${providerId}`
+  const startOidcLogin = (slug: string) => {
+    window.location.href = `/api/auth/oidc/login/${encodeURIComponent(slug)}`
   }
 
   return (
@@ -128,12 +142,12 @@ export function LoginForm({
               const Icon = providerIcon(provider.template)
               return (
                 <Button
-                  key={provider.id}
+                  key={provider.slug}
                   type="button"
                   variant="outline"
                   className="w-full"
                   disabled={isLoading}
-                  onClick={() => startOidcLogin(provider.id)}
+                  onClick={() => startOidcLogin(provider.slug)}
                 >
                   {/* `aria-hidden` because the visible button text
                       already announces the provider — pairing the icon
@@ -190,7 +204,17 @@ export function LoginForm({
               name="password"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>Password</FormLabel>
+                  <div className="flex items-center justify-between">
+                    <FormLabel>Password</FormLabel>
+                    {passwordResetAvailable && (
+                      <Link
+                        to="/forgot-password"
+                        className="text-sm font-medium text-muted-foreground hover:text-foreground"
+                      >
+                        Forgot password?
+                      </Link>
+                    )}
+                  </div>
                   <FormControl>
                     <Input
                       type="password"

@@ -1200,11 +1200,9 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         service_context.get_service::<temps_config::ConfigService>(),
         service_context.get_service::<dyn temps_core::notifications::NotificationService>(),
     ) {
-        let data_dir = config.data_dir.clone();
         let monitor = Arc::new(DiskSpaceMonitor::new(
             config_service.clone(),
             notification_service,
-            data_dir,
         ));
 
         tokio::spawn(async move {

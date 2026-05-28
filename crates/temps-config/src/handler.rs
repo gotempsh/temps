@@ -1,3 +1,4 @@
+use crate::disk_status::DiskSpaceCheckResult;
 use crate::ConfigService;
 use axum::{
     extract::{Extension, State},
@@ -257,6 +258,7 @@ impl From<AppSettings> for AppSettingsResponse {
 #[openapi(
     paths(
         get_settings,
+        get_disk_status,
         update_settings,
         generate_join_token,
         revoke_join_token,
@@ -266,6 +268,9 @@ impl From<AppSettings> for AppSettingsResponse {
     components(schemas(
         AppSettings,
         AppSettingsResponse,
+        crate::disk_status::DiskInfo,
+        crate::disk_status::DiskSpaceAlert,
+        crate::disk_status::DiskSpaceCheckResult,
         ContainerLogSettings,
         DnsProviderSettingsMasked,
         DockerRegistrySettingsMasked,
@@ -291,6 +296,7 @@ pub fn configure_routes() -> Router<Arc<SettingsState>> {
     Router::new()
         .route("/settings", get(get_settings))
         .route("/settings", put(update_settings))
+        .route("/settings/disk-status", get(get_disk_status))
         .route("/settings/join-token/generate", post(generate_join_token))
         .route("/settings/join-token", delete(revoke_join_token))
         .route("/settings/join-token/status", get(get_join_token_status))
@@ -332,6 +338,44 @@ async fn get_settings(
                 .build())
         }
     }
+}
+
+/// Get current disk usage for the control-plane server
+///
+/// Returns live disk usage for the monitored path along with any disks that
+/// meet or exceed the configured alert threshold. Read-only — does not send
+/// notifications. Used by the dashboard to surface a low-disk-space warning.
+#[utoipa::path(
+    tag = "Settings",
+    get,
+    path = "/settings/disk-status",
+    responses(
+        (status = 200, description = "Current disk usage and threshold alerts", body = DiskSpaceCheckResult),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+async fn get_disk_status(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<SettingsState>>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsRead);
+
+    let status = crate::disk_status::collect_disk_status(&app_state.config_service)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to collect disk status: {}", e);
+            ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .type_("https://temps.sh/probs/disk-status-error")
+                .title("Disk Status Error")
+                .detail(e.to_string())
+                .build()
+        })?;
+
+    Ok(Json(status))
 }
 
 /// Update application settings

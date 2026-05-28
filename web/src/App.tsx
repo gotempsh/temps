@@ -192,6 +192,12 @@ const ApiKeyDetail = lazy(() => import('./pages/ApiKeyDetail'))
 const MfaVerify = lazy(() =>
   import('./pages/MfaVerify').then((m) => ({ default: m.MfaVerify }))
 )
+const ForgotPassword = lazy(() =>
+  import('./pages/ForgotPassword').then((m) => ({ default: m.ForgotPassword }))
+)
+const ResetPassword = lazy(() =>
+  import('./pages/ResetPassword').then((m) => ({ default: m.ResetPassword }))
+)
 const NotFound = lazy(() => import('./components/global/NotFound'))
 
 // Settings sub-pages
@@ -528,6 +534,11 @@ const AppContent = () => {
               <Routes>
                 {/* Public routes that don't require authentication */}
                 <Route path="/mfa-verify" element={<MfaVerify />} />
+                <Route path="/forgot-password" element={<ForgotPassword />} />
+                {/* Target of the password-reset email link
+                    ({base_url}/auth/reset-password?token=...) — see
+                    send_password_reset_email in temps-auth. */}
+                <Route path="/auth/reset-password" element={<ResetPassword />} />
 
                 {/* Protected routes - layout determined by demo mode */}
                 <Route

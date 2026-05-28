@@ -1661,19 +1661,29 @@ impl OtelStorage for TimescaleDbStorage {
     }
 
     async fn get_storage_quota(&self, project_id: i32) -> StorageResult<StorageQuota> {
+        // Per-project storage is estimated as
+        //   table_size * (rows for project / total rows in table).
+        // The per-project numerator must be exact, but the whole-table
+        // denominator only needs to be approximate -- the whole formula is
+        // already a proportional estimate. On these hypertables an unfiltered
+        // `COUNT(*)` scans every chunk, and this runs three times per call on
+        // the ingest hot path (`check_quota`), so the denominator uses
+        // TimescaleDB's `approximate_row_count` (planner stats, microseconds).
+        // `GREATEST(.., 1)` still guards against a zero/negative estimate on a
+        // freshly-created, never-analyzed table.
         let sql = r#"
             SELECT
                 COALESCE((SELECT pg_total_relation_size('otel_metrics') *
                     (SELECT COUNT(*) FROM otel_metrics WHERE project_id = $1)::float /
-                    GREATEST((SELECT COUNT(*) FROM otel_metrics), 1)::float
+                    GREATEST(approximate_row_count('otel_metrics'::regclass), 1)::float
                 ), 0)::bigint +
                 COALESCE((SELECT pg_total_relation_size('otel_spans') *
                     (SELECT COUNT(*) FROM otel_spans WHERE project_id = $1)::float /
-                    GREATEST((SELECT COUNT(*) FROM otel_spans), 1)::float
+                    GREATEST(approximate_row_count('otel_spans'::regclass), 1)::float
                 ), 0)::bigint +
                 COALESCE((SELECT pg_total_relation_size('otel_log_events') *
                     (SELECT COUNT(*) FROM otel_log_events WHERE project_id = $1)::float /
-                    GREATEST((SELECT COUNT(*) FROM otel_log_events), 1)::float
+                    GREATEST(approximate_row_count('otel_log_events'::regclass), 1)::float
                 ), 0)::bigint as total_bytes
         "#;
 

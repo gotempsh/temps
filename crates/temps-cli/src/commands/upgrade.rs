@@ -8,6 +8,21 @@ use tracing::{debug, info};
 
 const GITHUB_RELEASES_API: &str = "https://api.github.com/repos/gotempsh/temps/releases";
 
+/// Default base URL of the Temps Cloud license + EE binary proxy. The EE
+/// binary lives in a private repo and is only reachable through this
+/// license-gated proxy. Overridable via `--ee-api` for staging/local.
+const DEFAULT_EE_API: &str = "https://temps.sh";
+
+/// Which edition to upgrade/switch to.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum UpgradeTier {
+    /// The open-source binary from GitHub releases (default).
+    Oss,
+    /// The Enterprise Edition binary from the license-gated temps.sh proxy.
+    /// Requires `--license-path`.
+    Ee,
+}
+
 /// Release channel the upgrader subscribes to. The picker filters all
 /// available GitHub releases through this channel before selecting the
 /// newest, so a host on `Stable` never auto-upgrades onto a beta tag.
@@ -85,6 +100,29 @@ pub struct UpgradeCommand {
     /// the default).
     #[arg(long, hide = true)]
     pub stable: bool,
+
+    /// Edition to upgrade to. Default: `oss` (GitHub releases). Pass
+    /// `--tier ee` to switch this install to the Enterprise Edition binary,
+    /// which requires `--license-path`.
+    #[arg(long, value_enum)]
+    pub tier: Option<UpgradeTier>,
+
+    /// Path to the EE license JWT. Required with `--tier ee`. The license
+    /// is also copied to `<data-dir>/data/license.jwt` and, if a systemd
+    /// unit exists, the unit's `TEMPS_EE_LICENSE_PATH` env is updated so
+    /// the binary finds its license on every restart.
+    #[arg(long)]
+    pub license_path: Option<PathBuf>,
+
+    /// Base URL of the Temps Cloud EE proxy (`--tier ee` only). Defaults to
+    /// `https://temps.sh`. Override for staging/local testing.
+    #[arg(long)]
+    pub ee_api: Option<String>,
+
+    /// Data dir whose `data/license.jwt` receives the license on `--tier ee`.
+    /// Defaults to `$TEMPS_DATA_DIR` or `~/.temps`.
+    #[arg(long, env = "TEMPS_DATA_DIR")]
+    pub data_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Deserialize, Debug)]
@@ -126,7 +164,21 @@ impl UpgradeCommand {
         UpgradeChannel::Stable
     }
 
+    /// Effective tier. CLI-only, defaults to OSS.
+    fn resolved_tier(&self) -> UpgradeTier {
+        self.tier.unwrap_or(UpgradeTier::Oss)
+    }
+
     async fn run(self) -> anyhow::Result<()> {
+        // EE is a different distribution path (private repo, license-gated
+        // proxy, license install, systemd env), so it gets its own method.
+        if self.resolved_tier() == UpgradeTier::Ee {
+            return self.run_ee().await;
+        }
+        self.run_oss().await
+    }
+
+    async fn run_oss(self) -> anyhow::Result<()> {
         // Determine the binary path to upgrade
         let binary_path = match &self.path {
             Some(p) => p.clone(),
@@ -275,6 +327,155 @@ impl UpgradeCommand {
         println!("  Run `temps --version` to verify.");
 
         Ok(())
+    }
+
+    /// Switch this install to the Enterprise Edition binary.
+    ///
+    /// Differs from the OSS path: the EE binary lives in a private repo and
+    /// is fetched through the license-gated proxy on temps.sh (no GitHub
+    /// token on the host). After the swap we install the license to the
+    /// data dir and, if a systemd unit exists, point its
+    /// `TEMPS_EE_LICENSE_PATH` env at it so restarts keep working.
+    async fn run_ee(self) -> anyhow::Result<()> {
+        // EE only ships linux-amd64 today. Fail early with a clear message
+        // rather than after resolving a version that has no usable asset.
+        let target = platform_target()?;
+        if target != "linux-amd64" {
+            return Err(anyhow::anyhow!(
+                "Temps EE currently ships linux-amd64 only (detected '{}'). \
+                 macOS / arm64 EE builds are on the roadmap.",
+                target
+            ));
+        }
+
+        // License is mandatory for EE.
+        let license_path = self.license_path.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "--tier ee requires --license-path <path-to-license.jwt>. \
+                 Download yours from {}/dashboard/license",
+                self.ee_api_base()
+            )
+        })?;
+        let license_jwt = fs::read_to_string(&license_path)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to read license at {}: {}",
+                    license_path.display(),
+                    e
+                )
+            })?
+            .trim()
+            .to_string();
+        if license_jwt.is_empty() {
+            return Err(anyhow::anyhow!(
+                "License file at {} is empty",
+                license_path.display()
+            ));
+        }
+        // Shape pre-check (signature is verified by the EE binary at boot).
+        let summary = parse_license_summary(&license_jwt)?;
+
+        // Determine the binary path to replace.
+        let binary_path = match &self.path {
+            Some(p) => p.clone(),
+            None => std::env::current_exe()
+                .map_err(|e| anyhow::anyhow!("Failed to determine current binary path: {}", e))?,
+        };
+        let binary_path = fs::canonicalize(&binary_path).unwrap_or(binary_path);
+
+        let api = self.ee_api_base();
+        let current_version = current_version_tag();
+
+        // Resolve version (pinned or latest published) from the proxy.
+        let version = match &self.version {
+            Some(v) if v.starts_with('v') => v.clone(),
+            Some(v) => format!("v{}", v),
+            None => fetch_latest_ee_version(&api).await?,
+        };
+
+        // EE asset name: temps-ee-<version-without-v>-linux-amd64.tar.gz
+        let asset = format!(
+            "temps-ee-{}-{}.tar.gz",
+            version.trim_start_matches('v'),
+            target
+        );
+
+        println!();
+        println!("  Switch to Enterprise Edition:");
+        println!("    {} -> {} (ee)", current_version, version);
+        println!("    Tier:     {}", summary.tier);
+        println!("    Expires:  {}", summary.expires_display());
+        println!("    Platform: {}", target);
+        println!("    Binary:   {}", binary_path.display());
+        println!(
+            "    Source:   {}/api/ee/download/{}/{}",
+            api, version, asset
+        );
+        println!();
+
+        if self.check {
+            println!("  Run without --check to install.");
+            return Ok(());
+        }
+
+        if !self.yes {
+            print!("  Proceed with EE switch? [y/N] ");
+            std::io::stdout().flush()?;
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            let input = input.trim().to_lowercase();
+            if input != "y" && input != "yes" {
+                println!("  Cancelled.");
+                return Ok(());
+            }
+        }
+
+        check_write_permission(&binary_path)?;
+
+        // Verify checksum first (cheap; fails fast on a bad license/network).
+        println!("  Verifying checksum...");
+        let expected = fetch_ee_checksum(&api, &version, &asset, &license_jwt).await?;
+
+        println!("  Downloading {}...", asset);
+        let tarball = download_ee_asset(&api, &version, &asset, &license_jwt).await?;
+        verify_checksum(&tarball, &expected)?;
+        println!("  Checksum verified.");
+
+        println!("  Extracting binary...");
+        let new_binary = extract_binary_from_tarball(&tarball)?;
+
+        println!("  Replacing binary at {}...", binary_path.display());
+        replace_binary(&binary_path, &new_binary)?;
+
+        // Install the license into the data dir so the binary finds it.
+        let data_dir = resolve_data_dir(&self.data_dir)?;
+        let installed_license = install_license(&data_dir, &license_jwt)?;
+        println!("  License installed at {}", installed_license.display());
+
+        // Best-effort: point the systemd unit at the license so restarts
+        // keep working without re-passing --license-path.
+        match update_systemd_license_env(&installed_license) {
+            Ok(true) => println!("  Updated systemd unit env (TEMPS_EE_LICENSE_PATH)."),
+            Ok(false) => {} // no unit / not linux — silent
+            Err(e) => println!("  Note: could not update systemd unit env: {e}"),
+        }
+
+        println!();
+        println!("  Successfully switched to Temps EE {}", version);
+        println!("  Restart the service to activate:");
+        println!("    sudo systemctl restart temps   # or your service manager");
+        println!("  The binary will refuse to start without a valid license.");
+
+        Ok(())
+    }
+
+    /// Resolve the EE proxy base URL (flag > default), trailing slash trimmed.
+    fn ee_api_base(&self) -> String {
+        self.ee_api
+            .clone()
+            .unwrap_or_else(|| DEFAULT_EE_API.to_string())
+            .trim_end_matches('/')
+            .to_string()
     }
 }
 
@@ -587,6 +788,276 @@ fn replace_binary(binary_path: &PathBuf, new_binary: &[u8]) -> anyhow::Result<()
     Ok(())
 }
 
+// ── EE proxy helpers ────────────────────────────────────────────────────────
+
+/// Minimal decoded view of an EE license JWT for the upgrade pre-check and
+/// the confirmation summary. Signature is NOT verified here — only the EE
+/// binary (with its embedded pubkey) can do that. This catches typos and
+/// already-expired licenses before a long download.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LicenseSummary {
+    pub tier: String,
+    /// `exp` claim (unix seconds), if present.
+    pub exp: Option<i64>,
+}
+
+impl LicenseSummary {
+    fn expires_display(&self) -> String {
+        match self.exp {
+            Some(e) => chrono::DateTime::<chrono::Utc>::from_timestamp(e, 0)
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_else(|| e.to_string()),
+            None => "unknown".to_string(),
+        }
+    }
+}
+
+/// Decode a base64url (no-padding) string. JWT segments use this alphabet
+/// (`-`/`_` instead of `+`/`/`, no `=` padding). Small self-contained
+/// decoder so we don't pull in the `base64` crate just for this.
+fn decode_base64url(input: &str) -> Result<Vec<u8>, String> {
+    fn val(c: u8) -> Result<u8, String> {
+        match c {
+            b'A'..=b'Z' => Ok(c - b'A'),
+            b'a'..=b'z' => Ok(c - b'a' + 26),
+            b'0'..=b'9' => Ok(c - b'0' + 52),
+            b'-' => Ok(62),
+            b'_' => Ok(63),
+            _ => Err(format!("invalid base64url character: {}", c as char)),
+        }
+    }
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+    let mut acc: u32 = 0;
+    let mut bits = 0u8;
+    for &b in bytes {
+        acc = (acc << 6) | val(b)? as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Ok(out)
+}
+
+/// Decode + shape-validate an EE license JWT. Returns its tier/exp summary.
+/// Rejects malformed JWTs, non-premium/enterprise tiers, and expired
+/// licenses. Pure (takes `now` for testability via the wrapper below).
+fn parse_license_summary(jwt: &str) -> anyhow::Result<LicenseSummary> {
+    parse_license_summary_at(jwt, chrono::Utc::now().timestamp())
+}
+
+fn parse_license_summary_at(jwt: &str, now: i64) -> anyhow::Result<LicenseSummary> {
+    let parts: Vec<&str> = jwt.split('.').collect();
+    if parts.len() != 3 {
+        return Err(anyhow::anyhow!(
+            "License is not a valid JWT (expected 3 segments, got {})",
+            parts.len()
+        ));
+    }
+    let payload = decode_base64url(parts[1])
+        .map_err(|e| anyhow::anyhow!("Failed to decode license payload: {e}"))?;
+    let claims: serde_json::Value = serde_json::from_slice(&payload)
+        .map_err(|e| anyhow::anyhow!("License payload is not valid JSON: {e}"))?;
+
+    let tier = claims
+        .get("tier")
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| anyhow::anyhow!("License has no 'tier' claim"))?
+        .to_string();
+    if tier != "premium" && tier != "enterprise" {
+        return Err(anyhow::anyhow!(
+            "License tier '{}' cannot run the EE binary (need premium or enterprise)",
+            tier
+        ));
+    }
+
+    let exp = claims.get("exp").and_then(|e| e.as_i64());
+    if let Some(exp) = exp {
+        if exp <= now {
+            return Err(anyhow::anyhow!(
+                "License expired at unix {} (now {})",
+                exp,
+                now
+            ));
+        }
+    }
+
+    Ok(LicenseSummary { tier, exp })
+}
+
+/// Resolve the latest published EE version tag from the proxy.
+async fn fetch_latest_ee_version(api: &str) -> anyhow::Result<String> {
+    #[derive(Deserialize)]
+    struct ReleasesResponse {
+        releases: Vec<ReleaseEntry>,
+    }
+    #[derive(Deserialize)]
+    struct ReleaseEntry {
+        tag: String,
+    }
+
+    let url = format!("{}/api/ee/releases", api);
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(&url)
+        .header("User-Agent", "temps-self-upgrade")
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to fetch EE releases from {}: {}", url, e))?;
+    if !resp.status().is_success() {
+        return Err(anyhow::anyhow!(
+            "EE releases endpoint returned {} ({})",
+            resp.status(),
+            url
+        ));
+    }
+    let body: ReleasesResponse = resp
+        .json()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to parse EE releases response: {}", e))?;
+    body.releases
+        .into_iter()
+        .next()
+        .map(|r| r.tag)
+        .ok_or_else(|| anyhow::anyhow!("No published EE releases found at {}", url))
+}
+
+/// Fetch the `.sha256` for an EE asset through the license-gated proxy.
+async fn fetch_ee_checksum(
+    api: &str,
+    version: &str,
+    asset: &str,
+    license_jwt: &str,
+) -> anyhow::Result<String> {
+    let url = format!("{}/api/ee/download/{}/{}/sha256", api, version, asset);
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(&url)
+        .header("User-Agent", "temps-self-upgrade")
+        .header("Authorization", format!("Bearer {}", license_jwt))
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to fetch EE checksum: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(anyhow::anyhow!(
+            "EE checksum request returned {} (is your license valid?)",
+            resp.status()
+        ));
+    }
+    resp.text()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to read EE checksum: {}", e))
+}
+
+/// Download an EE binary tarball through the license-gated proxy.
+async fn download_ee_asset(
+    api: &str,
+    version: &str,
+    asset: &str,
+    license_jwt: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let url = format!("{}/api/ee/download/{}/{}", api, version, asset);
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(&url)
+        .header("User-Agent", "temps-self-upgrade")
+        .header("Authorization", format!("Bearer {}", license_jwt))
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to download EE binary: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(anyhow::anyhow!(
+            "EE download returned {} ({})",
+            resp.status(),
+            url
+        ));
+    }
+    resp.bytes()
+        .await
+        .map(|b| b.to_vec())
+        .map_err(|e| anyhow::anyhow!("Failed to read EE download: {}", e))
+}
+
+/// Resolve the data dir: explicit flag/env > `~/.temps`.
+fn resolve_data_dir(explicit: &Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    if let Some(p) = explicit {
+        return Ok(p.clone());
+    }
+    let home = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory for data dir"))?;
+    Ok(home.join(".temps"))
+}
+
+/// Install the license JWT at `<data_dir>/data/license.jwt` (mode 0600).
+/// Returns the path written.
+fn install_license(data_dir: &std::path::Path, license_jwt: &str) -> anyhow::Result<PathBuf> {
+    let dir = data_dir.join("data");
+    fs::create_dir_all(&dir)
+        .map_err(|e| anyhow::anyhow!("Failed to create {}: {}", dir.display(), e))?;
+    let path = dir.join("license.jwt");
+    fs::write(&path, license_jwt)
+        .map_err(|e| anyhow::anyhow!("Failed to write license to {}: {}", path.display(), e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(path)
+}
+
+/// If a systemd unit exists at /etc/systemd/system/temps.service, ensure it
+/// has `Environment=TEMPS_EE_LICENSE_PATH=<path>` in its [Service] section.
+/// Returns Ok(true) if the unit was modified, Ok(false) if there's nothing
+/// to do (non-linux, no unit, or already present). Best-effort.
+fn update_systemd_license_env(license_path: &std::path::Path) -> anyhow::Result<bool> {
+    if OS != "linux" {
+        return Ok(false);
+    }
+    let unit = PathBuf::from("/etc/systemd/system/temps.service");
+    if !unit.exists() {
+        return Ok(false);
+    }
+    let contents =
+        fs::read_to_string(&unit).map_err(|e| anyhow::anyhow!("read {}: {}", unit.display(), e))?;
+
+    let env_line = format!(
+        "Environment=TEMPS_EE_LICENSE_PATH={}",
+        license_path.display()
+    );
+    if contents.contains("TEMPS_EE_LICENSE_PATH=") {
+        // Already wired (possibly to a different path) — leave operator's
+        // value alone rather than fighting them.
+        return Ok(false);
+    }
+
+    // Insert our Environment line right after the [Service] header so it
+    // lands in the right section regardless of unit layout.
+    let mut out = String::with_capacity(contents.len() + env_line.len() + 1);
+    let mut inserted = false;
+    for line in contents.lines() {
+        out.push_str(line);
+        out.push('\n');
+        if !inserted && line.trim() == "[Service]" {
+            out.push_str(&env_line);
+            out.push('\n');
+            inserted = true;
+        }
+    }
+    if !inserted {
+        // No [Service] section? Don't guess — report nothing changed.
+        return Ok(false);
+    }
+    fs::write(&unit, out).map_err(|e| anyhow::anyhow!("write {}: {}", unit.display(), e))?;
+    // Reload so the next restart picks up the new env. Ignore failure
+    // (operator can `daemon-reload` manually).
+    let _ = std::process::Command::new("systemctl")
+        .arg("daemon-reload")
+        .status();
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -858,6 +1329,10 @@ mod tests {
             yes: false,
             check: false,
             stable: false,
+            tier: None,
+            license_path: None,
+            ee_api: None,
+            data_dir: None,
         };
         assert_eq!(cmd.resolved_channel(), UpgradeChannel::Stable);
     }
@@ -874,6 +1349,10 @@ mod tests {
             yes: false,
             check: false,
             stable: true,
+            tier: None,
+            license_path: None,
+            ee_api: None,
+            data_dir: None,
         };
         assert_eq!(cmd.resolved_channel(), UpgradeChannel::Stable);
     }
@@ -890,6 +1369,10 @@ mod tests {
             yes: false,
             check: false,
             stable: true,
+            tier: None,
+            license_path: None,
+            ee_api: None,
+            data_dir: None,
         };
         assert_eq!(cmd.resolved_channel(), UpgradeChannel::Beta);
     }
@@ -904,7 +1387,123 @@ mod tests {
             yes: false,
             check: false,
             stable: false,
+            tier: None,
+            license_path: None,
+            ee_api: None,
+            data_dir: None,
         };
         assert_eq!(cmd.resolved_channel(), UpgradeChannel::Beta);
+    }
+
+    // ── EE tier + license logic ──────────────────────────────────────────
+
+    fn cmd_with_tier(tier: Option<UpgradeTier>) -> UpgradeCommand {
+        UpgradeCommand {
+            channel: None,
+            version: None,
+            path: None,
+            yes: false,
+            check: false,
+            stable: false,
+            tier,
+            license_path: None,
+            ee_api: None,
+            data_dir: None,
+        }
+    }
+
+    #[test]
+    fn resolved_tier_defaults_to_oss() {
+        // No --tier means OSS: existing scripts keep working unchanged.
+        assert_eq!(cmd_with_tier(None).resolved_tier(), UpgradeTier::Oss);
+    }
+
+    #[test]
+    fn resolved_tier_ee_when_flagged() {
+        assert_eq!(
+            cmd_with_tier(Some(UpgradeTier::Ee)).resolved_tier(),
+            UpgradeTier::Ee
+        );
+    }
+
+    #[test]
+    fn ee_api_base_defaults_and_trims() {
+        let mut cmd = cmd_with_tier(Some(UpgradeTier::Ee));
+        assert_eq!(cmd.ee_api_base(), "https://temps.sh");
+        cmd.ee_api = Some("http://localhost:4432/".to_string());
+        assert_eq!(cmd.ee_api_base(), "http://localhost:4432");
+    }
+
+    #[test]
+    fn decode_base64url_roundtrip() {
+        // base64url of {"tier":"premium"} (no padding)
+        let json = b"{\"tier\":\"premium\"}";
+        // Build the encoding the same way a JWT would (URL_SAFE_NO_PAD).
+        // Hand-encode via a known-good value instead of importing base64:
+        // we just assert our decoder produces the original bytes from a
+        // string we encode with the standard alphabet mapping.
+        let encoded = encode_base64url_for_test(json);
+        assert_eq!(decode_base64url(&encoded).unwrap(), json);
+    }
+
+    #[test]
+    fn parse_license_summary_accepts_valid_premium() {
+        let jwt = make_test_jwt(r#"{"tier":"premium","exp":9999999999}"#);
+        let s = parse_license_summary_at(&jwt, 1_000_000_000).unwrap();
+        assert_eq!(s.tier, "premium");
+        assert_eq!(s.exp, Some(9999999999));
+    }
+
+    #[test]
+    fn parse_license_summary_rejects_expired() {
+        let jwt = make_test_jwt(r#"{"tier":"premium","exp":100}"#);
+        let err = parse_license_summary_at(&jwt, 1_000_000_000).unwrap_err();
+        assert!(err.to_string().contains("expired"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_license_summary_rejects_community_tier() {
+        let jwt = make_test_jwt(r#"{"tier":"community","exp":9999999999}"#);
+        let err = parse_license_summary_at(&jwt, 1_000_000_000).unwrap_err();
+        assert!(
+            err.to_string().contains("cannot run the EE binary"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_license_summary_rejects_malformed() {
+        let err = parse_license_summary_at("not.a.jwt.extra", 0).unwrap_err();
+        assert!(err.to_string().contains("3 segments"), "got: {err}");
+    }
+
+    // Test-only base64url encoder (no padding) so we can build JWTs to feed
+    // the decoder + parser without adding the base64 crate as a dep.
+    fn encode_base64url_for_test(input: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut out = String::new();
+        let mut acc: u32 = 0;
+        let mut bits = 0u8;
+        for &b in input {
+            acc = (acc << 8) | b as u32;
+            bits += 8;
+            while bits >= 6 {
+                bits -= 6;
+                out.push(ALPHABET[((acc >> bits) & 0x3f) as usize] as char);
+            }
+        }
+        if bits > 0 {
+            out.push(ALPHABET[((acc << (6 - bits)) & 0x3f) as usize] as char);
+        }
+        out
+    }
+
+    fn make_test_jwt(claims_json: &str) -> String {
+        let header = encode_base64url_for_test(br#"{"alg":"EdDSA","typ":"JWT"}"#);
+        let payload = encode_base64url_for_test(claims_json.as_bytes());
+        // Signature segment is arbitrary — parse_license_summary never
+        // verifies it (the EE binary does).
+        format!("{header}.{payload}.{}", encode_base64url_for_test(b"sig"))
     }
 }

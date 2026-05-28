@@ -11,6 +11,17 @@ impl AuthEmailService {
         }
     }
 
+    /// Whether an email provider capable of delivering transactional mail
+    /// (password reset, verification, magic link) is configured. This is
+    /// specifically an *email* provider — a Slack-only notification setup
+    /// does not count, since those features need a real inbox delivery.
+    pub async fn is_email_provider_configured(&self) -> bool {
+        self.notification_service
+            .is_email_provider_configured()
+            .await
+            .unwrap_or(false)
+    }
+
     pub async fn send_verification_email(
         &self,
         email: &str,
@@ -47,7 +58,9 @@ impl AuthEmailService {
             from: None,
             reply_to: None,
         };
-        self.notification_service.send_email(message).await
+        self.notification_service
+            .send_transactional_email(message)
+            .await
     }
 
     pub async fn send_password_reset_email(
@@ -88,7 +101,9 @@ impl AuthEmailService {
             from: None,
             reply_to: None,
         };
-        self.notification_service.send_email(message).await
+        self.notification_service
+            .send_transactional_email(message)
+            .await
     }
 
     pub async fn send_magic_link_email(
@@ -126,7 +141,9 @@ impl AuthEmailService {
             from: None,
             reply_to: None,
         };
-        self.notification_service.send_email(message).await
+        self.notification_service
+            .send_transactional_email(message)
+            .await
     }
 }
 
@@ -161,6 +178,14 @@ mod tests {
             Ok(())
         }
 
+        async fn send_transactional_email(
+            &self,
+            message: EmailMessage,
+        ) -> Result<(), NotificationError> {
+            self.sent_emails.lock().await.push(message);
+            Ok(())
+        }
+
         async fn send_notification(
             &self,
             _notification: temps_core::notifications::NotificationData,
@@ -169,6 +194,10 @@ mod tests {
         }
 
         async fn is_configured(&self) -> Result<bool, NotificationError> {
+            Ok(true)
+        }
+
+        async fn is_email_provider_configured(&self) -> Result<bool, NotificationError> {
             Ok(true)
         }
     }

@@ -4,6 +4,7 @@ import { useDashboardAnalytics } from '@/hooks/useDashboardAnalytics'
 import { useDashboardHealth } from '@/hooks/useDashboardHealth'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { ExternalConnectivityAlert } from '@/components/alerts/ExternalConnectivityAlert'
+import { DiskSpaceAlert } from '@/components/alerts/DiskSpaceAlert'
 import { MetricCard } from '@/components/dashboard/MetricCard'
 import { ProjectCard } from '@/components/dashboard/ProjectCard'
 import { ImprovedOnboardingDashboard } from '@/components/onboarding/ImprovedOnboardingDashboard'
@@ -253,6 +254,7 @@ export function Projects() {
   return (
     <div className="p-4 sm:p-8 space-y-6">
       <ExternalConnectivityAlert showInDashboard dismissible />
+      <DiskSpaceAlert dismissible />
 
       {/* Metric cards (merged from former Dashboard page). */}
       <div className="grid gap-3 grid-cols-2 sm:gap-4 md:grid-cols-4 md:gap-6">

@@ -742,10 +742,14 @@ impl AuthService {
         Ok(updated_user)
     }
 
-    // Check if email provider is configured
-    pub fn is_email_configured(&self) -> bool {
-        false
-        // self.email_service.is_some()
+    /// Whether an email provider is configured for transactional mail.
+    ///
+    /// Checks specifically for an enabled *email* notification provider —
+    /// not just any provider — because password reset, email verification
+    /// and magic links require real inbox delivery, not a Slack/webhook
+    /// channel.
+    pub async fn is_email_configured(&self) -> bool {
+        self.email_service.is_email_provider_configured().await
     }
 
     // Helper to generate secure random tokens
@@ -938,6 +942,15 @@ mod tests {
             Ok(())
         }
 
+        async fn send_transactional_email(
+            &self,
+            message: temps_core::notifications::EmailMessage,
+        ) -> Result<(), NotificationError> {
+            // The auth flows now send via the transactional path; record it
+            // through the same logic the tests assert against.
+            self.send_email(message).await
+        }
+
         async fn send_notification(
             &self,
             _notification: temps_core::notifications::NotificationData,
@@ -947,6 +960,11 @@ mod tests {
         }
 
         async fn is_configured(&self) -> Result<bool, NotificationError> {
+            // Always configured for tests
+            Ok(true)
+        }
+
+        async fn is_email_provider_configured(&self) -> Result<bool, NotificationError> {
             // Always configured for tests
             Ok(true)
         }
@@ -1712,8 +1730,9 @@ mod tests {
     async fn test_is_email_configured() {
         let (_db, auth_service, _) = setup_test_env().await;
 
-        // Currently hardcoded to false in the implementation
-        assert!(!auth_service.is_email_configured());
+        // Delegates to the notification service's email-provider check; the
+        // test mock reports an email provider is configured.
+        assert!(auth_service.is_email_configured().await);
     }
 
     #[tokio::test]

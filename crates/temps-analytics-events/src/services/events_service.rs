@@ -169,7 +169,7 @@ impl AnalyticsEventsService {
                 event_type,
                 event_data,
                 timestamp,
-                page_url,
+                href AS page_url,
                 page_title
             FROM events
             WHERE {}

@@ -734,7 +734,7 @@ pub async fn request_magic_link(
     State(state): State<Arc<AuthState>>,
     Json(request): Json<MagicLinkRequest>,
 ) -> Result<impl IntoResponse, temps_core::problemdetails::Problem> {
-    if !state.auth_service.is_email_configured() {
+    if !state.auth_service.is_email_configured().await {
         return Err(problem_new(StatusCode::SERVICE_UNAVAILABLE)
             .with_title("Email Service Not Configured")
             .with_detail(
@@ -854,7 +854,7 @@ pub async fn verify_magic_link(
     tag = "Authentication"
 )]
 pub async fn email_status(State(state): State<Arc<AuthState>>) -> Json<EmailStatusResponse> {
-    let email_configured = state.auth_service.is_email_configured();
+    let email_configured = state.auth_service.is_email_configured().await;
     let oidc_providers = state
         .oidc_service
         .list_enabled_providers()
@@ -883,7 +883,7 @@ pub async fn request_password_reset(
     State(state): State<Arc<AuthState>>,
     Json(body): Json<MagicLinkRequest>,
 ) -> Result<impl IntoResponse, temps_core::problemdetails::Problem> {
-    if !state.auth_service.is_email_configured() {
+    if !state.auth_service.is_email_configured().await {
         return Err(problem_new(StatusCode::SERVICE_UNAVAILABLE)
             .with_title("Email Service Not Configured")
             .with_detail("Password reset is not available without email configuration"));
