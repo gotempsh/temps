@@ -349,6 +349,87 @@ All commands support these global options:
 
 ---
 
+## Common Gotchas
+
+### 1. Difference Between `temps` Binary and `@temps-sdk/cli`
+
+The `temps` command you run in your terminal is the **client** (`@temps-sdk/cli`), not the server. The server binary is a separate component that runs on your infrastructure. When you install `@temps-sdk/cli` globally, you get the CLI client that communicates with a running Temps server instance.
+
+- **`@temps-sdk/cli`** (client): The command-line tool you install and run locally
+- **`temps` server binary**: The backend service that runs on your infrastructure and manages deployments
+
+### 2. Why `temps login` Is Required Before Any Command
+
+The CLI requires authentication before executing any command. Running `temps login` establishes a secure connection to your Temps instance and stores credentials locally. Without this step, the CLI cannot authenticate requests to the server.
+
+**Always run `temps login <server-url>` first**, even if you're just testing the CLI. The login flow is browser-based and secure — the CLI never stores your password.
+
+### 3. How to Switch Between Multiple Temps Instances
+
+If you work with multiple Temps servers, you can switch between them by logging in to each one:
+
+```bash
+# Login to production instance
+temps login https://temps-prod.example.com
+
+# Login to staging instance
+temps login https://temps-staging.example.com
+```
+
+The CLI stores credentials for each instance separately. To see which instance you're currently authenticated with:
+
+```bash
+temps config show
+```
+
+To explicitly target a specific instance, use the `--api-url` flag:
+
+```bash
+temps --api-url https://temps-staging.example.com projects list
+```
+
+Or set the environment variable:
+
+```bash
+export TEMPS_API_URL=https://temps-staging.example.com
+temps projects list
+```
+
+### 4. Headless CI Authentication with `--api-key`
+
+In CI/CD environments without a browser, use API keys instead of the interactive login flow:
+
+```bash
+# Generate an API key in the Temps web UI (Settings > API Keys)
+# Then use it in your CI pipeline:
+
+temps deploy --project my-app --api-key your-api-key-here
+```
+
+Or set it as an environment variable:
+
+```bash
+export TEMPS_API_KEY=your-api-key-here
+temps deploy --project my-app
+```
+
+**Important:** Never commit API keys to version control. Use your CI platform's secret management (GitHub Secrets, GitLab CI Variables, etc.).
+
+### 5. Common Error Messages and Fixes
+
+| Error Message | Cause | Solution |
+|---------------|-------|----------|
+| `Error: Not authenticated` | No active login session | Run `temps login <server-url>` first |
+| `Error: Invalid API key` | API key is expired or incorrect | Generate a new API key in the web UI and update your environment variable |
+| `Error: Connection refused` | Server URL is unreachable | Verify the `TEMPS_API_URL` is correct and the server is running |
+| `Error: Project not found` | Project name doesn't exist or you lack permissions | Run `temps projects list` to see available projects |
+| `Error: Unauthorized` | Your credentials lack permission for this action | Check your user role in the web UI (Admin, Developer, Viewer) |
+| `Error: Deployment failed: build timeout` | Build took longer than the timeout limit | Increase timeout with `--timeout` flag or optimize your build |
+| `Error: Domain verification failed` | DNS records not properly configured | Verify DNS records match the values shown in `temps domains verify` |
+| `Error: Environment variable not found` | Variable doesn't exist in the target environment | Use `temps environments vars list` to see available variables |
+
+---
+
 ## JSON Output
 
 Most commands support `--json` flag for scripting and automation:
