@@ -9,12 +9,214 @@ export const metadata = {
 
 # Troubleshooting
 
-## Page Goal
+Quick solutions to common Temps issues. Search by error message or symptom to find your fix. {{ className: 'lead' }}
 
-Help users self-serve solutions to common problems.
+---
 
-## Target Persona
+## Build & Deployment Errors
 
-**Stuck Steve** - Has a problem, wants quick solution, searching for error messages.
+### Build fails with "command not found"
 
-## Key Content: Build errors, deployment errors, runtime errors, DNS issues, SSL problems, performance issues, FAQs
+The auto-detected build command does not match your project setup.
+
+**Fix:** Override the build command in `.temps.yaml`:
+
+```yaml {{ title: '.temps.yaml' }}
+build:
+  build_command: yarn build
+  install_command: yarn install --frozen-lockfile
+```
+
+Or configure in the Temps dashboard under project settings.
+
+### Health check timeout
+
+The application takes longer than 300 seconds to start, or the health check path returns an error.
+
+**Fix:**
+- Add a `/health` endpoint that returns a 200 status code
+- Configure `health.path` in `.temps.yaml` to point to your health endpoint
+- If your application needs more startup time (e.g., database migrations), run migrations as a separate step
+
+### Port mismatch
+
+Your application listens on a different port than what Temps expects.
+
+**Fix:** Always read from the `PORT` environment variable. Do not hardcode ports:
+
+```javascript {{ title: 'Node.js' }}
+const port = process.env.PORT || 3000;
+app.listen(port, '0.0.0.0');
+```
+
+```python {{ title: 'Python' }}
+import os
+port = int(os.environ.get('PORT', 8000))
+```
+
+```go {{ title: 'Go' }}
+port := os.Getenv("PORT")
+if port == "" {
+    port = "8080"
+}
+http.ListenAndServe("0.0.0.0:"+port, router)
+```
+
+### Application returns 4xx or 5xx errors
+
+If your application returns 4xx or 5xx errors for 60 consecutive seconds, the deployment fails.
+
+**Fix:**
+- Add a dedicated `/health` endpoint that returns a simple 200 response
+- Avoid requiring authentication or redirects on the root path (`/`)
+- Check application logs for startup errors
+
+---
+
+## Port & Startup Issues
+
+### Port already in use
+
+If ports 80 or 443 are already in use (e.g., by nginx or Apache), either stop those services or use different ports:
+
+```bash
+temps serve \
+  --database-url "..." \
+  --address 0.0.0.0:8080 \
+  --tls-address 0.0.0.0:8443 \
+  --console-address 0.0.0.0:8081
+```
+
+### Server hangs on startup
+
+If Temps hangs during startup, it's likely waiting for the screenshot provider to initialize. Disable it with:
+
+```bash
+export TEMPS_SCREENSHOT_PROVIDER=noop
+temps serve --database-url "..." --address 0.0.0.0:80
+```
+
+### Application binding to localhost only
+
+Containers that bind to `localhost` or `127.0.0.1` only accept connections from inside the container, so Temps cannot route traffic to them.
+
+**Fix:** Always bind to `0.0.0.0`:
+
+```javascript {{ title: 'Node.js' }}
+app.listen(port, '0.0.0.0');
+```
+
+```python {{ title: 'Python' }}
+app.run(host='0.0.0.0', port=port)
+```
+
+```go {{ title: 'Go' }}
+http.ListenAndServe("0.0.0.0:"+port, router)
+```
+
+---
+
+## Database Connection Issues
+
+### Database connection fails
+
+Make sure PostgreSQL is running and accessible:
+
+```bash
+# Test connection
+psql "postgresql://postgres:temps@localhost:16432/temps" -c "SELECT 1"
+```
+
+**Common causes:**
+- PostgreSQL service is not running
+- Wrong credentials in connection string
+- Database does not exist
+- Firewall blocking port 5432
+
+**Fix:**
+- Verify PostgreSQL is running: `docker ps | grep temps-postgres`
+- Check connection string in `--database-url` flag
+- Ensure database exists: `createdb temps`
+- Enable TimescaleDB extension: `psql temps -c "CREATE EXTENSION IF NOT EXISTS timescaledb;"`
+
+### Connection timeout
+
+If the connection times out, the database may be unreachable or the port is blocked.
+
+**Fix:**
+- Verify the database host and port are correct
+- Check firewall rules allow connections to port 5432
+- If using Docker, ensure the container is running: `docker logs temps-postgres`
+- Test connectivity: `nc -zv localhost 16432`
+
+### "FATAL: password authentication failed"
+
+The database password is incorrect.
+
+**Fix:**
+- Verify the password in your connection string matches the database password
+- If using Docker, check the `POSTGRES_PASSWORD` environment variable
+- Reset the password if needed and update the connection string
+
+---
+
+## SSL & Domain Issues
+
+### Certificate provisioning fails
+
+**Check DNS propagation:** Run `dig app.yourdomain.com` (or use an online DNS checker) and verify the A record points to your server's IP.
+
+**Check port 80:** For HTTP-01 challenges, port 80 must be open. Test with:
+
+```bash
+curl -v http://app.yourdomain.com/.well-known/acme-challenge/test
+```
+
+**Check firewall:** Ensure your server's firewall allows inbound connections on ports 80 and 443.
+
+### Domain shows as pending
+
+Certificate provisioning usually completes in under a minute. If the domain stays pending:
+
+- Verify the DNS record exists and has propagated
+- Check that no other service (nginx, Apache) is competing for port 80
+- Try removing and re-adding the domain
+
+### SSL certificate expired
+
+Temps renews certificates automatically. If a certificate expires:
+
+- Check that port 80 is still open (for HTTP-01)
+- Check that the DNS provider credentials are still valid (for DNS-01)
+- Temps sends a notification 30 days before expiration — check your notification channels
+
+### Mixed content warnings
+
+If your application loads resources over HTTP while the page is served over HTTPS, browsers will block or warn about mixed content.
+
+**Fix:** Ensure all internal URLs use `https://` or protocol-relative paths (`//`).
+
+### Wildcard domain not working
+
+Wildcard certificates require DNS-01 validation, which means Temps needs API access to your DNS provider.
+
+**Fix:**
+1. Go to **Settings > DNS Providers**
+2. Click **Add DNS Provider**
+3. Choose your provider and enter API credentials:
+   - **Cloudflare** — API token with Zone:DNS:Edit permission
+   - **Route 53** — AWS access key with Route 53 permissions
+   - **DigitalOcean** — API token
+   - **Azure DNS** — Service principal credentials
+   - **Google Cloud DNS** — Service account key
+4. Add the wildcard domain `*.yourdomain.com` with DNS-01 challenge type
+
+---
+
+## General Troubleshooting Tips
+
+- **Check logs:** Review application and Temps logs for detailed error messages
+- **Verify environment variables:** Ensure all required environment variables are set
+- **Test locally first:** Reproduce issues locally before deploying
+- **Check documentation:** See the relevant guide for your framework or language
+- **Contact support:** If issues persist, reach out with logs and configuration details
