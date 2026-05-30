@@ -8,13 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
--
+- **Per-project AI Crawler Activity feed** (`web`) — a new "AI Crawlers" entry in the project Observe sidebar (`projects/:slug/ai-crawlers`) shows a chronological feed of AI-agent requests (ClaudeBot, GPTBot, PerplexityBot, …) hitting that project's sites, newest first. Complements the aggregated AI-agent views (ranked agents, top crawled pages) with a time-ordered stream. Reads the existing `GET /proxy-logs?is_ai_agent=true` endpoint via the generated SDK; provider/agent filters and a configurable page size (25/50/100/200) are synced to the URL. Scoped to the current project.
+- CLI: `session-replay` commands.
 
 ### Changed
 -
 
 ### Fixed
--
+- CLI: `--api-key` is now pinned for the login validation request, so `temps login --api-key=<key>` validates the supplied key even when an active context already holds one (previously `getApiKey()`'s priority order — env > context > secrets — could shadow the supplied key and validate the wrong one).
 
 
 ## [0.1.0-beta.24] - 2026-05-30
