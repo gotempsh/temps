@@ -41,6 +41,7 @@ import { ErrorEventDetail } from './ErrorEventDetail'
 import { ErrorGroupDetail } from './ErrorGroupDetail'
 import Observe from './Observe'
 import RequestLogs from './RequestLogs'
+import ProjectAiCrawlers from './ProjectAiCrawlers'
 import Traces from './Traces'
 import { ProjectAgentActivity } from './AiGateway'
 import { AutofixerPage } from '@/components/autofixer/AutofixerPage'
@@ -395,6 +396,10 @@ export function ProjectDetail() {
               <Route
                 path="request-logs/*"
                 element={<RequestLogs project={project} />}
+              />
+              <Route
+                path="ai-crawlers"
+                element={<ProjectAiCrawlers project={project} />}
               />
               <Route
                 path="monitors"
