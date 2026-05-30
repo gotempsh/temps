@@ -14,24 +14,54 @@ export function normalizeApiUrl(url: string): string {
   return normalized
 }
 
-export async function setupClient(baseUrlOverride?: string): Promise<void> {
+/**
+ * Module-level pin for the API key the auth interceptor must send. When set
+ * (via `setupClient(url, key)`), it takes precedence over `credentials.getApiKey()`.
+ *
+ * This exists for the api-key login path. `getApiKey()` resolves in priority
+ * order (env var > active context > stored secrets), so when an active context
+ * already holds a key, a freshly-supplied `--api-key` written to the secrets
+ * layer is *shadowed* and never sent — the CLI then validates the wrong key and
+ * reports "Invalid API key". Pinning the key the caller actually passed makes
+ * `temps login --api-key=…` validate exactly that key, independent of ambient
+ * env vars or the active context.
+ */
+let pinnedApiKey: string | undefined
+
+let interceptorRegistered = false
+
+export async function setupClient(
+  baseUrlOverride?: string,
+  apiKeyOverride?: string,
+): Promise<void> {
   // An explicit override wins over config resolution. The api-key login path
   // uses this so it validates against the server the caller named, not
   // whatever context happens to be active.
   const apiUrl = normalizeApiUrl(baseUrlOverride ?? config.get('apiUrl'))
 
+  // Pin (or clear) the key the interceptor must send. Passing `undefined`
+  // resets to the normal priority-ordered resolution.
+  pinnedApiKey = apiKeyOverride
+
   client.setConfig({
     baseUrl: apiUrl,
   })
 
-  // Add auth header interceptor
-  client.interceptors.request.use(async (request: Request) => {
-    const apiKey = await credentials.getApiKey()
-    if (apiKey) {
-      request.headers.set('Authorization', `Bearer ${apiKey}`)
-    }
-    return request
-  })
+  // Register the auth header interceptor exactly once. Re-registering on every
+  // `setupClient` call (e.g. login then a follow-up request) would stack
+  // duplicate interceptors that each re-read and re-set the header.
+  if (!interceptorRegistered) {
+    interceptorRegistered = true
+    client.interceptors.request.use(async (request: Request) => {
+      // A pinned key (from an explicit `--api-key`) is authoritative — it must
+      // not be shadowed by an active context or env var during login.
+      const apiKey = pinnedApiKey ?? (await credentials.getApiKey())
+      if (apiKey) {
+        request.headers.set('Authorization', `Bearer ${apiKey}`)
+      }
+      return request
+    })
+  }
 }
 
 /**

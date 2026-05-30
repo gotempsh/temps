@@ -445,10 +445,14 @@ export async function loginWithApiKey(
     debugLog(`raw url arg: ${opts.url ?? '(none, using config apiUrl)'}`)
   }
 
-  // Temporarily set the API key to validate it. Pass `baseUrl` explicitly so
-  // validation hits the named server even if another context is active.
-  await credentials.set('apiKey', key)
-  await setupClient(baseUrl)
+  // Validate the *supplied* key against the named server. We pass `key` as an
+  // explicit interceptor override (rather than writing it to the credential
+  // store first) so:
+  //   - `getApiKey()`'s priority order (env > active context > secrets) cannot
+  //     shadow it — otherwise an active context's key gets validated instead,
+  //     and we'd report "Invalid API key" for a key we never sent;
+  //   - a failed validation leaves no half-written credentials behind.
+  await setupClient(baseUrl, key)
 
   try {
     const result = await withSpinner(
@@ -486,9 +490,23 @@ export async function loginWithApiKey(
     })
 
     displayWelcome(result.email, ctxName, baseUrl)
-  } catch {
-    await credentials.clear()
-    throw new AuthenticationError('Invalid API key')
+  } catch (err) {
+    // Validation failed. We deliberately did NOT pre-write the key, so there's
+    // nothing of ours to roll back — and we must NOT `credentials.clear()`,
+    // which would wipe a perfectly good key from a previously-authenticated
+    // context. Surface the server's reason when we have one.
+    if (debug && err instanceof Error) {
+      debugLog(`api-key validation failed: ${err.message}`)
+    }
+    throw new AuthenticationError(
+      err instanceof AuthenticationError
+        ? err.message
+        : `Invalid API key (validated against ${baseUrl})`,
+    )
+  } finally {
+    // Drop the explicit pin so subsequent commands fall back to normal
+    // priority-ordered credential resolution.
+    await setupClient(baseUrl)
   }
 }
 
