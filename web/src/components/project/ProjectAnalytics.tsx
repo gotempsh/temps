@@ -19,6 +19,7 @@ import {
   UTMCampaignsChart,
 } from '@/components/analytics/overview'
 import { AiAgentsDetail } from '@/components/analytics/AiAgentsDetail'
+import { AiCrawlerActivityFeed } from '@/components/analytics/AiCrawlerActivityFeed'
 import { VisitorGlobePage } from '@/components/analytics/VisitorGlobe'
 import { LiveGlobePage } from '@/components/analytics/LiveGlobe'
 import { PageFlow } from '@/components/analytics/PageFlow'
@@ -1152,6 +1153,21 @@ function AiAgentsTab({ project }: AiAgentsTabProps) {
         environment={selectedEnvironment}
         onBack={goBack}
       />
+
+      <div className="space-y-3">
+        <div>
+          <h3 className="text-lg font-semibold tracking-tight">
+            Recent crawler activity
+          </h3>
+          <p className="text-sm text-muted-foreground">
+            Individual AI crawler requests to this project, newest first.
+          </p>
+        </div>
+        <AiCrawlerActivityFeed
+          projectId={project.id}
+          environmentId={selectedEnvironment}
+        />
+      </div>
     </div>
   )
 }

@@ -18,8 +18,9 @@ import { Bot, ChevronLeft, ChevronRight, ExternalLink } from 'lucide-react'
 import { useMemo } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 
-const PAGE_SIZE = 50
 const ALL = '__all__'
+const PAGE_SIZE_OPTIONS = [25, 50, 100, 200] as const
+const DEFAULT_PAGE_SIZE = 50
 
 /** Color a status-code pill the way the rest of the app does. */
 function statusVariant(
@@ -34,6 +35,8 @@ function statusVariant(
 interface AiCrawlerActivityFeedProps {
   /** Optional project scope. Omit for a global, all-projects feed. */
   projectId?: number
+  /** Optional environment scope within the project. */
+  environmentId?: number
 }
 
 /**
@@ -48,6 +51,7 @@ interface AiCrawlerActivityFeedProps {
  */
 export function AiCrawlerActivityFeed({
   projectId,
+  environmentId,
 }: AiCrawlerActivityFeedProps) {
   const [searchParams, setSearchParams] = useSearchParams()
 
@@ -55,6 +59,17 @@ export function AiCrawlerActivityFeed({
   const agent = searchParams.get('ai_agent') || ''
   const path = searchParams.get('path') || ''
   const page = Math.max(1, parseInt(searchParams.get('page') || '1', 10) || 1)
+  // Configurable items-per-page, persisted in the URL. Falls back to the
+  // default when the param is absent or not one of the allowed sizes.
+  const parsedPageSize = parseInt(
+    searchParams.get('page_size') || String(DEFAULT_PAGE_SIZE),
+    10
+  )
+  const pageSize = (PAGE_SIZE_OPTIONS as readonly number[]).includes(
+    parsedPageSize
+  )
+    ? parsedPageSize
+    : DEFAULT_PAGE_SIZE
 
   // Agents available in the agent dropdown: all, or just the selected provider's.
   const agentOptions = useMemo(() => {
@@ -77,6 +92,7 @@ export function AiCrawlerActivityFeed({
     ...getProxyLogsOptions({
       query: {
         project_id: projectId || null,
+        environment_id: environmentId || null,
         is_ai_agent: true,
         ai_provider: provider || null,
         ai_agent: agent || null,
@@ -84,7 +100,7 @@ export function AiCrawlerActivityFeed({
         sort_by: 'timestamp',
         sort_order: 'desc',
         page,
-        page_size: PAGE_SIZE,
+        page_size: pageSize,
       },
     }),
     staleTime: 1000 * 15,
@@ -185,14 +201,39 @@ export function AiCrawlerActivityFeed({
         </div>
       )}
 
-      {/* Pagination */}
-      {totalPages > 1 && (
-        <div className="flex items-center justify-between">
-          <span className="text-sm text-muted-foreground">
-            <span className="hidden sm:inline">Page </span>
-            {page} / {totalPages}
-          </span>
-          <div className="flex gap-2">
+      {/* Pagination + configurable page size (shown whenever there are rows) */}
+      {!isLoading && !error && logs.length > 0 && (
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex items-center gap-2 text-sm text-muted-foreground">
+            <span>Per page</span>
+            <Select
+              value={String(pageSize)}
+              onValueChange={(v) => {
+                const next = new URLSearchParams(searchParams)
+                next.set('page_size', v)
+                // Resizing changes which rows fall on page 1, so reset.
+                next.delete('page')
+                setSearchParams(next, { replace: true })
+              }}
+            >
+              <SelectTrigger className="h-8 w-[80px]">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {PAGE_SIZE_OPTIONS.map((size) => (
+                  <SelectItem key={size} value={String(size)}>
+                    {size}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <span className="text-sm text-muted-foreground">
+              <span className="hidden sm:inline">Page </span>
+              {page} / {Math.max(totalPages, 1)}
+            </span>
             <Button
               variant="outline"
               size="sm"
