@@ -184,6 +184,7 @@ const CliLogin = lazy(() =>
 )
 const ProxyLogs = lazy(() => import('./pages/ProxyLogs'))
 const ProxyLogDetail = lazy(() => import('./pages/ProxyLogDetail'))
+const AiCrawlerActivity = lazy(() => import('./pages/AiCrawlerActivity'))
 const IpGeolocationDetail = lazy(() => import('./pages/IpGeolocationDetail'))
 const ApiKeys = lazy(() => import('./pages/ApiKeys'))
 const ApiKeyCreate = lazy(() => import('./pages/ApiKeyCreate'))
@@ -399,6 +400,7 @@ const FullAppRoutes = () => {
                 {/* Observe section */}
                 <Route path="/proxy-logs" element={<ProxyLogs />} />
                 <Route path="/proxy-logs/:id" element={<ProxyLogDetail />} />
+                <Route path="/ai-crawlers" element={<AiCrawlerActivity />} />
                 <Route path="/audit-logs" element={<AuditLogs />} />
                 {/* CLI device-authorization approval surface. The route
                     sits inside the protected layout so unauthenticated

@@ -1,6 +1,7 @@
 import { getProxyLogsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { ProxyLogResponse } from '@/api/client/types.gen'
 import { AiAgentLogo } from '@/components/ui/ai-agent-logo'
+import { AGENT_TO_PROVIDER, AI_PROVIDERS } from '@/lib/ai-agents'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -107,50 +108,6 @@ type ColumnKey =
   | 'bot_name'
   | 'cache_status'
   | 'upstream_host'
-
-/**
- * Mirror of the backend AI-agent taxonomy (`temps-proxy::ai_agent_detector`).
- * Keep in sync when adding providers there. We hardcode here so the dropdown
- * doesn't need an extra round-trip on first paint; the backend remains the
- * source of truth for matching.
- */
-const AI_PROVIDERS: { provider: string; agents: string[] }[] = [
-  {
-    provider: 'OpenAI',
-    agents: ['GPTBot', 'OAI-SearchBot', 'ChatGPT-User', 'OpenAI'],
-  },
-  {
-    provider: 'Anthropic',
-    agents: ['ClaudeBot', 'Claude-SearchBot', 'Claude-User', 'anthropic-ai'],
-  },
-  { provider: 'Perplexity', agents: ['PerplexityBot', 'Perplexity-User'] },
-  { provider: 'Google', agents: ['GoogleOther'] },
-  { provider: 'Apple', agents: ['Applebot', 'Applebot-Extended'] },
-  { provider: 'Meta', agents: ['Meta-ExternalAgent', 'Meta-ExternalFetcher'] },
-  { provider: 'Amazon', agents: ['Amazonbot'] },
-  { provider: 'ByteDance', agents: ['Bytespider'] },
-  { provider: 'Common Crawl', agents: ['CCBot'] },
-  { provider: 'Cohere', agents: ['cohere-ai', 'cohere-training-data-crawler'] },
-  { provider: 'Diffbot', agents: ['Diffbot'] },
-  { provider: 'You.com', agents: ['YouBot'] },
-  { provider: 'DuckDuckGo', agents: ['DuckAssistBot'] },
-  { provider: 'Brave', agents: ['Bravebot'] },
-  { provider: 'Andi', agents: ['Andibot'] },
-  { provider: 'Omgili', agents: ['Omgilibot', 'Omgili'] },
-  { provider: 'ImageSift', agents: ['ImagesiftBot'] },
-  { provider: 'Timpi', agents: ['Timpibot'] },
-  { provider: 'Kangaroo', agents: ['Kangaroo Bot'] },
-  { provider: 'Mistral', agents: ['MistralAI-User'] },
-  { provider: 'xAI', agents: ['GrokBot'] },
-]
-
-const AGENT_TO_PROVIDER: Record<string, string> = AI_PROVIDERS.reduce(
-  (acc, { provider, agents }) => {
-    for (const agent of agents) acc[agent] = provider
-    return acc
-  },
-  {} as Record<string, string>
-)
 
 const STORAGE_KEY = 'proxy-logs-visible-columns'
 
