@@ -162,6 +162,7 @@ mod tests {
             last_health_error: None,
             consecutive_health_failures: 0,
             health_metadata: None,
+            metrics_enabled: false,
         }
     }
 

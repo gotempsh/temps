@@ -1325,6 +1325,64 @@ impl ExternalServiceManager {
         Ok(config)
     }
 
+    /// Store a metrics ingest key into the service's encrypted config blob and
+    /// restart the container so the OTLP env vars take effect.
+    ///
+    /// The key is persisted in the `metrics_ingest_key` field of the config so
+    /// that any future container recreate (upgrade, restart) automatically picks
+    /// it up without needing another key-provisioning step.
+    pub async fn store_and_apply_ingest_key(
+        &self,
+        service_id: i32,
+        ingest_key: String,
+    ) -> Result<(), ExternalServiceError> {
+        // Merge the key into the existing encrypted params.
+        let mut params = self.get_service_parameters(service_id).await?;
+        params.insert(
+            "metrics_ingest_key".to_string(),
+            serde_json::Value::String(ingest_key),
+        );
+
+        let config_json =
+            serde_json::to_string(&params).map_err(|e| ExternalServiceError::InternalError {
+                reason: format!("Failed to serialize config: {}", e),
+            })?;
+        let encrypted = self
+            .encryption_service
+            .encrypt_string(&config_json)
+            .map_err(|e| ExternalServiceError::InternalError {
+                reason: format!("Failed to encrypt config: {}", e),
+            })?;
+
+        external_services::Entity::update(external_services::ActiveModel {
+            id: sea_orm::Set(service_id),
+            config: sea_orm::Set(Some(encrypted)),
+            ..Default::default()
+        })
+        .exec(self.db.as_ref())
+        .await
+        .map_err(|e| ExternalServiceError::InternalError {
+            reason: format!("Failed to save ingest key: {}", e),
+        })?;
+
+        // Now recreate the container — it will read metrics_ingest_key from config.
+        let service = self.get_service(service_id).await?;
+        let service_type = ServiceType::from_str(&service.service_type).map_err(|_| {
+            ExternalServiceError::InvalidServiceType {
+                id: service_id,
+                service_type: service.service_type.clone(),
+            }
+        })?;
+        let config = self.get_service_config(service_id).await?;
+        let instance = self.create_service_instance(service.name.clone(), service_type);
+        instance
+            .apply_ingest_key(config)
+            .await
+            .map_err(|e| ExternalServiceError::InternalError {
+                reason: format!("Failed to restart container with ingest key: {}", e),
+            })
+    }
+
     pub async fn list_services(&self) -> Result<Vec<ExternalServiceInfo>, ExternalServiceError> {
         let services = external_services::Entity::find()
             .order_by_desc(external_services::Column::CreatedAt)

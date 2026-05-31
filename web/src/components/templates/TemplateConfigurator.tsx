@@ -107,7 +107,6 @@ const SERVICE_TYPES = [
   { id: 'postgres' as ServiceTypeRoute, name: 'PostgreSQL', description: 'Reliable Relational Database' },
   { id: 'redis' as ServiceTypeRoute, name: 'Redis', description: 'In-Memory Data Store' },
   { id: 's3' as ServiceTypeRoute, name: 'S3 / RustFS', description: 'S3-compatible Object Storage' },
-  { id: 'minio' as ServiceTypeRoute, name: 'MinIO', description: 'Object Storage (Deprecated)', deprecated: true },
   { id: 'libsql' as ServiceTypeRoute, name: 'LibSQL', description: 'SQLite-compatible Database' },
 ]
 

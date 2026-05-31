@@ -16,7 +16,8 @@ use temps_core::error_builder::ErrorBuilder;
 use temps_core::{
     problemdetails::Problem, AiConfigSettings, AppSettings, AuditContext, AuditLogger,
     AuditOperation, ContainerLogSettings, DiskSpaceAlertSettings, LetsEncryptSettings,
-    RateLimitSettings, RequestMetadata, ScreenshotSettings, SecurityHeadersSettings,
+    MetricsStoreKind, RateLimitSettings, RequestMetadata, ScreenshotSettings,
+    SecurityHeadersSettings,
 };
 use tracing::{error, info};
 use utoipa::{OpenApi, ToSchema};
@@ -496,6 +497,41 @@ async fn update_settings(
                 "Could not fetch current settings to preserve sensitive fields: {}",
                 e
             );
+        }
+    }
+
+    // Validate monitoring settings fields.
+    {
+        let m = &settings.monitoring;
+        if m.scrape_interval_secs < 15 {
+            return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .detail("monitoring.scrape_interval_secs must be >= 15")
+                .build());
+        }
+        if m.retention_raw_days < 1 || m.retention_raw_days > 30 {
+            return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .detail("monitoring.retention_raw_days must be between 1 and 30")
+                .build());
+        }
+        if m.retention_hourly_days < 7 || m.retention_hourly_days > 365 {
+            return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .detail("monitoring.retention_hourly_days must be between 7 and 365")
+                .build());
+        }
+        if m.store == MetricsStoreKind::ClickHouse {
+            match &m.clickhouse_url {
+                None => {
+                    return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                        .detail("monitoring.clickhouse_url is required when store is ClickHouse")
+                        .build());
+                }
+                Some(url) if url::Url::parse(url).is_err() => {
+                    return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                        .detail("monitoring.clickhouse_url is not a valid URL")
+                        .build());
+                }
+                _ => {}
+            }
         }
     }
 

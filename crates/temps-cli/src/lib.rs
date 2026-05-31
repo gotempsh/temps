@@ -117,6 +117,7 @@ pub fn install_tracing(log_level: &str, log_format: &str) {
              temps_presets={level},\
              temps_status_page={level},\
              temps_monitoring={level},\
+             temps_metrics={level},\
              temps_routes={level},\
              temps_error_tracking={level},\
              temps_sentry_ingester={level},\

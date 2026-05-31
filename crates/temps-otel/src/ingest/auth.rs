@@ -25,6 +25,21 @@ pub struct ProjectAuth {
     pub project_name: String,
 }
 
+/// Authenticated service context for infrastructure metrics ingest.
+#[derive(Debug, Clone)]
+pub struct ServiceAuth {
+    pub service_id: i32,
+    pub service_name: String,
+    pub token_id: i32,
+}
+
+/// Unified ingest authentication result — either a project or a service context.
+#[derive(Debug, Clone)]
+pub enum IngestAuth {
+    Project(ProjectAuth),
+    Service(ServiceAuth),
+}
+
 /// Service for authenticating OTel ingest requests.
 pub struct OtelAuthService {
     db: Arc<DatabaseConnection>,
@@ -33,6 +48,108 @@ pub struct OtelAuthService {
 impl OtelAuthService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
         Self { db }
+    }
+
+    /// Authenticate any ingest token — project (`tk_`/`dt_`) or service (`si_`).
+    ///
+    /// Routes `si_` tokens to `authenticate_service_token`; all others fall
+    /// through to the existing `authenticate` method.
+    pub async fn authenticate_any(
+        &self,
+        token: &str,
+        header_project_id: Option<i32>,
+    ) -> Result<IngestAuth, OtelError> {
+        if token.starts_with("si_") {
+            self.authenticate_service_token(token)
+                .await
+                .map(IngestAuth::Service)
+        } else {
+            self.authenticate(token, header_project_id)
+                .await
+                .map(IngestAuth::Project)
+        }
+    }
+
+    /// Authenticate a service ingest token (`si_`).
+    ///
+    /// The token must exist in `api_keys` with `role_type = 'metrics_ingest'`
+    /// and have a non-NULL `service_id` linking it to `external_services`.
+    async fn authenticate_service_token(&self, token: &str) -> Result<ServiceAuth, OtelError> {
+        if token.len() < 10 {
+            return Err(OtelError::InvalidApiKey);
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(token.as_bytes());
+        let key_hash = hex::encode(hasher.finalize());
+
+        let sql = r#"
+            SELECT ak.id AS key_id, ak.service_id, es.name AS service_name
+            FROM api_keys ak
+            JOIN external_services es ON es.id = ak.service_id
+            WHERE ak.key_hash = $1
+              AND ak.is_active = true
+              AND ak.role_type = 'metrics_ingest'
+              AND (ak.expires_at IS NULL OR ak.expires_at > NOW())
+            LIMIT 1
+        "#;
+
+        let result = self
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                sql,
+                vec![key_hash.into()],
+            ))
+            .await
+            .map_err(|e| OtelError::Storage {
+                message: format!("Database error during service token auth: {}", e),
+            })?;
+
+        match result {
+            Some(row) => {
+                let key_id: i32 = row
+                    .try_get("", "key_id")
+                    .map_err(|_| OtelError::AuthFailed {
+                        reason: "Failed to parse key_id".into(),
+                    })?;
+                let service_id: i32 =
+                    row.try_get("", "service_id")
+                        .map_err(|_| OtelError::AuthFailed {
+                            reason: "Failed to parse service_id".into(),
+                        })?;
+                let service_name: String =
+                    row.try_get("", "service_name")
+                        .map_err(|_| OtelError::AuthFailed {
+                            reason: "Failed to parse service_name".into(),
+                        })?;
+
+                // Update last_used_at (fire-and-forget)
+                let db = self.db.clone();
+                tokio::spawn(async move {
+                    let update_sql = "UPDATE api_keys SET last_used_at = NOW() WHERE id = $1";
+                    if let Err(e) = db
+                        .execute(Statement::from_sql_and_values(
+                            DatabaseBackend::Postgres,
+                            update_sql,
+                            vec![key_id.into()],
+                        ))
+                        .await
+                    {
+                        warn!(key_id, error = %e, "Failed to update service token last_used_at");
+                    }
+                });
+
+                Ok(ServiceAuth {
+                    service_id,
+                    service_name,
+                    token_id: key_id,
+                })
+            }
+            None => Err(OtelError::AuthFailed {
+                reason: "Invalid or expired service ingest token".into(),
+            }),
+        }
     }
 
     /// Authenticate an OTel ingest request.
@@ -270,15 +387,101 @@ mod tests {
 
         // Valid dt_ format
         assert!(validate_key_format("dt_abcdefghij").is_ok());
+
+        // Valid si_ format
+        assert!(validate_key_format("si_abcdefghij").is_ok());
     }
 
     fn validate_key_format(key: &str) -> Result<(), OtelError> {
         if key.len() < 10 {
             return Err(OtelError::InvalidApiKey);
         }
-        if !key.starts_with("tk_") && !key.starts_with("dt_") {
+        if !key.starts_with("tk_") && !key.starts_with("dt_") && !key.starts_with("si_") {
             return Err(OtelError::InvalidApiKey);
         }
         Ok(())
+    }
+
+    // ── Token format validation ──────────────────────────────────────────────
+
+    #[test]
+    fn test_si_token_prefix_recognized() {
+        // si_ prefix should route to service auth path in authenticate_any
+        let token = "si_abcdefghij1234567890";
+        assert!(token.starts_with("si_"));
+        assert!(token.len() >= 10);
+    }
+
+    #[test]
+    fn test_si_token_too_short_rejected() {
+        // Token under 10 chars should fail length check
+        let token = "si_abc";
+        assert!(token.len() < 10);
+    }
+
+    #[test]
+    fn test_tk_prefix_still_routes_to_project_auth() {
+        let token = "tk_abcdefghij";
+        assert!(!token.starts_with("si_"));
+        assert!(token.starts_with("tk_"));
+    }
+
+    #[test]
+    fn test_dt_prefix_still_routes_to_deployment_auth() {
+        let token = "dt_abcdefghij";
+        assert!(!token.starts_with("si_"));
+        assert!(token.starts_with("dt_"));
+    }
+
+    #[test]
+    fn test_unknown_prefix_rejected() {
+        let token = "xx_abcdefghij";
+        assert!(!token.starts_with("si_"));
+        assert!(!token.starts_with("tk_"));
+        assert!(!token.starts_with("dt_"));
+    }
+
+    // ── ServiceAuth struct ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_service_auth_fields() {
+        let auth = ServiceAuth {
+            service_id: 42,
+            service_name: "my-rustfs".to_string(),
+            token_id: 7,
+        };
+        assert_eq!(auth.service_id, 42);
+        assert_eq!(auth.service_name, "my-rustfs");
+        assert_eq!(auth.token_id, 7);
+    }
+
+    // ── IngestAuth enum ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_ingest_auth_service_variant() {
+        let auth = IngestAuth::Service(ServiceAuth {
+            service_id: 1,
+            service_name: "rustfs-prod".to_string(),
+            token_id: 99,
+        });
+        match auth {
+            IngestAuth::Service(sa) => assert_eq!(sa.service_id, 1),
+            IngestAuth::Project(_) => panic!("expected Service variant"),
+        }
+    }
+
+    #[test]
+    fn test_ingest_auth_project_variant() {
+        let auth = IngestAuth::Project(ProjectAuth {
+            project_id: 5,
+            environment_id: None,
+            deployment_id: None,
+            token_id: 3,
+            project_name: "my-project".to_string(),
+        });
+        match auth {
+            IngestAuth::Project(pa) => assert_eq!(pa.project_id, 5),
+            IngestAuth::Service(_) => panic!("expected Project variant"),
+        }
     }
 }

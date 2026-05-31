@@ -10,7 +10,7 @@ use std::sync::{
 use tracing::{error, warn};
 
 use crate::error::OtelError;
-use crate::ingest::auth::{OtelAuthService, ProjectAuth};
+use crate::ingest::auth::{IngestAuth, OtelAuthService, ProjectAuth};
 use crate::ingest::rate_limit::RateLimiter;
 use crate::storage::OtelStorage;
 use crate::types::*;
@@ -78,6 +78,20 @@ impl OtelService {
     ) -> Result<ProjectAuth, OtelError> {
         self.auth_service
             .authenticate(token, header_project_id)
+            .await
+    }
+
+    /// Authenticate any ingest token — project (`tk_`/`dt_`) or service (`si_`).
+    ///
+    /// Routes `si_` tokens to the service auth path; all others fall through
+    /// to the existing project auth path.
+    pub async fn authenticate_any(
+        &self,
+        token: &str,
+        header_project_id: Option<i32>,
+    ) -> Result<IngestAuth, OtelError> {
+        self.auth_service
+            .authenticate_any(token, header_project_id)
             .await
     }
 

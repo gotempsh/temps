@@ -373,6 +373,11 @@ pub enum Job {
     BackupCompleted(BackupCompletedJob),
     BackupFailed(BackupFailedJob),
     BackupCancelRequested(BackupCancelRequestedJob),
+    /// Scheduled hourly to prune raw service_metrics rows older than the
+    /// configured `retention_raw_days` window. Continuous aggregates
+    /// (hourly/daily rollups) have their own TimescaleDB retention policies
+    /// and do not need to be pruned here.
+    PruneMetrics,
 }
 
 impl fmt::Display for Job {
@@ -421,6 +426,7 @@ impl fmt::Display for Job {
             Job::BackupCompleted(job) => write!(f, "BackupCompleted(backup: {}, engine: {}, size: {:?})", job.backup_id, job.engine, job.size_bytes),
             Job::BackupFailed(job) => write!(f, "BackupFailed(backup: {}, engine: {})", job.backup_id, job.engine),
             Job::BackupCancelRequested(job) => write!(f, "BackupCancelRequested(backup: {})", job.backup_id),
+            Job::PruneMetrics => write!(f, "PruneMetrics"),
         }
     }
 }

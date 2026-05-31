@@ -36,6 +36,11 @@ pub fn configure_routes() -> Router<OtelAppState> {
         .route("/otel/v1/metrics", post(ingest_handler::ingest_metrics))
         .route("/otel/v1/traces", post(ingest_handler::ingest_traces))
         .route("/otel/v1/logs", post(ingest_handler::ingest_logs))
+        // OTLP ingest endpoints (token in path — for services that can't send headers)
+        .route(
+            "/otel/v1/service/{service_token}/metrics",
+            post(ingest_handler::ingest_service_metrics_by_token),
+        )
         // OTLP ingest endpoints (project/environment/deployment in path)
         .route(
             "/otel/v1/{project_id}/{environment_id}/{deployment_id}/metrics",

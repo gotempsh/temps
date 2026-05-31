@@ -20,6 +20,8 @@ temps-query-redis = { path = "../temps-query-redis" }
 temps-query-mongodb = { path = "../temps-query-mongodb" }
 temps-dns = { path = "../temps-dns" }
 temps-network = { path = "../temps-network" }
+temps-metrics = { path = "../temps-metrics" }
+temps-monitoring = { path = "../temps-monitoring" }
 serde = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }

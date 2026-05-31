@@ -120,7 +120,11 @@ async fn setup_e2e() -> Option<(
     let auth_service = Arc::new(OtelAuthService::new(db.clone()));
     let rate_limiter = Arc::new(RateLimiter::new(10000, Duration::from_secs(60)));
     let otel_service = Arc::new(OtelService::new(storage, auth_service, rate_limiter));
-    let app_state = OtelAppState { otel_service };
+    let app_state = OtelAppState {
+        otel_service,
+        metrics_store: None,
+        metrics_write_tx: None,
+    };
 
     // Create auth middleware that injects AuthContext into request extensions.
     // Query handlers use RequireAuth which reads AuthContext from extensions.

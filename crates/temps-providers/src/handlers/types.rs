@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use utoipa::ToSchema;
 
+use sea_orm::DatabaseConnection;
+use temps_auth::ApiKeyService;
 use temps_core::AuditLogger;
 
 pub struct AppState {
@@ -16,6 +18,14 @@ pub struct AppState {
     /// startup (single-node control plane). `None` on workers or in tests
     /// where the loop isn't running.
     pub health_monitor: Option<Arc<ExternalServiceHealthMonitor>>,
+    /// Metrics store for time-series metric queries and writes.
+    /// Optional — present only when the metrics subsystem is enabled in config.
+    pub metrics_store: Option<Arc<dyn temps_metrics::MetricsStore>>,
+    /// Direct DB connection for alert rule CRUD (monitoring_alert_rules table).
+    pub db: Arc<DatabaseConnection>,
+    /// API key service — used to provision `si_` ingest keys when metrics are
+    /// enabled on a RustFS (or other OTLP-push) service.
+    pub api_key_service: Arc<ApiKeyService>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]

@@ -742,6 +742,15 @@ pub trait ExternalService: Send + Sync {
         ))
     }
 
+    /// Restart the service container so that a freshly stored `metrics_ingest_key`
+    /// in the config takes effect as OTLP env vars.
+    ///
+    /// The key is read from `service_config` — callers must persist it first.
+    /// Default is a no-op; only OTLP-push engines (RustFS) override this.
+    async fn apply_ingest_key(&self, _service_config: ServiceConfig) -> Result<()> {
+        Ok(())
+    }
+
     /// Get service type
     fn get_type(&self) -> ServiceType;
 

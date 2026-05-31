@@ -15,6 +15,7 @@ temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
 temps-deployer = { path = "../temps-deployer" }
 temps-auth = { path = "../temps-auth" }
+temps-metrics = { path = "../temps-metrics" }
 
 # Async runtime
 tokio = { workspace = true }

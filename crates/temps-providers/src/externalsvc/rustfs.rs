@@ -83,6 +83,12 @@ pub struct RustfsInputConfig {
     #[serde(default = "default_image")]
     #[schemars(example = "example_image", default = "default_image")]
     pub docker_image: String,
+
+    /// Metrics ingest key (`si_` prefix). Populated automatically when metrics
+    /// are enabled — never set by the user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub metrics_ingest_key: Option<String>,
 }
 
 /// Internal runtime configuration for RustFS service
@@ -96,6 +102,10 @@ pub struct RustfsConfig {
     pub host: String,
     pub region: String,
     pub docker_image: String,
+    /// Plaintext `si_` metrics ingest key, present when metrics are enabled.
+    /// Stored in the encrypted service config blob — never in plaintext elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics_ingest_key: Option<String>,
 }
 
 impl RustfsConfig {
@@ -163,6 +173,7 @@ impl RustfsConfig {
             host: input.host,
             region: input.region,
             docker_image: input.docker_image,
+            metrics_ingest_key: input.metrics_ingest_key,
         }
     }
 }
@@ -185,6 +196,7 @@ impl From<RustfsInputConfig> for RustfsConfig {
             host: input.host,
             region: input.region,
             docker_image: input.docker_image,
+            metrics_ingest_key: input.metrics_ingest_key,
         }
     }
 }
@@ -561,11 +573,29 @@ impl RustfsService {
             (name_label_key.as_str(), self.name.as_str()),
         ]);
 
-        // RustFS uses RUSTFS_ACCESS_KEY and RUSTFS_SECRET_KEY environment variables
-        let env_vars = [
+        // RustFS uses RUSTFS_ACCESS_KEY and RUSTFS_SECRET_KEY environment variables.
+        // RUSTFS_PROMETHEUS_AUTH_TYPE=public disables JWT auth on the Prometheus
+        // metrics endpoint (/minio/v2/metrics/cluster) so the local scraper can
+        // reach it without generating a bearer token.  These containers are
+        // private (no public exposure), so this is safe.
+        let mut env_vars = vec![
             format!("RUSTFS_ACCESS_KEY={}", config.access_key),
             format!("RUSTFS_SECRET_KEY={}", config.secret_key),
         ];
+        // When a metrics ingest key is stored in config, metrics are enabled —
+        // inject the OTLP push env vars so RustFS reports to Temps automatically.
+        if let Some(key) = &config.metrics_ingest_key {
+            // Embed the si_ token in the URL path — RustFS alpha doesn't
+            // reliably forward RUSTFS_OBS_ENDPOINT_METRICS_HEADERS, so we use
+            // a dedicated /otel/v1/service/{token}/metrics endpoint instead.
+            env_vars.push(format!(
+                "RUSTFS_OBS_METRIC_ENDPOINT=http://host.docker.internal:8080/api/otel/v1/service/{}/metrics",
+                key
+            ));
+            env_vars.push("RUSTFS_OBS_METRICS_EXPORT_ENABLED=true".to_string());
+            env_vars.push("RUSTFS_OBS_TRACES_EXPORT_ENABLED=false".to_string());
+            env_vars.push("RUSTFS_OBS_LOGS_EXPORT_ENABLED=false".to_string());
+        }
 
         ensure_network_exists(docker)
             .await
@@ -837,6 +867,36 @@ impl RustfsService {
 
 #[async_trait]
 impl ExternalService for RustfsService {
+    /// Restart the RustFS container so that the `metrics_ingest_key` stored in
+    /// `service_config` takes effect as OTLP env vars.
+    async fn apply_ingest_key(&self, service_config: ServiceConfig) -> Result<()> {
+        let input_config: RustfsInputConfig = serde_json::from_value(service_config.parameters)
+            .map_err(|e| anyhow::anyhow!("Failed to parse RustFS configuration: {}", e))?;
+        let config = RustfsConfig::from(input_config);
+        let resource_limits = self.resource_limits.read().await.clone();
+
+        let container_name = self.get_container_name();
+
+        let _ = self
+            .docker
+            .stop_container(&container_name, None::<StopContainerOptions>)
+            .await;
+
+        let _ = self
+            .docker
+            .remove_container(
+                &container_name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+
+        self.create_container(&self.docker, &config, &resource_limits)
+            .await
+    }
+
     async fn init(&self, config: ServiceConfig) -> Result<HashMap<String, String>> {
         info!("Initializing RustFS service: {}", config.name);
 
@@ -2014,6 +2074,7 @@ mod tests {
             host: default_host(),
             region: default_region(),
             docker_image: default_image(),
+            metrics_ingest_key: None,
         };
 
         let config = RustfsConfig::from(input);
@@ -2035,6 +2096,7 @@ mod tests {
             host: "custom-host".to_string(),
             region: "eu-west-1".to_string(),
             docker_image: "rustfs/rustfs:1.0.0".to_string(),
+            metrics_ingest_key: None,
         };
 
         let config = RustfsConfig::from(input);
