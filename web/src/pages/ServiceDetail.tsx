@@ -840,6 +840,8 @@ export function ServiceDetail() {
               serviceId={service.service.id}
               engine={service.service.service_type}
               dockerImage={service.current_parameters?.docker_image ?? undefined}
+              metricsEnabled={service.service.metrics_enabled ?? false}
+              onMonitoringChange={() => refetch()}
             />
           )}
 

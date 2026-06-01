@@ -5427,6 +5427,11 @@ export type ExternalServiceInfo = {
      * Cluster members (empty for standalone services).
      */
     members?: Array<ServiceMemberInfo>;
+    /**
+     * Whether metric collection is enabled for this service. The UI uses this
+     * to decide whether to poll the monitoring endpoints.
+     */
+    metrics_enabled?: boolean;
     name: string;
     /**
      * Node ID where the service runs. Null means control plane (local).

@@ -1121,12 +1121,30 @@ export function ServiceMonitoring() {
     queryFn: () => fetchLatestMetrics(serviceId),
     enabled: !!serviceId,
     staleTime: 15_000,
-    refetchInterval: 30_000,
+    refetchInterval: (query) => {
+      // Stop polling on permanent errors (monitoring disabled on the server or
+      // this service, service not found) — otherwise we poll forever.
+      const err = query.state.error as Error | null
+      if (err) {
+        const msg = err.message.toLowerCase()
+        if (
+          msg.includes('not enabled') ||
+          msg.includes('not found') ||
+          msg.includes('unavailable') ||
+          msg.includes('http 404') ||
+          msg.includes('http 503')
+        ) {
+          return false
+        }
+      }
+      return 30_000
+    },
     retry: (failureCount, err) => {
       const msg = err.message.toLowerCase()
       if (
         msg.includes('not enabled') ||
         msg.includes('not found') ||
+        msg.includes('unavailable') ||
         msg.includes('http 404') ||
         msg.includes('http 503')
       )

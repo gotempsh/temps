@@ -16,7 +16,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { Switch } from '@/components/ui/switch'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useSettings, useUpdateSettings } from '@/hooks/useSettings'
@@ -134,7 +133,7 @@ export function MonitoringSettingsPage() {
 
   return (
     <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
-      {/* Enable / disable */}
+      {/* Overview — metrics collection is always on, controlled per-service */}
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
@@ -143,114 +142,27 @@ export function MonitoringSettingsPage() {
           </CardTitle>
           <CardDescription>
             Collect resource and performance metrics from databases, containers,
-            and nodes. Metrics are stored in TimescaleDB (default) or ClickHouse
-            and used for alerting and dashboards.
+            and nodes for alerting and dashboards. Enable monitoring per service
+            from its detail page — these settings tune how the collected data is
+            sampled and retained.
           </CardDescription>
         </CardHeader>
         <CardContent>
-          <div className="flex items-center justify-between">
-            <div className="space-y-0.5">
-              <Label htmlFor="monitoring-enabled">Enable metrics collection</Label>
-              <p className="text-sm text-muted-foreground">
-                Starts the MetricsScraper and AlertEvaluator background tasks.
-                Disabled by default — enable once your TimescaleDB extension is
-                active.
-              </p>
-            </div>
-            <Switch
-              id="monitoring-enabled"
-              checked={monitoring?.enabled ?? false}
-              onCheckedChange={(checked) =>
-                setValue('monitoring.enabled', checked, { shouldDirty: true })
-              }
-            />
-          </div>
-        </CardContent>
-      </Card>
-
-      {/* Store selector */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Database className="h-5 w-5" />
-            Storage Backend
-          </CardTitle>
-          <CardDescription>
-            Choose where metric data is persisted.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="grid gap-3 sm:grid-cols-2">
-            {/* TimescaleDB card */}
-            <button
-              type="button"
-              onClick={() =>
-                setValue('monitoring.store', 'timescale_db', {
-                  shouldDirty: true,
-                })
-              }
-              className={[
-                'rounded-lg border p-4 text-left transition-colors',
-                storeKind === 'timescale_db'
-                  ? 'border-primary bg-primary/5 ring-1 ring-primary'
-                  : 'border-border hover:border-muted-foreground/40',
-              ].join(' ')}
-            >
-              <p className="font-medium text-sm">TimescaleDB</p>
-              <p className="text-xs text-muted-foreground mt-1">
-                Uses your existing PostgreSQL/TimescaleDB. No additional setup.
-              </p>
-            </button>
-
-            {/* ClickHouse card */}
-            <button
-              type="button"
-              onClick={() =>
-                setValue('monitoring.store', 'click_house', {
-                  shouldDirty: true,
-                })
-              }
-              className={[
-                'rounded-lg border p-4 text-left transition-colors',
-                storeKind === 'click_house'
-                  ? 'border-primary bg-primary/5 ring-1 ring-primary'
-                  : 'border-border hover:border-muted-foreground/40',
-              ].join(' ')}
-            >
-              <p className="font-medium text-sm">ClickHouse</p>
-              <p className="text-xs text-muted-foreground mt-1">
-                Higher retention at scale. Requires a ClickHouse instance.
-              </p>
-            </button>
-          </div>
-
-          {storeKind === 'click_house' && (
-            <div className="space-y-2 pt-2">
-              <Label htmlFor="clickhouse-url">ClickHouse URL</Label>
-              <Input
-                id="clickhouse-url"
-                type="url"
-                placeholder="http://localhost:8123"
-                {...register('monitoring.clickhouse_url', {
-                  validate: (v) => {
-                    if (storeKind !== 'click_house') return true
-                    if (!v) return 'ClickHouse URL is required'
-                    try {
-                      new URL(v)
-                      return true
-                    } catch {
-                      return 'Must be a valid URL'
-                    }
-                  },
-                })}
-              />
-              {errors.monitoring?.clickhouse_url && (
-                <p className="text-xs text-destructive">
-                  {errors.monitoring.clickhouse_url.message}
+          <div className="flex items-center justify-between rounded-lg border border-border bg-muted/30 px-4 py-3">
+            <div className="flex items-center gap-2">
+              <Database className="h-4 w-4 text-muted-foreground" />
+              <div>
+                <p className="text-sm font-medium">Storage backend</p>
+                <p className="text-xs text-muted-foreground">
+                  Follows the server configuration — set via{' '}
+                  <code className="font-mono">TEMPS_CLICKHOUSE_*</code> env vars.
                 </p>
-              )}
+              </div>
             </div>
-          )}
+            <span className="rounded-md bg-background px-2.5 py-1 text-xs font-medium text-foreground ring-1 ring-inset ring-border">
+              {storeKind === 'click_house' ? 'ClickHouse' : 'TimescaleDB'}
+            </span>
+          </div>
         </CardContent>
       </Card>
 

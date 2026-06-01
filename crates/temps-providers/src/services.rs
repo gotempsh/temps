@@ -230,6 +230,9 @@ pub struct ExternalServiceInfo {
     pub members: Vec<ServiceMemberInfo>,
     /// Error message from failed initialization (None if no error).
     pub error_message: Option<String>,
+    /// Whether metric collection is enabled for this service.
+    #[serde(default)]
+    pub metrics_enabled: bool,
 }
 
 /// Format a `tokio_postgres::Error` (or any `std::error::Error`) by
@@ -1981,6 +1984,7 @@ impl ExternalServiceManager {
             topology: service.topology,
             members,
             error_message: service.error_message,
+            metrics_enabled: service.metrics_enabled,
         })
     }
 
@@ -8257,6 +8261,7 @@ echo "[restore] Pre-seed complete"
             topology: external_service.topology,
             members: Vec::new(),
             error_message: external_service.error_message,
+            metrics_enabled: external_service.metrics_enabled,
         })
     }
 
@@ -10727,6 +10732,7 @@ mod tests {
             topology: "standalone".to_string(),
             members: Vec::new(),
             error_message: None,
+            metrics_enabled: false,
         };
 
         assert_eq!(service_info.id, 1);

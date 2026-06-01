@@ -1253,20 +1253,20 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                 use temps_core::MetricsStoreKind;
                 use temps_metrics::{MetricsStore, TimescaleMetricsStore};
 
+                // Always provide a TimescaleDB-backed store for container metrics.
+                // ClickHouse is the only unsupported store and falls back to None.
                 match service_context.get_service::<temps_config::ConfigService>() {
                     Some(cfg_svc) => match cfg_svc.get_settings().await {
-                        Ok(settings) if settings.monitoring.enabled => {
-                            match settings.monitoring.store {
-                                MetricsStoreKind::TimescaleDb => {
-                                    Some(Arc::new(TimescaleMetricsStore::new(db.clone()))
-                                        as Arc<dyn MetricsStore>)
-                                }
-                                MetricsStoreKind::ClickHouse => {
-                                    debug!("ClickHouse metrics store is not yet supported; container metrics disabled");
-                                    None
-                                }
+                        Ok(settings) => match settings.monitoring.store {
+                            MetricsStoreKind::TimescaleDb => {
+                                Some(Arc::new(TimescaleMetricsStore::new(db.clone()))
+                                    as Arc<dyn MetricsStore>)
                             }
-                        }
+                            MetricsStoreKind::ClickHouse => {
+                                debug!("ClickHouse metrics store is not yet supported; container metrics disabled");
+                                None
+                            }
+                        },
                         _ => None,
                     },
                     None => None,
@@ -1303,20 +1303,21 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
             use temps_core::MetricsStoreKind;
             use temps_metrics::{MetricsScraper, MetricsStore, TimescaleMetricsStore};
 
+            // The metrics store and scraper are ALWAYS wired up — the per-service
+            // `metrics_enabled` flag is the single source of truth for what gets
+            // scraped. The scraper idles (near-zero cost) when no service has
+            // monitoring enabled, so a user clicking "Enable Monitoring" on a
+            // service just works without an operator first flipping a global flag.
+            //
+            // ClickHouse is the only unsupported store; we always fall back to
+            // TimescaleDB until it lands.
             match cfg_svc.get_settings().await {
-                Ok(settings) if settings.monitoring.enabled => {
-                    let metrics_store: Arc<dyn MetricsStore> = match settings.monitoring.store {
-                        MetricsStoreKind::TimescaleDb => {
-                            Arc::new(TimescaleMetricsStore::new(db.clone()))
-                        }
-                        MetricsStoreKind::ClickHouse => {
-                            debug!("ClickHouse metrics store not yet supported; external service scraping disabled");
-                            // Skip spawning the scraper for unsupported backends.
-                            // Jump to the end of this block by not spawning anything.
-                            // We fall through to the else branch below instead.
-                            Arc::new(TimescaleMetricsStore::new(db.clone()))
-                        }
-                    };
+                Ok(settings) => {
+                    if matches!(settings.monitoring.store, MetricsStoreKind::ClickHouse) {
+                        debug!("ClickHouse metrics store not yet supported; using TimescaleDB");
+                    }
+                    let metrics_store: Arc<dyn MetricsStore> =
+                        Arc::new(TimescaleMetricsStore::new(db.clone()));
 
                     // Register the metrics store so plugins (e.g. providers)
                     // can retrieve it for HTTP query endpoints.
@@ -1333,7 +1334,9 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                         scraper.start().await;
                     });
 
-                    debug!("MetricsScraper started (external service DB-level metrics)");
+                    debug!(
+                        "MetricsScraper started (scrapes only services with metrics_enabled=true)"
+                    );
 
                     // Start AlertEvaluator alongside the scraper.
                     // It reads monitoring_alert_rules from the DB and evaluates
@@ -1381,9 +1384,6 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                                         continue;
                                     }
                                 };
-                                if !settings.monitoring.enabled {
-                                    continue;
-                                }
                                 let store: Arc<dyn MetricsStore> = match settings.monitoring.store {
                                     MetricsStoreKind::TimescaleDb => {
                                         Arc::new(TimescaleMetricsStore::new(prune_db.clone()))
@@ -1413,9 +1413,6 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
 
                         debug!("Metrics pruning job scheduled (hourly)");
                     }
-                }
-                Ok(_) => {
-                    debug!("Metrics collection disabled — MetricsScraper and AlertEvaluator not started");
                 }
                 Err(e) => {
                     tracing::warn!("Failed to read monitoring settings: {e} — MetricsScraper and AlertEvaluator not started");

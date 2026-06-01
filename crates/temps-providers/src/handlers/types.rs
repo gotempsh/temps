@@ -193,6 +193,10 @@ pub struct ExternalServiceInfo {
     /// Error message from failed initialization.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    /// Whether metric collection is enabled for this service. The UI uses this
+    /// to decide whether to poll the monitoring endpoints.
+    #[serde(default)]
+    pub metrics_enabled: bool,
 }
 
 /// Public info about a cluster member.

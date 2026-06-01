@@ -1086,6 +1086,12 @@ export interface MonitoringCardProps {
   engine: string
   /** Docker image — used to detect RustFS when service_type is 's3' */
   dockerImage?: string
+  /** Whether metric collection is enabled for this service. When false, the
+   *  card shows the "Enable Monitoring" state and does NOT poll the API. */
+  metricsEnabled?: boolean
+  /** Called after monitoring is toggled on/off so the parent can refetch the
+   *  service (which owns the `metricsEnabled` flag). */
+  onMonitoringChange?: () => void
 }
 
 /**
@@ -1094,7 +1100,7 @@ export interface MonitoringCardProps {
  *   B — enabled, no data yet → pending card with polling
  *   C — data available → live stat row + chart + alert rules
  */
-export function MonitoringCard({ serviceId, engine, dockerImage }: MonitoringCardProps) {
+export function MonitoringCard({ serviceId, engine, dockerImage, metricsEnabled = false, onMonitoringChange }: MonitoringCardProps) {
   const queryClient = useQueryClient()
   const normalEngine = normalizeEngine(engine, dockerImage)
 
@@ -1107,6 +1113,9 @@ export function MonitoringCard({ serviceId, engine, dockerImage }: MonitoringCar
   } = useQuery<MetricLatest[], Error>({
     queryKey: ['service-metrics-latest', serviceId],
     queryFn: () => fetchLatestMetrics(serviceId),
+    // Only hit the API when monitoring is enabled for this service. When off,
+    // we render the Enable state from the prop without any network calls.
+    enabled: metricsEnabled,
     retry: (failureCount, err) => {
       // Don't retry on permanent errors (disabled, not found)
       const msg = err.message.toLowerCase()
@@ -1123,10 +1132,26 @@ export function MonitoringCard({ serviceId, engine, dockerImage }: MonitoringCar
     },
     staleTime: 3_000,
     refetchInterval: (query) => {
-      // Stop polling once we have data (switch to 30s passive refresh)
+      // Stop polling entirely on permanent errors (monitoring disabled on the
+      // server or this service, service not found). Otherwise we'd hammer the
+      // API every 3s forever and the card would visibly blink.
+      const err = query.state.error as Error | null
+      if (err) {
+        const msg = err.message.toLowerCase()
+        if (
+          msg.includes('not enabled') ||
+          msg.includes('not found') ||
+          msg.includes('unavailable') ||
+          msg.includes('http 404') ||
+          msg.includes('http 503')
+        ) {
+          return false
+        }
+      }
+      // Stop fast-polling once we have data (switch to 30s passive refresh)
       const d = query.state.data
       if (d && d.length > 0) return 30_000
-      // Poll every 3s while waiting for first scrape
+      // Poll every 3s while waiting for the first scrape after enabling
       return 3_000
     },
   })
@@ -1138,6 +1163,9 @@ export function MonitoringCard({ serviceId, engine, dockerImage }: MonitoringCar
       queryClient.invalidateQueries({
         queryKey: ['service-metrics-latest', serviceId],
       })
+      // Refetch the parent service so the metricsEnabled flag flips to true and
+      // the query un-gates.
+      onMonitoringChange?.()
     },
     onError: (err: Error) =>
       toast.error('Failed to enable monitoring', { description: err.message }),
@@ -1150,19 +1178,22 @@ export function MonitoringCard({ serviceId, engine, dockerImage }: MonitoringCar
       queryClient.invalidateQueries({
         queryKey: ['service-metrics-latest', serviceId],
       })
+      onMonitoringChange?.()
     },
     onError: (err: Error) =>
       toast.error('Failed to disable monitoring', { description: err.message }),
   })
 
-  // State A: monitoring disabled or not configured
+  // State A: monitoring disabled for this service. Either the service flag is
+  // off (no API call made at all) or the API reported it's not enabled.
   const isDisabled =
-    error != null &&
-    (error.message.toLowerCase().includes('not enabled') ||
-      error.message.toLowerCase().includes('not found') ||
-      error.message.toLowerCase().includes('unavailable') ||
-      error.message.includes('HTTP 404') ||
-      error.message.includes('HTTP 503'))
+    !metricsEnabled ||
+    (error != null &&
+      (error.message.toLowerCase().includes('not enabled') ||
+        error.message.toLowerCase().includes('not found') ||
+        error.message.toLowerCase().includes('unavailable') ||
+        error.message.includes('HTTP 404') ||
+        error.message.includes('HTTP 503')))
 
   if (isDisabled) {
     return (
