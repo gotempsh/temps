@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Service upgrade support for RustFS (was previously "not implemented").
 - **`temps migrate` command** — applies pending database migrations as an explicit, decoupled step with the server stopped and **no timeout**. Recommended upgrade flow for production and large databases: download the new binary → `temps migrate --database-url=…` → restart the server. `temps serve` still auto-applies pending migrations on boot for simple installs, so this is fully backward compatible.
 - `temps doctor` now reports pending migrations explicitly ("N applied, up to date" vs "N applied, M PENDING — run `temps migrate` before restarting the server"), and detects an uninitialized schema.
+- Default alert rules for MongoDB services (current connections, queued reads/writes, WiredTiger cache pressure, replication-buffer pressure, cursor timeouts). The `AlertEvaluator` also back-seeds default rules for every metrics-enabled service on startup (idempotent `ON CONFLICT DO NOTHING`), self-healing services whose engine had no default seeds when monitoring was first enabled.
 
 ### Changed
 - Cumulative counter metrics (`_total`/`_count`) now display the running total in stat tiles and rate-of-change in charts, computed via a TimescaleDB LAG window query.

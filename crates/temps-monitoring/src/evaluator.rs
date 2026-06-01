@@ -121,6 +121,15 @@ impl AlertEvaluator {
             warn!("AlertEvaluator: failed to load firing alarms from DB on startup: {e}");
         }
 
+        // Back-seed default alert rules for every metrics-enabled service.
+        // The `seed_default_rules` upsert is ON CONFLICT DO NOTHING, so this
+        // is a no-op for services that already have their defaults. It catches
+        // services whose engine had no default seeds when metrics was first
+        // toggled on (e.g. MongoDB services pre-dating the mongodb seed).
+        if let Err(e) = self.backseed_default_rules_for_enabled_services().await {
+            warn!("AlertEvaluator: failed to back-seed default rules on startup: {e}");
+        }
+
         loop {
             if let Err(e) = self.run_cycle().await {
                 error!("AlertEvaluator: cycle failed: {e}");
@@ -183,6 +192,47 @@ impl AlertEvaluator {
         info!(
             "AlertEvaluator: restored {} firing alarm(s) from DB",
             self.firing_alarms.read().await.len()
+        );
+
+        Ok(())
+    }
+
+    /// Back-seed default alert rules for every external service that has
+    /// `metrics_enabled = true`. Idempotent — `seed_default_rules` uses
+    /// `INSERT … ON CONFLICT DO NOTHING`, so services that already have their
+    /// defaults seeded incur only a no-op upsert per rule.
+    ///
+    /// This exists to self-heal services whose engine had no default seeds
+    /// when the user first toggled metrics on (e.g. MongoDB services pre-dating
+    /// the mongodb seed). Without it the user must toggle metrics off and back
+    /// on to pick up newly-added default rules.
+    async fn backseed_default_rules_for_enabled_services(&self) -> Result<(), String> {
+        use temps_entities::external_services;
+
+        let services = external_services::Entity::find()
+            .filter(external_services::Column::MetricsEnabled.eq(true))
+            .all(self.db.as_ref())
+            .await
+            .map_err(|e| format!("backseed_default_rules_for_enabled_services: DB error: {e}"))?;
+
+        let mut seeded = 0usize;
+        for service in services {
+            if let Err(e) =
+                seed_default_rules(self.db.as_ref(), service.id, &service.service_type).await
+            {
+                warn!(
+                    service_id = service.id,
+                    engine = %service.service_type,
+                    "AlertEvaluator: back-seed failed (non-fatal): {e}"
+                );
+            } else {
+                seeded += 1;
+            }
+        }
+
+        info!(
+            "AlertEvaluator: back-seeded default alert rules for {} service(s)",
+            seeded
         );
 
         Ok(())
@@ -612,6 +662,8 @@ pub use temps_metrics::MetricsError;
 ///   replication lag and deadlocks.
 /// - `"redis"` — 4 default rules covering memory fragmentation, eviction,
 ///   client count and keyspace hit ratio.
+/// - `"mongodb"` — 6 default rules covering connections, queued operations,
+///   WiredTiger cache pressure, replication buffer pressure, and asserts.
 /// - Anything else — no rules inserted.
 pub async fn seed_default_rules(
     db: &DatabaseConnection,
@@ -621,6 +673,7 @@ pub async fn seed_default_rules(
     let seeds: Vec<RuleSeed> = match engine.to_lowercase().as_str() {
         "postgres" => postgres_default_seeds(),
         "redis" => redis_default_seeds(),
+        "mongodb" => mongodb_default_seeds(),
         _ => {
             debug!(
                 service_id,
@@ -869,6 +922,64 @@ fn redis_default_seeds() -> Vec<RuleSeed> {
             comparator: "<",
             severity: "warning",
             for_duration_secs: 300,
+        },
+    ]
+}
+
+fn mongodb_default_seeds() -> Vec<RuleSeed> {
+    // Metric names mirror the MongoDB collector's serverStatus extractor
+    // (see `temps_metrics::collector::mongodb`). Connection limits are based on
+    // mongod's default `maxIncomingConnections = 65536`, but most deployments
+    // run with the container default of ~819 (80% of 1024 ulimit) — the
+    // ratio-style metric we don't have, so absolute thresholds are used.
+    vec![
+        RuleSeed {
+            name: "High current connections (warning)",
+            metric_name: "mongo.connections_current",
+            threshold: 500.0,
+            comparator: ">",
+            severity: "warning",
+            for_duration_secs: 60,
+        },
+        RuleSeed {
+            name: "Operations queued for reads",
+            metric_name: "mongo.queued_reads",
+            threshold: 5.0,
+            comparator: ">",
+            severity: "warning",
+            for_duration_secs: 60,
+        },
+        RuleSeed {
+            name: "Operations queued for writes",
+            metric_name: "mongo.queued_writes",
+            threshold: 5.0,
+            comparator: ">",
+            severity: "warning",
+            for_duration_secs: 60,
+        },
+        RuleSeed {
+            name: "WiredTiger cache near full",
+            metric_name: "mongo.wiredtiger_cache_ratio",
+            threshold: 0.95,
+            comparator: ">",
+            severity: "warning",
+            for_duration_secs: 300,
+        },
+        RuleSeed {
+            name: "Replication buffer pressure",
+            metric_name: "mongo.replication_buffer_ratio",
+            threshold: 0.80,
+            comparator: ">",
+            severity: "warning",
+            for_duration_secs: 120,
+        },
+        RuleSeed {
+            name: "Cursor timeouts detected",
+            metric_name: "mongo.cursor_timed_out_total",
+            threshold: 0.0,
+            comparator: ">",
+            severity: "warning",
+            for_duration_secs: 0,
         },
     ]
 }
