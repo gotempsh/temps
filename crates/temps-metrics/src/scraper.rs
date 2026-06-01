@@ -478,31 +478,33 @@ fn build_connection_string(
             };
             let username = get_str("username");
             let password = get_str("password");
-            let database = get_str("database");
-            let database = if database.is_empty() {
-                "admin".to_string()
-            } else {
-                database
-            };
 
             if username.is_empty() {
-                Ok(format!("mongodb://{}:{}/{}", host, port, database))
+                // No authentication configured — connect without credentials.
+                Ok(format!("mongodb://{}:{}/", host, port))
             } else if password.is_empty() {
                 // MongoDB authentication requires a password when a username is
-                // provided.  A connection string like `mongodb://user:@host/db`
+                // provided.  A connection string like `mongodb://user:@host/`
                 // will silently fail auth on most server versions.
                 Err(format!(
                     "Service {}: MongoDB username '{}' requires a non-empty password",
                     service.id, username
                 ))
             } else {
+                // `authSource=admin` is required because Temps provisions the
+                // service user as a root user in the `admin` database. Without
+                // it the driver derives authSource from the path database
+                // (e.g. `mydatabase`), and SCRAM fails with "Authentication
+                // failed." because the user does not exist there.
+                //
+                // Mirrors the provider's own connection strings in
+                // `temps-providers/src/externalsvc/mongodb.rs` (~/?authSource=admin&directConnection=true).
                 Ok(format!(
-                    "mongodb://{}:{}@{}:{}/{}",
+                    "mongodb://{}:{}@{}:{}/?authSource=admin",
                     urlencoded(&username),
                     urlencoded(&password),
                     host,
                     port,
-                    database
                 ))
             }
         }
