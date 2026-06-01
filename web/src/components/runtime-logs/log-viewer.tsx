@@ -431,14 +431,17 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
     return logs.filter((raw) => selectedLevels.includes(inferLevel(raw)))
   }, [logs, selectedLevels])
 
-  // Fixed 22px row height — matches history-log-viewer.tsx and the container
-  // logs viewer. Single-line cadence: long messages still wrap visually past
-  // the row bottom but the virtualizer assumes one line tall, which keeps the
-  // tail terminal-like and lets us drop the per-row measurement cost.
+  // Dynamic row height. Log lines are often long JSON payloads that wrap to
+  // several visual lines; a fixed 22px row caused wrapped content to overflow
+  // its slot and render on top of the rows below. `measureElement` reports each
+  // row's real height to the virtualizer (estimateSize is just the initial
+  // guess for off-screen rows). The row wrapper sets `ref` + `data-index` so
+  // the virtualizer can measure it.
   const virtualizer = useVirtualizer({
     count: filteredLogs.length,
     getScrollElement: () => parentRef.current,
     estimateSize: () => 22,
+    measureElement: (el) => el.getBoundingClientRect().height,
     overscan: 20,
   })
   // Poll the environments list. `current_deployment_id` on the entry whose
@@ -1662,12 +1665,14 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
                     <div
                       key={virtualRow.key}
                       data-index={virtualRow.index}
+                      ref={virtualizer.measureElement}
                       style={{
                         position: 'absolute',
                         top: `${virtualRow.start}px`,
                         left: 0,
                         width: '100%',
-                        height: `${virtualRow.size}px`,
+                        // No fixed height — the row sizes to its (possibly
+                        // wrapped) content and measureElement reports it back.
                       }}
                       className={cn(isFresh && 'log-fresh-line')}
                     >

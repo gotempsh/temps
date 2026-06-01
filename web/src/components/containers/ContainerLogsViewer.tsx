@@ -537,12 +537,14 @@ export function ContainerLogsViewer({
                     <div
                       key={virtualItem.key}
                       data-index={virtualItem.index}
+                      ref={virtualizer.measureElement}
                       style={{
                         position: 'absolute',
                         top: `${virtualItem.start}px`,
                         left: 0,
                         width: '100%',
-                        height: `${virtualItem.size}px`,
+                        // No fixed height — rows size to their (possibly
+                        // wrapped) content; measureElement reports it back.
                       }}
                     >
                       <LiveLogRow

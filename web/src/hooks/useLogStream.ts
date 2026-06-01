@@ -93,10 +93,10 @@ function parseLine(raw: string): LiveLogLine {
   }
 }
 
-// Fixed row height — matches the history viewer (history-log-viewer.tsx:337).
-// Single-line ASCII rows: overflow becomes a horizontal scroll on the row's
-// message span rather than wrapping into a tall stack. Keeps the cadence
-// terminal-like and the virtualizer fast (no per-row measurement).
+// Initial estimate for an unmeasured row. Actual height is measured per row
+// (see `measureElement` below) because log lines are often long JSON payloads
+// that wrap to several visual lines — a fixed height made wrapped content
+// overflow its slot and render on top of the rows below.
 const ROW_HEIGHT_PX = 22
 
 export function useLogStream({
@@ -151,6 +151,7 @@ export function useLogStream({
     count: filteredLogs.length,
     getScrollElement: () => parentRef.current,
     estimateSize: () => ROW_HEIGHT_PX,
+    measureElement: (el) => el.getBoundingClientRect().height,
     overscan: 20,
   })
 
