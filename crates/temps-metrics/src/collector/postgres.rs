@@ -4,8 +4,9 @@
 //! timeout (configurable via [`CollectorConfig::timeout`]) and runs several
 //! read-only queries:
 //!
-//! 1. `pg_stat_activity` — active/idle connection counts, long-running and
-//!    blocked query counts
+//! 1. `pg_stat_activity` — client-backend connection counts by state
+//!    (active/idle/idle-in-txn/other + total), long-running and blocked query
+//!    counts. Engine background processes are excluded.
 //! 2. `pg_stat_database` — cache-hit ratio, commits, rollbacks, deadlocks,
 //!    temp file usage, tuple DML rates, tuple fetch vs. return ratio
 //! 3. `pg_stat_replication` — per-replica write and replay lag (seconds)
@@ -211,11 +212,21 @@ async fn collect_metrics(
     // 1. pg_stat_activity — connection counts, long-running and blocked queries
     // -------------------------------------------------------------------------
     {
+        // Only count *client* backends. `pg_stat_activity` also lists the
+        // engine's own background processes — walwriter, checkpointer,
+        // bgwriter, autovacuum launcher, archiver, logical-replication
+        // launcher, walsenders, and (PG18+) the async `io worker` pool — all
+        // of which carry a NULL `state`. Including them inflated the count by a
+        // fixed ~8–10 "Connections Other" that look alarming but are just the
+        // server idling, and they don't count against an app's connection
+        // budget. `backend_type = 'client backend'` is the standard filter for
+        // "connections an application actually opened".
         let rows = client
             .query(
                 "SELECT state, count(*)::bigint AS cnt \
                  FROM pg_stat_activity \
                  WHERE pid <> pg_backend_pid() \
+                   AND backend_type = 'client backend' \
                  GROUP BY state",
                 &[],
             )
@@ -227,7 +238,9 @@ async fn collect_metrics(
         let mut other: i64 = 0;
 
         for row in &rows {
-            // `state` can be NULL for walsender / autovacuum processes.
+            // A client backend can still report NULL `state` in a brief window
+            // right after connecting / before its first query; bucket it as
+            // "other" rather than dropping it.
             let state: Option<&str> = row.get(0);
             let cnt: i64 = row.get(1);
             match state {
@@ -259,6 +272,16 @@ async fn collect_metrics(
         points.push(make_point(
             "pg.connections_other",
             other as f64,
+            MetricKind::Gauge,
+            HashMap::new(),
+        ));
+        // Total client connections — the headline number for capacity (compare
+        // against `max_connections`). Far more informative than "active" alone
+        // for an app with a connection pool, which sits at 0 active / N idle
+        // almost all the time.
+        points.push(make_point(
+            "pg.connections_total",
+            (active + idle + idle_in_txn + other) as f64,
             MetricKind::Gauge,
             HashMap::new(),
         ));

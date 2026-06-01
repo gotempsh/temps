@@ -173,6 +173,7 @@ const ENGINE_GROUPS: Record<EngineKind, MetricGroup[]> = {
     {
       title: 'Connections',
       metrics: [
+        'pg.connections_total',
         'pg.connections_active',
         'pg.connections_idle',
         'pg.connections_idle_in_transaction',
@@ -398,7 +399,7 @@ const ALL_METRICS: Record<EngineKind, string[]> = Object.fromEntries(
 // Headline metrics shown in the hero row
 const HERO_METRICS: Record<EngineKind, string[]> = {
   postgres: [
-    'pg.connections_active',
+    'pg.connections_total',
     'pg.cache_hit_ratio',
     'pg.deadlocks_total',
     'pg.database_size_bytes',
@@ -460,6 +461,13 @@ function formatMetricValue(name: string, value: number): string {
 }
 
 const METRIC_LABELS: Record<string, string> = {
+  // Postgres connections — "Total" is the headline (client backends only;
+  // engine background processes are excluded by the collector).
+  'pg.connections_total': 'Connections',
+  'pg.connections_active': 'Active',
+  'pg.connections_idle': 'Idle',
+  'pg.connections_idle_in_transaction': 'Idle in Transaction',
+  'pg.connections_other': 'Other',
   'rustfs_cluster_buckets_total': 'Buckets',
   'rustfs_cluster_objects_total': 'Objects',
   'rustfs_cluster_capacity_usable_total_bytes': 'Usable Capacity',

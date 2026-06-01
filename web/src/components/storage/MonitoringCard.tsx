@@ -269,7 +269,7 @@ type EngineKind = 'postgres' | 'redis' | 'mongodb' | 's3' | 'rustfs'
 
 const ENGINE_STAT_METRICS: Record<EngineKind, string[]> = {
   postgres: [
-    'pg.connections_active',
+    'pg.connections_total',
     'pg.cache_hit_ratio',
     'pg.replication_replay_lag_seconds',
     'pg.deadlocks_total',
@@ -291,7 +291,7 @@ const ENGINE_STAT_METRICS: Record<EngineKind, string[]> = {
 }
 
 const DEFAULT_CHART_METRIC: Record<EngineKind, string> = {
-  postgres: 'pg.connections_active',
+  postgres: 'pg.connections_total',
   redis: 'redis.connected_clients',
   mongodb: 'mongo.connections_current',
   s3: 's3.bucket_count',
@@ -300,6 +300,7 @@ const DEFAULT_CHART_METRIC: Record<EngineKind, string> = {
 
 const KNOWN_METRICS: Record<EngineKind, string[]> = {
   postgres: [
+    'pg.connections_total',
     'pg.connections_active',
     'pg.connections_idle',
     'pg.connections_idle_in_transaction',
