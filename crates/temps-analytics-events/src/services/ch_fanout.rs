@@ -381,8 +381,12 @@ pub enum ChFanoutError {
 /// in `migrations/clickhouse/0001_events.sql` exactly. The `clickhouse`
 /// crate's `Row` derive does positional binary serialization, so this
 /// must stay in lockstep with the DDL.
+///
+/// Exposed at `pub(crate)` so the sibling `ch_backfill` module can reuse it
+/// without duplicating the field list. External callers go through
+/// [`crate::services::ch_backfill::backfill_events_window`] instead.
 #[derive(::clickhouse::Row, serde::Serialize)]
-struct ChEventRow {
+pub(crate) struct ChEventRow {
     event_id: i64,
     project_id: i32,
     environment_id: Option<i32>,
@@ -445,7 +449,7 @@ struct ChEventRow {
 /// is the matching `ip_geolocations` row (looked up by `m.ip_geolocation_id`)
 /// so country/region/city land on the CH row directly — no cross-database
 /// join at query time.
-fn row_to_ch(
+pub(crate) fn row_to_ch(
     m: &temps_entities::events::Model,
     geo: Option<&temps_entities::ip_geolocations::Model>,
 ) -> ChEventRow {
