@@ -8,13 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
--
+- **Database monitoring**: full metrics observability for external services (Postgres, Redis, MongoDB, RustFS/S3). New `temps-metrics` crate scrapes each enabled service every 30s into a TimescaleDB hypertable with hourly/daily continuous aggregates. Per-service monitoring page at `/storage/:id/monitoring` with hero stats, time-series charts (1h/6h/24h/7d), categorized metric groups, and threshold-based alert rules.
+- **RustFS OTLP metrics ingest**: RustFS containers push OTLP metrics to Temps via a service-scoped `si_` API key (new `MetricsIngest` role). Enabling monitoring on an S3/RustFS service auto-provisions the key and restarts the container with the OTLP endpoint configured. New ingest route `POST /api/otel/v1/service/{token}/metrics`.
+- Per-service metrics collectors: PostgreSQL (31 metrics), MongoDB (30), Redis (15), RustFS/S3 (cluster capacity, objects, operations, process stats).
 
 ### Changed
--
+- Cumulative counter metrics (`_total`/`_count`) now display the running total in stat tiles and rate-of-change in charts, computed via a TimescaleDB LAG window query.
+- `service_metrics` raw retention extended from 7 to 30 days.
+- MinIO removed from the S3 service creation UI; RustFS is now the sole default object-storage engine.
 
 ### Fixed
--
+- Metrics scraper releases its per-service in-flight slot via an RAII drop guard, preventing a permanent scrape stall if a collector task panics.
 
 
 ## [0.1.0-beta.25] - 2026-05-31

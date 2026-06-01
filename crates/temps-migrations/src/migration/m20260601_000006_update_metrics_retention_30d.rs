@@ -18,8 +18,8 @@ impl MigrationTrait for Migration {
             r#"
 DO $$
 BEGIN
-    -- Remove existing raw retention policy (drop is idempotent — no error if absent).
-    PERFORM remove_retention_policy('service_metrics', if_not_exists => TRUE);
+    -- Remove existing raw retention policy (drop is idempotent via if_exists).
+    PERFORM remove_retention_policy('service_metrics', if_exists => TRUE);
 
     -- Re-create at 30 days.
     PERFORM add_retention_policy(
@@ -43,7 +43,7 @@ $$;
             r#"
 DO $$
 BEGIN
-    PERFORM remove_retention_policy('service_metrics', if_not_exists => TRUE);
+    PERFORM remove_retention_policy('service_metrics', if_exists => TRUE);
     PERFORM add_retention_policy(
         'service_metrics',
         INTERVAL '7 days',
