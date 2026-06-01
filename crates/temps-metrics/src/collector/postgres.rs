@@ -334,9 +334,15 @@ async fn collect_metrics(
     // 2. pg_stat_database — cache hit ratio, commits, rollbacks, deadlocks,
     //    temp file usage, tuple DML counters, tuple fetch/return ratio.
     //
-    //    Emitted once per database with a `datname` label so the UI can filter
-    //    or aggregate across all databases on the instance.  Internal Postgres
-    //    databases (template0, template1) are excluded.
+    //    Each metric is emitted twice:
+    //      * once per database with a `datname` label (for drill-down), and
+    //      * once UNLABELLED as an instance-wide aggregate.
+    //    The stat tiles read the unlabelled row so they show the whole
+    //    instance, not one arbitrary database (the store's latest-value query
+    //    can only pick one row per metric name). Sums are plain SUM; the two
+    //    ratios are recomputed from summed numerators/denominators so they stay
+    //    mathematically correct (you cannot average per-db ratios).
+    //    Internal Postgres databases (template0, template1) are excluded.
     // -------------------------------------------------------------------------
     {
         let rows = client
@@ -353,6 +359,20 @@ async fn collect_metrics(
             )
             .await?;
 
+        // Instance-wide accumulators for the unlabelled aggregate points.
+        let mut sum_blks_hit: i64 = 0;
+        let mut sum_blks_read: i64 = 0;
+        let mut sum_commit: i64 = 0;
+        let mut sum_rollback: i64 = 0;
+        let mut sum_deadlocks: i64 = 0;
+        let mut sum_temp_files: i64 = 0;
+        let mut sum_temp_bytes: i64 = 0;
+        let mut sum_inserted: i64 = 0;
+        let mut sum_updated: i64 = 0;
+        let mut sum_deleted: i64 = 0;
+        let mut sum_returned: i64 = 0;
+        let mut sum_fetched: i64 = 0;
+
         for row in &rows {
             let datname: &str = row.get(0);
             let blks_hit: i64 = row.get(1);
@@ -367,6 +387,19 @@ async fn collect_metrics(
             let tup_deleted: i64 = row.get(10);
             let tup_returned: i64 = row.get(11);
             let tup_fetched: i64 = row.get(12);
+
+            sum_blks_hit += blks_hit;
+            sum_blks_read += blks_read;
+            sum_commit += xact_commit;
+            sum_rollback += xact_rollback;
+            sum_deadlocks += deadlocks;
+            sum_temp_files += temp_files;
+            sum_temp_bytes += temp_bytes;
+            sum_inserted += tup_inserted;
+            sum_updated += tup_updated;
+            sum_deleted += tup_deleted;
+            sum_returned += tup_returned;
+            sum_fetched += tup_fetched;
 
             let mut db_labels = HashMap::new();
             db_labels.insert("datname".into(), datname.to_owned());
@@ -456,6 +489,81 @@ async fn collect_metrics(
                 db_labels,
             ));
         }
+
+        // Instance-wide aggregates (no `datname` label). The stat tiles read
+        // these so they reflect the whole instance rather than one database.
+        let total_blks = sum_blks_hit + sum_blks_read;
+        let instance_cache_hit_ratio = if total_blks > 0 {
+            sum_blks_hit as f64 / total_blks as f64
+        } else {
+            1.0
+        };
+        let instance_fetch_ratio = if sum_returned > 0 {
+            sum_fetched as f64 / sum_returned as f64
+        } else {
+            1.0
+        };
+
+        points.push(make_point(
+            "pg.cache_hit_ratio",
+            instance_cache_hit_ratio,
+            MetricKind::Gauge,
+            HashMap::new(),
+        ));
+        points.push(make_point(
+            "pg.tuple_fetch_ratio",
+            instance_fetch_ratio,
+            MetricKind::Gauge,
+            HashMap::new(),
+        ));
+        points.push(make_point(
+            "pg.commits_total",
+            sum_commit as f64,
+            MetricKind::Counter,
+            HashMap::new(),
+        ));
+        points.push(make_point(
+            "pg.rollbacks_total",
+            sum_rollback as f64,
+            MetricKind::Counter,
+            HashMap::new(),
+        ));
+        points.push(make_point(
+            "pg.deadlocks_total",
+            sum_deadlocks as f64,
+            MetricKind::Counter,
+            HashMap::new(),
+        ));
+        points.push(make_point(
+            "pg.temp_files_total",
+            sum_temp_files as f64,
+            MetricKind::Counter,
+            HashMap::new(),
+        ));
+        points.push(make_point(
+            "pg.temp_bytes_total",
+            sum_temp_bytes as f64,
+            MetricKind::Counter,
+            HashMap::new(),
+        ));
+        points.push(make_point(
+            "pg.tuples_inserted_total",
+            sum_inserted as f64,
+            MetricKind::Counter,
+            HashMap::new(),
+        ));
+        points.push(make_point(
+            "pg.tuples_updated_total",
+            sum_updated as f64,
+            MetricKind::Counter,
+            HashMap::new(),
+        ));
+        points.push(make_point(
+            "pg.tuples_deleted_total",
+            sum_deleted as f64,
+            MetricKind::Counter,
+            HashMap::new(),
+        ));
     }
 
     // -------------------------------------------------------------------------
@@ -709,7 +817,8 @@ async fn collect_metrics(
 
     // -------------------------------------------------------------------------
     // 8. Database size — bytes consumed by each database on disk.
-    //    Emitted once per database with a `datname` label, same as section 2.
+    //    Emitted once per database with a `datname` label, plus an unlabelled
+    //    instance-wide total (SUM of all databases) for the stat tile.
     //    Useful for capacity planning and detecting unexpected growth spikes.
     // -------------------------------------------------------------------------
     {
@@ -723,9 +832,11 @@ async fn collect_metrics(
             )
             .await?;
 
+        let mut total_size: i64 = 0;
         for row in &rows {
             let datname: &str = row.get(0);
             let size_bytes: i64 = row.get(1);
+            total_size += size_bytes;
             let mut db_labels = HashMap::new();
             db_labels.insert("datname".into(), datname.to_owned());
             points.push(make_point(
@@ -735,6 +846,15 @@ async fn collect_metrics(
                 db_labels,
             ));
         }
+
+        // Instance-wide total (no `datname` label) — the stat tile reads this
+        // so "Database Size" reflects all databases, not one arbitrary one.
+        points.push(make_point(
+            "pg.database_size_bytes",
+            total_size as f64,
+            MetricKind::Gauge,
+            HashMap::new(),
+        ));
     }
 
     Ok(points)

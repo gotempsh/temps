@@ -27,6 +27,38 @@ impl TimescaleMetricsStore {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
         Self { db }
     }
+
+    /// Whether an unlabelled (`labels = '{}'`) series exists for this
+    /// metric+source in the raw table. Used by `query_range` to decide whether
+    /// to scope a chart to the instance-wide aggregate series (preferring it
+    /// over a blend of per-label rows). Returns `false` on any query error so
+    /// the caller falls back to the unfiltered query rather than charting
+    /// nothing. Bounded to the recent window via `LIMIT 1`.
+    async fn has_unlabelled_series(&self, source_kind: &str, source_id: i32, name: &str) -> bool {
+        if validate_metric_name(name).is_err() {
+            return false;
+        }
+        let sql = format!(
+            "SELECT 1 FROM service_metrics \
+             WHERE source_kind = '{sk}' AND source_id = {sid} \
+               AND name = '{nm}' AND labels = '{{}}'::jsonb \
+             LIMIT 1",
+            sk = escape_sql_string(source_kind),
+            sid = source_id,
+            nm = escape_sql_string(name),
+        );
+        match self
+            .db
+            .query_one(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                sql,
+            ))
+            .await
+        {
+            Ok(opt) => opt.is_some(),
+            Err(_) => false,
+        }
+    }
 }
 
 /// Escape a string for safe embedding in a single-quoted SQL literal.
@@ -302,6 +334,26 @@ impl MetricsStore for TimescaleMetricsStore {
         let from_str = filter.from.to_rfc3339_opts(SecondsFormat::Micros, true);
         let to_str = filter.to.to_rfc3339_opts(SecondsFormat::Micros, true);
 
+        // Some metrics are written as multiple label-series per scrape (e.g.
+        // Postgres emits `pg.cache_hit_ratio` / `pg.database_size_bytes` once
+        // per `datname` PLUS one unlabelled instance-wide aggregate). For a
+        // single chart series we want the unlabelled aggregate, never a blend
+        // of every per-db row (AVG across databases is meaningless for a ratio,
+        // and double-counts a size). If an unlabelled series exists for this
+        // metric we scope the query to it; otherwise (per-replica lag,
+        // already-unlabelled metrics) we leave the query unfiltered.
+        //
+        // The hourly/daily continuous aggregates carry `labels` in their GROUP
+        // BY (m20260601_000009), so this same filter is valid on every range.
+        let has_unlabelled = self
+            .has_unlabelled_series(filter.source_kind.as_str(), filter.source_id, &filter.name)
+            .await;
+        let raw_label_filter = if has_unlabelled {
+            " AND labels = '{}'::jsonb"
+        } else {
+            ""
+        };
+
         let sql = if range_duration <= seven_days {
             // Raw table — use time_bucket with the requested step.
             let step_secs = filter.step.num_seconds().max(1);
@@ -335,7 +387,7 @@ impl MetricsStore for TimescaleMetricsStore {
                            AND source_id = {sid} \
                            AND name = '{nm}' \
                            AND time >= '{from}' \
-                           AND time <= '{to}' \
+                           AND time <= '{to}'{label_filter} \
                          GROUP BY time \
                        ) per_scrape \
                        GROUP BY bucket \
@@ -344,6 +396,7 @@ impl MetricsStore for TimescaleMetricsStore {
                     step_secs = step_secs,
                     sk = sk, sid = sid, nm = nm,
                     from = from_str, to = to_str,
+                    label_filter = raw_label_filter,
                 )
             } else {
                 format!(
@@ -353,12 +406,13 @@ impl MetricsStore for TimescaleMetricsStore {
                        AND source_id = {sid} \
                        AND name = '{nm}' \
                        AND time >= '{from}' \
-                       AND time <= '{to}' \
+                       AND time <= '{to}'{label_filter} \
                      GROUP BY bucket \
                      ORDER BY bucket ASC",
                     step_secs = step_secs,
                     sk = sk, sid = sid, nm = nm,
                     from = from_str, to = to_str,
+                    label_filter = raw_label_filter,
                 )
             }
         } else if range_duration <= ninety_days {
@@ -373,13 +427,14 @@ impl MetricsStore for TimescaleMetricsStore {
                    AND source_id = {source_id} \
                    AND name = '{name}' \
                    AND bucket >= '{from}' \
-                   AND bucket <= '{to}' \
+                   AND bucket <= '{to}'{label_filter} \
                  ORDER BY bucket ASC",
                 source_kind = escape_sql_string(filter.source_kind.as_str()),
                 source_id = filter.source_id,
                 name = escape_sql_string(&filter.name),
                 from = from_str,
                 to = to_str,
+                label_filter = raw_label_filter,
             )
         } else {
             // Daily continuous aggregate.
@@ -392,13 +447,14 @@ impl MetricsStore for TimescaleMetricsStore {
                    AND source_id = {source_id} \
                    AND name = '{name}' \
                    AND bucket >= '{from}' \
-                   AND bucket <= '{to}' \
+                   AND bucket <= '{to}'{label_filter} \
                  ORDER BY bucket ASC",
                 source_kind = escape_sql_string(filter.source_kind.as_str()),
                 source_id = filter.source_id,
                 name = escape_sql_string(&filter.name),
                 from = from_str,
                 to = to_str,
+                label_filter = raw_label_filter,
             )
         };
 
@@ -489,13 +545,20 @@ impl MetricsStore for TimescaleMetricsStore {
             format!("AND name = ANY(ARRAY[{}])", names_literal)
         };
 
+        // `DISTINCT ON (name)` keeps one row per metric name. Some metrics are
+        // written as multiple label-series per scrape (e.g. Postgres emits
+        // `pg.database_size_bytes` once per `datname` PLUS one unlabelled
+        // instance-wide aggregate). For the single stat-tile value we always
+        // want the unlabelled aggregate row, never an arbitrary per-label one,
+        // so order labelled-vs-unlabelled first (empty `{}` jsonb wins), then by
+        // recency. Metrics with only one series are unaffected.
         let sql = format!(
             "SELECT DISTINCT ON (name) name, value \
              FROM service_metrics \
              WHERE source_kind = '{source_kind}' \
                AND source_id = {source_id} \
                {name_filter} \
-             ORDER BY name, time DESC",
+             ORDER BY name, (labels = '{{}}'::jsonb) DESC, time DESC",
             source_kind = escape_sql_string(filter.source_kind.as_str()),
             source_id = filter.source_id,
             name_filter = name_filter,

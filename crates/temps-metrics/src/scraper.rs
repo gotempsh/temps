@@ -60,6 +60,14 @@ const COLLECTOR_TIMEOUT_SECS: u64 = 5;
 /// enabled simultaneously.  Choose a value ≤ half the Sea-ORM pool size.
 const MAX_CONCURRENT_COLLECTORS: usize = 20;
 
+/// Last raw counter value per `(source_id, metric_name, labels_key)`, used to
+/// compute scrape-to-scrape deltas. The `labels_key` component (see
+/// [`labels_key`]) keeps distinct label-series for the same metric name
+/// independent — Postgres emits e.g. `pg.commits_total` once per `datname`
+/// plus one unlabelled instance-wide aggregate; without it they would share a
+/// baseline and produce garbage deltas.
+type CounterBaselines = Arc<RwLock<HashMap<(i32, String, String), f64>>>;
+
 /// Background metrics scraper.
 ///
 /// Spawn via [`MetricsScraper::start`].  The struct is cheaply cloneable
@@ -69,9 +77,9 @@ pub struct MetricsScraper {
     store: Arc<dyn MetricsStore>,
     config_service: Arc<ConfigService>,
     encryption_service: Arc<EncryptionService>,
-    /// Last raw counter values keyed by (source_id, metric_name).
-    /// Used to compute deltas between scrapes.
-    last_scalar_values: Arc<RwLock<HashMap<(i32, String), f64>>>,
+    /// Last raw counter values keyed by `(source_id, metric_name, labels_key)`.
+    /// See [`CounterBaselines`].
+    last_scalar_values: CounterBaselines,
     /// Tracks which service IDs currently have an in-flight scrape task.
     /// Prevents concurrent scrapes for the same service (double-delta corruption).
     /// Services currently being scraped. Uses std::sync::Mutex (not tokio) so
@@ -282,7 +290,7 @@ impl MetricsScraper {
         // exist or have metrics disabled.  Avoids unbounded growth with service churn.
         {
             let mut guard = self.last_scalar_values.write().await;
-            guard.retain(|(sid, _), _| active_ids.contains(sid));
+            guard.retain(|(sid, _, _), _| active_ids.contains(sid));
         }
 
         Ok(())
@@ -324,6 +332,26 @@ async fn collect_with_timeout<C: Collector>(
     }
 }
 
+/// Canonical, order-independent key for a point's label set.
+///
+/// `HashMap` iteration order is non-deterministic, so two points with the same
+/// labels could otherwise produce different key strings on different scrapes
+/// and lose their delta baseline. Sorting the pairs makes the key stable. An
+/// empty label set yields `""`, distinguishing instance-wide aggregates from
+/// per-label series of the same metric name.
+fn labels_key(labels: &HashMap<String, String>) -> String {
+    if labels.is_empty() {
+        return String::new();
+    }
+    let mut pairs: Vec<(&String, &String)> = labels.iter().collect();
+    pairs.sort();
+    pairs
+        .into_iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Compute counter deltas and update `last_scalar_values`.
 ///
 /// For [`MetricKind::Counter`] points:
@@ -335,7 +363,7 @@ async fn collect_with_timeout<C: Collector>(
 ///
 /// Gauge points pass through unchanged.
 async fn apply_delta(
-    last_values: &Arc<RwLock<HashMap<(i32, String), f64>>>,
+    last_values: &CounterBaselines,
     source_id: i32,
     raw_points: Vec<MetricPoint>,
 ) -> Vec<MetricPoint> {
@@ -344,7 +372,7 @@ async fn apply_delta(
 
     for mut pt in raw_points {
         if pt.kind == MetricKind::Counter {
-            let key = (source_id, pt.name.clone());
+            let key = (source_id, pt.name.clone(), labels_key(&pt.labels));
             let raw = pt.value;
 
             match guard.get(&key).copied() {
@@ -655,7 +683,9 @@ mod tests {
 
         let guard = last.read().await;
         assert_eq!(
-            *guard.get(&(1, "pg.blks_read_total".to_string())).unwrap(),
+            *guard
+                .get(&(1, "pg.blks_read_total".to_string(), String::new()))
+                .unwrap(),
             1000.0
         );
     }
@@ -766,5 +796,82 @@ mod tests {
         // Second scrape for source 2
         let out2 = apply_delta(&last, 2, vec![make_pt(2, 250.0)]).await;
         assert_eq!(out2[0].value, 50.0, "source 2 delta should be 50");
+    }
+
+    #[tokio::test]
+    async fn apply_delta_keeps_label_series_independent() {
+        // Same metric name, different label sets (two databases + one
+        // unlabelled instance aggregate) must each track their own baseline.
+        // Before the labels-aware key they shared (source_id, name) and
+        // clobbered each other's previous value every scrape.
+        let last = Arc::new(RwLock::new(HashMap::new()));
+
+        let make_pt = |datname: Option<&str>, val: f64| {
+            let mut labels = HashMap::new();
+            if let Some(d) = datname {
+                labels.insert("datname".to_string(), d.to_string());
+            }
+            MetricPoint {
+                time: chrono::Utc::now(),
+                source_kind: SourceKind::Database,
+                source_id: 1,
+                name: "pg.commits_total".into(),
+                value: val,
+                kind: MetricKind::Counter,
+                engine: Some("postgres".into()),
+                environment: None,
+                node_id: None,
+                labels,
+            }
+        };
+
+        // First scrape: baselines for db "app" (100), db "other" (10), and the
+        // unlabelled instance aggregate (110 = 100 + 10).
+        let out = apply_delta(
+            &last,
+            1,
+            vec![
+                make_pt(Some("app"), 100.0),
+                make_pt(Some("other"), 10.0),
+                make_pt(None, 110.0),
+            ],
+        )
+        .await;
+        assert!(out.is_empty(), "first scrape sets baselines, emits nothing");
+
+        // Second scrape: each series advances independently.
+        let out = apply_delta(
+            &last,
+            1,
+            vec![
+                make_pt(Some("app"), 130.0),  // +30
+                make_pt(Some("other"), 12.0), // +2
+                make_pt(None, 142.0),         // +32
+            ],
+        )
+        .await;
+
+        let by_db = |d: &str| {
+            out.iter()
+                .find(|p| p.labels.get("datname").map(String::as_str) == Some(d))
+                .map(|p| p.value)
+        };
+        let instance = out.iter().find(|p| p.labels.is_empty()).map(|p| p.value);
+
+        assert_eq!(by_db("app"), Some(30.0), "app db delta");
+        assert_eq!(by_db("other"), Some(2.0), "other db delta");
+        assert_eq!(instance, Some(32.0), "instance aggregate delta");
+    }
+
+    #[test]
+    fn labels_key_is_order_independent() {
+        let mut a = HashMap::new();
+        a.insert("x".to_string(), "1".to_string());
+        a.insert("y".to_string(), "2".to_string());
+        let mut b = HashMap::new();
+        b.insert("y".to_string(), "2".to_string());
+        b.insert("x".to_string(), "1".to_string());
+        assert_eq!(labels_key(&a), labels_key(&b));
+        assert_eq!(labels_key(&HashMap::new()), "");
     }
 }
