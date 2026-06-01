@@ -148,6 +148,9 @@ pub struct FireAlarmRequest {
     pub environment_id: Option<i32>,
     pub deployment_id: Option<i32>,
     pub container_id: Option<i32>,
+    /// External service that triggered this alarm, for service-scoped
+    /// (database metric) alarms. `None` for container/outage/deployment alarms.
+    pub service_id: Option<i32>,
     pub alarm_type: AlarmType,
     pub severity: AlarmSeverity,
     pub title: String,
@@ -229,6 +232,7 @@ impl AlarmService {
             environment_id: Set(request.environment_id),
             deployment_id: Set(request.deployment_id),
             container_id: Set(request.container_id),
+            service_id: Set(request.service_id),
             alarm_type: Set(request.alarm_type.as_str().to_string()),
             severity: Set(request.severity.as_str().to_string()),
             status: Set(AlarmStatus::Firing.as_str().to_string()),
@@ -661,29 +665,87 @@ impl AlarmService {
             }
         }
 
+        match request.service_id {
+            Some(service_id) => {
+                // Scope the cooldown to this service so a database metric alarm
+                // on (say) Redis does not suppress an identically-typed alarm on
+                // Postgres in the same project. Service-scoped alarms share
+                // alarm_type `database_metric_threshold` and have NULL
+                // deployment/container, so without this every service in a
+                // project would collapse into a single cooldown bucket.
+                query = query.filter(alarms::Column::ServiceId.eq(service_id));
+            }
+            None => {
+                query = query.filter(alarms::Column::ServiceId.is_null());
+            }
+        }
+
         let count = query.count(self.db.as_ref()).await?;
         Ok(count > 0)
     }
 
+    /// Build the human-readable metadata shown in the alarm notification's
+    /// "Details" block.
+    ///
+    /// The notification renderer simply title-cases each metadata key and prints
+    /// the value, so we resolve internal numeric IDs to the names/slugs an
+    /// operator actually recognises (project slug, service name, environment
+    /// slug) and deliberately omit the raw IDs — they are not actionable in an
+    /// email. Each lookup degrades gracefully: if a name can't be resolved we
+    /// skip that row rather than fall back to a bare ID.
+    async fn build_notification_metadata(
+        &self,
+        project_id: i32,
+        service_id: Option<i32>,
+        environment_id: Option<i32>,
+    ) -> HashMap<String, String> {
+        let mut metadata: HashMap<String, String> = HashMap::new();
+
+        // Project → slug (preferred) so the reader sees "my-app", not "4".
+        if let Ok(Some(project)) = temps_entities::projects::Entity::find_by_id(project_id)
+            .one(self.db.as_ref())
+            .await
+        {
+            metadata.insert("project".to_string(), project.slug);
+        }
+
+        // Service → "name (type)" e.g. "cache (redis)" so the operator knows
+        // exactly which database triggered the alarm.
+        if let Some(service_id) = service_id {
+            if let Ok(Some(service)) =
+                temps_entities::external_services::Entity::find_by_id(service_id)
+                    .one(self.db.as_ref())
+                    .await
+            {
+                metadata.insert(
+                    "service".to_string(),
+                    format!("{} ({})", service.name, service.service_type),
+                );
+            }
+        }
+
+        // Environment → slug, only for deployment-scoped alarms that have one.
+        if let Some(env_id) = environment_id {
+            if let Ok(Some(env)) = temps_entities::environments::Entity::find_by_id(env_id)
+                .one(self.db.as_ref())
+                .await
+            {
+                metadata.insert("environment".to_string(), env.slug);
+            }
+        }
+
+        metadata
+    }
+
     /// Send notification for a fired alarm (failure is logged, not propagated)
     async fn send_alarm_notification(&self, request: &FireAlarmRequest, alarm_id: i32) {
-        let mut metadata: HashMap<String, String> = [
-            ("alarm_id".to_string(), alarm_id.to_string()),
-            (
-                "alarm_type".to_string(),
-                request.alarm_type.as_str().to_string(),
-            ),
-            ("project_id".to_string(), request.project_id.to_string()),
-        ]
-        .into_iter()
-        .collect();
-
-        if let Some(env_id) = request.environment_id {
-            metadata.insert("environment_id".to_string(), env_id.to_string());
-        }
-        if let Some(dep_id) = request.deployment_id {
-            metadata.insert("deployment_id".to_string(), dep_id.to_string());
-        }
+        let metadata = self
+            .build_notification_metadata(
+                request.project_id,
+                request.service_id,
+                request.environment_id,
+            )
+            .await;
 
         let notification = NotificationData {
             id: uuid::Uuid::new_v4().to_string(),
@@ -711,25 +773,23 @@ impl AlarmService {
 
     /// Send recovery notification when an alarm resolves (failure is logged, not propagated)
     async fn send_resolved_notification(&self, alarm: &alarms::Model) {
+        let mut metadata = self
+            .build_notification_metadata(alarm.project_id, alarm.service_id, alarm.environment_id)
+            .await;
+        metadata.insert("status".to_string(), "resolved".to_string());
+
         let notification = NotificationData {
             id: uuid::Uuid::new_v4().to_string(),
             title: format!("Resolved: {}", alarm.title),
             message: format!(
-                "Alarm '{}' has been resolved.\nType: {}\nOriginal severity: {}",
-                alarm.title, alarm.alarm_type, alarm.severity
+                "Alarm '{}' has been resolved.\nOriginal severity: {}",
+                alarm.title, alarm.severity
             ),
             notification_type: NotificationType::Info,
             priority: NotificationPriority::Normal,
             severity: None,
             timestamp: Utc::now(),
-            metadata: [
-                ("alarm_id".to_string(), alarm.id.to_string()),
-                ("alarm_type".to_string(), alarm.alarm_type.clone()),
-                ("project_id".to_string(), alarm.project_id.to_string()),
-                ("status".to_string(), "resolved".to_string()),
-            ]
-            .into_iter()
-            .collect(),
+            metadata,
             bypass_throttling: false,
         };
 
@@ -775,23 +835,36 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use temps_core::jobs::QueueError;
     use temps_core::notifications::{EmailMessage, NotificationError};
+    use temps_entities::external_services;
 
     // ── Test helpers ──────────────────────────────────────────────────
 
-    /// Tracks how many notifications were sent
+    /// Tracks how many notifications were sent and retains the most recent one
+    /// so tests can assert on the rendered metadata (project slug, service name).
     struct TrackingNotificationService {
         send_count: AtomicU32,
+        last_notification: std::sync::Mutex<Option<NotificationData>>,
     }
 
     impl TrackingNotificationService {
         fn new() -> Self {
             Self {
                 send_count: AtomicU32::new(0),
+                last_notification: std::sync::Mutex::new(None),
             }
         }
 
         fn send_count(&self) -> u32 {
             self.send_count.load(Ordering::SeqCst)
+        }
+
+        fn last_metadata(&self) -> HashMap<String, String> {
+            self.last_notification
+                .lock()
+                .expect("notification mutex poisoned")
+                .as_ref()
+                .map(|n| n.metadata.clone())
+                .unwrap_or_default()
         }
     }
 
@@ -799,9 +872,13 @@ mod tests {
     impl NotificationService for TrackingNotificationService {
         async fn send_notification(
             &self,
-            _notification: NotificationData,
+            notification: NotificationData,
         ) -> Result<(), NotificationError> {
             self.send_count.fetch_add(1, Ordering::SeqCst);
+            *self
+                .last_notification
+                .lock()
+                .expect("notification mutex poisoned") = Some(notification);
             Ok(())
         }
         async fn send_email(&self, _message: EmailMessage) -> Result<(), NotificationError> {
@@ -847,6 +924,7 @@ mod tests {
             environment_id: Some(1),
             deployment_id: Some(10),
             container_id: Some(100),
+            service_id: None,
             alarm_type: alarm_type.to_string(),
             severity: severity.to_string(),
             status: status.to_string(),
@@ -868,6 +946,7 @@ mod tests {
             environment_id: Some(1),
             deployment_id: Some(10),
             container_id: Some(100),
+            service_id: None,
             alarm_type: AlarmType::ContainerRestart,
             severity: AlarmSeverity::Warning,
             title: "Container restarted".to_string(),
@@ -1062,6 +1141,104 @@ mod tests {
         // No notification or job sent when suppressed
         assert_eq!(notification_service.send_count(), 0);
         assert_eq!(job_queue.send_count(), 0);
+    }
+
+    /// Minimal `external_services` row for notification-metadata resolution.
+    fn sample_service(id: i32, name: &str, service_type: &str) -> external_services::Model {
+        external_services::Model {
+            id,
+            name: name.to_string(),
+            service_type: service_type.to_string(),
+            version: None,
+            status: "running".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            slug: Some(name.to_string()),
+            config: None,
+            node_id: None,
+            topology: "standalone".to_string(),
+            error_message: None,
+            health_status: None,
+            last_health_check_at: None,
+            last_health_error: None,
+            consecutive_health_failures: 0,
+            health_metadata: None,
+            metrics_enabled: true,
+        }
+    }
+
+    /// A database-metric (service-scoped) fire request: no environment or
+    /// deployment, but a `service_id`. Mirrors what `AlertEvaluator` builds for
+    /// a Redis/Postgres threshold rule.
+    fn service_scoped_fire_request(service_id: i32) -> FireAlarmRequest {
+        FireAlarmRequest {
+            project_id: 4,
+            environment_id: None,
+            deployment_id: None,
+            container_id: None,
+            service_id: Some(service_id),
+            alarm_type: AlarmType::DatabaseMetricThreshold,
+            severity: AlarmSeverity::Warning,
+            title: "Metric threshold breached: High memory fragmentation ratio".to_string(),
+            message: "redis.memory_fragmentation_ratio is 7.600 (threshold: > 1.500)".to_string(),
+            metadata: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_service_alarm_notification_uses_names_not_ids() {
+        // The alarm row inserted on fire — service-scoped, so no env/deployment.
+        let mut alarm = sample_alarm(1, "database_metric_threshold", "warning", "firing");
+        alarm.environment_id = None;
+        alarm.deployment_id = None;
+        alarm.container_id = None;
+        alarm.service_id = Some(7);
+
+        // Query order for a service-scoped fire_alarm:
+        //   1. cooldown count (0) → not suppressed
+        //   2. insert alarm
+        //   3. project lookup (build_notification_metadata) — empty: graceful skip
+        //   4. service lookup → returns the redis service
+        // (no environment lookup: environment_id is None)
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[maplit::btreemap! {
+                "num_items" => sea_orm::Value::BigInt(Some(0)),
+            }]])
+            .append_query_results(vec![vec![alarm]])
+            .append_query_results(vec![Vec::<temps_entities::projects::Model>::new()])
+            .append_query_results(vec![vec![sample_service(7, "cache", "redis")]])
+            .into_connection();
+
+        let notification_service = Arc::new(TrackingNotificationService::new());
+        let job_queue = Arc::new(TrackingJobQueue::new());
+
+        let service = AlarmService::new(
+            Arc::new(db),
+            notification_service.clone(),
+            job_queue.clone(),
+        );
+
+        let result = service.fire_alarm(service_scoped_fire_request(7)).await;
+        assert_eq!(result.unwrap(), Some(1));
+        assert_eq!(notification_service.send_count(), 1);
+
+        let metadata = notification_service.last_metadata();
+
+        // The service is resolved to a human-readable "name (type)" so the
+        // operator sees WHICH database breached, not just a project number.
+        assert_eq!(
+            metadata.get("service").map(String::as_str),
+            Some("cache (redis)"),
+            "notification should name the service: {metadata:?}"
+        );
+
+        // Raw numeric IDs must NOT leak into the email DETAILS block.
+        for forbidden in ["project_id", "service_id", "alarm_id", "deployment_id"] {
+            assert!(
+                !metadata.contains_key(forbidden),
+                "metadata must not contain raw id key '{forbidden}': {metadata:?}"
+            );
+        }
     }
 
     // ── AlarmService.resolve_alarm tests ──────────────────────────────

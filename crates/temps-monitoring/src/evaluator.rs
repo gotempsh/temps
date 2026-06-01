@@ -84,13 +84,15 @@ pub struct AlertEvaluator {
     firing_alarms: Arc<RwLock<HashMap<i32, i32>>>,
 }
 
-/// Cached alarm context `(project_id, environment_id, deployment_id)` for a rule.
+/// Cached alarm context `(project_id, environment_id, deployment_id, service_id)`
+/// for a rule.
 ///
-/// Deployment-scoped rules carry real environment + deployment IDs.
-/// Service-scoped (database) rules have neither — those fields are `None` and
-/// the resulting alarm row will store NULL for both, matching the nullable FK
-/// shape on `alarms.environment_id` and `alarms.deployment_id`.
-type AlarmContext = (i32, Option<i32>, Option<i32>);
+/// Deployment-scoped rules carry real environment + deployment IDs and no
+/// service. Service-scoped (database) rules carry only `service_id`; their
+/// environment and deployment are `None` and the alarm row stores NULL for
+/// both, matching the nullable FK shape on `alarms.environment_id`,
+/// `alarms.deployment_id`, and `alarms.service_id`.
+type AlarmContext = (i32, Option<i32>, Option<i32>, Option<i32>);
 
 impl AlertEvaluator {
     /// Create a new evaluator.
@@ -371,7 +373,7 @@ impl AlertEvaluator {
                 let ctx = context_cache
                     .get(&rule.id)
                     .copied()
-                    .unwrap_or((0, None, None));
+                    .unwrap_or((0, None, None, None));
                 if let Err(e) = self.evaluate_rule(rule, &latest, ctx).await {
                     warn!(
                         rule_id = rule.id,
@@ -480,19 +482,21 @@ impl AlertEvaluator {
             _ => AlarmSeverity::Warning,
         };
 
-        let (project_id, environment_id, deployment_id) = ctx;
+        let (project_id, environment_id, deployment_id, service_id) = ctx;
 
         let request = FireAlarmRequest {
             project_id,
             environment_id,
             deployment_id,
             container_id: None,
+            service_id,
             alarm_type,
             severity,
             title: format!("Metric threshold breached: {}", rule.name),
             message,
             metadata: Some(serde_json::json!({
                 "rule_id": rule_id,
+                "rule_name": rule.name,
                 "metric_name": rule.metric_name,
                 "value": value,
                 "threshold": rule.threshold,
@@ -533,7 +537,7 @@ impl AlertEvaluator {
         };
 
         if let Some(alarm_id) = alarm_id {
-            let (project_id, _, _) = ctx;
+            let (project_id, _, _, _) = ctx;
 
             match self.alarm_service.resolve_alarm(alarm_id, project_id).await {
                 Ok(()) => {
@@ -595,7 +599,8 @@ impl AlertEvaluator {
                 .one(self.db.as_ref())
                 .await
             {
-                return (dep.project_id, Some(dep.environment_id), Some(dep_id));
+                // Deployment-scoped rules have no associated service.
+                return (dep.project_id, Some(dep.environment_id), Some(dep_id), None);
             }
         }
 
@@ -607,14 +612,16 @@ impl AlertEvaluator {
                 .await
             {
                 // Service-scoped (database) rules have no environment or
-                // deployment context — store NULL so the FK constraints hold.
-                return (ps.project_id, None, None);
+                // deployment context — store NULL for those so the FK
+                // constraints hold — but DO carry the service_id so the alarm
+                // (and its notification) records which service breached.
+                return (ps.project_id, None, None, Some(svc_id));
             }
         }
 
         // Fallback — no context found. project_id=0 keeps existing behaviour
-        // for unsuppressed errors elsewhere; env/deployment stay None.
-        (0, None, None)
+        // for unsuppressed errors elsewhere; env/deployment/service stay None.
+        (0, None, None, None)
     }
 }
 
@@ -664,6 +671,11 @@ pub use temps_metrics::MetricsError;
 ///   client count and keyspace hit ratio.
 /// - `"mongodb"` — 6 default rules covering connections, queued operations,
 ///   WiredTiger cache pressure, replication buffer pressure, and asserts.
+/// - `"rustfs"` — 3 default rules covering offline nodes and free-capacity
+///   pressure, tied to the Prometheus metrics emitted by RustFS / MinIO.
+/// - `"s3"` — no defaults: the AWS S3 collector only emits `s3.bucket_count`,
+///   which is informational, not actionable. Self-hosted deployments use the
+///   `"rustfs"` service_type and get real alerts via the Prometheus scrape.
 /// - Anything else — no rules inserted.
 pub async fn seed_default_rules(
     db: &DatabaseConnection,
@@ -674,6 +686,7 @@ pub async fn seed_default_rules(
         "postgres" => postgres_default_seeds(),
         "redis" => redis_default_seeds(),
         "mongodb" => mongodb_default_seeds(),
+        "rustfs" => rustfs_default_seeds(),
         _ => {
             debug!(
                 service_id,
@@ -984,6 +997,46 @@ fn mongodb_default_seeds() -> Vec<RuleSeed> {
     ]
 }
 
+fn rustfs_default_seeds() -> Vec<RuleSeed> {
+    // Metric names mirror what the S3/Prometheus collector maps from RustFS /
+    // MinIO (see `RUSTFS_METRICS` in `temps_metrics::collector::prometheus`).
+    //
+    // Two raw thresholds we can trust:
+    //   - `s3.nodes_offline` > 0 — any offline node degrades availability
+    //   - `s3.capacity_usable_free_bytes` — absolute byte thresholds are the
+    //     only safe option; the collector does not emit a free/used ratio.
+    //     The thresholds below assume a small-to-medium deployment. Users on
+    //     larger clusters should tune these per-rule via the UI.
+    vec![
+        RuleSeed {
+            name: "Storage nodes offline",
+            metric_name: "s3.nodes_offline",
+            threshold: 0.0,
+            comparator: ">",
+            severity: "critical",
+            for_duration_secs: 60,
+        },
+        RuleSeed {
+            name: "Low free capacity (warning)",
+            // 10 GiB free
+            metric_name: "s3.capacity_usable_free_bytes",
+            threshold: 10.0 * 1024.0 * 1024.0 * 1024.0,
+            comparator: "<",
+            severity: "warning",
+            for_duration_secs: 300,
+        },
+        RuleSeed {
+            name: "Low free capacity (critical)",
+            // 2 GiB free
+            metric_name: "s3.capacity_usable_free_bytes",
+            threshold: 2.0 * 1024.0 * 1024.0 * 1024.0,
+            comparator: "<",
+            severity: "critical",
+            for_duration_secs: 60,
+        },
+    ]
+}
+
 fn container_default_seeds() -> Vec<RuleSeed> {
     vec![
         RuleSeed {
@@ -1212,5 +1265,143 @@ mod tests {
             .collect();
         assert!(names.contains(&"container.cpu_percent".to_string()));
         assert!(names.contains(&"container.memory_percent".to_string()));
+    }
+
+    // ── resolve_alarm_context() ─────────────────────────────────────────────────
+
+    use async_trait::async_trait;
+    use chrono::{DateTime, Utc};
+    use sea_orm::{DatabaseBackend, MockDatabase};
+    use temps_core::notifications::{
+        EmailMessage, NotificationData, NotificationError, NotificationService,
+    };
+    use temps_metrics::{MetricPoint, MetricsError, RangeQuery};
+
+    /// No-op metrics store — `resolve_alarm_context` never touches it.
+    struct NoopStore;
+
+    #[async_trait]
+    impl MetricsStore for NoopStore {
+        async fn write_batch(&self, _points: Vec<MetricPoint>) -> Result<(), MetricsError> {
+            Ok(())
+        }
+        async fn query_range(
+            &self,
+            _filter: RangeQuery,
+        ) -> Result<Vec<(DateTime<Utc>, f64)>, MetricsError> {
+            Ok(Vec::new())
+        }
+        async fn query_latest(
+            &self,
+            _filter: LatestQuery,
+        ) -> Result<HashMap<String, f64>, MetricsError> {
+            Ok(HashMap::new())
+        }
+        async fn latest_timestamp(
+            &self,
+            _source_kind: SourceKind,
+            _source_id: i32,
+        ) -> Result<Option<DateTime<Utc>>, MetricsError> {
+            Ok(None)
+        }
+        async fn prune(&self, _older_than: DateTime<Utc>) -> Result<u64, MetricsError> {
+            Ok(0)
+        }
+    }
+
+    struct NoopNotifications;
+
+    #[async_trait]
+    impl NotificationService for NoopNotifications {
+        async fn send_notification(&self, _n: NotificationData) -> Result<(), NotificationError> {
+            Ok(())
+        }
+        async fn send_email(&self, _m: EmailMessage) -> Result<(), NotificationError> {
+            Ok(())
+        }
+        async fn is_configured(&self) -> Result<bool, NotificationError> {
+            Ok(false)
+        }
+    }
+
+    struct NoopQueue;
+
+    #[async_trait]
+    impl temps_core::JobQueue for NoopQueue {
+        async fn send(&self, _job: temps_core::Job) -> Result<(), temps_core::jobs::QueueError> {
+            Ok(())
+        }
+        fn subscribe(&self) -> Box<dyn temps_core::JobReceiver> {
+            unimplemented!("not needed in tests")
+        }
+    }
+
+    fn evaluator_with_db(db: DatabaseConnection) -> AlertEvaluator {
+        let db = Arc::new(db);
+        let alarm_service = Arc::new(AlarmService::new(
+            db.clone(),
+            Arc::new(NoopNotifications),
+            Arc::new(NoopQueue),
+        ));
+        AlertEvaluator::new(db, Arc::new(NoopStore), alarm_service)
+    }
+
+    /// A service-scoped rule must resolve its `service_id` into the alarm
+    /// context. This is the exact bug that lost service identity: previously the
+    /// project lookup discarded the `service_id`, so the alarm (and its email)
+    /// could only show "Project N" with no indication of which service breached.
+    #[tokio::test]
+    async fn resolve_alarm_context_carries_service_id_for_service_rule() {
+        let rule = make_rule(Some(7), None);
+
+        // Service-scoped rules look up `project_services` by service_id.
+        let ps = temps_entities::project_services::Model {
+            id: 1,
+            project_id: 4,
+            service_id: 7,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![ps]])
+            .into_connection();
+
+        let evaluator = evaluator_with_db(db);
+        let (project_id, environment_id, deployment_id, service_id) =
+            evaluator.resolve_alarm_context(&rule).await;
+
+        assert_eq!(project_id, 4);
+        assert_eq!(environment_id, None);
+        assert_eq!(deployment_id, None);
+        assert_eq!(
+            service_id,
+            Some(7),
+            "service-scoped rule must carry the service_id into the alarm context"
+        );
+    }
+
+    /// A service-scoped rule whose service has no owning project falls back to
+    /// the sentinel context but still preserves the service_id so the alarm can
+    /// at least name the service.
+    #[tokio::test]
+    async fn resolve_alarm_context_service_rule_without_project_keeps_service_id() {
+        let rule = make_rule(Some(9), None);
+
+        // project_services lookup returns nothing.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<temps_entities::project_services::Model>::new()])
+            .into_connection();
+
+        let evaluator = evaluator_with_db(db);
+        let (project_id, environment_id, deployment_id, service_id) =
+            evaluator.resolve_alarm_context(&rule).await;
+
+        // Falls through to the sentinel — no project mapping found.
+        assert_eq!(project_id, 0);
+        assert_eq!(environment_id, None);
+        assert_eq!(deployment_id, None);
+        // service_id is None here because the fallback path can't attribute it
+        // to a project; the alarm is still stored under the sentinel project.
+        assert_eq!(service_id, None);
     }
 }

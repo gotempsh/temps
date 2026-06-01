@@ -279,8 +279,14 @@ async fn collect_metrics(
         // against `max_connections`). Far more informative than "active" alone
         // for an app with a connection pool, which sits at 0 active / N idle
         // almost all the time.
+        //
+        // Named `pg.connections` (NOT `_total`): this is a point-in-time GAUGE
+        // of the current connection count, not a cumulative counter. The query
+        // layer treats a `_total`/`_count` suffix as a monotonic counter and
+        // charts its rate-of-change via LAG — which would flatten a steady
+        // gauge of N to 0.
         points.push(make_point(
-            "pg.connections_total",
+            "pg.connections",
             (active + idle + idle_in_txn + other) as f64,
             MetricKind::Gauge,
             HashMap::new(),

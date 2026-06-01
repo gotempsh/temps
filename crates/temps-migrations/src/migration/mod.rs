@@ -113,6 +113,7 @@ mod m20260601_000006_update_metrics_retention_30d;
 mod m20260601_000007_create_service_metrics_status;
 mod m20260601_000008_alarms_nullable_env_deployment;
 mod m20260601_000009_metrics_caggs_keep_labels;
+mod m20260601_000010_add_service_id_to_alarms;
 
 pub struct Migrator;
 
@@ -229,6 +230,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260601_000007_create_service_metrics_status::Migration),
             Box::new(m20260601_000008_alarms_nullable_env_deployment::Migration),
             Box::new(m20260601_000009_metrics_caggs_keep_labels::Migration),
+            Box::new(m20260601_000010_add_service_id_to_alarms::Migration),
         ]
     }
 }

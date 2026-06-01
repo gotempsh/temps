@@ -410,6 +410,7 @@ impl OutageDetectionService {
             environment_id: Some(environment_id),
             deployment_id: Some(deployment_id),
             container_id: None,
+            service_id: None,
             alarm_type: AlarmType::Outage,
             severity,
             title: format!(
@@ -1132,6 +1133,7 @@ mod tests {
             environment_id: Some(1),
             deployment_id: Some(10),
             container_id: None,
+            service_id: None,
             alarm_type: alarm_type.to_string(),
             severity: "critical".to_string(),
             status: status.to_string(),
