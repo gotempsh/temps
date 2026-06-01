@@ -700,6 +700,15 @@ export type AppSettings = {
      * internet must keep this `false` — otherwise a MitM steals the join token.
      */
     insecure_tls?: boolean;
+    /**
+     * URL that service containers use to reach the Temps API from *inside*
+     * the Docker network (OTLP metrics ingest, agent callbacks, etc.). On
+     * Docker Desktop this defaults to `http://host.docker.internal:<console_port>`;
+     * on Linux it requires the `host.docker.internal:host-gateway` host
+     * mapping (which Temps adds to provisioned containers). Distinct from
+     * `external_url`, which is the public-facing address.
+     */
+    internal_url?: string | null;
     letsencrypt?: LetsEncryptSettings;
     /**
      * Metrics observability settings. Controls the MetricsStore backend,
@@ -726,6 +735,7 @@ export type AppSettingsResponse = {
     docker_registry: DockerRegistrySettingsMasked;
     external_url?: string | null;
     insecure_tls: boolean;
+    internal_url?: string | null;
     letsencrypt: LetsEncryptSettings;
     multi_node: MultiNodeSettingsMasked;
     preview_domain: string;
@@ -7637,6 +7647,16 @@ export type MetricsRangeQuery = {
 export type MetricsResponse = {
     count: number;
     data: Array<MetricBucket>;
+};
+
+/**
+ * Freshness status: when metrics were last received for this service.
+ */
+export type MetricsStatusResponse = {
+    /**
+     * ISO 8601 timestamp of the most recent metric row, or null if none yet.
+     */
+    last_received_at?: string | null;
 };
 
 /**
@@ -23207,6 +23227,34 @@ export type ExternalServiceMetricsGetLatestResponses = {
 };
 
 export type ExternalServiceMetricsGetLatestResponse = ExternalServiceMetricsGetLatestResponses[keyof ExternalServiceMetricsGetLatestResponses];
+
+export type ExternalServiceMetricsStatusData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/metrics/status';
+};
+
+export type ExternalServiceMetricsStatusErrors = {
+    /**
+     * Metrics not available
+     */
+    503: unknown;
+};
+
+export type ExternalServiceMetricsStatusResponses = {
+    /**
+     * Metrics freshness status
+     */
+    200: MetricsStatusResponse;
+};
+
+export type ExternalServiceMetricsStatusResponse = ExternalServiceMetricsStatusResponses[keyof ExternalServiceMetricsStatusResponses];
 
 export type GetServicePreviewEnvironmentVariablesMaskedData = {
     body?: never;

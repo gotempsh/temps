@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 
 use crate::error::MetricsError;
-use crate::store::{LatestQuery, MetricPoint, MetricsStore, RangeQuery};
+use crate::store::{LatestQuery, MetricPoint, MetricsStore, RangeQuery, SourceKind};
 
 /// Stub ClickHouse metrics store. Not yet implemented.
 ///
@@ -41,6 +41,14 @@ impl MetricsStore for ClickhouseMetricsStore {
         &self,
         _filter: LatestQuery,
     ) -> Result<HashMap<String, f64>, MetricsError> {
+        Err(MetricsError::NotImplemented)
+    }
+
+    async fn latest_timestamp(
+        &self,
+        _source_kind: SourceKind,
+        _source_id: i32,
+    ) -> Result<Option<DateTime<Utc>>, MetricsError> {
         Err(MetricsError::NotImplemented)
     }
 

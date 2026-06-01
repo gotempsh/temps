@@ -9,6 +9,13 @@ use utoipa::ToSchema;
 pub struct AppSettings {
     // Core settings
     pub external_url: Option<String>,
+    /// URL that service containers use to reach the Temps API from *inside*
+    /// the Docker network (OTLP metrics ingest, agent callbacks, etc.). On
+    /// Docker Desktop this defaults to `http://host.docker.internal:<console_port>`;
+    /// on Linux it requires the `host.docker.internal:host-gateway` host
+    /// mapping (which Temps adds to provisioned containers). Distinct from
+    /// `external_url`, which is the public-facing address.
+    pub internal_url: Option<String>,
     pub preview_domain: String,
 
     // Screenshot settings
@@ -505,6 +512,7 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             external_url: None,
+            internal_url: None,
             preview_domain: DEFAULT_LOCAL_DOMAIN.to_string(),
             screenshots: ScreenshotSettings::default(),
             letsencrypt: LetsEncryptSettings::default(),
@@ -678,5 +686,27 @@ impl AppSettings {
     /// Convert settings to JSON value
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}))
+    }
+
+    /// Resolve the URL that service containers use to reach the Temps API from
+    /// inside the Docker network. Resolution order:
+    ///   1. `internal_url` settings field (admin-editable, runtime)
+    ///   2. `TEMPS_INTERNAL_API_URL` env var (operator override at startup)
+    ///   3. `http://host.docker.internal:{console_port}` default
+    ///
+    /// The returned value has no trailing slash. `console_port` is the port the
+    /// API/console listener binds to (callers pass it from `ServerConfig`).
+    pub fn resolve_internal_url(&self, console_port: u16) -> String {
+        let raw = self
+            .internal_url
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                std::env::var("TEMPS_INTERNAL_API_URL")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+            })
+            .unwrap_or_else(|| format!("http://host.docker.internal:{console_port}"));
+        raw.trim_end_matches('/').to_string()
     }
 }

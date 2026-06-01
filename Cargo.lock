@@ -12219,6 +12219,7 @@ dependencies = [
  "tar",
  "tempfile",
  "temps-auth",
+ "temps-config",
  "temps-core",
  "temps-database",
  "temps-dns",

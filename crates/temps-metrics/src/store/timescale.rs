@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tracing::warn;
 
 use crate::error::MetricsError;
-use crate::store::{LatestQuery, MetricKind, MetricPoint, MetricsStore, RangeQuery};
+use crate::store::{LatestQuery, MetricKind, MetricPoint, MetricsStore, RangeQuery, SourceKind};
 
 /// Maximum rows per INSERT statement. Larger batches produce multi-MB query
 /// strings that stress PostgreSQL's parser and cause all-or-nothing failures.
@@ -206,6 +206,53 @@ impl MetricsStore for TimescaleMetricsStore {
                 ))
                 .await
                 .map_err(MetricsError::DatabaseError)?;
+        }
+
+        // Maintain the per-source "last received" status row so the UI can show
+        // a freshness timestamp with an O(1) lookup instead of MAX(time) over
+        // the hypertable. One upsert per distinct source in this batch.
+        let mut latest_by_source: HashMap<(String, i32), DateTime<Utc>> = HashMap::new();
+        for p in &points {
+            let key = (p.source_kind.as_str().to_string(), p.source_id);
+            latest_by_source
+                .entry(key)
+                .and_modify(|t| {
+                    if p.time > *t {
+                        *t = p.time;
+                    }
+                })
+                .or_insert(p.time);
+        }
+        if !latest_by_source.is_empty() {
+            let values: Vec<String> = latest_by_source
+                .iter()
+                .map(|((sk, sid), t)| {
+                    format!(
+                        "('{}', {}, '{}')",
+                        escape_sql_string(sk),
+                        sid,
+                        t.to_rfc3339_opts(SecondsFormat::Micros, true)
+                    )
+                })
+                .collect();
+            let status_sql = format!(
+                "INSERT INTO service_metrics_status (source_kind, source_id, last_received_at) \
+                 VALUES {} \
+                 ON CONFLICT (source_kind, source_id) DO UPDATE \
+                 SET last_received_at = GREATEST(service_metrics_status.last_received_at, EXCLUDED.last_received_at)",
+                values.join(", ")
+            );
+            // Non-fatal — a failure here must not lose the already-written metrics.
+            if let Err(e) = self
+                .db
+                .execute(Statement::from_string(
+                    sea_orm::DatabaseBackend::Postgres,
+                    status_sql,
+                ))
+                .await
+            {
+                warn!(error = %e, "Failed to update service_metrics_status (non-fatal)");
+            }
         }
 
         Ok(())
@@ -475,6 +522,39 @@ impl MetricsStore for TimescaleMetricsStore {
         }
 
         Ok(result)
+    }
+
+    async fn latest_timestamp(
+        &self,
+        source_kind: SourceKind,
+        source_id: i32,
+    ) -> Result<Option<DateTime<Utc>>, MetricsError> {
+        // O(1) primary-key lookup on the small status table — no hypertable
+        // scan. The row is upserted on every write_batch.
+        let sql = format!(
+            "SELECT last_received_at \
+             FROM service_metrics_status \
+             WHERE source_kind = '{source_kind}' AND source_id = {source_id}",
+            source_kind = escape_sql_string(source_kind.as_str()),
+            source_id = source_id,
+        );
+
+        let row = self
+            .db
+            .query_one(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                sql,
+            ))
+            .await
+            .map_err(MetricsError::DatabaseError)?;
+
+        match row {
+            Some(r) => Ok(Some(
+                r.try_get::<DateTime<Utc>>("", "last_received_at")
+                    .map_err(MetricsError::DatabaseError)?,
+            )),
+            None => Ok(None),
+        }
     }
 
     /// Drops raw metric chunks older than `older_than` using TimescaleDB's

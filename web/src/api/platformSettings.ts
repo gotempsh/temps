@@ -119,6 +119,7 @@ export interface MonitoringSettings {
 export interface PlatformSettings extends AppSettings {
   dns_provider: DnsProviderSettings
   external_url: string | null
+  internal_url: string | null
   letsencrypt: LetsEncryptSettings
   preview_domain: string
   screenshots: ScreenshotSettings
@@ -177,6 +178,7 @@ export async function updatePlatformSettings(
   const body: any = {
     dns_provider: updated.dns_provider,
     external_url: updated.external_url,
+    internal_url: updated.internal_url,
     letsencrypt: updated.letsencrypt,
     preview_domain: updated.preview_domain,
     screenshots: updated.screenshots,

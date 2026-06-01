@@ -383,6 +383,63 @@ async fn get_service_metrics_latest(
     Ok((StatusCode::OK, Json(values)))
 }
 
+/// Freshness status: when metrics were last received for this service.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MetricsStatusResponse {
+    /// ISO 8601 timestamp of the most recent metric row, or null if none yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_received_at: Option<String>,
+}
+
+/// Return the freshness status (last-received timestamp) for a service.
+///
+/// Cheap O(1) lookup against `service_metrics_status` — used by the UI to show
+/// "last received at …" without scanning the metrics hypertable.
+#[utoipa::path(
+    get,
+    path = "/external-services/{id}/metrics/status",
+    operation_id = "ExternalServiceMetricsStatus",
+    tag = "Metrics",
+    params(("id" = i32, Path, description = "External service ID")),
+    responses(
+        (status = 200, description = "Metrics freshness status", body = MetricsStatusResponse),
+        (status = 503, description = "Metrics not available"),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_service_metrics_status(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ExternalServicesRead);
+    assert_service_owned_by_caller(id, &auth, &state).await?;
+
+    let store = state.metrics_store.as_ref().ok_or_else(|| {
+        ErrorBuilder::new(StatusCode::SERVICE_UNAVAILABLE)
+            .title("Metrics Unavailable")
+            .detail("Metric collection is not enabled on this server")
+            .build()
+    })?;
+
+    let last = store
+        .latest_timestamp(SourceKind::Database, id)
+        .await
+        .map_err(|e| {
+            error!(service_id = id, error = %e, "Failed to query metrics status");
+            internal_server_error()
+                .detail(format!("Failed to query metrics status: {}", e))
+                .build()
+        })?;
+
+    Ok((
+        StatusCode::OK,
+        Json(MetricsStatusResponse {
+            last_received_at: last.map(|t| t.to_rfc3339()),
+        }),
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // External Services — alert rules
 // ---------------------------------------------------------------------------
@@ -759,10 +816,18 @@ async fn provision_otlp_ingest_key(
         }
     };
 
-    // Persist the key into the encrypted config, then restart the container.
+    // Resolve the internal URL containers use to reach the Temps API. Falls
+    // back to the host.docker.internal default with the console port when no
+    // ConfigService is wired.
+    let internal_url = match &state.config_service {
+        Some(cfg) => cfg.resolve_internal_url().await,
+        None => "http://host.docker.internal:8080".to_string(),
+    };
+
+    // Persist the key + ingest URL into the encrypted config, then restart.
     if let Err(e) = state
         .external_service_manager
-        .store_and_apply_ingest_key(service.id, ingest_key)
+        .store_and_apply_ingest_key(service.id, ingest_key, internal_url)
         .await
     {
         error!(
@@ -1137,6 +1202,10 @@ pub fn configure_metrics_routes() -> Router<Arc<AppState>> {
             get(get_service_metrics_latest),
         )
         .route(
+            "/external-services/{id}/metrics/status",
+            get(get_service_metrics_status),
+        )
+        .route(
             "/external-services/{id}/metrics/alert-rules",
             get(list_service_alert_rules).post(create_service_alert_rule),
         )
@@ -1174,6 +1243,7 @@ pub fn configure_metrics_routes() -> Router<Arc<AppState>> {
     paths(
         get_service_metrics_range,
         get_service_metrics_latest,
+        get_service_metrics_status,
         list_service_alert_rules,
         create_service_alert_rule,
         update_service_alert_rule,
@@ -1187,6 +1257,7 @@ pub fn configure_metrics_routes() -> Router<Arc<AppState>> {
     components(schemas(
         MetricDataPoint,
         MetricsRangeQuery,
+        MetricsStatusResponse,
         AlertRuleResponse,
         CreateAlertRuleRequest,
         UpdateAlertRuleRequest,

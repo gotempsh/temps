@@ -829,24 +829,6 @@ pub async fn ingest_logs_by_path(
     result
 }
 
-/// Service metrics ingest with token in URL path.
-///
-/// For OTLP exporters (like RustFS alpha) that don't support custom request
-/// headers — the `si_` service token is embedded in the URL path instead.
-/// The endpoint is `/otel/v1/service/{service_token}/metrics`.
-pub async fn ingest_service_metrics_by_token(
-    State(state): State<OtelAppState>,
-    Path(service_token): Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<impl IntoResponse, Problem> {
-    let result = do_ingest_metrics(&state, &service_token, None, &headers, &body).await;
-    if let Err(ref e) = result {
-        error!(error = ?e, "Failed to ingest service metrics (token in path)");
-    }
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

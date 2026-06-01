@@ -37,7 +37,10 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { getServiceOptions } from '@/api/client/@tanstack/react-query.gen'
+import {
+  getServiceOptions,
+  externalServiceMetricsStatusOptions,
+} from '@/api/client/@tanstack/react-query.gen'
 import {
   Activity,
   ArrowLeft,
@@ -46,7 +49,7 @@ import {
   RefreshCw,
   Trash2,
 } from 'lucide-react'
-import { useState } from 'react'
+import { createContext, useContext, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { toast } from 'sonner'
 import {
@@ -428,6 +431,21 @@ function normalizeEngine(engine: string, dockerImage?: string | null): EngineKin
   return 'postgres'
 }
 
+/** Compact relative time, e.g. "just now", "12s ago", "3m ago", "2h ago". */
+function formatRelativeTime(iso: string): string {
+  const then = new Date(iso).getTime()
+  if (Number.isNaN(then)) return ''
+  const secs = Math.max(0, Math.floor((Date.now() - then) / 1000))
+  if (secs < 5) return 'just now'
+  if (secs < 60) return `${secs}s ago`
+  const mins = Math.floor(secs / 60)
+  if (mins < 60) return `${mins}m ago`
+  const hours = Math.floor(mins / 60)
+  if (hours < 24) return `${hours}h ago`
+  const days = Math.floor(hours / 24)
+  return `${days}d ago`
+}
+
 function formatMetricValue(name: string, value: number): string {
   if (name.endsWith('_bytes') || name.endsWith('_bytes_total')) return formatBytes(value)
   if (name.endsWith('_ratio')) return `${(value * 100).toFixed(1)}%`
@@ -479,6 +497,49 @@ const RANGE_OPTIONS = [
 ]
 
 const CHART_LINE_COLOR = '#2563eb'
+
+// ---------------------------------------------------------------------------
+// Auto-refresh interval — shared across all monitoring queries on the page.
+// `null` means auto-refresh is off (manual Refresh only).
+// ---------------------------------------------------------------------------
+
+const REFRESH_OPTIONS: { label: string; value: number | null }[] = [
+  { label: 'Off', value: null },
+  { label: '5s', value: 5_000 },
+  { label: '10s', value: 10_000 },
+  { label: '30s', value: 30_000 },
+  { label: '1m', value: 60_000 },
+]
+
+const REFRESH_STORAGE_KEY = 'temps:monitoring:refresh-interval'
+
+/** Refetch interval in ms, or `false` to disable (React Query's convention). */
+const RefreshIntervalContext = createContext<number | false>(30_000)
+
+/** Read the active refetch interval for monitoring queries. */
+function useRefreshInterval(): number | false {
+  return useContext(RefreshIntervalContext)
+}
+
+function loadStoredRefreshInterval(): number | null {
+  try {
+    const raw = localStorage.getItem(REFRESH_STORAGE_KEY)
+    if (raw === null) return 30_000
+    if (raw === 'off') return null
+    const n = parseInt(raw, 10)
+    return Number.isFinite(n) ? n : 30_000
+  } catch {
+    return 30_000
+  }
+}
+
+function storeRefreshInterval(value: number | null): void {
+  try {
+    localStorage.setItem(REFRESH_STORAGE_KEY, value === null ? 'off' : String(value))
+  } catch {
+    // ignore — non-critical
+  }
+}
 
 // ---------------------------------------------------------------------------
 // MetricTile — a single clickable stat item rendered inside a <dl> grid
@@ -545,11 +606,12 @@ type MetricChartProps = {
 }
 
 function MetricChart({ serviceId, metricName, range }: MetricChartProps) {
+  const refetchInterval = useRefreshInterval()
   const { data, isLoading } = useQuery<MetricRangePoint[]>({
     queryKey: ['svc-monitoring-range', serviceId, metricName, range],
     queryFn: () => fetchMetricRange(serviceId, metricName, range),
     staleTime: 15_000,
-    refetchInterval: 30_000,
+    refetchInterval,
   })
 
   const chartData = (data ?? []).map((p) => ({
@@ -781,6 +843,7 @@ type AlertRulesSectionProps = {
 
 function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
   const queryClient = useQueryClient()
+  const refetchInterval = useRefreshInterval()
   const [addDialogOpen, setAddDialogOpen] = useState(false)
   const [ruleToDelete, setRuleToDelete] = useState<ServiceAlertRule | null>(null)
 
@@ -788,7 +851,7 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
     queryKey: ['svc-monitoring-alert-rules', serviceId],
     queryFn: () => fetchAlertRules(serviceId),
     staleTime: 30_000,
-    refetchInterval: 30_000,
+    refetchInterval,
   })
 
   const invalidate = () =>
@@ -958,6 +1021,7 @@ function MonitoringDashboard({
   engine,
   latestMetrics,
 }: MonitoringDashboardProps) {
+  const refetchInterval = useRefreshInterval()
   const groups = ENGINE_GROUPS[engine]
   const heroMetrics = HERO_METRICS[engine]
 
@@ -976,7 +1040,7 @@ function MonitoringDashboard({
     queryKey: ['svc-monitoring-alert-rules', serviceId],
     queryFn: () => fetchAlertRules(serviceId),
     staleTime: 30_000,
-    refetchInterval: 30_000,
+    refetchInterval,
   })
 
   const firingBySeverity = new Map<string, 'warning' | 'critical'>()
@@ -1098,6 +1162,11 @@ export function ServiceMonitoring() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
 
+  // Auto-refresh interval (ms) or null = off. Persisted in localStorage so the
+  // user's choice survives navigation/reload.
+  const [refreshMs, setRefreshMs] = useState<number | null>(loadStoredRefreshInterval)
+  const refetchInterval: number | false = refreshMs ?? false
+
   const serviceId = id ? parseInt(id) : 0
 
   const { data: serviceData, isLoading: serviceLoading } = useQuery({
@@ -1137,7 +1206,7 @@ export function ServiceMonitoring() {
           return false
         }
       }
-      return 30_000
+      return refetchInterval
     },
     retry: (failureCount, err) => {
       const msg = err.message.toLowerCase()
@@ -1162,12 +1231,21 @@ export function ServiceMonitoring() {
 
   const serviceName = serviceData?.service?.name ?? 'Service'
 
+  // Freshness status — cheap O(1) lookup of when metrics were last received.
+  const { data: statusData } = useQuery({
+    ...externalServiceMetricsStatusOptions({ path: { id: serviceId } }),
+    enabled: !!serviceId && !isDisabled,
+    refetchInterval,
+  })
+  const lastReceivedAt = statusData?.last_received_at ?? null
+
   const handleRefresh = () => {
     refetch()
     queryClient.invalidateQueries({ queryKey: ['svc-monitoring-alert-rules', serviceId] })
   }
 
   return (
+   <RefreshIntervalContext.Provider value={refetchInterval}>
     <div className="flex-1 overflow-auto">
       <div className="p-4 space-y-6 md:p-6">
       {/* Page header */}
@@ -1199,18 +1277,47 @@ export function ServiceMonitoring() {
           </h1>
           <p className="text-sm text-muted-foreground mt-0.5">
             Real-time metrics and performance monitoring
+            {lastReceivedAt && (
+              <span> · last received {formatRelativeTime(lastReceivedAt)}</span>
+            )}
           </p>
         </div>
-        <Button
-          variant="outline"
-          size="sm"
-          className="gap-1.5 shrink-0"
-          onClick={handleRefresh}
-          disabled={isFetching}
-        >
-          <RefreshCw className={`size-3.5 ${isFetching ? 'animate-spin' : ''}`} />
-          <span>Refresh</span>
-        </Button>
+        <div className="flex shrink-0 items-center gap-2">
+          {/* Auto-refresh interval */}
+          <Select
+            value={refreshMs === null ? 'off' : String(refreshMs)}
+            onValueChange={(v) => {
+              const next = v === 'off' ? null : parseInt(v, 10)
+              setRefreshMs(next)
+              storeRefreshInterval(next)
+            }}
+          >
+            <SelectTrigger className="h-8 w-[88px] gap-1.5 text-xs">
+              <RefreshCw className="size-3.5 shrink-0 text-muted-foreground" />
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {REFRESH_OPTIONS.map((opt) => (
+                <SelectItem
+                  key={opt.label}
+                  value={opt.value === null ? 'off' : String(opt.value)}
+                >
+                  {opt.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Button
+            variant="outline"
+            size="sm"
+            className="gap-1.5"
+            onClick={handleRefresh}
+            disabled={isFetching}
+          >
+            <RefreshCw className={`size-3.5 ${isFetching ? 'animate-spin' : ''}`} />
+            <span>Refresh</span>
+          </Button>
+        </div>
       </div>
 
       {/* Body */}
@@ -1252,5 +1359,6 @@ export function ServiceMonitoring() {
       )}
       </div>
     </div>
+   </RefreshIntervalContext.Provider>
   )
 }

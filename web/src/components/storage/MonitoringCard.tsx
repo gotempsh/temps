@@ -52,6 +52,7 @@ import {
 } from '@/components/ui/table'
 import { EmptyPlaceholder } from '@/components/EmptyPlaceholder'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { externalServiceMetricsStatusOptions } from '@/api/client/@tanstack/react-query.gen'
 import {
   Activity,
   AlertTriangle,
@@ -415,6 +416,21 @@ function isNormalEngine(engine: string): engine is EngineKind {
 function normalizeEngine(engine: string, dockerImage?: string): EngineKind {
   if (engine === 's3' && dockerImage?.toLowerCase().includes('rustfs')) return 'rustfs'
   return isNormalEngine(engine) ? engine : 'postgres'
+}
+
+/** Compact relative time, e.g. "just now", "12s ago", "3m ago", "2h ago". */
+function formatRelativeTime(iso: string): string {
+  const then = new Date(iso).getTime()
+  if (Number.isNaN(then)) return ''
+  const secs = Math.max(0, Math.floor((Date.now() - then) / 1000))
+  if (secs < 5) return 'just now'
+  if (secs < 60) return `${secs}s ago`
+  const mins = Math.floor(secs / 60)
+  if (mins < 60) return `${mins}m ago`
+  const hours = Math.floor(mins / 60)
+  if (hours < 24) return `${hours}h ago`
+  const days = Math.floor(hours / 24)
+  return `${days}d ago`
 }
 
 function formatMetricValue(name: string, value: number): string {
@@ -1156,6 +1172,14 @@ export function MonitoringCard({ serviceId, engine, dockerImage, metricsEnabled 
     },
   })
 
+  // Freshness status — when metrics were last received (cheap O(1) lookup).
+  const { data: statusData } = useQuery({
+    ...externalServiceMetricsStatusOptions({ path: { id: serviceId } }),
+    enabled: metricsEnabled,
+    refetchInterval: 30_000,
+  })
+  const lastReceivedAt = statusData?.last_received_at ?? null
+
   const enableMonitoring = useMutation({
     mutationFn: () => enableMetrics(serviceId),
     onSuccess: () => {
@@ -1271,6 +1295,11 @@ export function MonitoringCard({ serviceId, engine, dockerImage, metricsEnabled 
           <span className="flex items-center gap-2">
             <Activity className="h-4 w-4" />
             Monitoring
+            {lastReceivedAt && (
+              <span className="text-xs font-normal text-muted-foreground">
+                · last received {formatRelativeTime(lastReceivedAt)}
+              </span>
+            )}
           </span>
           <Button
             variant="ghost"

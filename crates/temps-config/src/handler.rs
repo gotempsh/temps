@@ -78,6 +78,7 @@ pub struct JoinTokenStatusResponse {
 pub struct AppSettingsResponse {
     // Core settings
     pub external_url: Option<String>,
+    pub internal_url: Option<String>,
     pub preview_domain: String,
 
     // Screenshot settings
@@ -185,6 +186,7 @@ impl From<AppSettings> for AppSettingsResponse {
     fn from(settings: AppSettings) -> Self {
         Self {
             external_url: settings.external_url,
+            internal_url: settings.internal_url,
             preview_domain: settings.preview_domain,
             screenshots: settings.screenshots,
             letsencrypt: settings.letsencrypt,
@@ -553,6 +555,30 @@ async fn update_settings(
             return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
                 .detail("External URL is not a valid URL")
                 .build());
+        }
+    }
+
+    // Validate and sanitize internal_url (same rules as external_url)
+    if let Some(ref mut int_url) = settings.internal_url {
+        *int_url = int_url.trim().trim_end_matches('/').to_string();
+        if int_url.is_empty() {
+            settings.internal_url = None;
+        } else {
+            if !int_url.starts_with("http://") && !int_url.starts_with("https://") {
+                return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                    .detail("Internal URL must start with http:// or https://")
+                    .build());
+            }
+            if int_url.contains('#') || int_url.contains('?') {
+                return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                    .detail("Internal URL must not contain '#' or '?' characters")
+                    .build());
+            }
+            if url::Url::parse(int_url).is_err() {
+                return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                    .detail("Internal URL is not a valid URL")
+                    .build());
+            }
         }
     }
 

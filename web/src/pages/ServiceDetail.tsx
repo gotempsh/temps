@@ -1764,6 +1764,7 @@ export function ServiceDetail() {
         serviceName={service.service.name}
         currentImage={service.current_parameters?.docker_image || undefined}
         serviceType={service.service.service_type}
+        onSuccess={() => refetch()}
       />
 
       <MajorUpgradeDialog

@@ -100,6 +100,9 @@ impl TempsPlugin for ProvidersPlugin {
         // API key service — needed to provision si_ ingest keys for OTLP-push services.
         let api_key_service = context.require_service::<temps_auth::ApiKeyService>();
 
+        // Config service — resolves the internal URL containers push OTLP to.
+        let config_service = context.get_service::<temps_config::ConfigService>();
+
         // Create QueryService
         let query_service = Arc::new(crate::QueryService::new(external_service_manager.clone()));
 
@@ -112,6 +115,7 @@ impl TempsPlugin for ProvidersPlugin {
             metrics_store,
             db,
             api_key_service,
+            config_service,
         });
 
         // Configure routes with the app state

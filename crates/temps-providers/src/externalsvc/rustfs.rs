@@ -32,8 +32,13 @@ use super::{
     ExternalService, HealthProbeResult, ServiceConfig, ServiceResourceLimits, ServiceType,
 };
 
-/// Default RustFS Docker image (from Docker Hub)
-pub const DEFAULT_RUSTFS_IMAGE: &str = "rustfs/rustfs:1.0.0-alpha.98";
+/// Default RustFS Docker image (from Docker Hub).
+///
+/// `1.0.0-beta.6` is the first stable line with reliable OTLP custom-header
+/// support (`RUSTFS_OBS_ENDPOINT_METRICS_HEADERS`), fixed in alpha.99. This
+/// lets us authenticate metrics push with an `Authorization` header instead of
+/// embedding the ingest token in the URL path (which leaks into logs).
+pub const DEFAULT_RUSTFS_IMAGE: &str = "rustfs/rustfs:1.0.0-beta.6";
 /// Default RustFS API port
 pub const DEFAULT_RUSTFS_API_PORT: u16 = 9000;
 /// Default RustFS console port
@@ -89,6 +94,12 @@ pub struct RustfsInputConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(skip)]
     pub metrics_ingest_key: Option<String>,
+
+    /// Base internal URL containers push OTLP metrics to (no trailing slash,
+    /// no path). Populated automatically alongside `metrics_ingest_key`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub metrics_ingest_url: Option<String>,
 }
 
 /// Internal runtime configuration for RustFS service
@@ -106,6 +117,9 @@ pub struct RustfsConfig {
     /// Stored in the encrypted service config blob — never in plaintext elsewhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics_ingest_key: Option<String>,
+    /// Base internal URL containers push OTLP metrics to (no trailing slash).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics_ingest_url: Option<String>,
 }
 
 impl RustfsConfig {
@@ -174,6 +188,7 @@ impl RustfsConfig {
             region: input.region,
             docker_image: input.docker_image,
             metrics_ingest_key: input.metrics_ingest_key,
+            metrics_ingest_url: input.metrics_ingest_url,
         }
     }
 }
@@ -197,6 +212,7 @@ impl From<RustfsInputConfig> for RustfsConfig {
             region: input.region,
             docker_image: input.docker_image,
             metrics_ingest_key: input.metrics_ingest_key,
+            metrics_ingest_url: input.metrics_ingest_url,
         }
     }
 }
@@ -585,11 +601,25 @@ impl RustfsService {
         // When a metrics ingest key is stored in config, metrics are enabled —
         // inject the OTLP push env vars so RustFS reports to Temps automatically.
         if let Some(key) = &config.metrics_ingest_key {
-            // Embed the si_ token in the URL path — RustFS alpha doesn't
-            // reliably forward RUSTFS_OBS_ENDPOINT_METRICS_HEADERS, so we use
-            // a dedicated /otel/v1/service/{token}/metrics endpoint instead.
+            // Base internal URL — resolved from the `internal_url` setting at
+            // provisioning time. Falls back to the Docker Desktop default for
+            // a pre-existing service that has no stored URL.
+            let base_url = config
+                .metrics_ingest_url
+                .as_deref()
+                .unwrap_or("http://host.docker.internal:8080")
+                .trim_end_matches('/');
+            // Standard OTLP metrics endpoint — the `si_` token is sent in the
+            // Authorization header (RustFS ≥ beta.6 forwards custom OTLP
+            // headers), NOT in the URL, so it never leaks into request logs.
             env_vars.push(format!(
-                "RUSTFS_OBS_METRIC_ENDPOINT=http://host.docker.internal:8080/api/otel/v1/service/{}/metrics",
+                "RUSTFS_OBS_METRIC_ENDPOINT={}/api/otel/v1/metrics",
+                base_url
+            ));
+            // RustFS parses header values as URL-encoded — the space after
+            // "Bearer" must be %20.
+            env_vars.push(format!(
+                "RUSTFS_OBS_ENDPOINT_METRICS_HEADERS=Authorization=Bearer%20{}",
                 key
             ));
             env_vars.push("RUSTFS_OBS_METRICS_EXPORT_ENABLED=true".to_string());
@@ -895,6 +925,50 @@ impl ExternalService for RustfsService {
 
         self.create_container(&self.docker, &config, &resource_limits)
             .await
+    }
+
+    /// Upgrade the RustFS container to a new Docker image.
+    ///
+    /// RustFS stores data on a Docker volume mounted at `/data`, so an upgrade
+    /// is simply: stop + remove the old container, then create a new one with
+    /// the new image. The volume (and therefore all data) is preserved. The
+    /// metrics ingest key carried in the new config is re-applied so OTLP push
+    /// keeps working after the upgrade.
+    async fn upgrade(&self, _old_config: ServiceConfig, new_config: ServiceConfig) -> Result<()> {
+        let new_cfg = self.get_rustfs_config(new_config)?;
+        info!(
+            "Starting RustFS upgrade to image {} for service {}",
+            new_cfg.docker_image, self.name
+        );
+
+        let resource_limits = self.resource_limits.read().await.clone();
+        let container_name = self.get_container_name();
+
+        // Stop + remove the old container. Volumes survive (not removed here).
+        let _ = self
+            .docker
+            .stop_container(&container_name, None::<StopContainerOptions>)
+            .await;
+        let _ = self
+            .docker
+            .remove_container(
+                &container_name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+
+        // create_container pulls the new image and mounts the existing volume.
+        self.create_container(&self.docker, &new_cfg, &resource_limits)
+            .await?;
+
+        info!(
+            "RustFS upgrade completed successfully for service {}",
+            self.name
+        );
+        Ok(())
     }
 
     async fn init(&self, config: ServiceConfig) -> Result<HashMap<String, String>> {
@@ -2075,6 +2149,7 @@ mod tests {
             region: default_region(),
             docker_image: default_image(),
             metrics_ingest_key: None,
+            metrics_ingest_url: None,
         };
 
         let config = RustfsConfig::from(input);
@@ -2097,6 +2172,7 @@ mod tests {
             region: "eu-west-1".to_string(),
             docker_image: "rustfs/rustfs:1.0.0".to_string(),
             metrics_ingest_key: None,
+            metrics_ingest_url: None,
         };
 
         let config = RustfsConfig::from(input);

@@ -8,17 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Database monitoring**: full metrics observability for external services (Postgres, Redis, MongoDB, RustFS/S3). New `temps-metrics` crate scrapes each enabled service every 30s into a TimescaleDB hypertable with hourly/daily continuous aggregates. Per-service monitoring page at `/storage/:id/monitoring` with hero stats, time-series charts (1h/6h/24h/7d), categorized metric groups, and threshold-based alert rules.
-- **RustFS OTLP metrics ingest**: RustFS containers push OTLP metrics to Temps via a service-scoped `si_` API key (new `MetricsIngest` role). Enabling monitoring on an S3/RustFS service auto-provisions the key and restarts the container with the OTLP endpoint configured. New ingest route `POST /api/otel/v1/service/{token}/metrics`.
-- Per-service metrics collectors: PostgreSQL (31 metrics), MongoDB (30), Redis (15), RustFS/S3 (cluster capacity, objects, operations, process stats).
+- **Database monitoring**: full metrics observability for external services (Postgres, Redis, MongoDB, RustFS/S3). New `temps-metrics` crate scrapes each enabled service into a TimescaleDB hypertable with hourly/daily continuous aggregates. Per-service monitoring page at `/storage/:id/monitoring` with hero stats, time-series charts (1h/6h/24h/7d), categorized metric groups, and threshold-based alert rules. Metrics collection is always wired up; the per-service "Enable Monitoring" toggle is the single control.
+- **RustFS OTLP metrics ingest**: RustFS containers push OTLP metrics to Temps via a service-scoped `si_` API key (new `MetricsIngest` role) sent in the `Authorization` header. Enabling monitoring on an S3/RustFS service auto-provisions the key and restarts the container with the OTLP endpoint configured. Default RustFS image bumped to `1.0.0-beta.6` (first line with reliable OTLP header support).
+- Per-service metrics collectors: PostgreSQL (31 metrics), MongoDB (32, incl. uptime/page-faults/asserts), Redis (17, incl. ops/sec, commands, network), RustFS/S3 (cluster capacity, objects, operations, process stats).
+- **Internal URL** platform setting (`internal_url`): how service containers reach the Temps API from inside the Docker network (OTLP metrics, agent callbacks). Resolves via setting → `TEMPS_INTERNAL_API_URL` env → `http://host.docker.internal:<proxy-port>`. Editable in Settings.
+- "Last received at …" freshness indicator on monitoring views, backed by a tiny `service_metrics_status` table (O(1) lookup, upserted on write — no hypertable scan).
+- Configurable auto-refresh interval (Off / 5s / 10s / 30s / 1m) on the monitoring page, persisted in localStorage.
+- Service upgrade support for RustFS (was previously "not implemented").
 
 ### Changed
 - Cumulative counter metrics (`_total`/`_count`) now display the running total in stat tiles and rate-of-change in charts, computed via a TimescaleDB LAG window query.
-- `service_metrics` raw retention extended from 7 to 30 days.
+- `service_metrics` raw retention 7 → 30 days; daily-aggregate retention 2 years → 1 year.
 - MinIO removed from the S3 service creation UI; RustFS is now the sole default object-storage engine.
+- Service-detail monitoring card no longer polls the metrics API when monitoring is disabled for that service.
 
 ### Fixed
 - Metrics scraper releases its per-service in-flight slot via an RAII drop guard, preventing a permanent scrape stall if a collector task panics.
+- Monitoring queries stop polling on permanent errors (monitoring disabled / not found / 503) instead of retrying every few seconds.
+- Retention migration uses `if_exists` (not the non-existent `if_not_exists`) on `remove_retention_policy`, fixing a fresh-install setup crash.
+- Service detail refetches after a service upgrade so the new image/status is reflected immediately.
 
 
 ## [0.1.0-beta.25] - 2026-05-31

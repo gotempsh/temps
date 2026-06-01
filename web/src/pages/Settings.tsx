@@ -40,7 +40,7 @@ import { toast } from 'sonner'
 
 type SettingsFormData = Pick<
   PlatformSettings,
-  'external_url' | 'preview_domain' | 'screenshots'
+  'external_url' | 'internal_url' | 'preview_domain' | 'screenshots'
 >
 
 export function Settings() {
@@ -59,6 +59,7 @@ export function Settings() {
   } = useForm<SettingsFormData>({
     defaultValues: {
       external_url: '',
+      internal_url: '',
       preview_domain: 'localho.st',
       screenshots: {
         enabled: false,
@@ -80,6 +81,7 @@ export function Settings() {
     if (settings) {
       reset({
         external_url: settings.external_url || '',
+        internal_url: settings.internal_url || '',
         preview_domain: settings.preview_domain || 'localho.st',
         screenshots: settings.screenshots || {
           enabled: false,
@@ -161,6 +163,38 @@ export function Settings() {
             )}
             <p className="text-sm text-muted-foreground">
               Used for OAuth callbacks, webhooks, and external integrations
+            </p>
+          </div>
+
+          <div className="space-y-2 pt-4">
+            <Label htmlFor="internal-url">Internal URL</Label>
+            <Input
+              id="internal-url"
+              type="url"
+              placeholder="http://host.docker.internal:8080"
+              {...register('internal_url', {
+                validate: (value) => {
+                  if (!value) return true // optional — falls back to default
+                  const trimmed = value.trim()
+                  if (!trimmed) return true
+                  if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://'))
+                    return 'Must start with http:// or https://'
+                  if (trimmed.includes('#') || trimmed.includes('?'))
+                    return 'Must not contain # or ? characters'
+                  try { new URL(trimmed) } catch {
+                    return 'Must be a valid URL'
+                  }
+                  return true
+                },
+              })}
+            />
+            {errors.internal_url && (
+              <p className="text-sm text-destructive">{errors.internal_url.message}</p>
+            )}
+            <p className="text-sm text-muted-foreground">
+              How service containers reach the Temps API from inside the Docker
+              network (OTLP metrics ingest, agent callbacks). Leave blank to use{' '}
+              <code className="font-mono text-xs">http://host.docker.internal:&lt;proxy-port&gt;</code>.
             </p>
           </div>
         </CardContent>

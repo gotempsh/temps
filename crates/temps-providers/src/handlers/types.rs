@@ -26,6 +26,10 @@ pub struct AppState {
     /// API key service — used to provision `si_` ingest keys when metrics are
     /// enabled on a RustFS (or other OTLP-push) service.
     pub api_key_service: Arc<ApiKeyService>,
+    /// Config service — used to resolve the internal URL containers push OTLP
+    /// metrics to (and the console port for its default). `None` in contexts
+    /// where it isn't wired (e.g. some tests).
+    pub config_service: Option<Arc<temps_config::ConfigService>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]

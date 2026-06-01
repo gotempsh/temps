@@ -1328,22 +1328,27 @@ impl ExternalServiceManager {
         Ok(config)
     }
 
-    /// Store a metrics ingest key into the service's encrypted config blob and
-    /// restart the container so the OTLP env vars take effect.
+    /// Store a metrics ingest key + internal URL into the service's encrypted
+    /// config blob and restart the container so the OTLP env vars take effect.
     ///
-    /// The key is persisted in the `metrics_ingest_key` field of the config so
-    /// that any future container recreate (upgrade, restart) automatically picks
-    /// it up without needing another key-provisioning step.
+    /// Both are persisted in the config (`metrics_ingest_key` and
+    /// `metrics_ingest_url`) so any future container recreate (upgrade,
+    /// restart) automatically picks them up without re-provisioning.
     pub async fn store_and_apply_ingest_key(
         &self,
         service_id: i32,
         ingest_key: String,
+        ingest_url: String,
     ) -> Result<(), ExternalServiceError> {
-        // Merge the key into the existing encrypted params.
+        // Merge the key + URL into the existing encrypted params.
         let mut params = self.get_service_parameters(service_id).await?;
         params.insert(
             "metrics_ingest_key".to_string(),
             serde_json::Value::String(ingest_key),
+        );
+        params.insert(
+            "metrics_ingest_url".to_string(),
+            serde_json::Value::String(ingest_url),
         );
 
         let config_json =

@@ -145,6 +145,15 @@ pub trait MetricsStore: Send + Sync {
     async fn query_latest(&self, filter: LatestQuery)
         -> Result<HashMap<String, f64>, MetricsError>;
 
+    /// Return the timestamp of the most-recent metric row for a source, or
+    /// `None` if no metrics have ever been recorded. Used by the UI to show
+    /// "last received at …" so users can confirm the pipeline is alive.
+    async fn latest_timestamp(
+        &self,
+        source_kind: SourceKind,
+        source_id: i32,
+    ) -> Result<Option<DateTime<Utc>>, MetricsError>;
+
     /// Delete raw metric rows older than `older_than`.
     /// Continuous-aggregate retention is managed by TimescaleDB refresh
     /// policies; this method only touches the raw `service_metrics` table.
