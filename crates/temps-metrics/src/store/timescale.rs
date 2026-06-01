@@ -6,7 +6,10 @@ use std::sync::Arc;
 use tracing::warn;
 
 use crate::error::MetricsError;
-use crate::store::{LatestQuery, MetricKind, MetricPoint, MetricsStore, RangeQuery, SourceKind};
+use crate::store::{
+    LabelledMetric, LatestByLabelQuery, LatestQuery, MetricKind, MetricPoint, MetricsStore,
+    RangeQuery, SourceKind,
+};
 
 /// Maximum rows per INSERT statement. Larger batches produce multi-MB query
 /// strings that stress PostgreSQL's parser and cause all-or-nothing failures.
@@ -28,21 +31,33 @@ impl TimescaleMetricsStore {
         Self { db }
     }
 
-    /// Whether an unlabelled (`labels = '{}'`) series exists for this
-    /// metric+source in the raw table. Used by `query_range` to decide whether
-    /// to scope a chart to the instance-wide aggregate series (preferring it
-    /// over a blend of per-label rows). Returns `false` on any query error so
-    /// the caller falls back to the unfiltered query rather than charting
-    /// nothing. Bounded to the recent window via `LIMIT 1`.
-    async fn has_unlabelled_series(&self, source_kind: &str, source_id: i32, name: &str) -> bool {
+    /// The minimum label-key count across the recent rows of a metric, or
+    /// `None` if the metric has no rows / on error.
+    ///
+    /// The instance-wide aggregate row is the one with the FEWEST label keys
+    /// (per-series rows add a dimension key like `datname`/`replica_addr` on top
+    /// of the shared base labels). `query_range` uses this to scope a chart to
+    /// the aggregate series instead of blending every per-label row together.
+    /// Returns `None` on error so the caller falls back to an unfiltered query
+    /// rather than charting nothing. Bounded to the recent window via `LIMIT`.
+    async fn min_label_key_count(
+        &self,
+        source_kind: &str,
+        source_id: i32,
+        name: &str,
+    ) -> Option<i64> {
         if validate_metric_name(name).is_err() {
-            return false;
+            return None;
         }
+        // Look only at the most-recent ~64 rows: a single scrape writes all of a
+        // metric's series at once, so the recent window contains every series.
         let sql = format!(
-            "SELECT 1 FROM service_metrics \
-             WHERE source_kind = '{sk}' AND source_id = {sid} \
-               AND name = '{nm}' AND labels = '{{}}'::jsonb \
-             LIMIT 1",
+            "SELECT min(k)::bigint AS min_keys FROM ( \
+                 SELECT (SELECT count(*) FROM jsonb_object_keys(labels)) AS k \
+                 FROM service_metrics \
+                 WHERE source_kind = '{sk}' AND source_id = {sid} AND name = '{nm}' \
+                 ORDER BY time DESC LIMIT 64 \
+             ) recent",
             sk = escape_sql_string(source_kind),
             sid = source_id,
             nm = escape_sql_string(name),
@@ -55,8 +70,8 @@ impl TimescaleMetricsStore {
             ))
             .await
         {
-            Ok(opt) => opt.is_some(),
-            Err(_) => false,
+            Ok(Some(row)) => row.try_get::<Option<i64>>("", "min_keys").ok().flatten(),
+            _ => None,
         }
     }
 }
@@ -336,23 +351,25 @@ impl MetricsStore for TimescaleMetricsStore {
 
         // Some metrics are written as multiple label-series per scrape (e.g.
         // Postgres emits `pg.cache_hit_ratio` / `pg.database_size_bytes` once
-        // per `datname` PLUS one unlabelled instance-wide aggregate). For a
-        // single chart series we want the unlabelled aggregate, never a blend
-        // of every per-db row (AVG across databases is meaningless for a ratio,
-        // and double-counts a size). If an unlabelled series exists for this
-        // metric we scope the query to it; otherwise (per-replica lag,
-        // already-unlabelled metrics) we leave the query unfiltered.
+        // per `datname` PLUS one instance-wide aggregate). For a single chart
+        // series we want the aggregate, never a blend of every per-db row (AVG
+        // across databases is meaningless for a ratio, and double-counts a
+        // size). The aggregate is the series with the FEWEST label keys; we
+        // scope the query to rows whose key count equals that minimum, so
+        // per-`datname` rows (which add one key) are excluded. Metrics with a
+        // single series have a single key count, so the filter is a no-op for
+        // them (per-replica lag, connection counts, etc.).
         //
         // The hourly/daily continuous aggregates carry `labels` in their GROUP
         // BY (m20260601_000009), so this same filter is valid on every range.
-        let has_unlabelled = self
-            .has_unlabelled_series(filter.source_kind.as_str(), filter.source_id, &filter.name)
+        let min_keys = self
+            .min_label_key_count(filter.source_kind.as_str(), filter.source_id, &filter.name)
             .await;
-        let raw_label_filter = if has_unlabelled {
-            " AND labels = '{}'::jsonb"
-        } else {
-            ""
+        let raw_label_filter = match min_keys {
+            Some(k) => format!(" AND (SELECT count(*) FROM jsonb_object_keys(labels)) = {k}"),
+            None => String::new(),
         };
+        let raw_label_filter = raw_label_filter.as_str();
 
         let sql = if range_duration <= seven_days {
             // Raw table — use time_bucket with the requested step.
@@ -547,18 +564,24 @@ impl MetricsStore for TimescaleMetricsStore {
 
         // `DISTINCT ON (name)` keeps one row per metric name. Some metrics are
         // written as multiple label-series per scrape (e.g. Postgres emits
-        // `pg.database_size_bytes` once per `datname` PLUS one unlabelled
-        // instance-wide aggregate). For the single stat-tile value we always
-        // want the unlabelled aggregate row, never an arbitrary per-label one,
-        // so order labelled-vs-unlabelled first (empty `{}` jsonb wins), then by
-        // recency. Metrics with only one series are unaffected.
+        // `pg.database_size_bytes` once per `datname` PLUS one instance-wide
+        // aggregate). For the single stat-tile value we always want the
+        // aggregate row, never an arbitrary per-label one. The aggregate is the
+        // row with the FEWEST label keys: per-series rows add a dimension key
+        // (e.g. `datname`, `replica_addr`) on top of the shared base labels
+        // (`engine`, `environment`), while the aggregate carries only the base
+        // labels. So order by label-key count ascending, then by recency.
+        // (An empty `{}` is just the zero-key case and still wins.) Metrics with
+        // a single series are unaffected.
         let sql = format!(
             "SELECT DISTINCT ON (name) name, value \
              FROM service_metrics \
              WHERE source_kind = '{source_kind}' \
                AND source_id = {source_id} \
                {name_filter} \
-             ORDER BY name, (labels = '{{}}'::jsonb) DESC, time DESC",
+             ORDER BY name, \
+                      (SELECT count(*) FROM jsonb_object_keys(labels)) ASC, \
+                      time DESC",
             source_kind = escape_sql_string(filter.source_kind.as_str()),
             source_id = filter.source_id,
             name_filter = name_filter,
@@ -582,6 +605,98 @@ impl MetricsStore for TimescaleMetricsStore {
                 .try_get("", "value")
                 .map_err(MetricsError::DatabaseError)?;
             result.insert(name, value);
+        }
+
+        Ok(result)
+    }
+
+    async fn query_latest_by_label(
+        &self,
+        filter: LatestByLabelQuery,
+    ) -> Result<Vec<LabelledMetric>, MetricsError> {
+        // SECURITY(metrics-security-1): the label key is interpolated into SQL.
+        // It comes from server-side handler constants today, but validate it
+        // with the same allowlist as metric names so a future caller can't
+        // inject. Reject anything outside `[a-zA-Z0-9_.:-]`.
+        if validate_metric_name(&filter.label_key).is_err() {
+            warn!(
+                label_key = %filter.label_key,
+                "query_latest_by_label: label key contains invalid characters; returning empty"
+            );
+            return Ok(Vec::new());
+        }
+
+        // Validate metric names (same allowlist), dropping any invalid ones.
+        let valid_names: Vec<&str> = filter
+            .names
+            .iter()
+            .filter_map(|n| match validate_metric_name(n) {
+                Ok(()) => Some(n.as_str()),
+                Err(_) => {
+                    warn!(
+                        metric_name = %n,
+                        "query_latest_by_label: metric name contains invalid characters; excluding"
+                    );
+                    None
+                }
+            })
+            .collect();
+        if valid_names.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let names_literal = valid_names
+            .iter()
+            .map(|n| format!("'{}'", escape_sql_string(n)))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let label_key = escape_sql_string(&filter.label_key);
+
+        // For each (name, label_value) keep the most-recent row. Only rows that
+        // carry the label key are considered (`labels ? key`), which excludes
+        // the unlabelled instance-wide aggregate. The `DISTINCT ON` key is
+        // (name, label_value) so each metric gets one value per label value.
+        let sql = format!(
+            "SELECT DISTINCT ON (name, labels->>'{label_key}') \
+                    name, labels->>'{label_key}' AS label_value, value \
+             FROM service_metrics \
+             WHERE source_kind = '{source_kind}' \
+               AND source_id = {source_id} \
+               AND name = ANY(ARRAY[{names}]) \
+               AND labels ? '{label_key}' \
+             ORDER BY name, labels->>'{label_key}', time DESC",
+            label_key = label_key,
+            source_kind = escape_sql_string(filter.source_kind.as_str()),
+            source_id = filter.source_id,
+            names = names_literal,
+        );
+
+        let rows = self
+            .db
+            .query_all(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                sql,
+            ))
+            .await
+            .map_err(MetricsError::DatabaseError)?;
+
+        let mut result = Vec::with_capacity(rows.len());
+        for row in rows {
+            let name: String = row
+                .try_get("", "name")
+                .map_err(MetricsError::DatabaseError)?;
+            let label_value: String = row
+                .try_get("", "label_value")
+                .map_err(MetricsError::DatabaseError)?;
+            let value: f64 = row
+                .try_get("", "value")
+                .map_err(MetricsError::DatabaseError)?;
+            result.push(LabelledMetric {
+                label_value,
+                name,
+                value,
+            });
         }
 
         Ok(result)

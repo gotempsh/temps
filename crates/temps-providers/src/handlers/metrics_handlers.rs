@@ -27,6 +27,7 @@
 //! An optional `percentile` param (0–100) switches the range query into
 //! histogram-percentile mode using `service_metrics_histogram`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
@@ -45,7 +46,7 @@ use temps_core::{
     problemdetails::Problem,
 };
 use temps_entities::{external_services, monitoring_alert_rules};
-use temps_metrics::{LatestQuery, RangeQuery, SourceKind};
+use temps_metrics::{LatestByLabelQuery, LatestQuery, RangeQuery, SourceKind};
 use tracing::error;
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
@@ -438,6 +439,133 @@ async fn get_service_metrics_status(
             last_received_at: last.map(|t| t.to_rfc3339()),
         }),
     ))
+}
+
+/// Per-database metric values for a Postgres service.
+///
+/// A Postgres instance can host many databases (some unrelated to this
+/// service). The collector records per-`datname` series; this groups the
+/// latest value of each requested metric by database so the UI can render a
+/// "Databases" breakdown table instead of one collapsed number.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DatabaseMetricsRow {
+    /// Database name (`datname`).
+    pub database: String,
+    /// Latest value of each requested metric for this database
+    /// (e.g. `{"pg.database_size_bytes": 7943871, "pg.cache_hit_ratio": 0.99}`).
+    pub metrics: HashMap<String, f64>,
+}
+
+/// Response for the per-database metrics breakdown.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DatabaseMetricsResponse {
+    /// One entry per database, sorted by the first metric descending
+    /// (largest first) so the biggest database leads the table.
+    pub databases: Vec<DatabaseMetricsRow>,
+}
+
+/// Metrics surfaced per database in the breakdown, in display order.
+/// All are gauges/counters that `pg_stat_database` / `pg_database_size` emit
+/// once per `datname`.
+// Must stay in sync with the web `PG_PER_DATABASE_GROUPS` list in
+// ServiceMonitoring.tsx — every metric the per-database section displays has to
+// be requested here, or the UI shows "—" for the missing ones.
+const PER_DATABASE_METRICS: &[&str] = &[
+    "pg.database_size_bytes",
+    "pg.cache_hit_ratio",
+    "pg.tuple_fetch_ratio",
+    "pg.commits_total",
+    "pg.rollbacks_total",
+    "pg.deadlocks_total",
+    "pg.temp_files_total",
+    "pg.temp_bytes_total",
+    "pg.tuples_inserted_total",
+    "pg.tuples_updated_total",
+    "pg.tuples_deleted_total",
+];
+
+/// Return the latest per-database metric values for a Postgres service.
+///
+/// Groups `pg_stat_database` / size metrics by `datname` so the UI can show a
+/// breakdown table (each database with its own size, cache-hit ratio, etc.)
+/// rather than collapsing every database into one value.
+#[utoipa::path(
+    get,
+    path = "/external-services/{id}/metrics/by-database",
+    operation_id = "ExternalServiceMetricsByDatabase",
+    tag = "Metrics",
+    params(("id" = i32, Path, description = "External service ID")),
+    responses(
+        (status = 200, description = "Per-database metric breakdown", body = DatabaseMetricsResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 503, description = "Metrics not available"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_service_metrics_by_database(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ExternalServicesRead);
+    assert_service_owned_by_caller(id, &auth, &state).await?;
+
+    let store = state.metrics_store.as_ref().ok_or_else(|| {
+        ErrorBuilder::new(StatusCode::SERVICE_UNAVAILABLE)
+            .title("Metrics Unavailable")
+            .detail("Metric collection is not enabled on this server")
+            .build()
+    })?;
+
+    let rows = store
+        .query_latest_by_label(LatestByLabelQuery {
+            source_kind: SourceKind::Database,
+            source_id: id,
+            names: PER_DATABASE_METRICS.iter().map(|s| s.to_string()).collect(),
+            label_key: "datname".to_string(),
+        })
+        .await
+        .map_err(|e| {
+            error!(service_id = id, error = %e, "Failed to query per-database metrics");
+            internal_server_error()
+                .detail(format!("Failed to query per-database metrics: {}", e))
+                .build()
+        })?;
+
+    // Fold the flat (database, metric, value) list into one map per database.
+    let mut by_db: std::collections::BTreeMap<String, HashMap<String, f64>> =
+        std::collections::BTreeMap::new();
+    for r in rows {
+        by_db
+            .entry(r.label_value)
+            .or_default()
+            .insert(r.name, r.value);
+    }
+
+    let mut databases: Vec<DatabaseMetricsRow> = by_db
+        .into_iter()
+        .map(|(database, metrics)| DatabaseMetricsRow { database, metrics })
+        .collect();
+
+    // Largest database first (by the headline size metric); fall back to name.
+    databases.sort_by(|a, b| {
+        let av = a
+            .metrics
+            .get("pg.database_size_bytes")
+            .copied()
+            .unwrap_or(0.0);
+        let bv = b
+            .metrics
+            .get("pg.database_size_bytes")
+            .copied()
+            .unwrap_or(0.0);
+        bv.partial_cmp(&av)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.database.cmp(&b.database))
+    });
+
+    Ok((StatusCode::OK, Json(DatabaseMetricsResponse { databases })))
 }
 
 // ---------------------------------------------------------------------------
@@ -1206,6 +1334,10 @@ pub fn configure_metrics_routes() -> Router<Arc<AppState>> {
             get(get_service_metrics_status),
         )
         .route(
+            "/external-services/{id}/metrics/by-database",
+            get(get_service_metrics_by_database),
+        )
+        .route(
             "/external-services/{id}/metrics/alert-rules",
             get(list_service_alert_rules).post(create_service_alert_rule),
         )
@@ -1244,6 +1376,7 @@ pub fn configure_metrics_routes() -> Router<Arc<AppState>> {
         get_service_metrics_range,
         get_service_metrics_latest,
         get_service_metrics_status,
+        get_service_metrics_by_database,
         list_service_alert_rules,
         create_service_alert_rule,
         update_service_alert_rule,
@@ -1258,6 +1391,8 @@ pub fn configure_metrics_routes() -> Router<Arc<AppState>> {
         MetricDataPoint,
         MetricsRangeQuery,
         MetricsStatusResponse,
+        DatabaseMetricsRow,
+        DatabaseMetricsResponse,
         AlertRuleResponse,
         CreateAlertRuleRequest,
         UpdateAlertRuleRequest,

@@ -3062,6 +3062,39 @@ export type DataImplication = {
 export type DataImplicationSeverity = 'info' | 'warning' | 'data-not-migrated' | 'potential-data-loss';
 
 /**
+ * Response for the per-database metrics breakdown.
+ */
+export type DatabaseMetricsResponse = {
+    /**
+     * One entry per database, sorted by the first metric descending
+     * (largest first) so the biggest database leads the table.
+     */
+    databases: Array<DatabaseMetricsRow>;
+};
+
+/**
+ * Per-database metric values for a Postgres service.
+ *
+ * A Postgres instance can host many databases (some unrelated to this
+ * service). The collector records per-`datname` series; this groups the
+ * latest value of each requested metric by database so the UI can render a
+ * "Databases" breakdown table instead of one collapsed number.
+ */
+export type DatabaseMetricsRow = {
+    /**
+     * Database name (`datname`).
+     */
+    database: string;
+    /**
+     * Latest value of each requested metric for this database
+     * (e.g. `{"pg.database_size_bytes": 7943871, "pg.cache_hit_ratio": 0.99}`).
+     */
+    metrics: {
+        [key: string]: number;
+    };
+};
+
+/**
  * Request to delete keys
  */
 export type DelRequest = {
@@ -23147,6 +23180,42 @@ export type ExternalServiceMetricsUpdateAlertRuleResponses = {
 };
 
 export type ExternalServiceMetricsUpdateAlertRuleResponse = ExternalServiceMetricsUpdateAlertRuleResponses[keyof ExternalServiceMetricsUpdateAlertRuleResponses];
+
+export type ExternalServiceMetricsByDatabaseData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/metrics/by-database';
+};
+
+export type ExternalServiceMetricsByDatabaseErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * Metrics not available
+     */
+    503: unknown;
+};
+
+export type ExternalServiceMetricsByDatabaseResponses = {
+    /**
+     * Per-database metric breakdown
+     */
+    200: DatabaseMetricsResponse;
+};
+
+export type ExternalServiceMetricsByDatabaseResponse = ExternalServiceMetricsByDatabaseResponses[keyof ExternalServiceMetricsByDatabaseResponses];
 
 export type ExternalServiceMetricsToggleData = {
     body: ToggleServiceMetricsRequest;

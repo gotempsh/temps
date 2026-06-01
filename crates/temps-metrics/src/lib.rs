@@ -14,4 +14,7 @@ pub use error::MetricsError;
 pub use scraper::MetricsScraper;
 pub use store::clickhouse::ClickhouseMetricsStore;
 pub use store::timescale::{validate_metric_name, TimescaleMetricsStore};
-pub use store::{LatestQuery, MetricKind, MetricPoint, MetricsStore, RangeQuery, SourceKind};
+pub use store::{
+    LabelledMetric, LatestByLabelQuery, LatestQuery, MetricKind, MetricPoint, MetricsStore,
+    RangeQuery, SourceKind,
+};

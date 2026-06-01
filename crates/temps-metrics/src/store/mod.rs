@@ -109,6 +109,34 @@ pub struct LatestQuery {
     pub names: Vec<String>,
 }
 
+/// Parameters for a per-label-value latest query.
+///
+/// Returns the most-recent value of each requested metric **grouped by the
+/// distinct values of a single label key** (e.g. `datname` for Postgres
+/// per-database metrics). Used to build a breakdown table — one row per
+/// database — instead of collapsing every `datname` series into one number.
+#[derive(Debug, Clone)]
+pub struct LatestByLabelQuery {
+    pub source_kind: SourceKind,
+    pub source_id: i32,
+    /// Metric names to retrieve (e.g. `pg.database_size_bytes`,
+    /// `pg.cache_hit_ratio`).
+    pub names: Vec<String>,
+    /// Label key to group by (e.g. `"datname"`). Only rows that carry this
+    /// label key are returned; the instance-wide aggregate row (which lacks it)
+    /// is excluded.
+    pub label_key: String,
+}
+
+/// One `(label_value, metric_name, value)` triple from a [`LatestByLabelQuery`].
+#[derive(Debug, Clone)]
+pub struct LabelledMetric {
+    /// The value of the grouped label key (e.g. the database name).
+    pub label_value: String,
+    pub name: String,
+    pub value: f64,
+}
+
 /// Abstraction over the metrics storage backend.
 #[async_trait]
 pub trait MetricsStore: Send + Sync {
@@ -144,6 +172,15 @@ pub trait MetricsStore: Send + Sync {
     /// Return the most-recent value for each requested metric name.
     async fn query_latest(&self, filter: LatestQuery)
         -> Result<HashMap<String, f64>, MetricsError>;
+
+    /// Return the most-recent value of each requested metric, grouped by the
+    /// distinct values of a single label key (e.g. `datname`). One entry per
+    /// `(label_value, metric_name)`. Rows lacking the label key (the
+    /// instance-wide aggregate) are excluded.
+    async fn query_latest_by_label(
+        &self,
+        filter: LatestByLabelQuery,
+    ) -> Result<Vec<LabelledMetric>, MetricsError>;
 
     /// Return the timestamp of the most-recent metric row for a source, or
     /// `None` if no metrics have ever been recorded. Used by the UI to show

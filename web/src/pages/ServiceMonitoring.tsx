@@ -40,6 +40,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   getServiceOptions,
   externalServiceMetricsStatusOptions,
+  externalServiceMetricsByDatabaseOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import {
   Activity,
@@ -51,6 +52,7 @@ import {
 } from 'lucide-react'
 import { createContext, useContext, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
+import { usePageTitle } from '@/hooks/usePageTitle'
 import { toast } from 'sonner'
 import {
   LineChart,
@@ -168,6 +170,15 @@ type MetricGroup = {
   metrics: string[]
 }
 
+// NOTE (Postgres scope): metrics split into two buckets.
+//   * GLOBAL (here, in ENGINE_GROUPS): instance-wide stats that have no
+//     per-database breakdown — connection/lock state (`pg_stat_activity` is
+//     cluster-wide), table-level tuple/scan stats (aggregated across all user
+//     tables), and WAL/replication (single cluster-wide stream).
+//   * PER-DATABASE (PG_PER_DATABASE_GROUPS): emitted once per `datname` plus an
+//     instance aggregate. Shown in the dedicated "Databases" section with a
+//     database selector, NOT in these top tiles, so a per-db sum never sits
+//     unlabelled next to a true global metric.
 const ENGINE_GROUPS: Record<EngineKind, MetricGroup[]> = {
   postgres: [
     {
@@ -184,23 +195,8 @@ const ENGINE_GROUPS: Record<EngineKind, MetricGroup[]> = {
       ],
     },
     {
-      title: 'Performance',
+      title: 'Tables',
       metrics: [
-        'pg.cache_hit_ratio',
-        'pg.tuple_fetch_ratio',
-        'pg.commits_total',
-        'pg.rollbacks_total',
-        'pg.deadlocks_total',
-        'pg.temp_files_total',
-        'pg.temp_bytes_total',
-      ],
-    },
-    {
-      title: 'Throughput',
-      metrics: [
-        'pg.tuples_inserted_total',
-        'pg.tuples_updated_total',
-        'pg.tuples_deleted_total',
         'pg.tuples_live',
         'pg.tuples_dead',
         'pg.dead_tuple_ratio',
@@ -226,10 +222,6 @@ const ENGINE_GROUPS: Record<EngineKind, MetricGroup[]> = {
         'pg.replication_write_lag_seconds',
         'pg.replication_replay_lag_seconds',
       ],
-    },
-    {
-      title: 'Storage',
-      metrics: ['pg.database_size_bytes'],
     },
   ],
   redis: [
@@ -388,11 +380,52 @@ const ENGINE_GROUPS: Record<EngineKind, MetricGroup[]> = {
   ],
 }
 
-// All known metrics for alert rule creation
+// Per-database Postgres metric groups, shown in the dedicated "Databases"
+// section with a database selector. Each metric is emitted once per `datname`
+// plus an instance-wide aggregate (selector value "All databases"). Order /
+// titles mirror the old Performance + Throughput tile groups.
+const PG_PER_DATABASE_GROUPS: MetricGroup[] = [
+  {
+    title: 'Storage',
+    metrics: ['pg.database_size_bytes'],
+  },
+  {
+    title: 'Performance',
+    metrics: [
+      'pg.cache_hit_ratio',
+      'pg.tuple_fetch_ratio',
+      'pg.commits_total',
+      'pg.rollbacks_total',
+      'pg.deadlocks_total',
+      'pg.temp_files_total',
+      'pg.temp_bytes_total',
+    ],
+  },
+  {
+    title: 'Write Activity',
+    metrics: [
+      'pg.tuples_inserted_total',
+      'pg.tuples_updated_total',
+      'pg.tuples_deleted_total',
+    ],
+  },
+]
+
+// Flat list of every per-database metric name (for the by-database query).
+const PG_PER_DATABASE_METRICS: string[] = PG_PER_DATABASE_GROUPS.flatMap(
+  (g) => g.metrics,
+)
+
+// All known metrics for alert rule creation. For Postgres this includes both
+// the global metrics (ENGINE_GROUPS) and the per-database metrics so alert
+// rules can target either scope.
 const ALL_METRICS: Record<EngineKind, string[]> = Object.fromEntries(
   Object.entries(ENGINE_GROUPS).map(([engine, groups]) => [
     engine,
-    groups.flatMap((g) => g.metrics),
+    [
+      ...groups.flatMap((g) => g.metrics),
+      ...(engine === 'postgres' ? PG_PER_DATABASE_METRICS : []),
+    ],
   ]),
 ) as Record<EngineKind, string[]>
 
@@ -646,7 +679,10 @@ function MetricChart({ serviceId, metricName, range }: MetricChartProps) {
 
   return (
     <ResponsiveContainer width="100%" height="100%">
-      <LineChart data={chartData} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
+      {/* Right margin leaves room so the last data point isn't flush against
+          the panel edge — otherwise its hover tooltip renders past the edge and
+          gets clipped by the scroll container. */}
+      <LineChart data={chartData} margin={{ top: 4, right: 24, left: 0, bottom: 0 }}>
         <CartesianGrid strokeDasharray="3 3" stroke="rgba(128,128,128,0.15)" vertical={false} />
         <XAxis
           dataKey="time"
@@ -837,6 +873,99 @@ function AddAlertRuleDialog({
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// DatabasesSection — per-database breakdown for Postgres services
+// ---------------------------------------------------------------------------
+
+// Sentinel for the "All databases" selector option (instance-wide aggregate).
+const ALL_DATABASES = '__all__'
+
+type DatabasesSectionProps = {
+  serviceId: number
+  /** Instance-wide aggregate values (from query_latest) for "All databases". */
+  aggregateByName: Map<string, number>
+}
+
+/**
+ * Per-database Postgres metrics with a database selector.
+ *
+ * A Postgres instance can host many unrelated databases; these metrics
+ * (`pg_stat_database` + size) are emitted once per `datname`. The selector
+ * chooses "All databases" (the instance aggregate) or a single database, and
+ * the tile grids re-render for that scope. Kept separate from the global tiles
+ * so a per-db sum is never shown unlabelled next to a true instance metric.
+ */
+function DatabasesSection({ serviceId, aggregateByName }: DatabasesSectionProps) {
+  const refetchInterval = useRefreshInterval()
+  const [selected, setSelected] = useState<string>(ALL_DATABASES)
+
+  const { data, isLoading } = useQuery({
+    ...externalServiceMetricsByDatabaseOptions({ path: { id: serviceId } }),
+    refetchInterval,
+  })
+
+  const databases = data?.databases ?? []
+
+  // Don't render until at least one database has reported per-db metrics.
+  if (!isLoading && databases.length === 0) return null
+
+  // Resolve the value map for the current selection.
+  const valuesForSelection = (): Map<string, number> => {
+    if (selected === ALL_DATABASES) return aggregateByName
+    const db = databases.find((d) => d.database === selected)
+    const m = new Map<string, number>()
+    if (db?.metrics) {
+      for (const [name, value] of Object.entries(db.metrics)) m.set(name, value)
+    }
+    return m
+  }
+  const values = valuesForSelection()
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+        <h2 className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground">
+          Databases
+        </h2>
+        <Select value={selected} onValueChange={setSelected}>
+          <SelectTrigger className="w-full sm:w-[260px]">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value={ALL_DATABASES}>All databases</SelectItem>
+            {databases.map((db) => (
+              <SelectItem key={db.database} value={db.database}>
+                {db.database}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+
+      {PG_PER_DATABASE_GROUPS.map((group) => (
+        <div key={group.title}>
+          <div className="mb-2">
+            <h3 className="text-[10px] font-medium uppercase tracking-widest text-muted-foreground/70">
+              {group.title}
+            </h3>
+          </div>
+          <dl className="grid grid-cols-2 divide-x divide-y divide-border rounded-lg border border-border sm:grid-cols-3 lg:grid-cols-4">
+            {group.metrics.map((name) => (
+              <MetricTile
+                key={name}
+                name={name}
+                value={values.get(name)}
+                selected={false}
+                onClick={() => {}}
+              />
+            ))}
+          </dl>
+        </div>
+      ))}
+    </div>
   )
 }
 
@@ -1155,6 +1284,11 @@ function MonitoringDashboard({
         </div>
       ))}
 
+      {/* Per-database breakdown (Postgres) */}
+      {engine === 'postgres' && (
+        <DatabasesSection serviceId={serviceId} aggregateByName={latestByName} />
+      )}
+
       {/* Alert rules */}
       <AlertRulesSection serviceId={serviceId} engine={engine} />
     </div>
@@ -1185,6 +1319,12 @@ export function ServiceMonitoring() {
   const engine = normalizeEngine(
     serviceData?.service?.service_type ?? '',
     serviceData?.current_parameters?.docker_image,
+  )
+
+  usePageTitle(
+    serviceData?.service?.name
+      ? `${serviceData.service.name} · Monitoring`
+      : 'Monitoring',
   )
 
   const {

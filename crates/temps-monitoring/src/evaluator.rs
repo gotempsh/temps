@@ -1275,7 +1275,9 @@ mod tests {
     use temps_core::notifications::{
         EmailMessage, NotificationData, NotificationError, NotificationService,
     };
-    use temps_metrics::{MetricPoint, MetricsError, RangeQuery};
+    use temps_metrics::{
+        LabelledMetric, LatestByLabelQuery, MetricPoint, MetricsError, RangeQuery,
+    };
 
     /// No-op metrics store — `resolve_alarm_context` never touches it.
     struct NoopStore;
@@ -1296,6 +1298,12 @@ mod tests {
             _filter: LatestQuery,
         ) -> Result<HashMap<String, f64>, MetricsError> {
             Ok(HashMap::new())
+        }
+        async fn query_latest_by_label(
+            &self,
+            _filter: LatestByLabelQuery,
+        ) -> Result<Vec<LabelledMetric>, MetricsError> {
+            Ok(Vec::new())
         }
         async fn latest_timestamp(
             &self,
