@@ -158,6 +158,23 @@ impl MetricsStore for TimescaleMetricsStore {
             let mut rows: Vec<String> = Vec::with_capacity(chunk.len());
 
             for p in chunk {
+                // SECURITY(metrics-security-1): validate the metric name before
+                // it is interpolated into SQL below. Metric names on the OTLP
+                // `si_` ingest path come straight off the wire (untrusted), and
+                // the read path (`query_*`) already rejects names outside the
+                // allowlist. Applying the same gate here keeps the write path
+                // from being the weaker link: a name with SQL metacharacters is
+                // dropped with a warning rather than escaped-and-stored.
+                if validate_metric_name(&p.name).is_err() {
+                    warn!(
+                        metric = %p.name,
+                        source_id = p.source_id,
+                        "Skipping metric point: name contains characters outside the \
+                         [a-zA-Z0-9_.:-] allowlist (possible injection attempt)"
+                    );
+                    continue;
+                }
+
                 // Enforce Counter delta contract in debug builds.
                 // (Issue 8: counter delta loss on restart is a caller
                 //  responsibility; this assert validates the invariant.)
@@ -908,5 +925,110 @@ mod tests {
             fractional_len, 6,
             "expected 6 fractional digits, got {fractional_len}"
         );
+    }
+
+    // ── write_batch metric-name validation (SECURITY metrics-security-1) ───────
+    //
+    // These verify that `write_batch` applies the `validate_metric_name`
+    // allowlist before interpolating the name into the metrics INSERT.
+    //
+    // `write_batch` executes up to two statements per call:
+    //   1. the metrics INSERT — ONLY when at least one point survives validation
+    //      (an all-dropped chunk hits `rows.is_empty()` → `continue`, no INSERT)
+    //   2. the `service_metrics_status` freshness upsert — always runs for a
+    //      non-empty input batch, and is name-independent (source_kind is an
+    //      enum, source_id is i32), so it carries no injection risk.
+    //
+    // `Transaction` doesn't expose its SQL text, so we assert on the count of
+    // statements the MockDatabase logged. The signal is the metrics INSERT:
+    //   • all-invalid input  → 1 statement  (status upsert only, no INSERT)
+    //   • one valid point     → 2 statements (metrics INSERT + status upsert)
+    // The difference of exactly one INSERT proves the malicious name was
+    // dropped before reaching SQL — a kept row would have produced an INSERT.
+
+    use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
+
+    /// Build a store over a MockDatabase that accepts up to `n` execute() calls.
+    fn mock_store(n: usize) -> (TimescaleMetricsStore, Arc<DatabaseConnection>) {
+        let exec_results: Vec<MockExecResult> = (0..n)
+            .map(|_| MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            })
+            .collect();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results(exec_results)
+                .into_connection(),
+        );
+        (TimescaleMetricsStore::new(db.clone()), db)
+    }
+
+    /// Number of statements the mock actually executed. Consumes the store so
+    /// its `Arc<DatabaseConnection>` clone is dropped, leaving this `db` as the
+    /// sole owner for `into_transaction_log()`.
+    fn executed_count(store: TimescaleMetricsStore, db: Arc<DatabaseConnection>) -> usize {
+        drop(store);
+        Arc::try_unwrap(db)
+            .expect("store dropped, so this is the only remaining ref")
+            .into_transaction_log()
+            .len()
+    }
+
+    #[tokio::test]
+    async fn write_batch_skips_malicious_metric_name() {
+        // A single point whose name is a SQL-injection payload must be dropped:
+        // no surviving rows → NO metrics INSERT. Only the name-independent
+        // status upsert runs (1 statement), never the metrics INSERT.
+        let (store, db) = mock_store(2); // allow up to 2 so a stray INSERT wouldn't error out
+
+        store
+            .write_batch(vec![make_gauge("x'); DROP TABLE service_metrics; --", 1.0)])
+            .await
+            .expect("write_batch should succeed (the bad point is skipped, not an error)");
+
+        assert_eq!(
+            executed_count(store, db),
+            1,
+            "all-invalid batch must run ONLY the status upsert — no metrics INSERT \
+             (the malicious name was dropped before SQL)"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_batch_drops_only_the_malicious_point() {
+        // Mixed batch: the valid point survives (metrics INSERT runs), the
+        // malicious one is dropped. 2 statements = metrics INSERT + status
+        // upsert — same as a fully-valid single-point batch, proving the bad
+        // point neither blocked the write nor added a second INSERT.
+        let (store, db) = mock_store(2);
+
+        store
+            .write_batch(vec![
+                make_gauge("pg.connections", 5.0),
+                make_gauge("evil'); DELETE FROM service_metrics WHERE '1'='1", 9.0),
+            ])
+            .await
+            .expect("write_batch should succeed");
+
+        assert_eq!(
+            executed_count(store, db),
+            2,
+            "metrics INSERT (for the one valid point) + status upsert"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_batch_inserts_valid_name() {
+        // Sanity baseline: a single valid point → metrics INSERT + status
+        // upsert = 2 statements.
+        let (store, db) = mock_store(2);
+
+        store
+            .write_batch(vec![make_gauge("redis.connected_clients", 3.0)])
+            .await
+            .expect("write_batch should succeed");
+
+        assert_eq!(executed_count(store, db), 2);
     }
 }

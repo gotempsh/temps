@@ -174,7 +174,13 @@ pub struct ToggleDeploymentMetricsRequest {
 }
 
 /// Wire representation of a monitoring alert rule.
+///
+/// Registered under a domain-prefixed OpenAPI schema name to avoid colliding
+/// with `temps-error-tracking`'s unrelated `AlertRuleResponse` (utoipa keys
+/// schemas by their bare struct name, so without `as = ...` the last crate to
+/// register would silently shadow this one in the merged spec / generated SDK).
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[schema(as = ServiceAlertRuleResponse)]
 pub struct AlertRuleResponse {
     pub id: i32,
     pub service_id: Option<i32>,
@@ -208,7 +214,10 @@ impl From<monitoring_alert_rules::Model> for AlertRuleResponse {
 }
 
 /// Request body for creating an alert rule on an external service.
+///
+/// Domain-prefixed schema name — see [`AlertRuleResponse`] for why.
 #[derive(Debug, Deserialize, ToSchema)]
+#[schema(as = ServiceCreateAlertRuleRequest)]
 pub struct CreateAlertRuleRequest {
     pub name: String,
     pub metric_name: String,
@@ -229,7 +238,10 @@ fn default_enabled() -> bool {
 }
 
 /// Request body for updating an existing alert rule.
+///
+/// Domain-prefixed schema name — see [`AlertRuleResponse`] for why.
 #[derive(Debug, Deserialize, ToSchema)]
+#[schema(as = ServiceUpdateAlertRuleRequest)]
 pub struct UpdateAlertRuleRequest {
     pub name: Option<String>,
     pub metric_name: Option<String>,
@@ -859,6 +871,11 @@ async fn toggle_service_metrics(
     Json(request): Json<ToggleServiceMetricsRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesWrite);
+    // SECURITY(metrics-security-6): verify the service belongs to the caller
+    // before mutating it. Without this, any ExternalServicesWrite holder could
+    // toggle monitoring on another tenant's service — and enabling it
+    // provisions a new `si_` ingest key and restarts that service's container.
+    assert_service_owned_by_caller(id, &auth, &state).await?;
 
     if request.enabled {
         // Look up the service engine so we can seed the right default rules.
@@ -1003,6 +1020,7 @@ async fn get_deployment_metrics_range(
     Query(params): Query<MetricsRangeQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    assert_deployment_owned_by_caller(id, &auth, &state).await?;
 
     let store = state.metrics_store.as_ref().ok_or_else(|| {
         ErrorBuilder::new(StatusCode::SERVICE_UNAVAILABLE)
@@ -1070,6 +1088,7 @@ async fn get_deployment_metrics_latest(
     Path(id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    assert_deployment_owned_by_caller(id, &auth, &state).await?;
 
     let store = state.metrics_store.as_ref().ok_or_else(|| {
         ErrorBuilder::new(StatusCode::SERVICE_UNAVAILABLE)
@@ -1127,6 +1146,7 @@ async fn toggle_deployment_metrics(
     Json(request): Json<ToggleDeploymentMetricsRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsWrite);
+    assert_deployment_owned_by_caller(id, &auth, &state).await?;
 
     if request.enabled {
         if let Err(e) = temps_monitoring::seed_default_container_rules(state.db.as_ref(), id).await
@@ -1314,6 +1334,72 @@ async fn assert_service_owned_by_caller(
     Ok(())
 }
 
+/// Pure authorization policy: may a caller see/act on a deployment?
+///
+/// `caller_project_id` is the project a deployment token is bound to
+/// (`AuthContext::project_id()`), or `None` for a session user.
+///
+/// * `None` (session user) — visible. For the current single-project model a
+///   session user may access any project; the strict multi-tenant
+///   `project_members` check is tracked in the FIXME on
+///   `assert_service_owned_by_caller`.
+/// * `Some(pid)` (deployment token) — visible only if the deployment lives in
+///   that bound project.
+///
+/// Extracted as a pure fn so the security rule is unit-testable without
+/// constructing an `AppState`.
+fn deployment_visible_to_caller(
+    deployment_project_id: i32,
+    caller_project_id: Option<i32>,
+) -> bool {
+    match caller_project_id {
+        None => true,
+        Some(pid) => deployment_project_id == pid,
+    }
+}
+
+/// Verify the caller is allowed to act on the given deployment.
+///
+/// SECURITY(metrics-security-6): deployment metrics handlers take a deployment
+/// `{id}` from the path and check a `Deployments*` permission, but without this
+/// they never verify the deployment belongs to the caller — letting any holder
+/// of the permission read or toggle metrics on another tenant's deployment by
+/// changing the URL id (IDOR). Mirrors `assert_service_owned_by_caller`.
+///
+/// Returns 404 (not 403) when the deployment isn't visible to the caller, so we
+/// don't leak the existence of other tenants' deployments.
+async fn assert_deployment_owned_by_caller(
+    deployment_id: i32,
+    auth: &temps_auth::AuthContext,
+    state: &AppState,
+) -> Result<(), Problem> {
+    use temps_entities::deployments;
+
+    let deployment = deployments::Entity::find_by_id(deployment_id)
+        .one(state.db.as_ref())
+        .await
+        .map_err(|e| {
+            error!(deployment_id, error = %e, "assert_deployment_owned: DB error");
+            internal_server_error()
+                .detail("Failed to verify deployment ownership")
+                .build()
+        })?;
+
+    let Some(deployment) = deployment else {
+        return Err(not_found()
+            .detail(format!("Deployment {} not found", deployment_id))
+            .build());
+    };
+
+    if !deployment_visible_to_caller(deployment.project_id, auth.project_id()) {
+        return Err(not_found()
+            .detail(format!("Deployment {} not found", deployment_id))
+            .build());
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Route builder
 // ---------------------------------------------------------------------------
@@ -1487,5 +1573,34 @@ mod tests {
     fn test_validate_severity_invalid() {
         assert!(validate_severity("info").is_err());
         assert!(validate_severity("").is_err());
+    }
+
+    // ── deployment ownership policy (SECURITY metrics-security-6 / IDOR) ───────
+    //
+    // `deployment_visible_to_caller` is the pure policy behind
+    // `assert_deployment_owned_by_caller`. The IDOR fix hinges on a
+    // deployment-token caller only seeing deployments in its own bound project,
+    // so these assert that rule directly (no AppState needed).
+
+    #[test]
+    fn deployment_token_can_see_its_own_project_deployment() {
+        // Token bound to project 7, deployment lives in project 7 → visible.
+        assert!(deployment_visible_to_caller(7, Some(7)));
+    }
+
+    #[test]
+    fn deployment_token_cannot_see_other_project_deployment() {
+        // Token bound to project 7, deployment lives in project 8 → IDOR blocked.
+        assert!(!deployment_visible_to_caller(8, Some(7)));
+        // And the symmetric case, to be explicit.
+        assert!(!deployment_visible_to_caller(7, Some(8)));
+    }
+
+    #[test]
+    fn session_user_can_see_any_deployment() {
+        // No bound project (session user) → visible under the current
+        // single-project model, regardless of the deployment's project.
+        assert!(deployment_visible_to_caller(1, None));
+        assert!(deployment_visible_to_caller(999, None));
     }
 }

@@ -21,7 +21,9 @@ use crate::types::{MetricPoint as OtlpMetricPoint, MetricType};
 use crate::OtelAppState;
 use temps_core::problemdetails::{self, Problem};
 use temps_core::ProblemDetails;
-use temps_metrics::{MetricKind, MetricPoint as StoreMetricPoint, SourceKind};
+use temps_metrics::{
+    validate_metric_name, MetricKind, MetricPoint as StoreMetricPoint, SourceKind,
+};
 
 impl From<OtelError> for Problem {
     fn from(error: OtelError) -> Self {
@@ -32,7 +34,7 @@ impl From<OtelError> for Problem {
                     .with_title("Authentication Failed")
                     .with_detail(error.to_string())
             }
-            OtelError::RateLimitExceeded { .. } => {
+            OtelError::RateLimitExceeded { .. } | OtelError::ServiceRateLimitExceeded { .. } => {
                 warn!(error = %error, "OTel ingest rate limited");
                 problemdetails::new(StatusCode::TOO_MANY_REQUESTS)
                     .with_title("Rate Limit Exceeded")
@@ -180,6 +182,19 @@ fn otlp_to_store_point(p: &OtlpMetricPoint, deployment_id: i32) -> Option<StoreM
         return None;
     }
 
+    // SECURITY(metrics-security-1): OTLP metric names are attacker-controllable
+    // (sent by the deployed application) and are interpolated into SQL by the
+    // store. Drop names outside the [a-zA-Z0-9_.:-] allowlist at this trust
+    // boundary so they never reach the write path.
+    if validate_metric_name(&p.metric_name).is_err() {
+        warn!(
+            deployment_id,
+            metric_name = %p.metric_name,
+            "Dropping deployment metric: name outside allowlist (possible injection attempt)"
+        );
+        return None;
+    }
+
     let value = p.value?;
 
     // Both Sum and Gauge are stored as MetricKind::Gauge.
@@ -323,6 +338,14 @@ async fn do_ingest_service_metrics(
     headers: &HeaderMap,
     body: &Bytes,
 ) -> Result<(StatusCode, [(&'static str, &'static str); 1], Vec<u8>), Problem> {
+    // SECURITY(metrics-security-2): the `si_` ingest path is otherwise
+    // unthrottled. Apply a per-service rate limit (keyed on service_id) before
+    // doing any decode/decompress work, so a runaway or compromised exporter
+    // can't flood the metrics write channel / TimescaleDB. Fail fast with 429.
+    state
+        .otel_service
+        .check_service_rate_limit(service_auth.service_id)?;
+
     let data = decode::decompress(body, content_encoding(headers))?;
     // project_id = 0 and deployment_id = None: service metrics are not scoped
     // to a project.  The decode function attaches project_id to each point for
@@ -349,6 +372,19 @@ async fn do_ingest_service_metrics(
             .iter()
             .filter_map(|p| {
                 if p.metric_type == MetricType::Histogram {
+                    return None;
+                }
+                // SECURITY(metrics-security-1): metric names on the `si_` ingest
+                // path are attacker-controllable (sent by the monitored
+                // container over OTLP) and are interpolated into SQL by the
+                // store. Drop names outside the [a-zA-Z0-9_.:-] allowlist here,
+                // at the trust boundary, so they never reach the write path.
+                if validate_metric_name(&p.metric_name).is_err() {
+                    warn!(
+                        service_id = service_auth.service_id,
+                        metric_name = %p.metric_name,
+                        "Dropping service metric: name outside allowlist (possible injection attempt)"
+                    );
                     return None;
                 }
                 let value = p.value?;
@@ -1143,6 +1179,41 @@ mod tests {
             otlp_to_store_point(&p, 42).is_none(),
             "Histogram points have no scalar value and must be dropped"
         );
+    }
+
+    /// SECURITY(metrics-security-1): OTLP metric names are attacker-controllable
+    /// and are interpolated into SQL by the store. `otlp_to_store_point` must
+    /// drop names outside the [a-zA-Z0-9_.:-] allowlist at this trust boundary
+    /// (returning `None`) so they never reach the write path. This is the
+    /// deployment-path counterpart of the `si_` service-ingest guard.
+    #[test]
+    fn test_otlp_rejects_sql_injection_metric_name() {
+        for payload in [
+            "x'); DROP TABLE service_metrics; --",
+            "metric' OR '1'='1",
+            "name with space",
+            "name;semicolon",
+            "name\nnewline",
+            "", // empty is also rejected by the allowlist
+        ] {
+            let mut p = make_otlp_point(MetricType::Gauge, 1.0);
+            p.metric_name = payload.to_string();
+            assert!(
+                otlp_to_store_point(&p, 42).is_none(),
+                "injection/invalid name must be dropped before reaching SQL: {payload:?}"
+            );
+        }
+    }
+
+    /// Counterpart to the rejection test: a well-formed name passes through and
+    /// carries its value, confirming the guard doesn't over-reject.
+    #[test]
+    fn test_otlp_accepts_valid_metric_name() {
+        let mut p = make_otlp_point(MetricType::Gauge, 42.0);
+        p.metric_name = "rustfs.storage.used_bytes".to_string();
+        let sp = otlp_to_store_point(&p, 42).expect("valid name should produce a store point");
+        assert_eq!(sp.name, "rustfs.storage.used_bytes");
+        assert_eq!(sp.value, 42.0);
     }
 
     /// SECURITY(metrics-security-5): label count cap must be enforced.
