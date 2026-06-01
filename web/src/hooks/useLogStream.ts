@@ -18,7 +18,12 @@ export interface UseLogStreamOptions {
   maxLogs?: number
 }
 
-const DEFAULT_MAX_LOGS = 5000
+// Bounded tail buffer — older lines fall off the top when the buffer is
+// full, matching how `docker logs --tail 1000 --follow` behaves. Keeps the
+// browser responsive even on a chatty service that emits hundreds of lines
+// per second over a long session. The history viewer is where users go when
+// they need older data.
+const DEFAULT_MAX_LOGS = 1000
 
 export interface UseLogStreamReturn {
   logs: LiveLogLine[]
@@ -88,26 +93,11 @@ function parseLine(raw: string): LiveLogLine {
   }
 }
 
-function estimateLineHeight(content: string, containerWidth: number) {
-  const averageCharWidth = 9
-  const lineHeight = 20
-  const minHeight = 24
-
-  if (!content || !containerWidth) return minHeight
-
-  const paddingHeight = 8
-  const effectiveWidth = containerWidth - 32
-  const charactersPerLine = Math.max(
-    1,
-    Math.floor(effectiveWidth / averageCharWidth)
-  )
-  const estimatedLines = Math.max(
-    1,
-    Math.ceil(content.length / charactersPerLine)
-  )
-
-  return Math.max(minHeight, lineHeight * estimatedLines + paddingHeight)
-}
+// Fixed row height — matches the history viewer (history-log-viewer.tsx:337).
+// Single-line ASCII rows: overflow becomes a horizontal scroll on the row's
+// message span rather than wrapping into a tall stack. Keeps the cadence
+// terminal-like and the virtualizer fast (no per-row measurement).
+const ROW_HEIGHT_PX = 22
 
 export function useLogStream({
   wsUrl,
@@ -134,7 +124,6 @@ export function useLogStream({
   const parentRef = useRef<HTMLDivElement>(null)
   const wsRef = useRef<WebSocket | null>(null)
   const isConnectingRef = useRef(false)
-  const containerWidth = useRef<number>(0)
   // Buffer incoming WS frames and flush once per animation frame. Without this,
   // a high-volume log source produces one setState per line, which makes React
   // re-render the virtualizer for every byte and freezes the tab.
@@ -161,16 +150,8 @@ export function useLogStream({
   const virtualizer = useVirtualizer({
     count: filteredLogs.length,
     getScrollElement: () => parentRef.current,
-    estimateSize: (index) => {
-      return estimateLineHeight(
-        filteredLogs[index]?.message ?? '',
-        containerWidth.current
-      )
-    },
-    overscan: 5,
-    measureElement: (element) => {
-      return element?.getBoundingClientRect().height ?? 0
-    },
+    estimateSize: () => ROW_HEIGHT_PX,
+    overscan: 20,
   })
 
   // WebSocket connection effect
@@ -347,19 +328,6 @@ export function useLogStream({
       }
     })
   }, [])
-
-  // Add ResizeObserver to track container width
-  useEffect(() => {
-    if (parentRef.current) {
-      const resizeObserver = new ResizeObserver((entries) => {
-        containerWidth.current = entries[0].contentRect.width
-        virtualizer.measure()
-      })
-
-      resizeObserver.observe(parentRef.current)
-      return () => resizeObserver.disconnect()
-    }
-  }, [virtualizer])
 
   // Search and match scrolling
   const scrollToMatch = useCallback(

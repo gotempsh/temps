@@ -53,6 +53,7 @@ export function ContainerDetail({
       projectId={projectId}
       environmentId={environmentId}
       containerId={containerId}
+      serviceName={container.service_name ?? container.container_name ?? null}
     />
   )
 }

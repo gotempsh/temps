@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `service_metrics` raw retention 7 → 30 days; daily-aggregate retention 2 years → 1 year.
 - MinIO removed from the S3 service creation UI; RustFS is now the sole default object-storage engine.
 - Service-detail monitoring card no longer polls the metrics API when monitoring is disabled for that service.
+- Runtime/container log viewer redesigned to match the history viewer: ANSI color rendering, inferred severity levels with colored badges, parsed timestamps, toggleable timestamp/level/service columns (persisted per-browser), and fixed-height virtualized rows. The live tail buffer is bounded at 1000 lines (older lines fall off the top, like `docker logs --tail`) so a chatty service can't freeze the tab.
 - Database migration startup timeout raised from 120s to 600s, and a 15s `lock_timeout` is set before applying so a migration blocked on a lock fails fast instead of hanging the whole startup window. Migrations that exceed the window now print guidance to run `temps migrate` manually with the new binary before restarting.
 - Migrations are now tolerant of unknown/extra applied rows: a migration history containing rows this binary doesn't define (e.g. from a newer build or the Enterprise Edition) no longer blocks startup — only this binary's own pending migrations are applied.
 
