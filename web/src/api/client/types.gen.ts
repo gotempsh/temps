@@ -11640,6 +11640,28 @@ export type ServiceAccessInfo = {
 export type ServiceAction = 'create' | 'link-external' | 'skip';
 
 /**
+ * Wire representation of a monitoring alert rule.
+ *
+ * Registered under a domain-prefixed OpenAPI schema name to avoid colliding
+ * with `temps-error-tracking`'s unrelated `AlertRuleResponse` (utoipa keys
+ * schemas by their bare struct name, so without `as = ...` the last crate to
+ * register would silently shadow this one in the merged spec / generated SDK).
+ */
+export type ServiceAlertRuleResponse = {
+    comparator: string;
+    deployment_id?: number | null;
+    enabled: boolean;
+    for_duration_secs: number;
+    id: number;
+    metric_name: string;
+    name: string;
+    service_id?: number | null;
+    severity: string;
+    silenced_until?: string | null;
+    threshold: number;
+};
+
+/**
  * A single backup entry in the per-service backup list.
  */
 export type ServiceBackupEntryResponse = {
@@ -11723,6 +11745,30 @@ export type ServiceBackupListResponse = {
      * Total number of backups for this service across all pages.
      */
     total: number;
+};
+
+/**
+ * Request body for creating an alert rule on an external service.
+ *
+ * Domain-prefixed schema name — see [`AlertRuleResponse`] for why.
+ */
+export type ServiceCreateAlertRuleRequest = {
+    /**
+     * One of `>`, `<`, `>=`, `<=`.
+     */
+    comparator: string;
+    enabled?: boolean;
+    /**
+     * Seconds the breach must persist before the alarm fires (0 = immediate).
+     */
+    for_duration_secs?: number;
+    metric_name: string;
+    name: string;
+    /**
+     * `"warning"` or `"critical"`.
+     */
+    severity: string;
+    threshold: number;
 };
 
 export type ServiceHealthResponse = {
@@ -11930,6 +11976,21 @@ export type ServiceTypeInfo = {
 };
 
 export type ServiceTypeRoute = 'mongodb' | 'postgres' | 'redis' | 's3' | 'kv' | 'blob' | 'rustfs' | 'minio';
+
+/**
+ * Request body for updating an existing alert rule.
+ *
+ * Domain-prefixed schema name — see [`AlertRuleResponse`] for why.
+ */
+export type ServiceUpdateAlertRuleRequest = {
+    comparator?: string | null;
+    enabled?: boolean | null;
+    for_duration_secs?: number | null;
+    metric_name?: string | null;
+    name?: string | null;
+    severity?: string | null;
+    threshold?: number | null;
+};
 
 export type SesCredentialsRequest = {
     access_key_id: string;
@@ -23044,13 +23105,13 @@ export type ExternalServiceMetricsGetAlertRulesResponses = {
     /**
      * List of alert rules
      */
-    200: Array<AlertRuleResponse>;
+    200: Array<ServiceAlertRuleResponse>;
 };
 
 export type ExternalServiceMetricsGetAlertRulesResponse = ExternalServiceMetricsGetAlertRulesResponses[keyof ExternalServiceMetricsGetAlertRulesResponses];
 
 export type ExternalServiceMetricsCreateAlertRuleData = {
-    body: CreateAlertRuleRequest;
+    body: ServiceCreateAlertRuleRequest;
     path: {
         /**
          * External service ID
@@ -23084,7 +23145,7 @@ export type ExternalServiceMetricsCreateAlertRuleResponses = {
     /**
      * Alert rule created
      */
-    201: AlertRuleResponse;
+    201: ServiceAlertRuleResponse;
 };
 
 export type ExternalServiceMetricsCreateAlertRuleResponse = ExternalServiceMetricsCreateAlertRuleResponses[keyof ExternalServiceMetricsCreateAlertRuleResponses];
@@ -23134,7 +23195,7 @@ export type ExternalServiceMetricsDeleteAlertRuleResponses = {
 export type ExternalServiceMetricsDeleteAlertRuleResponse = ExternalServiceMetricsDeleteAlertRuleResponses[keyof ExternalServiceMetricsDeleteAlertRuleResponses];
 
 export type ExternalServiceMetricsUpdateAlertRuleData = {
-    body: UpdateAlertRuleRequest;
+    body: ServiceUpdateAlertRuleRequest;
     path: {
         /**
          * External service ID
@@ -23176,7 +23237,7 @@ export type ExternalServiceMetricsUpdateAlertRuleResponses = {
     /**
      * Updated alert rule
      */
-    200: AlertRuleResponse;
+    200: ServiceAlertRuleResponse;
 };
 
 export type ExternalServiceMetricsUpdateAlertRuleResponse = ExternalServiceMetricsUpdateAlertRuleResponses[keyof ExternalServiceMetricsUpdateAlertRuleResponses];

@@ -1,16 +1,7 @@
 /**
  * MonitoringCard — per-service metrics, live stats, chart, and alert-rule management.
  *
- * TODO: regenerate OpenAPI SDK once the following backend endpoints are added:
- *   PATCH /api/external-services/{id}/metrics/enable
- *   GET   /api/external-services/{id}/metrics/latest
- *   GET   /api/external-services/{id}/metrics/range
- *   GET   /api/external-services/{id}/metrics/alert-rules
- *   POST  /api/external-services/{id}/metrics/alert-rules
- *   PATCH /api/external-services/{id}/metrics/alert-rules/{rule_id}
- *   DELETE /api/external-services/{id}/metrics/alert-rules/{rule_id}
- *
- * Until the SDK is regenerated, all calls go through typed fetch helpers below.
+ * All API calls go through the generated OpenAPI SDK (`@/api/client`).
  */
 
 import { Button } from '@/components/ui/button'
@@ -52,7 +43,19 @@ import {
 } from '@/components/ui/table'
 import { EmptyPlaceholder } from '@/components/EmptyPlaceholder'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { externalServiceMetricsStatusOptions } from '@/api/client/@tanstack/react-query.gen'
+import {
+  externalServiceMetricsStatusOptions,
+  externalServiceMetricsGetLatestOptions,
+  externalServiceMetricsGetLatestQueryKey,
+  externalServiceMetricsGetRangeOptions,
+  externalServiceMetricsGetAlertRulesOptions,
+  externalServiceMetricsGetAlertRulesQueryKey,
+  externalServiceMetricsCreateAlertRuleMutation,
+  externalServiceMetricsUpdateAlertRuleMutation,
+  externalServiceMetricsDeleteAlertRuleMutation,
+  externalServiceMetricsToggleMutation,
+} from '@/api/client/@tanstack/react-query.gen'
+import type { ServiceAlertRuleResponse } from '@/api/client/types.gen'
 import {
   Activity,
   AlertTriangle,
@@ -76,103 +79,22 @@ import {
 import { formatBytes } from '@/lib/utils'
 
 // ---------------------------------------------------------------------------
-// Types (hand-rolled until SDK is regenerated)
+// View-model types (derived from the generated SDK responses)
 // ---------------------------------------------------------------------------
 
-/** A single metric reading — normalised from the HashMap<String, f64> the
- *  backend returns (e.g. { "pg.connections_active": 12.0, ... }). */
+/** A single metric reading — normalised from the `{ name: value }` map the
+ *  `metrics/latest` endpoint returns (e.g. { "pg.connections_active": 12.0 }). */
 type MetricLatest = {
   name: string
   value: number
 }
 
-/** A (time, value) point returned by the /range endpoint. */
-type MetricRangePoint = {
-  time: string
-  value: number
-}
+/** Alert-rule form-state unions. The API accepts `comparator`/`severity` as
+ *  plain strings; these constrain the UI selects to the supported values. */
+type Comparator = 'gt' | 'lt' | 'gte' | 'lte'
+type Severity = 'info' | 'warning' | 'critical'
 
-/** One monitoring alert rule. */
-type ServiceAlertRule = {
-  id: number
-  name: string
-  metric_name: string
-  comparator: 'gt' | 'lt' | 'gte' | 'lte'
-  threshold: number
-  severity: 'info' | 'warning' | 'critical'
-  for_duration_secs: number
-  enabled: boolean
-  /** 'firing' | 'ok' — populated by the AlertEvaluator at query time. */
-  status: 'firing' | 'ok'
-}
-
-type ServiceAlertRuleCreateRequest = {
-  name: string
-  metric_name: string
-  comparator: 'gt' | 'lt' | 'gte' | 'lte'
-  threshold: number
-  severity: 'info' | 'warning' | 'critical'
-  for_duration_secs?: number
-  enabled?: boolean
-}
-
-type ServiceAlertRuleUpdateRequest = {
-  threshold?: number
-  enabled?: boolean
-}
-
-// ---------------------------------------------------------------------------
-// Fetch helpers (use /api prefix per project feedback)
-// ---------------------------------------------------------------------------
-
-async function enableMetrics(serviceId: number): Promise<void> {
-  const res = await fetch(
-    `/api/external-services/${serviceId}/metrics/enable`,
-    {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'include',
-      body: JSON.stringify({ enabled: true }),
-    },
-  )
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}))
-    throw new Error((err as { detail?: string }).detail ?? 'Failed to enable monitoring')
-  }
-}
-
-async function disableMetrics(serviceId: number): Promise<void> {
-  const res = await fetch(
-    `/api/external-services/${serviceId}/metrics/enable`,
-    {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'include',
-      body: JSON.stringify({ enabled: false }),
-    },
-  )
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}))
-    throw new Error((err as { detail?: string }).detail ?? 'Failed to disable monitoring')
-  }
-}
-
-async function fetchLatestMetrics(serviceId: number): Promise<MetricLatest[]> {
-  const res = await fetch(
-    `/api/external-services/${serviceId}/metrics/latest`,
-    { credentials: 'include' },
-  )
-  if (!res.ok) {
-    // Preserve the backend detail message so isDisabled detection works
-    const body = await res.json().catch(() => ({})) as { detail?: string; title?: string }
-    const detail = body.detail ?? body.title ?? `HTTP ${res.status}`
-    throw new Error(detail)
-  }
-  // Backend returns HashMap<String, f64> — convert to array
-  const map = await res.json() as Record<string, number>
-  return Object.entries(map).map(([name, value]) => ({ name, value }))
-}
-
+/** Map the human range selector (hours) to the API's `range` query value. */
 const HOURS_TO_RANGE: Record<number, string> = {
   1: '1h',
   6: '6h',
@@ -180,85 +102,29 @@ const HOURS_TO_RANGE: Record<number, string> = {
   168: '7d',
 }
 
-async function fetchMetricRange(
-  serviceId: number,
-  metricName: string,
-  rangeHours: number,
-): Promise<MetricRangePoint[]> {
-  const range = HOURS_TO_RANGE[rangeHours] ?? '1h'
-  const res = await fetch(
-    `/api/external-services/${serviceId}/metrics?metric=${encodeURIComponent(metricName)}&range=${range}`,
-    { credentials: 'include' },
-  )
-  if (!res.ok) throw new Error('Failed to fetch metric range')
-  return res.json() as Promise<MetricRangePoint[]>
+/** Extract a comparable message from whatever the SDK throws on a failed
+ *  request. `@hey-api/client-fetch` throws the parsed RFC 7807 Problem body
+ *  ({ detail, title, status }), so we surface the same string the old
+ *  hand-rolled fetch helper produced for the "monitoring not enabled" checks. */
+function metricsErrorText(err: unknown): string {
+  if (err == null) return ''
+  if (typeof err === 'string') return err
+  if (err instanceof Error) return err.message
+  const problem = err as { detail?: string; title?: string; status?: number }
+  return problem.detail ?? problem.title ?? `HTTP ${problem.status ?? ''}`
 }
 
-async function fetchAlertRules(serviceId: number): Promise<ServiceAlertRule[]> {
-  const res = await fetch(
-    `/api/external-services/${serviceId}/metrics/alert-rules`,
-    { credentials: 'include' },
+/** Whether an error means metrics are permanently unavailable for this service
+ *  (disabled / not found / store offline) and polling should stop. */
+function isMonitoringUnavailable(err: unknown): boolean {
+  const msg = metricsErrorText(err).toLowerCase()
+  return (
+    msg.includes('not enabled') ||
+    msg.includes('not found') ||
+    msg.includes('unavailable') ||
+    msg.includes('http 404') ||
+    msg.includes('http 503')
   )
-  if (!res.ok) throw new Error('Failed to fetch alert rules')
-  return res.json() as Promise<ServiceAlertRule[]>
-}
-
-async function createAlertRule(
-  serviceId: number,
-  body: ServiceAlertRuleCreateRequest,
-): Promise<ServiceAlertRule> {
-  const res = await fetch(
-    `/api/external-services/${serviceId}/metrics/alert-rules`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'include',
-      body: JSON.stringify(body),
-    },
-  )
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}))
-    throw new Error((err as { detail?: string }).detail ?? 'Failed to create alert rule')
-  }
-  return res.json() as Promise<ServiceAlertRule>
-}
-
-async function updateAlertRule(
-  serviceId: number,
-  ruleId: number,
-  body: ServiceAlertRuleUpdateRequest,
-): Promise<ServiceAlertRule> {
-  const res = await fetch(
-    `/api/external-services/${serviceId}/metrics/alert-rules/${ruleId}`,
-    {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'include',
-      body: JSON.stringify(body),
-    },
-  )
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}))
-    throw new Error((err as { detail?: string }).detail ?? 'Failed to update alert rule')
-  }
-  return res.json() as Promise<ServiceAlertRule>
-}
-
-async function deleteAlertRule(
-  serviceId: number,
-  ruleId: number,
-): Promise<void> {
-  const res = await fetch(
-    `/api/external-services/${serviceId}/metrics/alert-rules/${ruleId}`,
-    {
-      method: 'DELETE',
-      credentials: 'include',
-    },
-  )
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}))
-    throw new Error((err as { detail?: string }).detail ?? 'Failed to delete alert rule')
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -497,18 +363,11 @@ function AddAlertRuleDialog({
   const [name, setName] = useState('')
   const [metricName, setMetricName] = useState(KNOWN_METRICS[engine][0] ?? '')
   const [threshold, setThreshold] = useState('0')
-  const [comparator, setComparator] = useState<ServiceAlertRuleCreateRequest['comparator']>('gt')
-  const [severity, setSeverity] = useState<ServiceAlertRuleCreateRequest['severity']>('warning')
+  const [comparator, setComparator] = useState<Comparator>('gt')
+  const [severity, setSeverity] = useState<Severity>('warning')
 
   const create = useMutation({
-    mutationFn: () =>
-      createAlertRule(serviceId, {
-        name,
-        metric_name: metricName,
-        comparator,
-        threshold: parseFloat(threshold),
-        severity,
-      }),
+    ...externalServiceMetricsCreateAlertRuleMutation(),
     onSuccess: () => {
       toast.success('Alert rule created')
       onSuccess()
@@ -558,9 +417,7 @@ function AddAlertRuleDialog({
               <label className="text-sm font-medium">Comparator</label>
               <Select
                 value={comparator}
-                onValueChange={(v) =>
-                  setComparator(v as ServiceAlertRuleCreateRequest['comparator'])
-                }
+                onValueChange={(v) => setComparator(v as Comparator)}
               >
                 <SelectTrigger>
                   <SelectValue />
@@ -586,9 +443,7 @@ function AddAlertRuleDialog({
             <label className="text-sm font-medium">Severity</label>
             <Select
               value={severity}
-              onValueChange={(v) =>
-                setSeverity(v as ServiceAlertRuleCreateRequest['severity'])
-              }
+              onValueChange={(v) => setSeverity(v as Severity)}
             >
               <SelectTrigger>
                 <SelectValue />
@@ -606,7 +461,18 @@ function AddAlertRuleDialog({
             Cancel
           </Button>
           <Button
-            onClick={() => create.mutate()}
+            onClick={() =>
+              create.mutate({
+                path: { id: serviceId },
+                body: {
+                  name,
+                  metric_name: metricName,
+                  comparator,
+                  threshold: parseFloat(threshold),
+                  severity,
+                },
+              })
+            }
             disabled={create.isPending || !name.trim()}
           >
             {create.isPending && (
@@ -633,38 +499,33 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
   const queryClient = useQueryClient()
   const [open, setOpen] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
-  const [ruleToDelete, setRuleToDelete] = useState<ServiceAlertRule | null>(null)
+  const [ruleToDelete, setRuleToDelete] = useState<ServiceAlertRuleResponse | null>(null)
   // Track which rule is being threshold-edited inline: ruleId -> string value
   const [editingThreshold, setEditingThreshold] = useState<
     Record<number, string>
   >({})
 
-  const { data: rules, isLoading } = useQuery<ServiceAlertRule[]>({
-    queryKey: ['service-metrics-alert-rules', serviceId],
-    queryFn: () => fetchAlertRules(serviceId),
+  const { data: rules, isLoading } = useQuery({
+    ...externalServiceMetricsGetAlertRulesOptions({ path: { id: serviceId } }),
     enabled: open,
   })
 
   const invalidate = () =>
     queryClient.invalidateQueries({
-      queryKey: ['service-metrics-alert-rules', serviceId],
+      queryKey: externalServiceMetricsGetAlertRulesQueryKey({
+        path: { id: serviceId },
+      }),
     })
 
   const updateRule = useMutation({
-    mutationFn: ({
-      ruleId,
-      body,
-    }: {
-      ruleId: number
-      body: ServiceAlertRuleUpdateRequest
-    }) => updateAlertRule(serviceId, ruleId, body),
+    ...externalServiceMetricsUpdateAlertRuleMutation(),
     onSuccess: () => invalidate(),
     onError: (err: Error) =>
       toast.error('Failed to update rule', { description: err.message }),
   })
 
   const removeRule = useMutation({
-    mutationFn: (ruleId: number) => deleteAlertRule(serviceId, ruleId),
+    ...externalServiceMetricsDeleteAlertRuleMutation(),
     onSuccess: () => {
       toast.success('Alert rule deleted')
       setRuleToDelete(null)
@@ -745,7 +606,7 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
                                   const val = parseFloat(editing)
                                   if (!isNaN(val) && val !== rule.threshold) {
                                     updateRule.mutate({
-                                      ruleId: rule.id,
+                                      path: { id: serviceId, rule_id: rule.id },
                                       body: { threshold: val },
                                     })
                                   }
@@ -797,15 +658,8 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
                             </Badge>
                           </TableCell>
                           <TableCell>
-                            <Badge
-                              variant={
-                                rule.status === 'firing'
-                                  ? 'destructive'
-                                  : 'outline'
-                              }
-                              className="text-xs"
-                            >
-                              {rule.status === 'firing' ? 'FIRING' : 'OK'}
+                            <Badge variant="outline" className="text-xs">
+                              OK
                             </Badge>
                           </TableCell>
                           <TableCell>
@@ -873,7 +727,10 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
               variant="destructive"
               disabled={removeRule.isPending}
               onClick={() =>
-                ruleToDelete && removeRule.mutate(ruleToDelete.id)
+                ruleToDelete &&
+                removeRule.mutate({
+                  path: { id: serviceId, rule_id: ruleToDelete.id },
+                })
               }
             >
               {removeRule.isPending && (
@@ -916,23 +773,23 @@ function LiveMetrics({ serviceId, engine, latestMetrics }: LiveMetricsProps) {
     latestByName.set(m.name, m)
   }
 
-  // Count firing alert rules to show the badge
-  const { data: alertRules } = useQuery<ServiceAlertRule[]>({
-    queryKey: ['service-metrics-alert-rules', serviceId],
-    queryFn: () => fetchAlertRules(serviceId),
+  // Keep the alert rules warm so the section opens instantly; the backend does
+  // not surface a per-rule firing state, so the badge count stays at zero.
+  useQuery({
+    ...externalServiceMetricsGetAlertRulesOptions({ path: { id: serviceId } }),
     staleTime: 30_000,
     refetchInterval: 30_000,
   })
 
-  const firingCount = alertRules?.filter((r) => r.status === 'firing').length ?? 0
+  const firingCount = 0
 
   // Range chart data
   const rangeLabel = HOURS_TO_RANGE[rangeHours] ?? '1h'
-  const { data: rangeData, isLoading: rangeLoading } = useQuery<
-    MetricRangePoint[]
-  >({
-    queryKey: ['service-metrics-range', serviceId, selectedMetric, rangeLabel],
-    queryFn: () => fetchMetricRange(serviceId, selectedMetric, rangeHours),
+  const { data: rangeData, isLoading: rangeLoading } = useQuery({
+    ...externalServiceMetricsGetRangeOptions({
+      path: { id: serviceId },
+      query: { metric: selectedMetric, range: rangeLabel },
+    }),
     staleTime: 15_000,
     refetchInterval: 30_000,
   })
@@ -1127,24 +984,18 @@ export function MonitoringCard({ serviceId, engine, dockerImage, metricsEnabled 
     data: latestMetrics,
     isLoading,
     error,
-  } = useQuery<MetricLatest[], Error>({
-    queryKey: ['service-metrics-latest', serviceId],
-    queryFn: () => fetchLatestMetrics(serviceId),
+  } = useQuery({
+    ...externalServiceMetricsGetLatestOptions({ path: { id: serviceId } }),
+    // Normalise the `{ name: value }` map the endpoint returns into the array
+    // shape the rest of the card consumes.
+    select: (map): MetricLatest[] =>
+      Object.entries(map).map(([name, value]) => ({ name, value })),
     // Only hit the API when monitoring is enabled for this service. When off,
     // we render the Enable state from the prop without any network calls.
     enabled: metricsEnabled,
     retry: (failureCount, err) => {
       // Don't retry on permanent errors (disabled, not found)
-      const msg = err.message.toLowerCase()
-      if (
-        msg.includes('not enabled') ||
-        msg.includes('not found') ||
-        msg.includes('unavailable') ||
-        msg.includes('http 404') ||
-        msg.includes('http 503')
-      ) {
-        return false
-      }
+      if (isMonitoringUnavailable(err)) return false
       return failureCount < 2
     },
     staleTime: 3_000,
@@ -1152,22 +1003,12 @@ export function MonitoringCard({ serviceId, engine, dockerImage, metricsEnabled 
       // Stop polling entirely on permanent errors (monitoring disabled on the
       // server or this service, service not found). Otherwise we'd hammer the
       // API every 3s forever and the card would visibly blink.
-      const err = query.state.error as Error | null
-      if (err) {
-        const msg = err.message.toLowerCase()
-        if (
-          msg.includes('not enabled') ||
-          msg.includes('not found') ||
-          msg.includes('unavailable') ||
-          msg.includes('http 404') ||
-          msg.includes('http 503')
-        ) {
-          return false
-        }
+      if (query.state.error && isMonitoringUnavailable(query.state.error)) {
+        return false
       }
       // Stop fast-polling once we have data (switch to 30s passive refresh)
       const d = query.state.data
-      if (d && d.length > 0) return 30_000
+      if (d && Object.keys(d).length > 0) return 30_000
       // Poll every 3s while waiting for the first scrape after enabling
       return 3_000
     },
@@ -1182,11 +1023,13 @@ export function MonitoringCard({ serviceId, engine, dockerImage, metricsEnabled 
   const lastReceivedAt = statusData?.last_received_at ?? null
 
   const enableMonitoring = useMutation({
-    mutationFn: () => enableMetrics(serviceId),
+    ...externalServiceMetricsToggleMutation(),
     onSuccess: () => {
       toast.success('Monitoring enabled — first metrics appear within 30 seconds.')
       queryClient.invalidateQueries({
-        queryKey: ['service-metrics-latest', serviceId],
+        queryKey: externalServiceMetricsGetLatestQueryKey({
+          path: { id: serviceId },
+        }),
       })
       // Refetch the parent service so the metricsEnabled flag flips to true and
       // the query un-gates.
@@ -1197,11 +1040,13 @@ export function MonitoringCard({ serviceId, engine, dockerImage, metricsEnabled 
   })
 
   const disableMonitoring = useMutation({
-    mutationFn: () => disableMetrics(serviceId),
+    ...externalServiceMetricsToggleMutation(),
     onSuccess: () => {
       toast.success('Monitoring disabled.')
       queryClient.invalidateQueries({
-        queryKey: ['service-metrics-latest', serviceId],
+        queryKey: externalServiceMetricsGetLatestQueryKey({
+          path: { id: serviceId },
+        }),
       })
       onMonitoringChange?.()
     },
@@ -1211,14 +1056,7 @@ export function MonitoringCard({ serviceId, engine, dockerImage, metricsEnabled 
 
   // State A: monitoring disabled for this service. Either the service flag is
   // off (no API call made at all) or the API reported it's not enabled.
-  const isDisabled =
-    !metricsEnabled ||
-    (error != null &&
-      (error.message.toLowerCase().includes('not enabled') ||
-        error.message.toLowerCase().includes('not found') ||
-        error.message.toLowerCase().includes('unavailable') ||
-        error.message.includes('HTTP 404') ||
-        error.message.includes('HTTP 503')))
+  const isDisabled = !metricsEnabled || (error != null && isMonitoringUnavailable(error))
 
   if (isDisabled) {
     return (
@@ -1228,7 +1066,12 @@ export function MonitoringCard({ serviceId, engine, dockerImage, metricsEnabled 
         description="Performance metrics, query insights, and historical trends."
       >
         <Button
-          onClick={() => enableMonitoring.mutate()}
+          onClick={() =>
+            enableMonitoring.mutate({
+              path: { id: serviceId },
+              body: { enabled: true },
+            })
+          }
           disabled={enableMonitoring.isPending}
         >
           {enableMonitoring.isPending && (
@@ -1274,7 +1117,12 @@ export function MonitoringCard({ serviceId, engine, dockerImage, metricsEnabled 
           <Button
             variant="ghost"
             size="sm"
-            onClick={() => disableMonitoring.mutate()}
+            onClick={() =>
+              disableMonitoring.mutate({
+                path: { id: serviceId },
+                body: { enabled: false },
+              })
+            }
             disabled={disableMonitoring.isPending}
             className="text-muted-foreground hover:text-destructive"
           >
@@ -1305,7 +1153,12 @@ export function MonitoringCard({ serviceId, engine, dockerImage, metricsEnabled 
           <Button
             variant="ghost"
             size="sm"
-            onClick={() => disableMonitoring.mutate()}
+            onClick={() =>
+              disableMonitoring.mutate({
+                path: { id: serviceId },
+                body: { enabled: false },
+              })
+            }
             disabled={disableMonitoring.isPending}
             className="text-muted-foreground hover:text-destructive"
           >

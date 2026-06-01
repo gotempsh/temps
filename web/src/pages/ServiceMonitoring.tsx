@@ -41,7 +41,14 @@ import {
   getServiceOptions,
   externalServiceMetricsStatusOptions,
   externalServiceMetricsByDatabaseOptions,
+  externalServiceMetricsGetLatestOptions,
+  externalServiceMetricsGetRangeOptions,
+  externalServiceMetricsGetAlertRulesOptions,
+  externalServiceMetricsGetAlertRulesQueryKey,
+  externalServiceMetricsCreateAlertRuleMutation,
+  externalServiceMetricsDeleteAlertRuleMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import type { ServiceAlertRuleResponse } from '@/api/client/types.gen'
 import {
   Activity,
   ArrowLeft,
@@ -66,97 +73,40 @@ import {
 import { formatBytes } from '@/lib/utils'
 
 // ---------------------------------------------------------------------------
-// Types
+// View-model types (derived from the generated SDK responses)
 // ---------------------------------------------------------------------------
 
+/** A single metric reading — normalised from the `{ name: value }` map the
+ *  `metrics/latest` endpoint returns. */
 type MetricLatest = { name: string; value: number }
-type MetricRangePoint = { time: string; value: number }
 
-type ServiceAlertRule = {
-  id: number
-  name: string
-  metric_name: string
-  comparator: 'gt' | 'lt' | 'gte' | 'lte'
-  threshold: number
-  severity: 'info' | 'warning' | 'critical'
-  for_duration_secs: number
-  enabled: boolean
-  status: 'firing' | 'ok'
+/** Alert-rule form-state unions. The API accepts `comparator`/`severity` as
+ *  plain strings; these constrain the UI selects to the supported values. */
+type Comparator = 'gt' | 'lt' | 'gte' | 'lte'
+type Severity = 'info' | 'warning' | 'critical'
+
+/** Extract a comparable message from whatever the SDK throws on a failed
+ *  request. `@hey-api/client-fetch` throws the parsed RFC 7807 Problem body
+ *  ({ detail, title, status }). */
+function metricsErrorText(err: unknown): string {
+  if (err == null) return ''
+  if (typeof err === 'string') return err
+  if (err instanceof Error) return err.message
+  const problem = err as { detail?: string; title?: string; status?: number }
+  return problem.detail ?? problem.title ?? `HTTP ${problem.status ?? ''}`
 }
 
-type ServiceAlertRuleCreateRequest = {
-  name: string
-  metric_name: string
-  comparator: 'gt' | 'lt' | 'gte' | 'lte'
-  threshold: number
-  severity: 'info' | 'warning' | 'critical'
-  for_duration_secs?: number
-  enabled?: boolean
-}
-
-// ---------------------------------------------------------------------------
-// Fetch helpers
-// ---------------------------------------------------------------------------
-
-async function fetchLatestMetrics(serviceId: number): Promise<MetricLatest[]> {
-  const res = await fetch(`/api/external-services/${serviceId}/metrics/latest`, {
-    credentials: 'include',
-  })
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({})) as { detail?: string; title?: string }
-    throw new Error(body.detail ?? body.title ?? `HTTP ${res.status}`)
-  }
-  const map = await res.json() as Record<string, number>
-  return Object.entries(map).map(([name, value]) => ({ name, value }))
-}
-
-async function fetchMetricRange(
-  serviceId: number,
-  metricName: string,
-  range: string,
-): Promise<MetricRangePoint[]> {
-  const res = await fetch(
-    `/api/external-services/${serviceId}/metrics?metric=${encodeURIComponent(metricName)}&range=${range}`,
-    { credentials: 'include' },
+/** Whether an error means metrics are permanently unavailable for this service
+ *  (disabled / not found / store offline) and polling should stop. */
+function isMonitoringUnavailable(err: unknown): boolean {
+  const msg = metricsErrorText(err).toLowerCase()
+  return (
+    msg.includes('not enabled') ||
+    msg.includes('not found') ||
+    msg.includes('unavailable') ||
+    msg.includes('http 404') ||
+    msg.includes('http 503')
   )
-  if (!res.ok) throw new Error('Failed to fetch metric range')
-  return res.json() as Promise<MetricRangePoint[]>
-}
-
-async function fetchAlertRules(serviceId: number): Promise<ServiceAlertRule[]> {
-  const res = await fetch(`/api/external-services/${serviceId}/metrics/alert-rules`, {
-    credentials: 'include',
-  })
-  if (!res.ok) throw new Error('Failed to fetch alert rules')
-  return res.json() as Promise<ServiceAlertRule[]>
-}
-
-async function createAlertRule(
-  serviceId: number,
-  body: ServiceAlertRuleCreateRequest,
-): Promise<ServiceAlertRule> {
-  const res = await fetch(`/api/external-services/${serviceId}/metrics/alert-rules`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    credentials: 'include',
-    body: JSON.stringify(body),
-  })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}))
-    throw new Error((err as { detail?: string }).detail ?? 'Failed to create alert rule')
-  }
-  return res.json() as Promise<ServiceAlertRule>
-}
-
-async function deleteAlertRule(serviceId: number, ruleId: number): Promise<void> {
-  const res = await fetch(
-    `/api/external-services/${serviceId}/metrics/alert-rules/${ruleId}`,
-    { method: 'DELETE', credentials: 'include' },
-  )
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}))
-    throw new Error((err as { detail?: string }).detail ?? 'Failed to delete alert rule')
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -648,9 +598,11 @@ type MetricChartProps = {
 
 function MetricChart({ serviceId, metricName, range }: MetricChartProps) {
   const refetchInterval = useRefreshInterval()
-  const { data, isLoading } = useQuery<MetricRangePoint[]>({
-    queryKey: ['svc-monitoring-range', serviceId, metricName, range],
-    queryFn: () => fetchMetricRange(serviceId, metricName, range),
+  const { data, isLoading } = useQuery({
+    ...externalServiceMetricsGetRangeOptions({
+      path: { id: serviceId },
+      query: { metric: metricName, range },
+    }),
     staleTime: 15_000,
     refetchInterval,
   })
@@ -756,20 +708,11 @@ function AddAlertRuleDialog({
   const [name, setName] = useState('')
   const [metricName, setMetricName] = useState(ALL_METRICS[engine][0] ?? '')
   const [threshold, setThreshold] = useState('0')
-  const [comparator, setComparator] =
-    useState<ServiceAlertRuleCreateRequest['comparator']>('gt')
-  const [severity, setSeverity] =
-    useState<ServiceAlertRuleCreateRequest['severity']>('warning')
+  const [comparator, setComparator] = useState<Comparator>('gt')
+  const [severity, setSeverity] = useState<Severity>('warning')
 
   const create = useMutation({
-    mutationFn: () =>
-      createAlertRule(serviceId, {
-        name,
-        metric_name: metricName,
-        comparator,
-        threshold: parseFloat(threshold),
-        severity,
-      }),
+    ...externalServiceMetricsCreateAlertRuleMutation(),
     onSuccess: () => {
       toast.success('Alert rule created')
       onSuccess()
@@ -820,7 +763,7 @@ function AddAlertRuleDialog({
               <Select
                 value={comparator}
                 onValueChange={(v) =>
-                  setComparator(v as ServiceAlertRuleCreateRequest['comparator'])
+                  setComparator(v as Comparator)
                 }
               >
                 <SelectTrigger>
@@ -848,7 +791,7 @@ function AddAlertRuleDialog({
             <Select
               value={severity}
               onValueChange={(v) =>
-                setSeverity(v as ServiceAlertRuleCreateRequest['severity'])
+                setSeverity(v as Severity)
               }
             >
               <SelectTrigger>
@@ -866,7 +809,21 @@ function AddAlertRuleDialog({
           <Button variant="outline" onClick={() => onOpenChange(false)}>
             Cancel
           </Button>
-          <Button onClick={() => create.mutate()} disabled={create.isPending || !name.trim()}>
+          <Button
+            onClick={() =>
+              create.mutate({
+                path: { id: serviceId },
+                body: {
+                  name,
+                  metric_name: metricName,
+                  comparator,
+                  threshold: parseFloat(threshold),
+                  severity,
+                },
+              })
+            }
+            disabled={create.isPending || !name.trim()}
+          >
             {create.isPending && <Loader2 className="mr-2 size-4 animate-spin" />}
             Add Rule
           </Button>
@@ -982,20 +939,23 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
   const queryClient = useQueryClient()
   const refetchInterval = useRefreshInterval()
   const [addDialogOpen, setAddDialogOpen] = useState(false)
-  const [ruleToDelete, setRuleToDelete] = useState<ServiceAlertRule | null>(null)
+  const [ruleToDelete, setRuleToDelete] = useState<ServiceAlertRuleResponse | null>(null)
 
-  const { data: rules, isLoading } = useQuery<ServiceAlertRule[]>({
-    queryKey: ['svc-monitoring-alert-rules', serviceId],
-    queryFn: () => fetchAlertRules(serviceId),
+  const { data: rules, isLoading } = useQuery({
+    ...externalServiceMetricsGetAlertRulesOptions({ path: { id: serviceId } }),
     staleTime: 30_000,
     refetchInterval,
   })
 
   const invalidate = () =>
-    queryClient.invalidateQueries({ queryKey: ['svc-monitoring-alert-rules', serviceId] })
+    queryClient.invalidateQueries({
+      queryKey: externalServiceMetricsGetAlertRulesQueryKey({
+        path: { id: serviceId },
+      }),
+    })
 
   const removeRule = useMutation({
-    mutationFn: (ruleId: number) => deleteAlertRule(serviceId, ruleId),
+    ...externalServiceMetricsDeleteAlertRuleMutation(),
     onSuccess: () => {
       toast.success('Alert rule deleted')
       setRuleToDelete(null)
@@ -1004,7 +964,9 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
     onError: (err: Error) => toast.error('Failed to delete rule', { description: err.message }),
   })
 
-  const firingCount = rules?.filter((r) => r.status === 'firing').length ?? 0
+  // The backend does not surface a per-rule firing state, so the badge count
+  // stays at zero (same as before — `status` was never populated).
+  const firingCount = 0
 
   return (
     <>
@@ -1081,11 +1043,8 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
                       </Badge>
                     </TableCell>
                     <TableCell>
-                      <Badge
-                        variant={rule.status === 'firing' ? 'destructive' : 'outline'}
-                        className="text-xs"
-                      >
-                        {rule.status === 'firing' ? 'FIRING' : 'OK'}
+                      <Badge variant="outline" className="text-xs">
+                        OK
                       </Badge>
                     </TableCell>
                     <TableCell>
@@ -1131,7 +1090,12 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
             <Button
               variant="destructive"
               disabled={removeRule.isPending}
-              onClick={() => ruleToDelete && removeRule.mutate(ruleToDelete.id)}
+              onClick={() =>
+                ruleToDelete &&
+                removeRule.mutate({
+                  path: { id: serviceId, rule_id: ruleToDelete.id },
+                })
+              }
             >
               {removeRule.isPending && <Loader2 className="mr-2 size-4 animate-spin" />}
               Delete
@@ -1172,26 +1136,18 @@ function MonitoringDashboard({
     latestByName.set(m.name, m.value)
   }
 
-  // Build a set of metrics that are firing alerts for visual callouts
-  const { data: alertRules } = useQuery<ServiceAlertRule[]>({
-    queryKey: ['svc-monitoring-alert-rules', serviceId],
-    queryFn: () => fetchAlertRules(serviceId),
+  // Keep the alert rules warm so the section opens instantly. The backend does
+  // not surface a per-rule firing state, so no tile/banner callouts fire (same
+  // behaviour as before — `status` was never populated).
+  useQuery({
+    ...externalServiceMetricsGetAlertRulesOptions({ path: { id: serviceId } }),
     staleTime: 30_000,
     refetchInterval,
   })
 
   const firingBySeverity = new Map<string, 'warning' | 'critical'>()
-  for (const rule of alertRules ?? []) {
-    if (rule.status === 'firing') {
-      // critical takes precedence over warning
-      const existing = firingBySeverity.get(rule.metric_name)
-      if (!existing || rule.severity === 'critical') {
-        firingBySeverity.set(rule.metric_name, rule.severity as 'warning' | 'critical')
-      }
-    }
-  }
 
-  const firingCount = (alertRules ?? []).filter((r) => r.status === 'firing').length
+  const firingCount = 0
 
   return (
     <div className="space-y-8">
@@ -1333,49 +1289,29 @@ export function ServiceMonitoring() {
     error: metricsError,
     refetch,
     isFetching,
-  } = useQuery<MetricLatest[], Error>({
-    queryKey: ['svc-monitoring-latest', serviceId],
-    queryFn: () => fetchLatestMetrics(serviceId),
+  } = useQuery({
+    ...externalServiceMetricsGetLatestOptions({ path: { id: serviceId } }),
+    // Normalise the `{ name: value }` map into the array shape the dashboard
+    // consumes.
+    select: (map): MetricLatest[] =>
+      Object.entries(map).map(([name, value]) => ({ name, value })),
     enabled: !!serviceId,
     staleTime: 15_000,
     refetchInterval: (query) => {
       // Stop polling on permanent errors (monitoring disabled on the server or
       // this service, service not found) — otherwise we poll forever.
-      const err = query.state.error as Error | null
-      if (err) {
-        const msg = err.message.toLowerCase()
-        if (
-          msg.includes('not enabled') ||
-          msg.includes('not found') ||
-          msg.includes('unavailable') ||
-          msg.includes('http 404') ||
-          msg.includes('http 503')
-        ) {
-          return false
-        }
+      if (query.state.error && isMonitoringUnavailable(query.state.error)) {
+        return false
       }
       return refetchInterval
     },
     retry: (failureCount, err) => {
-      const msg = err.message.toLowerCase()
-      if (
-        msg.includes('not enabled') ||
-        msg.includes('not found') ||
-        msg.includes('unavailable') ||
-        msg.includes('http 404') ||
-        msg.includes('http 503')
-      )
-        return false
+      if (isMonitoringUnavailable(err)) return false
       return failureCount < 2
     },
   })
 
-  const isDisabled =
-    metricsError != null &&
-    (metricsError.message.toLowerCase().includes('not enabled') ||
-      metricsError.message.toLowerCase().includes('not found') ||
-      metricsError.message.includes('HTTP 404') ||
-      metricsError.message.includes('HTTP 503'))
+  const isDisabled = metricsError != null && isMonitoringUnavailable(metricsError)
 
   const serviceName = serviceData?.service?.name ?? 'Service'
 
@@ -1389,7 +1325,11 @@ export function ServiceMonitoring() {
 
   const handleRefresh = () => {
     refetch()
-    queryClient.invalidateQueries({ queryKey: ['svc-monitoring-alert-rules', serviceId] })
+    queryClient.invalidateQueries({
+      queryKey: externalServiceMetricsGetAlertRulesQueryKey({
+        path: { id: serviceId },
+      }),
+    })
   }
 
   return (
