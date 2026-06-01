@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
--
+- **`temps backfill clickhouse` subcommand** — standalone, one-shot data migration tool for moving historical events from the PostgreSQL/TimescaleDB `events` hypertable into ClickHouse. Runs out-of-process from `temps serve`, so it never contends with the live fan-out worker's outbox locks and does not double the PG write load on the primary during migration. Reuses the live fan-out's `ChEventRow` shape and `row_to_ch` mapper as the single source of truth — backfilled rows are byte-identical to live-ingested rows, and re-runs are safe via ClickHouse's `ReplacingMergeTree(_version)` dedupe on `event_id`. Flags: `--from` / `--to` RFC3339 window (defaults to MIN/MAX timestamp), `--project-id` filter, `--batch-size` (default 10k), `--chunk-days` (default 1), `--rate-limit-events-per-sec` throttle for live-server backfills, `--apply-migrations` to create CH schema, `--dry-run` to preview the chunk plan, and `--resume` with checkpoint at `$TEMPS_DATA_DIR/clickhouse-backfill.state`. Progress bar via indicatif.
 
 ### Changed
 -
