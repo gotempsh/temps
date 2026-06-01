@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod api_key;
+pub mod backfill;
 pub mod backup;
 pub mod build;
 pub mod deploy;
@@ -19,6 +20,7 @@ pub mod upgrade;
 
 pub use agent::AgentCommand;
 pub use api_key::ApiKeyCommand;
+pub use backfill::BackfillCommand;
 pub use backup::BackupCommand;
 pub use build::BuildCommand;
 pub use deploy::DeployCommand;

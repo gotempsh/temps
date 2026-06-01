@@ -9,10 +9,10 @@ pub mod commands;
 
 use clap::{Parser, Subcommand};
 use commands::{
-    AgentCommand, ApiKeyCommand, BackupCommand, BuildCommand, DeployCommand, DoctorCommand,
-    DomainCommand, EdgeCommand, JoinCommand, NetworkCommand, NodeCommand, ProxyCommand,
-    ResetPasswordCommand, SandboxCommand, ServeCommand, ServicesCommand, SetupCommand,
-    UpgradeCommand,
+    AgentCommand, ApiKeyCommand, BackfillCommand, BackupCommand, BuildCommand, DeployCommand,
+    DoctorCommand, DomainCommand, EdgeCommand, JoinCommand, NetworkCommand, NodeCommand,
+    ProxyCommand, ResetPasswordCommand, SandboxCommand, ServeCommand, ServicesCommand,
+    SetupCommand, UpgradeCommand,
 };
 use tracing_subscriber::{layer::SubscriberExt, Layer};
 
@@ -57,6 +57,8 @@ pub enum Commands {
     ApiKey(ApiKeyCommand),
     /// Backup management commands
     Backup(BackupCommand),
+    /// One-shot data migration utilities (e.g. TimescaleDB → ClickHouse)
+    Backfill(BackfillCommand),
     /// Manage platform services (KV, Blob)
     Services(ServicesCommand),
     /// Domain and certificate management
@@ -195,6 +197,7 @@ pub fn dispatch(
         Commands::ResetAdminPassword(reset_cmd) => reset_cmd.execute(),
         Commands::ApiKey(api_key_cmd) => api_key_cmd.execute(),
         Commands::Backup(backup_cmd) => backup_cmd.execute(),
+        Commands::Backfill(backfill_cmd) => backfill_cmd.execute(),
         Commands::Services(services_cmd) => services_cmd.execute(),
         Commands::Domain(domain_cmd) => domain_cmd.execute(),
         Commands::Build(build_cmd) => build_cmd.execute(),
