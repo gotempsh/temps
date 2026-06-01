@@ -200,12 +200,15 @@ pub struct StatusCheckCompletedJob {
 }
 
 /// Job for when an alarm is fired (container restart, outage, high resource usage, etc.)
+///
+/// `environment_id` and `deployment_id` are `Option` because service-scoped
+/// (database) alarms have no environment or deployment context.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlarmFiredJob {
     pub alarm_id: i32,
     pub project_id: i32,
-    pub environment_id: i32,
-    pub deployment_id: i32,
+    pub environment_id: Option<i32>,
+    pub deployment_id: Option<i32>,
     pub alarm_type: String,
     pub severity: String,
     pub title: String,
@@ -222,12 +225,15 @@ pub struct AutopilotTriggerJob {
 }
 
 /// Job for when an alarm is resolved
+///
+/// `environment_id` and `deployment_id` are `Option` because service-scoped
+/// (database) alarms have no environment or deployment context.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlarmResolvedJob {
     pub alarm_id: i32,
     pub project_id: i32,
-    pub environment_id: i32,
-    pub deployment_id: i32,
+    pub environment_id: Option<i32>,
+    pub deployment_id: Option<i32>,
     pub alarm_type: String,
     pub title: String,
 }

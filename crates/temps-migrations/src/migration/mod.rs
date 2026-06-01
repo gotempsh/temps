@@ -111,6 +111,7 @@ mod m20260601_000004_add_monitoring_alert_rules_unique_idx;
 mod m20260601_000005_add_service_id_to_api_keys;
 mod m20260601_000006_update_metrics_retention_30d;
 mod m20260601_000007_create_service_metrics_status;
+mod m20260601_000008_alarms_nullable_env_deployment;
 
 pub struct Migrator;
 
@@ -225,6 +226,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260601_000005_add_service_id_to_api_keys::Migration),
             Box::new(m20260601_000006_update_metrics_retention_30d::Migration),
             Box::new(m20260601_000007_create_service_metrics_status::Migration),
+            Box::new(m20260601_000008_alarms_nullable_env_deployment::Migration),
         ]
     }
 }

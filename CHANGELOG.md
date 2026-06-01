@@ -32,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Retention migration uses `if_exists` (not the non-existent `if_not_exists`) on `remove_retention_policy`, fixing a fresh-install setup crash.
 - Service detail refetches after a service upgrade so the new image/status is reflected immediately.
 - Redis counter metrics (`evicted_keys_total`, `keyspace_hits_total`, `keyspace_misses_total`, `expired_keys_total`) were mislabelled as `Gauge` instead of `Counter`, so their raw cumulative values were charted directly instead of as a rate of change.
+- Service-scoped (database) alarms no longer fail to fire: `alarms.environment_id` and `alarms.deployment_id` are now nullable. The evaluator previously wrote sentinel `0` values, which violated the environment/deployment foreign keys and dropped every database alarm. The FKs are recreated `ON DELETE SET NULL` so historical alarms survive environment/deployment deletion, and cooldown de-duplication now matches `IS NULL` per scope level.
 
 
 ## [0.1.0-beta.25] - 2026-05-31

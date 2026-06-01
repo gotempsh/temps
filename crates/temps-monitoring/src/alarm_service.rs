@@ -136,12 +136,17 @@ impl AlarmStatus {
     }
 }
 
-/// Request to fire a new alarm
+/// Request to fire a new alarm.
+///
+/// `environment_id` and `deployment_id` are optional because service-scoped
+/// (database) alarms — fired by `AlertEvaluator` for rules with a `service_id`
+/// and no `deployment_id` — have no environment or deployment to point at.
+/// Container, outage, and deployment-scoped alarms always provide `Some(...)`.
 #[derive(Debug, Clone)]
 pub struct FireAlarmRequest {
     pub project_id: i32,
-    pub environment_id: i32,
-    pub deployment_id: i32,
+    pub environment_id: Option<i32>,
+    pub deployment_id: Option<i32>,
     pub container_id: Option<i32>,
     pub alarm_type: AlarmType,
     pub severity: AlarmSeverity,
@@ -209,7 +214,7 @@ impl AlarmService {
         // Check cooldown: is there a recent firing alarm of the same type for the same deployment+container?
         if self.is_in_cooldown(&request).await? {
             info!(
-                "Alarm suppressed by cooldown: type={}, deployment={}, container={:?}",
+                "Alarm suppressed by cooldown: type={}, deployment={:?}, container={:?}",
                 request.alarm_type.as_str(),
                 request.deployment_id,
                 request.container_id
@@ -239,7 +244,7 @@ impl AlarmService {
             .await
             .map_err(|e| AlarmError::Database {
                 operation: format!(
-                    "insert alarm type={} for deployment {}",
+                    "insert alarm type={} for deployment {:?}",
                     request.alarm_type.as_str(),
                     request.deployment_id
                 ),
@@ -249,7 +254,7 @@ impl AlarmService {
         let alarm_id = result.id;
 
         info!(
-            "Alarm fired: id={}, type={}, severity={}, project={}, env={}, deployment={}",
+            "Alarm fired: id={}, type={}, severity={}, project={}, env={:?}, deployment={:?}",
             alarm_id,
             request.alarm_type.as_str(),
             request.severity.as_str(),
@@ -624,17 +629,26 @@ impl AlarmService {
 
     /// Check if there's a recent alarm of the same type still within cooldown.
     ///
-    /// When `container_id` is `None`, the filter explicitly requires
-    /// `container_id IS NULL` so alarms scoped to a specific container don't
-    /// suppress alarms for the deployment as a whole (and vice versa).
+    /// When `deployment_id` or `container_id` is `None` (service-scoped alarms
+    /// have no deployment; deployment-scoped alarms have no specific
+    /// container), the filter explicitly requires `IS NULL` so alarms scoped
+    /// at one level don't suppress alarms scoped at a different level.
     async fn is_in_cooldown(&self, request: &FireAlarmRequest) -> Result<bool, AlarmError> {
         let cutoff = Utc::now() - self.cooldown;
 
         let mut query = alarms::Entity::find()
             .filter(alarms::Column::ProjectId.eq(request.project_id))
-            .filter(alarms::Column::DeploymentId.eq(request.deployment_id))
             .filter(alarms::Column::AlarmType.eq(request.alarm_type.as_str()))
             .filter(alarms::Column::FiredAt.gte(cutoff));
+
+        match request.deployment_id {
+            Some(deployment_id) => {
+                query = query.filter(alarms::Column::DeploymentId.eq(deployment_id));
+            }
+            None => {
+                query = query.filter(alarms::Column::DeploymentId.is_null());
+            }
+        }
 
         match request.container_id {
             Some(container_id) => {
@@ -653,6 +667,24 @@ impl AlarmService {
 
     /// Send notification for a fired alarm (failure is logged, not propagated)
     async fn send_alarm_notification(&self, request: &FireAlarmRequest, alarm_id: i32) {
+        let mut metadata: HashMap<String, String> = [
+            ("alarm_id".to_string(), alarm_id.to_string()),
+            (
+                "alarm_type".to_string(),
+                request.alarm_type.as_str().to_string(),
+            ),
+            ("project_id".to_string(), request.project_id.to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        if let Some(env_id) = request.environment_id {
+            metadata.insert("environment_id".to_string(), env_id.to_string());
+        }
+        if let Some(dep_id) = request.deployment_id {
+            metadata.insert("deployment_id".to_string(), dep_id.to_string());
+        }
+
         let notification = NotificationData {
             id: uuid::Uuid::new_v4().to_string(),
             title: request.title.clone(),
@@ -661,24 +693,7 @@ impl AlarmService {
             priority: request.severity.to_notification_priority(),
             severity: Some(request.severity.as_str().to_string()),
             timestamp: Utc::now(),
-            metadata: [
-                ("alarm_id".to_string(), alarm_id.to_string()),
-                (
-                    "alarm_type".to_string(),
-                    request.alarm_type.as_str().to_string(),
-                ),
-                ("project_id".to_string(), request.project_id.to_string()),
-                (
-                    "environment_id".to_string(),
-                    request.environment_id.to_string(),
-                ),
-                (
-                    "deployment_id".to_string(),
-                    request.deployment_id.to_string(),
-                ),
-            ]
-            .into_iter()
-            .collect(),
+            metadata,
             bypass_throttling: request.severity == AlarmSeverity::Critical,
         };
 
@@ -829,8 +844,8 @@ mod tests {
         alarms::Model {
             id,
             project_id: 1,
-            environment_id: 1,
-            deployment_id: 10,
+            environment_id: Some(1),
+            deployment_id: Some(10),
             container_id: Some(100),
             alarm_type: alarm_type.to_string(),
             severity: severity.to_string(),
@@ -850,8 +865,8 @@ mod tests {
     fn sample_fire_request() -> FireAlarmRequest {
         FireAlarmRequest {
             project_id: 1,
-            environment_id: 1,
-            deployment_id: 10,
+            environment_id: Some(1),
+            deployment_id: Some(10),
             container_id: Some(100),
             alarm_type: AlarmType::ContainerRestart,
             severity: AlarmSeverity::Warning,

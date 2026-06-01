@@ -305,8 +305,8 @@ impl ContainerHealthMonitor {
 
         let request = FireAlarmRequest {
             project_id: deployment.project_id,
-            environment_id: deployment.environment_id,
-            deployment_id: deployment.id,
+            environment_id: Some(deployment.environment_id),
+            deployment_id: Some(deployment.id),
             container_id: Some(container.id),
             alarm_type: AlarmType::ContainerRestart,
             severity,
@@ -387,8 +387,8 @@ impl ContainerHealthMonitor {
 
                 let request = FireAlarmRequest {
                     project_id: deployment.project_id,
-                    environment_id: deployment.environment_id,
-                    deployment_id: deployment.id,
+                    environment_id: Some(deployment.environment_id),
+                    deployment_id: Some(deployment.id),
                     container_id: Some(container.id),
                     alarm_type,
                     severity,
@@ -719,8 +719,8 @@ impl ContainerHealthMonitor {
 
         let request = FireAlarmRequest {
             project_id: deployment.project_id,
-            environment_id: deployment.environment_id,
-            deployment_id: deployment.id,
+            environment_id: Some(deployment.environment_id),
+            deployment_id: Some(deployment.id),
             container_id: Some(container.id),
             alarm_type,
             severity,
@@ -1019,8 +1019,8 @@ mod tests {
         let alarm_model = temps_entities::alarms::Model {
             id: 1,
             project_id: 1,
-            environment_id: 1,
-            deployment_id: 10,
+            environment_id: Some(1),
+            deployment_id: Some(10),
             container_id: Some(1),
             alarm_type: "container_restart".to_string(),
             severity: "info".to_string(),
@@ -1115,8 +1115,8 @@ mod tests {
         let alarm_model = temps_entities::alarms::Model {
             id: 1,
             project_id: 1,
-            environment_id: 1,
-            deployment_id: 10,
+            environment_id: Some(1),
+            deployment_id: Some(10),
             container_id: Some(1),
             alarm_type: "container_oom_killed".to_string(),
             severity: "critical".to_string(),

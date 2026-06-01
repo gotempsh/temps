@@ -84,9 +84,13 @@ pub struct AlertEvaluator {
     firing_alarms: Arc<RwLock<HashMap<i32, i32>>>,
 }
 
-/// Cached alarm context (project_id, environment_id, deployment_id) for a rule.
-/// Avoids per-breach DB lookups by computing this once per cycle.
-type AlarmContext = (i32, i32, i32);
+/// Cached alarm context `(project_id, environment_id, deployment_id)` for a rule.
+///
+/// Deployment-scoped rules carry real environment + deployment IDs.
+/// Service-scoped (database) rules have neither — those fields are `None` and
+/// the resulting alarm row will store NULL for both, matching the nullable FK
+/// shape on `alarms.environment_id` and `alarms.deployment_id`.
+type AlarmContext = (i32, Option<i32>, Option<i32>);
 
 impl AlertEvaluator {
     /// Create a new evaluator.
@@ -314,7 +318,10 @@ impl AlertEvaluator {
 
             // Evaluate each rule in the group against the fetched values.
             for rule in group {
-                let ctx = context_cache.get(&rule.id).copied().unwrap_or((0, 0, 0));
+                let ctx = context_cache
+                    .get(&rule.id)
+                    .copied()
+                    .unwrap_or((0, None, None));
                 if let Err(e) = self.evaluate_rule(rule, &latest, ctx).await {
                     warn!(
                         rule_id = rule.id,
@@ -538,7 +545,7 @@ impl AlertEvaluator {
                 .one(self.db.as_ref())
                 .await
             {
-                return (dep.project_id, dep.environment_id, dep_id);
+                return (dep.project_id, Some(dep.environment_id), Some(dep_id));
             }
         }
 
@@ -549,13 +556,15 @@ impl AlertEvaluator {
                 .one(self.db.as_ref())
                 .await
             {
-                // No meaningful deployment_id for database rules; use 0.
-                return (ps.project_id, 0, 0);
+                // Service-scoped (database) rules have no environment or
+                // deployment context — store NULL so the FK constraints hold.
+                return (ps.project_id, None, None);
             }
         }
 
-        // Fallback — no context found.
-        (0, 0, 0)
+        // Fallback — no context found. project_id=0 keeps existing behaviour
+        // for unsuppressed errors elsewhere; env/deployment stay None.
+        (0, None, None)
     }
 }
 
