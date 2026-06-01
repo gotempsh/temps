@@ -10,9 +10,9 @@ pub mod commands;
 use clap::{Parser, Subcommand};
 use commands::{
     AgentCommand, ApiKeyCommand, BackupCommand, BuildCommand, DeployCommand, DoctorCommand,
-    DomainCommand, EdgeCommand, JoinCommand, NetworkCommand, NodeCommand, ProxyCommand,
-    ResetPasswordCommand, SandboxCommand, ServeCommand, ServicesCommand, SetupCommand,
-    UpgradeCommand,
+    DomainCommand, EdgeCommand, JoinCommand, MigrateCommand, NetworkCommand, NodeCommand,
+    ProxyCommand, ResetPasswordCommand, SandboxCommand, ServeCommand, ServicesCommand,
+    SetupCommand, UpgradeCommand,
 };
 use tracing_subscriber::{layer::SubscriberExt, Layer};
 
@@ -50,6 +50,8 @@ pub enum Commands {
     /// Initial setup: create admin user, configure DNS/Git providers, and domain
     #[command(alias = "init")]
     Setup(Box<SetupCommand>),
+    /// Apply pending database migrations (recommended before upgrading the server)
+    Migrate(MigrateCommand),
     /// Reset admin user password
     ResetAdminPassword(ResetPasswordCommand),
     /// Create an API key with a specified role
@@ -193,6 +195,7 @@ pub fn dispatch(
         Commands::Serve(serve_cmd) => serve_cmd.execute_with_extra_plugins(extra_plugins),
         Commands::Proxy(proxy_cmd) => proxy_cmd.execute(),
         Commands::Setup(setup_cmd) => setup_cmd.execute(),
+        Commands::Migrate(migrate_cmd) => migrate_cmd.execute(),
         Commands::ResetAdminPassword(reset_cmd) => reset_cmd.execute(),
         Commands::ApiKey(api_key_cmd) => api_key_cmd.execute(),
         Commands::Backup(backup_cmd) => backup_cmd.execute(),

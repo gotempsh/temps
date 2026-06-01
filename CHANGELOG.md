@@ -15,18 +15,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - "Last received at …" freshness indicator on monitoring views, backed by a tiny `service_metrics_status` table (O(1) lookup, upserted on write — no hypertable scan).
 - Configurable auto-refresh interval (Off / 5s / 10s / 30s / 1m) on the monitoring page, persisted in localStorage.
 - Service upgrade support for RustFS (was previously "not implemented").
+- **`temps migrate` command** — applies pending database migrations as an explicit, decoupled step with the server stopped and **no timeout**. Recommended upgrade flow for production and large databases: download the new binary → `temps migrate --database-url=…` → restart the server. `temps serve` still auto-applies pending migrations on boot for simple installs, so this is fully backward compatible.
+- `temps doctor` now reports pending migrations explicitly ("N applied, up to date" vs "N applied, M PENDING — run `temps migrate` before restarting the server"), and detects an uninitialized schema.
 
 ### Changed
 - Cumulative counter metrics (`_total`/`_count`) now display the running total in stat tiles and rate-of-change in charts, computed via a TimescaleDB LAG window query.
 - `service_metrics` raw retention 7 → 30 days; daily-aggregate retention 2 years → 1 year.
 - MinIO removed from the S3 service creation UI; RustFS is now the sole default object-storage engine.
 - Service-detail monitoring card no longer polls the metrics API when monitoring is disabled for that service.
+- Database migration startup timeout raised from 120s to 600s, and a 15s `lock_timeout` is set before applying so a migration blocked on a lock fails fast instead of hanging the whole startup window. Migrations that exceed the window now print guidance to run `temps migrate` manually with the new binary before restarting.
+- Migrations are now tolerant of unknown/extra applied rows: a migration history containing rows this binary doesn't define (e.g. from a newer build or the Enterprise Edition) no longer blocks startup — only this binary's own pending migrations are applied.
 
 ### Fixed
 - Metrics scraper releases its per-service in-flight slot via an RAII drop guard, preventing a permanent scrape stall if a collector task panics.
 - Monitoring queries stop polling on permanent errors (monitoring disabled / not found / 503) instead of retrying every few seconds.
 - Retention migration uses `if_exists` (not the non-existent `if_not_exists`) on `remove_retention_policy`, fixing a fresh-install setup crash.
 - Service detail refetches after a service upgrade so the new image/status is reflected immediately.
+- Redis counter metrics (`evicted_keys_total`, `keyspace_hits_total`, `keyspace_misses_total`, `expired_keys_total`) were mislabelled as `Gauge` instead of `Counter`, so their raw cumulative values were charted directly instead of as a rate of change.
 
 
 ## [0.1.0-beta.25] - 2026-05-31

@@ -150,7 +150,7 @@ fn parse_info(config: &CollectorConfig, info: &str) -> Vec<MetricPoint> {
                 source_id,
                 name: $name.to_string(),
                 value: $value,
-                kind: MetricKind::Gauge,
+                kind: MetricKind::Counter,
                 engine: Some("redis".to_string()),
                 environment: environment.clone(),
                 node_id,
