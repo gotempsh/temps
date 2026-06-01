@@ -6,7 +6,7 @@ use sea_orm_migration::prelude::*;
 /// **Tiered retention:**
 /// - Raw (`service_metrics`): 30 days
 /// - Hourly aggregate (`service_metrics_hourly`): 90 days
-/// - Daily aggregate (`service_metrics_daily`): 2 years (730 days)
+/// - Daily aggregate (`service_metrics_daily`): 1 year (365 days)
 ///
 /// **Continuous aggregate hierarchy:**
 /// - `service_metrics_hourly` is built from the raw table (1-hour buckets).
@@ -196,10 +196,12 @@ SELECT add_retention_policy(
     if_not_exists => TRUE
 );
 
--- Daily aggregate: 2 years
+-- Daily aggregate: 1 year
+-- Kept primarily for long-term capacity/growth trends (storage size, DB size).
+-- Operational metrics rarely need multi-year history, so 1 year is plenty.
 SELECT add_retention_policy(
     'service_metrics_daily',
-    INTERVAL '730 days',
+    INTERVAL '365 days',
     if_not_exists => TRUE
 );
 "#,

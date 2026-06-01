@@ -1,11 +1,12 @@
 use sea_orm_migration::prelude::*;
 
-/// Updates the `service_metrics` raw table retention policy from 7 days to
-/// 30 days on databases provisioned before this migration.
+/// Updates metrics retention on databases provisioned before this migration:
+/// - raw `service_metrics`: 7 days → 30 days
+/// - `service_metrics_daily`: 2 years (730d) → 1 year (365d)
 ///
 /// The original migration used `if_not_exists => TRUE` so existing policies
-/// were not replaced.  This migration explicitly removes the old policy and
-/// re-creates it at 30 days.
+/// were not replaced.  This migration explicitly removes the old policies and
+/// re-creates them at the new intervals.
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 
@@ -18,13 +19,19 @@ impl MigrationTrait for Migration {
             r#"
 DO $$
 BEGIN
-    -- Remove existing raw retention policy (drop is idempotent via if_exists).
+    -- Raw: 7 days → 30 days. (remove is idempotent via if_exists)
     PERFORM remove_retention_policy('service_metrics', if_exists => TRUE);
-
-    -- Re-create at 30 days.
     PERFORM add_retention_policy(
         'service_metrics',
         INTERVAL '30 days',
+        if_not_exists => TRUE
+    );
+
+    -- Daily aggregate: 2 years → 1 year.
+    PERFORM remove_retention_policy('service_metrics_daily', if_exists => TRUE);
+    PERFORM add_retention_policy(
+        'service_metrics_daily',
+        INTERVAL '365 days',
         if_not_exists => TRUE
     );
 END
@@ -47,6 +54,13 @@ BEGIN
     PERFORM add_retention_policy(
         'service_metrics',
         INTERVAL '7 days',
+        if_not_exists => TRUE
+    );
+
+    PERFORM remove_retention_policy('service_metrics_daily', if_exists => TRUE);
+    PERFORM add_retention_policy(
+        'service_metrics_daily',
+        INTERVAL '730 days',
         if_not_exists => TRUE
     );
 END
