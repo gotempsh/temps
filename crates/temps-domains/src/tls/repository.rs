@@ -351,12 +351,20 @@ impl CertificateRepository for DefaultCertificateRepository {
         use temps_entities::domains;
 
         let expiry_date = Utc::now() + Duration::days(days as i64);
+        // Include any domain with an expiring certificate, regardless of current status.
+        // Previously this was filtered to `status = "active"`, which meant a single failed
+        // renewal attempt would leave the domain stuck in `pending_http`/`challenge_requested`
+        // and it would never be retried — the cert would silently expire.
+        //
+        // We now include all domains with a stored certificate that's about to expire and
+        // let `check_and_renew_certificates` decide what to do with each row. Domains that
+        // have no certificate (truly never-provisioned) still get filtered out by the
+        // `expiration_time IS NOT NULL` clause.
         let results = domains::Entity::find()
             .filter(
                 Condition::all()
                     .add(domains::Column::ExpirationTime.is_not_null())
-                    .add(domains::Column::ExpirationTime.lte(expiry_date))
-                    .add(domains::Column::Status.eq("active")),
+                    .add(domains::Column::ExpirationTime.lte(expiry_date)),
             )
             .all(self.db.as_ref())
             .await?;

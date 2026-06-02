@@ -411,7 +411,11 @@ impl TlsService {
     }
 
     async fn handle_http01_renewal(&self, cert: &Certificate, report: &mut RenewalReport) {
-        info!("🔄 Auto-renewing HTTP-01 certificate for {}", cert.domain);
+        let days_remaining = cert.days_until_expiry();
+        info!(
+            "🔄 Auto-renewing HTTP-01 certificate for {} (status={:?}, expires in {} days)",
+            cert.domain, cert.status, days_remaining
+        );
 
         let email = self.get_acme_email().await;
 
