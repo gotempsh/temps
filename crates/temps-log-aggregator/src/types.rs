@@ -147,11 +147,21 @@ pub struct LogSearchFilter {
     /// Page size (default: 100, max: 2000)
     #[serde(default = "default_page_size")]
     pub page_size: u32,
+    /// grep -C: number of raw context lines to include before AND after each
+    /// match. 0 (default) returns matches only — wire shape unchanged. The
+    /// surrounding lines ignore the level/text/field filters (they're raw
+    /// neighbors, the whole point of context) and are clamped to
+    /// `MAX_CONTEXT_LINES` server-side.
+    #[serde(default)]
+    pub context_lines: u32,
 }
 
 fn default_page_size() -> u32 {
     100
 }
+
+/// Upper bound on `context_lines` (each side) to keep response size bounded.
+pub const MAX_CONTEXT_LINES: u32 = 50;
 
 /// A single field-level filter
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,6 +210,21 @@ pub struct LogSearchLine {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>)]
     pub deploy_id: Option<Uuid>,
+    /// Raw surrounding lines (grep -C). `None` unless `context_lines > 0` was
+    /// requested. Overlapping windows between nearby matches are merged: the
+    /// shared neighbors appear on the earlier match only, so the frontend can
+    /// render one continuous block without duplicated lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<LineContext>,
+}
+
+/// Raw surrounding lines for a single match (grep -C style).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct LineContext {
+    /// Lines immediately before the match, oldest-first.
+    pub before: Vec<ContextLine>,
+    /// Lines immediately after the match, oldest-first.
+    pub after: Vec<ContextLine>,
 }
 
 /// Search execution mode

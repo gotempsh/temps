@@ -177,6 +177,11 @@ pub struct SearchLogsRequest {
     pub cursor: Option<String>,
     /// Page size (default: 100, max: 500)
     pub page_size: Option<u32>,
+    /// grep -C: number of raw context lines to include before and after each
+    /// match (0 = none, default). Clamped to 50 server-side. The surrounding
+    /// lines ignore the level/text filters — they are the actual adjacent log
+    /// lines, merged across overlapping matches.
+    pub context_lines: Option<u32>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -234,6 +239,7 @@ pub struct PurgeLogsRequest {
             PurgeLogsRequest,
             LogSearchLine,
             ContextLine,
+            LineContext,
             SearchMode,
             LogLevel,
             LogStream,
@@ -315,6 +321,7 @@ async fn search_logs(
         field_filters: vec![],
         cursor: request.cursor,
         page_size: request.page_size.unwrap_or(100),
+        context_lines: request.context_lines.unwrap_or(0),
     };
 
     let result = app_state.search_service.search(&filter).await?;

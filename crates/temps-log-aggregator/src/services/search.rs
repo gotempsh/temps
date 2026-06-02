@@ -240,6 +240,19 @@ impl LogSearchService {
         // - Any overlapping chunks for the same container/time window
         let mut seen: HashSet<(i64, String, LogStream, String)> = HashSet::new();
 
+        // grep -C support. When context_lines > 0 we keep the fully-parsed
+        // line buffer of every chunk that produced at least one surviving
+        // match, so we can slice raw neighbors after the page is finalized
+        // WITHOUT re-reading or re-decompressing the chunk. Bounded by the
+        // number of distinct chunks contributing to the page (<= page_size).
+        let context_lines = std::cmp::min(filter.context_lines, MAX_CONTEXT_LINES) as usize;
+        let want_context = context_lines > 0;
+        // Per-chunk buffer of parsed lines, indexed by line offset. `None`
+        // entries are lines that failed to parse — kept as placeholders so a
+        // line's offset still maps to its position in the buffer.
+        let mut chunk_lines: std::collections::HashMap<Uuid, Vec<Option<LogLine>>> =
+            std::collections::HashMap::new();
+
         // Process chunks in batches of MAX_CONCURRENT_FETCHES
         for chunk_batch in chunks.chunks(MAX_CONCURRENT_FETCHES) {
             let mut fetch_futures = Vec::new();
@@ -297,6 +310,22 @@ impl LogSearchService {
                             // filters (time + level + service + text). Users
                             // care about "matches in window", not raw bytes.
                             total_scanned += 1;
+
+                            // Cache this chunk's full parsed line buffer the
+                            // first time it contributes a match, so context
+                            // attachment below can slice raw neighbors with no
+                            // extra I/O. Every line is parsed regardless of
+                            // filters — context is raw (grep -C), and unparsable
+                            // lines become None placeholders to keep offsets aligned.
+                            if want_context {
+                                chunk_lines.entry(chunk_id).or_insert_with(|| {
+                                    content
+                                        .lines()
+                                        .map(|l| serde_json::from_str::<LogLine>(l).ok())
+                                        .collect()
+                                });
+                            }
+
                             let entry = HeapEntry {
                                 timestamp: parsed.ts,
                                 line: LogSearchLine {
@@ -308,6 +337,9 @@ impl LogSearchService {
                                     chunk_id,
                                     line_offset: line_idx as i32,
                                     deploy_id: parsed.deploy_id,
+                                    // Filled in by attach_context() after the
+                                    // page is finalized, when context_lines > 0.
+                                    context: None,
                                 },
                             };
 
@@ -359,12 +391,129 @@ impl LogSearchService {
         let mut all_matches = newest_first;
         all_matches.reverse();
 
+        // Attach grep -C context to the final page only. Overlapping windows
+        // between nearby matches in the same chunk are merged so no neighbor
+        // line is emitted twice.
+        if want_context {
+            Self::attach_context(&mut all_matches, &chunk_lines, context_lines);
+        }
+
         Ok(LogSearchResult {
             lines: all_matches,
             next_cursor,
             search_mode: SearchMode::Archive,
             total_scanned,
         })
+    }
+
+    /// Attach grep -C surrounding lines to each match in `matches`, slicing
+    /// raw neighbors from the per-chunk parsed-line buffers in `chunk_lines`.
+    ///
+    /// Overlap handling: when two matches in the SAME chunk sit within `n`
+    /// lines of each other, their windows overlap. We split the gap at its
+    /// midpoint so every inter-match line is emitted exactly once — assigned
+    /// to the earlier match's `after` up to the midpoint, and to the later
+    /// match's `before` past it. The frontend renders contiguous offsets as a
+    /// single uninterrupted block, so the visual result is grep's merged
+    /// `-C` window with both match lines highlighted.
+    fn attach_context(
+        matches: &mut [LogSearchLine],
+        chunk_lines: &std::collections::HashMap<Uuid, Vec<Option<LogLine>>>,
+        n: usize,
+    ) {
+        // Group match offsets per chunk so we can compute neighbor boundaries.
+        // matches is ASC by timestamp, but within one chunk offsets are also
+        // monotonic, so we collect per-chunk sorted offsets for the midpoint
+        // split. Build a lookup: chunk_id -> sorted Vec<line_offset> of matches.
+        let mut per_chunk: std::collections::HashMap<Uuid, Vec<i32>> =
+            std::collections::HashMap::new();
+        for m in matches.iter() {
+            per_chunk.entry(m.chunk_id).or_default().push(m.line_offset);
+        }
+        for offsets in per_chunk.values_mut() {
+            offsets.sort_unstable();
+            offsets.dedup();
+        }
+
+        for m in matches.iter_mut() {
+            let Some(buffer) = chunk_lines.get(&m.chunk_id) else {
+                continue;
+            };
+            let offsets = match per_chunk.get(&m.chunk_id) {
+                Some(o) => o,
+                None => continue,
+            };
+            let target = m.line_offset;
+            let target_usize = target.max(0) as usize;
+
+            // Neighboring matches in this chunk (if any) bound the window so
+            // shared lines aren't duplicated. prev = closest match below,
+            // next = closest match above.
+            let pos = offsets.binary_search(&target).unwrap_or(offsets.len());
+            let prev = if pos > 0 {
+                Some(offsets[pos - 1])
+            } else {
+                None
+            };
+            let next = offsets.get(pos + 1).copied();
+
+            // before: [target - n, target), clamped at the midpoint with prev.
+            let raw_before_start = target_usize.saturating_sub(n);
+            let before_start = match prev {
+                Some(p) if (target - p) as usize <= 2 * n => {
+                    // Windows overlap: split the gap at its midpoint. The
+                    // midpoint line belongs to the earlier match's `after`,
+                    // so `before` starts just past it.
+                    let mid = p + (target - p) / 2;
+                    std::cmp::max(raw_before_start, (mid + 1).max(0) as usize)
+                }
+                _ => raw_before_start,
+            };
+            let mut before = Vec::new();
+            for off in before_start..target_usize {
+                if let Some(Some(line)) = buffer.get(off) {
+                    before.push(Self::to_context_line(line, off as i32, false));
+                }
+            }
+
+            // after: (target, target + n], clamped at the midpoint with next.
+            let raw_after_end = std::cmp::min(target_usize + n, buffer.len().saturating_sub(1));
+            let after_end = match next {
+                Some(nx) if (nx - target) as usize <= 2 * n => {
+                    let mid = target + (nx - target) / 2;
+                    std::cmp::min(raw_after_end, mid.max(0) as usize)
+                }
+                _ => raw_after_end,
+            };
+            let mut after = Vec::new();
+            if buffer.get(target_usize).is_some() {
+                for off in (target_usize + 1)..=after_end {
+                    if off >= buffer.len() {
+                        break;
+                    }
+                    if let Some(Some(line)) = buffer.get(off) {
+                        after.push(Self::to_context_line(line, off as i32, false));
+                    }
+                }
+            }
+
+            if before.is_empty() && after.is_empty() {
+                continue;
+            }
+            m.context = Some(LineContext { before, after });
+        }
+    }
+
+    /// Convert a cached parsed line into a `ContextLine`.
+    fn to_context_line(line: &LogLine, line_offset: i32, is_match: bool) -> ContextLine {
+        ContextLine {
+            timestamp: line.ts,
+            level: line.level,
+            message: line.msg.clone(),
+            fields: line.fields.clone(),
+            line_offset,
+            is_match,
+        }
     }
 
     /// Check if a single log line matches the search filter.
@@ -469,6 +618,7 @@ mod tests {
             field_filters: vec![],
             cursor: None,
             page_size: 100,
+            context_lines: 0,
         }
     }
 
@@ -755,6 +905,7 @@ mod tests {
                 field_filters: vec![],
                 cursor: None,
                 page_size: 100,
+                context_lines: 0,
             };
 
             assert!(search.line_matches_filter(&web_line, &filter));
@@ -803,6 +954,7 @@ mod tests {
                 field_filters: vec![],
                 cursor: None,
                 page_size: 100,
+                context_lines: 0,
             };
 
             assert!(search.line_matches_filter(&lines[0], &filter)); // web
@@ -848,6 +1000,7 @@ mod tests {
                 field_filters: vec![],
                 cursor: None,
                 page_size: 100,
+                context_lines: 0,
             };
 
             assert!(search.line_matches_filter(&prod_line, &filter));
@@ -898,6 +1051,7 @@ mod tests {
                 field_filters: vec![],
                 cursor: None,
                 page_size: 100,
+                context_lines: 0,
             };
 
             assert!(search.line_matches_filter(&line_deploy, &filter));
@@ -935,6 +1089,7 @@ mod tests {
                 field_filters: vec![],
                 cursor: None,
                 page_size: 100,
+                context_lines: 0,
             };
 
             assert!(search.line_matches_filter(&error_line, &filter));
@@ -975,6 +1130,7 @@ mod tests {
                 field_filters: vec![],
                 cursor: None,
                 page_size: 100,
+                context_lines: 0,
             };
 
             assert!(search.line_matches_filter(&line, &filter));
@@ -1013,6 +1169,7 @@ mod tests {
                 field_filters: vec![],
                 cursor: None,
                 page_size: 100,
+                context_lines: 0,
             };
             assert!(search.line_matches_filter(&line, &filter));
 
@@ -1062,6 +1219,7 @@ mod tests {
                 field_filters: vec![],
                 cursor: None,
                 page_size: 100,
+                context_lines: 0,
             };
 
             assert!(search.line_matches_filter(&error_timeout, &filter));
@@ -1114,6 +1272,7 @@ mod tests {
                 }],
                 cursor: None,
                 page_size: 100,
+                context_lines: 0,
             };
             assert!(search.line_matches_filter(&line, &filter));
 
@@ -1134,6 +1293,7 @@ mod tests {
                 }],
                 cursor: None,
                 page_size: 100,
+                context_lines: 0,
             };
             assert!(search.line_matches_filter(&line, &filter_req));
         }
@@ -1181,6 +1341,7 @@ mod tests {
                 }],
                 cursor: None,
                 page_size: 100,
+                context_lines: 0,
             };
             assert!(search.line_matches_filter(&line, &filter_gt));
 
@@ -1201,6 +1362,7 @@ mod tests {
                 }],
                 cursor: None,
                 page_size: 100,
+                context_lines: 0,
             };
             assert!(!search.line_matches_filter(&line, &filter_gt_high));
 
@@ -1221,6 +1383,7 @@ mod tests {
                 }],
                 cursor: None,
                 page_size: 100,
+                context_lines: 0,
             };
             assert!(search.line_matches_filter(&line, &filter_lt));
 
@@ -1241,6 +1404,7 @@ mod tests {
                 }],
                 cursor: None,
                 page_size: 100,
+                context_lines: 0,
             };
             assert!(search.line_matches_filter(&line, &filter_gte));
 
@@ -1261,6 +1425,7 @@ mod tests {
                 }],
                 cursor: None,
                 page_size: 100,
+                context_lines: 0,
             };
             assert!(!search.line_matches_filter(&line, &filter_lte));
         }
@@ -1299,6 +1464,7 @@ mod tests {
                 }],
                 cursor: None,
                 page_size: 100,
+                context_lines: 0,
             };
 
             assert!(!search.line_matches_filter(&line, &filter));
@@ -1348,6 +1514,7 @@ mod tests {
                 ],
                 cursor: None,
                 page_size: 100,
+                context_lines: 0,
             };
             assert!(search.line_matches_filter(&line, &filter_both));
 
@@ -1375,6 +1542,7 @@ mod tests {
                 ],
                 cursor: None,
                 page_size: 100,
+                context_lines: 0,
             };
             assert!(!search.line_matches_filter(&line, &filter_partial));
         }
@@ -1422,6 +1590,7 @@ mod tests {
                 field_filters: vec![],
                 cursor: None,
                 page_size: 100,
+                context_lines: 0,
             };
 
             let matches: Vec<_> = roundtripped
@@ -1443,6 +1612,7 @@ mod tests {
                 field_filters: vec![],
                 cursor: None,
                 page_size: 100,
+                context_lines: 0,
             };
 
             let no_matches: Vec<_> = roundtripped
@@ -1501,6 +1671,7 @@ mod tests {
                 field_filters: vec![],
                 cursor: None,
                 page_size: 100,
+                context_lines: 0,
             };
 
             let matches: Vec<_> = roundtripped
@@ -1522,6 +1693,7 @@ mod tests {
                 field_filters: vec![],
                 cursor: None,
                 page_size: 100,
+                context_lines: 0,
             };
 
             let matches_500: Vec<_> = roundtripped
@@ -1544,6 +1716,7 @@ mod tests {
                 field_filters: vec![],
                 cursor: None,
                 page_size: 100,
+                context_lines: 0,
             };
 
             let matches_conn: Vec<_> = roundtripped
@@ -1613,6 +1786,7 @@ mod tests {
                 }],
                 cursor: None,
                 page_size: 100,
+                context_lines: 0,
             };
 
             let matches_500: Vec<_> = roundtripped
@@ -1639,6 +1813,7 @@ mod tests {
                 }],
                 cursor: None,
                 page_size: 100,
+                context_lines: 0,
             };
 
             let matches_slow: Vec<_> = roundtripped
@@ -1668,6 +1843,7 @@ mod tests {
                 }],
                 cursor: None,
                 page_size: 100,
+                context_lines: 0,
             };
 
             let matches_user: Vec<_> = roundtripped
@@ -1735,6 +1911,7 @@ mod tests {
                 ],
                 cursor: None,
                 page_size: 100,
+                context_lines: 0,
             };
 
             let matches: Vec<_> = roundtripped
@@ -1786,6 +1963,7 @@ mod tests {
                 field_filters: vec![],
                 cursor: None,
                 page_size: 100,
+                context_lines: 0,
             };
 
             let errors: Vec<_> = roundtripped
@@ -1808,6 +1986,7 @@ mod tests {
                 field_filters: vec![],
                 cursor: None,
                 page_size: 100,
+                context_lines: 0,
             };
 
             let disk_matches: Vec<_> = roundtripped
@@ -1855,6 +2034,7 @@ mod tests {
                 field_filters: vec![],
                 cursor: None,
                 page_size: 100,
+                context_lines: 0,
             };
 
             assert!(search.line_matches_filter(&recent_line, &filter));
@@ -1881,6 +2061,7 @@ mod tests {
                 field_filters: vec![],
                 cursor: None,
                 page_size: 100,
+                context_lines: 0,
             };
 
             let result = search.search(&filter).await;
@@ -1911,6 +2092,7 @@ mod tests {
                 field_filters: vec![],
                 cursor: None,
                 page_size: 100,
+                context_lines: 0,
             };
 
             let result = search.search(&filter).await;
@@ -1999,6 +2181,7 @@ mod tests {
                 }],
                 cursor: None,
                 page_size: 500,
+                context_lines: 0,
             };
 
             let matches: Vec<_> = roundtripped
@@ -2062,6 +2245,7 @@ mod tests {
                 field_filters: vec![],
                 cursor: None,
                 page_size: 100,
+                context_lines: 0,
             };
 
             let matches: Vec<_> = lines
@@ -2070,5 +2254,154 @@ mod tests {
                 .collect();
             assert_eq!(matches.len(), 4, "empty filter should match all lines");
         }
+    }
+
+    // ── grep -C context attachment (attach_context) ─────────────────────────
+
+    /// Build a single-chunk buffer of `count` sequential INFO lines, each
+    /// message "line-{i}", timestamped i milliseconds apart so order is stable.
+    fn make_chunk_buffer(count: usize) -> Vec<Option<LogLine>> {
+        let base = Utc::now();
+        (0..count)
+            .map(|i| {
+                Some(LogLine {
+                    ts: base + Duration::milliseconds(i as i64),
+                    stream: LogStream::Stdout,
+                    level: LogLevel::Info,
+                    msg: format!("line-{i}"),
+                    fields: None,
+                    container_id: "cnt1".to_string(),
+                    service: "web".to_string(),
+                    env: "1".to_string(),
+                    project_id: 1,
+                    deploy_id: None,
+                })
+            })
+            .collect()
+    }
+
+    fn make_match(chunk_id: Uuid, line_offset: i32) -> LogSearchLine {
+        LogSearchLine {
+            timestamp: Utc::now(),
+            level: LogLevel::Error,
+            service: "web".to_string(),
+            message: format!("match-at-{line_offset}"),
+            fields: None,
+            chunk_id,
+            line_offset,
+            deploy_id: None,
+            context: None,
+        }
+    }
+
+    #[test]
+    fn test_attach_context_basic_window() {
+        let chunk_id = Uuid::new_v4();
+        let mut buffers = std::collections::HashMap::new();
+        buffers.insert(chunk_id, make_chunk_buffer(20));
+
+        // One match at offset 10, N=3 → 3 before (7,8,9) and 3 after (11,12,13).
+        let mut matches = vec![make_match(chunk_id, 10)];
+        LogSearchService::attach_context(&mut matches, &buffers, 3);
+
+        let ctx = matches[0].context.as_ref().expect("context attached");
+        assert_eq!(ctx.before.len(), 3);
+        assert_eq!(ctx.after.len(), 3);
+        assert_eq!(ctx.before[0].line_offset, 7);
+        assert_eq!(ctx.before[2].line_offset, 9);
+        assert_eq!(ctx.after[0].line_offset, 11);
+        assert_eq!(ctx.after[2].line_offset, 13);
+        // Context lines are neighbors, never the match itself.
+        assert!(ctx.before.iter().all(|l| !l.is_match));
+        assert!(ctx.after.iter().all(|l| !l.is_match));
+    }
+
+    #[test]
+    fn test_attach_context_clamps_at_chunk_start_and_end() {
+        let chunk_id = Uuid::new_v4();
+        let mut buffers = std::collections::HashMap::new();
+        buffers.insert(chunk_id, make_chunk_buffer(10));
+
+        // Match at offset 0 → no before, after clamped to available lines.
+        let mut at_start = vec![make_match(chunk_id, 0)];
+        LogSearchService::attach_context(&mut at_start, &buffers, 5);
+        let ctx = at_start[0].context.as_ref().expect("context");
+        assert_eq!(ctx.before.len(), 0, "no lines before offset 0");
+        assert_eq!(ctx.after.len(), 5);
+
+        // Match at last offset (9) → no after, before clamped.
+        let mut at_end = vec![make_match(chunk_id, 9)];
+        LogSearchService::attach_context(&mut at_end, &buffers, 5);
+        let ctx = at_end[0].context.as_ref().expect("context");
+        assert_eq!(ctx.before.len(), 5);
+        assert_eq!(ctx.after.len(), 0, "no lines after the last offset");
+    }
+
+    #[test]
+    fn test_attach_context_merges_overlapping_windows_no_duplicates() {
+        let chunk_id = Uuid::new_v4();
+        let mut buffers = std::collections::HashMap::new();
+        buffers.insert(chunk_id, make_chunk_buffer(30));
+
+        // Two matches 4 lines apart (10 and 14), N=5 → windows overlap.
+        // Expectation: no neighbor line offset appears in BOTH windows.
+        let mut matches = vec![make_match(chunk_id, 10), make_match(chunk_id, 14)];
+        LogSearchService::attach_context(&mut matches, &buffers, 5);
+
+        let mut emitted: Vec<i32> = Vec::new();
+        for m in &matches {
+            if let Some(ctx) = &m.context {
+                for l in ctx.before.iter().chain(ctx.after.iter()) {
+                    emitted.push(l.line_offset);
+                }
+            }
+        }
+        let mut deduped = emitted.clone();
+        deduped.sort_unstable();
+        deduped.dedup();
+        assert_eq!(
+            emitted.len(),
+            deduped.len(),
+            "overlapping windows must not emit any neighbor line twice: {emitted:?}"
+        );
+        // The match offsets themselves are not emitted as context lines.
+        assert!(!emitted.contains(&10));
+        assert!(!emitted.contains(&14));
+    }
+
+    #[test]
+    fn test_attach_context_zero_window_when_no_neighbors() {
+        // A single-line chunk: a match at offset 0 with N=5 has no neighbors,
+        // so context stays None rather than an empty struct.
+        let chunk_id = Uuid::new_v4();
+        let mut buffers = std::collections::HashMap::new();
+        buffers.insert(chunk_id, make_chunk_buffer(1));
+
+        let mut matches = vec![make_match(chunk_id, 0)];
+        LogSearchService::attach_context(&mut matches, &buffers, 5);
+        assert!(matches[0].context.is_none());
+    }
+
+    #[test]
+    fn test_attach_context_skips_unparsable_neighbor_lines() {
+        // A None in the buffer (unparsable raw line) is skipped but doesn't
+        // shift offsets: the surviving neighbors keep their real offsets.
+        let chunk_id = Uuid::new_v4();
+        let mut buffer = make_chunk_buffer(10);
+        buffer[8] = None; // corrupt the line just before the match at 10... wait
+        let mut buffers = std::collections::HashMap::new();
+        buffers.insert(chunk_id, buffer);
+
+        let mut matches = vec![make_match(chunk_id, 5)];
+        LogSearchService::attach_context(&mut matches, &buffers, 3);
+        let ctx = matches[0].context.as_ref().expect("context");
+        // offset 8 isn't within [2,4]∪[6,8]; it IS at the edge of `after`.
+        // after window is 6,7,8 → 8 is None so only 6,7 survive.
+        let after_offsets: Vec<i32> = ctx.after.iter().map(|l| l.line_offset).collect();
+        assert_eq!(
+            after_offsets,
+            vec![6, 7],
+            "None neighbor dropped, offsets intact"
+        );
     }
 }
