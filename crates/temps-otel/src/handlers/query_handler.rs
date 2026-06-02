@@ -47,6 +47,11 @@ pub struct TraceQueryParams {
     pub attributes: Option<String>,
     /// Filter by span name pattern (ILIKE).
     pub name_pattern: Option<String>,
+    /// Sort field for the trace-summaries list: "start_time" (default) or
+    /// "duration". Anything else falls back to start_time.
+    pub sort_by: Option<String>,
+    /// Sort direction: "asc" or "desc" (default).
+    pub sort_order: Option<String>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
 }
@@ -310,6 +315,9 @@ pub async fn query_traces(
             .map(parse_attributes)
             .filter(|m| !m.is_empty()),
         name_pattern: params.name_pattern.clone(),
+        // Sorting only applies to the trace-summaries list, not raw span queries.
+        sort_by: TraceSortField::default(),
+        sort_order: SortOrder::default(),
         limit: params.limit,
         offset: params.offset,
     };
@@ -336,6 +344,8 @@ pub async fn query_traces(
         ("end_time" = Option<String>, Query, description = "End time (RFC 3339)"),
         ("environment_id" = Option<i32>, Query, description = "Filter by environment ID"),
         ("deployment_id" = Option<i32>, Query, description = "Filter by deployment ID"),
+        ("sort_by" = Option<String>, Query, description = "Sort field: 'start_time' (default) or 'duration'"),
+        ("sort_order" = Option<String>, Query, description = "Sort direction: 'asc' or 'desc' (default)"),
         ("limit" = Option<u64>, Query, description = "Max traces to return (default: 50, max: 100)"),
         ("offset" = Option<u64>, Query, description = "Offset for pagination"),
     ),
@@ -376,6 +386,16 @@ pub async fn query_trace_summaries(
             .map(parse_attributes)
             .filter(|m| !m.is_empty()),
         name_pattern: params.name_pattern.clone(),
+        sort_by: params
+            .sort_by
+            .as_deref()
+            .map(TraceSortField::parse)
+            .unwrap_or_default(),
+        sort_order: params
+            .sort_order
+            .as_deref()
+            .map(SortOrder::parse)
+            .unwrap_or_default(),
         limit: params.limit,
         offset: params.offset,
     };

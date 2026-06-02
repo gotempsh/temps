@@ -754,6 +754,25 @@ impl OtelStorage for TimescaleDbStorage {
 
         let where_sql = where_clauses.join(" AND ");
 
+        // Build the ORDER BY from the requested sort. Both options sort on an
+        // aggregate (this is a GROUP BY trace_id query), so neither can use an
+        // index — but the time-window WHERE keeps the grouped set small. We add
+        // a stable tie-breaker so pagination is deterministic across pages.
+        //
+        // NOTE: sort_by/sort_order come from a fixed enum, not user strings, so
+        // interpolating them into SQL is injection-safe.
+        let order_dir = query.sort_order.as_sql();
+        let order_sql = match query.sort_by {
+            crate::types::TraceSortField::Duration => {
+                format!(
+                    "ORDER BY MAX(s.duration_ms) {order_dir}, MIN(s.start_time) DESC, s.trace_id"
+                )
+            }
+            crate::types::TraceSortField::StartTime => {
+                format!("ORDER BY MIN(s.start_time) {order_dir}, s.trace_id")
+            }
+        };
+
         // Aggregate per trace_id: pick root span (NULL parent) or longest span,
         // count total spans and error spans, compute trace duration.
         // LEFT JOIN deployments + environments to resolve the environment name
@@ -788,7 +807,7 @@ impl OtelStorage for TimescaleDbStorage {
             WHERE {where_sql}
             GROUP BY s.trace_id
             {status_having}
-            ORDER BY MIN(s.start_time) DESC
+            {order_sql}
             LIMIT ${param_idx} OFFSET ${next_param}
             "#,
             next_param = param_idx + 1

@@ -382,8 +382,62 @@ pub struct TraceQuery {
     pub attributes: Option<BTreeMap<String, String>>,
     /// Filter by span name pattern (ILIKE).
     pub name_pattern: Option<String>,
+    /// Field to sort the trace-summaries list by. Defaults to start time.
+    #[serde(default)]
+    pub sort_by: TraceSortField,
+    /// Sort direction. Defaults to descending.
+    #[serde(default)]
+    pub sort_order: SortOrder,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
+}
+
+/// Sortable fields for the trace-summaries list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceSortField {
+    /// Trace start time (`MIN(start_time)`), the default.
+    #[default]
+    StartTime,
+    /// Trace duration (`MAX(duration_ms)` — the longest span in the trace).
+    Duration,
+}
+
+impl TraceSortField {
+    /// Parse a query-string value into a sort field, defaulting to StartTime.
+    pub fn parse(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "duration" | "duration_ms" => TraceSortField::Duration,
+            _ => TraceSortField::StartTime,
+        }
+    }
+}
+
+/// Sort direction for list queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SortOrder {
+    Asc,
+    #[default]
+    Desc,
+}
+
+impl SortOrder {
+    /// Parse a query-string value into a direction, defaulting to Desc.
+    pub fn parse(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "asc" | "ascending" => SortOrder::Asc,
+            _ => SortOrder::Desc,
+        }
+    }
+
+    /// The SQL keyword for this direction.
+    pub fn as_sql(self) -> &'static str {
+        match self {
+            SortOrder::Asc => "ASC",
+            SortOrder::Desc => "DESC",
+        }
+    }
 }
 
 /// Summary of a GenAI conversation — aggregated from OTel spans with `gen_ai.*` attributes.
@@ -963,6 +1017,41 @@ mod tests {
         let q = TraceQuery::default();
         assert!(q.attributes.is_none());
         assert!(q.name_pattern.is_none());
+    }
+
+    #[test]
+    fn test_trace_query_default_sort() {
+        // Default list sort is newest-first by start time.
+        let q = TraceQuery::default();
+        assert_eq!(q.sort_by, TraceSortField::StartTime);
+        assert_eq!(q.sort_order, SortOrder::Desc);
+    }
+
+    #[test]
+    fn test_trace_sort_field_parse() {
+        assert_eq!(TraceSortField::parse("duration"), TraceSortField::Duration);
+        assert_eq!(
+            TraceSortField::parse("duration_ms"),
+            TraceSortField::Duration
+        );
+        assert_eq!(TraceSortField::parse("DURATION"), TraceSortField::Duration);
+        assert_eq!(
+            TraceSortField::parse("start_time"),
+            TraceSortField::StartTime
+        );
+        // Unknown values fall back to the safe default.
+        assert_eq!(TraceSortField::parse("bogus"), TraceSortField::StartTime);
+    }
+
+    #[test]
+    fn test_sort_order_parse_and_sql() {
+        assert_eq!(SortOrder::parse("asc"), SortOrder::Asc);
+        assert_eq!(SortOrder::parse("ascending"), SortOrder::Asc);
+        assert_eq!(SortOrder::parse("desc"), SortOrder::Desc);
+        // Unknown values fall back to descending.
+        assert_eq!(SortOrder::parse("sideways"), SortOrder::Desc);
+        assert_eq!(SortOrder::Asc.as_sql(), "ASC");
+        assert_eq!(SortOrder::Desc.as_sql(), "DESC");
     }
 
     #[test]
