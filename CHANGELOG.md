@@ -35,6 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The AI Agents overview and the visitor Journey tab now default to **Last 24 hours** (was Last 7 days), matching the rest of the analytics tabs.
 
 ### Fixed
+- Project sidebar now expands the correct section (e.g. Analytics) when a deep sub-route is hard-refreshed or opened from a direct link — previously it fell back to the top-level project nav because the drill-down state was only seeded on mount (before the project had loaded) and never re-synced. Sub-route matching is also prefix-aware, so deeper pages (e.g. the AI Agents "View all" tables) keep their section's nav item highlighted.
+- The AI Agents overview no longer duplicates its breakdown cards with full tables inline. The ranked, searchable Agents / Pages-crawled tables (with Unique IPs and per-page agent drill-down) moved to a dedicated "View all" page (`/analytics/ai-agents/all`), reached from the Top Agents, Top Providers, and Top Pages cards. The Top Providers link opens the tables pre-grouped by provider via `?group=provider`.
 - Metrics scraper releases its per-service in-flight slot via an RAII drop guard, preventing a permanent scrape stall if a collector task panics.
 - Monitoring queries stop polling on permanent errors (monitoring disabled / not found / 503) instead of retrying every few seconds.
 - Retention migration uses `if_exists` (not the non-existent `if_not_exists`) on `remove_retention_policy`, fixing a fresh-install setup crash.

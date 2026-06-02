@@ -1040,9 +1040,11 @@ function DimensionTab({ project }: DimensionTabProps) {
 // over from the overview card's "View all" link.
 interface AiAgentsTabProps {
   project: ProjectResponse
+  /** `overview` (default) = chart + cards; `tables` = the full "View all" page. */
+  view?: 'overview' | 'tables'
 }
 
-function AiAgentsTab({ project }: AiAgentsTabProps) {
+function AiAgentsTab({ project, view = 'overview' }: AiAgentsTabProps) {
   const navigate = useNavigate()
   const [searchParams, setSearchParams] = useSearchParams()
 
@@ -1109,7 +1111,8 @@ function AiAgentsTab({ project }: AiAgentsTabProps) {
     [searchParams, setSearchParams]
   )
 
-  const goBack = React.useCallback(() => {
+  // Serialise the active date filter so navigation preserves the window.
+  const dateQs = React.useCallback(() => {
     const params = new URLSearchParams()
     params.set('filter', dateFilter.quickFilter)
     if (
@@ -1121,8 +1124,30 @@ function AiAgentsTab({ project }: AiAgentsTabProps) {
       params.set('to', dateFilter.dateRange.to.toISOString())
     }
     const qs = params.toString()
-    navigate(`/projects/${project.slug}/analytics${qs ? `?${qs}` : ''}`)
-  }, [navigate, project.slug, dateFilter])
+    return qs ? `?${qs}` : ''
+  }, [dateFilter])
+
+  const goBack = React.useCallback(() => {
+    // From the tables ("View all") page, Back returns to the AI overview;
+    // from the overview it returns to the main analytics overview.
+    const dest =
+      view === 'tables'
+        ? `/projects/${project.slug}/analytics/ai-agents`
+        : `/projects/${project.slug}/analytics`
+    navigate(`${dest}${dateQs()}`)
+  }, [navigate, project.slug, view, dateQs])
+
+  const onViewAll = React.useCallback(() => {
+    navigate(`/projects/${project.slug}/analytics/ai-agents/all${dateQs()}`)
+  }, [navigate, project.slug, dateQs])
+
+  const onViewAllProviders = React.useCallback(() => {
+    const qs = dateQs()
+    const sep = qs ? '&' : '?'
+    navigate(
+      `/projects/${project.slug}/analytics/ai-agents/all${qs}${sep}group=provider`
+    )
+  }, [navigate, project.slug, dateQs])
 
   return (
     <div className="space-y-6">
@@ -1151,6 +1176,12 @@ function AiAgentsTab({ project }: AiAgentsTabProps) {
         endDate={endDate}
         environment={selectedEnvironment}
         onBack={goBack}
+        view={view}
+        onViewAll={view === 'overview' ? onViewAll : undefined}
+        onViewAllProviders={view === 'overview' ? onViewAllProviders : undefined}
+        defaultGroupBy={
+          searchParams.get('group') === 'provider' ? 'provider' : 'agent'
+        }
       />
     </div>
   )
@@ -1455,6 +1486,10 @@ export function ProjectAnalytics({ project }: ProjectAnalyticsProps) {
         element={<DimensionTab project={project} />}
       />
       <Route path="ai-agents" element={<AiAgentsTab project={project} />} />
+      <Route
+        path="ai-agents/all"
+        element={<AiAgentsTab project={project} view="tables" />}
+      />
       <Route
         path="segments/:dimension/:value"
         element={<SegmentVisitorsTab project={project} />}

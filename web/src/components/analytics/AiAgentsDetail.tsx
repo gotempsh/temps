@@ -41,15 +41,27 @@ interface AiAgentsDetailProps {
   environment: number | undefined
   /** Carries the active date filter back to the overview. */
   onBack: () => void
+  /**
+   * `overview` (default): timeline chart + breakdown card grid.
+   * `tables`: the full searchable Agents / Pages-crawled tables (the
+   * "View all" detail page). Splitting the two keeps the overview scannable
+   * while preserving the deep tables (search, Unique IPs, per-page agent
+   * drill-down) on their own page.
+   */
+  view?: 'overview' | 'tables'
+  /** Navigate to the full tables page (shown only in `overview` view). */
+  onViewAll?: () => void
+  /** Navigate to the full tables page grouped by provider (Top Providers card). */
+  onViewAllProviders?: () => void
+  /** Initial grouping for the tables view (`agent` by default). */
+  defaultGroupBy?: 'provider' | 'agent'
 }
 
 /**
- * Full "view all" page for AI agent traffic. Two sections:
- *  1. Every AI agent/provider that hit the site, ranked, searchable, with a
- *     by-provider / by-agent toggle.
- *  2. The pages those agents crawled most, with distinct-agent counts.
- * Both are read from the proxy-log AI breakdown endpoints and link into the
- * request log filtered to the matching AI traffic.
+ * AI agent traffic surface. In `overview` mode it shows the timeline chart and
+ * the breakdown card grid; in `tables` mode it shows the full ranked, searchable
+ * Agents / Pages-crawled tables. Both read from the proxy-log AI breakdown
+ * endpoints and link into the request log filtered to the matching AI traffic.
  */
 export function AiAgentsDetail({
   project,
@@ -57,9 +69,14 @@ export function AiAgentsDetail({
   endDate,
   environment,
   onBack,
+  view = 'overview',
+  onViewAll,
+  onViewAllProviders,
+  defaultGroupBy = 'agent',
 }: AiAgentsDetailProps) {
   const navigate = useNavigate()
-  const [groupBy, setGroupBy] = React.useState<'provider' | 'agent'>('agent')
+  const [groupBy, setGroupBy] =
+    React.useState<'provider' | 'agent'>(defaultGroupBy)
   const [agentSearch, setAgentSearch] = React.useState('')
   const [pageSearch, setPageSearch] = React.useState('')
   // Which page row is expanded to show its per-agent breakdown.
@@ -378,60 +395,71 @@ export function AiAgentsDetail({
         </div>
       </div>
 
-      {/* Request volume over time, split by provider/agent. */}
-      <AiAgentsTimelineChart
-        project={project}
-        startDate={startDate}
-        endDate={endDate}
-        environment={environment}
-      />
+      {view === 'overview' && (
+        <>
+          {/* Request volume over time, split by provider/agent. */}
+          <AiAgentsTimelineChart
+            project={project}
+            startDate={startDate}
+            endDate={endDate}
+            environment={environment}
+          />
 
-      {/* Overview card grid — mirrors the main analytics overview layout. */}
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-        <AiBreakdownCard
-          title="Top Agents"
-          description="Most active AI crawlers by requests"
-          rows={topAgentCards}
-          isLoading={agentsQuery.isLoading}
-          error={agentsQuery.isError}
-          footer={`Showing top ${topAgentCards.length} agents by requests`}
-        />
-        <AiBreakdownCard
-          title="Top Providers"
-          description="Crawler vendors, rolled up"
-          rows={topProviderCards}
-          isLoading={agentsQuery.isLoading}
-          error={agentsQuery.isError}
-          footer={`Showing top ${topProviderCards.length} providers by requests`}
-        />
-        <AiBreakdownCard
-          title="Crawl purpose"
-          description="Why bots are hitting your site"
-          rows={purposeCards}
-          isLoading={agentsQuery.isLoading}
-          error={agentsQuery.isError}
-          footer="Classified from the AI agent taxonomy"
-        />
-        <AiBreakdownCard
-          title="Response status"
-          description="Are crawlers getting served, or hitting errors?"
-          rows={statusCards}
-          isLoading={statusQuery.isLoading}
-          error={statusQuery.isError}
-          footer="HTTP status classes for AI traffic"
-        />
-        <AiBreakdownCard
-          title="Top Pages crawled"
-          description="Which content AI agents request most"
-          rows={topPageCards}
-          isLoading={pagesQuery.isLoading}
-          error={pagesQuery.isError}
-          footer={`Showing top ${topPageCards.length} pages · badge = distinct agents`}
-          onRowClick={(row) => setExpandedPath(row.id)}
-        />
-      </div>
+          {/* Overview card grid — mirrors the main analytics overview layout. */}
+          <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+            <AiBreakdownCard
+              title="Top Agents"
+              description="Most active AI crawlers by requests"
+              rows={topAgentCards}
+              isLoading={agentsQuery.isLoading}
+              error={agentsQuery.isError}
+              footer={`Showing top ${topAgentCards.length} agents by requests`}
+              action={onViewAll ? <ViewAllButton onClick={onViewAll} /> : undefined}
+            />
+            <AiBreakdownCard
+              title="Top Providers"
+              description="Crawler vendors, rolled up"
+              rows={topProviderCards}
+              isLoading={agentsQuery.isLoading}
+              error={agentsQuery.isError}
+              footer={`Showing top ${topProviderCards.length} providers by requests`}
+              action={
+                onViewAllProviders ? (
+                  <ViewAllButton onClick={onViewAllProviders} />
+                ) : undefined
+              }
+            />
+            <AiBreakdownCard
+              title="Crawl purpose"
+              description="Why bots are hitting your site"
+              rows={purposeCards}
+              isLoading={agentsQuery.isLoading}
+              error={agentsQuery.isError}
+              footer="Classified from the AI agent taxonomy"
+            />
+            <AiBreakdownCard
+              title="Response status"
+              description="Are crawlers getting served, or hitting errors?"
+              rows={statusCards}
+              isLoading={statusQuery.isLoading}
+              error={statusQuery.isError}
+              footer="HTTP status classes for AI traffic"
+            />
+            <AiBreakdownCard
+              title="Top Pages crawled"
+              description="Which content AI agents request most"
+              rows={topPageCards}
+              isLoading={pagesQuery.isLoading}
+              error={pagesQuery.isError}
+              footer={`Showing top ${topPageCards.length} pages · badge = distinct agents`}
+              action={onViewAll ? <ViewAllButton onClick={onViewAll} /> : undefined}
+            />
+          </div>
+        </>
+      )}
 
       {/* Full ranked tables with search + per-page drill-down. */}
+      {view === 'tables' && (
       <Tabs defaultValue="agents">
         <TabsList>
           <TabsTrigger value="agents">Agents</TabsTrigger>
@@ -681,7 +709,18 @@ export function AiAgentsDetail({
           )}
         </TabsContent>
       </Tabs>
+      )}
     </div>
+  )
+}
+
+/** "View all" link for an overview card header → the full tables page. */
+function ViewAllButton({ onClick }: { onClick: () => void }) {
+  return (
+    <Button variant="ghost" size="sm" className="text-xs" onClick={onClick}>
+      View all
+      <ExternalLink className="ml-1 h-3 w-3" />
+    </Button>
   )
 }
 

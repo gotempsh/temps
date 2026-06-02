@@ -73,7 +73,7 @@ import { resolvePluginIcon } from '@/lib/pluginIcons'
 import { cn } from '@/lib/utils'
 import { useQuery } from '@tanstack/react-query'
 import { ChevronRight, Eye, type LucideIcon } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useLocation } from 'react-router-dom'
 import { Avatar, AvatarFallback, AvatarImage } from '../ui/avatar'
 import {
@@ -882,13 +882,58 @@ function ProjectNav({
   // current route so a deep link lands inside the right sub-view, but
   // we never re-derive afterwards — Back must always return to root,
   // even though the URL is still a sub-route.
-  const [drilledTo, setDrilledTo] = useState<string | null>(() => {
-    if (!activeRoute) return null
-    const parent = projectBaseNav.find((it) =>
-      it.subItems?.some((s) => s.url === activeRoute)
-    )
-    return parent?.title ?? null
-  })
+  // Match a sub-item to the current route. Prefix-aware so a deeper route
+  // (e.g. `analytics/ai-agents/all`) still resolves to its section's sub-item
+  // (`analytics/ai-agents`), not just an exact match.
+  const matchesSubRoute = (subUrl: string, route: string) =>
+    route === subUrl || route.startsWith(`${subUrl}/`)
+
+  const findDrillParent = (route: string) =>
+    projectBaseNav.find((it) =>
+      it.subItems?.some((s) => matchesSubRoute(s.url, route))
+    )?.title ?? null
+
+  const [drilledTo, setDrilledTo] = useState<string | null>(() =>
+    activeRoute ? findDrillParent(activeRoute) : null
+  )
+
+  // On a hard refresh the `useState` initializer above runs before `project`
+  // has loaded, so `activeRoute` is empty and `drilledTo` stays null — leaving
+  // the sidebar on the root nav even though the URL is a deep sub-route. Re-sync
+  // exactly once, the first time `activeRoute` becomes available, so a refreshed
+  // deep link (e.g. /analytics/ai-agents) expands the right section. We gate on
+  // a ref so this never fires again on later route changes — that would fight
+  // the Back arrow, which intentionally collapses to root while staying on the
+  // sub-route URL.
+  const didSyncDrillRef = useRef(false)
+  useEffect(() => {
+    if (didSyncDrillRef.current || !activeRoute) return
+    didSyncDrillRef.current = true
+    const parent = findDrillParent(activeRoute)
+    if (parent) setDrilledTo(parent)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeRoute])
+
+  // The single most-specific nav URL that the current route falls under. Among
+  // all candidate URLs whose path the route matches (exactly or as a prefix),
+  // the LONGEST one wins — so `analytics/ai-agents/all` highlights
+  // `analytics/ai-agents`, not the shorter `analytics` Overview.
+  // NOTE: must stay ABOVE the `if (!project)` early return — it's a hook.
+  const bestMatchUrl = useMemo(() => {
+    const candidates = projectBaseNav.flatMap((it) => [
+      it.url,
+      ...(it.subItems?.map((s) => s.url) ?? []),
+    ])
+    let best: string | null = null
+    for (const c of candidates) {
+      const pathOnly = c.split('?')[0]
+      if (matchesSubRoute(pathOnly, activeRoute)) {
+        if (best === null || pathOnly.length > best.length) best = pathOnly
+      }
+    }
+    return best
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeRoute, projectBaseNav])
 
   if (!project) {
     return (
@@ -903,7 +948,7 @@ function ProjectNav({
     const pathOnly = url.split('?')[0]
     if (pathOnly === 'project') return activeRoute === '' || activeRoute === 'project'
     if (pathOnly === 'environments') return activeRoute.startsWith('environments')
-    return activeRoute === pathOnly
+    return pathOnly === bestMatchUrl
   }
   const isParentActive = (item: ProjectNavItem) =>
     !!item.subItems?.some((s) => isActive(s.url))
