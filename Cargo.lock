@@ -12065,6 +12065,7 @@ dependencies = [
  "axum 0.8.9",
  "bytes",
  "chrono",
+ "clickhouse",
  "flate2",
  "futures",
  "hex",

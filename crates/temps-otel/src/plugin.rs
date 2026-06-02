@@ -20,6 +20,7 @@ use crate::ingest::auth::OtelAuthService;
 use crate::ingest::rate_limit::RateLimiter;
 use crate::services::health_service::HealthComputeService;
 use crate::services::OtelService;
+use crate::storage::clickhouse::{ClickHouseOtelConfig, ClickHouseOtelStorage};
 use crate::storage::timescaledb::TimescaleDbStorage;
 use crate::OtelAppState;
 use temps_metrics::{MetricsStore, TimescaleMetricsStore};
@@ -273,14 +274,76 @@ impl TempsPlugin for OtelPlugin {
                 None
             };
 
-            // Create storage backend with configured retention and quota
-            let storage: Arc<dyn crate::storage::OtelStorage> =
-                Arc::new(TimescaleDbStorage::with_config(
-                    db.clone(),
-                    s3_client,
-                    config.retention_days,
-                    config.quota_bytes_per_project,
+            // ── Storage backend selection ────────────────────────────
+            //
+            // When all four TEMPS_CLICKHOUSE_* env vars are set,
+            // ClickHouseOtelStorage is the backend for span telemetry.
+            // Non-span methods (metrics, logs, insights, health, quota)
+            // are always delegated to TimescaleDbStorage regardless.
+            // When ClickHouse is not configured, TimescaleDbStorage is
+            // used for everything — the default, unchanged path.
+            let ch_config = read_clickhouse_otel_config_from_env();
+
+            // TimescaleDbStorage is always constructed: it is the sole
+            // backend when CH is disabled, and the inner delegate when
+            // CH is enabled.
+            let timescale_storage = Arc::new(TimescaleDbStorage::with_config(
+                db.clone(),
+                s3_client,
+                config.retention_days,
+                config.quota_bytes_per_project,
+            ));
+
+            let storage: Arc<dyn crate::storage::OtelStorage> = if let Some(ch_cfg) = ch_config {
+                info!(
+                    url = %ch_cfg.url,
+                    database = %ch_cfg.database,
+                    "ClickHouse OTel backend enabled (ADR-016) — applying migrations"
+                );
+                let ch_storage = Arc::new(ClickHouseOtelStorage::new(
+                    ch_cfg.clone(),
+                    timescale_storage,
                 ));
+                // Run migrations in a background task so plugin init
+                // returns promptly. If migrations fail, the first
+                // span ingest or read will surface the error.
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let client = ch_storage.ch_client().clone();
+                    let database_name = ch_cfg.database.clone();
+                    handle.spawn(async move {
+                        match crate::storage::clickhouse::migrations::apply_migrations(
+                            &client,
+                            &database_name,
+                        )
+                        .await
+                        {
+                            Ok(report) => info!(
+                                applied = ?report.applied,
+                                skipped_count = report.skipped.len(),
+                                "ClickHouse OTel migrations applied"
+                            ),
+                            Err(e) => tracing::warn!(
+                                error = %e,
+                                "ClickHouse OTel migrations failed; \
+                                 span ingest/queries will surface the error per-call"
+                            ),
+                        }
+                    });
+                } else {
+                    tracing::warn!(
+                        "No tokio runtime available when initializing ClickHouse OTel \
+                             backend; migrations will not run. This usually means the plugin \
+                             was wired during a sync init path."
+                    );
+                }
+                ch_storage as Arc<dyn crate::storage::OtelStorage>
+            } else {
+                debug!(
+                    "ClickHouse OTel backend disabled (TEMPS_CLICKHOUSE_* unset) — \
+                         using TimescaleDB"
+                );
+                timescale_storage as Arc<dyn crate::storage::OtelStorage>
+            };
             context.register_service(storage.clone());
 
             // Create auth service
@@ -416,6 +479,28 @@ impl TempsPlugin for OtelPlugin {
     fn openapi_schema(&self) -> Option<OpenApi> {
         Some(<OtelApiDoc as OpenApiTrait>::openapi())
     }
+}
+
+/// Read the ClickHouse connection config for the OTel backend from the same
+/// `TEMPS_CLICKHOUSE_*` environment variables that `ServerConfig` uses.
+///
+/// Returns `Some(config)` only when all four variables are set and non-empty
+/// (fail-closed: partial configuration is treated as disabled). Returns `None`
+/// when ClickHouse is not configured, preserving the default TimescaleDB path.
+fn read_clickhouse_otel_config_from_env() -> Option<ClickHouseOtelConfig> {
+    let url = std::env::var("TEMPS_CLICKHOUSE_URL")
+        .ok()
+        .filter(|s| !s.is_empty())?;
+    let database = std::env::var("TEMPS_CLICKHOUSE_DATABASE")
+        .ok()
+        .filter(|s| !s.is_empty())?;
+    let user = std::env::var("TEMPS_CLICKHOUSE_USER")
+        .ok()
+        .filter(|s| !s.is_empty())?;
+    let password = std::env::var("TEMPS_CLICKHOUSE_PASSWORD")
+        .ok()
+        .filter(|s| !s.is_empty())?;
+    Some(ClickHouseOtelConfig::new(url, database, user, password))
 }
 
 /// Apply retention across all projects by scanning the tables for distinct project IDs.

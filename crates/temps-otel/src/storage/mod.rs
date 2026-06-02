@@ -5,6 +5,7 @@
 //! but alternative backends (ClickHouse, etc.) can be plugged in by
 //! implementing this trait.
 
+pub mod clickhouse;
 pub mod timescaledb;
 
 use async_trait::async_trait;
