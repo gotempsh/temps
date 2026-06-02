@@ -1380,8 +1380,7 @@ impl ProxyLogService {
         // doesn't collapse gaps.
         let mut acc: std::collections::HashMap<(String, String), i64> =
             std::collections::HashMap::new();
-        let mut all_buckets: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::new();
+        let mut all_buckets: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for row in results {
             let bucket: chrono::DateTime<Utc> = match row.try_get("", "bucket") {
                 Ok(b) => b,

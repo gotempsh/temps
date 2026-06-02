@@ -781,8 +781,7 @@ async fn get_ai_agent_timeline(
         if !ProxyLogService::is_valid_interval(b) {
             return Err((
                 StatusCode::BAD_REQUEST,
-                "bucket must be a valid interval, e.g. '1 hour', '6 hours' or '1 day'"
-                    .to_string(),
+                "bucket must be a valid interval, e.g. '1 hour', '6 hours' or '1 day'".to_string(),
             ));
         }
     }
@@ -854,12 +853,7 @@ async fn get_ai_status_breakdown(
     }
 
     let items = service
-        .get_ai_status_breakdown(
-            query.project_id,
-            query.environment_id,
-            start_time,
-            end_time,
-        )
+        .get_ai_status_breakdown(query.project_id, query.environment_id, start_time, end_time)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -1027,7 +1021,9 @@ mod tests {
         assert!(ProxyLogService::is_valid_interval("6 hours"));
         assert!(ProxyLogService::is_valid_interval("1 day"));
         // Junk / injection attempts the handler must reject with a 400.
-        assert!(!ProxyLogService::is_valid_interval("1; DROP TABLE proxy_logs"));
+        assert!(!ProxyLogService::is_valid_interval(
+            "1; DROP TABLE proxy_logs"
+        ));
         assert!(!ProxyLogService::is_valid_interval("evil"));
         assert!(!ProxyLogService::is_valid_interval("1 fortnight"));
         assert!(!ProxyLogService::is_valid_interval("-1 hour"));
