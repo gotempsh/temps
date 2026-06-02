@@ -1061,7 +1061,7 @@ function AiAgentsTab({ project }: AiAgentsTabProps) {
       if (filter && QUICK_FILTERS.some((f) => f.value === filter)) {
         return { quickFilter: filter, dateRange: undefined }
       }
-      return { quickFilter: '7days', dateRange: undefined }
+      return { quickFilter: '24hours', dateRange: undefined }
     }
   )
   const [selectedEnvironment, setSelectedEnvironment] = React.useState<
@@ -1374,7 +1374,7 @@ interface JourneyTabProps {
 
 function JourneyTab({ project }: JourneyTabProps) {
   const [dateFilter, setDateFilter] = React.useState<AnalyticsDateFilter>({
-    quickFilter: '7days',
+    quickFilter: '24hours',
     dateRange: undefined,
   })
   const [selectedEnvironment, setSelectedEnvironment] = React.useState<
