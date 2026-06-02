@@ -31,6 +31,7 @@ import { DateRangePicker } from '@/components/ui/date-range-picker'
 import type { DateRange } from 'react-day-picker'
 import { cn } from '@/lib/utils'
 import {
+  ContextLine,
   LogLevel,
   LogSearchLine,
   useLogHistory,
@@ -40,6 +41,7 @@ import { useVirtualizer } from '@tanstack/react-virtual'
 import AnsiToHtml from 'ansi-to-html'
 import {
   AlertCircle,
+  AlignVerticalSpaceAround,
   ArrowUp,
   Clock,
   Columns3,
@@ -60,6 +62,20 @@ const ansiConverter = new AnsiToHtml({
   newline: false,
   escapeXML: true,
 })
+
+// Render a log message to HTML with ANSI colors, then layer the matched search
+// term as a <mark> on top — same pattern as the live-tail viewer (log-viewer.tsx)
+// so highlighting looks identical across both log surfaces. The replace runs on
+// the already-escaped HTML, in plain text, so it can't mangle ANSI span markup.
+function renderMessageHtml(message: string, searchTerm?: string): string {
+  const html = ansiConverter.toHtml(message)
+  if (!searchTerm) return html
+  const escaped = searchTerm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return html.replace(
+    new RegExp(`(${escaped})`, 'gi'),
+    '<mark class="bg-yellow-200 dark:bg-yellow-800 rounded px-1">$1</mark>',
+  )
+}
 
 const LOG_LEVEL_OPTIONS: LogLevel[] = ['ERROR', 'WARN', 'INFO', 'DEBUG', 'TRACE']
 
@@ -104,24 +120,160 @@ interface ColumnVisibility {
   service: boolean
 }
 
-function HistoryLogLine({
-  line,
-  columns,
-}: {
-  line: LogSearchLine
-  columns: ColumnVisibility
-}) {
-  const d = new Date(line.timestamp)
+const CONTEXT_MIN = 0
+const CONTEXT_MAX = 50
+
+// A rendered row is one of:
+//  - 'match'     : a search hit (full styling, highlighted)
+//  - 'context'   : a raw neighbor line shown by grep -C (dimmed)
+//  - 'separator' : a thin "⋯" divider between non-contiguous blocks
+type RenderRow =
+  | { kind: 'match'; key: string; line: LogSearchLine }
+  | {
+      kind: 'context'
+      key: string
+      timestamp: string
+      level: LogLevel
+      message: string
+      service: string
+    }
+  | { kind: 'separator'; key: string }
+
+function formatTs(timestamp: string): string {
+  const d = new Date(timestamp)
   const base = d.toLocaleTimeString('en-US', {
     hour12: false,
     hour: '2-digit',
     minute: '2-digit',
     second: '2-digit',
   })
-  const ts = `${base}.${String(d.getMilliseconds()).padStart(3, '0')}`
+  return `${base}.${String(d.getMilliseconds()).padStart(3, '0')}`
+}
+
+// Flatten the match rope into render rows, interleaving each match's grep -C
+// context. Contiguous lines (same chunk, adjacent offsets) render as one block;
+// a gap inserts a separator. Dedup on (chunk_id, line_offset) guards against
+// any residual window overlap the backend didn't merge.
+function buildRenderRows(lines: LogSearchLine[]): RenderRow[] {
+  const rows: RenderRow[] = []
+  const seen = new Set<string>()
+  // Track the last emitted (chunk_id, offset) to decide separators within a
+  // contiguous run. Reset across matches that don't carry context.
+  let lastChunk: string | null = null
+  let lastOffset: number | null = null
+
+  // Context lines come from the same chunk as their match, and a chunk is a
+  // single container/service — so a neighbor's service is always the match's
+  // service. The backend's ContextLine doesn't carry it, so we inherit it here
+  // to keep the deployment column populated for context rows too.
+  const pushContext = (chunkId: string, service: string, c: ContextLine) => {
+    const key = `${chunkId}:${c.line_offset}`
+    if (seen.has(key)) return
+    seen.add(key)
+    if (
+      lastChunk === chunkId &&
+      lastOffset !== null &&
+      c.line_offset > lastOffset + 1
+    ) {
+      rows.push({ kind: 'separator', key: `sep-${key}` })
+    }
+    rows.push({
+      kind: 'context',
+      key,
+      timestamp: c.timestamp,
+      level: c.level,
+      message: c.message,
+      service,
+    })
+    lastChunk = chunkId
+    lastOffset = c.line_offset
+  }
+
+  for (const line of lines) {
+    const ctx = line.context
+    if (ctx?.before?.length) {
+      // A new block start that isn't contiguous with the previous row → divider.
+      if (
+        rows.length > 0 &&
+        !(lastChunk === line.chunk_id &&
+          lastOffset !== null &&
+          ctx.before[0].line_offset <= lastOffset + 1)
+      ) {
+        rows.push({ kind: 'separator', key: `sep-pre-${line.chunk_id}:${line.line_offset}` })
+        lastChunk = null
+        lastOffset = null
+      }
+      for (const c of ctx.before) pushContext(line.chunk_id, line.service, c)
+    }
+
+    const matchKey = `${line.chunk_id}:${line.line_offset}`
+    if (!seen.has(matchKey)) {
+      seen.add(matchKey)
+      // Separator if the match isn't contiguous with the previous row.
+      if (
+        rows.length > 0 &&
+        !(lastChunk === line.chunk_id &&
+          lastOffset !== null &&
+          line.line_offset <= lastOffset + 1)
+      ) {
+        rows.push({ kind: 'separator', key: `sep-m-${matchKey}` })
+      }
+      rows.push({ kind: 'match', key: matchKey, line })
+      lastChunk = line.chunk_id
+      lastOffset = line.line_offset
+    }
+
+    if (ctx?.after?.length) {
+      for (const c of ctx.after) pushContext(line.chunk_id, line.service, c)
+    }
+  }
+
+  return rows
+}
+
+function HistoryLogRow({
+  row,
+  columns,
+  searchTerm,
+}: {
+  row: RenderRow
+  columns: ColumnVisibility
+  searchTerm?: string
+}) {
+  if (row.kind === 'separator') {
+    // Gap between two non-adjacent match windows (like grep's `--`). Not a
+    // truncation — the context for each match is complete; these blocks simply
+    // aren't next to each other in the log stream.
+    return (
+      <div className="flex items-center gap-2 px-2 py-1 select-none text-[10px] text-muted-foreground/50">
+        <span className="h-px flex-1 bg-border" />
+        <span className="shrink-0">gap in logs</span>
+        <span className="h-px flex-1 bg-border" />
+      </div>
+    )
+  }
+
+  const isContext = row.kind === 'context'
+  const isMatch = row.kind === 'match'
+  const timestamp = isContext ? row.timestamp : row.line.timestamp
+  const level = isContext ? row.level : row.line.level
+  const message = isContext ? row.message : row.line.message
+  const service = isContext ? row.service : row.line.service
+  const ts = formatTs(timestamp)
 
   return (
-    <div className="flex items-start gap-2 py-0.5 px-2 font-mono text-xs hover:bg-muted/50">
+    <div
+      className={cn(
+        'flex items-start gap-2 py-0.5 px-2 font-mono text-xs hover:bg-muted/50',
+        // Datadog-style, in our visual language: the matched search term is
+        // highlighted inline via <mark> (renderMessageHtml), so the message
+        // itself shows why a line matched. The match ("origin") row gets only a
+        // restrained left accent + faint tint to anchor it; context lines are
+        // recessed. We let the <mark> do the work rather than shouting the row.
+        isContext && 'opacity-60',
+        isMatch && 'border-l-2 border-l-primary/70 bg-primary/[0.04] pl-[6px]',
+      )}
+    >
       {columns.timestamp && (
         <span className="text-muted-foreground shrink-0 tabular-nums w-[85px]">
           {ts}
@@ -132,20 +284,22 @@ function HistoryLogLine({
           variant="outline"
           className={cn(
             'shrink-0 text-[10px] font-medium px-1.5 py-0 h-[18px] leading-[18px] rounded-sm',
-            LEVEL_COLORS[line.level] ?? LEVEL_COLORS.INFO
+            LEVEL_COLORS[level] ?? LEVEL_COLORS.INFO,
           )}
         >
-          {line.level}
+          {level}
         </Badge>
       )}
       {columns.service && (
         <span className="text-muted-foreground shrink-0 w-[70px] truncate">
-          {line.service}
+          {service}
         </span>
       )}
       <span
         className="whitespace-pre-wrap break-all min-w-0 flex-1"
-        dangerouslySetInnerHTML={{ __html: ansiConverter.toHtml(line.message) }}
+        dangerouslySetInnerHTML={{
+          __html: renderMessageHtml(message, searchTerm),
+        }}
       />
     </div>
   )
@@ -208,6 +362,32 @@ export default function HistoryLogViewer({
     }
   }, [columns])
 
+  // grep -C: raw lines to show before AND after each match. 0 = off. Persisted
+  // like columns so the user's choice survives navigation.
+  const [contextLines, setContextLines] = useState<number>(() => {
+    if (typeof window === 'undefined') return 0
+    try {
+      const raw = window.localStorage.getItem('temps.history-log.context-lines')
+      if (raw !== null) {
+        const n = Number.parseInt(raw, 10)
+        if (Number.isFinite(n)) return Math.min(Math.max(n, CONTEXT_MIN), CONTEXT_MAX)
+      }
+    } catch {
+      // Ignore corrupted storage.
+    }
+    return 0
+  })
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        'temps.history-log.context-lines',
+        String(contextLines),
+      )
+    } catch {
+      // Storage may be unavailable; not worth surfacing.
+    }
+  }, [contextLines])
+
   const parentRef = useRef<HTMLDivElement>(null)
   // Include the custom range in the filterKey so picking a different window
   // resets the older-pages rope. ms keys keep the string compact.
@@ -215,7 +395,7 @@ export default function HistoryLogViewer({
     timeRange === CUSTOM_RANGE_VALUE && customRange?.from && customRange?.to
       ? `${customRange.from.getTime()}-${customRange.to.getTime()}`
       : ''
-  const filterKey = `${selectedEnv}-${selectedService}-${selectedLevels.join(',')}-${debouncedText}-${timeRange}-${customRangeKey}`
+  const filterKey = `${selectedEnv}-${selectedService}-${selectedLevels.join(',')}-${debouncedText}-${timeRange}-${customRangeKey}-${contextLines}`
   const prevFilterKeyRef = useRef(filterKey)
 
   // Debounce search text
@@ -300,6 +480,7 @@ export default function HistoryLogViewer({
       text: !fulltextDisabled && debouncedText ? debouncedText : undefined,
       // Frontend asks for 500 per page; server caps at 2000.
       pageSize: 500,
+      contextLines: contextLines > 0 ? contextLines : undefined,
     },
     !!project.id,
   )
@@ -331,8 +512,13 @@ export default function HistoryLogViewer({
   const effectiveNextCursor =
     olderCursor !== undefined ? olderCursor : data?.next_cursor ?? null
 
+  // Flatten matches + their grep -C context into a single list of render rows.
+  // When contextLines is 0 every row is a plain match, so this is a cheap 1:1
+  // map and the view behaves exactly as before.
+  const renderRows = useMemo(() => buildRenderRows(lines), [lines])
+
   const virtualizer = useVirtualizer({
-    count: lines.length,
+    count: renderRows.length,
     getScrollElement: () => parentRef.current,
     estimateSize: () => 22,
     overscan: 20,
@@ -360,6 +546,7 @@ export default function HistoryLogViewer({
       if (selectedEnv) body.envs = [selectedEnv]
       if (selectedService) body.services = [selectedService]
       if (!fulltextDisabled && debouncedText) body.text = debouncedText
+      if (contextLines > 0) body.context_lines = contextLines
 
       const res = await fetch('/api/logs/search', {
         method: 'POST',
@@ -399,6 +586,7 @@ export default function HistoryLogViewer({
     selectedService,
     fulltextDisabled,
     debouncedText,
+    contextLines,
   ])
 
   const totalMatched = data?.total_scanned ?? 0
@@ -633,6 +821,39 @@ export default function HistoryLogViewer({
             )}
           </Tooltip>
 
+          {/* grep -C: surrounding lines around each match. 0 = off. Capped at
+              50 each side (matches the server cap). */}
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <div className="flex items-center gap-1.5 shrink-0">
+                <AlignVerticalSpaceAround className="h-3.5 w-3.5 text-muted-foreground" />
+                <Input
+                  type="number"
+                  min={CONTEXT_MIN}
+                  max={CONTEXT_MAX}
+                  step={1}
+                  value={contextLines}
+                  onChange={(e) => {
+                    const n = Number.parseInt(e.target.value, 10)
+                    const next = Number.isFinite(n) ? n : 0
+                    setContextLines(
+                      Math.min(Math.max(next, CONTEXT_MIN), CONTEXT_MAX),
+                    )
+                  }}
+                  aria-label="Surrounding context lines"
+                  className="w-[64px] tabular-nums"
+                />
+                <span className="text-xs text-muted-foreground hidden sm:inline">
+                  ± lines
+                </span>
+              </div>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">
+              Show this many raw log lines before and after each match
+              (grep&nbsp;-C). 0 disables it. Max {CONTEXT_MAX}.
+            </TooltipContent>
+          </Tooltip>
+
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button variant="outline" size="sm" className="gap-1.5">
@@ -718,7 +939,12 @@ export default function HistoryLogViewer({
               {totalMatched > showingCount
                 ? ` of ${totalMatched.toLocaleString()}+`
                 : ''}{' '}
-              {showingCount === 1 ? 'log' : 'logs'}
+              {showingCount === 1 ? 'match' : 'matches'}
+              {contextLines > 0 && (
+                <span className="text-muted-foreground/70">
+                  {' '}· ±{contextLines} context lines
+                </span>
+              )}
             </span>
           </div>
         </div>
@@ -808,9 +1034,14 @@ export default function HistoryLogViewer({
                       width: '100%',
                     }}
                   >
-                    <HistoryLogLine
-                      line={lines[virtualRow.index]}
+                    <HistoryLogRow
+                      row={renderRows[virtualRow.index]}
                       columns={columns}
+                      searchTerm={
+                        !fulltextDisabled && debouncedText
+                          ? debouncedText
+                          : undefined
+                      }
                     />
                   </div>
                 ))}

@@ -44,6 +44,9 @@ import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import {
   AlertTriangle,
+  ArrowDown,
+  ArrowUp,
+  ArrowUpDown,
   Check,
   ChevronLeft,
   ChevronRight,
@@ -566,6 +569,41 @@ OTEL_SERVICE_NAME=${project.name}`
   )
 }
 
+// A right-aligned, clickable column header that drives server-side sort.
+// Shows a neutral up/down glyph when inactive, and the active direction arrow
+// when this column is the sort key.
+function SortHeader({
+  label,
+  active,
+  order,
+  onClick,
+}: {
+  label: string
+  active: boolean
+  order: 'asc' | 'desc'
+  onClick: () => void
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-sort={active ? (order === 'asc' ? 'ascending' : 'descending') : 'none'}
+      className="ml-auto inline-flex items-center gap-1 hover:text-foreground transition-colors"
+    >
+      {label}
+      {active ? (
+        order === 'asc' ? (
+          <ArrowUp className="h-3.5 w-3.5" />
+        ) : (
+          <ArrowDown className="h-3.5 w-3.5" />
+        )
+      ) : (
+        <ArrowUpDown className="h-3.5 w-3.5 opacity-40" />
+      )}
+    </button>
+  )
+}
+
 // ── Main Component ──────────────────────────────────────────────────
 
 export default function TracesList({ project }: TracesListProps) {
@@ -597,6 +635,13 @@ export default function TracesList({ project }: TracesListProps) {
     const p = searchParams.get('page')
     return p ? parseInt(p, 10) : 1
   })
+  // Server-side sort. Default mirrors the backend: newest traces first.
+  const [sortBy, setSortBy] = useState<'start_time' | 'duration'>(() =>
+    searchParams.get('sort') === 'duration' ? 'duration' : 'start_time',
+  )
+  const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>(() =>
+    searchParams.get('dir') === 'asc' ? 'asc' : 'desc',
+  )
   const [showSetup, setShowSetup] = useState(false)
 
   // Compute time window
@@ -656,8 +701,26 @@ export default function TracesList({ project }: TracesListProps) {
     if (environmentId !== 'all') params.set('env', environmentId)
     if (deploymentId !== 'all') params.set('deploy', deploymentId)
     if (page > 1) params.set('page', page.toString())
+    if (sortBy !== 'start_time') params.set('sort', sortBy)
+    if (sortOrder !== 'desc') params.set('dir', sortOrder)
     setSearchParams(params, { replace: true })
-  }, [timeRange, serviceName, status, search, environmentId, deploymentId, page, setSearchParams])
+  }, [timeRange, serviceName, status, search, environmentId, deploymentId, page, sortBy, sortOrder, setSearchParams])
+
+  // Toggle sort on a column header. Clicking the active column flips direction;
+  // clicking a new column selects it (duration starts desc = slowest first,
+  // timestamp starts desc = newest first — the most useful default each way).
+  const handleSort = useCallback(
+    (field: 'start_time' | 'duration') => {
+      if (sortBy === field) {
+        setSortOrder((d) => (d === 'desc' ? 'asc' : 'desc'))
+      } else {
+        setSortBy(field)
+        setSortOrder('desc')
+      }
+      setPage(1)
+    },
+    [sortBy],
+  )
 
   // Breadcrumbs
   useEffect(() => {
@@ -682,6 +745,8 @@ export default function TracesList({ project }: TracesListProps) {
           environmentId !== 'all' ? Number(environmentId) : undefined,
         deployment_id:
           deploymentId !== 'all' ? Number(deploymentId) : undefined,
+        sort_by: sortBy,
+        sort_order: sortOrder,
         limit: PAGE_SIZE,
         offset: (page - 1) * PAGE_SIZE,
       },
@@ -931,9 +996,23 @@ export default function TracesList({ project }: TracesListProps) {
                   {environmentId === 'all' && <TableHead className="hidden lg:table-cell">Environment</TableHead>}
                   <TableHead className="hidden md:table-cell">Kind</TableHead>
                   <TableHead>Status</TableHead>
-                  <TableHead className="text-right">Duration</TableHead>
+                  <TableHead className="text-right">
+                    <SortHeader
+                      label="Duration"
+                      active={sortBy === 'duration'}
+                      order={sortOrder}
+                      onClick={() => handleSort('duration')}
+                    />
+                  </TableHead>
                   <TableHead className="hidden md:table-cell text-right">Spans</TableHead>
-                  <TableHead className="hidden md:table-cell text-right">Timestamp</TableHead>
+                  <TableHead className="hidden md:table-cell text-right">
+                    <SortHeader
+                      label="Timestamp"
+                      active={sortBy === 'start_time'}
+                      order={sortOrder}
+                      onClick={() => handleSort('start_time')}
+                    />
+                  </TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>

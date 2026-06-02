@@ -6,6 +6,20 @@ import { useQuery, keepPreviousData } from '@tanstack/react-query'
 export type LogLevel = 'ERROR' | 'WARN' | 'INFO' | 'DEBUG' | 'TRACE'
 export type SearchMode = 'index' | 'archive'
 
+export interface ContextLine {
+  timestamp: string
+  level: LogLevel
+  message: string
+  fields: Record<string, unknown> | null
+  line_offset: number
+  is_match: boolean
+}
+
+export interface LineContext {
+  before: ContextLine[]
+  after: ContextLine[]
+}
+
 export interface LogSearchLine {
   timestamp: string
   level: LogLevel
@@ -15,6 +29,8 @@ export interface LogSearchLine {
   chunk_id: string
   line_offset: number
   deploy_id: string | null
+  /** Raw grep -C surrounding lines, present only when contextLines > 0. */
+  context?: LineContext | null
 }
 
 export interface SearchLogsResponse {
@@ -34,6 +50,8 @@ export interface LogSearchParams {
   text?: string
   cursor?: string
   pageSize?: number
+  /** grep -C: raw lines to show before AND after each match (0 = off). */
+  contextLines?: number
 }
 
 // ── API call ───────────────────────────────────────────────────────────
@@ -51,6 +69,8 @@ async function searchLogs(params: LogSearchParams): Promise<SearchLogsResponse> 
   if (params.text) body.text = params.text
   if (params.cursor) body.cursor = params.cursor
   if (params.pageSize) body.page_size = params.pageSize
+  if (params.contextLines && params.contextLines > 0)
+    body.context_lines = params.contextLines
 
   const response = await client.post({
     url: '/logs/search',
@@ -76,6 +96,7 @@ export function useLogHistory(params: LogSearchParams, enabled = true) {
       params.text,
       params.cursor,
       params.pageSize,
+      params.contextLines,
     ],
     queryFn: () => searchLogs(params),
     enabled: enabled && !!params.projectId,
