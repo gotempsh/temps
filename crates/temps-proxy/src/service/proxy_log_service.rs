@@ -990,7 +990,7 @@ impl ProxyLogService {
         }
     }
 
-    fn is_valid_interval(interval: &str) -> bool {
+    pub(crate) fn is_valid_interval(interval: &str) -> bool {
         // Valid PostgreSQL interval formats
         let valid_units = [
             "microseconds",
@@ -1303,19 +1303,20 @@ impl ProxyLogService {
         values.push(agents_owned.into());
         next_idx += 1;
 
-        // The bucket interval is bound next, then the gapfill window bounds.
+        // The bucket interval is bound next, then the window bounds.
         // We build the full bucket spine with `generate_series` and LEFT JOIN
         // the real per-agent counts onto it (the same approach the analytics
-        // hourly-visits query uses) so EVERY bucket in the window is present in
-        // the result even when the data only spans a couple of buckets —
-        // `time_bucket_gapfill` collapses gaps in that single-bucket edge case.
-        // The spine is one row per (bucket, agent-with-data); empty buckets
-        // appear once with a NULL agent and zero count, which the frontend uses
-        // purely to keep the x-axis continuous. Payload stays lean: it's
-        // (buckets-with-data × agents) + (empty buckets × 1), not buckets × all
-        // known agents.
+        // hourly-visits query uses). We deliberately do NOT use
+        // `time_bucket_gapfill` here: it fails to fill gaps when the data spans
+        // only a single bucket, which is exactly the edge case we hit. The
+        // `generate_series` spine guarantees EVERY bucket in the window is
+        // present regardless. The spine yields one row per
+        // (bucket, agent-with-data); empty buckets appear once with a NULL agent
+        // and zero count, which the frontend uses purely to keep the x-axis
+        // continuous. Payload stays lean: it's (buckets-with-data × agents) +
+        // (empty buckets × 1), not buckets × all known agents.
         let bucket_param_idx = next_idx;
-        values.push(bucket_interval.clone().into());
+        values.push(bucket_interval.into());
         next_idx += 1;
         let gap_start_idx = next_idx;
         values.push(start_time.into());

@@ -773,6 +773,20 @@ async fn get_ai_agent_timeline(
         }
     };
 
+    // Validate the optional bucket override here so a bad value is a 400 (like
+    // `group_by` above), not a 500 from the service layer — and so the raw user
+    // string is never reflected back in the error body. The service re-checks
+    // via `is_valid_interval` as defense-in-depth.
+    if let Some(ref b) = query.bucket {
+        if !ProxyLogService::is_valid_interval(b) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "bucket must be a valid interval, e.g. '1 hour', '6 hours' or '1 day'"
+                    .to_string(),
+            ));
+        }
+    }
+
     let bucket = query
         .bucket
         .clone()
@@ -950,4 +964,73 @@ pub fn openapi() -> utoipa::openapi::OpenApi {
     struct ApiDoc;
 
     ApiDoc::openapi()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn window(hours: i64) -> (UtcDateTime, UtcDateTime) {
+        // Fixed anchor so the test is deterministic (no `Utc::now()`).
+        // `UtcDateTime` is a chrono `DateTime<Utc>` alias.
+        let start = chrono::DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let end = start + chrono::Duration::hours(hours);
+        (start, end)
+    }
+
+    #[test]
+    fn auto_bucket_picks_granularity_by_window_width() {
+        // <= 2h → 5 minutes
+        let (s, e) = window(1);
+        assert_eq!(auto_bucket_for_window(s, e), "5 minutes");
+        let (s, e) = window(2);
+        assert_eq!(auto_bucket_for_window(s, e), "5 minutes");
+
+        // (2h, 48h] → 1 hour
+        let (s, e) = window(3);
+        assert_eq!(auto_bucket_for_window(s, e), "1 hour");
+        let (s, e) = window(48);
+        assert_eq!(auto_bucket_for_window(s, e), "1 hour");
+
+        // (48h, 14d] → 6 hours
+        let (s, e) = window(49);
+        assert_eq!(auto_bucket_for_window(s, e), "6 hours");
+        let (s, e) = window(24 * 14);
+        assert_eq!(auto_bucket_for_window(s, e), "6 hours");
+
+        // > 14d → 1 day
+        let (s, e) = window(24 * 14 + 1);
+        assert_eq!(auto_bucket_for_window(s, e), "1 day");
+        let (s, e) = window(24 * 90);
+        assert_eq!(auto_bucket_for_window(s, e), "1 day");
+    }
+
+    #[test]
+    fn auto_bucket_clamps_zero_or_inverted_window_to_minimum() {
+        // A zero-width (or end<=start) window must not panic and must still
+        // return the finest granularity — `num_hours().max(1)` guarantees this.
+        let (s, _) = window(0);
+        assert_eq!(auto_bucket_for_window(s, s), "5 minutes");
+        let (s, e) = window(5);
+        // end before start
+        assert_eq!(auto_bucket_for_window(e, s), "5 minutes");
+    }
+
+    #[test]
+    fn bucket_interval_allowlist_accepts_valid_and_rejects_injection() {
+        use crate::service::proxy_log_service::ProxyLogService;
+        // Valid forms the auto-bucket + UI emit.
+        assert!(ProxyLogService::is_valid_interval("5 minutes"));
+        assert!(ProxyLogService::is_valid_interval("1 hour"));
+        assert!(ProxyLogService::is_valid_interval("6 hours"));
+        assert!(ProxyLogService::is_valid_interval("1 day"));
+        // Junk / injection attempts the handler must reject with a 400.
+        assert!(!ProxyLogService::is_valid_interval("1; DROP TABLE proxy_logs"));
+        assert!(!ProxyLogService::is_valid_interval("evil"));
+        assert!(!ProxyLogService::is_valid_interval("1 fortnight"));
+        assert!(!ProxyLogService::is_valid_interval("-1 hour"));
+        assert!(!ProxyLogService::is_valid_interval(""));
+    }
 }
