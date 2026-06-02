@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **`temps-platform-setup` skill: HIGH-risk security findings** (`skills/temps-platform-setup`) — remediated the issues flagged by the Gen Agent Trust Hub audit. Replaced the `curl … | bash` installer with a download → review → run flow (`REMOTE_CODE_EXECUTION`); swapped every literal secret (`ghp_…`, `glpat-…`, `dop_v1_…`, `AKIA…`/`wJalr…`, `tk_…`, Cloudflare token, zone id) for `<YOUR_*>` placeholders and documented the real env-var fallbacks verified against `temps-cli` clap args (`CREDENTIALS_UNSAFE`); fixed wrong DNS flag names (`--route53-access-key` → `--aws-access-key-id`, `--route53-secret-key` → `--aws-secret-access-key`); and added a Security Considerations section treating external command output (logs, `git clone`, `env import`, error events) as untrusted to blunt prompt injection (`PROMPT_INJECTION`).
 
 
 ## [0.1.0-beta.25] - 2026-05-31
