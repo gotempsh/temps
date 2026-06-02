@@ -10,8 +10,9 @@ use temps_core::{DateTime, UtcDateTime};
 use utoipa::{IntoParams, ToSchema};
 
 use crate::service::proxy_log_service::{
-    AiAgentBreakdownRow, AiPageBreakdownRow, ProjectHealthSummary, ProxyLogResponse,
-    ProxyLogService, StatsFilters, TimeBucketStats, TodayStatsResponse,
+    AiAgentBreakdownRow, AiAgentTimelineRow, AiPageBreakdownRow, AiStatusBreakdownRow,
+    AiTimelineGroupBy, ProjectHealthSummary, ProxyLogResponse, ProxyLogService, StatsFilters,
+    TimeBucketStats, TodayStatsResponse,
 };
 
 /// Query parameters for listing proxy logs
@@ -677,6 +678,184 @@ async fn get_ai_page_breakdown(
     }))
 }
 
+/// Query for the AI-agent timeline. Reuses the breakdown window params and adds
+/// the grouping dimension. The bucket interval is auto-selected from the window
+/// width unless `bucket` is provided.
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct AiAgentTimelineQuery {
+    /// Filter by project ID.
+    pub project_id: Option<i32>,
+    /// Filter by environment ID.
+    pub environment_id: Option<i32>,
+    /// Start time (ISO 8601). Defaults to `end_time - 7d`.
+    #[param(value_type = Option<String>, example = "2026-05-22T00:00:00Z")]
+    pub start_time: Option<UtcDateTime>,
+    /// End time (ISO 8601). Defaults to now.
+    #[param(value_type = Option<String>, example = "2026-05-29T00:00:00Z")]
+    pub end_time: Option<UtcDateTime>,
+    /// Grouping dimension: `provider` (default) or `agent`.
+    #[param(example = "provider")]
+    pub group_by: Option<String>,
+    /// Bucket interval override (e.g. `1 hour`, `1 day`). Auto-selected from the
+    /// window width when omitted.
+    #[param(example = "1 hour")]
+    pub bucket: Option<String>,
+}
+
+/// Response wrapping the AI agent timeline rows.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AiAgentTimelineResponse {
+    pub items: Vec<AiAgentTimelineRow>,
+    pub start_time: String,
+    pub end_time: String,
+    /// Bucket interval used for the buckets (so the UI can label the x-axis).
+    #[schema(example = "1 hour")]
+    pub bucket: String,
+    /// Echoes the grouping dimension actually applied.
+    #[schema(example = "provider")]
+    pub group_by: String,
+}
+
+/// Pick a sensible time-bucket width for a window, mirroring the frontend's
+/// aggregation choice so the AI timeline lines up with the traffic chart.
+fn auto_bucket_for_window(start: UtcDateTime, end: UtcDateTime) -> &'static str {
+    let hours = (end - start).num_hours().max(1);
+    if hours <= 2 {
+        "5 minutes"
+    } else if hours <= 48 {
+        "1 hour"
+    } else if hours <= 24 * 14 {
+        "6 hours"
+    } else {
+        "1 day"
+    }
+}
+
+/// Time-bucketed AI-agent request volume, split by provider or agent.
+///
+/// Powers the "AI agents over time" stacked chart. Same data source as the AI
+/// agent breakdown (request logs), just bucketed.
+#[utoipa::path(
+    get,
+    path = "/proxy-logs/stats/ai-agents/timeline",
+    params(AiAgentTimelineQuery),
+    responses(
+        (status = 200, description = "AI agent timeline", body = AiAgentTimelineResponse),
+        (status = 400, description = "Invalid parameters"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = "Proxy Logs"
+)]
+async fn get_ai_agent_timeline(
+    State(service): State<Arc<ProxyLogService>>,
+    Query(query): Query<AiAgentTimelineQuery>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let end_time = query.end_time.unwrap_or_else(chrono::Utc::now);
+    let start_time = query
+        .start_time
+        .unwrap_or_else(|| end_time - chrono::Duration::days(7));
+
+    if start_time >= end_time {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "start_time must be before end_time".to_string(),
+        ));
+    }
+
+    let group_by = match query.group_by.as_deref() {
+        Some("agent") => AiTimelineGroupBy::Agent,
+        Some("provider") | None => AiTimelineGroupBy::Provider,
+        Some(other) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("group_by must be 'provider' or 'agent', got '{}'", other),
+            ));
+        }
+    };
+
+    let bucket = query
+        .bucket
+        .clone()
+        .unwrap_or_else(|| auto_bucket_for_window(start_time, end_time).to_string());
+
+    let items = service
+        .get_ai_agent_timeline(
+            query.project_id,
+            query.environment_id,
+            start_time,
+            end_time,
+            bucket.clone(),
+            group_by,
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(AiAgentTimelineResponse {
+        items,
+        start_time: start_time.to_rfc3339(),
+        end_time: end_time.to_rfc3339(),
+        bucket,
+        group_by: match group_by {
+            AiTimelineGroupBy::Agent => "agent".to_string(),
+            AiTimelineGroupBy::Provider => "provider".to_string(),
+        },
+    }))
+}
+
+/// Response wrapping the AI status breakdown rows.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AiStatusBreakdownResponse {
+    pub items: Vec<AiStatusBreakdownRow>,
+    pub start_time: String,
+    pub end_time: String,
+}
+
+/// HTTP status-class breakdown for AI-agent traffic — are bots being served
+/// (2xx) or hitting broken/blocked pages (4xx/5xx)?
+#[utoipa::path(
+    get,
+    path = "/proxy-logs/stats/ai-status",
+    params(AiAgentBreakdownQuery),
+    responses(
+        (status = 200, description = "AI status breakdown", body = AiStatusBreakdownResponse),
+        (status = 400, description = "Invalid parameters"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = "Proxy Logs"
+)]
+async fn get_ai_status_breakdown(
+    State(service): State<Arc<ProxyLogService>>,
+    Query(query): Query<AiAgentBreakdownQuery>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let end_time = query.end_time.unwrap_or_else(chrono::Utc::now);
+    let start_time = query
+        .start_time
+        .unwrap_or_else(|| end_time - chrono::Duration::days(7));
+
+    if start_time >= end_time {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "start_time must be before end_time".to_string(),
+        ));
+    }
+
+    let items = service
+        .get_ai_status_breakdown(
+            query.project_id,
+            query.environment_id,
+            start_time,
+            end_time,
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(AiStatusBreakdownResponse {
+        items,
+        start_time: start_time.to_rfc3339(),
+        end_time: end_time.to_rfc3339(),
+    }))
+}
+
 /// List every AI agent the detector knows how to classify.
 ///
 /// Returned in the same order as the internal taxonomy so the UI can use it as
@@ -719,7 +898,12 @@ pub fn create_routes() -> axum::Router<Arc<ProxyLogService>> {
             get(get_projects_health),
         )
         .route("/proxy-logs/stats/ai-agents", get(get_ai_agent_breakdown))
+        .route(
+            "/proxy-logs/stats/ai-agents/timeline",
+            get(get_ai_agent_timeline),
+        )
         .route("/proxy-logs/stats/ai-pages", get(get_ai_page_breakdown))
+        .route("/proxy-logs/stats/ai-status", get(get_ai_status_breakdown))
         .route("/proxy-logs/ai-agents/known", get(list_known_ai_agents))
 }
 
@@ -737,7 +921,9 @@ pub fn openapi() -> utoipa::openapi::OpenApi {
             get_time_bucket_stats,
             get_projects_health,
             get_ai_agent_breakdown,
+            get_ai_agent_timeline,
             get_ai_page_breakdown,
+            get_ai_status_breakdown,
             list_known_ai_agents,
         ),
         components(schemas(
@@ -751,8 +937,12 @@ pub fn openapi() -> utoipa::openapi::OpenApi {
             ProjectsHealthResponse,
             AiAgentBreakdownResponse,
             AiAgentBreakdownRow,
+            AiAgentTimelineResponse,
+            AiAgentTimelineRow,
             AiPageBreakdownResponse,
             AiPageBreakdownRow,
+            AiStatusBreakdownResponse,
+            AiStatusBreakdownRow,
             AiAgentDescriptor,
             KnownAiAgentsResponse,
         ))

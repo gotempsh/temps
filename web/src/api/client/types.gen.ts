@@ -570,6 +570,41 @@ export type AiAgentDescriptor = {
 };
 
 /**
+ * Response wrapping the AI agent timeline rows.
+ */
+export type AiAgentTimelineResponse = {
+    /**
+     * Bucket interval used for the buckets (so the UI can label the x-axis).
+     */
+    bucket: string;
+    end_time: string;
+    /**
+     * Echoes the grouping dimension actually applied.
+     */
+    group_by: string;
+    items: Array<AiAgentTimelineRow>;
+    start_time: string;
+};
+
+/**
+ * One point in the AI-agent timeline: the request count for a single
+ * (`bucket`, `key`) pair, where `key` is a provider or agent name depending on
+ * the requested grouping. The UI pivots these into one stacked series per
+ * `key` across the shared bucket x-axis.
+ */
+export type AiAgentTimelineRow = {
+    /**
+     * Bucket start in RFC3339 format.
+     */
+    bucket: string;
+    /**
+     * Provider or agent name this count belongs to.
+     */
+    key: string;
+    request_count: number;
+};
+
+/**
  * Global AI configuration settings. Controls the default config repo
  * containing `.claude/` directory (skills, MCP servers, plugins) that
  * gets overlaid into every agent sandbox.
@@ -608,6 +643,27 @@ export type AiPageBreakdownRow = {
     last_seen?: string | null;
     path: string;
     request_count: number;
+};
+
+/**
+ * Response wrapping the AI status breakdown rows.
+ */
+export type AiStatusBreakdownResponse = {
+    end_time: string;
+    items: Array<AiStatusBreakdownRow>;
+    start_time: string;
+};
+
+/**
+ * One row in the AI-agent HTTP status breakdown: the request count for a
+ * status class (`2xx`/`3xx`/`4xx`/`5xx`/`other`) across crawler traffic.
+ */
+export type AiStatusBreakdownRow = {
+    request_count: number;
+    /**
+     * Status class label.
+     */
+    status_class: string;
 };
 
 export type AlertRuleResponse = {
@@ -37431,6 +37487,59 @@ export type GetAiAgentBreakdownResponses = {
 
 export type GetAiAgentBreakdownResponse = GetAiAgentBreakdownResponses[keyof GetAiAgentBreakdownResponses];
 
+export type GetAiAgentTimelineData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Filter by project ID.
+         */
+        project_id?: number | null;
+        /**
+         * Filter by environment ID.
+         */
+        environment_id?: number | null;
+        /**
+         * Start time (ISO 8601). Defaults to `end_time - 7d`.
+         */
+        start_time?: string | null;
+        /**
+         * End time (ISO 8601). Defaults to now.
+         */
+        end_time?: string | null;
+        /**
+         * Grouping dimension: `provider` (default) or `agent`.
+         */
+        group_by?: string | null;
+        /**
+         * Bucket interval override (e.g. `1 hour`, `1 day`). Auto-selected from the
+         * window width when omitted.
+         */
+        bucket?: string | null;
+    };
+    url: '/proxy-logs/stats/ai-agents/timeline';
+};
+
+export type GetAiAgentTimelineErrors = {
+    /**
+     * Invalid parameters
+     */
+    400: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetAiAgentTimelineResponses = {
+    /**
+     * AI agent timeline
+     */
+    200: AiAgentTimelineResponse;
+};
+
+export type GetAiAgentTimelineResponse = GetAiAgentTimelineResponses[keyof GetAiAgentTimelineResponses];
+
 export type GetAiPageBreakdownData = {
     body?: never;
     path?: never;
@@ -37484,6 +37593,60 @@ export type GetAiPageBreakdownResponses = {
 };
 
 export type GetAiPageBreakdownResponse = GetAiPageBreakdownResponses[keyof GetAiPageBreakdownResponses];
+
+export type GetAiStatusBreakdownData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Filter by project ID (recommended for per-project analytics).
+         */
+        project_id?: number | null;
+        /**
+         * Filter by environment ID.
+         */
+        environment_id?: number | null;
+        /**
+         * Start time (ISO 8601). Defaults to `end_time - 7d`.
+         */
+        start_time?: string | null;
+        /**
+         * End time (ISO 8601). Defaults to now.
+         */
+        end_time?: string | null;
+        /**
+         * Maximum rows to return. Capped at 100 server-side.
+         */
+        limit?: number | null;
+        /**
+         * Optional exact path filter. Only used by the AI pages breakdown — when
+         * set, returns the single matching page so callers can ask "how many AI
+         * agents hit this page?".
+         */
+        path?: string | null;
+    };
+    url: '/proxy-logs/stats/ai-status';
+};
+
+export type GetAiStatusBreakdownErrors = {
+    /**
+     * Invalid parameters
+     */
+    400: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetAiStatusBreakdownResponses = {
+    /**
+     * AI status breakdown
+     */
+    200: AiStatusBreakdownResponse;
+};
+
+export type GetAiStatusBreakdownResponse = GetAiStatusBreakdownResponses[keyof GetAiStatusBreakdownResponses];
 
 export type GetProjectsHealthData = {
     body?: never;

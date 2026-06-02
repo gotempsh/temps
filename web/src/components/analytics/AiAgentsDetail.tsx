@@ -1,8 +1,14 @@
 import {
   getAiAgentBreakdownOptions,
   getAiPageBreakdownOptions,
+  getAiStatusBreakdownOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { ProjectResponse } from '@/api/client/types.gen'
+import {
+  AiBreakdownCard,
+  type AiBreakdownRow,
+} from '@/components/analytics/AiBreakdownCard'
+import { AiAgentsTimelineChart } from '@/components/analytics/AiAgentsTimelineChart'
 import { AiAgentLogo } from '@/components/ui/ai-agent-logo'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -84,6 +90,135 @@ export function AiAgentsDetail({
     }),
     enabled: !!startDate && !!endDate,
   })
+
+  const statusQuery = useQuery({
+    ...getAiStatusBreakdownOptions({
+      query: {
+        project_id: project.id,
+        environment_id: environment,
+        start_time: startDate ? startDate.toISOString() : undefined,
+        end_time: endDate ? endDate.toISOString() : undefined,
+      },
+    }),
+    enabled: !!startDate && !!endDate,
+  })
+
+  // ── Overview card rows, all derived from the single agent breakdown ──────
+  // (each breakdown row already carries provider + agent + purpose), plus the
+  // status breakdown. Top-N capped so the cards stay scannable.
+  const TOP_N = 7
+
+  const topAgentCards = React.useMemo<AiBreakdownRow[]>(() => {
+    const items = agentsQuery.data?.items ?? []
+    const total = items.reduce((s, r) => s + r.request_count, 0)
+    return items
+      .slice()
+      .sort((a, b) => b.request_count - a.request_count)
+      .slice(0, TOP_N)
+      .map((r) => ({
+        id: r.agent,
+        label: r.agent,
+        badge: r.provider,
+        logoProvider: r.provider,
+        logoAgent: r.agent,
+        count: r.request_count,
+        percentage: total > 0 ? (r.request_count / total) * 100 : 0,
+      }))
+  }, [agentsQuery.data])
+
+  const topProviderCards = React.useMemo<AiBreakdownRow[]>(() => {
+    const items = agentsQuery.data?.items ?? []
+    const total = items.reduce((s, r) => s + r.request_count, 0)
+    const byProvider = new Map<string, number>()
+    for (const r of items) {
+      byProvider.set(r.provider, (byProvider.get(r.provider) ?? 0) + r.request_count)
+    }
+    return Array.from(byProvider.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, TOP_N)
+      .map(([provider, count]) => ({
+        id: provider,
+        label: provider,
+        logoProvider: provider,
+        count,
+        percentage: total > 0 ? (count / total) * 100 : 0,
+      }))
+  }, [agentsQuery.data])
+
+  const purposeCards = React.useMemo<AiBreakdownRow[]>(() => {
+    const items = agentsQuery.data?.items ?? []
+    const total = items.reduce((s, r) => s + r.request_count, 0)
+    // Humanise the taxonomy purpose values.
+    const labelFor = (p: string) =>
+      ({
+        training: 'Model training',
+        search: 'Search indexing',
+        user_fetch: 'User-triggered fetch',
+        seo: 'SEO crawler',
+        mixed: 'Mixed / general',
+      })[p] ?? (p || 'Unknown')
+    const byPurpose = new Map<string, number>()
+    for (const r of items) {
+      const key = r.purpose || 'unknown'
+      byPurpose.set(key, (byPurpose.get(key) ?? 0) + r.request_count)
+    }
+    return Array.from(byPurpose.entries())
+      .sort((a, b) => b[1] - a[1])
+      .map(([purpose, count]) => ({
+        id: purpose,
+        label: labelFor(purpose),
+        count,
+        percentage: total > 0 ? (count / total) * 100 : 0,
+      }))
+  }, [agentsQuery.data])
+
+  const statusCards = React.useMemo<AiBreakdownRow[]>(() => {
+    const items = statusQuery.data?.items ?? []
+    const total = items.reduce((s, r) => s + r.request_count, 0)
+    const colorFor = (cls: string) =>
+      cls.startsWith('2')
+        ? 'var(--chart-2)' // green — served
+        : cls.startsWith('3')
+          ? 'var(--chart-1)' // blue — redirect
+          : cls.startsWith('4')
+            ? 'var(--chart-3)' // amber — client error
+            : cls.startsWith('5')
+              ? 'var(--chart-4)' // red — server error
+              : 'var(--muted-foreground)'
+    const labelFor = (cls: string) =>
+      ({
+        '2xx': '2xx Served',
+        '3xx': '3xx Redirect',
+        '4xx': '4xx Not found / blocked',
+        '5xx': '5xx Server error',
+      })[cls] ?? `${cls} Other`
+    return items
+      .slice()
+      .sort((a, b) => b.request_count - a.request_count)
+      .map((r) => ({
+        id: r.status_class,
+        label: labelFor(r.status_class),
+        count: r.request_count,
+        percentage: total > 0 ? (r.request_count / total) * 100 : 0,
+        barColor: colorFor(r.status_class),
+      }))
+  }, [statusQuery.data])
+
+  const topPageCards = React.useMemo<AiBreakdownRow[]>(() => {
+    const items = pagesQuery.data?.items ?? []
+    const total = items.reduce((s, r) => s + r.request_count, 0)
+    return items
+      .slice()
+      .sort((a, b) => b.request_count - a.request_count)
+      .slice(0, TOP_N)
+      .map((r) => ({
+        id: r.path,
+        label: r.path,
+        badge: `${r.agent_count} agent${r.agent_count === 1 ? '' : 's'}`,
+        count: r.request_count,
+        percentage: total > 0 ? (r.request_count / total) * 100 : 0,
+      }))
+  }, [pagesQuery.data])
 
   const agentRows = React.useMemo(() => {
     const items = agentsQuery.data?.items ?? []
@@ -243,7 +378,60 @@ export function AiAgentsDetail({
         </div>
       </div>
 
-      {/* Two distinct datasets, each full width via its own tab */}
+      {/* Request volume over time, split by provider/agent. */}
+      <AiAgentsTimelineChart
+        project={project}
+        startDate={startDate}
+        endDate={endDate}
+        environment={environment}
+      />
+
+      {/* Overview card grid — mirrors the main analytics overview layout. */}
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <AiBreakdownCard
+          title="Top Agents"
+          description="Most active AI crawlers by requests"
+          rows={topAgentCards}
+          isLoading={agentsQuery.isLoading}
+          error={agentsQuery.isError}
+          footer={`Showing top ${topAgentCards.length} agents by requests`}
+        />
+        <AiBreakdownCard
+          title="Top Providers"
+          description="Crawler vendors, rolled up"
+          rows={topProviderCards}
+          isLoading={agentsQuery.isLoading}
+          error={agentsQuery.isError}
+          footer={`Showing top ${topProviderCards.length} providers by requests`}
+        />
+        <AiBreakdownCard
+          title="Crawl purpose"
+          description="Why bots are hitting your site"
+          rows={purposeCards}
+          isLoading={agentsQuery.isLoading}
+          error={agentsQuery.isError}
+          footer="Classified from the AI agent taxonomy"
+        />
+        <AiBreakdownCard
+          title="Response status"
+          description="Are crawlers getting served, or hitting errors?"
+          rows={statusCards}
+          isLoading={statusQuery.isLoading}
+          error={statusQuery.isError}
+          footer="HTTP status classes for AI traffic"
+        />
+        <AiBreakdownCard
+          title="Top Pages crawled"
+          description="Which content AI agents request most"
+          rows={topPageCards}
+          isLoading={pagesQuery.isLoading}
+          error={pagesQuery.isError}
+          footer={`Showing top ${topPageCards.length} pages · badge = distinct agents`}
+          onRowClick={(row) => setExpandedPath(row.id)}
+        />
+      </div>
+
+      {/* Full ranked tables with search + per-page drill-down. */}
       <Tabs defaultValue="agents">
         <TabsList>
           <TabsTrigger value="agents">Agents</TabsTrigger>

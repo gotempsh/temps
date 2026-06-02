@@ -1241,6 +1241,291 @@ impl ProxyLogService {
         Ok(rows)
     }
 
+    /// Time-bucketed AI-agent request counts, split by provider or by agent.
+    ///
+    /// Same pre-filter as [`Self::get_ai_agent_breakdown`] (`is_bot = true AND
+    /// bot_name IN (known)`) so the planner uses the `(timestamp DESC)` index,
+    /// but the result is grouped by `time_bucket(interval, timestamp)` and the
+    /// raw `bot_name`. The caller passes the bucket interval (validated against
+    /// the same allowlist as [`Self::get_time_bucket_stats`]) and chooses the
+    /// grouping dimension via `group_by` (`"provider"` or `"agent"`); provider
+    /// roll-up is done in Rust off the agent taxonomy so the SQL stays a single
+    /// stable shape. Each row is `(bucket, key, count)` — the UI pivots these
+    /// into one stacked series per key, mirroring the traffic time-series chart.
+    pub async fn get_ai_agent_timeline(
+        &self,
+        project_id: Option<i32>,
+        environment_id: Option<i32>,
+        start_time: UtcDateTime,
+        end_time: UtcDateTime,
+        bucket_interval: String,
+        group_by: AiTimelineGroupBy,
+    ) -> Result<Vec<AiAgentTimelineRow>, ProxyLogServiceError> {
+        if !Self::is_valid_interval(&bucket_interval) {
+            return Err(ProxyLogServiceError::InvalidFilter(format!(
+                "Invalid bucket interval: {}",
+                bucket_interval
+            )));
+        }
+
+        let known: Vec<&str> = crate::ai_agent_detector::known_agents()
+            .iter()
+            .map(|(_, m)| m.agent)
+            .collect();
+
+        if known.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut where_clauses: Vec<String> = vec![
+            "timestamp >= $1".to_string(),
+            "timestamp < $2".to_string(),
+            "is_bot = true".to_string(),
+            "bot_name IS NOT NULL".to_string(),
+        ];
+        let mut values: Vec<sea_orm::Value> = vec![start_time.into(), end_time.into()];
+        let mut next_idx = 3i32;
+
+        if let Some(pid) = project_id {
+            where_clauses.push(format!("project_id = ${}", next_idx));
+            values.push(pid.into());
+            next_idx += 1;
+        }
+        if let Some(eid) = environment_id {
+            where_clauses.push(format!("environment_id = ${}", next_idx));
+            values.push(eid.into());
+            next_idx += 1;
+        }
+
+        let agents_param_idx = next_idx;
+        where_clauses.push(format!("bot_name = ANY(${}::text[])", agents_param_idx));
+        let agents_owned: Vec<String> = known.iter().map(|s| (*s).to_owned()).collect();
+        values.push(agents_owned.into());
+        next_idx += 1;
+
+        // The bucket interval is bound next, then the gapfill window bounds.
+        // We build the full bucket spine with `generate_series` and LEFT JOIN
+        // the real per-agent counts onto it (the same approach the analytics
+        // hourly-visits query uses) so EVERY bucket in the window is present in
+        // the result even when the data only spans a couple of buckets —
+        // `time_bucket_gapfill` collapses gaps in that single-bucket edge case.
+        // The spine is one row per (bucket, agent-with-data); empty buckets
+        // appear once with a NULL agent and zero count, which the frontend uses
+        // purely to keep the x-axis continuous. Payload stays lean: it's
+        // (buckets-with-data × agents) + (empty buckets × 1), not buckets × all
+        // known agents.
+        let bucket_param_idx = next_idx;
+        values.push(bucket_interval.clone().into());
+        next_idx += 1;
+        let gap_start_idx = next_idx;
+        values.push(start_time.into());
+        next_idx += 1;
+        let gap_end_idx = next_idx;
+        values.push(end_time.into());
+
+        let sql = format!(
+            r#"
+            WITH spine AS (
+                SELECT generate_series(
+                    time_bucket(${bucket}::interval, ${gstart}::timestamptz),
+                    time_bucket(${bucket}::interval, ${gend}::timestamptz),
+                    ${bucket}::interval
+                ) AS bucket
+            ),
+            data AS (
+                SELECT
+                    time_bucket(${bucket}::interval, timestamp) AS bucket,
+                    bot_name AS agent,
+                    COUNT(*)::bigint AS request_count
+                FROM proxy_logs
+                WHERE {where}
+                GROUP BY bucket, bot_name
+            )
+            SELECT
+                s.bucket AS bucket,
+                d.agent AS agent,
+                COALESCE(d.request_count, 0)::bigint AS request_count
+            FROM spine s
+            LEFT JOIN data d ON d.bucket = s.bucket
+            ORDER BY s.bucket ASC
+            "#,
+            bucket = bucket_param_idx,
+            gstart = gap_start_idx,
+            gend = gap_end_idx,
+            where = where_clauses.join(" AND "),
+        );
+
+        let stmt = sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            &sql,
+            values,
+        );
+        let results = self.db.query_all(stmt).await?;
+
+        // Map agent -> provider once so provider roll-up doesn't re-walk the
+        // taxonomy per row.
+        let agent_index: std::collections::HashMap<
+            &'static str,
+            &'static crate::ai_agent_detector::AiAgentMatch,
+        > = crate::ai_agent_detector::known_agents()
+            .iter()
+            .map(|(_, m)| (m.agent, m))
+            .collect();
+
+        // Aggregate into (bucket, key) buckets. When grouping by provider we sum
+        // every agent that maps to the same provider within a bucket. We also
+        // record every spine bucket — including the LEFT-JOIN empty ones whose
+        // agent is NULL — so the result carries the full x-axis and the chart
+        // doesn't collapse gaps.
+        let mut acc: std::collections::HashMap<(String, String), i64> =
+            std::collections::HashMap::new();
+        let mut all_buckets: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        for row in results {
+            let bucket: chrono::DateTime<Utc> = match row.try_get("", "bucket") {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let bucket_iso = bucket.to_rfc3339();
+            all_buckets.insert(bucket_iso.clone());
+
+            // Empty spine buckets have a NULL agent — they contribute to the
+            // x-axis but carry no series count.
+            let agent: String = match row.try_get::<Option<String>>("", "agent") {
+                Ok(Some(a)) => a,
+                _ => continue,
+            };
+            let count: i64 = row.try_get("", "request_count").unwrap_or(0);
+
+            let key = match group_by {
+                AiTimelineGroupBy::Agent => agent.clone(),
+                AiTimelineGroupBy::Provider => agent_index
+                    .get(agent.as_str())
+                    .map(|m| m.provider.to_string())
+                    .unwrap_or_else(|| agent.clone()),
+            };
+
+            *acc.entry((bucket_iso, key)).or_insert(0) += count;
+        }
+
+        let mut rows: Vec<AiAgentTimelineRow> = acc
+            .into_iter()
+            .map(|((bucket, key), count)| AiAgentTimelineRow {
+                bucket,
+                key,
+                request_count: count,
+            })
+            .collect();
+
+        // Emit a zero-count marker for every bucket that had no AI traffic so the
+        // frontend sees the complete time axis. `key` is empty for these; the UI
+        // treats an empty key purely as an x-axis placeholder.
+        let buckets_with_data: std::collections::HashSet<&str> =
+            rows.iter().map(|r| r.bucket.as_str()).collect();
+        let empty_markers: Vec<AiAgentTimelineRow> = all_buckets
+            .iter()
+            .filter(|b| !buckets_with_data.contains(b.as_str()))
+            .map(|b| AiAgentTimelineRow {
+                bucket: b.clone(),
+                key: String::new(),
+                request_count: 0,
+            })
+            .collect();
+        rows.extend(empty_markers);
+
+        // Stable ordering: bucket ASC, then key, so the frontend pivot is
+        // deterministic and series colours stay put across refreshes.
+        rows.sort_by(|a, b| a.bucket.cmp(&b.bucket).then_with(|| a.key.cmp(&b.key)));
+
+        Ok(rows)
+    }
+
+    /// HTTP status-class breakdown for AI-agent traffic.
+    ///
+    /// Same pre-filter as the AI agent breakdown (`is_bot = true AND bot_name IN
+    /// (known)`), grouped by status class (`2xx`, `3xx`, `4xx`, `5xx`, `other`).
+    /// Surfaces whether crawlers are getting served (`2xx`) or hitting broken /
+    /// blocked pages (`4xx`/`5xx`) — a content-health signal the request tables
+    /// don't make obvious.
+    pub async fn get_ai_status_breakdown(
+        &self,
+        project_id: Option<i32>,
+        environment_id: Option<i32>,
+        start_time: UtcDateTime,
+        end_time: UtcDateTime,
+    ) -> Result<Vec<AiStatusBreakdownRow>, ProxyLogServiceError> {
+        let known: Vec<&str> = crate::ai_agent_detector::known_agents()
+            .iter()
+            .map(|(_, m)| m.agent)
+            .collect();
+
+        if known.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut where_clauses: Vec<String> = vec![
+            "timestamp >= $1".to_string(),
+            "timestamp < $2".to_string(),
+            "is_bot = true".to_string(),
+            "bot_name IS NOT NULL".to_string(),
+        ];
+        let mut values: Vec<sea_orm::Value> = vec![start_time.into(), end_time.into()];
+        let mut next_idx = 3i32;
+
+        if let Some(pid) = project_id {
+            where_clauses.push(format!("project_id = ${}", next_idx));
+            values.push(pid.into());
+            next_idx += 1;
+        }
+        if let Some(eid) = environment_id {
+            where_clauses.push(format!("environment_id = ${}", next_idx));
+            values.push(eid.into());
+            next_idx += 1;
+        }
+
+        where_clauses.push(format!("bot_name = ANY(${}::text[])", next_idx));
+        let agents_owned: Vec<String> = known.iter().map(|s| (*s).to_owned()).collect();
+        values.push(agents_owned.into());
+
+        // Bucket the raw status into a class label in SQL so the result is a
+        // small fixed set of rows regardless of how many distinct codes appear.
+        let sql = format!(
+            r#"
+            SELECT
+                CASE
+                    WHEN status_code >= 200 AND status_code < 300 THEN '2xx'
+                    WHEN status_code >= 300 AND status_code < 400 THEN '3xx'
+                    WHEN status_code >= 400 AND status_code < 500 THEN '4xx'
+                    WHEN status_code >= 500 AND status_code < 600 THEN '5xx'
+                    ELSE 'other'
+                END AS status_class,
+                COUNT(*)::bigint AS request_count
+            FROM proxy_logs
+            WHERE {where}
+            GROUP BY status_class
+            ORDER BY request_count DESC
+            "#,
+            where = where_clauses.join(" AND "),
+        );
+
+        let stmt = sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            &sql,
+            values,
+        );
+        let results = self.db.query_all(stmt).await?;
+
+        let rows = results
+            .into_iter()
+            .map(|row| AiStatusBreakdownRow {
+                status_class: row.try_get("", "status_class").unwrap_or_default(),
+                request_count: row.try_get("", "request_count").unwrap_or(0),
+            })
+            .collect();
+
+        Ok(rows)
+    }
+
     /// Convert a status code class like "2xx", "3xx", "4xx", "5xx" to a (min, max) range.
     /// Returns None if the class is not recognized.
     fn status_class_range(class: &str) -> Option<(i16, i16)> {
@@ -1331,6 +1616,40 @@ pub struct AiPageBreakdownRow {
     /// Last-seen timestamp in RFC3339 format, or `None` if no rows matched.
     #[schema(example = "2026-05-29T12:00:00Z")]
     pub last_seen: Option<String>,
+}
+
+/// Dimension to split the AI-agent timeline by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiTimelineGroupBy {
+    /// One series per vendor (OpenAI, Anthropic, Perplexity, …).
+    Provider,
+    /// One series per canonical agent (GPTBot, ClaudeBot, …).
+    Agent,
+}
+
+/// One point in the AI-agent timeline: the request count for a single
+/// (`bucket`, `key`) pair, where `key` is a provider or agent name depending on
+/// the requested grouping. The UI pivots these into one stacked series per
+/// `key` across the shared bucket x-axis.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AiAgentTimelineRow {
+    /// Bucket start in RFC3339 format.
+    #[schema(example = "2026-05-29T12:00:00Z")]
+    pub bucket: String,
+    /// Provider or agent name this count belongs to.
+    #[schema(example = "OpenAI")]
+    pub key: String,
+    pub request_count: i64,
+}
+
+/// One row in the AI-agent HTTP status breakdown: the request count for a
+/// status class (`2xx`/`3xx`/`4xx`/`5xx`/`other`) across crawler traffic.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AiStatusBreakdownRow {
+    /// Status class label.
+    #[schema(example = "2xx")]
+    pub status_class: String,
+    pub request_count: i64,
 }
 
 /// Health summary for a single project (last 1 hour)
