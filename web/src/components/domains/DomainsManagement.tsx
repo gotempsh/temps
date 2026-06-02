@@ -43,7 +43,7 @@ import {
 } from 'lucide-react'
 import { useState } from 'react'
 import { toast } from 'sonner'
-import { formatUTCDate } from '@/lib/date'
+import { formatExpiryRemaining, formatLocalDate } from '@/lib/date'
 import { DNSConfigurationHelper } from './DNSConfigurationHelper'
 import { usePlatformCapabilities } from '@/hooks/usePlatformCapabilities'
 import { useNavigate } from 'react-router-dom'
@@ -461,8 +461,20 @@ function DomainsCompactRows({
             domain.status === 'active' &&
             isExpiringSoon(domain.expiration_time || 0)
           const expires = domain.expiration_time
-            ? formatUTCDate(domain.expiration_time)
+            ? formatLocalDate(domain.expiration_time)
             : null
+          const remaining = domain.expiration_time
+            ? formatExpiryRemaining(domain.expiration_time)
+            : null
+          const expiryBadgeVariant: 'destructive' | 'warning' =
+            remaining?.expired || (remaining && remaining.totalHours < 48)
+              ? 'destructive'
+              : 'warning'
+          const expiryBadgeLabel = remaining
+            ? remaining.expired
+              ? `Expired ${remaining.short} ago`
+              : `Expires in ${remaining.short}`
+            : 'Expires soon'
           return (
             <li
               key={domain.id}
@@ -493,8 +505,8 @@ function DomainsCompactRows({
                       </Badge>
                     )}
                     {expiringSoon && (
-                      <Badge variant="warning" className="text-xs">
-                        Expires soon
+                      <Badge variant={expiryBadgeVariant} className="text-xs">
+                        {expiryBadgeLabel}
                       </Badge>
                     )}
                   </div>

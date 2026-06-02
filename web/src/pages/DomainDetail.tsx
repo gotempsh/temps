@@ -37,7 +37,7 @@ import {
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { usePlatformCapabilities } from '@/hooks/usePlatformCapabilities'
-import { formatUTCDate } from '@/lib/date'
+import { formatExpiryRemaining, formatLocalDateTime, formatUTCDate } from '@/lib/date'
 import { useIsFetching, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { formatDistanceToNowStrict } from 'date-fns'
 import {
@@ -364,18 +364,30 @@ export function DomainDetail() {
     )
   }
 
-  const challengeData = order?.authorizations as ChallengeData | undefined
-  const hasDnsChallenge = order && domain.verification_method === 'dns-01'
+  // Terminal ACME order states (per RFC 8555): cancelled, invalid, revoked, deactivated.
+  // When the order is in any of these, no further action is possible on it — the user
+  // must create a new order. Treat the order as "absent" for UI gating purposes so we
+  // don't strand the user with hidden actions.
+  const TERMINAL_ORDER_STATUSES = ['cancelled', 'canceled', 'invalid', 'revoked', 'deactivated']
+  const isOrderTerminal = !!order && TERMINAL_ORDER_STATUSES.includes(order.status)
+  const activeOrder = order && !isOrderTerminal ? order : undefined
+
+  const challengeData = activeOrder?.authorizations as ChallengeData | undefined
+  const hasDnsChallenge = !!activeOrder && domain.verification_method === 'dns-01'
   const dnsTxtRecords = challengeData?.dns_txt_records || []
   const hasDnsValues = dnsTxtRecords.length > 0
   const hasHttpChallenge =
-    order && domain.verification_method === 'http-01' && challengeData
+    !!activeOrder && domain.verification_method === 'http-01' && !!challengeData
 
   const isPendingState =
     domain.status === 'challenge_requested' ||
     domain.status === 'pending_dns' ||
     domain.status === 'pending_http' ||
     domain.status === 'pending'
+
+  // The user can (re)create an order when the domain is awaiting issuance and either
+  // no order exists or the existing order is in a terminal state.
+  const canCreateOrder = isPendingState && !activeOrder
 
 
   // Renew is meaningful for any ACME-issued certificate. DNS-01 renewals
@@ -388,7 +400,7 @@ export function DomainDetail() {
 
   const primaryActionButton = (() => {
     if (domain.status === 'active') return null
-    if (!order && isPendingState) {
+    if (canCreateOrder) {
       return (
         <Button
           onClick={handleCreateOrder}
@@ -402,13 +414,13 @@ export function DomainDetail() {
           ) : (
             <>
               <Shield className="mr-2 size-4" />
-              Create order
+              {isOrderTerminal ? 'Create new order' : 'Create order'}
             </>
           )}
         </Button>
       )
     }
-    if (order && (hasDnsChallenge || hasHttpChallenge)) {
+    if (activeOrder && (hasDnsChallenge || hasHttpChallenge)) {
       return (
         <Button
           onClick={handleCompleteDns}
@@ -539,10 +551,12 @@ export function DomainDetail() {
                   <h2 className="text-lg font-semibold">DNS challenge required</h2>
                   <Badge variant={getStatusBadgeVariant(domain.status)}>{domain.status}</Badge>
                 </div>
-                {!order ? (
+                {!activeOrder ? (
                   <div className="space-y-3 rounded-lg border border-gray-950/10 p-4">
                     <p className="text-sm text-muted-foreground">
-                      Create an ACME order to get your DNS challenge token.
+                      {isOrderTerminal
+                        ? `Previous order ended with status "${order?.status}". Create a new ACME order to continue.`
+                        : 'Create an ACME order to get your DNS challenge token.'}
                     </p>
                     <Button
                       onClick={handleCreateOrder}
@@ -556,7 +570,7 @@ export function DomainDetail() {
                       ) : (
                         <>
                           <Shield className="mr-2 size-4" />
-                          Create order
+                          {isOrderTerminal ? 'Create new order' : 'Create order'}
                         </>
                       )}
                     </Button>
@@ -635,22 +649,61 @@ export function DomainDetail() {
               </>
             )}
 
-            {(domain.status === 'pending' ||
-              domain.status === 'pending_http' ||
-              domain.status === 'challenge_requested') &&
-              domain.verification_method === 'http-01' && hasHttpChallenge && challengeData && (
-                <HttpChallengePanel
-                  domain={domain}
-                  challengeData={challengeData}
-                  publicIpData={publicIpData}
-                  httpDebugInfo={httpDebugInfo}
-                  onVerify={handleCompleteDns}
-                  onCancel={handleCancelOrder}
-                  verifying={finalizeOrder.isPending}
-                  canManage={canManageCertificates}
-                  withHeader
-                />
-              )}
+            {isPendingState && domain.verification_method === 'http-01' && (
+              <>
+                {hasHttpChallenge && challengeData ? (
+                  <HttpChallengePanel
+                    domain={domain}
+                    challengeData={challengeData}
+                    publicIpData={publicIpData}
+                    httpDebugInfo={httpDebugInfo}
+                    onVerify={handleCompleteDns}
+                    onCancel={handleCancelOrder}
+                    verifying={finalizeOrder.isPending}
+                    canManage={canManageCertificates}
+                    withHeader
+                  />
+                ) : !activeOrder ? (
+                  <>
+                    <div className="flex items-center justify-between">
+                      <h2 className="text-lg font-semibold">HTTP-01 challenge required</h2>
+                      <Badge variant={getStatusBadgeVariant(domain.status)}>{domain.status}</Badge>
+                    </div>
+                    <div className="space-y-3 rounded-lg border border-gray-950/10 p-4">
+                      <p className="text-sm text-muted-foreground">
+                        {isOrderTerminal
+                          ? `Previous order ended with status "${order?.status}". Create a new ACME order to continue.`
+                          : 'Create an ACME order to get your HTTP-01 challenge token.'}
+                      </p>
+                      <Button
+                        onClick={handleCreateOrder}
+                        disabled={!canManageCertificates || createOrder.isPending}
+                      >
+                        {createOrder.isPending ? (
+                          <>
+                            <Loader2 className="mr-2 size-4 animate-spin" />
+                            Creating…
+                          </>
+                        ) : (
+                          <>
+                            <Shield className="mr-2 size-4" />
+                            {isOrderTerminal ? 'Create new order' : 'Create order'}
+                          </>
+                        )}
+                      </Button>
+                    </div>
+                  </>
+                ) : (
+                  <Alert>
+                    <Clock className="size-4" />
+                    <AlertTitle>Waiting for challenge data</AlertTitle>
+                    <AlertDescription>
+                      The HTTP challenge is being prepared. This usually takes a few moments.
+                    </AlertDescription>
+                  </Alert>
+                )}
+              </>
+            )}
 
             {domain.status === 'failed' && (
               <FailedPanel
@@ -708,10 +761,10 @@ export function DomainDetail() {
                 <CompactDl label="Order ID" value={`#${order.id}`} mono />
                 <CompactDl label="Email" value={order.email} />
                 {order.expires_at && (
-                  <CompactDl label="Expires" value={formatUTCDate(order.expires_at)} />
+                  <CompactDl label="Expires" value={formatLocalDateTime(order.expires_at)} />
                 )}
-                <CompactDl label="Created" value={formatUTCDate(order.created_at)} />
-                <CompactDl label="Updated" value={formatUTCDate(order.updated_at)} />
+                <CompactDl label="Created" value={formatLocalDateTime(order.created_at)} />
+                <CompactDl label="Updated" value={formatLocalDateTime(order.updated_at)} />
               </dl>
             </div>
           </Card>
@@ -762,7 +815,7 @@ export function DomainDetail() {
               )}
               Refresh
             </Button>
-            {(canRenew || (order && isPendingState)) && (
+            {(canRenew || canCreateOrder || (activeOrder && isPendingState)) && (
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
                   <Button variant="outline" size="icon" aria-label="More actions">
@@ -779,7 +832,16 @@ export function DomainDetail() {
                       {renewLabel}
                     </DropdownMenuItem>
                   )}
-                  {order && isPendingState && (
+                  {canCreateOrder && (
+                    <DropdownMenuItem
+                      onSelect={handleCreateOrder}
+                      disabled={!canManageCertificates || createOrder.isPending}
+                    >
+                      <Shield className="mr-2 size-4" />
+                      {isOrderTerminal ? 'Create new order' : 'Create order'}
+                    </DropdownMenuItem>
+                  )}
+                  {activeOrder && isPendingState && (
                     <>
                       {canRenew && domain.status === 'active' && <DropdownMenuSeparator />}
                       <DropdownMenuItem
@@ -809,26 +871,13 @@ export function DomainDetail() {
         )}
 
         {domain.status === 'active' && isExpiringSoon(domain.expiration_time) && (
-          <Alert variant="warning">
-            <AlertTriangle className="size-4" />
-            <AlertTitle>Certificate expiring soon</AlertTitle>
-            <AlertDescription className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-              <span>
-                The TLS certificate will expire on {formatUTCDate(domain.expiration_time || 0)}.
-                Renew it before expiration to avoid service interruption.
-              </span>
-              {canRenew && (
-                <Button
-                  size="sm"
-                  onClick={handleRenewDomain}
-                  disabled={renewDomain.isPending}
-                >
-                  <RefreshCw className="mr-2 size-4" />
-                  {renewLabel}
-                </Button>
-              )}
-            </AlertDescription>
-          </Alert>
+          <ExpiringSoonAlert
+            expirationTime={domain.expiration_time}
+            canRenew={canRenew}
+            renewLabel={renewLabel}
+            onRenew={handleRenewDomain}
+            renewing={renewDomain.isPending}
+          />
         )}
 
         {domain.last_error && domain.status !== 'failed' && (
@@ -877,6 +926,47 @@ type Domain = {
   updated_at: number
 }
 
+
+function ExpiringSoonAlert({
+  expirationTime,
+  canRenew,
+  renewLabel,
+  onRenew,
+  renewing,
+}: {
+  expirationTime?: number | null
+  canRenew: boolean
+  renewLabel: string
+  onRenew: () => void
+  renewing: boolean
+}) {
+  const remaining = expirationTime ? formatExpiryRemaining(expirationTime) : null
+  const variant = remaining?.expired || (remaining && remaining.totalHours < 48)
+    ? 'destructive'
+    : 'warning'
+  return (
+    <Alert variant={variant as 'destructive' | 'warning'}>
+      <AlertTriangle className="size-4" />
+      <AlertTitle>
+        {remaining?.expired
+          ? `Certificate expired ${remaining.short} ago`
+          : `Certificate expiring soon${remaining ? ` — in ${remaining.short}` : ''}`}
+      </AlertTitle>
+      <AlertDescription className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+        <span>
+          The TLS certificate {remaining?.expired ? 'expired' : 'will expire'} on{' '}
+          {formatLocalDateTime(expirationTime || 0)}. Renew it before expiration to avoid service interruption.
+        </span>
+        {canRenew && (
+          <Button size="sm" onClick={onRenew} disabled={renewing}>
+            <RefreshCw className="mr-2 size-4" />
+            {renewLabel}
+          </Button>
+        )}
+      </AlertDescription>
+    </Alert>
+  )
+}
 
 function KeyFact({ label, value }: { label: string; value: React.ReactNode }) {
   return (
