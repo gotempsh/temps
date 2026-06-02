@@ -68,6 +68,8 @@ pub enum PropertyColumn {
     Region,
     /// Visitor city (from IP geolocation)
     City,
+    /// Bot/crawler name (GPTBot, ClaudeBot, Googlebot, etc.) — only for crawler traffic
+    CrawlerName,
 }
 
 impl PropertyColumn {
@@ -93,6 +95,7 @@ impl PropertyColumn {
             Self::Country => "country",
             Self::Region => "region",
             Self::City => "city",
+            Self::CrawlerName => "crawler_name",
         }
     }
 }

@@ -1,6 +1,7 @@
 export { AiAgentsChart } from './AiAgentsChart'
 export { AnalyticsMetrics } from './AnalyticsMetrics'
 export { BrowsersChart } from './BrowsersChart'
+export { CrawlersChart } from './CrawlersChart'
 export { ChannelsChart } from './ChannelsChart'
 export { DevicesChart } from './DevicesChart'
 export { LanguagesChart } from './LanguagesChart'

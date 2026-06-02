@@ -138,6 +138,7 @@ fn property_column_expr(col: PropertyColumn) -> (&'static str, &'static str) {
         Country => ("country", "Unknown"),
         Region => ("region", "Unknown"),
         City => ("city", "Unknown"),
+        CrawlerName => ("crawler_name", "Unknown"),
     }
 }
 
@@ -509,6 +510,8 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
         let (col, sentinel) = property_column_expr(q.group_by_column.clone());
         let count_sql = count_expr_str(&q.aggregation_level);
         let group_by_str = q.group_by_column.as_str().to_string();
+        let is_crawler_column = matches!(q.group_by_column, PropertyColumn::CrawlerName);
+        let crawler_filter_flag = i32::from(is_crawler_column);
 
         let env_filter_flag: i32 = q.scope.environment_id.map(|_| 1).unwrap_or(0);
         let env_filter_value: i32 = q.scope.environment_id.unwrap_or(0);
@@ -568,6 +571,7 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
                   AND (? = 0
                        OR (? = 1 AND referrer_hostname = ?)
                        OR (? = 2 AND referrer_hostname = ''))
+                  AND (? = 0 OR is_crawler = 1)
                 GROUP BY value
             ),
             total AS (SELECT sum(count) AS t FROM value_counts)
@@ -620,6 +624,7 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
             .bind(f_referrer_flag)
             .bind(&f_referrer_value)
             .bind(f_referrer_flag)
+            .bind(crawler_filter_flag)
             .bind(q.limit as u32)
             .fetch_all::<BreakdownRow>()
             .await
@@ -647,6 +652,8 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
         let (col, sentinel) = property_column_expr(q.group_by_column.clone());
         let count_sql = count_expr_str(&q.aggregation_level);
         let group_by_str = q.group_by_column.as_str().to_string();
+        let is_crawler_column = matches!(q.group_by_column, PropertyColumn::CrawlerName);
+        let crawler_filter_flag = i32::from(is_crawler_column);
 
         // Bucket auto-detection mirrors the Postgres impl so dashboards
         // pick the same granularity at the same range widths.
@@ -686,6 +693,7 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
               AND (? = 0 OR environment_id = ?)
               AND (? = 0 OR deployment_id = ?)
               AND (? = 0 OR event_name = ?)
+              AND (? = 0 OR is_crawler = 1)
             GROUP BY bucket_ms, value
             ORDER BY bucket_ms ASC, count DESC
             "#
@@ -710,6 +718,7 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
             .bind(dep_filter_value)
             .bind(event_filter_flag)
             .bind(&event_filter_value)
+            .bind(crawler_filter_flag)
             .fetch_all::<TimelineRow>()
             .await
             .map_err(|e| ch_err("query_property_timeline", e))?;

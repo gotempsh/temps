@@ -10,6 +10,7 @@ import {
   AnalyticsMetrics,
   BrowsersChart,
   ChannelsChart,
+  CrawlersChart,
   DevicesChart,
   LanguagesChart,
   LocationsChart,
@@ -1766,6 +1767,12 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
               environment={selectedEnvironment}
             />
             <UTMCampaignsChart
+              project={project}
+              startDate={startDate}
+              endDate={endDate}
+              environment={selectedEnvironment}
+            />
+            <CrawlersChart
               project={project}
               startDate={startDate}
               endDate={endDate}

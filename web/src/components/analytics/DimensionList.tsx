@@ -51,6 +51,7 @@ export type DimensionKey =
   | 'utm_campaign'
   | 'utm_term'
   | 'utm_content'
+  | 'crawlers'
 
 interface DimensionConfig {
   title: string
@@ -158,6 +159,12 @@ const DIMENSIONS: Record<DimensionKey, DimensionConfig> = {
     singular: 'content',
     plural: 'contents',
     groupBy: 'utm_content',
+  },
+  crawlers: {
+    title: 'Crawlers & Bots',
+    singular: 'crawler',
+    plural: 'crawlers',
+    groupBy: 'crawler_name',
   },
 }
 

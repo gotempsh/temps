@@ -493,6 +493,7 @@ impl AnalyticsEventsService {
         // Check if we need to join with ip_geolocations
         let is_geo_column = matches!(group_by_str, "country" | "region" | "city");
         let is_referrer_column = group_by_str == "referrer_hostname";
+        let is_crawler_column = group_by_str == "crawler_name";
         let needs_geo_join = is_geo_column || filters.country.is_some() || filters.region.is_some();
 
         let (from_clause, select_column) = if needs_geo_join && is_geo_column {
@@ -518,6 +519,11 @@ impl AnalyticsEventsService {
                 "events e",
                 format!("COALESCE(e.{}, 'Direct')", group_by_str),
             )
+        } else if is_crawler_column {
+            (
+                "events e",
+                format!("COALESCE(e.{}, 'Unknown')", group_by_str),
+            )
         } else {
             (
                 "events e",
@@ -539,6 +545,11 @@ impl AnalyticsEventsService {
                 ))"#
                 .to_string(),
             );
+        }
+
+        // For crawler_name, only show crawler traffic
+        if is_crawler_column {
+            conditions.push("e.is_crawler = true".to_string());
         }
 
         let mut param_idx = 4;
@@ -728,6 +739,7 @@ impl AnalyticsEventsService {
         // Check if we need to join with ip_geolocations
         let is_geo_column = matches!(group_by_str, "country" | "region" | "city");
         let is_referrer_column = group_by_str == "referrer_hostname";
+        let is_crawler_column = group_by_str == "crawler_name";
         let (from_clause, select_column) = if is_geo_column {
             (
                 "events e LEFT JOIN ip_geolocations ig ON e.ip_geolocation_id = ig.id",
@@ -737,6 +749,11 @@ impl AnalyticsEventsService {
             (
                 "events e",
                 format!("COALESCE(e.{}, 'Direct')", group_by_str),
+            )
+        } else if is_crawler_column {
+            (
+                "events e",
+                format!("COALESCE(e.{}, 'Unknown')", group_by_str),
             )
         } else {
             ("events e", format!("e.{}", group_by_str))
@@ -761,6 +778,11 @@ impl AnalyticsEventsService {
                 param_idx
             ));
             param_idx += 1;
+        }
+
+        // For crawler_name, only show crawler traffic
+        if is_crawler_column {
+            conditions.push("e.is_crawler = true".to_string());
         }
 
         // Pass bucket as a parameterized value ($N::interval) to prevent SQL injection

@@ -9745,7 +9745,7 @@ export type PropertyBreakdownResponse = {
     total: number;
 };
 
-export type PropertyColumn = 'channel' | 'device_type' | 'browser' | 'browser_version' | 'operating_system' | 'operating_system_version' | 'utm_source' | 'utm_medium' | 'utm_campaign' | 'utm_term' | 'utm_content' | 'referrer_hostname' | 'language' | 'event_type' | 'event_name' | 'page_path' | 'pathname' | 'country' | 'region' | 'city';
+export type PropertyColumn = 'channel' | 'device_type' | 'browser' | 'browser_version' | 'operating_system' | 'operating_system_version' | 'utm_source' | 'utm_medium' | 'utm_campaign' | 'utm_term' | 'utm_content' | 'referrer_hostname' | 'language' | 'event_type' | 'event_name' | 'page_path' | 'pathname' | 'country' | 'region' | 'city' | 'crawler_name';
 
 export type PropertyTimelineItem = {
     count: number;
