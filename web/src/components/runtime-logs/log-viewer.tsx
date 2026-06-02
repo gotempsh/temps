@@ -11,8 +11,11 @@ import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import {
   DropdownMenu,
+  DropdownMenuCheckboxItem,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { Input } from '@/components/ui/input'
@@ -27,19 +30,199 @@ import {
 import { cn } from '@/lib/utils'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useVirtualizer } from '@tanstack/react-virtual'
+import AnsiToHtml from 'ansi-to-html'
 import {
   AlertCircle,
   ChevronDown,
   ChevronUp,
+  Columns3,
   Pause,
   Play,
   RefreshCw,
   Search,
   Timer,
 } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { FilterBar } from './filter-bar'
-import { LogLine } from './log-line'
+
+// History-viewer-style row primitives. Duplicated locally (rather than
+// imported from useLogStream / history-log-viewer) because this viewer holds
+// `logs` as a plain string[] and parses on render — re-typing the rope as
+// LiveLogLine[] would ripple through the WS callback, the rAF flusher, the
+// interval poll, and tail/length math. Keeping the parse at render isolates
+// the visual change to the row itself.
+type LiveLogLevel = 'ERROR' | 'WARN' | 'INFO' | 'DEBUG' | 'TRACE'
+
+const LEVEL_OPTIONS: LiveLogLevel[] = ['ERROR', 'WARN', 'INFO', 'DEBUG', 'TRACE']
+
+const LEVEL_COLORS: Record<LiveLogLevel, string> = {
+  ERROR: 'bg-red-500/15 text-red-700 dark:text-red-400 border-red-500/20',
+  WARN: 'bg-yellow-500/15 text-yellow-700 dark:text-yellow-400 border-yellow-500/20',
+  INFO: 'bg-blue-500/15 text-blue-700 dark:text-blue-400 border-blue-500/20',
+  DEBUG: 'bg-zinc-500/15 text-zinc-700 dark:text-zinc-400 border-zinc-500/20',
+  TRACE: 'bg-zinc-400/15 text-zinc-500 dark:text-zinc-500 border-zinc-400/20',
+}
+
+// Leading ISO timestamp the server prepends when ?timestamps=true is on.
+// Docker emits RFC 3339 with nano precision (`2025-05-30T10:40:00.123456789Z`).
+const TIMESTAMP_PREFIX = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)\s+/
+
+// Severity inference — see useLogStream.ts for the matching version. Scans
+// only the first ~120 chars so a stack trace containing the word "warning"
+// downstream doesn't re-classify the whole row.
+const LEVEL_PATTERNS: Array<[LiveLogLevel, RegExp]> = [
+  ['ERROR', /\b(ERROR|ERR|FATAL|PANIC|EMERG|CRIT)\b|\bpanic:|\bfatal:/i],
+  ['WARN', /\b(WARN|WARNING)\b/i],
+  ['DEBUG', /\b(DEBUG|DBG)\b/i],
+  ['TRACE', /\b(TRACE|TRC)\b/i],
+  ['INFO', /\b(INFO|NOTICE)\b/i],
+]
+
+function inferLevel(message: string): LiveLogLevel {
+  const head = message.slice(0, 120)
+  for (const [level, pattern] of LEVEL_PATTERNS) {
+    if (pattern.test(head)) return level
+  }
+  return 'INFO'
+}
+
+interface ParsedLogLine {
+  level: LiveLogLevel
+  timestamp?: string
+  message: string
+}
+
+function parseLogLine(raw: string): ParsedLogLine {
+  const tsMatch = raw.match(TIMESTAMP_PREFIX)
+  const timestamp = tsMatch?.[1]
+  const message = timestamp ? raw.slice(tsMatch![0].length) : raw
+  return { level: inferLevel(message), timestamp, message }
+}
+
+function formatTimestamp(iso?: string): string {
+  if (!iso) return ''
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return ''
+  const base = d.toLocaleTimeString('en-US', {
+    hour12: false,
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  })
+  return `${base}.${String(d.getMilliseconds()).padStart(3, '0')}`
+}
+
+interface ColumnVisibility {
+  timestamp: boolean
+  level: boolean
+  service: boolean
+}
+
+const COLUMNS_STORAGE_KEY = 'temps.runtime-log.columns'
+
+// Default to the same dense terminal look as the history viewer: all three
+// columns on. Persists per-browser so users who want a tighter rope can
+// hide what they don't need.
+const DEFAULT_COLUMNS: ColumnVisibility = {
+  timestamp: true,
+  level: true,
+  service: true,
+}
+
+function loadColumns(): ColumnVisibility {
+  if (typeof window === 'undefined') return DEFAULT_COLUMNS
+  try {
+    const raw = window.localStorage.getItem(COLUMNS_STORAGE_KEY)
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<ColumnVisibility>
+      return {
+        timestamp: parsed.timestamp ?? DEFAULT_COLUMNS.timestamp,
+        level: parsed.level ?? DEFAULT_COLUMNS.level,
+        service: parsed.service ?? DEFAULT_COLUMNS.service,
+      }
+    }
+  } catch {
+    // Ignore corrupted storage and fall through to defaults.
+  }
+  return DEFAULT_COLUMNS
+}
+
+const ansiConverter = new AnsiToHtml({
+  fg: 'var(--foreground)',
+  bg: 'var(--background)',
+  newline: false,
+  escapeXML: true,
+})
+
+interface LiveLogRowProps {
+  raw: string
+  columns: ColumnVisibility
+  searchTerm: string
+  isHighlighted: boolean
+  serviceLabel?: string | null
+}
+
+const LiveLogRow = memo(function LiveLogRow({
+  raw,
+  columns,
+  searchTerm,
+  isHighlighted,
+  serviceLabel,
+}: LiveLogRowProps) {
+  const parsed = useMemo(() => parseLogLine(raw), [raw])
+
+  // ANSI conversion is unconditional — container stdout may carry escape
+  // sequences. ansi-to-html escapes XML so log content can't inject markup.
+  // Search highlight is layered as a regex replace on the resulting HTML,
+  // done in plain text so it doesn't mangle ANSI span boundaries.
+  const messageHtml = useMemo(() => {
+    const html = ansiConverter.toHtml(parsed.message)
+    if (!searchTerm) return html
+    const escaped = searchTerm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    return html.replace(
+      new RegExp(`(${escaped})`, 'gi'),
+      '<mark class="bg-yellow-200 dark:bg-yellow-800 rounded px-1">$1</mark>',
+    )
+  }, [parsed.message, searchTerm])
+
+  return (
+    <div
+      className={cn(
+        'flex items-start gap-2 py-0.5 px-2 font-mono text-xs select-text hover:bg-muted/50',
+        isHighlighted && 'bg-accent',
+      )}
+    >
+      {columns.timestamp && (
+        <span className="text-muted-foreground shrink-0 tabular-nums w-[85px]">
+          {formatTimestamp(parsed.timestamp)}
+        </span>
+      )}
+      {columns.level && (
+        <Badge
+          variant="outline"
+          className={cn(
+            'shrink-0 text-[10px] font-medium px-1.5 py-0 h-[18px] leading-[18px] rounded-sm',
+            LEVEL_COLORS[parsed.level],
+          )}
+        >
+          {parsed.level}
+        </Badge>
+      )}
+      {columns.service && serviceLabel && (
+        <span
+          className="text-muted-foreground shrink-0 w-[70px] truncate"
+          title={serviceLabel}
+        >
+          {serviceLabel}
+        </span>
+      )}
+      <span
+        className="whitespace-pre-wrap break-all min-w-0 flex-1"
+        dangerouslySetInnerHTML={{ __html: messageHtml }}
+      />
+    </div>
+  )
+})
 
 function SelectedContainerLabel({
   container,
@@ -135,32 +318,9 @@ function formatIntervalLabel(ms: IntervalMs): string {
   return `${Math.round(ms / 60_000)}m`
 }
 
-function estimateLineHeight(content: string, containerWidth: number) {
-  // Assuming average character width of 8px in monospace font
-  const averageCharWidth = 9
-  // text-xs (12px) × leading-snug (1.375) ≈ 16.5px per text row.
-  const lineHeight = 17
-  const minHeight = 18
-
-  if (!content || !containerWidth) return minHeight
-
-  // Container is now px-3 (12px each side) and rows are py-0 — no extra
-  // vertical padding from the row wrapper, so paddingHeight stays 0.
-  const paddingHeight = 0
-
-  // Calculate how many lines this content might wrap into
-  const effectiveWidth = containerWidth - 24 // px-3 = 12px each side
-  const charactersPerLine = Math.max(
-    1,
-    Math.floor(effectiveWidth / averageCharWidth)
-  )
-  const estimatedLines = Math.max(
-    1,
-    Math.ceil(content.length / charactersPerLine)
-  )
-
-  return Math.max(minHeight, lineHeight * estimatedLines + paddingHeight)
-}
+// Row height is fixed at 22px (see virtualizer config). Per-row measurement
+// previously lived here as estimateLineHeight; removed when we adopted the
+// history viewer's terminal-style fixed-cadence rows.
 
 export default function LogViewer({ project }: { project: ProjectResponse }) {
   const [logs, setLogs] = useState<string[]>([])
@@ -179,6 +339,26 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
   const [tail, setTail] = useState<number>(1000)
   const [autoScroll, setAutoScroll] = useState(true)
   const [showTimestamps, setShowTimestamps] = useState(false)
+  // Level chip filter — empty array means "show all", matching the history
+  // viewer. Levels are inferred per-line at render via parseLogLine; the
+  // filtered rope below memoizes that so the virtualizer only sees survivors.
+  const [selectedLevels, setSelectedLevels] = useState<LiveLogLevel[]>([])
+  const [columns, setColumns] = useState<ColumnVisibility>(loadColumns)
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(COLUMNS_STORAGE_KEY, JSON.stringify(columns))
+    } catch {
+      // Storage may be unavailable (private mode, quota); not worth surfacing.
+    }
+  }, [columns])
+  // Turning on the Timestamp column implies asking the server for timestamps.
+  // Without this, the column slot would render empty for every row. The WS
+  // effect already restarts on showTimestamps change.
+  useEffect(() => {
+    if (columns.timestamp && !showTimestamps) {
+      setShowTimestamps(true)
+    }
+  }, [columns.timestamp, showTimestamps])
   // Refresh mode: Live (rAF every frame), Pause (never auto-flush), or
   // Interval (flush every N ms). Persisted per-project so users don't re-pick
   // it every visit.
@@ -205,7 +385,6 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
   const [now, setNow] = useState(() => Date.now())
   const parentRef = useRef<HTMLDivElement>(null)
   const wsRef = useRef<WebSocket | null>(null)
-  const containerWidth = useRef<number>(0)
   const isConnectingRef = useRef(false)
   const retryTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // Buffered lines awaiting flush. Drained at different cadences depending on
@@ -240,16 +419,30 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
   // the pane until the next tick (5s of empty screen). Source-param
   // changes (env, container, dates, tail, timestamps) still wipe.
   const sourceSigRef = useRef<string>('')
+
+  // Filtered rope — drops lines whose inferred level isn't in the active
+  // selection. Search filtering stays at the row level (the LiveLogRow
+  // highlights matches) because filtering on the search term would hide the
+  // surrounding context that makes a match useful to read. The level chips
+  // are a real reducer: they collapse the visible rope so the count, the
+  // virtualizer, and the search-nav all agree on what's on screen.
+  const filteredLogs = useMemo(() => {
+    if (selectedLevels.length === 0) return logs
+    return logs.filter((raw) => selectedLevels.includes(inferLevel(raw)))
+  }, [logs, selectedLevels])
+
+  // Dynamic row height. Log lines are often long JSON payloads that wrap to
+  // several visual lines; a fixed 22px row caused wrapped content to overflow
+  // its slot and render on top of the rows below. `measureElement` reports each
+  // row's real height to the virtualizer (estimateSize is just the initial
+  // guess for off-screen rows). The row wrapper sets `ref` + `data-index` so
+  // the virtualizer can measure it.
   const virtualizer = useVirtualizer({
-    count: logs.length,
+    count: filteredLogs.length,
     getScrollElement: () => parentRef.current,
-    estimateSize: (index) => {
-      return estimateLineHeight(logs[index], containerWidth.current)
-    },
+    estimateSize: () => 22,
+    measureElement: (el) => el.getBoundingClientRect().height,
     overscan: 20,
-    measureElement: (element) => {
-      return element?.getBoundingClientRect().height ?? 0
-    },
   })
   // Poll the environments list. `current_deployment_id` on the entry whose
   // id == selectedTarget is the per-environment "what's running right now"
@@ -344,6 +537,23 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
       setSelectedContainer(containers[0].container_id)
     }
   }, [containersData, selectedContainer])
+
+  // Service label for the Service column. Falls back to the container name
+  // when a service isn't named explicitly (e.g. ad-hoc deploys). Memoized so
+  // every LiveLogRow render doesn't trigger a fresh array scan.
+  const selectedContainerServiceName = useMemo(() => {
+    if (!selectedContainer) return null
+    const container = containersData?.containers?.find(
+      (c) => c.container_id === selectedContainer,
+    )
+    return container?.service_name ?? container?.container_name ?? null
+  }, [containersData, selectedContainer])
+
+  const toggleLevel = useCallback((level: LiveLogLevel) => {
+    setSelectedLevels((prev) =>
+      prev.includes(level) ? prev.filter((l) => l !== level) : [...prev, level],
+    )
+  }, [])
 
   // Persist mode + keep a ref in sync for WS callbacks.
   useEffect(() => {
@@ -1020,19 +1230,6 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
     handleRetryConnection()
   }
 
-  // Add this effect to measure container width
-  useEffect(() => {
-    if (parentRef.current) {
-      const resizeObserver = new ResizeObserver((entries) => {
-        containerWidth.current = entries[0].contentRect.width
-        virtualizer.measure()
-      })
-
-      resizeObserver.observe(parentRef.current)
-      return () => resizeObserver.disconnect()
-    }
-  }, [virtualizer])
-
   return (
     <div className="w-full">
       <div className="rounded-lg border bg-background shadow-sm">
@@ -1147,6 +1344,85 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
                 className="pl-9 w-full"
               />
             </div>
+
+            {/* Columns dropdown — same set + storage key spirit as the
+                container logs viewer and the history viewer. Service column
+                is disabled when no container is selected so the slot isn't
+                advertised when there's nothing to put in it. */}
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-9 gap-1.5"
+                  aria-label="Toggle columns"
+                >
+                  <Columns3 className="h-3.5 w-3.5" />
+                  <span className="hidden sm:inline text-xs">Columns</span>
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-44">
+                <DropdownMenuLabel>Show columns</DropdownMenuLabel>
+                <DropdownMenuSeparator />
+                <DropdownMenuCheckboxItem
+                  checked={columns.timestamp}
+                  onCheckedChange={(v) =>
+                    setColumns((c) => ({ ...c, timestamp: v === true }))
+                  }
+                >
+                  Timestamp
+                </DropdownMenuCheckboxItem>
+                <DropdownMenuCheckboxItem
+                  checked={columns.level}
+                  onCheckedChange={(v) =>
+                    setColumns((c) => ({ ...c, level: v === true }))
+                  }
+                >
+                  Level
+                </DropdownMenuCheckboxItem>
+                <DropdownMenuCheckboxItem
+                  checked={columns.service}
+                  onCheckedChange={(v) =>
+                    setColumns((c) => ({ ...c, service: v === true }))
+                  }
+                  disabled={!selectedContainerServiceName}
+                >
+                  Service
+                </DropdownMenuCheckboxItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
+
+          {/* Level chip row — mirrors history-log-viewer.tsx. Empty selection
+              = show all; once a level is picked, only matching rows survive
+              the filteredLogs memo above. Layout intentionally lives between
+              the source-picker row and the mode-segmented control so it's
+              always visible regardless of Advanced Options state. */}
+          <div className="flex gap-1.5 flex-wrap items-center">
+            {LEVEL_OPTIONS.map((level) => (
+              <button
+                type="button"
+                key={level}
+                onClick={() => toggleLevel(level)}
+                className={cn(
+                  'px-2.5 py-0.5 text-xs font-medium rounded-full border transition-colors',
+                  selectedLevels.includes(level)
+                    ? LEVEL_COLORS[level]
+                    : 'bg-muted/50 text-muted-foreground border-border hover:bg-muted',
+                )}
+              >
+                {level}
+              </button>
+            ))}
+            {selectedLevels.length > 0 && (
+              <button
+                type="button"
+                onClick={() => setSelectedLevels([])}
+                className="px-2.5 py-0.5 text-xs text-muted-foreground hover:text-foreground"
+              >
+                Clear
+              </button>
+            )}
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
@@ -1373,12 +1649,18 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
                 }}
               >
                 {virtualizer.getVirtualItems().map((virtualRow) => {
-                  // Rows in the most recent flush batch get a one-shot
-                  // fade-in. Once a row is no longer in the freshest batch
-                  // (a subsequent flush moved batchStart forward) the class
-                  // is removed, but the animation has already completed —
-                  // the visible result is unchanged.
-                  const isFresh = virtualRow.index >= lastBatchStart
+                  const raw = filteredLogs[virtualRow.index]
+                  if (raw === undefined) return null
+                  // Fresh-batch animation runs only when no level filter is
+                  // active. With a filter on, virtualRow.index points into
+                  // the filtered rope and lastBatchStart points into the
+                  // unfiltered one — the comparison is meaningless. Skipping
+                  // the animation under filter is the cheaper fix than
+                  // translating indices and matches the user's mental model
+                  // ("I'm focused on these levels, don't dazzle me").
+                  const isFresh =
+                    selectedLevels.length === 0 &&
+                    virtualRow.index >= lastBatchStart
                   return (
                     <div
                       key={virtualRow.key}
@@ -1389,13 +1671,19 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
                         top: `${virtualRow.start}px`,
                         left: 0,
                         width: '100%',
+                        // No fixed height — the row sizes to its (possibly
+                        // wrapped) content and measureElement reports it back.
                       }}
                       className={cn(isFresh && 'log-fresh-line')}
                     >
-                      <LogLine
-                        content={logs[virtualRow.index]}
-                        isHighlighted={virtualRow.index === currentMatchIndex}
+                      <LiveLogRow
+                        raw={raw}
+                        columns={columns}
                         searchTerm={searchTerm}
+                        isHighlighted={
+                          virtualRow.index === currentMatchIndex
+                        }
+                        serviceLabel={selectedContainerServiceName}
                       />
                     </div>
                   )

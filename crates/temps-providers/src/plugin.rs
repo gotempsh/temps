@@ -91,6 +91,18 @@ impl TempsPlugin for ProvidersPlugin {
         // can reuse its same code path. Otherwise the endpoint returns 503.
         let health_monitor = context.get_service::<ExternalServiceHealthMonitor>();
 
+        // Optional: metrics store, present only when metrics collection is enabled.
+        let metrics_store = context.get_service::<dyn temps_metrics::MetricsStore>();
+
+        // DB connection for direct queries (alert rules CRUD, etc.)
+        let db = context.require_service::<sea_orm::DatabaseConnection>();
+
+        // API key service — needed to provision si_ ingest keys for OTLP-push services.
+        let api_key_service = context.require_service::<temps_auth::ApiKeyService>();
+
+        // Config service — resolves the internal URL containers push OTLP to.
+        let config_service = context.get_service::<temps_config::ConfigService>();
+
         // Create QueryService
         let query_service = Arc::new(crate::QueryService::new(external_service_manager.clone()));
 
@@ -100,6 +112,10 @@ impl TempsPlugin for ProvidersPlugin {
             audit_service,
             query_service,
             health_monitor,
+            metrics_store,
+            db,
+            api_key_service,
+            config_service,
         });
 
         // Configure routes with the app state

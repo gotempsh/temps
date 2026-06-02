@@ -481,6 +481,61 @@ impl ApiKeyService {
         self.update_api_key(user_id, api_key_id, request).await
     }
 
+    /// Generate a service-scoped metrics ingest key (`si_` prefix).
+    ///
+    /// The key is tied to the given `service_id` and uses the
+    /// `metrics_ingest` role.  It never expires — it lives until the
+    /// external service is deleted (cascade via FK).
+    ///
+    /// Returns the plaintext key (caller must inject into the container;
+    /// it is never stored in plaintext).
+    pub async fn create_service_ingest_key(
+        &self,
+        service_id: i32,
+        service_name: &str,
+        system_user_id: i32,
+    ) -> Result<String, ApiKeyServiceError> {
+        let random_part: String = rand::thread_rng()
+            .sample_iter(&rand::distributions::Alphanumeric)
+            .take(40)
+            .map(char::from)
+            .collect();
+        let api_key = format!("si_{}", random_part);
+
+        let key_hash = self.hash_api_key(&api_key);
+        let key_prefix = api_key.chars().take(8).collect::<String>();
+
+        temps_entities::api_keys::ActiveModel {
+            name: Set(format!("metrics-ingest-{}", service_name)),
+            key_hash: Set(key_hash),
+            key_prefix: Set(key_prefix),
+            user_id: Set(system_user_id),
+            role_type: Set("metrics_ingest".to_string()),
+            is_active: Set(true),
+            service_id: Set(Some(service_id)),
+            ..Default::default()
+        }
+        .insert(self.db.as_ref())
+        .await
+        .map_err(ApiKeyServiceError::DatabaseError)?;
+
+        Ok(api_key)
+    }
+
+    /// Revoke all metrics ingest keys for a given service.
+    /// Called when the service is being deleted (belt-and-suspenders alongside CASCADE).
+    pub async fn revoke_service_ingest_keys(
+        &self,
+        service_id: i32,
+    ) -> Result<(), ApiKeyServiceError> {
+        temps_entities::api_keys::Entity::delete_many()
+            .filter(temps_entities::api_keys::Column::ServiceId.eq(service_id))
+            .exec(self.db.as_ref())
+            .await
+            .map_err(ApiKeyServiceError::DatabaseError)?;
+        Ok(())
+    }
+
     fn generate_api_key(&self) -> String {
         const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
         let mut rng = rand::thread_rng();
@@ -1185,6 +1240,42 @@ mod tests {
 
         // Different inputs should produce different hashes
         assert_ne!(hash1, hash2);
+    }
+
+    // ── Service ingest key ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_si_token_has_correct_prefix() {
+        // Verify the prefix used for service ingest tokens
+        let token = "si_ABCDEFGHIJ1234567890abcdefghij12345678901234567890";
+        assert!(token.starts_with("si_"));
+        assert!(token.len() > 40);
+    }
+
+    #[test]
+    fn test_service_ingest_key_name_format() {
+        let service_name = "my-rustfs";
+        let key_name = format!("metrics-ingest-{}", service_name);
+        assert_eq!(key_name, "metrics-ingest-my-rustfs");
+    }
+
+    #[test]
+    fn test_service_ingest_role_type_string() {
+        // The role_type stored in DB for service keys
+        use crate::permissions::Role;
+        let role = Role::MetricsIngest;
+        assert_eq!(role.to_string(), "metrics_ingest");
+        assert!(Role::from_str("metrics_ingest").is_some());
+    }
+
+    #[test]
+    fn test_metrics_ingest_role_has_no_permissions() {
+        use crate::permissions::Role;
+        let perms = Role::MetricsIngest.permissions();
+        assert!(
+            perms.is_empty(),
+            "MetricsIngest role should have no UI permissions"
+        );
     }
 
     // Error Conversion Tests

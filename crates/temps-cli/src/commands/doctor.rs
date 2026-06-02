@@ -626,37 +626,56 @@ impl DoctorCommand {
             }
         }
 
-        // Migration status - check if seaql_migrations table exists and count
-        match db
-            .query_one(Statement::from_string(
-                DatabaseBackend::Postgres,
-                "SELECT COUNT(*) as count FROM seaql_migrations".to_string(),
-            ))
-            .await
+        // Migration status — report applied count AND, crucially, whether this
+        // binary has migrations the DB hasn't applied yet. Pending migrations
+        // are the key pre-upgrade signal: run `temps migrate` before restarting
+        // the server so a slow migration can't crash-loop the API.
         {
-            Ok(Some(row)) => {
-                use sea_orm::TryGetable;
-                if let Ok(count) = i64::try_get_by(&row, "count") {
+            use temps_migrations::{Migrator, MigratorTrait};
+
+            let applied: Option<i64> = db
+                .query_one(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    "SELECT COUNT(*) as count FROM seaql_migrations".to_string(),
+                ))
+                .await
+                .ok()
+                .flatten()
+                .and_then(|row| {
+                    use sea_orm::TryGetable;
+                    i64::try_get_by(&row, "count").ok()
+                });
+
+            match Migrator::get_pending_migrations(&db).await {
+                Ok(pending) => {
+                    let pending_n = pending.len();
+                    let applied_str = applied
+                        .map(|c| format!("{c} applied"))
+                        .unwrap_or_else(|| "applied count unknown".to_string());
+                    if pending_n == 0 {
+                        report.add(
+                            "Migrations",
+                            CheckResult::Pass(format!("{applied_str}, up to date")),
+                        );
+                    } else {
+                        report.add(
+                            "Migrations",
+                            CheckResult::Warn(format!(
+                                "{applied_str}, {pending_n} PENDING — run `temps migrate` \
+                                 before restarting the server"
+                            )),
+                        );
+                    }
+                }
+                Err(_) => {
                     report.add(
                         "Migrations",
-                        CheckResult::Pass(format!("{} applied", count)),
+                        CheckResult::Warn(
+                            "Migration table not found. Run `temps migrate` to initialize the schema."
+                                .to_string(),
+                        ),
                     );
                 }
-            }
-            Ok(None) => {
-                report.add(
-                    "Migrations",
-                    CheckResult::Warn("No migrations found".to_string()),
-                );
-            }
-            Err(_) => {
-                report.add(
-                    "Migrations",
-                    CheckResult::Warn(
-                        "Migration table not found. Run `temps serve` to apply migrations."
-                            .to_string(),
-                    ),
-                );
             }
         }
 

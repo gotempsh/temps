@@ -5331,6 +5331,7 @@ mod tests {
             last_health_error: None,
             consecutive_health_failures: 0,
             health_metadata: None,
+            metrics_enabled: false,
         };
         // Build a MockDatabase for the `pool` slot — restore_pitr for
         // Postgres doesn't touch it in the legacy-reject path.

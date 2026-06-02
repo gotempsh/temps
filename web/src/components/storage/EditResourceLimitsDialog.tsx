@@ -117,6 +117,21 @@ export function EditResourceLimitsDialog({
     )
   }, [open, currentLimits])
 
+  // Reset input to a sane default when toggling a limit back on, so a
+  // previously typed invalid value (e.g. "-1") doesn't reappear.
+  const handleMemoryToggle = (v: boolean) => {
+    if (v && (Number(memoryMb) <= 0 || !Number.isFinite(Number(memoryMb)))) {
+      setMemoryMb(String(DEFAULT_MEMORY_MB))
+    }
+    setMemoryEnabled(v)
+  }
+  const handleCpuToggle = (v: boolean) => {
+    if (v && (Number(cpuCores) <= 0 || !Number.isFinite(Number(cpuCores)))) {
+      setCpuCores(String(DEFAULT_CPU_CORES))
+    }
+    setCpuEnabled(v)
+  }
+
   // -- Validation ---------------------------------------------------------
   const validation = useMemo(() => {
     if (memoryEnabled) {
@@ -298,7 +313,7 @@ export function EditResourceLimitsDialog({
             label="Memory"
             currentLabel={currentMemoryLabel}
             enabled={memoryEnabled}
-            onToggle={setMemoryEnabled}
+            onToggle={handleMemoryToggle}
             toggleId="resource-memory-toggle"
             description="Hard cap. Container is OOM-killed past this."
           >
@@ -364,7 +379,7 @@ export function EditResourceLimitsDialog({
             label="CPU"
             currentLabel={currentCpuLabel}
             enabled={cpuEnabled}
-            onToggle={setCpuEnabled}
+            onToggle={handleCpuToggle}
             toggleId="resource-cpu-toggle"
             description="Cap at N cores. Fractional allowed."
           >
@@ -462,6 +477,7 @@ function LimitSection({
   toggleId: string
   children: React.ReactNode
 }) {
+  const isCurrentlyLimited = !currentLabel.toLowerCase().includes('unlimited')
   return (
     <section className="space-y-3">
       <div className="flex items-center justify-between gap-3">
@@ -478,7 +494,9 @@ function LimitSection({
             </span>
           </div>
           <p className="mt-0.5 text-xs text-muted-foreground">
-            {description}
+            {!enabled && isCurrentlyLimited
+              ? 'Toggle on to change, or save now to remove the limit.'
+              : description}
           </p>
         </div>
         <Switch

@@ -99,6 +99,7 @@ impl RoleInfo {
             Role::Mcp => "Access for MCP service operations",
             Role::ApiReader => "Read-only API access",
             Role::Custom => "Custom role with specific permissions",
+            Role::MetricsIngest => "Token for infrastructure metrics ingest (si_ prefix)",
         }
         .to_string();
 

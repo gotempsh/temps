@@ -104,6 +104,16 @@ mod m20260526_000001_add_preview_envs_on_demand;
 mod m20260526_000002_add_trust_idp_email_to_oidc_providers;
 mod m20260528_000001_add_proxy_logs_listing_indexes;
 mod m20260529_000001_add_proxy_logs_filter_indexes;
+mod m20260601_000001_create_service_metrics;
+mod m20260601_000002_add_monitoring_settings;
+mod m20260601_000003_add_monitoring_alert_rules;
+mod m20260601_000004_add_monitoring_alert_rules_unique_idx;
+mod m20260601_000005_add_service_id_to_api_keys;
+mod m20260601_000006_update_metrics_retention_30d;
+mod m20260601_000007_create_service_metrics_status;
+mod m20260601_000008_alarms_nullable_env_deployment;
+mod m20260601_000009_metrics_caggs_keep_labels;
+mod m20260601_000010_add_service_id_to_alarms;
 
 pub struct Migrator;
 
@@ -211,6 +221,16 @@ impl MigratorTrait for Migrator {
             Box::new(m20260526_000002_add_trust_idp_email_to_oidc_providers::Migration),
             Box::new(m20260528_000001_add_proxy_logs_listing_indexes::Migration),
             Box::new(m20260529_000001_add_proxy_logs_filter_indexes::Migration),
+            Box::new(m20260601_000001_create_service_metrics::Migration),
+            Box::new(m20260601_000002_add_monitoring_settings::Migration),
+            Box::new(m20260601_000003_add_monitoring_alert_rules::Migration),
+            Box::new(m20260601_000004_add_monitoring_alert_rules_unique_idx::Migration),
+            Box::new(m20260601_000005_add_service_id_to_api_keys::Migration),
+            Box::new(m20260601_000006_update_metrics_retention_30d::Migration),
+            Box::new(m20260601_000007_create_service_metrics_status::Migration),
+            Box::new(m20260601_000008_alarms_nullable_env_deployment::Migration),
+            Box::new(m20260601_000009_metrics_caggs_keep_labels::Migration),
+            Box::new(m20260601_000010_add_service_id_to_alarms::Migration),
         ]
     }
 }

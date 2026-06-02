@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use utoipa::ToSchema;
 
+use sea_orm::DatabaseConnection;
+use temps_auth::ApiKeyService;
 use temps_core::AuditLogger;
 
 pub struct AppState {
@@ -16,6 +18,18 @@ pub struct AppState {
     /// startup (single-node control plane). `None` on workers or in tests
     /// where the loop isn't running.
     pub health_monitor: Option<Arc<ExternalServiceHealthMonitor>>,
+    /// Metrics store for time-series metric queries and writes.
+    /// Optional — present only when the metrics subsystem is enabled in config.
+    pub metrics_store: Option<Arc<dyn temps_metrics::MetricsStore>>,
+    /// Direct DB connection for alert rule CRUD (monitoring_alert_rules table).
+    pub db: Arc<DatabaseConnection>,
+    /// API key service — used to provision `si_` ingest keys when metrics are
+    /// enabled on a RustFS (or other OTLP-push) service.
+    pub api_key_service: Arc<ApiKeyService>,
+    /// Config service — used to resolve the internal URL containers push OTLP
+    /// metrics to (and the console port for its default). `None` in contexts
+    /// where it isn't wired (e.g. some tests).
+    pub config_service: Option<Arc<temps_config::ConfigService>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -183,6 +197,10 @@ pub struct ExternalServiceInfo {
     /// Error message from failed initialization.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    /// Whether metric collection is enabled for this service. The UI uses this
+    /// to decide whether to poll the monitoring endpoints.
+    #[serde(default)]
+    pub metrics_enabled: bool,
 }
 
 /// Public info about a cluster member.

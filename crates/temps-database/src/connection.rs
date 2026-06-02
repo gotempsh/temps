@@ -17,8 +17,24 @@ const CONNECTIVITY_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 /// Default timeout for database connection establishment (30 seconds)
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Default timeout for running migrations (120 seconds)
-const MIGRATION_TIMEOUT: Duration = Duration::from_secs(120);
+/// Overall timeout for running blocking migrations.
+///
+/// Raised from the original 120s because schema migrations on large
+/// hypertables (e.g. an `ALTER` or backfill on a 20M+ row `proxy_logs`) can
+/// legitimately take several minutes. This is the ceiling for migrations that
+/// MUST complete before the proxy binds. Heavy, non-correctness-critical work
+/// (large index builds) should NOT live in a blocking migration — see
+/// `run_post_migration_indexes`, which builds them `CONCURRENTLY` after bind.
+const MIGRATION_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Per-statement lock acquisition timeout applied during migrations.
+///
+/// A blocking migration that cannot get its lock within this window fails fast
+/// (and the service restarts to retry) rather than stalling the entire
+/// `MIGRATION_TIMEOUT` budget waiting behind live traffic. This distinguishes
+/// "stuck on a contended lock" (fail fast, retry) from "legitimately slow"
+/// (holds its own lock, runs to completion).
+const MIGRATION_LOCK_TIMEOUT_MS: u64 = 15_000;
 
 /// Parse database URL and extract host and port
 fn parse_database_url(database_url: &str) -> Result<(String, u16), String> {
@@ -155,22 +171,11 @@ pub async fn establish_connection(database_url: &str) -> ServiceResult<Arc<DbCon
         }
     };
 
-    // Run migrations with timeout
-    match timeout(MIGRATION_TIMEOUT, Migrator::up(&db, None)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            return Err(ServiceError::Database(format!(
-                "Failed to run migrations: {}",
-                e
-            )));
-        }
-        Err(_) => {
-            return Err(ServiceError::Database(format!(
-                "Database migrations timed out after {} seconds",
-                MIGRATION_TIMEOUT.as_secs()
-            )));
-        }
-    }
+    // Apply pending migrations. `serve`/`setup` still do this automatically so
+    // simple single-node installs keep their zero-step upgrade. The RECOMMENDED
+    // enterprise flow is to run `temps migrate` explicitly with the new binary
+    // before restarting the server (see docs/upgrade-temps).
+    run_migrations(&db).await?;
 
     // NOTE: continuous-aggregate backfill is intentionally NOT run here. It
     // requires a `CALL refresh_continuous_aggregate()` (a TimescaleDB operation
@@ -180,6 +185,82 @@ pub async fn establish_connection(database_url: &str) -> ServiceResult<Arc<DbCon
     // policy catches up regardless. See `run_post_migration_backfill`.
 
     Ok(Arc::new(db))
+}
+
+/// Connect to the database WITHOUT running migrations.
+///
+/// Used by the standalone `temps migrate` command (which runs migrations
+/// explicitly afterwards) and by any caller that must not trigger schema
+/// changes. Performs the same connectivity check and pool configuration as
+/// [`establish_connection`].
+pub async fn connect_without_migrations(database_url: &str) -> ServiceResult<Arc<DbConnection>> {
+    let (host, port) = parse_database_url(database_url)
+        .map_err(|e| ServiceError::Database(format!("Invalid database URL: {}", e)))?;
+
+    check_database_connectivity(&host, port)
+        .await
+        .map_err(ServiceError::Database)?;
+
+    let opt = ConnectOptions::new(database_url);
+    let db = match timeout(CONNECTION_TIMEOUT, Database::connect(opt)).await {
+        Ok(Ok(db)) => db,
+        Ok(Err(e)) => {
+            return Err(ServiceError::Database(format!(
+                "Failed to connect to database: {}",
+                e
+            )))
+        }
+        Err(_) => {
+            return Err(ServiceError::Database(format!(
+                "Database connection timed out after {} seconds",
+                CONNECTION_TIMEOUT.as_secs()
+            )))
+        }
+    };
+
+    Ok(Arc::new(db))
+}
+
+/// Apply all pending migrations.
+///
+/// Uses Sea-ORM's `Migrator::up`, which applies only migrations present in this
+/// binary that are NOT yet recorded in `seaql_migrations`. Migration rows in the
+/// DB that this binary does not define (e.g. a newer version was run against the
+/// DB earlier, or EE-only migrations) are simply ignored — `up` never validates
+/// the reverse direction, so an "extra" applied migration can never cause a
+/// failure here.
+///
+/// A short session `lock_timeout` is set first so a migration blocked on a
+/// contended lock fails fast (and the operator retries) rather than burning the
+/// entire `MIGRATION_TIMEOUT` budget waiting behind live traffic.
+pub async fn run_migrations(db: &DbConnection) -> ServiceResult<()> {
+    // Fail fast on contended locks rather than hanging the whole budget.
+    // Best-effort — non-fatal on setups that reject it.
+    if let Err(e) = db
+        .execute(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("SET lock_timeout = '{}ms'", MIGRATION_LOCK_TIMEOUT_MS),
+        ))
+        .await
+    {
+        debug!(
+            "Could not set lock_timeout for migrations (non-fatal): {}",
+            e
+        );
+    }
+
+    match timeout(MIGRATION_TIMEOUT, Migrator::up(db, None)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(ServiceError::Database(format!(
+            "Failed to run migrations: {}",
+            e
+        ))),
+        Err(_) => Err(ServiceError::Database(format!(
+            "Database migrations timed out after {} seconds. For large databases, \
+             run `temps migrate` manually with the new binary before restarting the server.",
+            MIGRATION_TIMEOUT.as_secs()
+        ))),
+    }
 }
 
 /// Run post-migration backfill for continuous aggregates.

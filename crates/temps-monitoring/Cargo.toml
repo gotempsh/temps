@@ -13,6 +13,7 @@ temps-config = { path = "../temps-config" }
 temps-database = { path = "../temps-database" }
 temps-deployer = { path = "../temps-deployer" }
 temps-entities = { path = "../temps-entities" }
+temps-metrics = { path = "../temps-metrics" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }

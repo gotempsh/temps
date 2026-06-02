@@ -1247,13 +1247,44 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         if let Some(container_deployer) =
             service_context.get_service::<dyn temps_deployer::ContainerDeployer>()
         {
-            let health_monitor = Arc::new(ContainerHealthMonitor::new(
+            // Build the metrics store if monitoring is enabled, so container
+            // resource metrics are written alongside the alarm logic.
+            let container_metrics_store: Option<Arc<dyn temps_metrics::MetricsStore>> = {
+                use temps_core::MetricsStoreKind;
+                use temps_metrics::{MetricsStore, TimescaleMetricsStore};
+
+                // Always provide a TimescaleDB-backed store for container metrics.
+                // ClickHouse is the only unsupported store and falls back to None.
+                match service_context.get_service::<temps_config::ConfigService>() {
+                    Some(cfg_svc) => match cfg_svc.get_settings().await {
+                        Ok(settings) => match settings.monitoring.store {
+                            MetricsStoreKind::TimescaleDb => {
+                                Some(Arc::new(TimescaleMetricsStore::new(db.clone()))
+                                    as Arc<dyn MetricsStore>)
+                            }
+                            MetricsStoreKind::ClickHouse => {
+                                debug!("ClickHouse metrics store is not yet supported; container metrics disabled");
+                                None
+                            }
+                        },
+                        _ => None,
+                    },
+                    None => None,
+                }
+            };
+
+            let mut health_monitor = ContainerHealthMonitor::new(
                 db.clone(),
                 container_deployer,
-                alarm_service,
+                alarm_service.clone(),
                 ContainerHealthConfig::default(),
-            ));
+            );
 
+            if let Some(ms) = container_metrics_store {
+                health_monitor = health_monitor.with_metrics_store(ms);
+            }
+
+            let health_monitor = Arc::new(health_monitor);
             tokio::spawn(async move {
                 health_monitor.start().await;
             });
@@ -1261,6 +1292,134 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
             debug!("Container health monitor started (poll interval: 30s)");
         } else {
             debug!("ContainerDeployer not available - container health monitoring disabled");
+        }
+
+        // Start MetricsScraper for external service DB-level metrics
+        // (postgres, redis, mongodb) when monitoring is enabled.
+        if let (Some(cfg_svc), Some(enc_svc)) = (
+            service_context.get_service::<temps_config::ConfigService>(),
+            service_context.get_service::<temps_core::EncryptionService>(),
+        ) {
+            use temps_core::MetricsStoreKind;
+            use temps_metrics::{MetricsScraper, MetricsStore, TimescaleMetricsStore};
+
+            // The metrics store and scraper are ALWAYS wired up — the per-service
+            // `metrics_enabled` flag is the single source of truth for what gets
+            // scraped. The scraper idles (near-zero cost) when no service has
+            // monitoring enabled, so a user clicking "Enable Monitoring" on a
+            // service just works without an operator first flipping a global flag.
+            //
+            // ClickHouse is the only unsupported store; we always fall back to
+            // TimescaleDB until it lands.
+            match cfg_svc.get_settings().await {
+                Ok(settings) => {
+                    if matches!(settings.monitoring.store, MetricsStoreKind::ClickHouse) {
+                        debug!("ClickHouse metrics store not yet supported; using TimescaleDB");
+                    }
+                    let metrics_store: Arc<dyn MetricsStore> =
+                        Arc::new(TimescaleMetricsStore::new(db.clone()));
+
+                    // Register the metrics store so plugins (e.g. providers)
+                    // can retrieve it for HTTP query endpoints.
+                    service_context.register_service(metrics_store.clone());
+
+                    let scraper = Arc::new(MetricsScraper::new(
+                        db.clone(),
+                        metrics_store.clone(),
+                        cfg_svc,
+                        enc_svc,
+                    ));
+
+                    tokio::spawn(async move {
+                        scraper.start().await;
+                    });
+
+                    debug!(
+                        "MetricsScraper started (scrapes only services with metrics_enabled=true)"
+                    );
+
+                    // Start AlertEvaluator alongside the scraper.
+                    // It reads monitoring_alert_rules from the DB and evaluates
+                    // each rule against the most-recent value from MetricsStore,
+                    // firing/resolving alarms via the shared AlarmService.
+                    let evaluator = Arc::new(temps_monitoring::AlertEvaluator::new(
+                        db.clone(),
+                        metrics_store,
+                        alarm_service.clone(),
+                    ));
+
+                    tokio::spawn(async move {
+                        evaluator.start().await;
+                    });
+
+                    debug!("AlertEvaluator started (metric threshold alerts, 30s interval)");
+
+                    // Start hourly pruning job for raw service_metrics rows.
+                    // Continuous aggregates (hourly/daily rollups) have their
+                    // own TimescaleDB retention policies; this only handles
+                    // the raw hypertable rows.
+                    {
+                        use chrono::{Duration, Utc};
+                        use temps_core::MetricsStoreKind;
+                        use temps_metrics::{MetricsStore, TimescaleMetricsStore};
+
+                        let prune_db = db.clone();
+                        let prune_cfg =
+                            service_context.get_service::<temps_config::ConfigService>();
+
+                        tokio::spawn(async move {
+                            let mut interval =
+                                tokio::time::interval(std::time::Duration::from_secs(3600));
+                            loop {
+                                interval.tick().await;
+                                let Some(ref cfg_svc) = prune_cfg else {
+                                    break;
+                                };
+                                let settings = match cfg_svc.get_settings().await {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "PruneMetrics: failed to read settings: {e}"
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let store: Arc<dyn MetricsStore> = match settings.monitoring.store {
+                                    MetricsStoreKind::TimescaleDb => {
+                                        Arc::new(TimescaleMetricsStore::new(prune_db.clone()))
+                                    }
+                                    MetricsStoreKind::ClickHouse => {
+                                        debug!(
+                                            "PruneMetrics: ClickHouse not yet supported, skipping"
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let cutoff = Utc::now()
+                                    - Duration::days(settings.monitoring.retention_raw_days as i64);
+                                match store.prune(cutoff).await {
+                                    Ok(n) => {
+                                        debug!(
+                                            "PruneMetrics: pruned {} raw metric rows older than {}",
+                                            n, cutoff
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("PruneMetrics: prune failed: {e}");
+                                    }
+                                }
+                            }
+                        });
+
+                        debug!("Metrics pruning job scheduled (hourly)");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to read monitoring settings: {e} — MetricsScraper and AlertEvaluator not started");
+                }
+            }
+        } else {
+            debug!("ConfigService or EncryptionService not available — MetricsScraper and AlertEvaluator not started");
         }
     } else {
         tracing::warn!(

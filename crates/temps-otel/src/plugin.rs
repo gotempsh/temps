@@ -22,6 +22,7 @@ use crate::services::health_service::HealthComputeService;
 use crate::services::OtelService;
 use crate::storage::timescaledb::TimescaleDbStorage;
 use crate::OtelAppState;
+use temps_metrics::{MetricsStore, TimescaleMetricsStore};
 
 // ── Configuration ───────────────────────────────────────────────────
 
@@ -299,9 +300,26 @@ impl TempsPlugin for OtelPlugin {
             ));
             context.register_service(otel_service.clone());
 
+            // Build a MetricsStore pointing at the same TimescaleDB connection.
+            // This forwards OTLP-pushed metrics into `service_metrics` alongside
+            // scraper-collected DB/container/node metrics, unifying the data model.
+            // We always create a TimescaleDB store here — if monitoring is disabled
+            // the store is still valid but the scraper won't run, so no metrics
+            // will appear in service_metrics from the scraper side.
+            let metrics_store: Arc<dyn MetricsStore> =
+                Arc::new(TimescaleMetricsStore::new(db.clone()));
+
+            // Bounded channel for fire-and-forget MetricsStore writes from OTLP ingest.
+            // The background consumer task (spawned below) drains the channel.
+            // Capacity = 512 batches; try_send drops silently when full.
+            let (metrics_write_tx, mut metrics_write_rx) =
+                tokio::sync::mpsc::channel::<Vec<temps_metrics::MetricPoint>>(512);
+
             // Create app state for handlers
             let app_state = OtelAppState {
                 otel_service: otel_service.clone(),
+                metrics_store: Some(metrics_store.clone()),
+                metrics_write_tx: Some(metrics_write_tx),
             };
             context.register_service(Arc::new(app_state.clone()));
 
@@ -334,6 +352,24 @@ impl TempsPlugin for OtelPlugin {
                     }
                 }
             });
+
+            // 1b. Background consumer for bounded OTLP → MetricsStore writes.
+            // Drains the metrics_write_rx channel and calls write_batch one
+            // batch at a time, consuming at most 1 DB connection continuously.
+            // If the channel is drained and the sender is dropped, this task
+            // exits cleanly.
+            {
+                let write_store = metrics_store.clone();
+                tokio::spawn(async move {
+                    info!("OTLP metrics write consumer started");
+                    while let Some(batch) = metrics_write_rx.recv().await {
+                        if let Err(e) = write_store.write_batch(batch).await {
+                            tracing::warn!("OTLP metrics store write failed (non-fatal): {e}");
+                        }
+                    }
+                    info!("OTLP metrics write consumer stopped (channel closed)");
+                });
+            }
 
             // 2. Health compute service
             if config.enable_health_compute {

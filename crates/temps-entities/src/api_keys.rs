@@ -21,6 +21,7 @@ pub struct Model {
     pub last_used_at: Option<DBDateTime>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
+    pub service_id: Option<i32>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -31,11 +32,23 @@ pub enum Relation {
         to = "crate::users::Column::Id"
     )]
     User,
+    #[sea_orm(
+        belongs_to = "crate::external_services::Entity",
+        from = "Column::ServiceId",
+        to = "crate::external_services::Column::Id"
+    )]
+    ExternalService,
 }
 
 impl Related<crate::users::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::User.def()
+    }
+}
+
+impl Related<crate::external_services::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::ExternalService.def()
     }
 }
 

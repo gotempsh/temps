@@ -678,6 +678,7 @@ pub enum Role {
     Mcp,
     ApiReader,
     Custom, // For API keys with custom permissions
+    MetricsIngest,
 }
 
 impl fmt::Display for Role {
@@ -689,6 +690,7 @@ impl fmt::Display for Role {
             Role::Mcp => "mcp",
             Role::ApiReader => "api_reader",
             Role::Custom => "custom",
+            Role::MetricsIngest => "metrics_ingest",
         };
         write!(f, "{}", name)
     }
@@ -704,6 +706,7 @@ impl Role {
             "mcp" => Some(Role::Mcp),
             "api_reader" => Some(Role::ApiReader),
             "custom" => Some(Role::Custom),
+            "metrics_ingest" => Some(Role::MetricsIngest),
             _ => None,
         }
     }
@@ -716,6 +719,7 @@ impl Role {
             Role::Mcp,
             Role::ApiReader,
             Role::Custom,
+            Role::MetricsIngest,
         ]
     }
 
@@ -1025,7 +1029,8 @@ impl Role {
                 Permission::DeploymentsRead,
                 Permission::AnalyticsRead,
             ],
-            Role::Custom => &[], // Custom role has no default permissions
+            Role::Custom => &[],        // Custom role has no default permissions
+            Role::MetricsIngest => &[], // Auth is checked by role type string, not permission list
         }
     }
 

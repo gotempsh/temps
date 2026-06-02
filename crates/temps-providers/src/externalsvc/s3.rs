@@ -303,6 +303,11 @@ impl S3Service {
         let env_vars = [
             format!("MINIO_ROOT_USER={}", config.access_key),
             format!("MINIO_ROOT_PASSWORD={}", config.secret_key),
+            // Allow unauthenticated Prometheus scraping from the local metrics
+            // collector.  These containers are private (no public exposure), so
+            // removing the JWT requirement is safe and avoids needing to
+            // generate & rotate bearer tokens on every scrape.
+            "MINIO_PROMETHEUS_AUTH_TYPE=public".to_string(),
         ];
         ensure_network_exists(docker)
             .await

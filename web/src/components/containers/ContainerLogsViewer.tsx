@@ -53,37 +53,42 @@ const LEVEL_COLORS: Record<LiveLogLevel, string> = {
   TRACE: 'bg-zinc-400/15 text-zinc-500 dark:text-zinc-500 border-zinc-400/20',
 }
 
-// Subtle row tint so the eye catches ERROR/WARN rows as they fly past during
-// live tail. Kept faint enough not to compete with the level badge.
-const LEVEL_ROW_TINT: Partial<Record<LiveLogLevel, string>> = {
-  ERROR: 'bg-red-500/[0.04] hover:bg-red-500/[0.08]',
-  WARN: 'bg-yellow-500/[0.04] hover:bg-yellow-500/[0.08]',
-}
-
 interface ColumnVisibility {
   timestamp: boolean
   level: boolean
+  service: boolean
 }
 
 const COLUMNS_STORAGE_KEY = 'temps.live-log.columns'
 
+// Defaults match the history viewer's terminal look: timestamp + level +
+// service ALL on, so live and history feel like the same surface. Users who
+// want a denser tail can still hide columns via the Columns dropdown — the
+// choice persists per-browser.
+const DEFAULT_COLUMNS: ColumnVisibility = {
+  timestamp: true,
+  level: true,
+  service: true,
+}
+
 function loadColumns(): ColumnVisibility {
   if (typeof window === 'undefined') {
-    return { timestamp: false, level: true }
+    return DEFAULT_COLUMNS
   }
   try {
     const raw = window.localStorage.getItem(COLUMNS_STORAGE_KEY)
     if (raw) {
       const parsed = JSON.parse(raw) as Partial<ColumnVisibility>
       return {
-        timestamp: parsed.timestamp ?? false,
-        level: parsed.level ?? true,
+        timestamp: parsed.timestamp ?? DEFAULT_COLUMNS.timestamp,
+        level: parsed.level ?? DEFAULT_COLUMNS.level,
+        service: parsed.service ?? DEFAULT_COLUMNS.service,
       }
     }
   } catch {
     // Ignore corrupted storage and fall through to defaults.
   }
-  return { timestamp: false, level: true }
+  return DEFAULT_COLUMNS
 }
 
 function formatTimestamp(iso?: string): string {
@@ -103,12 +108,14 @@ interface LiveLogRowProps {
   line: LiveLogLine
   columns: ColumnVisibility
   searchTerm: string
+  serviceLabel?: string | null
 }
 
 const LiveLogRow = memo(function LiveLogRow({
   line,
   columns,
   searchTerm,
+  serviceLabel,
 }: LiveLogRowProps) {
   // ANSI conversion is unconditional — the server may pass through escape
   // codes from any container stdout. ansi-to-html escapes XML so injection
@@ -126,12 +133,7 @@ const LiveLogRow = memo(function LiveLogRow({
   }, [line.message, searchTerm])
 
   return (
-    <div
-      className={cn(
-        'flex items-start gap-2 py-0.5 px-2 font-mono text-xs select-text hover:bg-muted/50',
-        LEVEL_ROW_TINT[line.level]
-      )}
-    >
+    <div className="flex items-start gap-2 py-0.5 px-2 font-mono text-xs select-text hover:bg-muted/50">
       {columns.timestamp && (
         <span className="text-muted-foreground shrink-0 tabular-nums w-[85px]">
           {formatTimestamp(line.timestamp)}
@@ -148,6 +150,14 @@ const LiveLogRow = memo(function LiveLogRow({
           {line.level}
         </Badge>
       )}
+      {columns.service && serviceLabel && (
+        <span
+          className="text-muted-foreground shrink-0 w-[70px] truncate"
+          title={serviceLabel}
+        >
+          {serviceLabel}
+        </span>
+      )}
       <span
         className="whitespace-pre-wrap break-all min-w-0 flex-1"
         dangerouslySetInnerHTML={{ __html: messageHtml }}
@@ -159,9 +169,17 @@ const LiveLogRow = memo(function LiveLogRow({
 interface ContainerLogsViewerProps {
   fetchUrl: string
   containerId: string
+  // Label shown in the Service column. Usually the container's service name;
+  // falls back to the container name if unavailable. Left as a prop (rather
+  // than derived from the WS payload) because Docker stdout has no service
+  // metadata — the parent already knows what container this is.
+  serviceName?: string | null
 }
 
-export function ContainerLogsViewer({ fetchUrl }: ContainerLogsViewerProps) {
+export function ContainerLogsViewer({
+  fetchUrl,
+  serviceName,
+}: ContainerLogsViewerProps) {
   const wsUrl = (() => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
     const path = fetchUrl.replace(/^https?:\/\/[^/]+/, '')
@@ -383,6 +401,15 @@ export function ContainerLogsViewer({ fetchUrl }: ContainerLogsViewerProps) {
                 >
                   Level
                 </DropdownMenuCheckboxItem>
+                <DropdownMenuCheckboxItem
+                  checked={columns.service}
+                  onCheckedChange={(v) =>
+                    setColumns((c) => ({ ...c, service: v === true }))
+                  }
+                  disabled={!serviceName}
+                >
+                  Service
+                </DropdownMenuCheckboxItem>
               </DropdownMenuContent>
             </DropdownMenu>
 
@@ -516,12 +543,15 @@ export function ContainerLogsViewer({ fetchUrl }: ContainerLogsViewerProps) {
                         top: `${virtualItem.start}px`,
                         left: 0,
                         width: '100%',
+                        // No fixed height — rows size to their (possibly
+                        // wrapped) content; measureElement reports it back.
                       }}
                     >
                       <LiveLogRow
                         line={log}
                         columns={columns}
                         searchTerm={searchTerm}
+                        serviceLabel={serviceName}
                       />
                     </div>
                   )

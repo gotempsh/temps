@@ -9,6 +9,7 @@ homepage.workspace = true
 
 [dependencies]
 temps-auth = { path = "../temps-auth" }
+temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
@@ -20,6 +21,8 @@ temps-query-redis = { path = "../temps-query-redis" }
 temps-query-mongodb = { path = "../temps-query-mongodb" }
 temps-dns = { path = "../temps-dns" }
 temps-network = { path = "../temps-network" }
+temps-metrics = { path = "../temps-metrics" }
+temps-monitoring = { path = "../temps-monitoring" }
 serde = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }

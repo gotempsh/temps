@@ -76,6 +76,7 @@ members = [
     "crates/temps-external-plugins",
     "crates/temps-revenue",
     "crates/temps-observability",
+    "crates/temps-metrics",
     "examples/example-plugin",
     "examples/lighthouse-plugin",
     "examples/indexnow-plugin",

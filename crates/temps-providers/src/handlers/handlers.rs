@@ -324,6 +324,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             patch(update_service_resources),
         )
         .merge(super::query_handlers::configure_query_routes())
+        .merge(super::metrics_handlers::configure_metrics_routes())
 }
 
 /// Get parameter schema for a specific service type
@@ -2273,6 +2274,19 @@ async fn update_service_resources(
         super::query_handlers::get_entity_info,
         super::query_handlers::query_data,
         super::query_handlers::download_object,
+        super::metrics_handlers::get_service_metrics_range,
+        super::metrics_handlers::get_service_metrics_latest,
+        super::metrics_handlers::get_service_metrics_status,
+        super::metrics_handlers::get_service_metrics_by_database,
+        super::metrics_handlers::list_service_alert_rules,
+        super::metrics_handlers::create_service_alert_rule,
+        super::metrics_handlers::update_service_alert_rule,
+        super::metrics_handlers::delete_service_alert_rule,
+        super::metrics_handlers::toggle_service_metrics,
+        super::metrics_handlers::get_deployment_metrics_range,
+        super::metrics_handlers::get_deployment_metrics_latest,
+        super::metrics_handlers::toggle_deployment_metrics,
+        super::metrics_handlers::get_node_metrics_range,
     ),
     components(schemas(
         ServiceTypeInfo,
@@ -2319,6 +2333,16 @@ async fn update_service_resources(
         super::query_handlers::FieldResponse,
         super::query_handlers::QueryDataRequest,
         super::query_handlers::QueryDataResponse,
+        super::metrics_handlers::MetricDataPoint,
+        super::metrics_handlers::MetricsRangeQuery,
+        super::metrics_handlers::MetricsStatusResponse,
+        super::metrics_handlers::DatabaseMetricsRow,
+        super::metrics_handlers::DatabaseMetricsResponse,
+        super::metrics_handlers::AlertRuleResponse,
+        super::metrics_handlers::CreateAlertRuleRequest,
+        super::metrics_handlers::UpdateAlertRuleRequest,
+        super::metrics_handlers::ToggleServiceMetricsRequest,
+        super::metrics_handlers::ToggleDeploymentMetricsRequest,
     )),
     info(
         title = "External Services API",
@@ -2329,7 +2353,8 @@ async fn update_service_resources(
     ),
     tags(
         (name = "External Services", description = "External service integration endpoints"),
-        (name = "External Services - Query", description = "Data querying and exploration endpoints")
+        (name = "External Services - Query", description = "Data querying and exploration endpoints"),
+        (name = "Metrics", description = "Time-series metrics and alert rule endpoints")
     )
 )]
 pub struct ExternalServiceApiDoc;

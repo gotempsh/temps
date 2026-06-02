@@ -117,6 +117,9 @@ pub mod status_incident_updates;
 pub mod status_incidents;
 pub mod status_monitors;
 
+// Metrics alert rules
+pub mod monitoring_alert_rules;
+
 // Webhook entities
 pub mod webhook_deliveries;
 pub mod webhooks;

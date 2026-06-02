@@ -9,6 +9,13 @@ use utoipa::ToSchema;
 pub struct AppSettings {
     // Core settings
     pub external_url: Option<String>,
+    /// URL that service containers use to reach the Temps API from *inside*
+    /// the Docker network (OTLP metrics ingest, agent callbacks, etc.). On
+    /// Docker Desktop this defaults to `http://host.docker.internal:<console_port>`;
+    /// on Linux it requires the `host.docker.internal:host-gateway` host
+    /// mapping (which Temps adds to provisioned containers). Distinct from
+    /// `external_url`, which is the public-facing address.
+    pub internal_url: Option<String>,
     pub preview_domain: String,
 
     // Screenshot settings
@@ -58,6 +65,10 @@ pub struct AppSettings {
     /// intentionally NOT subject to these limits (each worker is dedicated
     /// hardware that already has its own per-host headroom).
     pub build_limits: BuildLimitsSettings,
+
+    /// Metrics observability settings. Controls the MetricsStore backend,
+    /// scrape interval, and tiered retention windows.
+    pub monitoring: MonitoringSettings,
 }
 
 /// Control-plane build resource limits.
@@ -430,11 +441,78 @@ impl Default for PreviewGatewaySettings {
     }
 }
 
+// ============================================================
+// Monitoring / metrics settings
+// ============================================================
+
+/// Which storage backend to use for the MetricsStore.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricsStoreKind {
+    /// Default: TimescaleDB (same PostgreSQL instance used by the control plane).
+    TimescaleDb,
+    /// Optional: ClickHouse cluster — requires `clickhouse_url` to be set.
+    ClickHouse,
+}
+
+/// Global metrics observability configuration.
+///
+/// Controls whether the MetricsScraper and AlertEvaluator background tasks
+/// are active, which storage backend they write to, and how long data is kept
+/// at each retention tier.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct MonitoringSettings {
+    /// Enable or disable all metrics collection (scraping + alerting).
+    /// Defaults to `false` so new installs don't write to TimescaleDB until
+    /// an operator explicitly enables the feature.
+    pub enabled: bool,
+
+    /// Storage backend for metric data.
+    pub store: MetricsStoreKind,
+
+    /// How often the MetricsScraper collects data from all sources, in seconds.
+    /// Minimum effective value is 10 s; values below that are clamped at runtime.
+    #[schema(minimum = 10, example = 30)]
+    pub scrape_interval_secs: u64,
+
+    /// How many days of raw (30 s resolution) metric data to keep.
+    #[schema(minimum = 1, example = 7)]
+    pub retention_raw_days: u32,
+
+    /// How many days of hourly-aggregate data to keep.
+    #[schema(minimum = 1, example = 90)]
+    pub retention_hourly_days: u32,
+
+    /// How many years of daily-aggregate data to keep (converted to days internally).
+    #[schema(minimum = 1, example = 2)]
+    pub retention_daily_years: u32,
+
+    /// ClickHouse DSN, required only when `store = "click_house"`.
+    /// Example: `"http://localhost:8123"`.
+    pub clickhouse_url: Option<String>,
+}
+
+impl Default for MonitoringSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            store: MetricsStoreKind::TimescaleDb,
+            scrape_interval_secs: 30,
+            retention_raw_days: 7,
+            retention_hourly_days: 90,
+            retention_daily_years: 2,
+            clickhouse_url: None,
+        }
+    }
+}
+
 const DEFAULT_LOCAL_DOMAIN: &str = "localho.st";
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
             external_url: None,
+            internal_url: None,
             preview_domain: DEFAULT_LOCAL_DOMAIN.to_string(),
             screenshots: ScreenshotSettings::default(),
             letsencrypt: LetsEncryptSettings::default(),
@@ -450,6 +528,7 @@ impl Default for AppSettings {
             ai_config: AiConfigSettings::default(),
             insecure_tls: false,
             build_limits: BuildLimitsSettings::default(),
+            monitoring: MonitoringSettings::default(),
         }
     }
 }
@@ -607,5 +686,27 @@ impl AppSettings {
     /// Convert settings to JSON value
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}))
+    }
+
+    /// Resolve the URL that service containers use to reach the Temps API from
+    /// inside the Docker network. Resolution order:
+    ///   1. `internal_url` settings field (admin-editable, runtime)
+    ///   2. `TEMPS_INTERNAL_API_URL` env var (operator override at startup)
+    ///   3. `http://host.docker.internal:{console_port}` default
+    ///
+    /// The returned value has no trailing slash. `console_port` is the port the
+    /// API/console listener binds to (callers pass it from `ServerConfig`).
+    pub fn resolve_internal_url(&self, console_port: u16) -> String {
+        let raw = self
+            .internal_url
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                std::env::var("TEMPS_INTERNAL_API_URL")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+            })
+            .unwrap_or_else(|| format!("http://host.docker.internal:{console_port}"));
+        raw.trim_end_matches('/').to_string()
     }
 }

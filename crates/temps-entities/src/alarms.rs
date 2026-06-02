@@ -10,9 +10,13 @@ pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
     pub project_id: i32,
-    pub environment_id: i32,
-    pub deployment_id: i32,
+    pub environment_id: Option<i32>,
+    pub deployment_id: Option<i32>,
     pub container_id: Option<i32>,
+    /// External service that triggered this alarm, if it is service-scoped
+    /// (e.g. a database metric threshold). `None` for container/outage/
+    /// deployment alarms which have no associated service.
+    pub service_id: Option<i32>,
 
     pub alarm_type: String,
     pub severity: String,
@@ -58,6 +62,12 @@ pub enum Relation {
     )]
     Container,
     #[sea_orm(
+        belongs_to = "super::external_services::Entity",
+        from = "Column::ServiceId",
+        to = "super::external_services::Column::Id"
+    )]
+    Service,
+    #[sea_orm(
         belongs_to = "super::users::Entity",
         from = "Column::AcknowledgedBy",
         to = "super::users::Column::Id"
@@ -86,6 +96,12 @@ impl Related<super::deployments::Entity> for Entity {
 impl Related<super::deployment_containers::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Container.def()
+    }
+}
+
+impl Related<super::external_services::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Service.def()
     }
 }
 

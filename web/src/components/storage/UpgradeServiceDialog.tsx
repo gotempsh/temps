@@ -84,6 +84,8 @@ interface UpgradeServiceDialogProps {
   serviceName: string
   currentImage?: string
   serviceType: string
+  /** Called after a successful upgrade so the parent can refetch service data. */
+  onSuccess?: () => void
 }
 
 export function UpgradeServiceDialog({
@@ -93,6 +95,7 @@ export function UpgradeServiceDialog({
   serviceName,
   currentImage,
   serviceType,
+  onSuccess,
 }: UpgradeServiceDialogProps) {
   const queryClient = useQueryClient()
   const supportedImages = getSupportedImages(serviceType)
@@ -120,6 +123,9 @@ export function UpgradeServiceDialog({
       queryClient.invalidateQueries({
         queryKey: ['get', '/external-services/:id'],
       })
+      // Let the parent refetch the service detail (image, status) with its
+      // own query key — the invalidate above doesn't match getServiceOptions.
+      onSuccess?.()
       onOpenChange(false)
       form.reset()
     },
