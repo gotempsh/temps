@@ -15,6 +15,9 @@ pub enum OtelError {
     #[error("Rate limit exceeded for project {project_id}: {limit} requests/min")]
     RateLimitExceeded { project_id: i32, limit: u32 },
 
+    #[error("Rate limit exceeded for service {service_id}: {limit} requests/min")]
+    ServiceRateLimitExceeded { service_id: i32, limit: u32 },
+
     #[error(
         "Storage quota exceeded for project {project_id}: used {used_bytes} of {limit_bytes} bytes"
     )]

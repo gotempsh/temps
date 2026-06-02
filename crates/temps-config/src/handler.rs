@@ -16,7 +16,8 @@ use temps_core::error_builder::ErrorBuilder;
 use temps_core::{
     problemdetails::Problem, AiConfigSettings, AppSettings, AuditContext, AuditLogger,
     AuditOperation, ContainerLogSettings, DiskSpaceAlertSettings, LetsEncryptSettings,
-    RateLimitSettings, RequestMetadata, ScreenshotSettings, SecurityHeadersSettings,
+    MetricsStoreKind, RateLimitSettings, RequestMetadata, ScreenshotSettings,
+    SecurityHeadersSettings,
 };
 use tracing::{error, info};
 use utoipa::{OpenApi, ToSchema};
@@ -77,6 +78,7 @@ pub struct JoinTokenStatusResponse {
 pub struct AppSettingsResponse {
     // Core settings
     pub external_url: Option<String>,
+    pub internal_url: Option<String>,
     pub preview_domain: String,
 
     // Screenshot settings
@@ -184,6 +186,7 @@ impl From<AppSettings> for AppSettingsResponse {
     fn from(settings: AppSettings) -> Self {
         Self {
             external_url: settings.external_url,
+            internal_url: settings.internal_url,
             preview_domain: settings.preview_domain,
             screenshots: settings.screenshots,
             letsencrypt: settings.letsencrypt,
@@ -499,6 +502,41 @@ async fn update_settings(
         }
     }
 
+    // Validate monitoring settings fields.
+    {
+        let m = &settings.monitoring;
+        if m.scrape_interval_secs < 15 {
+            return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .detail("monitoring.scrape_interval_secs must be >= 15")
+                .build());
+        }
+        if m.retention_raw_days < 1 || m.retention_raw_days > 30 {
+            return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .detail("monitoring.retention_raw_days must be between 1 and 30")
+                .build());
+        }
+        if m.retention_hourly_days < 7 || m.retention_hourly_days > 365 {
+            return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .detail("monitoring.retention_hourly_days must be between 7 and 365")
+                .build());
+        }
+        if m.store == MetricsStoreKind::ClickHouse {
+            match &m.clickhouse_url {
+                None => {
+                    return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                        .detail("monitoring.clickhouse_url is required when store is ClickHouse")
+                        .build());
+                }
+                Some(url) if url::Url::parse(url).is_err() => {
+                    return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                        .detail("monitoring.clickhouse_url is not a valid URL")
+                        .build());
+                }
+                _ => {}
+            }
+        }
+    }
+
     // Validate and sanitize external_url
     if let Some(ref mut ext_url) = settings.external_url {
         *ext_url = ext_url.trim().to_string();
@@ -517,6 +555,30 @@ async fn update_settings(
             return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
                 .detail("External URL is not a valid URL")
                 .build());
+        }
+    }
+
+    // Validate and sanitize internal_url (same rules as external_url)
+    if let Some(ref mut int_url) = settings.internal_url {
+        *int_url = int_url.trim().trim_end_matches('/').to_string();
+        if int_url.is_empty() {
+            settings.internal_url = None;
+        } else {
+            if !int_url.starts_with("http://") && !int_url.starts_with("https://") {
+                return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                    .detail("Internal URL must start with http:// or https://")
+                    .build());
+            }
+            if int_url.contains('#') || int_url.contains('?') {
+                return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                    .detail("Internal URL must not contain '#' or '?' characters")
+                    .build());
+            }
+            if url::Url::parse(int_url).is_err() {
+                return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                    .detail("Internal URL is not a valid URL")
+                    .build());
+            }
         }
     }
 

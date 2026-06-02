@@ -14,6 +14,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 const ROUTE_PREFIX_TEMPS: &str = "/api/_temps";
+const ROUTE_PREFIX_OTEL: &str = "/api/otel";
 const VISITOR_ID_COOKIE: &str = "_temps_visitor_id";
 const SESSION_ID_COOKIE: &str = "_temps_sid";
 
@@ -69,8 +70,10 @@ impl UpstreamResolver for UpstreamResolverImpl {
             host, path, sni_hostname
         );
 
-        // Check if it's a temps API route first
-        if path.starts_with(ROUTE_PREFIX_TEMPS) {
+        // Route API and OTLP ingest paths directly to the console (API server),
+        // regardless of the Host header — needed for OTLP push from containers
+        // that use host.docker.internal as the host.
+        if path.starts_with(ROUTE_PREFIX_TEMPS) || path.starts_with(ROUTE_PREFIX_OTEL) {
             debug!(
                 "Routing temps API request to console: {}",
                 self.server_config.console_address

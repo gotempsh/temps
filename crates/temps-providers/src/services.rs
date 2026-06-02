@@ -230,6 +230,9 @@ pub struct ExternalServiceInfo {
     pub members: Vec<ServiceMemberInfo>,
     /// Error message from failed initialization (None if no error).
     pub error_message: Option<String>,
+    /// Whether metric collection is enabled for this service.
+    #[serde(default)]
+    pub metrics_enabled: bool,
 }
 
 /// Format a `tokio_postgres::Error` (or any `std::error::Error`) by
@@ -1325,6 +1328,69 @@ impl ExternalServiceManager {
         Ok(config)
     }
 
+    /// Store a metrics ingest key + internal URL into the service's encrypted
+    /// config blob and restart the container so the OTLP env vars take effect.
+    ///
+    /// Both are persisted in the config (`metrics_ingest_key` and
+    /// `metrics_ingest_url`) so any future container recreate (upgrade,
+    /// restart) automatically picks them up without re-provisioning.
+    pub async fn store_and_apply_ingest_key(
+        &self,
+        service_id: i32,
+        ingest_key: String,
+        ingest_url: String,
+    ) -> Result<(), ExternalServiceError> {
+        // Merge the key + URL into the existing encrypted params.
+        let mut params = self.get_service_parameters(service_id).await?;
+        params.insert(
+            "metrics_ingest_key".to_string(),
+            serde_json::Value::String(ingest_key),
+        );
+        params.insert(
+            "metrics_ingest_url".to_string(),
+            serde_json::Value::String(ingest_url),
+        );
+
+        let config_json =
+            serde_json::to_string(&params).map_err(|e| ExternalServiceError::InternalError {
+                reason: format!("Failed to serialize config: {}", e),
+            })?;
+        let encrypted = self
+            .encryption_service
+            .encrypt_string(&config_json)
+            .map_err(|e| ExternalServiceError::InternalError {
+                reason: format!("Failed to encrypt config: {}", e),
+            })?;
+
+        external_services::Entity::update(external_services::ActiveModel {
+            id: sea_orm::Set(service_id),
+            config: sea_orm::Set(Some(encrypted)),
+            ..Default::default()
+        })
+        .exec(self.db.as_ref())
+        .await
+        .map_err(|e| ExternalServiceError::InternalError {
+            reason: format!("Failed to save ingest key: {}", e),
+        })?;
+
+        // Now recreate the container — it will read metrics_ingest_key from config.
+        let service = self.get_service(service_id).await?;
+        let service_type = ServiceType::from_str(&service.service_type).map_err(|_| {
+            ExternalServiceError::InvalidServiceType {
+                id: service_id,
+                service_type: service.service_type.clone(),
+            }
+        })?;
+        let config = self.get_service_config(service_id).await?;
+        let instance = self.create_service_instance(service.name.clone(), service_type);
+        instance
+            .apply_ingest_key(config)
+            .await
+            .map_err(|e| ExternalServiceError::InternalError {
+                reason: format!("Failed to restart container with ingest key: {}", e),
+            })
+    }
+
     pub async fn list_services(&self) -> Result<Vec<ExternalServiceInfo>, ExternalServiceError> {
         let services = external_services::Entity::find()
             .order_by_desc(external_services::Column::CreatedAt)
@@ -1923,6 +1989,7 @@ impl ExternalServiceManager {
             topology: service.topology,
             members,
             error_message: service.error_message,
+            metrics_enabled: service.metrics_enabled,
         })
     }
 
@@ -8199,6 +8266,7 @@ echo "[restore] Pre-seed complete"
             topology: external_service.topology,
             members: Vec::new(),
             error_message: external_service.error_message,
+            metrics_enabled: external_service.metrics_enabled,
         })
     }
 
@@ -10669,6 +10737,7 @@ mod tests {
             topology: "standalone".to_string(),
             members: Vec::new(),
             error_message: None,
+            metrics_enabled: false,
         };
 
         assert_eq!(service_info.id, 1);

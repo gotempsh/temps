@@ -59,6 +59,9 @@ const ImportService = lazy(() =>
 const ServiceDetail = lazy(() =>
   import('./pages/ServiceDetail').then((m) => ({ default: m.ServiceDetail }))
 )
+const ServiceMonitoring = lazy(() =>
+  import('./pages/ServiceMonitoring').then((m) => ({ default: m.ServiceMonitoring }))
+)
 const ServiceDataBrowser = lazy(() =>
   import('./pages/ServiceDataBrowser').then((m) => ({
     default: m.ServiceDataBrowser,
@@ -224,6 +227,11 @@ const DiskMonitoringPage = lazy(() =>
 const BuildLimitsPage = lazy(() =>
   import('./pages/settings/BuildLimitsPage').then((m) => ({
     default: m.BuildLimitsPage,
+  }))
+)
+const MetricsMonitoringPage = lazy(() =>
+  import('./pages/settings/MonitoringSettingsPage').then((m) => ({
+    default: m.MonitoringSettingsPage,
   }))
 )
 const AuthSettingsPage = lazy(() =>
@@ -434,6 +442,7 @@ const FullAppRoutes = () => {
                   <Route path="rate-limiting" element={<RateLimitingPage />} />
                   <Route path="disk-monitoring" element={<DiskMonitoringPage />} />
                   <Route path="build-limits" element={<BuildLimitsPage />} />
+                  <Route path="metrics-monitoring" element={<MetricsMonitoringPage />} />
                   <Route path="nodes" element={<NodesPage />} />
                   <Route path="nodes/:nodeId" element={<NodeDetailPage />} />
                   <Route path="plugins" element={<PluginsPage />} />
@@ -446,6 +455,7 @@ const FullAppRoutes = () => {
                 <Route path="/storage/create" element={<CreateService />} />
                 <Route path="/storage/import" element={<ImportService />} />
                 <Route path="/storage/:id" element={<ServiceDetail />} />
+                <Route path="/storage/:id/monitoring" element={<ServiceMonitoring />} />
                 <Route path="/storage/:id/browse" element={<ServiceDataBrowser />} />
                 <Route path="/storage/:id/restore" element={<ServiceRestore />} />
                 <Route path="/storage/:id/upgrades/:upgradeId" element={<MajorUpgradeDetail />} />

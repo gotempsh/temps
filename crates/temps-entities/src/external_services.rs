@@ -39,6 +39,12 @@ pub struct Model {
     /// `postgres_wal`). Populated by the background health monitor.
     /// NULL means no probe has populated any signal yet.
     pub health_metadata: Option<Json>,
+    /// Whether the MetricsScraper should collect DB-level metrics for this
+    /// service (pg_stat_*, Redis INFO, etc.).  Defaults to false — operators
+    /// opt in explicitly.  Added by migration
+    /// `m20260601_000002_add_monitoring_settings`.
+    #[sea_orm(default_value = false)]
+    pub metrics_enabled: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

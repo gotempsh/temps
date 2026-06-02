@@ -9178,6 +9178,7 @@ mod tests {
             last_health_error: Set(None),
             consecutive_health_failures: Set(0),
             health_metadata: Set(None),
+            metrics_enabled: Set(false),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
         };
@@ -9352,6 +9353,7 @@ mod tests {
             last_health_error: Set(None),
             consecutive_health_failures: Set(0),
             health_metadata: Set(None),
+            metrics_enabled: Set(false),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
         }
@@ -9581,6 +9583,7 @@ mod tests {
             last_health_error: Set(None),
             consecutive_health_failures: Set(0),
             health_metadata: Set(None),
+            metrics_enabled: Set(false),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
         }

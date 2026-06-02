@@ -11,6 +11,7 @@ import {
 import { cn } from '@/lib/utils'
 import { listExternalServiceBackupsOptions } from '@/lib/external-service-backups'
 import { ClusterHealthPanel } from '@/components/storage/ClusterHealthPanel'
+import { MonitoringCard } from '@/components/storage/MonitoringCard'
 import { EditServiceDialog } from '@/components/storage/EditServiceDialog'
 import { ServiceResourcesPanel } from '@/components/storage/ServiceResourcesPanel'
 import { MajorUpgradeDialog } from '@/components/storage/MajorUpgradeDialog'
@@ -76,6 +77,7 @@ import {
 } from '@/components/ui/dropdown-menu'
 import {
   AlertCircle,
+  Activity,
   ArrowLeft,
   ArrowUpCircle,
   CheckCircle2,
@@ -521,7 +523,7 @@ export function ServiceDetail() {
   if (isLoading) {
     return (
       <div className="flex-1 overflow-auto">
-        <div className="sm:p-4 space-y-6 md:p-6">
+        <div className="p-4 space-y-6 md:p-6">
           <div className="h-8 w-32 bg-muted rounded animate-pulse" />
           <Card>
             <CardHeader>
@@ -545,7 +547,7 @@ export function ServiceDetail() {
   if (queryError || !service) {
     return (
       <div className="flex-1 overflow-auto">
-        <div className="sm:p-4 space-y-6 md:p-6">
+        <div className="p-4 space-y-6 md:p-6">
           <div className="flex flex-col items-center justify-center py-12 text-center">
             <p className="text-sm text-muted-foreground mb-4">
               Failed to load service details
@@ -566,7 +568,7 @@ export function ServiceDetail() {
 
   return (
     <div className="flex-1 overflow-auto">
-      <div className="sm:p-4 space-y-6 md:p-6">
+      <div className="p-4 space-y-6 md:p-6">
         <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex items-center gap-3">
             <Link to="/storage">
@@ -618,7 +620,7 @@ export function ServiceDetail() {
             </div>
           </div>
 
-          <div className="flex items-center gap-2 self-start sm:self-auto">
+          <div className="flex items-center gap-2 self-start sm:self-auto flex-wrap">
             {/*
               Linked projects: collapsed into a header chip so the body of the
               page can stay focused on Health + Configuration. Click to see the
@@ -635,7 +637,8 @@ export function ServiceDetail() {
                     <Loader2 className="h-3 w-3 animate-spin" />
                   ) : (
                     <>
-                      {linkedProjectsResponse?.length || 0} linked
+                      <span className="hidden sm:inline">{linkedProjectsResponse?.length || 0} linked</span>
+                      <span className="sm:hidden">{linkedProjectsResponse?.length || 0}</span>
                     </>
                   )}
                 </Button>
@@ -715,10 +718,18 @@ export function ServiceDetail() {
               </PopoverContent>
             </Popover>
 
+            {service.service.status === 'running' && (
+              <Link to={`/storage/${id}/monitoring`}>
+                <Button variant="outline" size="sm" className="gap-2">
+                  <Activity className="h-4 w-4" />
+                  <span className="hidden sm:inline">Monitoring</span>
+                </Button>
+              </Link>
+            )}
             <Link to={`/storage/${id}/browse`}>
               <Button variant="outline" size="sm" className="gap-2">
                 <Database className="h-4 w-4" />
-                Browse Data
+                <span className="hidden sm:inline">Browse Data</span>
               </Button>
             </Link>
             <DropdownMenu>
@@ -823,6 +834,16 @@ export function ServiceDetail() {
               serviceType={service.service.service_type}
             />
           ) : null}
+
+          {service.service.status === 'running' && (
+            <MonitoringCard
+              serviceId={service.service.id}
+              engine={service.service.service_type}
+              dockerImage={service.current_parameters?.docker_image ?? undefined}
+              metricsEnabled={service.service.metrics_enabled ?? false}
+              onMonitoringChange={() => refetch()}
+            />
+          )}
 
           {/* Cluster Creation Progress */}
           {service.service.topology === 'cluster' &&
@@ -1164,8 +1185,8 @@ export function ServiceDetail() {
           {/* Backups Section */}
           <Card>
             <CardHeader>
-              <div className="flex items-start justify-between gap-3">
-                <div className="space-y-1.5">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                <div className="space-y-1.5 min-w-0">
                   <CardTitle className="flex items-center gap-2">
                     <span>Backups</span>
                     <Badge variant="outline">
@@ -1180,7 +1201,7 @@ export function ServiceDetail() {
                     Backups of this service stored across your S3 sources
                   </CardDescription>
                 </div>
-                <div className="flex items-center gap-2">
+                <div className="flex shrink-0 items-center gap-2">
                   <Button
                     variant="outline"
                     size="icon"
@@ -1204,7 +1225,8 @@ export function ServiceDetail() {
                     onClick={() => setIsBackupDialogOpen(true)}
                   >
                     <HardDrive className="h-4 w-4" />
-                    Trigger backup
+                    <span className="hidden sm:inline">Trigger backup</span>
+                    <span className="sm:hidden">Backup</span>
                   </Button>
                 </div>
               </div>
@@ -1742,6 +1764,7 @@ export function ServiceDetail() {
         serviceName={service.service.name}
         currentImage={service.current_parameters?.docker_image || undefined}
         serviceType={service.service.service_type}
+        onSuccess={() => refetch()}
       />
 
       <MajorUpgradeDialog

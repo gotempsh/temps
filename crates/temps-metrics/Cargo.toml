@@ -1,0 +1,42 @@
+[package]
+name = "temps-metrics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+sea-orm = { workspace = true }
+tokio = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# Scraper: entity access and config
+temps-core = { path = "../temps-core" }
+temps-config = { path = "../temps-config" }
+temps-entities = { path = "../temps-entities" }
+
+# Postgres collector
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
+
+# MongoDB collector
+mongodb = "3.7.0"
+bson = "2.13"
+
+# Redis collector
+redis = { workspace = true }
+
+# S3 collector
+aws-sdk-s3 = { workspace = true }
+aws-config = { workspace = true }
+aws-credential-types = "1.2"
+reqwest = { workspace = true }
+
+# Node collector (Linux /proc + statvfs)
+libc = "0.2"

@@ -700,7 +700,21 @@ export type AppSettings = {
      * internet must keep this `false` — otherwise a MitM steals the join token.
      */
     insecure_tls?: boolean;
+    /**
+     * URL that service containers use to reach the Temps API from *inside*
+     * the Docker network (OTLP metrics ingest, agent callbacks, etc.). On
+     * Docker Desktop this defaults to `http://host.docker.internal:<console_port>`;
+     * on Linux it requires the `host.docker.internal:host-gateway` host
+     * mapping (which Temps adds to provisioned containers). Distinct from
+     * `external_url`, which is the public-facing address.
+     */
+    internal_url?: string | null;
     letsencrypt?: LetsEncryptSettings;
+    /**
+     * Metrics observability settings. Controls the MetricsStore backend,
+     * scrape interval, and tiered retention windows.
+     */
+    monitoring?: MonitoringSettings;
     multi_node?: MultiNodeSettings;
     preview_domain?: string;
     preview_gateway?: PreviewGatewaySettings;
@@ -721,6 +735,7 @@ export type AppSettingsResponse = {
     docker_registry: DockerRegistrySettingsMasked;
     external_url?: string | null;
     insecure_tls: boolean;
+    internal_url?: string | null;
     letsencrypt: LetsEncryptSettings;
     multi_node: MultiNodeSettingsMasked;
     preview_domain: string;
@@ -3045,6 +3060,39 @@ export type DataImplication = {
  * Severity of a data implication
  */
 export type DataImplicationSeverity = 'info' | 'warning' | 'data-not-migrated' | 'potential-data-loss';
+
+/**
+ * Response for the per-database metrics breakdown.
+ */
+export type DatabaseMetricsResponse = {
+    /**
+     * One entry per database, sorted by the first metric descending
+     * (largest first) so the biggest database leads the table.
+     */
+    databases: Array<DatabaseMetricsRow>;
+};
+
+/**
+ * Per-database metric values for a Postgres service.
+ *
+ * A Postgres instance can host many databases (some unrelated to this
+ * service). The collector records per-`datname` series; this groups the
+ * latest value of each requested metric by database so the UI can render a
+ * "Databases" breakdown table instead of one collapsed number.
+ */
+export type DatabaseMetricsRow = {
+    /**
+     * Database name (`datname`).
+     */
+    database: string;
+    /**
+     * Latest value of each requested metric for this database
+     * (e.g. `{"pg.database_size_bytes": 7943871, "pg.cache_hit_ratio": 0.99}`).
+     */
+    metrics: {
+        [key: string]: number;
+    };
+};
 
 /**
  * Request to delete keys
@@ -5422,6 +5470,11 @@ export type ExternalServiceInfo = {
      * Cluster members (empty for standalone services).
      */
     members?: Array<ServiceMemberInfo>;
+    /**
+     * Whether metric collection is enabled for this service. The UI uses this
+     * to decide whether to poll the monitoring endpoints.
+     */
+    metrics_enabled?: boolean;
     name: string;
     /**
      * Node ID where the service runs. Null means control plane (local).
@@ -7540,6 +7593,20 @@ export type MetricBucket = {
     min_value: number;
 };
 
+/**
+ * A single `(timestamp, value)` data point in a metric series.
+ */
+export type MetricDataPoint = {
+    /**
+     * ISO 8601 timestamp with `Z` suffix.
+     */
+    time: string;
+    /**
+     * Metric value at this bucket.
+     */
+    value: number;
+};
+
 export type MetricNamesResponse = {
     names: Array<string>;
 };
@@ -7591,10 +7658,44 @@ export type MetricsQuery = {
     start_date: string;
 };
 
+/**
+ * Query params for range metric queries.
+ */
+export type MetricsRangeQuery = {
+    /**
+     * Metric name, e.g. `"pg.connections_active"`.
+     */
+    metric: string;
+    /**
+     * Optional histogram percentile (0–100).  When provided, the endpoint
+     * fetches histogram buckets and computes the requested quantile.
+     */
+    percentile?: number | null;
+    /**
+     * Time window: `"1h"` | `"6h"` | `"24h"` | `"7d"`.
+     */
+    range?: string;
+};
+
 export type MetricsResponse = {
     count: number;
     data: Array<MetricBucket>;
 };
+
+/**
+ * Freshness status: when metrics were last received for this service.
+ */
+export type MetricsStatusResponse = {
+    /**
+     * ISO 8601 timestamp of the most recent metric row, or null if none yet.
+     */
+    last_received_at?: string | null;
+};
+
+/**
+ * Which storage backend to use for the MetricsStore.
+ */
+export type MetricsStoreKind = 'timescale_db' | 'click_house';
 
 export type MetricsSummaryResponse = {
     active_customers: number;
@@ -7831,6 +7932,48 @@ export type MonitorStatus = {
     current_status: string;
     monitor: MonitorResponse;
     uptime_percentage: number;
+};
+
+/**
+ * Global metrics observability configuration.
+ *
+ * Controls whether the MetricsScraper and AlertEvaluator background tasks
+ * are active, which storage backend they write to, and how long data is kept
+ * at each retention tier.
+ */
+export type MonitoringSettings = {
+    /**
+     * ClickHouse DSN, required only when `store = "click_house"`.
+     * Example: `"http://localhost:8123"`.
+     */
+    clickhouse_url?: string | null;
+    /**
+     * Enable or disable all metrics collection (scraping + alerting).
+     * Defaults to `false` so new installs don't write to TimescaleDB until
+     * an operator explicitly enables the feature.
+     */
+    enabled?: boolean;
+    /**
+     * How many years of daily-aggregate data to keep (converted to days internally).
+     */
+    retention_daily_years?: number;
+    /**
+     * How many days of hourly-aggregate data to keep.
+     */
+    retention_hourly_days?: number;
+    /**
+     * How many days of raw (30 s resolution) metric data to keep.
+     */
+    retention_raw_days?: number;
+    /**
+     * How often the MetricsScraper collects data from all sources, in seconds.
+     * Minimum effective value is 10 s; values below that are clamped at runtime.
+     */
+    scrape_interval_secs?: number;
+    /**
+     * Storage backend for metric data.
+     */
+    store?: MetricsStoreKind;
 };
 
 export type MrrBucketResponse = {
@@ -11497,6 +11640,28 @@ export type ServiceAccessInfo = {
 export type ServiceAction = 'create' | 'link-external' | 'skip';
 
 /**
+ * Wire representation of a monitoring alert rule.
+ *
+ * Registered under a domain-prefixed OpenAPI schema name to avoid colliding
+ * with `temps-error-tracking`'s unrelated `AlertRuleResponse` (utoipa keys
+ * schemas by their bare struct name, so without `as = ...` the last crate to
+ * register would silently shadow this one in the merged spec / generated SDK).
+ */
+export type ServiceAlertRuleResponse = {
+    comparator: string;
+    deployment_id?: number | null;
+    enabled: boolean;
+    for_duration_secs: number;
+    id: number;
+    metric_name: string;
+    name: string;
+    service_id?: number | null;
+    severity: string;
+    silenced_until?: string | null;
+    threshold: number;
+};
+
+/**
  * A single backup entry in the per-service backup list.
  */
 export type ServiceBackupEntryResponse = {
@@ -11580,6 +11745,30 @@ export type ServiceBackupListResponse = {
      * Total number of backups for this service across all pages.
      */
     total: number;
+};
+
+/**
+ * Request body for creating an alert rule on an external service.
+ *
+ * Domain-prefixed schema name — see [`AlertRuleResponse`] for why.
+ */
+export type ServiceCreateAlertRuleRequest = {
+    /**
+     * One of `>`, `<`, `>=`, `<=`.
+     */
+    comparator: string;
+    enabled?: boolean;
+    /**
+     * Seconds the breach must persist before the alarm fires (0 = immediate).
+     */
+    for_duration_secs?: number;
+    metric_name: string;
+    name: string;
+    /**
+     * `"warning"` or `"critical"`.
+     */
+    severity: string;
+    threshold: number;
 };
 
 export type ServiceHealthResponse = {
@@ -11787,6 +11976,21 @@ export type ServiceTypeInfo = {
 };
 
 export type ServiceTypeRoute = 'mongodb' | 'postgres' | 'redis' | 's3' | 'kv' | 'blob' | 'rustfs' | 'minio';
+
+/**
+ * Request body for updating an existing alert rule.
+ *
+ * Domain-prefixed schema name — see [`AlertRuleResponse`] for why.
+ */
+export type ServiceUpdateAlertRuleRequest = {
+    comparator?: string | null;
+    enabled?: boolean | null;
+    for_duration_secs?: number | null;
+    metric_name?: string | null;
+    name?: string | null;
+    severity?: string | null;
+    threshold?: number | null;
+};
 
 export type SesCredentialsRequest = {
     access_key_id: string;
@@ -13089,6 +13293,34 @@ export type TodayStatsResponse = {
      * Total requests today
      */
     total_requests: number;
+};
+
+/**
+ * Request body to toggle OTLP metric ingestion for a deployment.
+ */
+export type ToggleDeploymentMetricsRequest = {
+    /**
+     * Whether to enable (`true`) or disable (`false`) metric ingestion.
+     */
+    enabled: boolean;
+    /**
+     * Prometheus scrape path (optional, defaults to `/metrics`).
+     */
+    path?: string | null;
+    /**
+     * Prometheus scrape port (optional).
+     */
+    port?: number | null;
+};
+
+/**
+ * Request body to toggle metric collection for an external service.
+ */
+export type ToggleServiceMetricsRequest = {
+    /**
+     * Whether to enable (`true`) or disable (`false`) metric collection.
+     */
+    enabled: boolean;
 };
 
 export type TokenRenewalRequest = {
@@ -20030,6 +20262,136 @@ export type GetScanByDeploymentResponses = {
 
 export type GetScanByDeploymentResponse = GetScanByDeploymentResponses[keyof GetScanByDeploymentResponses];
 
+export type DeploymentMetricsGetRangeData = {
+    body?: never;
+    path: {
+        /**
+         * Deployment ID
+         */
+        id: number;
+    };
+    query: {
+        /**
+         * Metric name, e.g. `"pg.connections_active"`.
+         */
+        metric: string;
+        /**
+         * Time window: `"1h"` | `"6h"` | `"24h"` | `"7d"`.
+         */
+        range?: string;
+        /**
+         * Optional histogram percentile (0–100).  When provided, the endpoint
+         * fetches histogram buckets and computes the requested quantile.
+         */
+        percentile?: number | null;
+    };
+    url: '/deployments/{id}/metrics';
+};
+
+export type DeploymentMetricsGetRangeErrors = {
+    /**
+     * Invalid query parameters
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * Metrics store not available
+     */
+    503: unknown;
+};
+
+export type DeploymentMetricsGetRangeResponses = {
+    /**
+     * Metric time series data points
+     */
+    200: Array<MetricDataPoint>;
+};
+
+export type DeploymentMetricsGetRangeResponse = DeploymentMetricsGetRangeResponses[keyof DeploymentMetricsGetRangeResponses];
+
+export type DeploymentMetricsToggleData = {
+    body: ToggleDeploymentMetricsRequest;
+    path: {
+        /**
+         * Deployment ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/deployments/{id}/metrics/enable';
+};
+
+export type DeploymentMetricsToggleErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DeploymentMetricsToggleResponses = {
+    /**
+     * Metrics toggle applied
+     */
+    200: unknown;
+};
+
+export type DeploymentMetricsGetLatestData = {
+    body?: never;
+    path: {
+        /**
+         * Deployment ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/deployments/{id}/metrics/latest';
+};
+
+export type DeploymentMetricsGetLatestErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * Metrics store not available
+     */
+    503: unknown;
+};
+
+export type DeploymentMetricsGetLatestResponses = {
+    /**
+     * Map of metric name to latest value
+     */
+    200: {
+        [key: string]: number;
+    };
+};
+
+export type DeploymentMetricsGetLatestResponse = DeploymentMetricsGetLatestResponses[keyof DeploymentMetricsGetLatestResponses];
+
 export type ListDnsProvidersData = {
     body?: never;
     path?: never;
@@ -22661,6 +23023,368 @@ export type PromoteClusterMemberResponses = {
      */
     202: unknown;
 };
+
+export type ExternalServiceMetricsGetRangeData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query: {
+        /**
+         * Metric name, e.g. `"pg.connections_active"`.
+         */
+        metric: string;
+        /**
+         * Time window: `"1h"` | `"6h"` | `"24h"` | `"7d"`.
+         */
+        range?: string;
+        /**
+         * Optional histogram percentile (0–100).  When provided, the endpoint
+         * fetches histogram buckets and computes the requested quantile.
+         */
+        percentile?: number | null;
+    };
+    url: '/external-services/{id}/metrics';
+};
+
+export type ExternalServiceMetricsGetRangeErrors = {
+    /**
+     * Invalid query parameters
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * Metrics store not available
+     */
+    503: unknown;
+};
+
+export type ExternalServiceMetricsGetRangeResponses = {
+    /**
+     * Metric time series data points
+     */
+    200: Array<MetricDataPoint>;
+};
+
+export type ExternalServiceMetricsGetRangeResponse = ExternalServiceMetricsGetRangeResponses[keyof ExternalServiceMetricsGetRangeResponses];
+
+export type ExternalServiceMetricsGetAlertRulesData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/metrics/alert-rules';
+};
+
+export type ExternalServiceMetricsGetAlertRulesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ExternalServiceMetricsGetAlertRulesResponses = {
+    /**
+     * List of alert rules
+     */
+    200: Array<ServiceAlertRuleResponse>;
+};
+
+export type ExternalServiceMetricsGetAlertRulesResponse = ExternalServiceMetricsGetAlertRulesResponses[keyof ExternalServiceMetricsGetAlertRulesResponses];
+
+export type ExternalServiceMetricsCreateAlertRuleData = {
+    body: ServiceCreateAlertRuleRequest;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/metrics/alert-rules';
+};
+
+export type ExternalServiceMetricsCreateAlertRuleErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ExternalServiceMetricsCreateAlertRuleResponses = {
+    /**
+     * Alert rule created
+     */
+    201: ServiceAlertRuleResponse;
+};
+
+export type ExternalServiceMetricsCreateAlertRuleResponse = ExternalServiceMetricsCreateAlertRuleResponses[keyof ExternalServiceMetricsCreateAlertRuleResponses];
+
+export type ExternalServiceMetricsDeleteAlertRuleData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+        /**
+         * Alert rule ID
+         */
+        rule_id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/metrics/alert-rules/{rule_id}';
+};
+
+export type ExternalServiceMetricsDeleteAlertRuleErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Alert rule not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ExternalServiceMetricsDeleteAlertRuleResponses = {
+    /**
+     * Alert rule deleted
+     */
+    204: void;
+};
+
+export type ExternalServiceMetricsDeleteAlertRuleResponse = ExternalServiceMetricsDeleteAlertRuleResponses[keyof ExternalServiceMetricsDeleteAlertRuleResponses];
+
+export type ExternalServiceMetricsUpdateAlertRuleData = {
+    body: ServiceUpdateAlertRuleRequest;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+        /**
+         * Alert rule ID
+         */
+        rule_id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/metrics/alert-rules/{rule_id}';
+};
+
+export type ExternalServiceMetricsUpdateAlertRuleErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Alert rule not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ExternalServiceMetricsUpdateAlertRuleResponses = {
+    /**
+     * Updated alert rule
+     */
+    200: ServiceAlertRuleResponse;
+};
+
+export type ExternalServiceMetricsUpdateAlertRuleResponse = ExternalServiceMetricsUpdateAlertRuleResponses[keyof ExternalServiceMetricsUpdateAlertRuleResponses];
+
+export type ExternalServiceMetricsByDatabaseData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/metrics/by-database';
+};
+
+export type ExternalServiceMetricsByDatabaseErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * Metrics not available
+     */
+    503: unknown;
+};
+
+export type ExternalServiceMetricsByDatabaseResponses = {
+    /**
+     * Per-database metric breakdown
+     */
+    200: DatabaseMetricsResponse;
+};
+
+export type ExternalServiceMetricsByDatabaseResponse = ExternalServiceMetricsByDatabaseResponses[keyof ExternalServiceMetricsByDatabaseResponses];
+
+export type ExternalServiceMetricsToggleData = {
+    body: ToggleServiceMetricsRequest;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/metrics/enable';
+};
+
+export type ExternalServiceMetricsToggleErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Service not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ExternalServiceMetricsToggleResponses = {
+    /**
+     * Metrics toggle applied
+     */
+    200: unknown;
+};
+
+export type ExternalServiceMetricsGetLatestData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/metrics/latest';
+};
+
+export type ExternalServiceMetricsGetLatestErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * Metrics store not available
+     */
+    503: unknown;
+};
+
+export type ExternalServiceMetricsGetLatestResponses = {
+    /**
+     * Map of metric name to latest value
+     */
+    200: {
+        [key: string]: number;
+    };
+};
+
+export type ExternalServiceMetricsGetLatestResponse = ExternalServiceMetricsGetLatestResponses[keyof ExternalServiceMetricsGetLatestResponses];
+
+export type ExternalServiceMetricsStatusData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/metrics/status';
+};
+
+export type ExternalServiceMetricsStatusErrors = {
+    /**
+     * Metrics not available
+     */
+    503: unknown;
+};
+
+export type ExternalServiceMetricsStatusResponses = {
+    /**
+     * Metrics freshness status
+     */
+    200: MetricsStatusResponse;
+};
+
+export type ExternalServiceMetricsStatusResponse = ExternalServiceMetricsStatusResponses[keyof ExternalServiceMetricsStatusResponses];
 
 export type GetServicePreviewEnvironmentVariablesMaskedData = {
     body?: never;
@@ -26849,6 +27573,60 @@ export type GetUptimeHistoryResponses = {
 };
 
 export type GetUptimeHistoryResponse = GetUptimeHistoryResponses[keyof GetUptimeHistoryResponses];
+
+export type NodeMetricsGetRangeData = {
+    body?: never;
+    path: {
+        /**
+         * Node ID
+         */
+        id: number;
+    };
+    query: {
+        /**
+         * Metric name, e.g. `"pg.connections_active"`.
+         */
+        metric: string;
+        /**
+         * Time window: `"1h"` | `"6h"` | `"24h"` | `"7d"`.
+         */
+        range?: string;
+        /**
+         * Optional histogram percentile (0–100).  When provided, the endpoint
+         * fetches histogram buckets and computes the requested quantile.
+         */
+        percentile?: number | null;
+    };
+    url: '/nodes/{id}/metrics';
+};
+
+export type NodeMetricsGetRangeErrors = {
+    /**
+     * Invalid query parameters
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * Metrics store not available
+     */
+    503: unknown;
+};
+
+export type NodeMetricsGetRangeResponses = {
+    /**
+     * Metric time series data points
+     */
+    200: Array<MetricDataPoint>;
+};
+
+export type NodeMetricsGetRangeResponse = NodeMetricsGetRangeResponses[keyof NodeMetricsGetRangeResponses];
 
 export type DeletePreferencesData = {
     body?: never;

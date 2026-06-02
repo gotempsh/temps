@@ -407,9 +407,10 @@ impl OutageDetectionService {
 
         let request = FireAlarmRequest {
             project_id: event.project_id,
-            environment_id,
-            deployment_id,
+            environment_id: Some(environment_id),
+            deployment_id: Some(deployment_id),
             container_id: None,
+            service_id: None,
             alarm_type: AlarmType::Outage,
             severity,
             title: format!(
@@ -1129,9 +1130,10 @@ mod tests {
         temps_entities::alarms::Model {
             id,
             project_id: 1,
-            environment_id: 1,
-            deployment_id: 10,
+            environment_id: Some(1),
+            deployment_id: Some(10),
             container_id: None,
+            service_id: None,
             alarm_type: alarm_type.to_string(),
             severity: "critical".to_string(),
             status: status.to_string(),

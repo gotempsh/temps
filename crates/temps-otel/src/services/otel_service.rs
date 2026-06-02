@@ -7,10 +7,11 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
+use std::time::Duration;
 use tracing::{error, warn};
 
 use crate::error::OtelError;
-use crate::ingest::auth::{OtelAuthService, ProjectAuth};
+use crate::ingest::auth::{IngestAuth, OtelAuthService, ProjectAuth};
 use crate::ingest::rate_limit::RateLimiter;
 use crate::storage::OtelStorage;
 use crate::types::*;
@@ -20,8 +21,22 @@ pub struct OtelService {
     storage: Arc<dyn OtelStorage>,
     auth_service: Arc<OtelAuthService>,
     rate_limiter: Arc<RateLimiter>,
+    /// Rate limiter for service-scoped (`si_`) OTLP ingest, keyed by
+    /// `service_id`. Kept separate from the project limiter so the two token
+    /// classes don't share counters. Sized generously (see [`SERVICE_INGEST_*`]
+    /// constants): `si_` traffic is machine-to-machine and periodic (a RustFS
+    /// container pushes every ~10–30s), so the ceiling exists only to cap a
+    /// runaway/compromised exporter, not to shape normal traffic.
+    service_rate_limiter: Arc<RateLimiter>,
     stats: PipelineStatsAtomic,
 }
+
+/// Max `si_` ingest requests per service per window. ~10 req/s — far above a
+/// healthy exporter's cadence, low enough to stop a tight-loop flood from
+/// filling TimescaleDB chunks / saturating the write channel.
+const SERVICE_INGEST_MAX_REQUESTS: u32 = 600;
+/// Sliding window for the service ingest limiter.
+const SERVICE_INGEST_WINDOW: Duration = Duration::from_secs(60);
 
 /// Atomic counters for pipeline observability.
 struct PipelineStatsAtomic {
@@ -66,6 +81,10 @@ impl OtelService {
             storage,
             auth_service,
             rate_limiter,
+            service_rate_limiter: Arc::new(RateLimiter::new(
+                SERVICE_INGEST_MAX_REQUESTS,
+                SERVICE_INGEST_WINDOW,
+            )),
             stats: PipelineStatsAtomic::default(),
         }
     }
@@ -81,6 +100,20 @@ impl OtelService {
             .await
     }
 
+    /// Authenticate any ingest token — project (`tk_`/`dt_`) or service (`si_`).
+    ///
+    /// Routes `si_` tokens to the service auth path; all others fall through
+    /// to the existing project auth path.
+    pub async fn authenticate_any(
+        &self,
+        token: &str,
+        header_project_id: Option<i32>,
+    ) -> Result<IngestAuth, OtelError> {
+        self.auth_service
+            .authenticate_any(token, header_project_id)
+            .await
+    }
+
     /// Check rate limit for a project.
     pub fn check_rate_limit(&self, project_id: i32) -> Result<(), OtelError> {
         if !self.rate_limiter.check_and_increment(project_id) {
@@ -89,6 +122,19 @@ impl OtelService {
             return Err(OtelError::RateLimitExceeded {
                 project_id,
                 limit: self.rate_limiter.max_requests(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Check the rate limit for a service-scoped (`si_`) ingest token, keyed by
+    /// `service_id`. Used by the OTLP service-metrics path, which is otherwise
+    /// unthrottled. Generous ceiling — see [`SERVICE_INGEST_MAX_REQUESTS`].
+    pub fn check_service_rate_limit(&self, service_id: i32) -> Result<(), OtelError> {
+        if !self.service_rate_limiter.check_and_increment(service_id) {
+            return Err(OtelError::ServiceRateLimitExceeded {
+                service_id,
+                limit: self.service_rate_limiter.max_requests(),
             });
         }
         Ok(())
@@ -624,6 +670,69 @@ mod tests {
             result,
             Err(OtelError::RateLimitExceeded { limit: 2, .. })
         ));
+    }
+
+    // ── service (`si_`) ingest rate limit (SECURITY metrics-security-2) ────────
+
+    #[test]
+    fn test_check_service_rate_limit_allows_within_limit() {
+        let (svc, _) = make_service(MockOtelStorage::new());
+        // Well within the generous SERVICE_INGEST_MAX_REQUESTS ceiling.
+        for _ in 0..50 {
+            assert!(svc.check_service_rate_limit(7).is_ok());
+        }
+    }
+
+    #[test]
+    fn test_check_service_rate_limit_rejects_over_limit() {
+        let (svc, _) = make_service(MockOtelStorage::new());
+        // Exhaust the per-service window, then expect a service-scoped 429.
+        for _ in 0..SERVICE_INGEST_MAX_REQUESTS {
+            assert!(svc.check_service_rate_limit(7).is_ok());
+        }
+        let result = svc.check_service_rate_limit(7);
+        assert!(
+            matches!(
+                result,
+                Err(OtelError::ServiceRateLimitExceeded {
+                    service_id: 7,
+                    limit
+                }) if limit == SERVICE_INGEST_MAX_REQUESTS
+            ),
+            "expected ServiceRateLimitExceeded for service 7, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_service_rate_limit_is_isolated_per_service() {
+        let (svc, _) = make_service(MockOtelStorage::new());
+        // Exhaust service 7's window.
+        for _ in 0..SERVICE_INGEST_MAX_REQUESTS {
+            assert!(svc.check_service_rate_limit(7).is_ok());
+        }
+        assert!(svc.check_service_rate_limit(7).is_err());
+        // A different service must be unaffected.
+        assert!(svc.check_service_rate_limit(8).is_ok());
+    }
+
+    #[test]
+    fn test_service_rate_limit_does_not_consume_project_limit() {
+        // The service limiter and the project limiter are separate instances:
+        // hammering one must not reject the other.
+        let db = Arc::new(sea_orm::DatabaseConnection::Disconnected);
+        let auth = Arc::new(crate::ingest::auth::OtelAuthService::new(db));
+        let project_limiter = Arc::new(RateLimiter::new(2, Duration::from_secs(60)));
+        let storage = Arc::new(MockOtelStorage::new()) as Arc<dyn OtelStorage>;
+        let svc = OtelService::new(storage, auth, project_limiter);
+
+        // Spend many service-ingest tokens for service 1...
+        for _ in 0..10 {
+            assert!(svc.check_service_rate_limit(1).is_ok());
+        }
+        // ...the project limiter (limit 2) for project 1 is untouched.
+        assert!(svc.check_rate_limit(1).is_ok());
+        assert!(svc.check_rate_limit(1).is_ok());
+        assert!(svc.check_rate_limit(1).is_err());
     }
 
     #[tokio::test]

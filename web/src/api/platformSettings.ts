@@ -98,10 +98,28 @@ export interface AiConfigSettings {
   config_repo_branch: string
 }
 
+export type MetricsStoreKind = 'timescale_db' | 'click_house'
+
+export interface MonitoringSettings {
+  enabled: boolean
+  store: MetricsStoreKind
+  /** How often the MetricsScraper collects data, in seconds. Min 15. */
+  scrape_interval_secs: number
+  /** Days of raw (30s resolution) data to keep. Min 1, max 30. */
+  retention_raw_days: number
+  /** Days of hourly-aggregate data to keep. Min 7, max 365. */
+  retention_hourly_days: number
+  /** Years of daily-aggregate data to keep. */
+  retention_daily_years: number
+  /** ClickHouse DSN — only required when store is 'click_house'. */
+  clickhouse_url: string | null
+}
+
 // Re-export the types from the API for consistency
 export interface PlatformSettings extends AppSettings {
   dns_provider: DnsProviderSettings
   external_url: string | null
+  internal_url: string | null
   letsencrypt: LetsEncryptSettings
   preview_domain: string
   screenshots: ScreenshotSettings
@@ -115,6 +133,7 @@ export interface PlatformSettings extends AppSettings {
   insecure_tls: boolean
   attack_mode?: boolean
   build_limits: BuildLimitsSettings
+  monitoring: MonitoringSettings
 }
 
 /**
@@ -159,6 +178,7 @@ export async function updatePlatformSettings(
   const body: any = {
     dns_provider: updated.dns_provider,
     external_url: updated.external_url,
+    internal_url: updated.internal_url,
     letsencrypt: updated.letsencrypt,
     preview_domain: updated.preview_domain,
     screenshots: updated.screenshots,
@@ -168,6 +188,8 @@ export async function updatePlatformSettings(
     agent_sandbox: updated.agent_sandbox,
     ai_config: updated.ai_config,
     attack_mode: updated.attack_mode,
+    build_limits: updated.build_limits,
+    monitoring: updated.monitoring,
   }
   await updateSettings({ body })
 

@@ -10968,6 +10968,7 @@ dependencies = [
  "temps-kv",
  "temps-log-aggregator",
  "temps-logs",
+ "temps-metrics",
  "temps-migrations",
  "temps-monitoring",
  "temps-network",
@@ -11906,6 +11907,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "temps-metrics"
+version = "0.1.0-beta.25"
+dependencies = [
+ "async-trait",
+ "aws-config",
+ "aws-credential-types",
+ "aws-sdk-s3",
+ "bson",
+ "chrono",
+ "libc",
+ "mongodb",
+ "redis 0.28.2",
+ "reqwest",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "temps-config",
+ "temps-core",
+ "temps-entities",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-postgres",
+ "tracing",
+]
+
+[[package]]
 name = "temps-migrations"
 version = "0.1.0-beta.25"
 dependencies = [
@@ -11935,6 +11962,7 @@ dependencies = [
  "temps-database",
  "temps-deployer",
  "temps-entities",
+ "temps-metrics",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -12055,6 +12083,7 @@ dependencies = [
  "temps-database",
  "temps-deployer",
  "temps-entities",
+ "temps-metrics",
  "temps-migrations",
  "thiserror 2.0.18",
  "tokio",
@@ -12190,12 +12219,15 @@ dependencies = [
  "tar",
  "tempfile",
  "temps-auth",
+ "temps-config",
  "temps-core",
  "temps-database",
  "temps-dns",
  "temps-entities",
  "temps-logs",
+ "temps-metrics",
  "temps-migrations",
+ "temps-monitoring",
  "temps-network",
  "temps-query",
  "temps-query-mongodb",

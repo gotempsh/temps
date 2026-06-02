@@ -345,12 +345,6 @@ const S3_OPTIONS: PresetOption[] = [
     hint: 'Default',
   },
   {
-    id: 'minio',
-    title: 'MinIO',
-    subtitle: 'S3-compatible (legacy)',
-    value: 'minio/minio:RELEASE.2025-09-07T16-13-09Z',
-  },
-  {
     id: 'custom',
     title: 'Custom image',
     subtitle: 'Bring your own',
@@ -373,7 +367,7 @@ function useS3Preset(): PresetState {
     ui: (
       <PresetGroup
         label="Storage engine"
-        description="RustFS is the default Rust-native engine. MinIO is kept for legacy services."
+        description="RustFS is the default high-performance Rust-native S3-compatible storage engine."
         options={S3_OPTIONS}
         selected={selected}
         customValue={custom}

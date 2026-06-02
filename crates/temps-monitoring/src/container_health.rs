@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use temps_deployer::ContainerDeployer;
 use temps_entities::{deployment_containers, deployments};
+use temps_metrics::store::{MetricKind, MetricPoint, MetricsStore, SourceKind};
 use tracing::{debug, error, info, warn};
 
 /// Cached state for a container between health checks
@@ -19,6 +20,10 @@ use tracing::{debug, error, info, warn};
 struct ContainerState {
     /// Last known restart count from Docker
     restart_count: i64,
+    /// Last observed network bytes received (for rate computation)
+    last_net_rx_bytes: u64,
+    /// Last observed network bytes transmitted (for rate computation)
+    last_net_tx_bytes: u64,
 }
 
 /// Configuration for resource usage thresholds
@@ -52,7 +57,10 @@ pub struct ContainerHealthMonitor {
     deployer: Arc<dyn ContainerDeployer>,
     alarm_service: Arc<AlarmService>,
     config: ContainerHealthConfig,
-    /// Cached restart counts keyed by deployment_container.id
+    /// Optional metrics store. When set, container resource metrics are written
+    /// after each poll cycle in addition to the alarm-firing logic.
+    metrics_store: Option<Arc<dyn MetricsStore>>,
+    /// Cached restart counts and network stats keyed by deployment_container.id
     container_states: tokio::sync::RwLock<HashMap<i32, ContainerState>>,
     /// Consecutive high-resource checks keyed by (container_db_id, alarm_type_str)
     resource_counters: tokio::sync::RwLock<HashMap<(i32, &'static str), u32>>,
@@ -70,9 +78,20 @@ impl ContainerHealthMonitor {
             deployer,
             alarm_service,
             config,
+            metrics_store: None,
             container_states: tokio::sync::RwLock::new(HashMap::new()),
             resource_counters: tokio::sync::RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Attach a metrics store. When set, container resource metrics
+    /// (CPU, memory, network I/O) are written after each poll cycle.
+    /// Monitoring works correctly without a metrics store — this field
+    /// is intentionally `Option` so the monitor starts even when metrics
+    /// collection is disabled.
+    pub fn with_metrics_store(mut self, store: Arc<dyn MetricsStore>) -> Self {
+        self.metrics_store = Some(store);
+        self
     }
 
     /// Start the health monitoring loop. Runs forever.
@@ -123,12 +142,40 @@ impl ContainerHealthMonitor {
 
         debug!("Checking {} active containers", containers.len());
 
+        // Batch-load all deployments referenced by the active container set in a
+        // single query to avoid N+1 per-container SELECT.
+        let deployment_ids: Vec<i32> = containers
+            .iter()
+            .map(|c| c.deployment_id)
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        let deployments_map: HashMap<i32, deployments::Model> = deployments::Entity::find()
+            .filter(deployments::Column::Id.is_in(deployment_ids))
+            .all(self.db.as_ref())
+            .await
+            .map_err(|e| format!("Failed to batch-query deployments: {e}"))?
+            .into_iter()
+            .map(|d| (d.id, d))
+            .collect();
+
         for container in &containers {
-            if let Err(e) = self.check_container(container).await {
-                debug!(
-                    "Failed to check container {} ({}): {}",
-                    container.id, container.container_name, e
-                );
+            match deployments_map.get(&container.deployment_id) {
+                None => {
+                    debug!(
+                        "Deployment {} not found for container {} ({}), skipping",
+                        container.deployment_id, container.id, container.container_name
+                    );
+                }
+                Some(deployment) => {
+                    if let Err(e) = self.check_container(container, deployment).await {
+                        debug!(
+                            "Failed to check container {} ({}): {}",
+                            container.id, container.container_name, e
+                        );
+                    }
+                }
             }
         }
 
@@ -139,24 +186,8 @@ impl ContainerHealthMonitor {
     async fn check_container(
         &self,
         container: &deployment_containers::Model,
+        deployment: &deployments::Model,
     ) -> Result<(), String> {
-        // Get the deployment to find project_id and environment_id
-        let deployment = deployments::Entity::find_by_id(container.deployment_id)
-            .one(self.db.as_ref())
-            .await
-            .map_err(|e| {
-                format!(
-                    "Failed to query deployment {}: {}",
-                    container.deployment_id, e
-                )
-            })?
-            .ok_or_else(|| {
-                format!(
-                    "Deployment {} not found for container {}",
-                    container.deployment_id, container.id
-                )
-            })?;
-
         // Get container info from Docker
         let info = self
             .deployer
@@ -170,8 +201,7 @@ impl ContainerHealthMonitor {
             })?;
 
         // Check restart count
-        self.check_restart_count(container, &deployment, &info)
-            .await;
+        self.check_restart_count(container, deployment, &info).await;
 
         // Persist runtime metadata (started_at, cpu_limit_cores) once they're
         // observed. These don't change while a container is running, so the
@@ -179,11 +209,11 @@ impl ContainerHealthMonitor {
         self.persist_runtime_info(container, &info).await;
 
         // Check container status (exited, dead, OOM)
-        self.check_container_status(container, &deployment, &info)
+        self.check_container_status(container, deployment, &info)
             .await;
 
         // Check resource usage (CPU, memory)
-        self.check_resource_usage(container, &deployment).await;
+        self.check_resource_usage(container, deployment).await;
 
         Ok(())
     }
@@ -230,11 +260,17 @@ impl ContainerHealthMonitor {
         let mut states = self.container_states.write().await;
         let previous = states.get(&container.id).cloned();
 
-        // Update cached state
+        // Update cached state (preserve network counters if already present)
+        let prev_net = previous
+            .as_ref()
+            .map(|p| (p.last_net_rx_bytes, p.last_net_tx_bytes))
+            .unwrap_or((0, 0));
         states.insert(
             container.id,
             ContainerState {
                 restart_count: current_restart_count,
+                last_net_rx_bytes: prev_net.0,
+                last_net_tx_bytes: prev_net.1,
             },
         );
 
@@ -269,9 +305,10 @@ impl ContainerHealthMonitor {
 
         let request = FireAlarmRequest {
             project_id: deployment.project_id,
-            environment_id: deployment.environment_id,
-            deployment_id: deployment.id,
+            environment_id: Some(deployment.environment_id),
+            deployment_id: Some(deployment.id),
             container_id: Some(container.id),
+            service_id: None,
             alarm_type: AlarmType::ContainerRestart,
             severity,
             title: format!(
@@ -351,9 +388,10 @@ impl ContainerHealthMonitor {
 
                 let request = FireAlarmRequest {
                     project_id: deployment.project_id,
-                    environment_id: deployment.environment_id,
-                    deployment_id: deployment.id,
+                    environment_id: Some(deployment.environment_id),
+                    deployment_id: Some(deployment.id),
                     container_id: Some(container.id),
+                    service_id: None,
                     alarm_type,
                     severity,
                     title: format!(
@@ -525,6 +563,128 @@ impl ContainerHealthMonitor {
                     .await;
             }
         }
+
+        // Write container resource metrics to the metrics store (if configured).
+        // This is non-fatal — metric write failures are logged as warnings only.
+        if let Some(store) = &self.metrics_store {
+            self.write_container_metrics(store, container, deployment, &stats)
+                .await;
+        }
+    }
+
+    /// Emit container resource metric points to the metrics store.
+    ///
+    /// Writes:
+    /// - `container.cpu_percent` (Gauge)
+    /// - `container.memory_used_bytes` (Gauge)
+    /// - `container.memory_percent` (Gauge, when limit is known)
+    /// - `container.network_rx_bytes_delta` (Gauge — bytes received since last poll)
+    /// - `container.network_tx_bytes_delta` (Gauge — bytes transmitted since last poll)
+    ///
+    /// Network metrics are emitted as **deltas** (bytes since the previous poll)
+    /// rather than raw cumulative counters.  This keeps TimescaleDB rollups
+    /// meaningful — `SUM(value)` over a time window gives total bytes, not a
+    /// meaningless sum of ever-growing counters.  On the first poll for a
+    /// container the previous baseline is 0, so the delta equals the raw value;
+    /// this is a known acceptable overcount for the very first data point.
+    async fn write_container_metrics(
+        &self,
+        store: &Arc<dyn MetricsStore>,
+        container: &deployment_containers::Model,
+        deployment: &deployments::Model,
+        stats: &temps_deployer::ContainerStats,
+    ) {
+        let now = chrono::Utc::now();
+        let container_id = container.id;
+        let node_id = container.node_id;
+
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("project_id".into(), deployment.project_id.to_string());
+        labels.insert(
+            "environment_id".into(),
+            deployment.environment_id.to_string(),
+        );
+        labels.insert("deployment_id".into(), deployment.id.to_string());
+        labels.insert("container_name".into(), container.container_name.clone());
+        if let Some(svc) = &container.service_name {
+            labels.insert("service_name".into(), svc.clone());
+        }
+
+        let make_point = |name: &str, value: f64, kind: MetricKind| MetricPoint {
+            time: now,
+            source_kind: SourceKind::Container,
+            source_id: container_id,
+            name: name.to_string(),
+            value,
+            kind,
+            engine: None,
+            environment: None,
+            node_id,
+            labels: labels.clone(),
+        };
+
+        let mut points = vec![
+            make_point(
+                "container.cpu_percent",
+                stats.cpu_percent,
+                MetricKind::Gauge,
+            ),
+            make_point(
+                "container.memory_used_bytes",
+                stats.memory_bytes as f64,
+                MetricKind::Gauge,
+            ),
+        ];
+
+        if let Some(mem_pct) = stats.memory_percent {
+            points.push(make_point(
+                "container.memory_percent",
+                mem_pct,
+                MetricKind::Gauge,
+            ));
+        }
+
+        // Compute network byte deltas from the cached previous values and update
+        // the cache.  Writing raw cumulative counters into TimescaleDB produces
+        // meaningless rollup aggregates — delta gauges are what dashboards need.
+        let (net_rx_delta, net_tx_delta) = {
+            let mut states = self.container_states.write().await;
+            if let Some(state) = states.get_mut(&container_id) {
+                let rx_delta = if stats.network_rx_bytes >= state.last_net_rx_bytes {
+                    stats.network_rx_bytes - state.last_net_rx_bytes
+                } else {
+                    // Counter reset (container restarted) — use raw value as delta.
+                    stats.network_rx_bytes
+                };
+                let tx_delta = if stats.network_tx_bytes >= state.last_net_tx_bytes {
+                    stats.network_tx_bytes - state.last_net_tx_bytes
+                } else {
+                    stats.network_tx_bytes
+                };
+                state.last_net_rx_bytes = stats.network_rx_bytes;
+                state.last_net_tx_bytes = stats.network_tx_bytes;
+                (rx_delta as f64, tx_delta as f64)
+            } else {
+                // No prior state — baseline is 0, delta = raw value.
+                (stats.network_rx_bytes as f64, stats.network_tx_bytes as f64)
+            }
+        };
+
+        points.push(make_point(
+            "container.network_rx_bytes_delta",
+            net_rx_delta,
+            MetricKind::Gauge,
+        ));
+        points.push(make_point(
+            "container.network_tx_bytes_delta",
+            net_tx_delta,
+            MetricKind::Gauge,
+        ));
+
+        store
+            .write_batch(points)
+            .await
+            .unwrap_or_else(|e| warn!("container metrics write for container {container_id}: {e}"));
     }
 
     /// Handle a resource threshold breach. Only fires alarm after N consecutive breaches.
@@ -561,9 +721,10 @@ impl ContainerHealthMonitor {
 
         let request = FireAlarmRequest {
             project_id: deployment.project_id,
-            environment_id: deployment.environment_id,
-            deployment_id: deployment.id,
+            environment_id: Some(deployment.environment_id),
+            deployment_id: Some(deployment.id),
             container_id: Some(container.id),
+            service_id: None,
             alarm_type,
             severity,
             title,
@@ -810,9 +971,15 @@ mod tests {
 
     #[test]
     fn test_container_state_clone() {
-        let state = ContainerState { restart_count: 5 };
+        let state = ContainerState {
+            restart_count: 5,
+            last_net_rx_bytes: 100,
+            last_net_tx_bytes: 200,
+        };
         let cloned = state.clone();
         assert_eq!(cloned.restart_count, 5);
+        assert_eq!(cloned.last_net_rx_bytes, 100);
+        assert_eq!(cloned.last_net_tx_bytes, 200);
     }
 
     // ── Restart detection tests ───────────────────────────────────────
@@ -855,9 +1022,10 @@ mod tests {
         let alarm_model = temps_entities::alarms::Model {
             id: 1,
             project_id: 1,
-            environment_id: 1,
-            deployment_id: 10,
+            environment_id: Some(1),
+            deployment_id: Some(10),
             container_id: Some(1),
+            service_id: None,
             alarm_type: "container_restart".to_string(),
             severity: "info".to_string(),
             status: "firing".to_string(),
@@ -951,9 +1119,10 @@ mod tests {
         let alarm_model = temps_entities::alarms::Model {
             id: 1,
             project_id: 1,
-            environment_id: 1,
-            deployment_id: 10,
+            environment_id: Some(1),
+            deployment_id: Some(10),
             container_id: Some(1),
+            service_id: None,
             alarm_type: "container_oom_killed".to_string(),
             severity: "critical".to_string(),
             status: "firing".to_string(),
@@ -1124,8 +1293,22 @@ mod tests {
         // Pre-populate state for containers 1 and 2
         {
             let mut states = monitor.container_states.write().await;
-            states.insert(1, ContainerState { restart_count: 0 });
-            states.insert(2, ContainerState { restart_count: 5 });
+            states.insert(
+                1,
+                ContainerState {
+                    restart_count: 0,
+                    last_net_rx_bytes: 0,
+                    last_net_tx_bytes: 0,
+                },
+            );
+            states.insert(
+                2,
+                ContainerState {
+                    restart_count: 5,
+                    last_net_rx_bytes: 0,
+                    last_net_tx_bytes: 0,
+                },
+            );
         }
         {
             let mut counters = monitor.resource_counters.write().await;

@@ -179,6 +179,7 @@ const settingsGroups: SettingsGroupDef[] = [
       { title: 'Security Headers', url: '/settings/security', icon: Shield },
       { title: 'Rate Limiting', url: '/settings/rate-limiting', icon: Monitor },
       { title: 'Disk Monitoring', url: '/settings/disk-monitoring', icon: HardDrive },
+      { title: 'Metrics Monitoring', url: '/settings/metrics-monitoring', icon: BarChart3 },
     ],
   },
 ]
