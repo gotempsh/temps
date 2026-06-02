@@ -20,12 +20,25 @@ use crate::traits::AnalyticsBackend;
 /// Connection configuration for the ClickHouse backend.
 ///
 /// Built from `temps-config` keys `analytics.clickhouse.{url,database,user,password}`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ClickHouseConfig {
     pub url: String,
     pub database: String,
     pub user: String,
     pub password: String,
+}
+
+// Manual Debug that masks the password so it can never leak into logs, panic
+// messages, or tracing spans that capture the config with `{:?}`.
+impl std::fmt::Debug for ClickHouseConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClickHouseConfig")
+            .field("url", &self.url)
+            .field("database", &self.database)
+            .field("user", &self.user)
+            .field("password", &"***")
+            .finish()
+    }
 }
 
 impl ClickHouseConfig {

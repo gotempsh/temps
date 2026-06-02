@@ -640,7 +640,7 @@ impl OtelStorage for TimescaleDbStorage {
         }
         if let Some(ref pattern) = query.name_pattern {
             where_clauses.push(format!("name ILIKE ${}", param_idx));
-            values.push(format!("%{}%", pattern).into());
+            values.push(format!("%{}%", escape_like_pattern(pattern)).into());
             param_idx += 1;
         }
 
@@ -736,7 +736,7 @@ impl OtelStorage for TimescaleDbStorage {
         }
         if let Some(ref pattern) = query.name_pattern {
             where_clauses.push(format!("s.name ILIKE ${}", param_idx));
-            values.push(format!("%{}%", pattern).into());
+            values.push(format!("%{}%", escape_like_pattern(pattern)).into());
             param_idx += 1;
         }
 
@@ -872,38 +872,46 @@ impl OtelStorage for TimescaleDbStorage {
     }
 
     async fn count_traces(&self, query: TraceQuery) -> StorageResult<u64> {
-        let mut where_clauses = vec!["project_id = $1".to_string()];
+        // Mirrors query_trace_summaries filters exactly — including `status`
+        // (via HAVING) and `min_duration_ms` — so the pagination count matches
+        // the actual result set returned by that method.
+        let mut where_clauses = vec!["s.project_id = $1".to_string()];
         let mut values: Vec<sea_orm::Value> = vec![query.project_id.into()];
         let mut param_idx = 2u32;
 
         if let Some(ref tid) = query.trace_id {
-            where_clauses.push(format!("trace_id = ${}", param_idx));
+            where_clauses.push(format!("s.trace_id = ${}", param_idx));
             values.push(tid.clone().into());
             param_idx += 1;
         }
         if let Some(ref svc) = query.service_name {
-            where_clauses.push(format!("service_name = ${}", param_idx));
+            where_clauses.push(format!("s.service_name = ${}", param_idx));
             values.push(svc.clone().into());
             param_idx += 1;
         }
+        if let Some(min_dur) = query.min_duration_ms {
+            where_clauses.push(format!("s.duration_ms >= ${}", param_idx));
+            values.push(min_dur.into());
+            param_idx += 1;
+        }
         if let Some(start) = query.start_time {
-            where_clauses.push(format!("start_time >= ${}", param_idx));
+            where_clauses.push(format!("s.start_time >= ${}", param_idx));
             values.push(start.into());
             param_idx += 1;
         }
         if let Some(end) = query.end_time {
-            where_clauses.push(format!("start_time <= ${}", param_idx));
+            where_clauses.push(format!("s.start_time <= ${}", param_idx));
             values.push(end.into());
             param_idx += 1;
         }
         if let Some(deployment_id) = query.deployment_id {
-            where_clauses.push(format!("deployment_id = ${}", param_idx));
+            where_clauses.push(format!("s.deployment_id = ${}", param_idx));
             values.push(deployment_id.into());
             param_idx += 1;
         }
         if let Some(environment_id) = query.environment_id {
             where_clauses.push(format!(
-                "deployment_id IN (SELECT id FROM deployments WHERE environment_id = ${})",
+                "s.deployment_id IN (SELECT id FROM deployments WHERE environment_id = ${})",
                 param_idx
             ));
             values.push(environment_id.into());
@@ -912,7 +920,7 @@ impl OtelStorage for TimescaleDbStorage {
         if let Some(ref attrs) = query.attributes {
             for (key, value) in attrs {
                 where_clauses.push(format!(
-                    "attributes->>${}::text = ${}",
+                    "s.attributes->>${}::text = ${}",
                     param_idx,
                     param_idx + 1
                 ));
@@ -922,16 +930,36 @@ impl OtelStorage for TimescaleDbStorage {
             }
         }
         if let Some(ref pattern) = query.name_pattern {
-            where_clauses.push(format!("name ILIKE ${}", param_idx));
-            values.push(format!("%{}%", pattern).into());
-            let _ = param_idx;
+            where_clauses.push(format!("s.name ILIKE ${}", param_idx));
+            values.push(format!("%{}%", escape_like_pattern(pattern)).into());
+            param_idx += 1;
         }
+
+        // status filter: mirrors query_trace_summaries HAVING clause.
+        // ERROR = traces with at least one ERROR span; OK = traces with none.
+        let status_having = match query.status {
+            Some(crate::types::SpanStatusCode::Error) => {
+                "HAVING COUNT(*) FILTER (WHERE s.status_code = 'ERROR') > 0"
+            }
+            Some(crate::types::SpanStatusCode::Ok) => {
+                "HAVING COUNT(*) FILTER (WHERE s.status_code = 'ERROR') = 0"
+            }
+            _ => "",
+        };
 
         let where_sql = where_clauses.join(" AND ");
 
+        // Wrap in a subquery so we can count the traces that survive the HAVING.
         let sql = format!(
-            "SELECT COUNT(DISTINCT trace_id)::bigint AS cnt FROM otel_spans WHERE {where_sql}"
+            "SELECT COUNT(*) AS cnt FROM (\
+                SELECT s.trace_id \
+                FROM otel_spans s \
+                WHERE {where_sql} \
+                GROUP BY s.trace_id \
+                {status_having}\
+            ) sub",
         );
+        let _ = param_idx;
 
         let result = self
             .db
@@ -1263,12 +1291,22 @@ impl OtelStorage for TimescaleDbStorage {
                         continue;
                     }
 
-                    let timestamp_ns = event
-                        .get("timestamp")
-                        .and_then(|v| v.as_str())
+                    let raw_ts = event.get("timestamp").and_then(|v| v.as_str());
+                    let timestamp_ns = raw_ts
                         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                         .map(|dt| dt.with_timezone(&chrono::Utc))
-                        .unwrap_or_else(chrono::Utc::now);
+                        .unwrap_or_else(|| {
+                            if raw_ts.is_some() {
+                                warn!(
+                                    span_id = %span_id,
+                                    raw_timestamp = raw_ts,
+                                    "get_genai_trace_events: unparsable span event timestamp; \
+                                     substituting Unix epoch"
+                                );
+                            }
+                            chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0)
+                                .unwrap_or_default()
+                        });
 
                     let attrs: std::collections::BTreeMap<String, String> = event
                         .get("attributes")
@@ -1961,6 +1999,25 @@ impl OtelStorage for TimescaleDbStorage {
 
         Ok(row.map(|r| r.p95).unwrap_or(0.0))
     }
+}
+
+// ── LIKE pattern helpers ─────────────────────────────────────────────
+
+/// Escape LIKE/ILIKE metacharacters in a user-supplied substring pattern.
+///
+/// PostgreSQL ILIKE uses backslash as the default escape character. We
+/// escape:
+///
+/// - `\` → `\\`   (backslash itself, first)
+/// - `%` → `\%`   (wildcard: any sequence of chars)
+/// - `_` → `\_`   (wildcard: exactly one char)
+///
+/// The caller wraps the result with `%{escaped}%` for a substring match.
+fn escape_like_pattern(pattern: &str) -> String {
+    pattern
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 // ── Row parsers ─────────────────────────────────────────────────────
