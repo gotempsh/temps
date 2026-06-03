@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod api_key;
 pub mod backfill;
+pub mod ch_backfill_domains;
 pub mod backup;
 pub mod build;
 pub mod deploy;

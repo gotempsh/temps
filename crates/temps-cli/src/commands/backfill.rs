@@ -52,8 +52,35 @@ pub enum BackfillTarget {
     Clickhouse(ClickhouseBackfillArgs),
 }
 
+/// Which observability domain to copy from TimescaleDB into ClickHouse.
+///
+/// `events` replicates via the live outbox too, but the other three
+/// (`proxy-logs`, `traces`, `metrics`) are backend-swap domains with no live
+/// replication — enabling ClickHouse routes *new* writes there but leaves the
+/// historical TimescaleDB rows behind. This backfill copies that history over.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackfillDomain {
+    /// Analytics events (`events` → ClickHouse `events`).
+    Events,
+    /// Proxy / request logs (`proxy_logs` → ClickHouse `proxy_logs`).
+    ProxyLogs,
+    /// OTel traces / spans (`otel_spans` → ClickHouse `spans`).
+    Traces,
+    /// Resource metrics (`service_metrics` → ClickHouse `service_metrics`).
+    Metrics,
+    /// All four domains, in turn.
+    All,
+}
+
 #[derive(Args, Clone)]
 pub struct ClickhouseBackfillArgs {
+    /// Which domain(s) to copy. Defaults to `events` to preserve the prior
+    /// behaviour of this command. Use `all` to copy every observability domain,
+    /// or pick `proxy-logs` / `traces` / `metrics` for a backend-swap domain
+    /// whose history did not migrate when you enabled ClickHouse.
+    #[arg(long, value_enum, default_value_t = BackfillDomain::Events)]
+    pub domain: BackfillDomain,
+
     /// PostgreSQL connection URL (system of record).
     #[arg(long, env = "TEMPS_DATABASE_URL")]
     pub database_url: String,
@@ -160,18 +187,54 @@ async fn run_clickhouse_async(args: ClickhouseBackfillArgs) -> anyhow::Result<()
         "{}",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".bright_blue()
     );
-    println!(
-        "{}",
-        "   ClickHouse analytics backfill".bright_white().bold()
-    );
+    println!("{}", "   ClickHouse backfill".bright_white().bold());
     println!(
         "{}",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".bright_blue()
     );
     println!();
 
+    // `all` runs each domain in turn, sharing one PG connection. Each domain
+    // reports its own progress; a failure in one aborts the rest so the
+    // operator sees exactly where it stopped.
+    let domains: Vec<BackfillDomain> = match args.domain {
+        BackfillDomain::All => vec![
+            BackfillDomain::Events,
+            BackfillDomain::ProxyLogs,
+            BackfillDomain::Traces,
+            BackfillDomain::Metrics,
+        ],
+        single => vec![single],
+    };
+
     let db = temps_database::establish_connection(&args.database_url).await?;
     info!("Connected to PostgreSQL");
+
+    for domain in domains {
+        match domain {
+            BackfillDomain::Events => run_events_backfill(db.clone(), &args).await?,
+            BackfillDomain::ProxyLogs | BackfillDomain::Traces | BackfillDomain::Metrics => {
+                crate::commands::ch_backfill_domains::run_domain_backfill(
+                    db.clone(),
+                    &args,
+                    domain,
+                )
+                .await?
+            }
+            BackfillDomain::All => unreachable!("All is expanded above"),
+        }
+    }
+
+    Ok(())
+}
+
+/// The original `events` backfill — PostgreSQL `events` → ClickHouse `events`
+/// via the shared `ch_backfill` window/keyset machinery.
+async fn run_events_backfill(
+    db: Arc<sea_orm::DatabaseConnection>,
+    args: &ClickhouseBackfillArgs,
+) -> anyhow::Result<()> {
+    println!("{}", "▸ Domain: analytics events".bright_white().bold());
 
     let ch_cfg = ClickHouseConfig::new(
         &args.clickhouse_url,
@@ -200,7 +263,7 @@ async fn run_clickhouse_async(args: ClickhouseBackfillArgs) -> anyhow::Result<()
     }
 
     // 1. Resolve the [from, to] window.
-    let (from, to) = resolve_window(db.as_ref(), &args).await?;
+    let (from, to) = resolve_window(db.as_ref(), args).await?;
     println!(
         "{} Window: {} → {}",
         "→".bright_blue(),
@@ -254,7 +317,7 @@ async fn run_clickhouse_async(args: ClickhouseBackfillArgs) -> anyhow::Result<()
     // 3. Load resume cursor if requested.
     let state_path = args.state_file.clone().unwrap_or_else(default_state_path);
     let (mut cursor, mut already_pushed) =
-        load_checkpoint_or_default(&args, &state_path, from, to)?;
+        load_checkpoint_or_default(args, &state_path, from, to)?;
     if already_pushed > 0 {
         println!(
             "{} Resuming from checkpoint — {} events already pushed",
@@ -323,7 +386,7 @@ async fn run_clickhouse_async(args: ClickhouseBackfillArgs) -> anyhow::Result<()
         pb.set_position(already_pushed);
 
         if args.resume {
-            persist_checkpoint(&state_path, &args, from, to, cursor)?;
+            persist_checkpoint(&state_path, args, from, to, cursor)?;
         }
     }
 
