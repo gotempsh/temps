@@ -154,6 +154,137 @@ fn count_expr_str(level: &str) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
+// SQL builders
+//
+// These three queries all compute a `percentage` (and, for breakdowns, a
+// `total_count`) from a ClickHouse scalar subquery `(SELECT t FROM total)`.
+// ClickHouse types a scalar subquery as `Nullable(T)` — it could match zero
+// rows — and that nullability propagates through the surrounding `if(...)`
+// arithmetic. The `clickhouse` crate decodes a `Nullable` column as a
+// null-flag byte followed by the value, but a plain `f64`/`u64` struct field
+// reads only the value bytes, so the RowBinary stream desyncs and every read
+// fails with "not enough data, probably a row type mismatches a database
+// schema". Wrapping each such expression in `assumeNotNull(...)` makes the
+// returned column non-nullable so it lines up with the row structs
+// (`CountAndPercentRow`, `BreakdownRow`) that hold plain `f64`/`u64`. The
+// values are logically never NULL (sum over an empty set is 0, and the `if`
+// guard short-circuits on a zero total), so the assumption is always sound.
+//
+// Extracted into pure functions so a Docker-free unit test can assert the
+// guard is present — the integration test that would otherwise catch this
+// is gated on a ClickHouse container and silently skips when Docker is
+// unavailable.
+// ---------------------------------------------------------------------------
+
+/// Build the `query_events_count` SQL. `level_expr` is a trusted count
+/// expression from [`count_expr`]; `custom_filter` is a fixed SQL fragment
+/// (empty or the page-view exclusion) — neither is user-controlled.
+fn events_count_sql(level_expr: &str, custom_filter: &str) -> String {
+    format!(
+        r#"
+            WITH total AS (
+                SELECT {level_expr} AS t
+                FROM events FINAL
+                WHERE project_id = ?
+                  AND timestamp >= fromUnixTimestamp64Milli(?)
+                  AND timestamp <= fromUnixTimestamp64Milli(?)
+                  AND event_name != ''
+                  AND (? = 0 OR environment_id = ?)
+                  {custom_filter}
+            )
+            SELECT
+                event_name AS name,
+                {level_expr} AS count,
+                assumeNotNull(if((SELECT t FROM total) > 0,
+                   {level_expr} / (SELECT t FROM total) * 100,
+                   0)) AS percentage
+            FROM events FINAL
+            WHERE project_id = ?
+              AND timestamp >= fromUnixTimestamp64Milli(?)
+              AND timestamp <= fromUnixTimestamp64Milli(?)
+              AND event_name != ''
+              AND (? = 0 OR environment_id = ?)
+              {custom_filter}
+            GROUP BY event_name
+            ORDER BY count DESC
+            LIMIT ?
+            "#
+    )
+}
+
+/// Build the `query_event_type_breakdown` SQL. `level_expr` is a trusted
+/// count expression from [`count_expr`].
+fn event_type_breakdown_sql(level_expr: &str) -> String {
+    format!(
+        r#"
+            WITH total AS (
+                SELECT {level_expr} AS t
+                FROM events FINAL
+                WHERE project_id = ?
+                  AND timestamp >= fromUnixTimestamp64Milli(?)
+                  AND timestamp <= fromUnixTimestamp64Milli(?)
+                  AND (? = 0 OR environment_id = ?)
+            )
+            SELECT
+                event_type AS name,
+                {level_expr} AS count,
+                assumeNotNull(if((SELECT t FROM total) > 0,
+                   {level_expr} / (SELECT t FROM total) * 100,
+                   0)) AS percentage
+            FROM events FINAL
+            WHERE project_id = ?
+              AND timestamp >= fromUnixTimestamp64Milli(?)
+              AND timestamp <= fromUnixTimestamp64Milli(?)
+              AND (? = 0 OR environment_id = ?)
+            GROUP BY event_type
+            ORDER BY count DESC
+            "#
+    )
+}
+
+/// Build the `query_property_breakdown` SQL. `col`/`sentinel` come from the
+/// allowlisted [`property_column_expr`] and `count_sql` from [`count_expr_str`]
+/// — all three are fixed strings, never raw user input.
+fn property_breakdown_sql(col: &str, sentinel: &str, count_sql: &str) -> String {
+    format!(
+        r#"
+            WITH value_counts AS (
+                SELECT
+                    if({col} = '', '{sentinel}', {col}) AS value,
+                    {count_sql} AS count
+                FROM events FINAL
+                WHERE project_id = ?
+                  AND timestamp >= fromUnixTimestamp64Milli(?)
+                  AND timestamp <= fromUnixTimestamp64Milli(?)
+                  AND (? = 0 OR environment_id = ?)
+                  AND (? = 0 OR deployment_id = ?)
+                  AND (? = 0 OR event_name = ?)
+                  AND (? = 0 OR country = ?)
+                  AND (? = 0 OR region = ?)
+                  AND (? = 0 OR browser = ?)
+                  AND (? = 0 OR operating_system = ?)
+                  AND (? = 0 OR channel = ?)
+                  AND (? = 0
+                       OR (? = 1 AND referrer_hostname = ?)
+                       OR (? = 2 AND referrer_hostname = ''))
+                GROUP BY value
+            ),
+            total AS (SELECT sum(count) AS t FROM value_counts)
+            SELECT
+                value,
+                count,
+                assumeNotNull(if((SELECT t FROM total) > 0,
+                   count / (SELECT t FROM total) * 100,
+                   0)) AS percentage,
+                assumeNotNull((SELECT t FROM total)) AS total_count
+            FROM value_counts
+            ORDER BY count DESC
+            LIMIT ?
+            "#
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Row types
 // ---------------------------------------------------------------------------
 
@@ -208,39 +339,7 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
             ""
         };
 
-        // The query selects (event_name, count, percentage) in one shot using
-        // a subquery for the total. ClickHouse doesn't share Postgres's
-        // CROSS JOIN ergonomics so we use a constant subquery.
-        let sql = format!(
-            r#"
-            WITH total AS (
-                SELECT {level_expr} AS t
-                FROM events FINAL
-                WHERE project_id = ?
-                  AND timestamp >= fromUnixTimestamp64Milli(?)
-                  AND timestamp <= fromUnixTimestamp64Milli(?)
-                  AND event_name != ''
-                  AND (? = 0 OR environment_id = ?)
-                  {custom_filter}
-            )
-            SELECT
-                event_name AS name,
-                {level_expr} AS count,
-                if((SELECT t FROM total) > 0,
-                   {level_expr} / (SELECT t FROM total) * 100,
-                   0) AS percentage
-            FROM events FINAL
-            WHERE project_id = ?
-              AND timestamp >= fromUnixTimestamp64Milli(?)
-              AND timestamp <= fromUnixTimestamp64Milli(?)
-              AND event_name != ''
-              AND (? = 0 OR environment_id = ?)
-              {custom_filter}
-            GROUP BY event_name
-            ORDER BY count DESC
-            LIMIT ?
-            "#
-        );
+        let sql = events_count_sql(level_expr, custom_filter);
 
         let env_filter_flag: i32 = q.scope.environment_id.map(|_| 1).unwrap_or(0);
         let env_filter_value: i32 = q.scope.environment_id.unwrap_or(0);
@@ -371,31 +470,7 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
         let start_ms = to_unix_milli(q.range.start);
         let end_ms = to_unix_milli(q.range.end);
 
-        let sql = format!(
-            r#"
-            WITH total AS (
-                SELECT {level_expr} AS t
-                FROM events FINAL
-                WHERE project_id = ?
-                  AND timestamp >= fromUnixTimestamp64Milli(?)
-                  AND timestamp <= fromUnixTimestamp64Milli(?)
-                  AND (? = 0 OR environment_id = ?)
-            )
-            SELECT
-                event_type AS name,
-                {level_expr} AS count,
-                if((SELECT t FROM total) > 0,
-                   {level_expr} / (SELECT t FROM total) * 100,
-                   0) AS percentage
-            FROM events FINAL
-            WHERE project_id = ?
-              AND timestamp >= fromUnixTimestamp64Milli(?)
-              AND timestamp <= fromUnixTimestamp64Milli(?)
-              AND (? = 0 OR environment_id = ?)
-            GROUP BY event_type
-            ORDER BY count DESC
-            "#
-        );
+        let sql = event_type_breakdown_sql(level_expr);
 
         let rows = self
             .client
@@ -547,42 +622,7 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
         //   We don't have that table replicated to CH. Apps that drill
         //   into referrer breakdowns will see their own domain in the
         //   list. Acceptable v1; flagged in the runbook.
-        let sql = format!(
-            r#"
-            WITH value_counts AS (
-                SELECT
-                    if({col} = '', '{sentinel}', {col}) AS value,
-                    {count_sql} AS count
-                FROM events FINAL
-                WHERE project_id = ?
-                  AND timestamp >= fromUnixTimestamp64Milli(?)
-                  AND timestamp <= fromUnixTimestamp64Milli(?)
-                  AND (? = 0 OR environment_id = ?)
-                  AND (? = 0 OR deployment_id = ?)
-                  AND (? = 0 OR event_name = ?)
-                  AND (? = 0 OR country = ?)
-                  AND (? = 0 OR region = ?)
-                  AND (? = 0 OR browser = ?)
-                  AND (? = 0 OR operating_system = ?)
-                  AND (? = 0 OR channel = ?)
-                  AND (? = 0
-                       OR (? = 1 AND referrer_hostname = ?)
-                       OR (? = 2 AND referrer_hostname = ''))
-                GROUP BY value
-            ),
-            total AS (SELECT sum(count) AS t FROM value_counts)
-            SELECT
-                value,
-                count,
-                if((SELECT t FROM total) > 0,
-                   count / (SELECT t FROM total) * 100,
-                   0) AS percentage,
-                (SELECT t FROM total) AS total_count
-            FROM value_counts
-            ORDER BY count DESC
-            LIMIT ?
-            "#
-        );
+        let sql = property_breakdown_sql(col, sentinel, count_sql);
 
         #[derive(Row, Deserialize)]
         struct BreakdownRow {
@@ -1742,5 +1782,105 @@ mod tests {
             report.applied
         );
         assert_eq!(report.skipped.len(), 3, "all three migrations skipped");
+    }
+
+    // ── SQL-shape guards (no Docker required) ──────────────────────────────
+    //
+    // The integration test above is the real end-to-end check, but it skips
+    // silently when Docker is unavailable — which is exactly how the
+    // Nullable-scalar-subquery bug shipped. These guards run in plain
+    // `cargo test`: they assert the SQL each row struct deserializes wraps
+    // its nullable scalar-subquery columns in `assumeNotNull(...)`, so a
+    // `Nullable(T)` column can never be read into a plain `f64`/`u64` field
+    // (which fails with "not enough data, probably a row type mismatch").
+
+    /// Helper: every `(SELECT t FROM total)` reference that feeds an output
+    /// column must sit inside an `assumeNotNull(...)`. We assert by checking
+    /// the SQL has no bare `) AS percentage` / `) AS total_count` whose
+    /// expression isn't `assumeNotNull`-wrapped. Cheap, robust proxy: the
+    /// only output columns built from the scalar subquery are wrapped.
+    fn assert_no_bare_nullable_output(sql: &str) {
+        // The percentage column is always derived from the scalar subquery.
+        assert!(
+            sql.contains("assumeNotNull(if((SELECT t FROM total) > 0,"),
+            "percentage column must wrap the Nullable if(...) in assumeNotNull; SQL:\n{sql}"
+        );
+        assert!(
+            !sql.contains("0) AS percentage"),
+            "found an unwrapped `0) AS percentage` — the Nullable if(...) leaks; SQL:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn events_count_sql_wraps_nullable_percentage() {
+        // Both aggregation levels and both custom-filter states.
+        for level in ["count()", "uniq(session_id)", "uniq(visitor_id)"] {
+            for filter in ["", "AND event_name NOT IN ('page_view')"] {
+                let sql = events_count_sql(level, filter);
+                assert_no_bare_nullable_output(&sql);
+                // The count column itself is non-nullable (count()/uniq()) and
+                // must NOT be wrapped — sanity-check we didn't over-wrap.
+                assert!(sql.contains(&format!("{level} AS count")));
+            }
+        }
+    }
+
+    #[test]
+    fn event_type_breakdown_sql_wraps_nullable_percentage() {
+        for level in ["count()", "uniq(session_id)", "uniq(visitor_id)"] {
+            let sql = event_type_breakdown_sql(level);
+            assert_no_bare_nullable_output(&sql);
+        }
+    }
+
+    #[test]
+    fn property_breakdown_sql_wraps_nullable_percentage_and_total() {
+        let sql = property_breakdown_sql("channel", "Unknown", "count()");
+        assert_no_bare_nullable_output(&sql);
+        // total_count is the raw scalar subquery — it MUST be wrapped, since a
+        // bare `(SELECT t FROM total)` is `Nullable(UInt64)` and the
+        // `total_count: u64` field can't decode it.
+        assert!(
+            sql.contains("assumeNotNull((SELECT t FROM total)) AS total_count"),
+            "total_count must wrap the scalar subquery in assumeNotNull; SQL:\n{sql}"
+        );
+        assert!(
+            !sql.contains("total)) AS total_count")
+                || sql.contains("assumeNotNull((SELECT t FROM total)) AS total_count"),
+            "total_count column must be assumeNotNull-wrapped; SQL:\n{sql}"
+        );
+    }
+
+    /// Exhaustive guard across the allowlisted grouping columns: every
+    /// property-breakdown variant produces the same wrapped output shape, so
+    /// drilling into any dimension (browser, country, referrer, …) is safe.
+    #[test]
+    fn property_breakdown_sql_wrapped_for_every_column() {
+        use crate::types::PropertyColumn::*;
+        let columns = [
+            Channel,
+            DeviceType,
+            Browser,
+            OperatingSystem,
+            ReferrerHostname,
+            Country,
+            Region,
+            City,
+            UtmSource,
+            EventName,
+            PagePath,
+        ];
+        for col in columns {
+            let (expr, sentinel) = property_column_expr(col.clone());
+            for level in ["events", "sessions", "visitors"] {
+                let count_sql = count_expr_str(level);
+                let sql = property_breakdown_sql(expr, sentinel, count_sql);
+                assert_no_bare_nullable_output(&sql);
+                assert!(
+                    sql.contains("assumeNotNull((SELECT t FROM total)) AS total_count"),
+                    "column {col:?} / level {level}: total_count not wrapped"
+                );
+            }
+        }
     }
 }

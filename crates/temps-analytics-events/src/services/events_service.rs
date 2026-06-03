@@ -1374,6 +1374,16 @@ WHERE project_id = $1
         use sea_orm::{ActiveModelTrait, ActiveValue::Set};
         use temps_entities::events;
 
+        // The `events` table (and its ClickHouse replica) enforce NOT NULL on
+        // session_id. A visitor with no session cookie yet — first hit, a
+        // preview origin where the cookie can't be read, or a client that
+        // doesn't send one — arrives here with `session_id = None`, which would
+        // violate the constraint and 500 the ingest (silently dropping the
+        // event). Fall back to a fresh session UUID so the event is never lost;
+        // a real cookie on subsequent requests groups them into one session.
+        let session_id =
+            Some(session_id.unwrap_or_else(|| temps_core::uuid::Uuid::new_v4().to_string()));
+
         // Extract hostname from event_data if available, otherwise use default
         let hostname = event_data
             .get("hostname")
