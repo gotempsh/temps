@@ -17,6 +17,10 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
+# ClickHouse metrics store (opt-in via TEMPS_CLICKHOUSE_*; TimescaleDB remains
+# the default). Version/features mirror temps-otel's CH backend.
+clickhouse = { version = "0.13", features = ["uuid", "chrono"] }
+
 # Scraper: entity access and config
 temps-core = { path = "../temps-core" }
 temps-config = { path = "../temps-config" }

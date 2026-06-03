@@ -11916,6 +11916,7 @@ dependencies = [
  "aws-sdk-s3",
  "bson",
  "chrono",
+ "clickhouse",
  "libc",
  "mongodb",
  "redis 0.28.2",

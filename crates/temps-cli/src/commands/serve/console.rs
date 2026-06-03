@@ -688,6 +688,57 @@ pub struct ConsoleApiParams {
     pub admin_gate_handle: Option<temps_core::admin_gate::AdminGateHandle>,
 }
 
+/// Build a ClickHouse-backed metrics store from the server config, or `None`
+/// when ClickHouse is not configured.
+///
+/// Returns `Some(store)` only when all four `TEMPS_CLICKHOUSE_*` vars are set
+/// (`config.is_clickhouse_enabled()`). When the monitoring store is set to
+/// ClickHouse but the env vars are absent, this logs a warning and returns
+/// `None` so the caller falls back to TimescaleDB (fail-open to the default
+/// path, never silently losing metrics). Construction does no I/O; migrations
+/// are spawned separately by the caller.
+fn build_ch_metrics_store(config: &ServerConfig) -> Option<Arc<dyn temps_metrics::MetricsStore>> {
+    use temps_metrics::{ClickHouseMetricsConfig, ClickhouseMetricsStore, MetricsStore};
+
+    if !config.is_clickhouse_enabled() {
+        tracing::warn!(
+            "Monitoring store is set to ClickHouse but TEMPS_CLICKHOUSE_* env vars are not \
+             fully configured; falling back to TimescaleDB for resource metrics"
+        );
+        return None;
+    }
+
+    // is_clickhouse_enabled() guarantees all four are Some.
+    let cfg = ClickHouseMetricsConfig::new(
+        config.clickhouse_url.clone().unwrap_or_default(),
+        config.clickhouse_database.clone().unwrap_or_default(),
+        config.clickhouse_user.clone().unwrap_or_default(),
+        config.clickhouse_password.clone().unwrap_or_default(),
+    );
+    let store = Arc::new(ClickhouseMetricsStore::new(cfg));
+
+    // Run migrations in the background so startup is not blocked. If they fail,
+    // the first write/read surfaces the error per-call.
+    let client = store.client().clone();
+    let database = config.clickhouse_database.clone().unwrap_or_default();
+    tokio::spawn(async move {
+        match temps_metrics::clickhouse_migrations::apply_migrations(&client, &database).await {
+            Ok(report) => debug!(
+                applied = ?report.applied,
+                skipped = report.skipped.len(),
+                "ClickHouse resource-metrics migrations applied"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "ClickHouse resource-metrics migrations failed; \
+                 metric writes/queries will surface the error per-call"
+            ),
+        }
+    });
+
+    Some(store as Arc<dyn MetricsStore>)
+}
+
 /// Initialize and start the console API server
 pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let ConsoleApiParams {
@@ -1253,8 +1304,10 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                 use temps_core::MetricsStoreKind;
                 use temps_metrics::{MetricsStore, TimescaleMetricsStore};
 
-                // Always provide a TimescaleDB-backed store for container metrics.
-                // ClickHouse is the only unsupported store and falls back to None.
+                // Provide a metrics store for container resource metrics. When
+                // the monitoring store is ClickHouse and CH is configured, use
+                // it; otherwise (TimescaleDb, or CH selected but unconfigured)
+                // fall back to TimescaleDB.
                 match service_context.get_service::<temps_config::ConfigService>() {
                     Some(cfg_svc) => match cfg_svc.get_settings().await {
                         Ok(settings) => match settings.monitoring.store {
@@ -1262,10 +1315,11 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                                 Some(Arc::new(TimescaleMetricsStore::new(db.clone()))
                                     as Arc<dyn MetricsStore>)
                             }
-                            MetricsStoreKind::ClickHouse => {
-                                debug!("ClickHouse metrics store is not yet supported; container metrics disabled");
-                                None
-                            }
+                            MetricsStoreKind::ClickHouse => build_ch_metrics_store(&config)
+                                .or_else(|| {
+                                    Some(Arc::new(TimescaleMetricsStore::new(db.clone()))
+                                        as Arc<dyn MetricsStore>)
+                                }),
                         },
                         _ => None,
                     },
@@ -1309,15 +1363,20 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
             // monitoring enabled, so a user clicking "Enable Monitoring" on a
             // service just works without an operator first flipping a global flag.
             //
-            // ClickHouse is the only unsupported store; we always fall back to
-            // TimescaleDB until it lands.
+            // When the monitoring store is ClickHouse AND TEMPS_CLICKHOUSE_* is
+            // configured, this single binding becomes the ClickHouse store used
+            // by the HTTP query endpoints, the AlertEvaluator, AND the scraper's
+            // writes. Otherwise (TimescaleDb, or CH selected but unconfigured)
+            // it falls back to TimescaleDB unchanged.
             match cfg_svc.get_settings().await {
                 Ok(settings) => {
-                    if matches!(settings.monitoring.store, MetricsStoreKind::ClickHouse) {
-                        debug!("ClickHouse metrics store not yet supported; using TimescaleDB");
-                    }
-                    let metrics_store: Arc<dyn MetricsStore> =
-                        Arc::new(TimescaleMetricsStore::new(db.clone()));
+                    let metrics_store: Arc<dyn MetricsStore> = match settings.monitoring.store {
+                        MetricsStoreKind::ClickHouse => build_ch_metrics_store(&config)
+                            .unwrap_or_else(|| Arc::new(TimescaleMetricsStore::new(db.clone()))),
+                        MetricsStoreKind::TimescaleDb => {
+                            Arc::new(TimescaleMetricsStore::new(db.clone()))
+                        }
+                    };
 
                     // Register the metrics store so plugins (e.g. providers)
                     // can retrieve it for HTTP query endpoints.
@@ -1366,6 +1425,10 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                         let prune_db = db.clone();
                         let prune_cfg =
                             service_context.get_service::<temps_config::ConfigService>();
+                        // Clone the server config so the ClickHouse arm can build
+                        // a store inside the spawned loop without re-spawning the
+                        // migration task each tick (CH prune is a TTL-backed no-op).
+                        let prune_config = config.clone();
 
                         tokio::spawn(async move {
                             let mut interval =
@@ -1384,15 +1447,24 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                                         continue;
                                     }
                                 };
+                                // When ClickHouse is the active metrics store, the
+                                // table's native TTL enforces retention — there is
+                                // nothing for prune() to do. Skip the tick entirely
+                                // rather than build a CH store just to call a no-op.
+                                if matches!(settings.monitoring.store, MetricsStoreKind::ClickHouse)
+                                    && prune_config.is_clickhouse_enabled()
+                                {
+                                    continue;
+                                }
                                 let store: Arc<dyn MetricsStore> = match settings.monitoring.store {
                                     MetricsStoreKind::TimescaleDb => {
                                         Arc::new(TimescaleMetricsStore::new(prune_db.clone()))
                                     }
                                     MetricsStoreKind::ClickHouse => {
-                                        debug!(
-                                            "PruneMetrics: ClickHouse not yet supported, skipping"
-                                        );
-                                        continue;
+                                        // CH selected but unconfigured — match the
+                                        // read/write path's TimescaleDB fallback.
+                                        // (The CH-configured case is skipped above.)
+                                        Arc::new(TimescaleMetricsStore::new(prune_db.clone()))
                                     }
                                 };
                                 let cutoff = Utc::now()

@@ -1,4 +1,5 @@
 pub mod clickhouse;
+pub mod clickhouse_migrations;
 pub mod timescale;
 
 use async_trait::async_trait;
