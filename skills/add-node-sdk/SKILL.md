@@ -1,262 +1,186 @@
 ---
 name: add-node-sdk
 description: |
-  Integrate the Temps Node.js SDK for server-side analytics, KV storage, blob storage, and platform management. Use when the user wants to: (1) Track server-side events, (2) Use Temps KV (key-value) storage, (3) Use Temps Blob storage for files, (4) Access Temps API from Node.js, (5) Server-side analytics integration, (6) Backend event tracking. Triggers: "temps node sdk", "server-side analytics", "temps kv", "temps blob", "backend integration", "node.js temps".
+  Integrate the Temps Node.js SDKs for server-side platform access, KV storage, and Blob storage. Use when the user wants to: (1) Call the Temps platform API from Node.js (deployments, projects, analytics, session replay, etc.), (2) Use Temps KV (key-value) storage, (3) Use Temps Blob storage for files, (4) Server-side integration with a Temps project, (5) Backend access to Temps resources. Triggers: "temps node sdk", "temps kv", "temps blob", "backend integration", "node.js temps", "@temps-sdk/node-sdk".
 ---
 
-# Add Node.js SDK
+# Add Node.js SDKs
 
-Integrate Temps platform features in Node.js applications.
+Integrate Temps platform features in Node.js / TypeScript apps.
 
-## Installation
+> **Verified against the real published packages.** A prior version of this skill referenced `@temps-sdk/node` (which does not exist), `new Temps({ apiKey, projectId })`, `temps.track()`, `new KV({ apiKey, namespace })`, `kv.has()`, `blob.get()`, `blob.getSignedUrl()`, `TempsError` — **none of those exist**. Confirm any API before changing it:
+> ```bash
+> npm pack @temps-sdk/node-sdk@latest @temps-sdk/kv@latest @temps-sdk/blob@latest
+> for t in temps-sdk-*-*.tgz; do tar -xzf "$t"; echo "== $t =="; cat package/dist/index.d.ts | head -60; rm -rf package; done
+> ```
+
+## The three real packages
+
+| Package | Purpose |
+|---|---|
+| `@temps-sdk/node-sdk` | Full platform API client (generated) + Sentry-style server error tracking |
+| `@temps-sdk/kv` | Vercel-KV-style key/value store |
+| `@temps-sdk/blob` | Vercel-Blob-style file store |
+
+> There is **no** `@temps-sdk/node`. The platform client package is `@temps-sdk/node-sdk`.
 
 ```bash
-# Core SDK
-npm install @temps-sdk/node
-
-# Individual packages (optional)
-npm install @temps-sdk/kv      # Key-Value storage
-npm install @temps-sdk/blob    # Blob/file storage
+npm install @temps-sdk/node-sdk   # platform API + error tracking
+npm install @temps-sdk/kv         # optional: KV storage
+npm install @temps-sdk/blob       # optional: blob storage
 ```
 
-## Configuration
+## Platform API client — `@temps-sdk/node-sdk`
+
+`TempsClient` is a generated client (hey-api) over the Temps OpenAPI surface. Construct it with a `baseUrl` and `apiKey`, then call resource sub-namespaces.
 
 ```typescript
-import { Temps } from '@temps-sdk/node';
+import { TempsClient } from '@temps-sdk/node-sdk';
 
-const temps = new Temps({
-  apiKey: process.env.TEMPS_API_KEY,
-  projectId: process.env.TEMPS_PROJECT_ID,
+const temps = new TempsClient({
+  baseUrl: process.env.TEMPS_API_URL!,   // e.g. https://app.temps.sh
+  apiKey: process.env.TEMPS_API_KEY,     // create under Settings → API Keys
 });
+
+// Resource namespaces (each maps to OpenAPI operations):
+// temps.projects, temps.deployments, temps.analytics, temps.sessionReplay,
+// temps.domains, temps.dns, temps.backups, temps.crons, temps.email,
+// temps.externalServices, temps.files, temps.funnels, temps.git, temps.monitoring,
+// temps.notifications, temps.performance, temps.platform, temps.proxyLogs,
+// temps.repositories, temps.settings, temps.users, temps.apiKeys, temps.auditLogs, …
+
+const projects = await temps.projects /* .list(...) etc. */;
 ```
 
-## Server-Side Event Tracking
+> ⚠️ The config is `{ baseUrl, apiKey }` (Vercel-style `baseUrl`), **not** `{ apiKey, projectId }`. There is **no** top-level `temps.track()` / `temps.identify()` — analytics live under `temps.analytics.*`. Use editor autocomplete on the namespace, or read `package/dist/index.d.ts` and `client/sdk.gen.d.ts` for exact method names and argument shapes (they're generated and may evolve).
 
-Track events from your backend:
+Each call resolves to `{ data, error, request, response }` (hey-api result shape) — check `error` before using `data`.
+
+## Server-side error tracking — `@temps-sdk/node-sdk`
+
+The node SDK re-exports a **Sentry-compatible** error-tracking API as the `ErrorTracking` namespace. It is DSN-based and mirrors `@sentry/node`.
 
 ```typescript
-import { Temps } from '@temps-sdk/node';
+import { ErrorTracking } from '@temps-sdk/node-sdk';
 
-const temps = new Temps({
-  apiKey: process.env.TEMPS_API_KEY,
-  projectId: process.env.TEMPS_PROJECT_ID,
+ErrorTracking.init({
+  dsn: process.env.SENTRY_DSN!,            // Temps DSN, from Error Tracking → DSN & Setup
+  environment: process.env.NODE_ENV,
+  release: process.env.GIT_SHA,
+  tracesSampleRate: 1.0,
 });
 
-// Track an event
-await temps.track('purchase_completed', {
-  userId: 'user_123',
-  orderId: 'order_456',
-  amount: 99.99,
-  currency: 'USD',
-  items: ['product_1', 'product_2'],
-});
+try {
+  doRiskyThing();
+} catch (err) {
+  ErrorTracking.captureException(err);
+}
 
-// Identify a user
-await temps.identify('user_123', {
-  email: 'user@example.com',
-  name: 'John Doe',
-  plan: 'premium',
-  createdAt: new Date().toISOString(),
-});
+ErrorTracking.captureMessage('Something notable happened', 'warning');
+ErrorTracking.setUser({ id: 'user_123', email: 'user@example.com' });
+ErrorTracking.addBreadcrumb({ category: 'auth', message: 'logged in', level: 'info' });
+const tx = ErrorTracking.startTransaction({ name: 'checkout', op: 'http.server' });
+// … tx.startChild(...), tx.finish()
 ```
 
-### Express Middleware
+> For **most** error-tracking work, prefer the dedicated `add-error-tracking` skill: Temps is Sentry wire-compatible, so the official `@sentry/node` SDK pointed at a Temps DSN is the recommended path. Use `ErrorTracking` from `@temps-sdk/node-sdk` only when you specifically want the bundled implementation (no extra dependency).
+
+## KV storage — `@temps-sdk/kv`
+
+Vercel-KV-style API. Use the default `kv` instance (env-configured) or construct a `KV`/`createClient`.
 
 ```typescript
-import express from 'express';
-import { Temps } from '@temps-sdk/node';
+import { kv } from '@temps-sdk/kv';
+// or: import { KV, createClient } from '@temps-sdk/kv';
 
-const app = express();
-const temps = new Temps({ apiKey: process.env.TEMPS_API_KEY });
-
-// Track all API requests
-app.use((req, res, next) => {
-  const start = Date.now();
-
-  res.on('finish', () => {
-    temps.track('api_request', {
-      method: req.method,
-      path: req.path,
-      statusCode: res.statusCode,
-      duration: Date.now() - start,
-      userId: req.user?.id,
-    });
-  });
-
-  next();
-});
+// Default instance reads TEMPS_API_URL, TEMPS_TOKEN, TEMPS_PROJECT_ID from env.
+await kv.set('user:123', { name: 'John' });
+await kv.set('session:abc', { userId: '123' }, { ex: 3600 });  // expire in 3600s
+const user = await kv.get<{ name: string }>('user:123');        // typed get; null if missing
+await kv.incr('counter');
+await kv.expire('user:123', 600);
+const ttl = await kv.ttl('user:123');                            // seconds; -2 missing, -1 no-expiry
+const removed = await kv.del('user:123', 'session:abc');         // count deleted
+const matches = await kv.keys('user:*');                         // pattern match
 ```
 
-## KV Storage
-
-Simple key-value storage with automatic JSON serialization:
+Explicit client (when you don't want env-based config):
 
 ```typescript
 import { KV } from '@temps-sdk/kv';
 
-const kv = new KV({
-  apiKey: process.env.TEMPS_API_KEY,
-  namespace: 'my-app', // Optional namespace
+const store = new KV({
+  apiUrl: process.env.TEMPS_API_URL,
+  token: process.env.TEMPS_TOKEN,    // API key or deployment token
+  projectId: 42,                     // number; required with API keys, inferred from deployment tokens
 });
-
-// Store values
-await kv.set('user:123', { name: 'John', email: 'john@example.com' });
-await kv.set('session:abc', { userId: '123' }, { ttl: 3600 }); // 1 hour TTL
-
-// Retrieve values
-const user = await kv.get('user:123');
-// { name: 'John', email: 'john@example.com' }
-
-// Check existence
-const exists = await kv.has('user:123');
-
-// Delete
-await kv.delete('user:123');
-
-// List keys
-const keys = await kv.list({ prefix: 'user:' });
-// ['user:123', 'user:456', ...]
 ```
 
-### KV Options
+`SetOptions` (Redis-style): `{ ex?: number /* sec */, px?: number /* ms */, nx?: boolean, xx?: boolean }`.
+
+> ⚠️ The config field is `token` (API key **or** deployment token) + `projectId: number`, **not** `apiKey`/`namespace`. There is **no** `kv.has()`, `kv.list({prefix})`, `getWithMetadata`, or a `{ ttl }` set option — use `{ ex }` / `{ px }`. KV errors throw `KVError`.
+
+## Blob storage — `@temps-sdk/blob`
+
+Vercel-Blob-style API. Use the default `blob` instance or construct `BlobClient`/`createClient`.
 
 ```typescript
-// Set with TTL (seconds)
-await kv.set('key', value, { ttl: 3600 });
+import { blob } from '@temps-sdk/blob';
+// or: import { BlobClient, createClient } from '@temps-sdk/blob';
 
-// Set with metadata
-await kv.set('key', value, {
-  metadata: { version: 1, updatedBy: 'system' }
+// Upload (returns BlobInfo: { url, pathname, contentType, size, ... })
+const info = await blob.put('avatars/user-123.png', imageBuffer, {
+  contentType: 'image/png',
+  addRandomSuffix: false,   // default true — set false to keep the exact pathname
 });
 
-// Get with metadata
-const { value, metadata } = await kv.getWithMetadata('key');
+// Download (returns a fetch Response — stream or buffer it yourself)
+const res = await blob.download(info.url);
+const bytes = Buffer.from(await res.arrayBuffer());
+
+// Metadata
+const meta = await blob.head(info.url);
 
 // List with pagination
-const result = await kv.list({
-  prefix: 'user:',
-  limit: 100,
-  cursor: 'next-cursor',
-});
+const { blobs, cursor, hasMore } = await blob.list({ prefix: 'avatars/', limit: 100 });
+
+// Copy and delete
+await blob.copy(info.url, 'avatars/backup.png');
+await blob.del(info.url);            // also accepts string[] of urls/pathnames
 ```
 
-## Blob Storage
-
-Store and retrieve files:
+Explicit client:
 
 ```typescript
-import { Blob } from '@temps-sdk/blob';
+import { BlobClient } from '@temps-sdk/blob';
 
-const blob = new Blob({
-  apiKey: process.env.TEMPS_API_KEY,
-});
-
-// Upload file from buffer
-const file = await blob.put('avatars/user-123.png', imageBuffer, {
-  contentType: 'image/png',
-  metadata: { userId: '123' },
-});
-
-// Upload from stream
-import { createReadStream } from 'fs';
-await blob.put('backups/data.json', createReadStream('./data.json'), {
-  contentType: 'application/json',
-});
-
-// Get file
-const data = await blob.get('avatars/user-123.png');
-
-// Get as stream (for large files)
-const stream = await blob.getStream('backups/data.json');
-
-// Get signed URL (for client-side access)
-const url = await blob.getSignedUrl('avatars/user-123.png', {
-  expiresIn: 3600, // 1 hour
-});
-
-// Delete
-await blob.delete('avatars/user-123.png');
-
-// List files
-const files = await blob.list({ prefix: 'avatars/' });
-```
-
-### Upload from Client
-
-Generate presigned upload URLs:
-
-```typescript
-// Server: Generate upload URL
-const uploadUrl = await blob.createUploadUrl('uploads/file.pdf', {
-  contentType: 'application/pdf',
-  maxSize: 10 * 1024 * 1024, // 10MB
-  expiresIn: 300, // 5 minutes
-});
-
-// Client: Upload directly to storage
-await fetch(uploadUrl, {
-  method: 'PUT',
-  body: file,
-  headers: { 'Content-Type': 'application/pdf' },
+const store = new BlobClient({
+  apiUrl: process.env.TEMPS_API_URL,
+  token: process.env.TEMPS_TOKEN,
+  projectId: 42,
 });
 ```
 
-## Error Handling
+`PutOptions`: `{ contentType?, addRandomSuffix? (default true), cacheControl?, contentEncoding?, contentDisposition? }`.
 
-```typescript
-import { TempsError, RateLimitError, NotFoundError } from '@temps-sdk/node';
-
-try {
-  await temps.track('event', data);
-} catch (error) {
-  if (error instanceof RateLimitError) {
-    // Retry after delay
-    await sleep(error.retryAfter * 1000);
-    await temps.track('event', data);
-  } else if (error instanceof NotFoundError) {
-    console.error('Resource not found:', error.message);
-  } else if (error instanceof TempsError) {
-    console.error('Temps error:', error.message, error.code);
-  } else {
-    throw error;
-  }
-}
-```
-
-## TypeScript Support
-
-Full TypeScript support with generics:
-
-```typescript
-interface User {
-  name: string;
-  email: string;
-  plan: 'free' | 'premium';
-}
-
-// Typed KV operations
-const user = await kv.get<User>('user:123');
-// user is User | null
-
-await kv.set<User>('user:123', {
-  name: 'John',
-  email: 'john@example.com',
-  plan: 'premium',
-});
-```
+> ⚠️ Methods are `put / del / head / list / download / copy`. There is **no** `blob.get()`, `blob.getStream()`, `blob.getSignedUrl()`, or `blob.createUploadUrl()` — to read content, call `download(url)` and consume the `Response`. Blob errors throw `BlobError`.
 
 ## Environment Variables
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `TEMPS_API_KEY` | Yes | API key from dashboard |
-| `TEMPS_PROJECT_ID` | For tracking | Project ID for analytics |
-| `TEMPS_API_URL` | No | Custom API URL (self-hosted) |
+| Variable | Used by | Notes |
+|---|---|---|
+| `TEMPS_API_URL` | node-sdk (`baseUrl`), kv, blob | Base URL of the Temps API, e.g. `https://app.temps.sh` |
+| `TEMPS_API_KEY` | node-sdk `TempsClient` | Create under **Settings → API Keys** |
+| `TEMPS_TOKEN` | kv, blob | API key **or** deployment token |
+| `TEMPS_PROJECT_ID` | kv, blob | Numeric project id; required with API keys, inferred from deployment tokens |
+| `SENTRY_DSN` | node-sdk `ErrorTracking` | Temps DSN from **Error Tracking → DSN & Setup** |
+
+On Temps deployments these may be injected automatically when you link a KV/Blob service to the project — check the project's environment variables before hardcoding.
 
 ## Best Practices
 
-1. **Initialize once**: Create SDK instance at app startup
-2. **Use environment variables**: Never hardcode API keys
-3. **Handle errors gracefully**: Wrap SDK calls in try/catch
-4. **Use namespaces in KV**: Organize keys by feature/domain
-5. **Set TTLs appropriately**: Don't store temporary data forever
+1. **Never hardcode keys/tokens** — read from environment variables.
+2. **Check `error` on `TempsClient` calls** before using `data` (hey-api result shape).
+3. **Catch `KVError` / `BlobError`** around storage calls.
+4. **Initialize `ErrorTracking.init()` once** at startup, before code that can throw.
+5. **Confirm method names from the generated `.d.ts`** — the platform client surface is generated from OpenAPI and evolves with the API.

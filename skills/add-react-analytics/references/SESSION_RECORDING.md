@@ -1,197 +1,158 @@
 # Session Recording
 
-Privacy-aware session recording with visual replay functionality.
+Privacy-aware session recording (rrweb under the hood) with visual replay in the Temps dashboard.
 
-## Setup
+> **Verified against the real package.** There are **two distinct ways** to record, with different APIs. A prior version of this doc invented `<SessionRecordingProvider enabled maskAllInputs blockClass>` and a `/api/_temps/recordings` endpoint — both wrong.
 
-Wrap your app with `SessionRecordingProvider`:
+## Recommended: configure recording on the analytics provider
+
+Recording is driven by the **main** `TempsAnalyticsProvider`. This is the default path — no extra provider needed.
 
 ```tsx
-// app/layout.tsx or app/providers.tsx
-'use client';
+import { TempsAnalyticsProvider } from '@temps-sdk/react-analytics';
 
+<TempsAnalyticsProvider
+  basePath="/api/_temps"
+  enableSessionRecording={true}
+  sessionRecordingConfig={{
+    maskAllInputs: true,        // default true
+    sessionSampleRate: 1.0,     // 0.0–1.0, default 1.0
+    excludedPaths: ['/admin'],  // paths never recorded
+    blockClass: 'rr-block',     // CSS class to block (default 'rr-block')
+    maskTextClass: 'rr-mask',   // CSS class to mask text (default 'rr-mask')
+    ignoreClass: 'rr-ignore',   // CSS class to ignore (default 'rr-ignore')
+    recordCanvas: false,        // default false
+    collectFonts: false,        // default false
+    batchSize: 100,             // events per flush (provider-level default 100)
+    flushInterval: 5000,        // ms between flushes (provider-level default 5000)
+  }}
+>
+  {children}
+</TempsAnalyticsProvider>
+```
+
+`sessionRecordingConfig` is the `TempsAnalyticsProviderProps["sessionRecordingConfig"]` shape — confirm the full field list in `package/dist/types.d.ts`.
+
+Recording events POST to `${basePath}/session-replay` (i.e. `/api/_temps/session-replay` for Temps-hosted apps), captured by the `temps-analytics-session-replay` backend.
+
+## Optional: user-toggleable recording (consent flows)
+
+For a user-facing on/off toggle, use the separate `SessionRecordingProvider` and its control hooks. **Its props and hook shape are different from the config object above.**
+
+```ts
+// Real signatures from the package:
+function SessionRecordingProvider(props: {
+  children: React.ReactNode;
+  defaultEnabled?: boolean;       // initial state
+  persistPreference?: boolean;    // remember the user's choice (localStorage)
+}): JSX.Element;
+
+function useSessionRecording(): {
+  isRecordingEnabled: boolean;
+  enableRecording: () => void;
+  disableRecording: () => void;
+  toggleRecording: () => void;
+  sessionId: string | null;
+};
+
+function useSessionRecordingControl(defaultEnabled?: boolean): {
+  isEnabled: boolean;
+  enable: () => void;
+  disable: () => void;
+  toggle: () => void;
+};
+```
+
+> ⚠️ `SessionRecordingProvider` does **not** accept `enabled`, `maskAllInputs`, `blockClass`, or `sampling`. Masking/blocking is configured via `sessionRecordingConfig` on the analytics provider (above). The control hook returns `{ isEnabled, enable, disable, toggle }` — **not** `{ isRecording, startRecording, stopRecording }`.
+
+### Setup
+
+```tsx
+'use client';
 import { SessionRecordingProvider } from '@temps-sdk/react-analytics';
 
-export function Providers({ children }) {
+export function RecordingToggleRoot({ children }: { children: React.ReactNode }) {
   return (
-    <SessionRecordingProvider
-      enabled={true}
-      maskAllInputs={true}       // Mask password/sensitive inputs
-      maskAllText={false}         // Don't mask all text content
-      blockClass="sensitive"      // CSS class to block from recording
-      ignoreClass="ignore-recording"
-    >
+    <SessionRecordingProvider defaultEnabled={false} persistPreference={true}>
       {children}
     </SessionRecordingProvider>
   );
 }
 ```
 
-## Provider Options
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `enabled` | `boolean` | `true` | Enable/disable recording |
-| `maskAllInputs` | `boolean` | `true` | Mask all input fields |
-| `maskAllText` | `boolean` | `false` | Mask all text content |
-| `blockClass` | `string` | - | CSS class to block elements |
-| `ignoreClass` | `string` | - | CSS class to ignore elements |
-| `sampling` | `object` | - | Sampling configuration |
-
-## Control Recording
-
-Use the `useSessionRecordingControl` hook to control recording:
+### Control component
 
 ```tsx
 'use client';
-
 import { useSessionRecordingControl } from '@temps-sdk/react-analytics';
 
 function RecordingControls() {
-  const { isRecording, startRecording, stopRecording, toggleRecording } =
-    useSessionRecordingControl();
-
+  const { isEnabled, enable, disable, toggle } = useSessionRecordingControl();
   return (
     <div>
-      <p>Recording: {isRecording ? 'ON' : 'OFF'}</p>
-      <button onClick={startRecording}>Start</button>
-      <button onClick={stopRecording}>Stop</button>
-      <button onClick={toggleRecording}>Toggle</button>
+      <span>Recording: {isEnabled ? 'On' : 'Off'}</span>
+      <button onClick={toggle}>{isEnabled ? 'Stop' : 'Start'}</button>
     </div>
   );
 }
 ```
 
-## Privacy Controls
-
-### Block Sensitive Elements
-
-Use CSS class or data attribute to block elements from recording:
+### GDPR consent banner
 
 ```tsx
-function PaymentForm() {
-  return (
-    <form>
-      {/* Method 1: CSS class */}
-      <input
-        type="text"
-        name="cardNumber"
-        className="sensitive"
-      />
+'use client';
+import { useSessionRecordingControl } from '@temps-sdk/react-analytics';
+import { useState, useEffect } from 'react';
 
-      {/* Method 2: Data attribute */}
-      <input
-        type="text"
-        name="cvv"
-        data-rr-block
-      />
-
-      <button type="submit">Pay</button>
-    </form>
-  );
-}
-```
-
-### Mask Text Content
-
-For additional privacy, mask specific text:
-
-```tsx
-<div data-rr-mask>
-  Sensitive text that will be masked in replay
-</div>
-```
-
-### Common Privacy Patterns
-
-```tsx
-// Payment forms - block entirely
-<div className="sensitive">
-  <CreditCardForm />
-</div>
-
-// Personal info - mask inputs
-<input type="text" name="ssn" data-rr-block />
-
-// Medical info - block section
-<section data-rr-block>
-  <MedicalHistory />
-</section>
-
-// Financial data - mask display
-<span data-rr-mask>${accountBalance}</span>
-```
-
-## GDPR Compliance
-
-For GDPR-compliant recording:
-
-```tsx
 function ConsentBanner() {
-  const [hasConsent, setHasConsent] = useState(false);
-  const { startRecording, stopRecording } = useSessionRecordingControl();
+  const [show, setShow] = useState(false);
+  const { enable, disable } = useSessionRecordingControl();
 
-  const handleAccept = () => {
-    setHasConsent(true);
-    startRecording();
-    localStorage.setItem('recording_consent', 'true');
-  };
+  useEffect(() => {
+    const consent = localStorage.getItem('session_recording_consent');
+    if (consent === null) setShow(true);
+    else if (consent === 'true') enable();
+  }, [enable]);
 
-  const handleDecline = () => {
-    setHasConsent(false);
-    stopRecording();
-    localStorage.setItem('recording_consent', 'false');
-  };
-
+  if (!show) return null;
   return (
-    <div>
-      <p>We use session recording to improve our service.</p>
-      <button onClick={handleAccept}>Accept</button>
-      <button onClick={handleDecline}>Decline</button>
+    <div className="fixed bottom-4 right-4 rounded bg-white p-4 shadow-lg">
+      <p>We record sessions to improve your experience.</p>
+      <div className="mt-2 flex gap-2">
+        <button onClick={() => { localStorage.setItem('session_recording_consent', 'true'); enable(); setShow(false); }}>Accept</button>
+        <button onClick={() => { localStorage.setItem('session_recording_consent', 'false'); disable(); setShow(false); }}>Decline</button>
+      </div>
     </div>
   );
 }
-
-// In provider, check consent
-<SessionRecordingProvider
-  enabled={localStorage.getItem('recording_consent') === 'true'}
-  maskAllInputs={true}
->
-  {children}
-</SessionRecordingProvider>
 ```
 
-## Performance Considerations
+## Privacy controls (masking & blocking)
 
-Session recording adds ~2-3% CPU overhead. To minimize impact:
+Masking/blocking is driven by the CSS classes you configure in `sessionRecordingConfig` (defaults: `rr-block`, `rr-mask`, `rr-ignore`).
 
 ```tsx
-<SessionRecordingProvider
-  enabled={true}
-  sampling={{
-    mousemove: true,
-    mouseInteraction: true,
-    scroll: true,
-    input: 'last',  // Only record final input value
-  }}
->
-  {children}
-</SessionRecordingProvider>
+// Block an element entirely (replaced by a placeholder in replay)
+<div className="rr-block"><CreditCardForm /></div>
+
+// Mask text content (shown as asterisks in replay)
+<span className="rr-mask">{accountBalance}</span>
+
+// Ignore an element from recording
+<div className="rr-ignore"><NoisyWidget /></div>
 ```
+
+If you set custom class names in `sessionRecordingConfig`, use those instead.
+
+## Verification
+
+1. Open DevTools → Network and look for POSTs to `/api/_temps/session-replay`.
+2. Interact with the app to generate events.
+3. Open the session replay in the Temps dashboard.
+4. Confirm masked/blocked elements are obscured in the replay.
 
 ## Troubleshooting
 
-**Recording not working?**
-- Verify `SessionRecordingProvider` wraps your app
-- Check browser console for rrweb errors
-- Ensure `enabled={true}`
-
-**Sensitive data visible in replay?**
-- Add `sensitive` class to containers
-- Use `data-rr-block` on specific elements
-- Enable `maskAllInputs={true}`
-
-**Performance issues?**
-- Reduce sampling rate
-- Block large dynamic elements
-- Disable on low-end devices
+- **Nothing recorded:** confirm `enableSessionRecording={true}` on the provider (or that the user enabled it via the toggle), and that `ignoreLocalhost` isn't suppressing all traffic on localhost.
+- **Sensitive data visible:** add the configured block/mask class to the element, and keep `maskAllInputs: true`.
+- **Too many requests:** raise `sessionSampleRate` granularity, `batchSize`, or `flushInterval`.

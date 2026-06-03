@@ -4,7 +4,7 @@ Comprehensive command-line reference for the Temps deployment platform CLI.
 
 ## What This Skill Covers
 
-Complete documentation for all **54+ CLI commands** including:
+Complete documentation for all **440+ CLI commands across 69 command groups** (matches `@temps-sdk/cli` v0.1.26) including:
 
 - ✅ Authentication (login, logout, whoami)
 - ✅ Projects (create, update, delete, settings)
@@ -51,50 +51,50 @@ bun add -g @temps-sdk/cli
 
 ```bash
 # Login to Temps
-temps login
+bunx @temps-sdk/cli login
 
 # Create a project
-temps projects create my-app
+bunx @temps-sdk/cli projects create my-app
 
 # Deploy from Git
-temps deploy my-app -b main -e production
+bunx @temps-sdk/cli deploy my-app -b main -e production
 
 # Set environment variables
-temps env set DATABASE_URL="postgresql://..." -p my-app -e production
+bunx @temps-sdk/cli environments vars set DATABASE_URL "postgresql://..." -p my-app -e production
 
-# View logs
-temps logs -p my-app -f
+# View deployment logs
+bunx @temps-sdk/cli deployments logs -p my-app -f
 ```
 
 ## Common Commands
 
 ```bash
 # Projects
-temps projects list
-temps projects create
-temps projects show -p my-app
+bunx @temps-sdk/cli projects list
+bunx @temps-sdk/cli projects create
+bunx @temps-sdk/cli projects show -p my-app
 
 # Deployments
-temps deploy my-app -b main -e production
-temps deployments list -p my-app
-temps deployments rollback -p my-app -e production
+bunx @temps-sdk/cli deploy my-app -b main -e production
+bunx @temps-sdk/cli deployments list -p my-app
+bunx @temps-sdk/cli deployments rollback -p my-app
 
 # Services
-temps services create -t postgres -n mydb
-temps services list
-temps services link --id 1 --project-id 5
+bunx @temps-sdk/cli services create -t postgres -n mydb
+bunx @temps-sdk/cli services list
+bunx @temps-sdk/cli services link --id 1 --project-id 5
 
 # Domains
-temps domains add -p my-app -d example.com
-temps domains verify -p my-app -d example.com
+bunx @temps-sdk/cli domains add -p my-app -d example.com
+bunx @temps-sdk/cli domains verify -p my-app -d example.com
 
 # Logs
-temps logs -p my-app -f
-temps runtime-logs -p my-app -e staging -f
+bunx @temps-sdk/cli deployments logs -p my-app -f
+bunx @temps-sdk/cli runtime-logs -p my-app -e staging -f
 
 # Monitoring
-temps monitors create --project-id 5 -n "API Health" -t http
-temps incidents list --project-id 5
+bunx @temps-sdk/cli monitors create --project-id 5 -n "API Health" -t http
+bunx @temps-sdk/cli incidents list --project-id 5
 ```
 
 ## Configuration
@@ -103,14 +103,16 @@ temps incidents list --project-id 5
 **Credentials**: Stored securely in `~/.temps/` with restricted file permissions (mode 0600)
 
 ```bash
-# View configuration
-temps configure show
+# Interactive AWS-style wizard
+bunx @temps-sdk/cli configure
 
-# Set API URL
-temps configure set apiUrl https://temps.example.com
+# Non-interactive (e.g. CI)
+bunx @temps-sdk/cli configure --api-url https://temps.example.com --api-token <TOKEN> --output-format json --no-interactive
 
-# Set output format
-temps configure set outputFormat json
+# View configuration / inspect or change individual values
+bunx @temps-sdk/cli configure show
+bunx @temps-sdk/cli configure get output-format
+bunx @temps-sdk/cli configure set output-format json
 ```
 
 ## Environment Variables
@@ -125,13 +127,17 @@ temps configure set outputFormat json
 
 ## Command Aliases
 
-Common shortcuts:
+Common shortcuts (verbatim from the CLI):
 - `temps p` → `temps projects`
 - `temps svc` → `temps services`
 - `temps cts` → `temps containers`
 - `temps hooks` → `temps webhooks`
 - `temps plogs` → `temps proxy-logs`
-- `temps rtlogs` → `temps runtime-logs`
+- `temps rlogs` → `temps runtime-logs`
+- `temps stats` → `temps analytics`
+- `temps deploys` → `temps deployments`
+
+See the **Command Aliases** table in [SKILL.md](SKILL.md) for the full list.
 
 ## JSON Output
 
@@ -139,10 +145,10 @@ All commands support `--json` for scripting:
 
 ```bash
 # Get project ID
-temps projects show -p my-app --json | jq '.id'
+bunx @temps-sdk/cli projects show -p my-app --json | jq '.id'
 
 # List running services
-temps services list --json | jq '.[] | select(.status == "running")'
+bunx @temps-sdk/cli services list --json | jq '.[] | select(.status == "running")'
 ```
 
 ## CI/CD Automation
@@ -153,9 +159,9 @@ Use `-y/--yes` to skip prompts:
 export TEMPS_TOKEN=$TEMPS_TOKEN
 export TEMPS_API_URL=https://temps.example.com
 
-temps deploy my-app -b main -e production -y
-temps env set VERSION="1.2.3" -p my-app -e production
-temps scans trigger --project-id 5 --environment-id 1
+bunx @temps-sdk/cli deploy my-app -b main -e production -y
+bunx @temps-sdk/cli environments vars set VERSION "1.2.3" -p my-app -e production
+bunx @temps-sdk/cli scans trigger --project-id 5 --environment-id 1
 ```
 
 ## When to Use This Skill
@@ -179,9 +185,9 @@ Use this skill when you need:
 
 ## Full Documentation
 
-See [SKILL.md](SKILL.md) for complete command reference with examples (1700+ lines).
+See [SKILL.md](SKILL.md) for the complete command reference with examples (6000+ lines, all 69 command groups).
 
 ---
 
 **Package**: [@temps-sdk/cli](https://www.npmjs.com/package/@temps-sdk/cli)
-**Version**: 0.1.9
+**Version**: 0.1.26
