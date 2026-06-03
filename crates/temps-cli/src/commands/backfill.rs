@@ -214,12 +214,8 @@ async fn run_clickhouse_async(args: ClickhouseBackfillArgs) -> anyhow::Result<()
         match domain {
             BackfillDomain::Events => run_events_backfill(db.clone(), &args).await?,
             BackfillDomain::ProxyLogs | BackfillDomain::Traces | BackfillDomain::Metrics => {
-                crate::commands::ch_backfill_domains::run_domain_backfill(
-                    db.clone(),
-                    &args,
-                    domain,
-                )
-                .await?
+                crate::commands::ch_backfill_domains::run_domain_backfill(db.clone(), &args, domain)
+                    .await?
             }
             BackfillDomain::All => unreachable!("All is expanded above"),
         }
@@ -316,8 +312,7 @@ async fn run_events_backfill(
 
     // 3. Load resume cursor if requested.
     let state_path = args.state_file.clone().unwrap_or_else(default_state_path);
-    let (mut cursor, mut already_pushed) =
-        load_checkpoint_or_default(args, &state_path, from, to)?;
+    let (mut cursor, mut already_pushed) = load_checkpoint_or_default(args, &state_path, from, to)?;
     if already_pushed > 0 {
         println!(
             "{} Resuming from checkpoint — {} events already pushed",

@@ -229,10 +229,7 @@ async fn apply_schema(
     args: &ClickhouseBackfillArgs,
     domain: BackfillDomain,
 ) -> anyhow::Result<()> {
-    println!(
-        "{} Ensuring ClickHouse schema exists…",
-        "→".bright_blue()
-    );
+    println!("{} Ensuring ClickHouse schema exists…", "→".bright_blue());
     let db_name = &args.clickhouse_database;
     match domain {
         BackfillDomain::ProxyLogs => {
@@ -267,11 +264,7 @@ async fn apply_schema(
 /// requested `--from` predates it. We warn rather than abort so an operator who
 /// has already widened the TTL, or who genuinely only wants recent data, isn't
 /// blocked — but the post-copy reconciliation will also flag any actual drop.
-async fn warn_if_ttl_truncates(
-    ch: &::clickhouse::Client,
-    spec: DomainSpec,
-    since: DBDateTime,
-) {
+async fn warn_if_ttl_truncates(ch: &::clickhouse::Client, spec: DomainSpec, since: DBDateTime) {
     #[derive(::clickhouse::Row, serde::Deserialize)]
     struct TtlRow {
         ttl_days: i64,

@@ -834,7 +834,10 @@ mod tests {
             ra.labels, rb.labels
         );
         // And the output is key-sorted (BTreeMap order).
-        assert_eq!(ra.labels, r#"{"container":"web","datname":"prod","zzz":"last"}"#);
+        assert_eq!(
+            ra.labels,
+            r#"{"container":"web","datname":"prod","zzz":"last"}"#
+        );
     }
 
     #[test]
