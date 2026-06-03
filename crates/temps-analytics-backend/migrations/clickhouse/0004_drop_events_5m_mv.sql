@@ -1,0 +1,24 @@
+-- Drop the events_5m_mv SummingMergeTree materialized view.
+--
+-- The MV was a per-INSERT trigger that summed event counts into 5-minute
+-- buckets. It is removed for two reasons:
+--
+--  1. CORRECTNESS. The base `events` table is fed by an AT-LEAST-ONCE outbox
+--     fan-out (ch_fanout) plus a re-runnable backfill, so the same event_id is
+--     inserted more than once by design. The base ReplacingMergeTree(_version)
+--     dedups those re-deliveries, but the SummingMergeTree MV had already
+--     ADDED each physical insert — and Summing only ever adds, it cannot
+--     dedup. The result was systematic double-counting (observed live:
+--     sum(event_count)=468 against 233 real events, with some buckets at a
+--     non-integer overcount ratio). Any read of event_count was wrong.
+--
+--  2. DEAD WEIGHT. Nothing reads it. The events read backend queries
+--     `FROM events FINAL` (with query-time bucketing) for every rollup,
+--     including the 5-minute and hourly views the MV was meant to accelerate.
+--     There is no `FROM events_5m_mv` anywhere in the codebase. So the MV only
+--     ever cost write amplification.
+--
+-- DROP VIEW removes the MV and, because it was created without a TO clause, its
+-- backing `.inner_id.*` SummingMergeTree table along with it. Idempotent via
+-- IF EXISTS so this is safe on installs that never created the MV.
+DROP VIEW IF EXISTS events_5m_mv

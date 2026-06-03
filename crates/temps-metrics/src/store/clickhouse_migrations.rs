@@ -30,10 +30,16 @@ struct Migration {
 }
 
 /// Ordered migration list. Add new entries to the bottom only.
-const MIGRATIONS: &[Migration] = &[Migration {
-    name: "0001_service_metrics",
-    sql: include_str!("../../migrations/clickhouse/0001_service_metrics.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        name: "0001_service_metrics",
+        sql: include_str!("../../migrations/clickhouse/0001_service_metrics.sql"),
+    },
+    Migration {
+        name: "0002_service_metrics_codecs",
+        sql: include_str!("../../migrations/clickhouse/0002_service_metrics_codecs.sql"),
+    },
+];
 
 /// SQL for the migration tracking table. Created on first run.
 ///

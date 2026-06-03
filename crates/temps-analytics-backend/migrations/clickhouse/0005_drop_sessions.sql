@@ -1,0 +1,13 @@
+-- Drop the unused ClickHouse `sessions` table.
+--
+-- This table was provisioned in 0003_sessions.sql but never wired up: there is
+-- no write path that inserts into it and no read path that queries it anywhere
+-- in the codebase (visitor/session analytics is served from PostgreSQL). Live
+-- it held 0 rows. It was dead schema migrated onto every install for nothing,
+-- so we drop it.
+--
+-- If session analytics is ever moved to ClickHouse, reintroduce the table in a
+-- fresh, forward migration with the shape the read path actually needs.
+--
+-- Idempotent via IF EXISTS.
+DROP TABLE IF EXISTS sessions

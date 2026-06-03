@@ -160,8 +160,19 @@ impl ChMetricRow {
     /// Not a `From` impl because label serialization can fail and `From`
     /// cannot return a `Result`.
     fn try_from_point(p: &MetricPoint) -> Result<Self, MetricsError> {
+        // Serialize labels DETERMINISTICALLY. `MetricPoint.labels` is a
+        // `HashMap`, whose iteration order Rust randomizes per process — so the
+        // same logical label set would serialize to different JSON byte strings
+        // across runs. `labels` is part of the ClickHouse ORDER BY (the
+        // ReplacingMergeTree dedup key), so two scrapes that re-serialize
+        // identical labels in different key order would land as TWO distinct
+        // series that never dedup. Collecting into a `BTreeMap` first sorts the
+        // keys, so identical labels always produce identical bytes and the
+        // dedup contract holds. (PostgreSQL's `jsonb` is already canonical, so
+        // this also aligns the live path with the backfill path.)
+        let sorted: std::collections::BTreeMap<&String, &String> = p.labels.iter().collect();
         let labels =
-            serde_json::to_string(&p.labels).map_err(|_| MetricsError::SerializationError)?;
+            serde_json::to_string(&sorted).map_err(|_| MetricsError::SerializationError)?;
 
         // _version: Unix-ms at conversion time (ingest moment). Retried scrape
         // batches produce a higher _version and win the ReplacingMergeTree
@@ -794,6 +805,36 @@ mod tests {
             serde_json::from_str(&row.labels).expect("labels must be valid json");
         assert_eq!(labels.get("engine"), Some(&"postgres".to_string()));
         assert!(row._version > 0);
+    }
+
+    #[test]
+    fn labels_serialize_deterministically_regardless_of_insertion_order() {
+        // `labels` is in the ClickHouse ORDER BY (the ReplacingMergeTree dedup
+        // key). Two points with the SAME logical labels inserted in different
+        // order must serialize to identical bytes, or the same series splits
+        // into two rows that never dedup. This guards the BTreeMap-sort fix.
+        let mut a = point("pg.x", 1.0, MetricKind::Gauge);
+        a.labels = HashMap::new();
+        a.labels.insert("datname".into(), "prod".into());
+        a.labels.insert("container".into(), "web".into());
+        a.labels.insert("zzz".into(), "last".into());
+
+        let mut b = point("pg.x", 1.0, MetricKind::Gauge);
+        b.labels = HashMap::new();
+        // Same pairs, inserted in a different order.
+        b.labels.insert("zzz".into(), "last".into());
+        b.labels.insert("container".into(), "web".into());
+        b.labels.insert("datname".into(), "prod".into());
+
+        let ra = ChMetricRow::try_from_point(&a).unwrap();
+        let rb = ChMetricRow::try_from_point(&b).unwrap();
+        assert_eq!(
+            ra.labels, rb.labels,
+            "identical labels must serialize identically; got {} vs {}",
+            ra.labels, rb.labels
+        );
+        // And the output is key-sorted (BTreeMap order).
+        assert_eq!(ra.labels, r#"{"container":"web","datname":"prod","zzz":"last"}"#);
     }
 
     #[test]

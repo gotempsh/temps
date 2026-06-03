@@ -10916,6 +10916,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "clickhouse",
  "colored 2.2.0",
  "dirs",
  "flate2",

@@ -42,6 +42,25 @@ const MIGRATIONS: &[Migration] = &[
         name: "0003_sessions",
         sql: include_str!("../migrations/clickhouse/0003_sessions.sql"),
     },
+    // 0004/0005 are forward DROP migrations. The original CREATE migrations
+    // above are intentionally LEFT in the list: existing installs have them
+    // recorded as applied, and removing them would desync the
+    // `_temps_ch_migrations` tracking. On a fresh install the CREATE runs then
+    // the DROP immediately removes it — a tiny, harmless churn — while on an
+    // existing install only the DROP is pending. See each file's header for why
+    // the object is being removed.
+    Migration {
+        name: "0004_drop_events_5m_mv",
+        sql: include_str!("../migrations/clickhouse/0004_drop_events_5m_mv.sql"),
+    },
+    Migration {
+        name: "0005_drop_sessions",
+        sql: include_str!("../migrations/clickhouse/0005_drop_sessions.sql"),
+    },
+    Migration {
+        name: "0006_events_codecs",
+        sql: include_str!("../migrations/clickhouse/0006_events_codecs.sql"),
+    },
 ];
 
 /// SQL for the migration tracking table itself. Created on first run.
