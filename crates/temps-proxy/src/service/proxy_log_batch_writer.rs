@@ -1,4 +1,4 @@
-use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
+use sea_orm::DatabaseConnection;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -6,6 +6,7 @@ use tracing::{debug, error, info, warn};
 
 use super::proxy_log_service::CreateProxyLogRequest;
 use crate::crawler_detector::CrawlerDetector;
+use crate::storage::ProxyLogStorage;
 
 /// Maximum number of log entries buffered in the channel before backpressure kicks in.
 /// At ~4 KB per entry, 8192 entries = ~32 MB maximum memory usage.
@@ -39,25 +40,44 @@ impl ProxyLogBatchHandle {
     }
 }
 
-/// Background batch writer that collects proxy log entries and inserts them
-/// in batches using multi-row INSERT statements for high throughput.
+/// Background batch writer that collects proxy log entries and persists them in
+/// batches via the configured [`ProxyLogStorage`] backend (TimescaleDB multi-row
+/// INSERT by default, ClickHouse when `TEMPS_CLICKHOUSE_*` is configured).
+///
+/// This task runs OFF the Pingora hot path — the hot path only ever does a
+/// non-blocking `try_send` into the bounded channel. Persistence is fail-open:
+/// if the backend errors, the batch is logged and dropped, never blocking live
+/// traffic and never panicking.
 pub struct ProxyLogBatchWriter {
+    /// Database connection retained only for IP enrichment (`ip_service` owns
+    /// the actual DB work). The proxy-log rows are written via `storage`.
+    #[allow(dead_code)]
     db: Arc<DatabaseConnection>,
     ip_service: Arc<temps_geo::IpAddressService>,
+    /// Pluggable persistence backend. Reproduces the prior TimescaleDB batch
+    /// INSERT, or routes to ClickHouse when enabled.
+    storage: Arc<dyn ProxyLogStorage>,
     receiver: mpsc::Receiver<CreateProxyLogRequest>,
 }
 
 impl ProxyLogBatchWriter {
     /// Create a new batch writer and return the handle for sending entries.
+    ///
+    /// `storage` is the persistence backend selected by
+    /// [`crate::storage::build_proxy_log_storage`] from the server config — the
+    /// same backend the HTTP read handlers use, so writes and reads always agree
+    /// on where proxy logs live.
     pub fn new(
         db: Arc<DatabaseConnection>,
         ip_service: Arc<temps_geo::IpAddressService>,
+        storage: Arc<dyn ProxyLogStorage>,
     ) -> (ProxyLogBatchHandle, Self) {
         let (sender, receiver) = mpsc::channel(CHANNEL_CAPACITY);
         let handle = ProxyLogBatchHandle { sender };
         let writer = Self {
             db,
             ip_service,
+            storage,
             receiver,
         };
         (handle, writer)
@@ -135,14 +155,19 @@ impl ProxyLogBatchWriter {
             self.enrich_entry(entry).await;
         }
 
-        // Build and execute batch INSERT
-        if let Err(e) = self.batch_insert(batch).await {
+        // Persist via the configured storage backend. FAIL OPEN: on backend
+        // error we log and drop the batch — we never block live traffic and
+        // never panic (this task is off the Pingora hot path, but the backend
+        // could be down, e.g. ClickHouse unreachable).
+        if let Err(e) = self.storage.write_batch(std::mem::take(batch)).await {
             error!(
-                "Failed to batch insert {} proxy log entries: {:?}",
+                "Failed to persist {} proxy log entries (dropping batch): {:?}",
                 count, e
             );
         }
 
+        // `std::mem::take` already emptied the batch; clear() is a defensive
+        // no-op in case write_batch short-circuits before taking ownership.
         batch.clear();
     }
 
@@ -195,122 +220,6 @@ impl ProxyLogBatchWriter {
             }
         }
     }
-
-    async fn batch_insert(&self, entries: &[CreateProxyLogRequest]) -> Result<(), sea_orm::DbErr> {
-        if entries.is_empty() {
-            return Ok(());
-        }
-
-        // Build a multi-row INSERT statement:
-        // INSERT INTO proxy_logs (col1, col2, ...) VALUES ($1, $2, ...), ($N+1, $N+2, ...), ...
-        let columns = [
-            "timestamp",
-            "method",
-            "path",
-            "query_string",
-            "host",
-            "status_code",
-            "response_time_ms",
-            "request_source",
-            "is_system_request",
-            "routing_status",
-            "project_id",
-            "environment_id",
-            "deployment_id",
-            "session_id",
-            "visitor_id",
-            "container_id",
-            "upstream_host",
-            "error_message",
-            "client_ip",
-            "user_agent",
-            "referrer",
-            "request_id",
-            "ip_geolocation_id",
-            "browser",
-            "browser_version",
-            "operating_system",
-            "device_type",
-            "is_bot",
-            "bot_name",
-            "request_size_bytes",
-            "response_size_bytes",
-            "cache_status",
-            "request_headers",
-            "response_headers",
-            "created_date",
-        ];
-        let cols_per_row = columns.len();
-
-        let mut sql = format!("INSERT INTO proxy_logs ({}) VALUES ", columns.join(", "));
-
-        let mut params: Vec<sea_orm::Value> = Vec::with_capacity(entries.len() * cols_per_row);
-        let now = chrono::Utc::now();
-
-        for (i, entry) in entries.iter().enumerate() {
-            if i > 0 {
-                sql.push_str(", ");
-            }
-            let offset = i * cols_per_row;
-            sql.push('(');
-            for j in 0..cols_per_row {
-                if j > 0 {
-                    sql.push_str(", ");
-                }
-                sql.push_str(&format!("${}", offset + j + 1));
-            }
-            sql.push(')');
-
-            let created_date = now.date_naive();
-
-            params.push(now.into()); // timestamp
-            params.push(entry.method.clone().into()); // method
-            params.push(entry.path.clone().into()); // path
-            params.push(entry.query_string.clone().into()); // query_string
-            params.push(entry.host.clone().into()); // host
-            params.push(entry.status_code.into()); // status_code
-            params.push(entry.response_time_ms.into()); // response_time_ms
-            params.push(entry.request_source.clone().into()); // request_source
-            params.push(entry.is_system_request.into()); // is_system_request
-            params.push(entry.routing_status.clone().into()); // routing_status
-            params.push(entry.project_id.into()); // project_id
-            params.push(entry.environment_id.into()); // environment_id
-            params.push(entry.deployment_id.into()); // deployment_id
-            params.push(entry.session_id.into()); // session_id
-            params.push(entry.visitor_id.into()); // visitor_id
-            params.push(entry.container_id.clone().into()); // container_id
-            params.push(entry.upstream_host.clone().into()); // upstream_host
-            params.push(entry.error_message.clone().into()); // error_message
-            params.push(entry.client_ip.clone().into()); // client_ip
-            params.push(entry.user_agent.clone().into()); // user_agent
-            params.push(entry.referrer.clone().into()); // referrer
-            params.push(entry.request_id.clone().into()); // request_id
-            params.push(entry.ip_geolocation_id.into()); // ip_geolocation_id
-            params.push(entry.browser.clone().into()); // browser
-            params.push(entry.browser_version.clone().into()); // browser_version
-            params.push(entry.operating_system.clone().into()); // operating_system
-            params.push(entry.device_type.clone().into()); // device_type
-            params.push(entry.is_bot.into()); // is_bot
-            params.push(entry.bot_name.clone().into()); // bot_name
-            params.push(entry.request_size_bytes.into()); // request_size_bytes
-            params.push(entry.response_size_bytes.into()); // response_size_bytes
-            params.push(entry.cache_status.clone().into()); // cache_status
-            params.push(entry.request_headers.clone().into()); // request_headers
-            params.push(entry.response_headers.clone().into()); // response_headers
-            params.push(created_date.into()); // created_date
-        }
-
-        self.db
-            .execute(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                &sql,
-                params,
-            ))
-            .await?;
-
-        debug!("Batch inserted {} proxy log entries", entries.len());
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -325,11 +234,24 @@ mod tests {
         Arc::new(temps_geo::IpAddressService::new(db, geoip_service))
     }
 
+    /// Build the default (TimescaleDB) storage backend for batch-writer tests.
+    /// These tests never call `write_batch` against a live DB — they exercise
+    /// the channel + enrichment paths — so a disconnected store is fine.
+    fn create_test_storage(
+        db: Arc<DatabaseConnection>,
+        ip_service: Arc<temps_geo::IpAddressService>,
+    ) -> Arc<dyn ProxyLogStorage> {
+        Arc::new(crate::storage::TimescaleDbProxyLogStore::new(
+            db, ip_service,
+        ))
+    }
+
     #[tokio::test]
     async fn test_batch_handle_send_and_receive() {
         let db = Arc::new(DatabaseConnection::default());
         let ip_service = create_test_ip_service(db.clone());
-        let (handle, mut writer) = ProxyLogBatchWriter::new(db, ip_service);
+        let storage = create_test_storage(db.clone(), ip_service.clone());
+        let (handle, mut writer) = ProxyLogBatchWriter::new(db, ip_service, storage);
 
         let request = CreateProxyLogRequest {
             method: "GET".to_string(),
@@ -382,7 +304,8 @@ mod tests {
     async fn test_batch_handle_try_send() {
         let db = Arc::new(DatabaseConnection::default());
         let ip_service = create_test_ip_service(db.clone());
-        let (handle, _writer) = ProxyLogBatchWriter::new(db, ip_service);
+        let storage = create_test_storage(db.clone(), ip_service.clone());
+        let (handle, _writer) = ProxyLogBatchWriter::new(db, ip_service, storage);
 
         let request = CreateProxyLogRequest {
             method: "GET".to_string(),
@@ -430,7 +353,8 @@ mod tests {
     async fn test_batch_handle_closed_channel() {
         let db = Arc::new(DatabaseConnection::default());
         let ip_service = create_test_ip_service(db.clone());
-        let (handle, writer) = ProxyLogBatchWriter::new(db, ip_service);
+        let storage = create_test_storage(db.clone(), ip_service.clone());
+        let (handle, writer) = ProxyLogBatchWriter::new(db, ip_service, storage);
 
         // Drop the writer (closes the receiver end)
         drop(writer);
@@ -481,7 +405,8 @@ mod tests {
     async fn test_enrich_entry_parses_user_agent() {
         let db = Arc::new(DatabaseConnection::default());
         let ip_service = create_test_ip_service(db.clone());
-        let (_, writer) = ProxyLogBatchWriter::new(db, ip_service);
+        let storage = create_test_storage(db.clone(), ip_service.clone());
+        let (_, writer) = ProxyLogBatchWriter::new(db, ip_service, storage);
 
         let mut entry = CreateProxyLogRequest {
             method: "GET".to_string(),
@@ -539,7 +464,8 @@ mod tests {
     async fn test_enrich_entry_detects_bot() {
         let db = Arc::new(DatabaseConnection::default());
         let ip_service = create_test_ip_service(db.clone());
-        let (_, writer) = ProxyLogBatchWriter::new(db, ip_service);
+        let storage = create_test_storage(db.clone(), ip_service.clone());
+        let (_, writer) = ProxyLogBatchWriter::new(db, ip_service, storage);
 
         let mut entry = CreateProxyLogRequest {
             method: "GET".to_string(),
@@ -594,7 +520,8 @@ mod tests {
     async fn test_enrich_entry_detects_ai_agent_canonical_name() {
         let db = Arc::new(DatabaseConnection::default());
         let ip_service = create_test_ip_service(db.clone());
-        let (_, writer) = ProxyLogBatchWriter::new(db, ip_service);
+        let storage = create_test_storage(db.clone(), ip_service.clone());
+        let (_, writer) = ProxyLogBatchWriter::new(db, ip_service, storage);
 
         // (user_agent, expected canonical bot_name) across several providers.
         let cases = [

@@ -226,11 +226,20 @@ pub fn setup_proxy_server(
     let ip_service = context.require_service::<temps_geo::IpAddressService>();
     let config_service = context.require_service::<temps_config::ConfigService>();
 
-    // Create batch writer for proxy logs (bounded channel + background batch INSERT)
+    // Select the proxy-log storage backend (ClickHouse when TEMPS_CLICKHOUSE_*
+    // is configured, else TimescaleDB). The batch writer must use the SAME
+    // backend the API read handlers use so writes and reads agree. The
+    // ClickHouse client lives only in this background task — never the Pingora
+    // hot path.
+    let proxy_log_storage =
+        crate::storage::build_proxy_log_storage(&config, db.clone(), ip_service.clone());
+
+    // Create batch writer for proxy logs (bounded channel + background batch write)
     let (proxy_log_handle, proxy_log_writer) =
         crate::service::proxy_log_batch_writer::ProxyLogBatchWriter::new(
             db.clone(),
             ip_service.clone(),
+            proxy_log_storage,
         );
 
     // Spawn the batch writer background task
@@ -400,11 +409,20 @@ pub fn create_proxy_service(
     let ip_service = context.require_service::<temps_geo::IpAddressService>();
     let config_service = context.require_service::<temps_config::ConfigService>();
 
-    // Create batch writer for proxy logs (bounded channel + background batch INSERT)
+    // Select the proxy-log storage backend (ClickHouse when TEMPS_CLICKHOUSE_*
+    // is configured, else TimescaleDB). The batch writer must use the SAME
+    // backend the API read handlers use so writes and reads agree. The
+    // ClickHouse client lives only in this background task — never the Pingora
+    // hot path.
+    let proxy_log_storage =
+        crate::storage::build_proxy_log_storage(&config, db.clone(), ip_service.clone());
+
+    // Create batch writer for proxy logs (bounded channel + background batch write)
     let (proxy_log_handle, proxy_log_writer) =
         crate::service::proxy_log_batch_writer::ProxyLogBatchWriter::new(
             db.clone(),
             ip_service.clone(),
+            proxy_log_storage,
         );
 
     // Spawn the batch writer background task

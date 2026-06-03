@@ -12258,6 +12258,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "clickhouse",
  "cookie 0.18.1",
  "dashmap",
  "flate2",

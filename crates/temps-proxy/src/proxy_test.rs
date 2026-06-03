@@ -241,10 +241,14 @@ pub mod proxy_tests {
 
         let ip_service = create_mock_ip_service(test_db.db.clone());
 
+        let proxy_log_storage: Arc<dyn crate::storage::ProxyLogStorage> = Arc::new(
+            crate::storage::TimescaleDbProxyLogStore::new(test_db.db.clone(), ip_service.clone()),
+        );
         let (proxy_log_handle, _proxy_log_writer) =
             crate::service::proxy_log_batch_writer::ProxyLogBatchWriter::new(
                 test_db.db.clone(),
                 ip_service.clone(),
+                proxy_log_storage,
             );
 
         let project_context_resolver = Arc::new(ProjectContextResolverImpl::new(mock_route_table))
@@ -871,10 +875,16 @@ pub mod proxy_tests {
         let crypto = create_test_crypto();
         let upstream_resolver = Arc::new(MockUpstreamResolver::default());
         let ip_service = create_mock_ip_service(db.clone());
+        let proxy_log_storage: Arc<dyn crate::storage::ProxyLogStorage> =
+            Arc::new(crate::storage::TimescaleDbProxyLogStore::new(
+                db.clone(),
+                ip_service.clone(),
+            ));
         let (proxy_log_handle, _proxy_log_writer) =
             crate::service::proxy_log_batch_writer::ProxyLogBatchWriter::new(
                 db.clone(),
                 ip_service,
+                proxy_log_storage,
             );
         let visitor_manager = Arc::new(MockVisitorManager::default());
         let session_manager = Arc::new(MockSessionManager::default());

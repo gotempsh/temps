@@ -14,6 +14,13 @@ pub enum ProxyLogServiceError {
 
     #[error("Invalid filter parameters: {0}")]
     InvalidFilter(String),
+
+    /// A ClickHouse operation failed. `operation` names the storage method
+    /// (e.g. `list_with_filters`, `write_batch`) so logs/responses can identify
+    /// exactly which read/write path hit the backend error. Not a `#[from]` of
+    /// `clickhouse::error::Error` because we always want the operation context.
+    #[error("ClickHouse error during {operation}: {reason}")]
+    ClickHouse { operation: String, reason: String },
 }
 
 /// Response model for proxy logs
@@ -144,11 +151,43 @@ pub struct CreateProxyLogRequest {
 pub struct ProxyLogService {
     db: Arc<DatabaseConnection>,
     ip_service: Arc<temps_geo::IpAddressService>,
+    /// Optional alternative storage backend. When `Some`, every read method that
+    /// the HTTP handlers call dispatches to this trait object (the ClickHouse
+    /// backend) instead of running the inline TimescaleDB query. When `None`
+    /// (the default), the inline TimescaleDB logic runs unchanged —
+    /// byte-for-byte identical to the prior behaviour.
+    ///
+    /// IMPORTANT: this is ALWAYS `None` for the `ProxyLogService` that the
+    /// [`crate::storage::TimescaleDbProxyLogStore`] holds internally as its read
+    /// relay, so the TimescaleDB trait impl never recurses back into a dispatch.
+    storage: Option<Arc<dyn crate::storage::ProxyLogStorage>>,
 }
 
 impl ProxyLogService {
+    /// Construct a service that talks directly to TimescaleDB (the default).
     pub fn new(db: Arc<DatabaseConnection>, ip_service: Arc<temps_geo::IpAddressService>) -> Self {
-        Self { db, ip_service }
+        Self {
+            db,
+            ip_service,
+            storage: None,
+        }
+    }
+
+    /// Construct a service that dispatches every read through the supplied
+    /// storage backend (used to serve handlers from ClickHouse when
+    /// `TEMPS_CLICKHOUSE_*` is configured). The `db` / `ip_service` are still
+    /// held so any non-dispatched path (e.g. `create`) keeps working, but the
+    /// list / lookup / stats methods delegate to `storage`.
+    pub fn with_storage(
+        db: Arc<DatabaseConnection>,
+        ip_service: Arc<temps_geo::IpAddressService>,
+        storage: Arc<dyn crate::storage::ProxyLogStorage>,
+    ) -> Self {
+        Self {
+            db,
+            ip_service,
+            storage: Some(storage),
+        }
     }
 
     /// Create a new proxy log entry asynchronously
@@ -259,6 +298,12 @@ impl ProxyLogService {
         page: u64,
         page_size: u64,
     ) -> Result<(Vec<proxy_logs::Model>, u64), ProxyLogServiceError> {
+        if let Some(storage) = &self.storage {
+            return storage
+                .list_with_filters(start_date, end_date, filters, page, page_size)
+                .await;
+        }
+
         let mut query = proxy_logs::Entity::find();
 
         // Whether any narrowing predicate is set. When nothing is filtered,
@@ -575,6 +620,9 @@ impl ProxyLogService {
         &self,
         id: i32,
     ) -> Result<Option<proxy_logs::Model>, ProxyLogServiceError> {
+        if let Some(storage) = &self.storage {
+            return storage.get_by_id(id).await;
+        }
         let log = proxy_logs::Entity::find_by_id(id)
             .one(self.db.as_ref())
             .await?;
@@ -586,6 +634,9 @@ impl ProxyLogService {
         &self,
         request_id: &str,
     ) -> Result<Option<proxy_logs::Model>, ProxyLogServiceError> {
+        if let Some(storage) = &self.storage {
+            return storage.get_by_request_id(request_id).await;
+        }
         let log = proxy_logs::Entity::find()
             .filter(proxy_logs::Column::RequestId.eq(request_id))
             .one(self.db.as_ref())
@@ -598,6 +649,9 @@ impl ProxyLogService {
         &self,
         filters: Option<StatsFilters>,
     ) -> Result<i64, ProxyLogServiceError> {
+        if let Some(storage) = &self.storage {
+            return storage.get_today_count(filters).await;
+        }
         let today_start = Utc::now().date_naive().and_hms_opt(0, 0, 0).unwrap();
         let today_start = chrono::DateTime::<Utc>::from_naive_utc_and_offset(today_start, Utc);
 
@@ -621,6 +675,11 @@ impl ProxyLogService {
         bucket_interval: String, // e.g., "1 hour", "1 day", "5 minutes"
         filters: Option<StatsFilters>,
     ) -> Result<Vec<TimeBucketStats>, ProxyLogServiceError> {
+        if let Some(storage) = &self.storage {
+            return storage
+                .get_time_bucket_stats(start_time, end_time, bucket_interval, filters)
+                .await;
+        }
         // Validate bucket interval
         if !Self::is_valid_interval(&bucket_interval) {
             return Err(ProxyLogServiceError::InvalidFilter(format!(
@@ -725,6 +784,11 @@ impl ProxyLogService {
         end_time: UtcDateTime,
         is_bot: Option<bool>,
     ) -> Result<Vec<ProjectHealthSummary>, ProxyLogServiceError> {
+        if let Some(storage) = &self.storage {
+            return storage
+                .get_projects_health_summary(project_ids, start_time, end_time, is_bot)
+                .await;
+        }
         if project_ids.is_empty() {
             return Ok(vec![]);
         }
@@ -1044,6 +1108,18 @@ impl ProxyLogService {
         end_time: UtcDateTime,
         limit: u64,
     ) -> Result<Vec<AiAgentBreakdownRow>, ProxyLogServiceError> {
+        if let Some(storage) = &self.storage {
+            return storage
+                .get_ai_agent_breakdown(
+                    project_id,
+                    environment_id,
+                    path,
+                    start_time,
+                    end_time,
+                    limit,
+                )
+                .await;
+        }
         let known: Vec<&str> = crate::ai_agent_detector::known_agents()
             .iter()
             .map(|(_, m)| m.agent)
@@ -1162,6 +1238,18 @@ impl ProxyLogService {
         end_time: UtcDateTime,
         limit: u64,
     ) -> Result<Vec<AiPageBreakdownRow>, ProxyLogServiceError> {
+        if let Some(storage) = &self.storage {
+            return storage
+                .get_ai_page_breakdown(
+                    project_id,
+                    environment_id,
+                    path,
+                    start_time,
+                    end_time,
+                    limit,
+                )
+                .await;
+        }
         let known: Vec<&str> = crate::ai_agent_detector::known_agents()
             .iter()
             .map(|(_, m)| m.agent)
@@ -1261,6 +1349,18 @@ impl ProxyLogService {
         bucket_interval: String,
         group_by: AiTimelineGroupBy,
     ) -> Result<Vec<AiAgentTimelineRow>, ProxyLogServiceError> {
+        if let Some(storage) = &self.storage {
+            return storage
+                .get_ai_agent_timeline(
+                    project_id,
+                    environment_id,
+                    start_time,
+                    end_time,
+                    bucket_interval,
+                    group_by,
+                )
+                .await;
+        }
         if !Self::is_valid_interval(&bucket_interval) {
             return Err(ProxyLogServiceError::InvalidFilter(format!(
                 "Invalid bucket interval: {}",
@@ -1454,6 +1554,11 @@ impl ProxyLogService {
         start_time: UtcDateTime,
         end_time: UtcDateTime,
     ) -> Result<Vec<AiStatusBreakdownRow>, ProxyLogServiceError> {
+        if let Some(storage) = &self.storage {
+            return storage
+                .get_ai_status_breakdown(project_id, environment_id, start_time, end_time)
+                .await;
+        }
         let known: Vec<&str> = crate::ai_agent_detector::known_agents()
             .iter()
             .map(|(_, m)| m.agent)

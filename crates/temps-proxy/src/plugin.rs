@@ -34,11 +34,51 @@ impl TempsPlugin for ProxyPlugin {
             // Get IP service
             let ip_service = context.require_service::<temps_geo::IpAddressService>();
 
+            // Get the server config so we can select the proxy-log storage
+            // backend. When TEMPS_CLICKHOUSE_* is configured the handlers read
+            // proxy/request logs from ClickHouse; otherwise they use TimescaleDB
+            // exactly as before.
+            //
+            // ConfigService is always registered in the running server. We read
+            // it via `get_service` (not `require_service`) so the storage
+            // selection degrades to the default TimescaleDB backend if it is
+            // somehow absent — proxy logging must never fail to register. When
+            // present and CH is enabled, the handler reads go to ClickHouse.
+            let server_config = context
+                .get_service::<temps_config::ConfigService>()
+                .map(|cs| cs.get_server_config());
+
             // Create LB service
             let lb_service = Arc::new(LbService::new(db.clone()));
 
-            // Create Proxy Log service with IP service for enrichment
-            let proxy_log_service = Arc::new(ProxyLogService::new(db.clone(), ip_service));
+            // Build the proxy-log storage backend (ClickHouse when enabled, else
+            // TimescaleDB) and wire it into the read service the handlers use.
+            // When ClickHouse is NOT configured this resolves to the default
+            // TimescaleDB path with no behaviour change.
+            let proxy_log_storage = match server_config {
+                Some(config) => {
+                    crate::storage::build_proxy_log_storage(&config, db.clone(), ip_service.clone())
+                }
+                None => {
+                    tracing::debug!(
+                        "Proxy plugin: ConfigService unavailable; proxy logs use the \
+                         default TimescaleDB backend"
+                    );
+                    Arc::new(crate::storage::TimescaleDbProxyLogStore::new(
+                        db.clone(),
+                        ip_service.clone(),
+                    )) as Arc<dyn crate::storage::ProxyLogStorage>
+                }
+            };
+
+            // Create Proxy Log service dispatching reads through the selected
+            // storage backend. `db`/`ip_service` are still held for the
+            // (handler-unused) enriching `create` path.
+            let proxy_log_service = Arc::new(ProxyLogService::with_storage(
+                db.clone(),
+                ip_service,
+                proxy_log_storage,
+            ));
 
             // Create IP Access Control service
             let ip_access_control_service = Arc::new(IpAccessControlService::new(db.clone()));
@@ -137,6 +177,10 @@ mod tests {
             geo_ip_service,
         ));
         context.register_service(ip_service);
+
+        // No ConfigService is registered here: the plugin reads it via
+        // `get_service` and, when absent, selects the default TimescaleDB
+        // proxy-log backend — which is exactly what we want to exercise.
 
         let plugin = ProxyPlugin::new();
         // Call register_services method correctly
