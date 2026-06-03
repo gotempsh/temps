@@ -82,7 +82,9 @@ pub struct ClickhouseBackfillArgs {
     pub domain: BackfillDomain,
 
     /// PostgreSQL connection URL (system of record).
-    #[arg(long, env = "TEMPS_DATABASE_URL")]
+    // hide_env_values: a Postgres URL embeds credentials
+    // (postgres://user:password@host/db), so keep its env value out of --help.
+    #[arg(long, env = "TEMPS_DATABASE_URL", hide_env_values = true)]
     pub database_url: String,
 
     /// ClickHouse HTTP endpoint URL (e.g. https://ch.example.internal:8443).
