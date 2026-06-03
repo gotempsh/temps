@@ -6,8 +6,8 @@ mod connection;
 
 pub use approx_count::{approximate_row_count, count_for_pagination, CountKind};
 pub use connection::{
-    connect_without_migrations, establish_connection, run_migrations, run_post_migration_backfill,
-    DbConnection,
+    connect_without_migrations, establish_connection, run_migrations, run_migrations_reported,
+    run_post_migration_backfill, DbConnection, MigrationRunReport, MigrationStepResult,
 };
 
 // Export test utilities for use by other crates in their tests

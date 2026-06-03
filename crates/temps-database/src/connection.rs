@@ -263,6 +263,119 @@ pub async fn run_migrations(db: &DbConnection) -> ServiceResult<()> {
     }
 }
 
+/// Outcome of one migration applied by [`run_migrations_reported`].
+#[derive(Debug, Clone)]
+pub struct MigrationStepResult {
+    /// The migration's name (e.g. `m20260603_000001_create_otel_trace_summaries`).
+    pub name: String,
+    /// Whether `up()` succeeded for this migration.
+    pub success: bool,
+    /// Wall-clock time the migration took.
+    pub elapsed: Duration,
+    /// The error message when `success` is false.
+    pub error: Option<String>,
+}
+
+/// Report returned by [`run_migrations_reported`]: the plan (pending names
+/// discovered before applying) and the per-migration results.
+#[derive(Debug, Clone, Default)]
+pub struct MigrationRunReport {
+    /// Names of the migrations that were pending at the start, in apply order.
+    pub planned: Vec<String>,
+    /// One entry per migration actually attempted, in apply order. On the
+    /// first failure, application stops and no further entries are added — so
+    /// `results.len() <= planned.len()` and the last entry is the failure.
+    pub results: Vec<MigrationStepResult>,
+}
+
+impl MigrationRunReport {
+    /// True when every planned migration applied successfully (or there was
+    /// nothing to apply).
+    pub fn all_succeeded(&self) -> bool {
+        self.results.iter().all(|r| r.success) && self.results.len() == self.planned.len()
+    }
+
+    /// The migration that failed, if any.
+    pub fn failed(&self) -> Option<&MigrationStepResult> {
+        self.results.iter().find(|r| !r.success)
+    }
+}
+
+/// Apply pending schema migrations one at a time, returning a [`MigrationRunReport`]
+/// so callers (the `temps migrate` CLI) can print a plan up front and a
+/// pass/fail line per migration.
+///
+/// Behaves like [`run_migrations`] but step-wise: it reads the pending list via
+/// `Migrator::get_pending_migrations`, then applies each with `Migrator::up(db,
+/// Some(1))`, timing each and stopping at the first failure. The same
+/// `lock_timeout` guard is applied so a contended lock fails fast instead of
+/// hanging. Each step is bounded by [`MIGRATION_TIMEOUT`].
+///
+/// This does NOT run the post-migration continuous-aggregate backfill — the
+/// caller runs [`run_post_migration_backfill`] afterwards, exactly as the
+/// all-or-nothing path does.
+pub async fn run_migrations_reported(db: &DbConnection) -> ServiceResult<MigrationRunReport> {
+    // Fail fast on contended locks rather than hanging (mirrors run_migrations).
+    if let Err(e) = db
+        .execute(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("SET lock_timeout = '{}ms'", MIGRATION_LOCK_TIMEOUT_MS),
+        ))
+        .await
+    {
+        debug!(
+            "Could not set lock_timeout for migrations (non-fatal): {}",
+            e
+        );
+    }
+
+    // 1. Read the plan: which migrations are pending, in apply order.
+    let pending = Migrator::get_pending_migrations(db)
+        .await
+        .map_err(|e| ServiceError::Database(format!("Failed to read pending migrations: {}", e)))?;
+
+    let mut report = MigrationRunReport {
+        planned: pending.iter().map(|m| m.name().to_string()).collect(),
+        results: Vec::new(),
+    };
+
+    // 2. Apply each pending migration individually so we can time and report it.
+    //    `Migrator::up(db, Some(1))` applies exactly the next pending migration.
+    for migration in &pending {
+        let name = migration.name().to_string();
+        let started = std::time::Instant::now();
+
+        let outcome = match timeout(MIGRATION_TIMEOUT, Migrator::up(db, Some(1))).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(format!("{}", e)),
+            Err(_) => Err(format!("timed out after {}s", MIGRATION_TIMEOUT.as_secs())),
+        };
+        let elapsed = started.elapsed();
+
+        match outcome {
+            Ok(()) => report.results.push(MigrationStepResult {
+                name,
+                success: true,
+                elapsed,
+                error: None,
+            }),
+            Err(err) => {
+                report.results.push(MigrationStepResult {
+                    name,
+                    success: false,
+                    elapsed,
+                    error: Some(err),
+                });
+                // Stop at the first failure — later migrations may depend on
+                // the one that just failed, and Sea-ORM won't have applied them.
+                break;
+            }
+        }
+    }
+
+    Ok(report)
+}
+
 /// Run post-migration backfill for continuous aggregates.
 ///
 /// `CALL refresh_continuous_aggregate()` cannot run inside a transaction block,
