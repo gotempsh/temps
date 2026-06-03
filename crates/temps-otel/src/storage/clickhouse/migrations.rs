@@ -95,20 +95,13 @@ pub async fn apply_migrations(
 
     // 1. Ensure the target database exists.
     //
-    // We build a temporary client without a database binding so the
-    // `CREATE DATABASE` statement is valid from any context. The original
-    // `client` already has `.with_database(database_name)` configured for
-    // all subsequent DDL.
-    //
-    // The URL is extracted from the client by cloning and overriding with
-    // no database; we reconstruct it from the same base URL.  Since
-    // `clickhouse::Client` does not expose the base URL we use a known-safe
-    // workaround: run `CREATE DATABASE` via the already-configured client.
-    // ClickHouse allows this statement regardless of the currently-selected
-    // database — the `DATABASE` clause in the statement names the target
-    // explicitly.
+    // The passed-in `client` is scoped to the target database, and ClickHouse
+    // rejects requests whose session database does not yet exist — including the
+    // CREATE DATABASE itself. Run this one statement on a clone scoped to the
+    // always-present `default` database so the target can be bootstrapped.
+    let bootstrap = client.clone().with_database("default");
     let create_db_sql = format!("CREATE DATABASE IF NOT EXISTS `{database_name}`");
-    client
+    bootstrap
         .query(&create_db_sql)
         .execute()
         .await
@@ -179,14 +172,15 @@ pub async fn apply_migrations(
 
 /// Execute a multi-statement SQL blob against ClickHouse.
 ///
-/// ClickHouse's HTTP endpoint accepts only one statement per request, so we
-/// split on `;\n` (the same delimiter used by the analytics backend runner)
-/// and execute each non-empty piece separately. Leading whole-line `--`
-/// comments are stripped before the emptiness check so comment-only chunks
-/// are silently skipped rather than sent as empty requests.
+/// ClickHouse's HTTP endpoint accepts only one statement per request. We strip
+/// every whole-line `--` comment from the blob FIRST, then split on `;`. Order
+/// matters: a `;` inside a comment (e.g. prose like "no rollup MVs;") must not
+/// become a statement boundary — splitting first would slice a CREATE TABLE in
+/// half. Inline `--` comments after code on the same line are left intact.
 async fn execute_multi(client: &::clickhouse::Client, sql: &str) -> Result<(), OtelError> {
-    for raw in sql.split(";\n") {
-        let stmt = strip_leading_line_comments(raw).trim();
+    let cleaned = strip_whole_line_comments(sql);
+    for raw in cleaned.split(';') {
+        let stmt = raw.trim();
         if stmt.is_empty() {
             continue;
         }
@@ -204,21 +198,18 @@ async fn execute_multi(client: &::clickhouse::Client, sql: &str) -> Result<(), O
     Ok(())
 }
 
-/// Drop leading whole-line `--` comments and blank lines from a SQL chunk.
-///
-/// Stops at the first non-comment/non-blank line so inline `--` comments
-/// inside a statement body are preserved unchanged.
-fn strip_leading_line_comments(raw: &str) -> &str {
-    let mut offset = 0;
-    for line in raw.split_inclusive('\n') {
-        let trimmed = line.trim_start();
-        if trimmed.is_empty() || trimmed.starts_with("--") {
-            offset += line.len();
-        } else {
-            break;
-        }
-    }
-    &raw[offset..]
+/// Remove every whole-line `--` comment (or blank line) across the whole blob,
+/// before statement splitting. A line counts as a comment if, after trimming
+/// leading whitespace, it starts with `--`. Lines with code followed by a
+/// trailing `--` comment are kept verbatim (ClickHouse accepts them).
+fn strip_whole_line_comments(sql: &str) -> String {
+    sql.lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.is_empty() && !trimmed.starts_with("--")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -238,31 +229,56 @@ mod tests {
         let sql = "-- Spans table: system-of-record for OTel traces.\n\
                    -- Sort key intentionally puts project_id first.\n\
                    CREATE TABLE IF NOT EXISTS spans (id Int64) ENGINE = MergeTree ORDER BY id";
-        let stripped = strip_leading_line_comments(sql).trim();
+        let stripped = strip_whole_line_comments(sql).trim().to_string();
         assert!(stripped.starts_with("CREATE TABLE IF NOT EXISTS spans"));
     }
 
     #[test]
-    fn preserves_inline_comments_inside_statement() {
+    fn drops_whole_line_comments_inside_statement() {
+        // A whole-line comment between column defs is removed, but the
+        // surrounding code is preserved and joins into one statement.
         let sql = "CREATE TABLE bar (\n\
                    -- column comment\n\
                    id Int64\n\
                    ) ENGINE = MergeTree ORDER BY id";
-        let stripped = strip_leading_line_comments(sql);
-        assert!(stripped.contains("-- column comment"));
+        let stripped = strip_whole_line_comments(sql);
+        assert!(!stripped.contains("-- column comment"));
+        assert!(stripped.contains("id Int64"));
+        assert!(stripped.contains("CREATE TABLE bar"));
     }
 
     #[test]
     fn returns_empty_for_pure_comment_chunk() {
         let sql = "-- just a comment\n-- and another\n";
-        assert!(strip_leading_line_comments(sql).trim().is_empty());
+        assert!(strip_whole_line_comments(sql).trim().is_empty());
     }
 
     #[test]
     fn handles_blank_lines_between_leading_comments() {
         let sql = "-- header\n\n-- more header\n\nCREATE TABLE baz (id Int64) ENGINE = MergeTree ORDER BY id";
-        let stripped = strip_leading_line_comments(sql).trim();
+        let stripped = strip_whole_line_comments(sql).trim().to_string();
         assert!(stripped.starts_with("CREATE TABLE baz"));
+    }
+
+    /// Regression: a `;` inside a comment must NOT split the following statement
+    /// in half. This is the exact bug that crashed the metrics migration at boot
+    /// (splitting on ";\n" before stripping comments sliced the CREATE TABLE).
+    #[test]
+    fn semicolon_inside_comment_does_not_split_statement() {
+        let sql = "-- no rollup MVs; query-time bucketing instead\n\
+                   CREATE TABLE t (\n\
+                   -- id is the key; nothing else\n\
+                   id Int64\n\
+                   ) ENGINE = MergeTree ORDER BY id";
+        let cleaned = strip_whole_line_comments(sql);
+        let stmts: Vec<&str> = cleaned
+            .split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(stmts.len(), 1, "must be ONE statement, got: {stmts:?}");
+        assert!(stmts[0].starts_with("CREATE TABLE t"));
+        assert!(stmts[0].contains("id Int64"));
     }
 
     // ── validate_database_name tests ──────────────────────────────────────
@@ -309,10 +325,10 @@ mod tests {
     #[test]
     fn every_migration_yields_at_least_one_runnable_statement() {
         for migration in MIGRATIONS {
-            let runnable: Vec<&str> = migration
-                .sql
-                .split(";\n")
-                .map(|raw| strip_leading_line_comments(raw).trim())
+            let cleaned = strip_whole_line_comments(migration.sql);
+            let runnable: Vec<&str> = cleaned
+                .split(';')
+                .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .collect();
             assert!(

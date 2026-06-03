@@ -215,9 +215,23 @@ impl ServerConfig {
             clickhouse_url: std::env::var("TEMPS_CLICKHOUSE_URL")
                 .ok()
                 .filter(|s| !s.is_empty()),
+            // The database name defaults to "temps" so ALL ClickHouse-backed
+            // telemetry (analytics events/sessions, OTel traces, resource
+            // metrics, proxy/request logs) lives in one consistent database.
+            // Operators only need to set URL/USER/PASSWORD; the name is
+            // overridable via TEMPS_CLICKHOUSE_DATABASE if they prefer another.
+            // Only default it when ClickHouse is actually being configured
+            // (URL present) — otherwise leave None so `is_clickhouse_enabled()`
+            // stays false for an unconfigured server.
             clickhouse_database: std::env::var("TEMPS_CLICKHOUSE_DATABASE")
                 .ok()
-                .filter(|s| !s.is_empty()),
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    std::env::var("TEMPS_CLICKHOUSE_URL")
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                        .map(|_| "temps".to_string())
+                }),
             clickhouse_user: std::env::var("TEMPS_CLICKHOUSE_USER")
                 .ok()
                 .filter(|s| !s.is_empty()),

@@ -99,10 +99,13 @@ pub async fn apply_migrations(
     // 0. Validate the database name before interpolating it into DDL.
     validate_database_name(database_name)?;
 
-    // 1. Ensure the target database exists. CH allows `CREATE DATABASE`
-    //    regardless of the currently-selected database — the name is explicit.
+    // 1. Ensure the target database exists. The passed-in `client` is scoped to
+    //    the target database, and CH rejects requests whose session database
+    //    does not yet exist — including the CREATE DATABASE itself. So run this
+    //    one statement on a clone scoped to the always-present `default` db.
+    let bootstrap = client.clone().with_database("default");
     let create_db_sql = format!("CREATE DATABASE IF NOT EXISTS `{database_name}`");
-    client
+    bootstrap
         .query(&create_db_sql)
         .execute()
         .await
@@ -169,12 +172,17 @@ pub async fn apply_migrations(
 
 /// Execute a multi-statement SQL blob against ClickHouse.
 ///
-/// ClickHouse's HTTP endpoint accepts only one statement per request, so we
-/// split on `;\n` and execute each non-empty piece. Leading whole-line `--`
-/// comments are stripped so comment-only chunks are skipped.
+/// ClickHouse's HTTP endpoint accepts only one statement per request. We first
+/// strip every whole-line `--` comment from the blob, THEN split on `;`. Doing
+/// it in that order is essential: a `;` appearing inside a comment (e.g. a
+/// benchmark note like "no rollup MVs;") must never become a statement
+/// boundary — splitting first would slice a CREATE TABLE in half. Inline `--`
+/// comments after code on the same line are left intact (ClickHouse parses
+/// them fine within a statement).
 async fn execute_multi(client: &::clickhouse::Client, sql: &str) -> Result<(), MetricsError> {
-    for raw in sql.split(";\n") {
-        let stmt = strip_leading_line_comments(raw).trim();
+    let cleaned = strip_whole_line_comments(sql);
+    for raw in cleaned.split(';') {
+        let stmt = raw.trim();
         if stmt.is_empty() {
             continue;
         }
@@ -190,21 +198,19 @@ async fn execute_multi(client: &::clickhouse::Client, sql: &str) -> Result<(), M
     Ok(())
 }
 
-/// Drop leading whole-line `--` comments and blank lines from a SQL chunk.
-///
-/// Stops at the first non-comment/non-blank line so inline `--` comments
-/// inside a statement body are preserved unchanged.
-fn strip_leading_line_comments(raw: &str) -> &str {
-    let mut offset = 0;
-    for line in raw.split_inclusive('\n') {
-        let trimmed = line.trim_start();
-        if trimmed.is_empty() || trimmed.starts_with("--") {
-            offset += line.len();
-        } else {
-            break;
-        }
-    }
-    &raw[offset..]
+/// Remove every line that is entirely a `--` comment (or blank), across the
+/// whole blob, before statement splitting. A line counts as a comment line if,
+/// after trimming leading whitespace, it starts with `--`. Lines with code
+/// followed by a trailing `--` comment are kept verbatim (the comment stays in
+/// the statement body, which ClickHouse accepts).
+fn strip_whole_line_comments(sql: &str) -> String {
+    sql.lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.is_empty() && !trimmed.starts_with("--")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -245,8 +251,30 @@ mod tests {
         let sql = "-- header comment\n\
                    -- another\n\
                    CREATE TABLE IF NOT EXISTS service_metrics (id Int64) ENGINE = MergeTree ORDER BY id";
-        let stripped = strip_leading_line_comments(sql).trim();
+        let stripped = strip_whole_line_comments(sql).trim().to_string();
         assert!(stripped.starts_with("CREATE TABLE IF NOT EXISTS service_metrics"));
+    }
+
+    /// Regression: a `;` inside a comment must NOT split the following statement.
+    /// This is the exact bug that crashed the real service_metrics migration at
+    /// boot (comment line "...rollup materialized views;" sliced the CREATE TABLE
+    /// when the runner split on ";\n" before stripping comments).
+    #[test]
+    fn semicolon_inside_comment_does_not_split_statement() {
+        let sql = "-- no rollup materialized views; query-time bucketing instead\n\
+                   CREATE TABLE service_metrics (\n\
+                   -- source_kind is database|deployment|container|node; validated\n\
+                   source_kind String\n\
+                   ) ENGINE = MergeTree ORDER BY source_kind";
+        let cleaned = strip_whole_line_comments(sql);
+        let stmts: Vec<&str> = cleaned
+            .split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(stmts.len(), 1, "must be ONE statement, got: {stmts:?}");
+        assert!(stmts[0].starts_with("CREATE TABLE service_metrics"));
+        assert!(stmts[0].contains("source_kind String"));
     }
 
     /// Every migration must yield at least one runnable statement after
@@ -254,10 +282,10 @@ mod tests {
     #[test]
     fn every_migration_yields_at_least_one_runnable_statement() {
         for migration in MIGRATIONS {
-            let runnable: Vec<&str> = migration
-                .sql
-                .split(";\n")
-                .map(|raw| strip_leading_line_comments(raw).trim())
+            let cleaned = strip_whole_line_comments(migration.sql);
+            let runnable: Vec<&str> = cleaned
+                .split(';')
+                .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .collect();
             assert!(

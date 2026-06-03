@@ -197,9 +197,16 @@ pub fn build_proxy_log_storage(
 
         // Apply migrations off the startup path. Cloning the client is cheap
         // (Arc-backed internally).
+        //
+        // `build_proxy_log_storage` is called during plugin registration, which
+        // is a SYNCHRONOUS context with no Tokio reactor — a bare `tokio::spawn`
+        // here panics ("there is no reactor running"). Guard on the runtime
+        // handle: spawn when one exists, otherwise run the migrations to
+        // completion on a short-lived current-thread runtime (proxy crates may
+        // be initialized outside the async runtime, per the Pingora note).
         let client = store.client().clone();
         let database = config.clickhouse_database.clone().unwrap_or_default();
-        tokio::spawn(async move {
+        let run_migrations = async move {
             match clickhouse_migrations::apply_migrations(&client, &database).await {
                 Ok(report) => tracing::debug!(
                     applied = ?report.applied,
@@ -212,7 +219,23 @@ pub fn build_proxy_log_storage(
                      writes/queries will surface the error per-call"
                 ),
             }
-        });
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(run_migrations);
+            }
+            Err(_) => match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt.block_on(run_migrations),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "Could not build a runtime to apply ClickHouse proxy-log \
+                     migrations; they will be attempted on first read/write"
+                ),
+            },
+        }
 
         tracing::info!(
             "Proxy/request logs: ClickHouse backend enabled (TEMPS_CLICKHOUSE_* configured)"

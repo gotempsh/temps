@@ -718,10 +718,13 @@ fn build_ch_metrics_store(config: &ServerConfig) -> Option<Arc<dyn temps_metrics
     let store = Arc::new(ClickhouseMetricsStore::new(cfg));
 
     // Run migrations in the background so startup is not blocked. If they fail,
-    // the first write/read surfaces the error per-call.
+    // the first write/read surfaces the error per-call. Guard on the runtime
+    // handle: this is called from an async path today, but a bare tokio::spawn
+    // panics if ever invoked from a sync context (no reactor) — fall back to a
+    // short-lived current-thread runtime in that case.
     let client = store.client().clone();
     let database = config.clickhouse_database.clone().unwrap_or_default();
-    tokio::spawn(async move {
+    let run_migrations = async move {
         match temps_metrics::clickhouse_migrations::apply_migrations(&client, &database).await {
             Ok(report) => debug!(
                 applied = ?report.applied,
@@ -734,7 +737,23 @@ fn build_ch_metrics_store(config: &ServerConfig) -> Option<Arc<dyn temps_metrics
                  metric writes/queries will surface the error per-call"
             ),
         }
-    });
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn(run_migrations);
+        }
+        Err(_) => match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt.block_on(run_migrations),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "Could not build a runtime to apply ClickHouse resource-metrics \
+                 migrations; they will be attempted on first read/write"
+            ),
+        },
+    }
 
     Some(store as Arc<dyn MetricsStore>)
 }

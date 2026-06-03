@@ -491,9 +491,13 @@ fn read_clickhouse_otel_config_from_env() -> Option<ClickHouseOtelConfig> {
     let url = std::env::var("TEMPS_CLICKHOUSE_URL")
         .ok()
         .filter(|s| !s.is_empty())?;
+    // Database name defaults to "temps" (consistent with ServerConfig) so all
+    // ClickHouse-backed telemetry shares one database. Operators set only
+    // URL/USER/PASSWORD; TEMPS_CLICKHOUSE_DATABASE overrides the name if desired.
     let database = std::env::var("TEMPS_CLICKHOUSE_DATABASE")
         .ok()
-        .filter(|s| !s.is_empty())?;
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "temps".to_string());
     let user = std::env::var("TEMPS_CLICKHOUSE_USER")
         .ok()
         .filter(|s| !s.is_empty())?;

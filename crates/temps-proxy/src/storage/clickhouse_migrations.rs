@@ -101,10 +101,14 @@ pub async fn apply_migrations(
     // 0. Validate the database name before interpolating it into DDL.
     validate_database_name(database_name)?;
 
-    // 1. Ensure the target database exists. CH allows `CREATE DATABASE`
-    //    regardless of the currently-selected database — the name is explicit.
+    // 1. Ensure the target database exists. The passed-in `client` is scoped to
+    //    the target database (`?database=<name>` on every request), and CH
+    //    rejects requests whose session database does not yet exist — including
+    //    the CREATE DATABASE itself. So run this one statement on a clone scoped
+    //    to the always-present `default` database.
+    let bootstrap = client.clone().with_database("default");
     let create_db_sql = format!("CREATE DATABASE IF NOT EXISTS `{database_name}`");
-    client
+    bootstrap
         .query(&create_db_sql)
         .execute()
         .await
@@ -181,8 +185,9 @@ async fn execute_multi(
     client: &::clickhouse::Client,
     sql: &str,
 ) -> Result<(), ProxyLogServiceError> {
-    for raw in sql.split(";\n") {
-        let stmt = strip_leading_line_comments(raw).trim();
+    let cleaned = strip_whole_line_comments(sql);
+    for raw in cleaned.split(';') {
+        let stmt = raw.trim();
         if stmt.is_empty() {
             continue;
         }
@@ -198,21 +203,18 @@ async fn execute_multi(
     Ok(())
 }
 
-/// Drop leading whole-line `--` comments and blank lines from a SQL chunk.
-///
-/// Stops at the first non-comment/non-blank line so inline `--` comments
-/// inside a statement body are preserved unchanged.
-fn strip_leading_line_comments(raw: &str) -> &str {
-    let mut offset = 0;
-    for line in raw.split_inclusive('\n') {
-        let trimmed = line.trim_start();
-        if trimmed.is_empty() || trimmed.starts_with("--") {
-            offset += line.len();
-        } else {
-            break;
-        }
-    }
-    &raw[offset..]
+/// Remove every whole-line `--` comment (or blank line) across the whole blob,
+/// before statement splitting. Order matters: a `;` inside a comment must not
+/// become a statement boundary (splitting first would slice a CREATE TABLE in
+/// half). Inline `--` comments after code on the same line are kept verbatim.
+fn strip_whole_line_comments(sql: &str) -> String {
+    sql.lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.is_empty() && !trimmed.starts_with("--")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -253,8 +255,27 @@ mod tests {
         let sql = "-- header comment\n\
                    -- another\n\
                    CREATE TABLE IF NOT EXISTS proxy_logs (id Int64) ENGINE = MergeTree ORDER BY id";
-        let stripped = strip_leading_line_comments(sql).trim();
+        let stripped = strip_whole_line_comments(sql).trim().to_string();
         assert!(stripped.starts_with("CREATE TABLE IF NOT EXISTS proxy_logs"));
+    }
+
+    /// Regression: a `;` inside a comment must NOT split the following statement
+    /// (the bug that crashed the metrics migration at boot).
+    #[test]
+    fn semicolon_inside_comment_does_not_split_statement() {
+        let sql = "-- not FINAL (keeps scans fast); see note below\n\
+                   CREATE TABLE t (\n\
+                   -- key is request_id; nothing else\n\
+                   id Int64\n\
+                   ) ENGINE = MergeTree ORDER BY id";
+        let cleaned = strip_whole_line_comments(sql);
+        let stmts: Vec<&str> = cleaned
+            .split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(stmts.len(), 1, "must be ONE statement, got: {stmts:?}");
+        assert!(stmts[0].starts_with("CREATE TABLE t"));
     }
 
     /// Every migration must yield at least one runnable statement after
@@ -262,10 +283,10 @@ mod tests {
     #[test]
     fn every_migration_yields_at_least_one_runnable_statement() {
         for migration in MIGRATIONS {
-            let runnable: Vec<&str> = migration
-                .sql
-                .split(";\n")
-                .map(|raw| strip_leading_line_comments(raw).trim())
+            let cleaned = strip_whole_line_comments(migration.sql);
+            let runnable: Vec<&str> = cleaned
+                .split(';')
+                .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .collect();
             assert!(
