@@ -306,6 +306,131 @@ impl TimescaleDbStorage {
         Ok(result.rows_affected())
     }
 
+    /// Maintain the `otel_trace_summaries` pre-aggregated table from a batch of
+    /// spans.
+    ///
+    /// The traces *list* view reads from this table instead of running
+    /// `GROUP BY trace_id` over the spans hypertable on every request (which
+    /// sorts on a computed aggregate and can't use an index — the scaling wall
+    /// at millions of traces). Here we fold the batch into one delta per
+    /// distinct `(project_id, trace_id)` in Rust, then issue a single
+    /// multi-row `INSERT … ON CONFLICT DO UPDATE` that accumulates the
+    /// running aggregates.
+    ///
+    /// **Correct under late-arriving spans.** Spans dribble in across time with
+    /// no "trace complete" signal, so the upsert is purely accumulative:
+    /// `span_count`/`error_count` add, `start_time` takes the LEAST, and
+    /// `duration_ms` takes the GREATEST. The root span (parent_span_id IS NULL)
+    /// owns `root_span_name`/`service_name`/`kind`/`deployment_environment`/
+    /// `deployment_id`; once a root has been recorded (`has_root = true`) a
+    /// later non-root span never overwrites those fields. If the root arrives
+    /// after some children, it claims them on its batch.
+    ///
+    /// This runs on the ingest hot path but adds only one statement per batch
+    /// (rows = distinct traces in the batch, not spans), against a small, hot,
+    /// index-cached table. Callers treat a failure here as non-fatal: the spans
+    /// are already durably stored, so a summary hiccup must not fail ingest.
+    async fn upsert_trace_summaries(&self, spans: &[SpanRecord]) -> StorageResult<u64> {
+        if spans.is_empty() {
+            return Ok(0);
+        }
+
+        // Fold the batch into one delta per distinct trace (pure, unit-tested).
+        let deltas = fold_trace_deltas(spans);
+
+        // Build one multi-row INSERT … ON CONFLICT DO UPDATE.
+        //
+        // The root fields are coalesced on conflict so they're only set when
+        // this batch carries a root (EXCLUDED.has_root). Once a row has a root,
+        // a rootless later batch (has_root = false) keeps the stored values.
+        let mut sql = String::from(
+            "INSERT INTO otel_trace_summaries (
+                project_id, trace_id, root_span_name, service_name, kind,
+                deployment_environment, deployment_id, start_time, duration_ms,
+                span_count, error_count, has_root, last_seen
+            ) VALUES ",
+        );
+
+        let mut values: Vec<sea_orm::Value> = Vec::new();
+        let mut param_idx = 1u32;
+        for (i, d) in deltas.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            // 12 bound params per row; last_seen uses now() in SQL.
+            sql.push_str(&format!(
+                "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, now())",
+                param_idx,
+                param_idx + 1,
+                param_idx + 2,
+                param_idx + 3,
+                param_idx + 4,
+                param_idx + 5,
+                param_idx + 6,
+                param_idx + 7,
+                param_idx + 8,
+                param_idx + 9,
+                param_idx + 10,
+                param_idx + 11,
+            ));
+            param_idx += 12;
+
+            values.extend_from_slice(&[
+                d.project_id.into(),
+                d.trace_id.clone().into(),
+                // Empty-string defaults for root fields when this batch has no
+                // root yet; they won't overwrite a stored root because the
+                // ON CONFLICT clause guards on EXCLUDED.has_root.
+                d.root_span_name.clone().unwrap_or_default().into(),
+                d.root_service_name.clone().unwrap_or_default().into(),
+                d.root_kind
+                    .clone()
+                    .unwrap_or_else(|| "INTERNAL".to_string())
+                    .into(),
+                d.root_env.clone().into(),
+                d.root_deployment_id.into(),
+                d.start_time.into(),
+                d.max_duration_ms.into(),
+                d.span_count.into(),
+                d.error_count.into(),
+                d.has_root.into(),
+            ]);
+        }
+
+        sql.push_str(
+            " ON CONFLICT (project_id, trace_id) DO UPDATE SET
+                span_count  = otel_trace_summaries.span_count + EXCLUDED.span_count,
+                error_count = otel_trace_summaries.error_count + EXCLUDED.error_count,
+                start_time  = LEAST(otel_trace_summaries.start_time, EXCLUDED.start_time),
+                duration_ms = GREATEST(otel_trace_summaries.duration_ms, EXCLUDED.duration_ms),
+                last_seen   = now(),
+                -- Root identity: adopt this batch's root only if we don't have
+                -- one yet AND this batch brought one. Otherwise keep stored.
+                has_root       = otel_trace_summaries.has_root OR EXCLUDED.has_root,
+                root_span_name = CASE WHEN NOT otel_trace_summaries.has_root AND EXCLUDED.has_root
+                                      THEN EXCLUDED.root_span_name ELSE otel_trace_summaries.root_span_name END,
+                service_name   = CASE WHEN NOT otel_trace_summaries.has_root AND EXCLUDED.has_root
+                                      THEN EXCLUDED.service_name ELSE otel_trace_summaries.service_name END,
+                kind           = CASE WHEN NOT otel_trace_summaries.has_root AND EXCLUDED.has_root
+                                      THEN EXCLUDED.kind ELSE otel_trace_summaries.kind END,
+                deployment_environment = CASE WHEN NOT otel_trace_summaries.has_root AND EXCLUDED.has_root
+                                      THEN EXCLUDED.deployment_environment ELSE otel_trace_summaries.deployment_environment END,
+                deployment_id  = CASE WHEN NOT otel_trace_summaries.has_root AND EXCLUDED.has_root
+                                      THEN EXCLUDED.deployment_id ELSE otel_trace_summaries.deployment_id END",
+        );
+
+        let result = self
+            .db
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                &sql,
+                values,
+            ))
+            .await?;
+
+        Ok(result.rows_affected())
+    }
+
     async fn batch_insert_logs(&self, records: &[LogRecord]) -> StorageResult<u64> {
         if records.is_empty() {
             return Ok(0);
@@ -436,7 +561,22 @@ impl OtelStorage for TimescaleDbStorage {
     }
 
     async fn store_spans(&self, spans: Vec<SpanRecord>) -> StorageResult<u64> {
-        self.batch_insert_spans(&spans).await
+        let stored = self.batch_insert_spans(&spans).await?;
+
+        // Maintain the pre-aggregated trace-summary table that backs the list
+        // view. Fail-soft: the spans are already durably written, so a summary
+        // upsert error must not fail ingest — the worst case is a trace that's
+        // momentarily missing or stale in the list until its next span arrives
+        // (or until a backfill/reconcile runs). Log and continue.
+        if let Err(e) = self.upsert_trace_summaries(&spans).await {
+            warn!(
+                error = %e,
+                span_count = spans.len(),
+                "failed to upsert otel_trace_summaries; spans stored, summary will lag"
+            );
+        }
+
+        Ok(stored)
     }
 
     async fn store_logs(&self, records: Vec<LogRecord>) -> StorageResult<u64> {
@@ -679,305 +819,29 @@ impl OtelStorage for TimescaleDbStorage {
         Ok(spans)
     }
 
+    /// List traces for the UI. Reads the pre-aggregated `otel_trace_summaries`
+    /// table (one indexed row per trace) so duration/start sorts are index
+    /// scans instead of a sort-after-aggregate over the spans hypertable —
+    /// the scaling wall at millions of traces.
+    ///
+    /// Falls back to the span-aggregation path only for queries carrying a
+    /// span-level filter the summary table can't satisfy (`attributes` or
+    /// `name_pattern`); see `query_trace_summaries_from_spans`.
     async fn query_trace_summaries(&self, query: TraceQuery) -> StorageResult<Vec<TraceSummary>> {
-        let limit = query.limit.unwrap_or(50).min(100);
-        let offset = query.offset.unwrap_or(0);
-
-        let mut where_clauses = vec!["s.project_id = $1".to_string()];
-        let mut values: Vec<sea_orm::Value> = vec![query.project_id.into()];
-        let mut param_idx = 2u32;
-
-        if let Some(ref tid) = query.trace_id {
-            where_clauses.push(format!("s.trace_id = ${}", param_idx));
-            values.push(tid.clone().into());
-            param_idx += 1;
+        if needs_span_level_filter(&query) {
+            return self.query_trace_summaries_from_spans(query).await;
         }
-        if let Some(ref svc) = query.service_name {
-            where_clauses.push(format!("s.service_name = ${}", param_idx));
-            values.push(svc.clone().into());
-            param_idx += 1;
-        }
-        if let Some(min_dur) = query.min_duration_ms {
-            where_clauses.push(format!("s.duration_ms >= ${}", param_idx));
-            values.push(min_dur.into());
-            param_idx += 1;
-        }
-        if let Some(start) = query.start_time {
-            where_clauses.push(format!("s.start_time >= ${}", param_idx));
-            values.push(start.into());
-            param_idx += 1;
-        }
-        if let Some(end) = query.end_time {
-            where_clauses.push(format!("s.start_time <= ${}", param_idx));
-            values.push(end.into());
-            param_idx += 1;
-        }
-        if let Some(deployment_id) = query.deployment_id {
-            where_clauses.push(format!("s.deployment_id = ${}", param_idx));
-            values.push(deployment_id.into());
-            param_idx += 1;
-        }
-        if let Some(environment_id) = query.environment_id {
-            where_clauses.push(format!("e.id = ${}", param_idx));
-            values.push(environment_id.into());
-            param_idx += 1;
-        }
-        if let Some(ref attrs) = query.attributes {
-            for (key, value) in attrs {
-                where_clauses.push(format!(
-                    "s.attributes->>${}::text = ${}",
-                    param_idx,
-                    param_idx + 1
-                ));
-                values.push(key.clone().into());
-                values.push(value.clone().into());
-                param_idx += 2;
-            }
-        }
-        if let Some(ref pattern) = query.name_pattern {
-            where_clauses.push(format!("s.name ILIKE ${}", param_idx));
-            values.push(format!("%{}%", escape_like_pattern(pattern)).into());
-            param_idx += 1;
-        }
-
-        // status filter: if ERROR, find traces that have at least one error span
-        // if OK, find traces with no error spans
-        let status_having = match query.status {
-            Some(crate::types::SpanStatusCode::Error) => {
-                "HAVING COUNT(*) FILTER (WHERE s.status_code = 'ERROR') > 0"
-            }
-            Some(crate::types::SpanStatusCode::Ok) => {
-                "HAVING COUNT(*) FILTER (WHERE s.status_code = 'ERROR') = 0"
-            }
-            _ => "",
-        };
-
-        let where_sql = where_clauses.join(" AND ");
-
-        // Build the ORDER BY from the requested sort. Both options sort on an
-        // aggregate (this is a GROUP BY trace_id query), so neither can use an
-        // index — but the time-window WHERE keeps the grouped set small. We add
-        // a stable tie-breaker so pagination is deterministic across pages.
-        //
-        // NOTE: sort_by/sort_order come from a fixed enum, not user strings, so
-        // interpolating them into SQL is injection-safe.
-        let order_dir = query.sort_order.as_sql();
-        let order_sql = match query.sort_by {
-            crate::types::TraceSortField::Duration => {
-                format!(
-                    "ORDER BY MAX(s.duration_ms) {order_dir}, MIN(s.start_time) DESC, s.trace_id"
-                )
-            }
-            crate::types::TraceSortField::StartTime => {
-                format!("ORDER BY MIN(s.start_time) {order_dir}, s.trace_id")
-            }
-        };
-
-        // Aggregate per trace_id: pick root span (NULL parent) or longest span,
-        // count total spans and error spans, compute trace duration.
-        // LEFT JOIN deployments + environments to resolve the environment name
-        // from the deployment record, falling back to the OTel resource attribute.
-        let sql = format!(
-            r#"
-            SELECT
-                s.trace_id,
-                (array_agg(s.name ORDER BY
-                    CASE WHEN s.parent_span_id IS NULL THEN 0 ELSE 1 END,
-                    s.duration_ms DESC
-                ))[1] AS root_span_name,
-                (array_agg(s.service_name ORDER BY
-                    CASE WHEN s.parent_span_id IS NULL THEN 0 ELSE 1 END,
-                    s.duration_ms DESC
-                ))[1] AS service_name,
-                (array_agg(s.kind ORDER BY
-                    CASE WHEN s.parent_span_id IS NULL THEN 0 ELSE 1 END,
-                    s.duration_ms DESC
-                ))[1] AS kind,
-                (array_agg(COALESCE(e.name, s.deployment_environment) ORDER BY
-                    CASE WHEN s.parent_span_id IS NULL THEN 0 ELSE 1 END,
-                    s.duration_ms DESC
-                ))[1] AS deployment_environment,
-                MIN(s.start_time) AS start_time,
-                MAX(s.duration_ms) AS duration_ms,
-                COUNT(*)::bigint AS span_count,
-                COUNT(*) FILTER (WHERE s.status_code = 'ERROR')::bigint AS error_count
-            FROM otel_spans s
-            LEFT JOIN deployments d ON d.id = s.deployment_id
-            LEFT JOIN environments e ON e.id = d.environment_id
-            WHERE {where_sql}
-            GROUP BY s.trace_id
-            {status_having}
-            {order_sql}
-            LIMIT ${param_idx} OFFSET ${next_param}
-            "#,
-            next_param = param_idx + 1
-        );
-        values.push((limit as i64).into());
-        values.push((offset as i64).into());
-
-        let results = self
-            .db
-            .query_all(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                &sql,
-                values,
-            ))
-            .await?;
-
-        let summaries = results
-            .iter()
-            .filter_map(|row| {
-                let trace_id: String = row.try_get("", "trace_id").ok()?;
-                let root_span_name: String = row.try_get("", "root_span_name").ok()?;
-                let service_name: String = row.try_get("", "service_name").ok()?;
-                let kind_str: String = row.try_get("", "kind").ok()?;
-                let deployment_environment: Option<String> =
-                    row.try_get("", "deployment_environment").ok().flatten();
-                let start_time: DateTime<Utc> = row.try_get("", "start_time").ok()?;
-                let duration_ms: f64 = row.try_get("", "duration_ms").ok()?;
-                let span_count: i64 = row.try_get("", "span_count").ok()?;
-                let error_count: i64 = row.try_get("", "error_count").ok()?;
-
-                let kind = match kind_str.as_str() {
-                    "Server" => crate::types::SpanKind::Server,
-                    "Client" => crate::types::SpanKind::Client,
-                    "Producer" => crate::types::SpanKind::Producer,
-                    "Consumer" => crate::types::SpanKind::Consumer,
-                    "Internal" => crate::types::SpanKind::Internal,
-                    _ => crate::types::SpanKind::Internal,
-                };
-
-                let status_code = if error_count > 0 {
-                    crate::types::SpanStatusCode::Error
-                } else {
-                    crate::types::SpanStatusCode::Ok
-                };
-
-                Some(TraceSummary {
-                    trace_id,
-                    root_span_name,
-                    service_name,
-                    deployment_environment,
-                    kind,
-                    status_code,
-                    start_time,
-                    duration_ms,
-                    span_count,
-                    error_count,
-                })
-            })
-            .collect();
-
-        Ok(summaries)
+        self.query_trace_summaries_from_table(query).await
     }
 
+    /// Count traces matching the query, for pagination. Mirrors the dispatch in
+    /// `query_trace_summaries` so the count matches the listed rows exactly.
     async fn count_traces(&self, query: TraceQuery) -> StorageResult<u64> {
-        // Mirrors query_trace_summaries filters exactly — including `status`
-        // (via HAVING) and `min_duration_ms` — so the pagination count matches
-        // the actual result set returned by that method.
-        let mut where_clauses = vec!["s.project_id = $1".to_string()];
-        let mut values: Vec<sea_orm::Value> = vec![query.project_id.into()];
-        let mut param_idx = 2u32;
-
-        if let Some(ref tid) = query.trace_id {
-            where_clauses.push(format!("s.trace_id = ${}", param_idx));
-            values.push(tid.clone().into());
-            param_idx += 1;
+        if needs_span_level_filter(&query) {
+            return self.count_traces_from_spans(query).await;
         }
-        if let Some(ref svc) = query.service_name {
-            where_clauses.push(format!("s.service_name = ${}", param_idx));
-            values.push(svc.clone().into());
-            param_idx += 1;
-        }
-        if let Some(min_dur) = query.min_duration_ms {
-            where_clauses.push(format!("s.duration_ms >= ${}", param_idx));
-            values.push(min_dur.into());
-            param_idx += 1;
-        }
-        if let Some(start) = query.start_time {
-            where_clauses.push(format!("s.start_time >= ${}", param_idx));
-            values.push(start.into());
-            param_idx += 1;
-        }
-        if let Some(end) = query.end_time {
-            where_clauses.push(format!("s.start_time <= ${}", param_idx));
-            values.push(end.into());
-            param_idx += 1;
-        }
-        if let Some(deployment_id) = query.deployment_id {
-            where_clauses.push(format!("s.deployment_id = ${}", param_idx));
-            values.push(deployment_id.into());
-            param_idx += 1;
-        }
-        if let Some(environment_id) = query.environment_id {
-            where_clauses.push(format!(
-                "s.deployment_id IN (SELECT id FROM deployments WHERE environment_id = ${})",
-                param_idx
-            ));
-            values.push(environment_id.into());
-            param_idx += 1;
-        }
-        if let Some(ref attrs) = query.attributes {
-            for (key, value) in attrs {
-                where_clauses.push(format!(
-                    "s.attributes->>${}::text = ${}",
-                    param_idx,
-                    param_idx + 1
-                ));
-                values.push(key.clone().into());
-                values.push(value.clone().into());
-                param_idx += 2;
-            }
-        }
-        if let Some(ref pattern) = query.name_pattern {
-            where_clauses.push(format!("s.name ILIKE ${}", param_idx));
-            values.push(format!("%{}%", escape_like_pattern(pattern)).into());
-            param_idx += 1;
-        }
-
-        // status filter: mirrors query_trace_summaries HAVING clause.
-        // ERROR = traces with at least one ERROR span; OK = traces with none.
-        let status_having = match query.status {
-            Some(crate::types::SpanStatusCode::Error) => {
-                "HAVING COUNT(*) FILTER (WHERE s.status_code = 'ERROR') > 0"
-            }
-            Some(crate::types::SpanStatusCode::Ok) => {
-                "HAVING COUNT(*) FILTER (WHERE s.status_code = 'ERROR') = 0"
-            }
-            _ => "",
-        };
-
-        let where_sql = where_clauses.join(" AND ");
-
-        // Wrap in a subquery so we can count the traces that survive the HAVING.
-        let sql = format!(
-            "SELECT COUNT(*) AS cnt FROM (\
-                SELECT s.trace_id \
-                FROM otel_spans s \
-                WHERE {where_sql} \
-                GROUP BY s.trace_id \
-                {status_having}\
-            ) sub",
-        );
-        let _ = param_idx;
-
-        let result = self
-            .db
-            .query_one(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                &sql,
-                values,
-            ))
-            .await?;
-
-        if let Some(row) = result {
-            let cnt: i64 = row.try_get("", "cnt").unwrap_or(0);
-            Ok(cnt as u64)
-        } else {
-            Ok(0)
-        }
+        self.count_traces_from_table(query).await
     }
-
     async fn get_trace(&self, project_id: i32, trace_id: &str) -> StorageResult<Vec<SpanRecord>> {
         let sql = r#"
             SELECT project_id, deployment_id, service_name, service_version,
@@ -1212,14 +1076,7 @@ impl OtelStorage for TimescaleDbStorage {
                     .unwrap_or_default();
 
                 let kind_str: String = row.try_get("", "kind").ok()?;
-                let kind = match kind_str.as_str() {
-                    "Server" => SpanKind::Server,
-                    "Client" => SpanKind::Client,
-                    "Producer" => SpanKind::Producer,
-                    "Consumer" => SpanKind::Consumer,
-                    "Internal" => SpanKind::Internal,
-                    _ => SpanKind::Internal,
-                };
+                let kind = parse_span_kind(&kind_str);
 
                 let status_str: String = row.try_get("", "status_code").ok()?;
                 let status_code = match status_str.as_str() {
@@ -1963,10 +1820,35 @@ impl OtelStorage for TimescaleDbStorage {
         // retention task and migration loader run on overlapping startup
         // connections.
         //
-        // We keep the trait method so callers/tests don't break, but it
-        // does nothing — Timescale's policy is the single source of
-        // truth for OTel retention.
-        Ok(0)
+        // We keep the trait method so callers/tests don't break; for the
+        // hypertables it does nothing — Timescale's policy is the single
+        // source of truth for their retention.
+        //
+        // EXCEPTION: `otel_trace_summaries` is a plain table, NOT a
+        // hypertable, so no native retention policy covers it. A summary row
+        // can't outlive the spans it derives from, which `otel_spans` expires
+        // at 90 days, so we sweep summaries on the same window here. This is a
+        // plain indexed DELETE on `start_time` (idx_otel_trace_summaries_start)
+        // and does not race any Timescale `drop_chunks` worker, since the
+        // summary table has no chunks.
+        let deleted = self
+            .db
+            .execute(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "DELETE FROM otel_trace_summaries WHERE start_time < now() - INTERVAL '90 days'"
+                    .to_string(),
+            ))
+            .await
+            .map(|r| r.rows_affected())
+            .unwrap_or_else(|e| {
+                // Non-fatal: a failed summary sweep just leaves stale rows that
+                // the next tick retries. Never propagate — the retention task
+                // logs and continues.
+                warn!(error = %e, "otel_trace_summaries retention sweep failed");
+                0
+            });
+
+        Ok(deleted)
     }
 
     async fn get_p95_latency(
@@ -2001,6 +1883,518 @@ impl OtelStorage for TimescaleDbStorage {
     }
 }
 
+// Inherent helpers backing the trait dispatch above. Kept out of the trait
+// impl so they can be private and unit-tested without going through the
+// OtelStorage trait.
+impl TimescaleDbStorage {
+    /// Fallback list query that aggregates spans at read time
+    /// (`GROUP BY trace_id`). Used only when the query carries a span-level
+    /// filter the summary table can't satisfy — `attributes` (per-span JSONB,
+    /// e.g. GenAI `gen_ai.system`) or `name_pattern` matched against *any*
+    /// span name. These are narrow drill-downs, so the unindexed
+    /// sort-after-aggregate cost is acceptable. The common list view (no such
+    /// filter) goes through the fast summary-table path instead.
+    async fn query_trace_summaries_from_spans(
+        &self,
+        query: TraceQuery,
+    ) -> StorageResult<Vec<TraceSummary>> {
+        let limit = query.limit.unwrap_or(50).min(100);
+        let offset = query.offset.unwrap_or(0);
+
+        let mut where_clauses = vec!["s.project_id = $1".to_string()];
+        let mut values: Vec<sea_orm::Value> = vec![query.project_id.into()];
+        let mut param_idx = 2u32;
+
+        if let Some(ref tid) = query.trace_id {
+            where_clauses.push(format!("s.trace_id = ${}", param_idx));
+            values.push(tid.clone().into());
+            param_idx += 1;
+        }
+        if let Some(ref svc) = query.service_name {
+            where_clauses.push(format!("s.service_name = ${}", param_idx));
+            values.push(svc.clone().into());
+            param_idx += 1;
+        }
+        if let Some(min_dur) = query.min_duration_ms {
+            where_clauses.push(format!("s.duration_ms >= ${}", param_idx));
+            values.push(min_dur.into());
+            param_idx += 1;
+        }
+        if let Some(start) = query.start_time {
+            where_clauses.push(format!("s.start_time >= ${}", param_idx));
+            values.push(start.into());
+            param_idx += 1;
+        }
+        if let Some(end) = query.end_time {
+            where_clauses.push(format!("s.start_time <= ${}", param_idx));
+            values.push(end.into());
+            param_idx += 1;
+        }
+        if let Some(deployment_id) = query.deployment_id {
+            where_clauses.push(format!("s.deployment_id = ${}", param_idx));
+            values.push(deployment_id.into());
+            param_idx += 1;
+        }
+        if let Some(environment_id) = query.environment_id {
+            where_clauses.push(format!("e.id = ${}", param_idx));
+            values.push(environment_id.into());
+            param_idx += 1;
+        }
+        if let Some(ref attrs) = query.attributes {
+            for (key, value) in attrs {
+                where_clauses.push(format!(
+                    "s.attributes->>${}::text = ${}",
+                    param_idx,
+                    param_idx + 1
+                ));
+                values.push(key.clone().into());
+                values.push(value.clone().into());
+                param_idx += 2;
+            }
+        }
+        if let Some(ref pattern) = query.name_pattern {
+            where_clauses.push(format!("s.name ILIKE ${}", param_idx));
+            values.push(format!("%{}%", escape_like_pattern(pattern)).into());
+            param_idx += 1;
+        }
+
+        // status filter: if ERROR, find traces that have at least one error span
+        // if OK, find traces with no error spans
+        let status_having = match query.status {
+            Some(crate::types::SpanStatusCode::Error) => {
+                "HAVING COUNT(*) FILTER (WHERE s.status_code = 'ERROR') > 0"
+            }
+            Some(crate::types::SpanStatusCode::Ok) => {
+                "HAVING COUNT(*) FILTER (WHERE s.status_code = 'ERROR') = 0"
+            }
+            _ => "",
+        };
+
+        let where_sql = where_clauses.join(" AND ");
+
+        // Build the ORDER BY from the requested sort. Both options sort on an
+        // aggregate (this is a GROUP BY trace_id query), so neither can use an
+        // index — but the time-window WHERE keeps the grouped set small. We add
+        // a stable tie-breaker so pagination is deterministic across pages.
+        //
+        // NOTE: sort_by/sort_order come from a fixed enum, not user strings, so
+        // interpolating them into SQL is injection-safe.
+        let order_dir = query.sort_order.as_sql();
+        let order_sql = match query.sort_by {
+            crate::types::TraceSortField::Duration => {
+                format!(
+                    "ORDER BY MAX(s.duration_ms) {order_dir}, MIN(s.start_time) DESC, s.trace_id"
+                )
+            }
+            crate::types::TraceSortField::StartTime => {
+                format!("ORDER BY MIN(s.start_time) {order_dir}, s.trace_id")
+            }
+        };
+
+        // Aggregate per trace_id: pick root span (NULL parent) or longest span,
+        // count total spans and error spans, compute trace duration.
+        // LEFT JOIN deployments + environments to resolve the environment name
+        // from the deployment record, falling back to the OTel resource attribute.
+        let sql = format!(
+            r#"
+            SELECT
+                s.trace_id,
+                (array_agg(s.name ORDER BY
+                    CASE WHEN s.parent_span_id IS NULL THEN 0 ELSE 1 END,
+                    s.duration_ms DESC
+                ))[1] AS root_span_name,
+                (array_agg(s.service_name ORDER BY
+                    CASE WHEN s.parent_span_id IS NULL THEN 0 ELSE 1 END,
+                    s.duration_ms DESC
+                ))[1] AS service_name,
+                (array_agg(s.kind ORDER BY
+                    CASE WHEN s.parent_span_id IS NULL THEN 0 ELSE 1 END,
+                    s.duration_ms DESC
+                ))[1] AS kind,
+                (array_agg(COALESCE(e.name, s.deployment_environment) ORDER BY
+                    CASE WHEN s.parent_span_id IS NULL THEN 0 ELSE 1 END,
+                    s.duration_ms DESC
+                ))[1] AS deployment_environment,
+                MIN(s.start_time) AS start_time,
+                MAX(s.duration_ms) AS duration_ms,
+                COUNT(*)::bigint AS span_count,
+                COUNT(*) FILTER (WHERE s.status_code = 'ERROR')::bigint AS error_count
+            FROM otel_spans s
+            LEFT JOIN deployments d ON d.id = s.deployment_id
+            LEFT JOIN environments e ON e.id = d.environment_id
+            WHERE {where_sql}
+            GROUP BY s.trace_id
+            {status_having}
+            {order_sql}
+            LIMIT ${param_idx} OFFSET ${next_param}
+            "#,
+            next_param = param_idx + 1
+        );
+        values.push((limit as i64).into());
+        values.push((offset as i64).into());
+
+        let results = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                &sql,
+                values,
+            ))
+            .await?;
+
+        let summaries = results
+            .iter()
+            .filter_map(|row| {
+                let trace_id: String = row.try_get("", "trace_id").ok()?;
+                let root_span_name: String = row.try_get("", "root_span_name").ok()?;
+                let service_name: String = row.try_get("", "service_name").ok()?;
+                let kind_str: String = row.try_get("", "kind").ok()?;
+                let deployment_environment: Option<String> =
+                    row.try_get("", "deployment_environment").ok().flatten();
+                let start_time: DateTime<Utc> = row.try_get("", "start_time").ok()?;
+                let duration_ms: f64 = row.try_get("", "duration_ms").ok()?;
+                let span_count: i64 = row.try_get("", "span_count").ok()?;
+                let error_count: i64 = row.try_get("", "error_count").ok()?;
+
+                let kind = parse_span_kind(&kind_str);
+
+                let status_code = if error_count > 0 {
+                    crate::types::SpanStatusCode::Error
+                } else {
+                    crate::types::SpanStatusCode::Ok
+                };
+
+                Some(TraceSummary {
+                    trace_id,
+                    root_span_name,
+                    service_name,
+                    deployment_environment,
+                    kind,
+                    status_code,
+                    start_time,
+                    duration_ms,
+                    span_count,
+                    error_count,
+                })
+            })
+            .collect();
+
+        Ok(summaries)
+    }
+
+    /// Fallback count that matches `query_trace_summaries_from_spans` exactly.
+    /// Used only on the span-aggregation fallback path (attribute/name filters).
+    async fn count_traces_from_spans(&self, query: TraceQuery) -> StorageResult<u64> {
+        // Mirrors query_trace_summaries_from_spans filters exactly — including
+        // `status` (via HAVING) and `min_duration_ms` — so the pagination count
+        // matches the actual result set returned by that method.
+        let mut where_clauses = vec!["s.project_id = $1".to_string()];
+        let mut values: Vec<sea_orm::Value> = vec![query.project_id.into()];
+        let mut param_idx = 2u32;
+
+        if let Some(ref tid) = query.trace_id {
+            where_clauses.push(format!("s.trace_id = ${}", param_idx));
+            values.push(tid.clone().into());
+            param_idx += 1;
+        }
+        if let Some(ref svc) = query.service_name {
+            where_clauses.push(format!("s.service_name = ${}", param_idx));
+            values.push(svc.clone().into());
+            param_idx += 1;
+        }
+        if let Some(min_dur) = query.min_duration_ms {
+            where_clauses.push(format!("s.duration_ms >= ${}", param_idx));
+            values.push(min_dur.into());
+            param_idx += 1;
+        }
+        if let Some(start) = query.start_time {
+            where_clauses.push(format!("s.start_time >= ${}", param_idx));
+            values.push(start.into());
+            param_idx += 1;
+        }
+        if let Some(end) = query.end_time {
+            where_clauses.push(format!("s.start_time <= ${}", param_idx));
+            values.push(end.into());
+            param_idx += 1;
+        }
+        if let Some(deployment_id) = query.deployment_id {
+            where_clauses.push(format!("s.deployment_id = ${}", param_idx));
+            values.push(deployment_id.into());
+            param_idx += 1;
+        }
+        if let Some(environment_id) = query.environment_id {
+            where_clauses.push(format!(
+                "s.deployment_id IN (SELECT id FROM deployments WHERE environment_id = ${})",
+                param_idx
+            ));
+            values.push(environment_id.into());
+            param_idx += 1;
+        }
+        if let Some(ref attrs) = query.attributes {
+            for (key, value) in attrs {
+                where_clauses.push(format!(
+                    "s.attributes->>${}::text = ${}",
+                    param_idx,
+                    param_idx + 1
+                ));
+                values.push(key.clone().into());
+                values.push(value.clone().into());
+                param_idx += 2;
+            }
+        }
+        if let Some(ref pattern) = query.name_pattern {
+            where_clauses.push(format!("s.name ILIKE ${}", param_idx));
+            values.push(format!("%{}%", escape_like_pattern(pattern)).into());
+            param_idx += 1;
+        }
+
+        // status filter: mirrors query_trace_summaries HAVING clause.
+        // ERROR = traces with at least one ERROR span; OK = traces with none.
+        let status_having = match query.status {
+            Some(crate::types::SpanStatusCode::Error) => {
+                "HAVING COUNT(*) FILTER (WHERE s.status_code = 'ERROR') > 0"
+            }
+            Some(crate::types::SpanStatusCode::Ok) => {
+                "HAVING COUNT(*) FILTER (WHERE s.status_code = 'ERROR') = 0"
+            }
+            _ => "",
+        };
+
+        let where_sql = where_clauses.join(" AND ");
+
+        // Wrap in a subquery so we can count the traces that survive the HAVING.
+        let sql = format!(
+            "SELECT COUNT(*) AS cnt FROM (\
+                SELECT s.trace_id \
+                FROM otel_spans s \
+                WHERE {where_sql} \
+                GROUP BY s.trace_id \
+                {status_having}\
+            ) sub",
+        );
+        let _ = param_idx;
+
+        let result = self
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                &sql,
+                values,
+            ))
+            .await?;
+
+        if let Some(row) = result {
+            let cnt: i64 = row.try_get("", "cnt").unwrap_or(0);
+            Ok(cnt as u64)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Fast list query reading the pre-aggregated `otel_trace_summaries` table.
+    /// Every filter maps to an indexed column on the summary row and both sorts
+    /// are index scans, so this is O(log n) in the number of traces instead of
+    /// the GROUP-BY-then-sort the spans path pays.
+    ///
+    /// The `deployment_environment` display value still resolves the canonical
+    /// environment name via a LEFT JOIN to `deployments`/`environments`
+    /// (falling back to the stored resource attribute), identical to the old
+    /// query, so the UI shows the same label.
+    async fn query_trace_summaries_from_table(
+        &self,
+        query: TraceQuery,
+    ) -> StorageResult<Vec<TraceSummary>> {
+        let limit = query.limit.unwrap_or(50).min(100);
+        let offset = query.offset.unwrap_or(0);
+
+        let (where_sql, mut values, param_idx) = Self::build_summary_filters(&query);
+
+        // sort_by/sort_order come from fixed enums, never user strings, so
+        // interpolating them is injection-safe. Both columns are indexed
+        // (idx_..._project_duration, idx_..._project_start), and the tie-breaker
+        // keeps pagination deterministic across pages.
+        let order_dir = query.sort_order.as_sql();
+        let order_sql = match query.sort_by {
+            crate::types::TraceSortField::Duration => {
+                format!("ORDER BY ts.duration_ms {order_dir}, ts.start_time DESC, ts.trace_id")
+            }
+            crate::types::TraceSortField::StartTime => {
+                format!("ORDER BY ts.start_time {order_dir}, ts.trace_id")
+            }
+        };
+
+        let sql = format!(
+            r#"
+            SELECT
+                ts.trace_id,
+                ts.root_span_name,
+                ts.service_name,
+                ts.kind,
+                COALESCE(e.name, ts.deployment_environment) AS deployment_environment,
+                ts.start_time,
+                ts.duration_ms,
+                ts.span_count,
+                ts.error_count
+            FROM otel_trace_summaries ts
+            LEFT JOIN deployments d ON d.id = ts.deployment_id
+            LEFT JOIN environments e ON e.id = d.environment_id
+            WHERE {where_sql}
+            {order_sql}
+            LIMIT ${limit_param} OFFSET ${offset_param}
+            "#,
+            limit_param = param_idx,
+            offset_param = param_idx + 1,
+        );
+        values.push((limit as i64).into());
+        values.push((offset as i64).into());
+
+        let results = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                &sql,
+                values,
+            ))
+            .await?;
+
+        let summaries = results
+            .iter()
+            .filter_map(|row| {
+                let trace_id: String = row.try_get("", "trace_id").ok()?;
+                let root_span_name: String = row.try_get("", "root_span_name").ok()?;
+                let service_name: String = row.try_get("", "service_name").ok()?;
+                let kind_str: String = row.try_get("", "kind").ok()?;
+                let deployment_environment: Option<String> =
+                    row.try_get("", "deployment_environment").ok().flatten();
+                let start_time: DateTime<Utc> = row.try_get("", "start_time").ok()?;
+                let duration_ms: f64 = row.try_get("", "duration_ms").ok()?;
+                let span_count: i64 = row.try_get("", "span_count").ok()?;
+                let error_count: i64 = row.try_get("", "error_count").ok()?;
+
+                let kind = parse_span_kind(&kind_str);
+                let status_code = if error_count > 0 {
+                    crate::types::SpanStatusCode::Error
+                } else {
+                    crate::types::SpanStatusCode::Ok
+                };
+
+                Some(TraceSummary {
+                    trace_id,
+                    root_span_name,
+                    service_name,
+                    deployment_environment,
+                    kind,
+                    status_code,
+                    start_time,
+                    duration_ms,
+                    span_count,
+                    error_count,
+                })
+            })
+            .collect();
+
+        Ok(summaries)
+    }
+
+    /// Fast count over `otel_trace_summaries`, matching
+    /// `query_trace_summaries_from_table` filters exactly.
+    async fn count_traces_from_table(&self, query: TraceQuery) -> StorageResult<u64> {
+        let (where_sql, values, _param_idx) = Self::build_summary_filters(&query);
+
+        // No JOIN needed for the count: every filter is on ts columns, and the
+        // env JOIN only affects the displayed name, not row membership. (The
+        // environment_id filter is expressed as a deployment_id subquery in
+        // build_summary_filters, so it doesn't need the JOIN either.)
+        let sql = format!("SELECT COUNT(*) AS cnt FROM otel_trace_summaries ts WHERE {where_sql}");
+
+        let result = self
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                &sql,
+                values,
+            ))
+            .await?;
+
+        if let Some(row) = result {
+            let cnt: i64 = row.try_get("", "cnt").unwrap_or(0);
+            Ok(cnt as u64)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Build the shared WHERE clause + bound params for the summary-table
+    /// list/count queries. Returns `(where_sql, values, next_param_idx)`.
+    ///
+    /// All filters map to indexed `ts` columns:
+    /// - time window → `ts.start_time` (the trace's earliest span)
+    /// - `status` → `ts.error_count > 0` / `= 0` (partial index for errors)
+    /// - `min_duration_ms` → `ts.duration_ms` (the trace's longest span)
+    /// - `environment_id` → `ts.deployment_id IN (SELECT … environment_id = ?)`
+    /// - `name_pattern` → `ts.root_span_name ILIKE ?` (root-name match; the
+    ///   any-span variant takes the span-aggregation fallback instead)
+    fn build_summary_filters(query: &TraceQuery) -> (String, Vec<sea_orm::Value>, u32) {
+        let mut where_clauses = vec!["ts.project_id = $1".to_string()];
+        let mut values: Vec<sea_orm::Value> = vec![query.project_id.into()];
+        let mut param_idx = 2u32;
+
+        if let Some(ref tid) = query.trace_id {
+            where_clauses.push(format!("ts.trace_id = ${param_idx}"));
+            values.push(tid.clone().into());
+            param_idx += 1;
+        }
+        if let Some(ref svc) = query.service_name {
+            where_clauses.push(format!("ts.service_name = ${param_idx}"));
+            values.push(svc.clone().into());
+            param_idx += 1;
+        }
+        if let Some(min_dur) = query.min_duration_ms {
+            where_clauses.push(format!("ts.duration_ms >= ${param_idx}"));
+            values.push(min_dur.into());
+            param_idx += 1;
+        }
+        if let Some(start) = query.start_time {
+            where_clauses.push(format!("ts.start_time >= ${param_idx}"));
+            values.push(start.into());
+            param_idx += 1;
+        }
+        if let Some(end) = query.end_time {
+            where_clauses.push(format!("ts.start_time <= ${param_idx}"));
+            values.push(end.into());
+            param_idx += 1;
+        }
+        if let Some(deployment_id) = query.deployment_id {
+            where_clauses.push(format!("ts.deployment_id = ${param_idx}"));
+            values.push(deployment_id.into());
+            param_idx += 1;
+        }
+        if let Some(environment_id) = query.environment_id {
+            where_clauses.push(format!(
+                "ts.deployment_id IN (SELECT id FROM deployments WHERE environment_id = ${param_idx})"
+            ));
+            values.push(environment_id.into());
+            param_idx += 1;
+        }
+        match query.status {
+            Some(crate::types::SpanStatusCode::Error) => {
+                where_clauses.push("ts.error_count > 0".to_string());
+            }
+            Some(crate::types::SpanStatusCode::Ok) => {
+                where_clauses.push("ts.error_count = 0".to_string());
+            }
+            _ => {}
+        }
+        if let Some(ref pattern) = query.name_pattern {
+            where_clauses.push(format!("ts.root_span_name ILIKE ${param_idx}"));
+            values.push(format!("%{}%", escape_like_pattern(pattern)).into());
+            param_idx += 1;
+        }
+
+        (where_clauses.join(" AND "), values, param_idx)
+    }
+}
+
 // ── LIKE pattern helpers ─────────────────────────────────────────────
 
 /// Escape LIKE/ILIKE metacharacters in a user-supplied substring pattern.
@@ -2018,6 +2412,138 @@ fn escape_like_pattern(pattern: &str) -> String {
         .replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")
+}
+
+/// Whether a trace query needs a span-level filter the pre-aggregated
+/// `otel_trace_summaries` table can't satisfy, forcing the slower
+/// `GROUP BY trace_id` fallback over the spans hypertable.
+///
+/// Two filters are span-level:
+/// - `attributes`: per-span JSONB (e.g. GenAI `gen_ai.system`). The summary
+///   row has no attributes, so this must scan spans.
+/// - `name_pattern`: the spans path matches *any* span name in the trace,
+///   while the summary only knows the root span name. To preserve the exact
+///   any-span semantics, route name-pattern queries through the fallback too.
+///
+/// Everything else (project, time window, service, deployment, environment,
+/// status, min-duration, trace_id) maps to indexed summary columns and takes
+/// the fast path.
+fn needs_span_level_filter(query: &TraceQuery) -> bool {
+    let has_attributes = query.attributes.as_ref().is_some_and(|a| !a.is_empty());
+    let has_name_pattern = query.name_pattern.as_ref().is_some_and(|p| !p.is_empty());
+    has_attributes || has_name_pattern
+}
+
+/// Parse the canonical span-kind text stored in `otel_spans.kind` /
+/// `otel_trace_summaries.kind` (uppercase, e.g. `"SERVER"`, written by
+/// `SpanKind::to_string`) back into a [`SpanKind`]. Unknown values fall back to
+/// `Internal`.
+///
+/// NOTE: the previous trace-summary read path matched capitalized variants
+/// (`"Server"`, `"Client"`, …) which never matched the uppercase stored
+/// values, so every trace's kind silently collapsed to `Internal`. This parser
+/// matches the actually-stored uppercase form and fixes that.
+fn parse_span_kind(kind_str: &str) -> crate::types::SpanKind {
+    match kind_str {
+        "SERVER" => crate::types::SpanKind::Server,
+        "CLIENT" => crate::types::SpanKind::Client,
+        "PRODUCER" => crate::types::SpanKind::Producer,
+        "CONSUMER" => crate::types::SpanKind::Consumer,
+        "UNSPECIFIED" => crate::types::SpanKind::Unspecified,
+        _ => crate::types::SpanKind::Internal,
+    }
+}
+
+/// One trace's worth of aggregates folded from a span batch, ready to upsert
+/// into `otel_trace_summaries`. The root fields are `Some` only when this batch
+/// carried the trace's root span (parent_span_id IS NULL); otherwise the upsert
+/// leaves the stored row's root identity untouched.
+#[derive(Debug, Clone, PartialEq)]
+struct TraceDelta {
+    project_id: i32,
+    trace_id: String,
+    /// Earliest span start seen in this batch for the trace.
+    start_time: DateTime<Utc>,
+    /// Longest span duration seen in this batch for the trace.
+    max_duration_ms: f64,
+    span_count: i64,
+    error_count: i64,
+    root_span_name: Option<String>,
+    root_service_name: Option<String>,
+    root_kind: Option<String>,
+    root_env: Option<String>,
+    root_deployment_id: Option<i32>,
+    has_root: bool,
+}
+
+/// Fold a span batch into one [`TraceDelta`] per distinct `(project_id,
+/// trace_id)`. Pure (no I/O) so the aggregation semantics can be unit-tested
+/// without a database.
+///
+/// Semantics, matching the `ON CONFLICT DO UPDATE` in `upsert_trace_summaries`:
+/// - `span_count` / `error_count` count this batch's spans (accumulated into
+///   the stored totals on upsert).
+/// - `start_time` is the MIN and `max_duration_ms` the MAX across the batch
+///   (combined with the stored row via LEAST/GREATEST on upsert).
+/// - The first root span encountered (parent_span_id IS NULL) sets the root
+///   identity fields; later spans never overwrite them within the batch. A
+///   batch with no root leaves all root fields `None` / `has_root = false`.
+///
+/// Output order is deterministic (sorted by `(project_id, trace_id)`) so the
+/// generated multi-row INSERT and tests are stable.
+fn fold_trace_deltas(spans: &[SpanRecord]) -> Vec<TraceDelta> {
+    use std::collections::HashMap;
+
+    let mut by_trace: HashMap<(i32, String), TraceDelta> = HashMap::new();
+
+    for s in spans {
+        let is_error = matches!(s.status_code, SpanStatusCode::Error);
+        let is_root = s.parent_span_id.is_none();
+        let key = (s.project_id, s.trace_id.clone());
+
+        let entry = by_trace.entry(key).or_insert_with(|| TraceDelta {
+            project_id: s.project_id,
+            trace_id: s.trace_id.clone(),
+            start_time: s.start_time,
+            max_duration_ms: 0.0,
+            span_count: 0,
+            error_count: 0,
+            root_span_name: None,
+            root_service_name: None,
+            root_kind: None,
+            root_env: None,
+            root_deployment_id: None,
+            has_root: false,
+        });
+
+        entry.span_count += 1;
+        if is_error {
+            entry.error_count += 1;
+        }
+        if s.start_time < entry.start_time {
+            entry.start_time = s.start_time;
+        }
+        if s.duration_ms > entry.max_duration_ms {
+            entry.max_duration_ms = s.duration_ms;
+        }
+        if is_root && !entry.has_root {
+            // First root span in this batch wins the trace's identity.
+            entry.has_root = true;
+            entry.root_span_name = Some(s.name.clone());
+            entry.root_service_name = Some(s.resource.service_name.clone());
+            entry.root_kind = Some(s.kind.to_string());
+            entry.root_env = s.resource.deployment_environment.clone();
+            entry.root_deployment_id = s.deployment_id;
+        }
+    }
+
+    let mut deltas: Vec<TraceDelta> = by_trace.into_values().collect();
+    deltas.sort_by(|a, b| {
+        a.project_id
+            .cmp(&b.project_id)
+            .then_with(|| a.trace_id.cmp(&b.trace_id))
+    });
+    deltas
 }
 
 // ── Row parsers ─────────────────────────────────────────────────────
@@ -2167,4 +2693,252 @@ fn parse_health_summary_row(row: &sea_orm::QueryResult) -> Result<HealthSummary,
         last_deploy_at: row.try_get("", "last_deploy_at").ok(),
         computed_at: row.try_get("", "computed_at").unwrap_or_default(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{
+        ResourceInfo, SpanKind, SpanRecord, SpanStatusCode, TraceQuery, TraceSortField,
+    };
+    use chrono::TimeZone;
+    use std::collections::BTreeMap;
+
+    fn ts(secs: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(1_700_000_000 + secs, 0).single().unwrap()
+    }
+
+    /// Minimal span builder for fold tests.
+    fn span(
+        project_id: i32,
+        trace_id: &str,
+        span_id: &str,
+        parent: Option<&str>,
+        start_secs: i64,
+        duration_ms: f64,
+        status: SpanStatusCode,
+    ) -> SpanRecord {
+        SpanRecord {
+            project_id,
+            deployment_id: Some(7),
+            resource: ResourceInfo {
+                service_name: "api".to_string(),
+                service_version: None,
+                deployment_environment: Some("production".to_string()),
+                attributes: BTreeMap::new(),
+            },
+            trace_id: trace_id.to_string(),
+            span_id: span_id.to_string(),
+            parent_span_id: parent.map(|p| p.to_string()),
+            name: format!("op-{span_id}"),
+            kind: SpanKind::Server,
+            start_time: ts(start_secs),
+            end_time: ts(start_secs) + chrono::Duration::milliseconds(duration_ms as i64),
+            duration_ms,
+            status_code: status,
+            status_message: String::new(),
+            attributes: BTreeMap::new(),
+            events: vec![],
+        }
+    }
+
+    fn base_query(project_id: i32) -> TraceQuery {
+        TraceQuery {
+            project_id,
+            trace_id: None,
+            service_name: None,
+            status: None,
+            min_duration_ms: None,
+            start_time: None,
+            end_time: None,
+            environment_id: None,
+            deployment_id: None,
+            attributes: None,
+            name_pattern: None,
+            sort_by: TraceSortField::StartTime,
+            sort_order: Default::default(),
+            limit: None,
+            offset: None,
+        }
+    }
+
+    // ── fold_trace_deltas ────────────────────────────────────────────────
+
+    #[test]
+    fn fold_empty_batch_yields_no_deltas() {
+        assert!(fold_trace_deltas(&[]).is_empty());
+    }
+
+    #[test]
+    fn fold_groups_by_trace_and_counts_spans_and_errors() {
+        // Two traces in one batch. Trace A: 3 spans, 1 error. Trace B: 1 span.
+        let spans = vec![
+            span(1, "A", "a1", None, 10, 100.0, SpanStatusCode::Ok),
+            span(1, "A", "a2", Some("a1"), 11, 250.0, SpanStatusCode::Error),
+            span(1, "A", "a3", Some("a1"), 12, 50.0, SpanStatusCode::Ok),
+            span(1, "B", "b1", None, 20, 30.0, SpanStatusCode::Ok),
+        ];
+        let deltas = fold_trace_deltas(&spans);
+        assert_eq!(deltas.len(), 2);
+
+        // Deterministic order: A before B.
+        let a = &deltas[0];
+        assert_eq!(a.trace_id, "A");
+        assert_eq!(a.span_count, 3);
+        assert_eq!(a.error_count, 1);
+        // start_time is the MIN (the root at +10s), duration the MAX (250ms).
+        assert_eq!(a.start_time, ts(10));
+        assert_eq!(a.max_duration_ms, 250.0);
+
+        let b = &deltas[1];
+        assert_eq!(b.trace_id, "B");
+        assert_eq!(b.span_count, 1);
+        assert_eq!(b.error_count, 0);
+    }
+
+    #[test]
+    fn fold_root_span_wins_identity_even_when_not_first() {
+        // The root (no parent) arrives AFTER a child in the batch; it must still
+        // claim the trace's root identity, and a longer child must not.
+        let mut root = span(1, "T", "root", None, 5, 80.0, SpanStatusCode::Ok);
+        root.name = "GET /checkout".to_string();
+        root.resource.service_name = "gateway".to_string();
+        root.kind = SpanKind::Server;
+
+        let child = span(1, "T", "child", Some("root"), 6, 900.0, SpanStatusCode::Ok);
+
+        // child first, root second
+        let deltas = fold_trace_deltas(&[child, root]);
+        assert_eq!(deltas.len(), 1);
+        let d = &deltas[0];
+        assert!(d.has_root);
+        assert_eq!(d.root_span_name.as_deref(), Some("GET /checkout"));
+        assert_eq!(d.root_service_name.as_deref(), Some("gateway"));
+        assert_eq!(d.root_kind.as_deref(), Some("SERVER")); // canonical uppercase
+                                                            // duration is still the MAX across the trace (the 900ms child).
+        assert_eq!(d.max_duration_ms, 900.0);
+    }
+
+    #[test]
+    fn fold_batch_without_root_leaves_root_fields_unset() {
+        // A batch of only child spans (late, before the root arrives). The
+        // delta must carry has_root=false so the upsert won't clobber a stored
+        // root identity with empty strings.
+        let spans = vec![
+            span(1, "T", "c1", Some("root"), 6, 100.0, SpanStatusCode::Ok),
+            span(1, "T", "c2", Some("root"), 7, 120.0, SpanStatusCode::Error),
+        ];
+        let deltas = fold_trace_deltas(&spans);
+        assert_eq!(deltas.len(), 1);
+        let d = &deltas[0];
+        assert!(!d.has_root);
+        assert!(d.root_span_name.is_none());
+        assert!(d.root_kind.is_none());
+        // counts still accumulate for late spans
+        assert_eq!(d.span_count, 2);
+        assert_eq!(d.error_count, 1);
+    }
+
+    #[test]
+    fn fold_separates_same_trace_id_across_projects() {
+        // Same trace_id string under two different projects must NOT merge.
+        let spans = vec![
+            span(1, "shared", "s1", None, 10, 10.0, SpanStatusCode::Ok),
+            span(2, "shared", "s2", None, 10, 10.0, SpanStatusCode::Ok),
+        ];
+        let deltas = fold_trace_deltas(&spans);
+        assert_eq!(deltas.len(), 2);
+        assert_eq!(deltas[0].project_id, 1);
+        assert_eq!(deltas[1].project_id, 2);
+    }
+
+    // ── needs_span_level_filter (fast vs. fallback dispatch) ──────────────
+
+    #[test]
+    fn plain_list_query_uses_fast_path() {
+        let mut q = base_query(1);
+        q.service_name = Some("api".to_string());
+        q.status = Some(SpanStatusCode::Error);
+        q.min_duration_ms = Some(100.0);
+        q.start_time = Some(ts(0));
+        assert!(
+            !needs_span_level_filter(&q),
+            "service/status/duration/time filters all live on the summary table"
+        );
+    }
+
+    #[test]
+    fn attribute_filter_forces_span_fallback() {
+        let mut q = base_query(1);
+        let mut attrs = BTreeMap::new();
+        attrs.insert("gen_ai.system".to_string(), "openai".to_string());
+        q.attributes = Some(attrs);
+        assert!(needs_span_level_filter(&q));
+    }
+
+    #[test]
+    fn empty_attribute_map_stays_on_fast_path() {
+        let mut q = base_query(1);
+        q.attributes = Some(BTreeMap::new());
+        assert!(
+            !needs_span_level_filter(&q),
+            "an empty attribute map is not a real filter"
+        );
+    }
+
+    #[test]
+    fn name_pattern_forces_span_fallback() {
+        let mut q = base_query(1);
+        q.name_pattern = Some("checkout".to_string());
+        assert!(needs_span_level_filter(&q));
+
+        // empty pattern is not a real filter
+        q.name_pattern = Some(String::new());
+        assert!(!needs_span_level_filter(&q));
+    }
+
+    // ── parse_span_kind (regression: uppercase stored values) ────────────
+
+    #[test]
+    fn parse_span_kind_matches_canonical_uppercase() {
+        assert!(matches!(parse_span_kind("SERVER"), SpanKind::Server));
+        assert!(matches!(parse_span_kind("CLIENT"), SpanKind::Client));
+        assert!(matches!(parse_span_kind("PRODUCER"), SpanKind::Producer));
+        assert!(matches!(parse_span_kind("CONSUMER"), SpanKind::Consumer));
+        assert!(matches!(parse_span_kind("INTERNAL"), SpanKind::Internal));
+        assert!(matches!(
+            parse_span_kind("UNSPECIFIED"),
+            SpanKind::Unspecified
+        ));
+    }
+
+    #[test]
+    fn parse_span_kind_round_trips_with_display() {
+        // The fold stores `SpanKind::to_string()`; parse_span_kind must invert
+        // it for every variant, or the list view shows the wrong kind.
+        for k in [
+            SpanKind::Server,
+            SpanKind::Client,
+            SpanKind::Producer,
+            SpanKind::Consumer,
+            SpanKind::Internal,
+            SpanKind::Unspecified,
+        ] {
+            let stored = k.to_string();
+            let parsed = parse_span_kind(&stored);
+            assert_eq!(
+                parsed.to_string(),
+                stored,
+                "round-trip failed for {k:?} (stored as {stored})"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_span_kind_unknown_falls_back_to_internal() {
+        assert!(matches!(parse_span_kind("bogus"), SpanKind::Internal));
+        // The OLD buggy capitalized form must now resolve to Internal (it's not
+        // a stored value), proving we no longer accidentally match it.
+        assert!(matches!(parse_span_kind("Server"), SpanKind::Internal));
+    }
 }
