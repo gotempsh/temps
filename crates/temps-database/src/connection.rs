@@ -301,20 +301,51 @@ impl MigrationRunReport {
     }
 }
 
-/// Apply pending schema migrations one at a time, returning a [`MigrationRunReport`]
-/// so callers (the `temps migrate` CLI) can print a plan up front and a
-/// pass/fail line per migration.
+/// Progress event emitted by [`run_migrations_streaming`] as it works through
+/// the pending list, so a CLI can give live feedback instead of waiting for the
+/// whole run to finish.
+#[derive(Debug, Clone)]
+pub enum MigrationProgress<'a> {
+    /// A migration is about to be applied. `index` is 1-based; `total` is the
+    /// number of pending migrations. Emitted before `Migrator::up` runs so the
+    /// operator sees which migration is currently in flight (the one that might
+    /// hang on a slow index build).
+    Started {
+        index: usize,
+        total: usize,
+        name: &'a str,
+    },
+    /// A migration finished — successfully or not. Carries the same per-step
+    /// result that ends up in [`MigrationRunReport::results`].
+    Finished {
+        index: usize,
+        total: usize,
+        result: &'a MigrationStepResult,
+    },
+}
+
+/// Apply pending schema migrations one at a time, invoking `on_progress` before
+/// and after each one so callers can give live feedback as the run proceeds.
 ///
-/// Behaves like [`run_migrations`] but step-wise: it reads the pending list via
-/// `Migrator::get_pending_migrations`, then applies each with `Migrator::up(db,
-/// Some(1))`, timing each and stopping at the first failure. The same
-/// `lock_timeout` guard is applied so a contended lock fails fast instead of
-/// hanging. Each step is bounded by [`MIGRATION_TIMEOUT`].
+/// This is the streaming core behind [`run_migrations_reported`]. It reads the
+/// pending list via `Migrator::get_pending_migrations`, then applies each with
+/// `Migrator::up(db, Some(1))`, timing each and stopping at the first failure.
+/// `on_progress` fires with [`MigrationProgress::Started`] right before a
+/// migration runs and [`MigrationProgress::Finished`] right after — so a CLI can
+/// print "applying X…" / "✓ X (820ms)" lines as they happen instead of waiting
+/// for the whole batch (a slow index build no longer looks like a hang).
 ///
-/// This does NOT run the post-migration continuous-aggregate backfill — the
-/// caller runs [`run_post_migration_backfill`] afterwards, exactly as the
-/// all-or-nothing path does.
-pub async fn run_migrations_reported(db: &DbConnection) -> ServiceResult<MigrationRunReport> {
+/// The same `lock_timeout` guard is applied so a contended lock fails fast
+/// instead of hanging, and each step is bounded by [`MIGRATION_TIMEOUT`]. This
+/// does NOT run the post-migration continuous-aggregate backfill — the caller
+/// runs [`run_post_migration_backfill`] afterwards.
+pub async fn run_migrations_streaming<F>(
+    db: &DbConnection,
+    mut on_progress: F,
+) -> ServiceResult<MigrationRunReport>
+where
+    F: FnMut(MigrationProgress<'_>),
+{
     // Fail fast on contended locks rather than hanging (mirrors run_migrations).
     if let Err(e) = db
         .execute(Statement::from_string(
@@ -334,17 +365,27 @@ pub async fn run_migrations_reported(db: &DbConnection) -> ServiceResult<Migrati
         .await
         .map_err(|e| ServiceError::Database(format!("Failed to read pending migrations: {}", e)))?;
 
+    let total = pending.len();
     let mut report = MigrationRunReport {
         planned: pending.iter().map(|m| m.name().to_string()).collect(),
-        results: Vec::new(),
+        results: Vec::with_capacity(total),
     };
 
     // 2. Apply each pending migration individually so we can time and report it.
     //    `Migrator::up(db, Some(1))` applies exactly the next pending migration.
-    for migration in &pending {
+    for (i, migration) in pending.iter().enumerate() {
+        let index = i + 1;
         let name = migration.name().to_string();
-        let started = std::time::Instant::now();
 
+        // Announce the migration BEFORE running it: this is the one that might
+        // sit for a while on a large table, so the operator needs to see it now.
+        on_progress(MigrationProgress::Started {
+            index,
+            total,
+            name: &name,
+        });
+
+        let started = std::time::Instant::now();
         let outcome = match timeout(MIGRATION_TIMEOUT, Migrator::up(db, Some(1))).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => Err(format!("{}", e)),
@@ -352,28 +393,57 @@ pub async fn run_migrations_reported(db: &DbConnection) -> ServiceResult<Migrati
         };
         let elapsed = started.elapsed();
 
-        match outcome {
-            Ok(()) => report.results.push(MigrationStepResult {
-                name,
-                success: true,
-                elapsed,
-                error: None,
-            }),
-            Err(err) => {
-                report.results.push(MigrationStepResult {
-                    name,
-                    success: false,
-                    elapsed,
-                    error: Some(err),
-                });
-                // Stop at the first failure — later migrations may depend on
-                // the one that just failed, and Sea-ORM won't have applied them.
-                break;
-            }
+        let (success, error) = match outcome {
+            Ok(()) => (true, None),
+            Err(err) => (false, Some(err)),
+        };
+        report.results.push(MigrationStepResult {
+            name,
+            success,
+            elapsed,
+            error,
+        });
+
+        // Safe to unwrap: we just pushed. Emit the finished result.
+        let result = report.results.last().expect("just pushed a result");
+        on_progress(MigrationProgress::Finished {
+            index,
+            total,
+            result,
+        });
+
+        // Stop at the first failure — later migrations may depend on the one
+        // that just failed, and Sea-ORM won't have applied them.
+        if !success {
+            break;
         }
     }
 
     Ok(report)
+}
+
+/// Apply pending schema migrations one at a time, returning a [`MigrationRunReport`]
+/// so callers can print a plan up front and a pass/fail line per migration.
+///
+/// Thin wrapper over [`run_migrations_streaming`] that discards progress events
+/// and returns only the final report. Prefer `run_migrations_streaming` when you
+/// want live per-migration feedback.
+pub async fn run_migrations_reported(db: &DbConnection) -> ServiceResult<MigrationRunReport> {
+    run_migrations_streaming(db, |_| {}).await
+}
+
+/// Read the list of pending migrations WITHOUT applying any of them.
+///
+/// Returns the names (in apply order) of migrations defined in this binary that
+/// are not yet recorded in `seaql_migrations`. Used by `temps migrate --dry-run`
+/// to show the plan and by the interactive `--confirm` gate to preview what
+/// would run before the operator commits. This is read-only: it never mutates
+/// the schema or the migration ledger.
+pub async fn get_pending_migration_names(db: &DbConnection) -> ServiceResult<Vec<String>> {
+    let pending = Migrator::get_pending_migrations(db)
+        .await
+        .map_err(|e| ServiceError::Database(format!("Failed to read pending migrations: {}", e)))?;
+    Ok(pending.iter().map(|m| m.name().to_string()).collect())
 }
 
 /// Run post-migration backfill for continuous aggregates.
