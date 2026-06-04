@@ -8,13 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
--
+- `temps migrate --dry-run` flag: previews pending migrations read-only without applying them
+- `temps migrate --yes`/`-y` flag: skips interactive confirmation gate (auto-skipped in non-TTY environments)
+- Live per-migration progress streaming: prints `→ [N/total] name` / `✓ [N/total] name (timing)` as each migration applies
+- `run_migrations_streaming` in `temps-database`: fires `Started`/`Finished` events per migration for caller progress callbacks
+- `get_pending_migration_names` helper in `temps-database`: read-only query of unapplied migration names
 
 ### Changed
 -
 
 ### Fixed
--
+- Chart tooltips stopped working after a `forwardRef` wrapper changed `ChartTooltip`'s component type identity; recharts matches tooltip children by type so the wrapped component was silently never registered. Reverted `ChartTooltip` to the raw `RechartsPrimitive.Tooltip`.
 
 
 ## [0.1.0-beta.26] - 2026-06-03
