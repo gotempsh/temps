@@ -98,17 +98,12 @@ ${colorConfig
   )
 }
 
-const ChartTooltip = React.forwardRef<
-  HTMLDivElement,
-  React.ComponentProps<typeof RechartsPrimitive.Tooltip>
->(({ wrapperStyle, allowEscapeViewBox, ...props }, _ref) => (
-  <RechartsPrimitive.Tooltip
-    wrapperStyle={{ zIndex: 50, ...wrapperStyle }}
-    allowEscapeViewBox={{ x: true, y: true, ...allowEscapeViewBox }}
-    {...props}
-  />
-))
-ChartTooltip.displayName = 'ChartTooltip'
+// IMPORTANT: ChartTooltip must be the raw recharts Tooltip, not a wrapper.
+// recharts identifies the tooltip child by its component type while walking the
+// chart's children; a forwardRef wrapper has a different type identity, so
+// recharts silently never registers it and tooltips stop activating on hover
+// across every chart in the app. (Regression from #108 — do not re-wrap this.)
+const ChartTooltip = RechartsPrimitive.Tooltip
 
 const ChartTooltipContent = React.forwardRef<
   HTMLDivElement,
