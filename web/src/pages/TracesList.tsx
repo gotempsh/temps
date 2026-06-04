@@ -757,6 +757,38 @@ export default function TracesList({ project }: TracesListProps) {
   const totalCount = data?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(totalCount / PAGE_SIZE))
 
+  // "Has this project EVER received a trace?" — a window/filter-independent
+  // probe (project_id only, limit 1). The main query above is scoped to the
+  // selected time range and filters, so its `total` goes to 0 whenever the
+  // window happens to be empty. Gating the setup onboarding on that would show
+  // "set up OpenTelemetry" to a project with millions of historical traces just
+  // because nothing landed in the last 24h. This probe answers the real
+  // question the onboarding screen is for.
+  const { data: anyTraceData, isLoading: isProbeLoading } = useQuery({
+    ...queryTraceSummariesOptions({
+      query: { project_id: project.id, limit: 1 },
+    }),
+    enabled: !!project.id,
+  })
+  const hasEverReceivedTraces = (anyTraceData?.total ?? 0) > 0
+
+  const hasActiveFilters =
+    !!search ||
+    !!serviceName ||
+    status !== 'all' ||
+    environmentId !== 'all' ||
+    deploymentId !== 'all'
+
+  // Copy for the in-window empty state, in priority order:
+  //  1. filters/window active → suggest adjusting them
+  //  2. project has traces but none in this window → suggest widening the range
+  //  3. project has never sent a trace → the genuine "get started" message
+  const emptyStateDescription = hasActiveFilters
+    ? 'Try adjusting your filters or time range.'
+    : hasEverReceivedTraces
+      ? 'No traces in the selected time range. Try widening the range.'
+      : 'Traces will appear here once your application sends data via OpenTelemetry.'
+
   // Extract unique service names for the filter dropdown
   const serviceNames = useMemo(() => {
     if (!traces.length) return []
@@ -844,8 +876,12 @@ export default function TracesList({ project }: TracesListProps) {
         </div>
       </div>
 
-      {/* Setup section — shown when there are no traces yet, or when toggled on */}
-      {((!isLoading && totalCount === 0) || showSetup) && (
+      {/* Setup section — onboarding for a project that has NEVER received a
+          trace, or when the user explicitly toggles it. Deliberately NOT gated
+          on the windowed `totalCount`: an empty time range is "no results
+          here", not "never set up", and must not resurface the setup wizard for
+          a project with existing traces (see hasEverReceivedTraces probe). */}
+      {((!isProbeLoading && !hasEverReceivedTraces) || showSetup) && (
         <OtelSetupSection project={project} />
       )}
 
@@ -909,7 +945,8 @@ export default function TracesList({ project }: TracesListProps) {
                   <SelectItem value="all">All Deployments</SelectItem>
                   {deployments.map((d) => (
                     <SelectItem key={d.id} value={String(d.id)}>
-                      #{d.id}{d.slug ? ` (${d.slug})` : ''}
+                      #{d.id}
+                      {d.commit_hash ? ` (${d.commit_hash.slice(0, 7)})` : ''}
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -962,13 +999,11 @@ export default function TracesList({ project }: TracesListProps) {
         <EmptyState
           icon={Workflow}
           title="No traces found"
-          description={
-            search || serviceName || status !== 'all' || environmentId !== 'all' || deploymentId !== 'all'
-              ? 'Try adjusting your filters or time range.'
-              : 'Traces will appear here once your application sends data via OpenTelemetry.'
-          }
+          description={emptyStateDescription}
           action={
-            !search && !serviceName && status === 'all' && environmentId === 'all' && deploymentId === 'all' ? (
+            // Only nudge toward setup for a project that has never sent a
+            // trace — never when it just has nothing in the current window.
+            !hasActiveFilters && !hasEverReceivedTraces ? (
               <Button
                 variant="outline"
                 size="sm"
