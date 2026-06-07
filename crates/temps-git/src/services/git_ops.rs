@@ -193,6 +193,19 @@ pub fn checkout_ref(repo: &Repository, ref_name: &str) -> Result<(), GitOpsError
         .map(|p| p.display().to_string())
         .unwrap_or_default();
 
+    // Reject the all-zeros "null SHA". Git uses it to signal an absent ref
+    // (e.g. branch/tag deletion webhooks), so it can never resolve to a commit.
+    // Fail with an actionable message instead of an opaque libgit2 error.
+    if !ref_name.is_empty() && ref_name.chars().all(|c| c == '0') {
+        return Err(GitOpsError::CheckoutFailed {
+            ref_name: ref_name.to_string(),
+            repo_path,
+            reason: "ref is the all-zeros null SHA, which corresponds to a deleted branch/tag and \
+                     has no commit to check out"
+                .to_string(),
+        });
+    }
+
     // Try to resolve as a commit SHA first (full or abbreviated)
     let object = repo
         .revparse_single(ref_name)
@@ -313,6 +326,36 @@ mod tests {
             }
             other => panic!("Expected CheckoutFailed, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_checkout_null_sha_returns_descriptive_error() {
+        let (_temp_dir, repo) = create_test_repo();
+
+        // The all-zeros null SHA (sent on branch/tag deletion) must fail with a
+        // descriptive reason, not an opaque libgit2 "object not found" message.
+        let null_sha = "0000000000000000000000000000000000000000";
+        let result = checkout_ref(&repo, null_sha);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            GitOpsError::CheckoutFailed {
+                ref_name, reason, ..
+            } => {
+                assert_eq!(ref_name, null_sha);
+                assert!(
+                    reason.contains("null SHA"),
+                    "reason should explain the null SHA, got: {reason}"
+                );
+            }
+            other => panic!("Expected CheckoutFailed, got {:?}", other),
+        }
+
+        // Abbreviated null SHA (the "0000000" the UI displays) is rejected too.
+        let result = checkout_ref(&repo, "0000000");
+        assert!(matches!(
+            result.unwrap_err(),
+            GitOpsError::CheckoutFailed { .. }
+        ));
     }
 
     #[test]

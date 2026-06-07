@@ -4015,6 +4015,22 @@ impl GitProviderManager {
         use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
         use temps_entities::projects;
 
+        // Branch/tag deletions send the all-zeros "null SHA" in the `after`
+        // field (GitHub, GitLab, and others all follow this Git convention).
+        // There is no commit to deploy, so creating a deployment from it would
+        // queue a download_repo job that fails with
+        // "Failed to checkout ref 0000000...". Ignore these events.
+        if commit.is_empty() || commit.chars().all(|c| c == '0') {
+            tracing::info!(
+                "Ignoring push event for {}/{} with null SHA (branch/tag deletion), branch: {:?}, tag: {:?}",
+                owner,
+                repo,
+                branch,
+                tag
+            );
+            return Ok(());
+        }
+
         // Find all projects with this owner and repo
         let matching_projects = projects::Entity::find()
             .filter(projects::Column::RepoOwner.eq(&owner))
@@ -5057,6 +5073,73 @@ mod tests {
         fn subscribe(&self) -> Box<dyn JobReceiver> {
             panic!("subscribe not needed for tests")
         }
+    }
+
+    /// A queue that fails the test if anything is ever enqueued. Used to assert
+    /// that a push event was short-circuited before any deployment job was sent.
+    struct PanicOnSendJobQueue;
+
+    #[async_trait]
+    impl JobQueue for PanicOnSendJobQueue {
+        async fn send(&self, job: Job) -> Result<(), QueueError> {
+            panic!("no job should be queued, but got: {job:?}");
+        }
+
+        fn subscribe(&self) -> Box<dyn JobReceiver> {
+            panic!("subscribe not needed for tests")
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_push_event_ignores_null_sha_deletion() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        // A MockDatabase with no queued results errors on the first query —
+        // proving the null-SHA guard returns before touching the database. The
+        // panic-on-send queue proves no deployment job is enqueued.
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+
+        let encryption_service = Arc::new(
+            temps_core::EncryptionService::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .unwrap(),
+        );
+        let queue_service = Arc::new(PanicOnSendJobQueue) as Arc<dyn JobQueue>;
+        let config_service = create_test_config_service(db.clone());
+
+        let manager =
+            GitProviderManager::new(db, encryption_service, queue_service, config_service);
+
+        // Full all-zeros null SHA (GitHub/GitLab branch deletion).
+        let result = manager
+            .handle_push_event(
+                "owner".into(),
+                "repo".into(),
+                Some("deleted-branch".into()),
+                None,
+                "0000000000000000000000000000000000000000".into(),
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "null-SHA push event should be ignored: {result:?}"
+        );
+
+        // Empty commit string is treated the same way.
+        let result = manager
+            .handle_push_event(
+                "owner".into(),
+                "repo".into(),
+                Some("b".into()),
+                None,
+                String::new(),
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "empty-SHA push event should be ignored: {result:?}"
+        );
     }
 
     // Helper function to create a test ConfigService
