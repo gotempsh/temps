@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **Null-SHA push events no longer create failed `0000000` deployments**: branch/tag deletions send the all-zeros Git null SHA (`0000…000`) in the push webhook's `after` field, which previously flowed through into a deployment whose `download_repo` job failed with `Failed to checkout ref 0000000…`. `handle_push_event` now short-circuits empty/all-zeros commits before any DB query or job enqueue (covers both GitHub and GitLab), and `checkout_ref` defensively rejects the null SHA with an actionable error.
 
 
 ## [0.1.0-beta.27] - 2026-06-05
