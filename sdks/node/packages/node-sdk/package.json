@@ -27,8 +27,8 @@
     "@hey-api/openapi-ts": "^0.82.4",
     "@types/bun": "latest",
     "@types/node": "^24.10.1",
-    "@vitest/coverage-v8": "^3.2.4",
-    "vitest": "^3.2.4"
+    "@vitest/coverage-v8": "^4.1.0",
+    "vitest": "^4.1.0"
   },
   "peerDependencies": {
     "typescript": "^5"
