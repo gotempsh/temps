@@ -5,6 +5,7 @@ import {
 import { BackupAlertsButton } from '@/components/dashboard/BackupAlertsButton'
 import { ThemeToggle } from '@/components/theme/ThemeToggle'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { useConsoleExtensions } from '@temps-sdk/console-kit'
 import { useQuery } from '@tanstack/react-query'
 import {
   Check,
@@ -175,6 +176,9 @@ export function Header() {
   const { breadcrumbs } = useBreadcrumbs()
   const navigate = useNavigate()
   const location = useLocation()
+  // Extension-provided header actions (e.g. EE's SRE Copilot), rendered
+  // leftmost in the top-right control cluster.
+  const { headerActions } = useConsoleExtensions()
 
   const projectSlugMatch = location.pathname.match(/^\/projects\/([^/]+)/)
   const projectSlug =
@@ -237,6 +241,9 @@ export function Header() {
           </Breadcrumb>
         </div>
         <div className="ml-auto flex items-center space-x-2">
+          {headerActions?.map((action) => (
+            <React.Fragment key={action.id}>{action.element}</React.Fragment>
+          ))}
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button variant="outline" size="icon">

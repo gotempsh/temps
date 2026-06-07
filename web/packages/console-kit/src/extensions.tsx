@@ -13,9 +13,25 @@ export interface ConsoleRoute {
   element: ReactElement
 }
 
+/**
+ * An action rendered in the top-right of the console header, left of the
+ * built-in Create / alerts / theme controls. Intended for compact icon
+ * buttons that navigate to or open an extension surface (e.g. EE's SRE
+ * Copilot). Order follows array order.
+ */
+export interface ConsoleHeaderAction {
+  /** Stable id (React key + test hook). */
+  id: string
+  /** The rendered control — typically an icon `Button`. The extension owns
+   *  its own onClick/navigation; the console shell only places it. */
+  element: ReactNode
+}
+
 export interface ConsoleExtensions {
   routes?: ConsoleRoute[]
   navItems?: ConsoleNavItem[]
+  /** Compact actions placed top-right in the header (see [`ConsoleHeaderAction`]). */
+  headerActions?: ConsoleHeaderAction[]
   logoBadge?: ReactNode
   /**
    * Replace the OSS unauthenticated login screen with an extension-provided
