@@ -28,6 +28,7 @@ pub mod cron_executions;
 pub mod crons;
 pub mod custom_routes;
 pub mod deployment_config;
+pub mod deployment_container_logs;
 pub mod deployment_containers;
 pub mod deployment_domains;
 pub mod deployment_jobs;

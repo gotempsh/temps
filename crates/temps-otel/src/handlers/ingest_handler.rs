@@ -87,7 +87,13 @@ impl From<OtelError> for Problem {
 fn extract_token(headers: &HeaderMap) -> Option<String> {
     if let Some(auth) = headers.get("authorization") {
         if let Ok(value) = auth.to_str() {
-            tracing::debug!(authorization = %value, "OTLP extract_token");
+            // SECURITY: never log the raw header — it carries a live, mostly
+            // non-expiring credential (Bearer dt_/tk_/si_). Log only its shape.
+            tracing::debug!(
+                scheme = value.split_whitespace().next().unwrap_or(""),
+                len = value.len(),
+                "OTLP extract_token"
+            );
             if let Some(key) = value.strip_prefix("Bearer ") {
                 return Some(key.trim().to_string());
             }

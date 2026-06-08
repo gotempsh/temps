@@ -9,8 +9,8 @@ use axum::{
     routing::{delete, get, patch, post, put},
     Json, Router,
 };
-use temps_auth::permission_guard;
 use temps_auth::RequireAuth;
+use temps_auth::{deny_deployment_token, permission_guard, project_scope_guard};
 use temps_core::{
     error_builder::{bad_request, forbidden, internal_server_error, not_found, ErrorBuilder},
     problemdetails::Problem,
@@ -382,6 +382,10 @@ async fn list_services(
     Query(pagination): Query<temps_core::PaginationParams>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
+    // This returns every service in the fleet (unscoped). A project-bound
+    // deployment token must not enumerate other tenants' services — it can use
+    // GET /external-services/projects/{its_own_project_id} instead.
+    deny_deployment_token!(auth);
 
     let (page, page_size) = pagination.normalize();
 
@@ -420,6 +424,7 @@ async fn get_service(
     Path(id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
+    super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
 
     match app_state
         .external_service_manager
@@ -536,6 +541,7 @@ async fn update_service(
     Json(request): Json<UpdateExternalServiceRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesWrite);
+    super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
 
     let service_config = crate::services::UpdateExternalServiceRequest {
         parameters: request.parameters.clone(),
@@ -621,6 +627,7 @@ async fn upgrade_service(
     Json(request): Json<UpgradeExternalServiceRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesWrite);
+    super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
 
     match app_state
         .external_service_manager
@@ -684,6 +691,7 @@ async fn delete_service(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesDelete);
+    super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
     match app_state
         .external_service_manager
         .get_service_details(id)
@@ -752,6 +760,7 @@ async fn check_health(
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
+    super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
 
     match app_state
         .external_service_manager
@@ -800,6 +809,7 @@ async fn get_cluster_health(
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
+    super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
 
     // Fetch the underlying row to (a) confirm existence, (b) check topology.
     let service = match app_state.external_service_manager.get_service(id).await {
@@ -862,6 +872,7 @@ async fn get_service_health_status(
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
+    super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
 
     let limit = params
         .get("limit")
@@ -910,6 +921,7 @@ async fn trigger_service_health_check(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesWrite);
+    super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
 
     let Some(monitor) = app_state.health_monitor.as_ref() else {
         return Err(ErrorBuilder::new(StatusCode::SERVICE_UNAVAILABLE)
@@ -991,6 +1003,7 @@ async fn get_postgres_wal_health(
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
+    super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
 
     match app_state
         .external_service_manager
@@ -1035,6 +1048,9 @@ async fn list_service_health_statuses(
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
+    // When `ids` is omitted this reports health for the whole fleet. A
+    // project-bound deployment token must not enumerate foreign services.
+    deny_deployment_token!(auth);
 
     let ids: Vec<i32> = params
         .get("ids")
@@ -1100,6 +1116,7 @@ async fn start_service(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesWrite);
+    super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
     match app_state
         .external_service_manager
         .get_service_details(id)
@@ -1173,6 +1190,7 @@ async fn retry_cluster(
     Json(request): Json<RetryClusterRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesWrite);
+    super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
 
     let members: Vec<crate::services::ClusterMemberRequest> = request
         .members
@@ -1255,6 +1273,7 @@ async fn add_cluster_member(
     Json(request): Json<AddClusterMemberRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesWrite);
+    super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
 
     match app_state
         .external_service_manager
@@ -1341,6 +1360,7 @@ async fn get_cluster_member(
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
+    super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
 
     match app_state
         .external_service_manager
@@ -1393,6 +1413,7 @@ async fn remove_cluster_member(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesWrite);
+    super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
 
     match app_state
         .external_service_manager
@@ -1471,6 +1492,7 @@ async fn promote_cluster_member(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesWrite);
+    super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
 
     match app_state
         .external_service_manager
@@ -1555,6 +1577,7 @@ async fn stop_service(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesWrite);
+    super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
     match app_state
         .external_service_manager
         .get_service_details(id)
@@ -1742,6 +1765,7 @@ async fn list_project_services(
     Query(pagination): Query<temps_core::PaginationParams>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
+    project_scope_guard!(auth, project_id);
 
     let (page, page_size) = pagination.normalize();
 
@@ -1783,6 +1807,8 @@ async fn get_service_environment_variable(
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
+    project_scope_guard!(auth, project_id);
+    super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
 
     match app_state
         .external_service_manager
@@ -1825,11 +1851,15 @@ async fn get_service_environment_variables(
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
+    project_scope_guard!(auth, project_id);
+    super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
 
     let options = EnvironmentVariableOptions {
         include_docker: false,
         include_runtime: false,
-        mask_sensitive: false,
+        // Only an admin may read plaintext connection strings / passwords.
+        // Non-admin owners get masked values to prevent credential exfiltration.
+        mask_sensitive: !auth.is_admin(),
         names_only: false,
     };
 
@@ -1870,6 +1900,7 @@ async fn get_project_service_environment_variables(
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
+    project_scope_guard!(auth, project_id);
 
     match app_state
         .external_service_manager
@@ -1906,6 +1937,9 @@ async fn get_service_by_slug(
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
+    // No project_id/service-id to scope against here; a deployment token has no
+    // business resolving services by global slug. Require user/API-key auth.
+    deny_deployment_token!(auth);
     let service = match app_state
         .external_service_manager
         .get_service_by_slug(&slug)
@@ -1954,11 +1988,13 @@ async fn get_service_preview_environment_variable_names(
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
+    super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
 
     let options = EnvironmentVariableOptions {
         include_docker: false,
         include_runtime: false,
-        mask_sensitive: false,
+        // names_only, so values aren't returned regardless.
+        mask_sensitive: true,
         names_only: true,
     };
 
@@ -2061,6 +2097,7 @@ async fn get_service_runtime(
     Path(id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
+    super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
 
     match app_state
         .external_service_manager
@@ -2099,6 +2136,7 @@ async fn get_service_stats(
     Path(id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
+    super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
 
     match app_state
         .external_service_manager
@@ -2152,6 +2190,7 @@ async fn update_service_resources(
     Json(request): Json<crate::externalsvc::ServiceResourceLimits>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesWrite);
+    super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
 
     match app_state
         .external_service_manager

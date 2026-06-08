@@ -1059,13 +1059,13 @@ impl LoadBalancer {
     }
 
     fn is_https_request(&self, session: &PingoraSession) -> bool {
-        session
-            .req_header()
-            .headers
-            .get("x-forwarded-proto")
-            .and_then(|v| v.to_str().ok())
-            .map(|proto| proto == "https")
-            .unwrap_or_else(|| session.req_header().uri.scheme_str() == Some("https"))
+        // SECURITY (SEC-12): do NOT trust a client-supplied `X-Forwarded-Proto`.
+        // Pingora is the edge TLS terminator, so the only authoritative signal
+        // is whether this downstream connection actually has a TLS digest.
+        // Trusting the header let a client on the plain-HTTP listener spoof
+        // `https`, influencing Secure-cookie attributes and the proto we forward
+        // upstream.
+        self.is_tls_connection(session)
     }
 
     /// Check if the connection is a TLS connection by checking for SSL digest

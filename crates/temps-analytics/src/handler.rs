@@ -9,8 +9,8 @@ use axum::{
 };
 use serde::Deserialize;
 use std::sync::Arc;
-use temps_auth::permission_guard;
 use temps_auth::RequireAuth;
+use temps_auth::{deny_deployment_token, permission_guard, project_scope_guard};
 use temps_core::error_builder::{bad_request, internal_server_error};
 use temps_core::problemdetails::Problem;
 use temps_core::{not_found, DateTime, UtcDateTime};
@@ -261,6 +261,7 @@ pub async fn get_analytics_events_count(
     Query(query): Query<EventsCountQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsRead);
+    project_scope_guard!(auth, query.project_id);
     let project_id = query.project_id;
 
     match app_state
@@ -319,6 +320,7 @@ pub async fn get_visitors(
     Query(query): Query<VisitorsListQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsRead);
+    project_scope_guard!(auth, query.project_id);
     let project_id = query.project_id;
 
     match app_state
@@ -377,6 +379,7 @@ pub async fn get_visitor_facets(
     Query(query): Query<VisitorFacetsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsRead);
+    project_scope_guard!(auth, query.project_id);
     let project_id = query.project_id;
 
     match app_state
@@ -424,6 +427,7 @@ pub async fn get_visitor_details(
     axum::extract::Path(visitor_id): axum::extract::Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsRead);
+    deny_deployment_token!(auth);
 
     match app_state
         .analytics_service
@@ -461,6 +465,7 @@ pub async fn get_visitor_info(
     axum::extract::Path(visitor_id): axum::extract::Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsRead);
+    deny_deployment_token!(auth);
 
     match app_state
         .analytics_service
@@ -498,6 +503,7 @@ pub async fn get_visitor_stats(
     axum::extract::Path(visitor_id): axum::extract::Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsRead);
+    deny_deployment_token!(auth);
 
     match app_state
         .analytics_service
@@ -538,6 +544,7 @@ pub async fn get_analytics_visitor_sessions(
     Query(query): Query<VisitorSessionsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsRead);
+    deny_deployment_token!(auth);
 
     match app_state
         .analytics_service
@@ -577,6 +584,7 @@ pub async fn get_visitor_journey(
     Query(query): Query<VisitorJourneyQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsRead);
+    project_scope_guard!(auth, query.project_id);
 
     match app_state
         .analytics_service
@@ -616,6 +624,7 @@ pub async fn get_session_details(
     Query(query): Query<SessionDetailsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsRead);
+    project_scope_guard!(auth, query.project_id);
 
     let project_id = query.project_id;
     match app_state
@@ -659,6 +668,7 @@ pub async fn get_analytics_session_events(
     Query(query): Query<SessionEventsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsRead);
+    project_scope_guard!(auth, query.project_id);
 
     let project_id = query.project_id;
 
@@ -714,6 +724,7 @@ pub async fn get_session_logs(
     Query(query): Query<SessionLogsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsRead);
+    project_scope_guard!(auth, query.project_id);
 
     let project_id = query.project_id;
 
@@ -766,6 +777,7 @@ pub async fn enrich_visitor(
     Json(request): Json<EnrichVisitorRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsWrite);
+    deny_deployment_token!(auth);
 
     // Check if visitor_id is a numeric ID or a GUID/encrypted GUID
     if let Ok(numeric_id) = visitor_id.parse::<i32>() {
@@ -815,6 +827,7 @@ pub async fn check_analytics_has_events(
     Query(query): Query<ProjectQuery>,
 ) -> Result<Json<HasAnalyticsEventsResponse>, Problem> {
     permission_guard!(auth, AnalyticsRead);
+    project_scope_guard!(auth, query.project_id);
 
     let project_id = query.project_id;
     match app_state
@@ -883,6 +896,7 @@ pub async fn get_page_paths(
     Query(query): Query<PagePathsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsRead);
+    project_scope_guard!(auth, query.project_id);
 
     match app_state
         .analytics_service
@@ -935,6 +949,7 @@ pub async fn get_page_path_visitors(
     Query(query): Query<requests::PagePathVisitorsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsRead);
+    project_scope_guard!(auth, query.project_id);
 
     let start_date: UtcDateTime = query.start_date.into();
     let end_date: UtcDateTime = query.end_date.into();
@@ -988,6 +1003,7 @@ pub async fn get_page_path_detail(
     Query(query): Query<requests::PagePathDetailQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsRead);
+    project_scope_guard!(auth, query.project_id);
 
     let start_date: UtcDateTime = query.start_date.into();
     let end_date: UtcDateTime = query.end_date.into();
@@ -1043,6 +1059,7 @@ pub async fn get_active_visitors_count(
     Query(query): Query<ActiveVisitorsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsRead);
+    project_scope_guard!(auth, query.project_id);
 
     let project_id = query.project_id;
     match app_state
@@ -1081,6 +1098,7 @@ pub async fn get_analytics_active_visitors(
     Query(query): Query<ActiveVisitorsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsRead);
+    project_scope_guard!(auth, query.project_id);
 
     let project_id = query.project_id;
     let window = query.window_minutes.unwrap_or(5);
@@ -1131,6 +1149,7 @@ pub async fn get_live_visitors_list(
     Query(query): Query<ActiveVisitorsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsRead);
+    project_scope_guard!(auth, query.project_id);
 
     let project_id = query.project_id;
     let window = query.window_minutes.unwrap_or(5);
@@ -1191,6 +1210,7 @@ pub async fn get_page_paths_sparklines(
     Query(query): Query<PagePathsSparklineQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsRead);
+    project_scope_guard!(auth, query.project_id);
 
     let start_time: UtcDateTime = query.start_time.into();
     let end_time: UtcDateTime = query.end_time.into();
@@ -1266,6 +1286,7 @@ pub async fn get_page_hourly_sessions(
     Query(query): Query<PageHourlySessionsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsRead);
+    project_scope_guard!(auth, query.project_id);
 
     let project_id = query.project_id;
     let start_time: UtcDateTime = query.start_time.into();
@@ -1322,6 +1343,7 @@ pub async fn get_visitor_by_id(
     axum::extract::Path(id): axum::extract::Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsRead);
+    deny_deployment_token!(auth);
 
     match app_state
         .analytics_service
@@ -1360,6 +1382,7 @@ pub async fn get_visitor_by_guid(
     axum::extract::Path(visitor_id): axum::extract::Path<String>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsRead);
+    deny_deployment_token!(auth);
 
     match app_state
         .analytics_service
@@ -1399,6 +1422,7 @@ pub async fn get_general_stats(
     Query(query): Query<GeneralStatsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsRead);
+    deny_deployment_token!(auth);
 
     match app_state
         .analytics_service
@@ -1439,6 +1463,7 @@ pub async fn get_page_flow(
     Query(query): Query<requests::PageFlowQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsRead);
+    project_scope_guard!(auth, query.project_id);
 
     let start_date: UtcDateTime = query.start_date.into();
     let end_date: UtcDateTime = query.end_date.into();
@@ -1500,6 +1525,7 @@ pub async fn get_recent_activity(
     Query(query): Query<RecentActivityQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsRead);
+    project_scope_guard!(auth, query.project_id);
 
     match app_state
         .analytics_service
@@ -1547,6 +1573,7 @@ pub async fn get_event_detail(
     Query(query): Query<requests::EventDetailQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsRead);
+    project_scope_guard!(auth, query.project_id);
 
     let start_date: UtcDateTime = query.start_date.into();
     let end_date: UtcDateTime = query.end_date.into();
@@ -1600,6 +1627,7 @@ pub async fn get_event_visitors(
     Query(query): Query<requests::EventVisitorsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsRead);
+    project_scope_guard!(auth, query.project_id);
 
     let start_date: UtcDateTime = query.start_date.into();
     let end_date: UtcDateTime = query.end_date.into();

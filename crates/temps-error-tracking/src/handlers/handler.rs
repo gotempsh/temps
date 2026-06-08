@@ -9,6 +9,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use temps_auth::{permission_guard, project_scope_guard, RequireAuth};
+use temps_core::problemdetails::Problem;
 use temps_core::DateTime;
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
@@ -270,6 +272,34 @@ pub struct ErrorResponse {
     pub details: Option<String>,
 }
 
+impl From<ErrorTrackingError> for temps_core::problemdetails::Problem {
+    fn from(err: ErrorTrackingError) -> Self {
+        use temps_core::problemdetails;
+        match err {
+            ErrorTrackingError::GroupNotFound
+            | ErrorTrackingError::EventNotFound
+            | ErrorTrackingError::ProjectNotFound => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Not Found")
+                .with_detail(err.to_string()),
+            ErrorTrackingError::InvalidFingerprint | ErrorTrackingError::Validation(_) => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Validation Error")
+                    .with_detail(err.to_string())
+            }
+            ErrorTrackingError::PayloadTooLarge { .. } => {
+                problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
+                    .with_title("Payload Too Large")
+                    .with_detail(err.to_string())
+            }
+            ErrorTrackingError::Database(_) | ErrorTrackingError::EmbeddingService(_) => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Internal Server Error")
+                    .with_detail(err.to_string())
+            }
+        }
+    }
+}
+
 impl axum::response::IntoResponse for ErrorTrackingError {
     fn into_response(self) -> axum::response::Response {
         let (status, message) = match self {
@@ -339,9 +369,12 @@ impl axum::response::IntoResponse for ErrorTrackingError {
 )]
 pub async fn list_error_groups(
     State(state): State<Arc<AppState>>,
+    RequireAuth(auth): RequireAuth,
     Path(project_id): Path<i32>,
     Query(query): Query<ListErrorGroupsQuery>,
-) -> Result<Json<PaginatedErrorGroupsResponse>, ErrorTrackingError> {
+) -> Result<Json<PaginatedErrorGroupsResponse>, Problem> {
+    permission_guard!(auth, ErrorTrackingRead);
+    project_scope_guard!(auth, project_id);
     let page = query.page;
     let page_size = std::cmp::min(query.page_size, 100);
 
@@ -392,8 +425,11 @@ pub async fn list_error_groups(
 )]
 pub async fn get_error_group(
     State(state): State<Arc<AppState>>,
+    RequireAuth(auth): RequireAuth,
     Path((project_id, group_id)): Path<(i32, i32)>,
-) -> Result<Json<ErrorGroupResponse>, ErrorTrackingError> {
+) -> Result<Json<ErrorGroupResponse>, Problem> {
+    permission_guard!(auth, ErrorTrackingRead);
+    project_scope_guard!(auth, project_id);
     let group = state
         .error_tracking_service
         .get_error_group(group_id, project_id)
@@ -420,13 +456,27 @@ pub async fn get_error_group(
 )]
 pub async fn update_error_group(
     State(state): State<Arc<AppState>>,
+    RequireAuth(auth): RequireAuth,
     Path((project_id, group_id)): Path<(i32, i32)>,
     Json(request): Json<UpdateErrorGroupRequest>,
-) -> Result<StatusCode, ErrorTrackingError> {
+) -> Result<StatusCode, Problem> {
+    permission_guard!(auth, ErrorTrackingWrite);
+    project_scope_guard!(auth, project_id);
     state
         .error_tracking_service
         .update_error_group_status(group_id, project_id, request.status, request.assigned_to)
         .await?;
+
+    // TODO(security): emit a structured audit event for this mutation once the
+    // crate is wired to the audit service (it currently has no AuditLogger in
+    // AppState). For now the write is at least authenticated, authorized, and
+    // tenant-scoped.
+    tracing::info!(
+        user_id = auth.user_id(),
+        project_id,
+        group_id,
+        "error group updated"
+    );
 
     Ok(StatusCode::OK)
 }
@@ -449,9 +499,12 @@ pub async fn update_error_group(
 )]
 pub async fn list_error_events(
     State(state): State<Arc<AppState>>,
+    RequireAuth(auth): RequireAuth,
     Path((project_id, group_id)): Path<(i32, i32)>,
     Query(query): Query<ListErrorEventsQuery>,
-) -> Result<Json<PaginatedErrorEventsResponse>, ErrorTrackingError> {
+) -> Result<Json<PaginatedErrorEventsResponse>, Problem> {
+    permission_guard!(auth, ErrorTrackingRead);
+    project_scope_guard!(auth, project_id);
     let page = query.page;
     let page_size = std::cmp::min(query.page_size, 100);
 
@@ -495,8 +548,11 @@ pub async fn list_error_events(
 )]
 pub async fn get_error_event(
     State(state): State<Arc<AppState>>,
+    RequireAuth(auth): RequireAuth,
     Path((project_id, group_id, event_id)): Path<(i32, i32, i64)>,
-) -> Result<Json<ErrorEventResponse>, ErrorTrackingError> {
+) -> Result<Json<ErrorEventResponse>, Problem> {
+    permission_guard!(auth, ErrorTrackingRead);
+    project_scope_guard!(auth, project_id);
     let event = state
         .error_tracking_service
         .get_error_event(event_id, group_id, project_id)
@@ -520,8 +576,11 @@ pub async fn get_error_event(
 )]
 pub async fn get_error_stats(
     State(state): State<Arc<AppState>>,
+    RequireAuth(auth): RequireAuth,
     Path(project_id): Path<i32>,
-) -> Result<Json<ErrorGroupStatsResponse>, ErrorTrackingError> {
+) -> Result<Json<ErrorGroupStatsResponse>, Problem> {
+    permission_guard!(auth, ErrorTrackingRead);
+    project_scope_guard!(auth, project_id);
     let stats = state
         .error_tracking_service
         .get_error_stats(project_id, None)
@@ -551,9 +610,12 @@ pub async fn get_error_stats(
 )]
 pub async fn get_error_dashboard_stats(
     State(state): State<Arc<AppState>>,
+    RequireAuth(auth): RequireAuth,
     Path(project_id): Path<i32>,
     Query(query): Query<ErrorDashboardStatsQuery>,
-) -> Result<Json<ErrorDashboardStatsResponse>, ErrorTrackingError> {
+) -> Result<Json<ErrorDashboardStatsResponse>, Problem> {
+    permission_guard!(auth, ErrorTrackingRead);
+    project_scope_guard!(auth, project_id);
     let stats = state
         .error_tracking_service
         .get_dashboard_stats(
@@ -594,9 +656,12 @@ pub async fn get_error_dashboard_stats(
 )]
 pub async fn get_error_time_series(
     State(state): State<Arc<AppState>>,
+    RequireAuth(auth): RequireAuth,
     Path(project_id): Path<i32>,
     Query(query): Query<ErrorTimeSeriesQuery>,
-) -> Result<Json<Vec<ErrorTimeSeriesDataResponse>>, ErrorTrackingError> {
+) -> Result<Json<Vec<ErrorTimeSeriesDataResponse>>, Problem> {
+    permission_guard!(auth, ErrorTrackingRead);
+    project_scope_guard!(auth, project_id);
     let data = state
         .error_tracking_service
         .get_error_time_series(
@@ -633,8 +698,11 @@ pub async fn get_error_time_series(
 )]
 pub async fn has_error_groups(
     State(state): State<Arc<AppState>>,
+    RequireAuth(auth): RequireAuth,
     Path(project_id): Path<i32>,
-) -> Result<Json<HasErrorGroupsResponse>, ErrorTrackingError> {
+) -> Result<Json<HasErrorGroupsResponse>, Problem> {
+    permission_guard!(auth, ErrorTrackingRead);
+    project_scope_guard!(auth, project_id);
     let has_error_groups = state
         .error_tracking_service
         .has_error_groups(project_id)

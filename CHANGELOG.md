@@ -8,13 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
--
+- **Historical deployment container logs**: runtime container logs used to vanish the moment a deployment was superseded and its containers were torn down — making it impossible to debug "what did the container that ran a few days ago actually print?". Now, just before a previous deployment's containers are stopped and removed (`MarkDeploymentCompleteJob::cancel_previous_deployments`), each container's logs are captured to a plain-text file under the data dir (via `LogService`) and recorded in a new `deployment_container_logs` table. New read endpoints `GET /api/projects/{project_id}/deployments/{deployment_id}/container-logs` (list) and `.../container-logs/{log_id}` (content), and a "Captured container logs" section on the deployment detail page, let you read the logs of a container that no longer exists (e.g. `web-2`). Capture is best-effort and tail-capped at 8 MiB — it never blocks or fails a deployment.
+- **`project_scope_guard!` and `deny_deployment_token!` auth macros** (`temps-auth`) plus `AuthContext::is_scoped_to_project`: the missing tenant-boundary primitive that confines a project-bound deployment token to its own project. `permission_guard!` proves a caller holds a permission; these prove the resource is theirs.
 
 ### Changed
 -
 
 ### Fixed
--
+- **SECURITY (CRITICAL): error-tracking admin API was completely unauthenticated**. Every handler in `temps-error-tracking` (`handler.rs`, `alert_rules_handler.rs`) took only `State`/`Path`/`Query` — no `RequireAuth`, no `permission_guard!`. An unauthenticated attacker could enumerate sequential project ids and read/modify every tenant's error groups, events, stack traces, and raw Sentry payloads (PII). All 14 handlers now require authentication (`ErrorTrackingRead`/`Write`/`Create`), are tenant-scoped, and authorize the path `project_id` against the caller. The DSN-authenticated Sentry ingest path was already correctly self-authenticating and is unchanged.
+- **SECURITY (HIGH): cross-project IDOR via `FullAccess` deployment tokens**. A deployment token is auto-injected into every deployed container, bound to one project, and typically carries `FullAccess` — which satisfies `permission_guard!` for *any* permission. Handlers across `temps-environments`, `temps-providers`, `temps-projects`, and `temps-analytics` trusted a `project_id`/service id from the request without checking it against the token's bound project, letting a compromised app read another tenant's secrets/env-var plaintext, DB connection strings, projects, and visitor PII — and modify/destroy them. All such handlers now call `project_scope_guard!` (or verify `project_services` linkage for shared external services, or deny deployment tokens on fleet-wide/by-id endpoints).
+- **SECURITY (HIGH): SSRF via self-hosted Git provider URL**. `GitProvidersCreate` (granted to ordinary users) synchronously probed `{base_url}/api/v4/user` on create, so a malicious `base_url`/`api_url` (e.g. `http://169.254.169.254`, `http://127.0.0.1`) was a live SSRF oracle into internal infrastructure. URLs are now validated with `temps_core::url_validation::validate_external_url` before use, and the GitHub/GitLab HTTP clients disable redirect following (closing the public-host→metadata 302 bypass).
+- **SECURITY (HIGH): unmasked DB credentials over the external-services API**. `get_service_environment_variables` returned plaintext `POSTGRES_URL`/`POSTGRES_PASSWORD` (`mask_sensitive: false`) to any owner; now only an admin receives unmasked values.
+- **SECURITY (MEDIUM): OTLP ingest logged the full bearer token** at `debug` level, writing live, mostly non-expiring credentials to logs whenever debug logging was enabled. It now logs only the auth scheme and length.
+- **SECURITY (LOW): proxy trusted a client-supplied `X-Forwarded-Proto`**. `is_https_request` now derives the scheme from the actual downstream TLS digest (`is_tls_connection`) instead of the spoofable header, so the `Secure` cookie attribute and the `X-Forwarded-Proto` forwarded upstream can't be influenced by the client.
 
 
 ## [0.1.0-beta.28] - 2026-06-08

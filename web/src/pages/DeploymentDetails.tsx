@@ -8,6 +8,7 @@ import {
   rollbackToDeploymentMutation,
   triggerProjectPipelineMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { DeploymentContainerLogs } from '@/components/deployments/DeploymentContainerLogs'
 import { DeploymentStages } from '@/components/deployments/DeploymentStages'
 import { RedeploymentModal } from '@/components/deployments/RedeploymentModal'
 import { Badge } from '@/components/ui/badge'
@@ -655,6 +656,14 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
         {/* Deployment Pipeline */}
         {deployment && (
           <DeploymentStages project={project} deployment={deployment} />
+        )}
+
+        {/* Captured logs from previous containers (survive teardown) */}
+        {deployment && (
+          <DeploymentContainerLogs
+            projectId={deployment.project_id}
+            deploymentId={deployment.id}
+          />
         )}
 
         <RedeploymentModal

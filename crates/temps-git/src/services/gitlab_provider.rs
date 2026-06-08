@@ -61,6 +61,10 @@ impl GitLabProvider {
         reqwest::Client::builder()
             .user_agent("Temps-Engine/1.0")
             .timeout(std::time::Duration::from_secs(30))
+            // SSRF defense-in-depth: never follow redirects — a public host
+            // could otherwise 302 to an internal address (e.g. cloud metadata)
+            // after URL validation has already passed at create time.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("Failed to build reqwest client with static config")
     }

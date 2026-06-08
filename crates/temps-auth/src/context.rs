@@ -298,4 +298,75 @@ impl AuthContext {
             .as_ref()
             .ok_or("This endpoint requires user authentication. Deployment tokens are not allowed.")
     }
+
+    /// Whether this auth context is permitted to act on `project_id`.
+    ///
+    /// A deployment token is bound to exactly one project at issuance. It must
+    /// only ever touch that project — even when it carries `FullAccess` (which
+    /// makes `has_permission` return `true` for everything). This is the tenant
+    /// boundary that `permission_guard!` alone does NOT enforce: the guard
+    /// proves the caller holds a permission, not that the resource is theirs.
+    ///
+    /// For user/API-key/CLI auth this returns `true` (project-level ACLs for
+    /// human principals are an Enterprise/RBAC concern handled elsewhere); the
+    /// check exists specifically to stop a project-scoped machine credential
+    /// from reaching another tenant's resources (cross-project IDOR).
+    ///
+    /// Handlers should prefer the [`project_scope_guard!`] macro, which turns a
+    /// failure into an RFC 7807 403 response.
+    pub fn is_scoped_to_project(&self, project_id: i32) -> bool {
+        match self.project_id() {
+            // Deployment token: must match its bound project exactly.
+            Some(token_project_id) => token_project_id == project_id,
+            // Not a deployment token (user/API key/CLI/session): no per-project
+            // confinement at this layer.
+            None => true,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn deployment_token_ctx(
+        project_id: i32,
+        permissions: Vec<DeploymentTokenPermission>,
+    ) -> AuthContext {
+        AuthContext::new_deployment_token(
+            project_id,
+            None,
+            None,
+            1,
+            "test-token".to_string(),
+            permissions,
+        )
+    }
+
+    #[test]
+    fn deployment_token_is_scoped_to_its_own_project() {
+        let ctx = deployment_token_ctx(7, vec![DeploymentTokenPermission::FullAccess]);
+        assert!(ctx.is_scoped_to_project(7));
+    }
+
+    #[test]
+    fn deployment_token_rejected_for_other_project_even_with_full_access() {
+        // FullAccess makes has_permission() return true for everything, so the
+        // ONLY thing stopping cross-tenant access is this scope check.
+        let ctx = deployment_token_ctx(7, vec![DeploymentTokenPermission::FullAccess]);
+        assert!(
+            !ctx.is_scoped_to_project(8),
+            "a project-7 token must not be scoped to project 8"
+        );
+        // Sanity: FullAccess really does grant the permission, proving the
+        // scope check is the load-bearing boundary.
+        assert!(ctx.has_permission(&Permission::EnvironmentsRead));
+    }
+
+    #[test]
+    fn deployment_token_rejected_for_other_project_with_narrow_permission() {
+        let ctx = deployment_token_ctx(7, vec![DeploymentTokenPermission::AnalyticsRead]);
+        assert!(ctx.is_scoped_to_project(7));
+        assert!(!ctx.is_scoped_to_project(8));
+    }
 }

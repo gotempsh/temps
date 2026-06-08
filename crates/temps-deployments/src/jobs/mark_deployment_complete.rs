@@ -17,7 +17,9 @@ use temps_core::{
     WorkflowTask,
 };
 use temps_database::DbConnection;
-use temps_entities::{deployment_containers, deployments, environments, nodes, projects};
+use temps_entities::{
+    deployment_container_logs, deployment_containers, deployments, environments, nodes, projects,
+};
 use temps_logs::{LogLevel, LogService};
 use tracing::{debug, info, warn};
 
@@ -1267,6 +1269,130 @@ impl MarkDeploymentCompleteJob {
         Ok(Arc::new(remote))
     }
 
+    /// Capture a container's logs to durable storage before it is torn down.
+    ///
+    /// Runtime logs are otherwise only available live from Docker; once the
+    /// container is removed they are gone. We dump them to a plain-text file
+    /// under the data dir (via `LogService`) and record a
+    /// `deployment_container_logs` row so users can read the logs of a
+    /// superseded container (e.g. "web-2") days later.
+    ///
+    /// Best-effort: any failure is logged and swallowed — capturing logs must
+    /// never block or fail a deployment teardown.
+    async fn capture_container_logs(
+        &self,
+        deployer: &Arc<dyn temps_deployer::ContainerDeployer>,
+        container: &deployment_containers::Model,
+        project_id: i32,
+        environment_id: i32,
+    ) {
+        // Tail cap: a single dump is bounded so a runaway log can't fill the
+        // disk. We keep the last MAX_BYTES and flag the row as truncated.
+        const MAX_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
+
+        let Some(log_service) = self.log_service.as_ref() else {
+            debug!(
+                "No log service configured; skipping log capture for container {}",
+                container.container_id
+            );
+            return;
+        };
+
+        // Pull the full logs from the (still-running) container.
+        let mut logs = match deployer.get_container_logs(&container.container_id).await {
+            Ok(logs) => logs,
+            Err(e) => {
+                // Not fatal — the container may have already exited/been pruned.
+                self.log(format!(
+                    "Could not capture logs for container {} before teardown: {}",
+                    container.container_name, e
+                ))
+                .await
+                .ok();
+                return;
+            }
+        };
+
+        // Truncate to the tail if oversized, on a char boundary to keep valid UTF-8.
+        let truncated = logs.len() > MAX_BYTES;
+        if truncated {
+            let mut start = logs.len() - MAX_BYTES;
+            while start < logs.len() && !logs.is_char_boundary(start) {
+                start += 1;
+            }
+            let tail = logs.split_off(start);
+            logs = format!(
+                "[… earlier output truncated; showing last {} bytes …]\n{}",
+                MAX_BYTES, tail
+            );
+        }
+
+        // Server-generated relative path. Contains only the deployment id (i32),
+        // the container's i32 row id, and a static suffix — no user-controlled
+        // input — so it cannot be used for path traversal.
+        let log_path = format!(
+            "deployment-container-logs/{}/{}.log",
+            container.deployment_id, container.id
+        );
+        let full_path = log_service.base_path().join(&log_path);
+
+        if let Some(parent) = full_path.parent() {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                self.log(format!(
+                    "Failed to create log capture directory for container {}: {}",
+                    container.container_name, e
+                ))
+                .await
+                .ok();
+                return;
+            }
+        }
+
+        let size_bytes = logs.len() as i64;
+        if let Err(e) = tokio::fs::write(&full_path, logs.as_bytes()).await {
+            self.log(format!(
+                "Failed to write captured logs for container {}: {}",
+                container.container_name, e
+            ))
+            .await
+            .ok();
+            return;
+        }
+
+        // Record the metadata row. If the row write fails the file is orphaned
+        // (harmless — it's just disk), so we still don't fail teardown.
+        let row = deployment_container_logs::ActiveModel {
+            deployment_id: Set(container.deployment_id),
+            project_id: Set(project_id),
+            environment_id: Set(environment_id),
+            container_id: Set(container.container_id.clone()),
+            container_name: Set(container.container_name.clone()),
+            service_name: Set(container.service_name.clone()),
+            node_id: Set(container.node_id),
+            log_path: Set(log_path),
+            size_bytes: Set(size_bytes),
+            truncated: Set(truncated),
+            ..Default::default()
+        };
+
+        if let Err(e) = row.insert(self.db.as_ref()).await {
+            self.log(format!(
+                "Failed to record captured logs for container {}: {}",
+                container.container_name, e
+            ))
+            .await
+            .ok();
+            return;
+        }
+
+        self.log(format!(
+            "Captured {} bytes of logs for container {} before teardown",
+            size_bytes, container.container_name
+        ))
+        .await
+        .ok();
+    }
+
     /// Teardown all running/pending deployments for the same environment
     /// This ensures only one active deployment per environment
     /// Note: Deployment state is NOT changed - the is_current flag indicates which deployment is active
@@ -1388,6 +1514,16 @@ impl MarkDeploymentCompleteJob {
                 } else {
                     self.container_deployer.clone()
                 };
+
+                // Capture the container's logs to durable storage BEFORE we stop
+                // and remove it, so they survive teardown and can be viewed later.
+                self.capture_container_logs(
+                    &deployer,
+                    &container,
+                    deployment.project_id,
+                    deployment.environment_id,
+                )
+                .await;
 
                 // Stop container first
                 match deployer.stop_container(&container_id).await {

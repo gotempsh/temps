@@ -27,6 +27,32 @@ use temps_core::UtcDateTime;
 use temps_entities::git_provider_connections;
 use utoipa::ToSchema;
 
+/// Reject self-hosted Git provider URLs that point at internal infrastructure
+/// (loopback, RFC1918 private ranges, link-local, cloud metadata 169.254.169.254).
+///
+/// `GitProvidersCreate` is granted to ordinary users, and the create handlers
+/// synchronously probe `{base_url}/api/v4/user` (GitLab) with the supplied
+/// token. Without this check a user could point `base_url`/`api_url` at an
+/// internal service and use the create call as an SSRF oracle (SEC-07). The
+/// validation is synchronous (it blocks literal private/loopback/link-local/
+/// metadata IPs and `localhost`); the provider HTTP clients additionally
+/// disable redirect following so a public host can't 302 to an internal one.
+///
+/// Residual gap: this synchronous validator does NOT resolve domains, so a
+/// public hostname that resolves to a private IP (DNS rebinding) is not caught
+/// here. Closing that needs a connect-time blocklisting DNS resolver on the
+/// provider clients (tracked separately).
+fn reject_ssrf_url(label: &str, url: Option<&String>) -> Result<(), Problem> {
+    if let Some(url) = url {
+        if let Err(e) = temps_core::url_validation::validate_external_url(url) {
+            return Err(problem_new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid Provider URL")
+                .with_detail(format!("{} '{}' is not allowed: {}", label, url, e)));
+        }
+    }
+    Ok(())
+}
+
 // Convert RepositoryServiceError to Problem Details
 impl From<RepositoryServiceError> for Problem {
     fn from(error: RepositoryServiceError) -> Self {
@@ -524,6 +550,10 @@ pub async fn create_git_provider(
     Json(request): Json<CreateProviderRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, Permission::GitProvidersCreate);
+
+    // SSRF guard: a self-hosted base_url/api_url must not point at internal infra.
+    reject_ssrf_url("base_url", request.base_url.as_ref())?;
+    reject_ssrf_url("api_url", request.api_url.as_ref())?;
 
     // Parse provider type
     let provider_type = GitProviderType::try_from(request.provider_type.as_str()).map_err(|e| {
@@ -1815,6 +1845,10 @@ pub async fn create_gitlab_pat_provider(
     Json(request): Json<CreateGitLabPATRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, Permission::GitProvidersCreate);
+
+    // SSRF guard: this handler synchronously probes {base_url}/api/v4/user with
+    // the supplied token, so a malicious base_url is a live SSRF vector.
+    reject_ssrf_url("base_url", request.base_url.as_ref())?;
 
     let user_id = auth.user_id();
 

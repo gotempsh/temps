@@ -6,7 +6,8 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use temps_entities::{
-    deployment_containers, deployment_domains, deployments, environments, projects,
+    deployment_container_logs, deployment_containers, deployment_domains, deployments,
+    environments, projects,
 };
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
@@ -832,6 +833,84 @@ impl DeploymentService {
         Ok(self
             .map_db_deployment_to_deployment(deployment, is_current, environment)
             .await)
+    }
+
+    /// List the captured (historical) container-log dumps for a deployment.
+    ///
+    /// These are written just before a superseded deployment's containers are
+    /// torn down (see `MarkDeploymentCompleteJob::capture_container_logs`), so
+    /// they let a user read the logs of a container that no longer exists
+    /// (e.g. "web-2" from a few days ago).
+    ///
+    /// Scoped to `project_id`: the deployment must belong to the caller's
+    /// project or this returns `NotFound`, preventing cross-tenant access.
+    pub async fn list_deployment_container_logs(
+        &self,
+        project_id: i32,
+        deployment_id: i32,
+    ) -> Result<Vec<deployment_container_logs::Model>, DeploymentError> {
+        // Authorize: confirm the deployment is in this project before exposing
+        // anything tied to it.
+        deployments::Entity::find()
+            .filter(deployments::Column::ProjectId.eq(project_id))
+            .filter(deployments::Column::Id.eq(deployment_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| {
+                DeploymentError::NotFound(format!(
+                    "deployment {} for project {} not found",
+                    deployment_id, project_id
+                ))
+            })?;
+
+        let logs = deployment_container_logs::Entity::find()
+            .filter(deployment_container_logs::Column::DeploymentId.eq(deployment_id))
+            .filter(deployment_container_logs::Column::ProjectId.eq(project_id))
+            .order_by_desc(deployment_container_logs::Column::CapturedAt)
+            .all(self.db.as_ref())
+            .await?;
+
+        Ok(logs)
+    }
+
+    /// Read the captured text content for a single historical container-log
+    /// dump, returning the metadata row alongside the log body.
+    ///
+    /// Scoped to `project_id` via the `log_id` row's own `project_id` column —
+    /// a caller can only read dumps that belong to their project.
+    pub async fn get_deployment_container_log_content(
+        &self,
+        project_id: i32,
+        deployment_id: i32,
+        log_id: i32,
+    ) -> Result<(deployment_container_logs::Model, String), DeploymentError> {
+        let row = deployment_container_logs::Entity::find()
+            .filter(deployment_container_logs::Column::Id.eq(log_id))
+            .filter(deployment_container_logs::Column::DeploymentId.eq(deployment_id))
+            .filter(deployment_container_logs::Column::ProjectId.eq(project_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| {
+                DeploymentError::NotFound(format!(
+                    "captured log {} for deployment {} in project {} not found",
+                    log_id, deployment_id, project_id
+                ))
+            })?;
+
+        // `log_path` is a server-generated relative path (never user input), so
+        // `get_log_content` resolves it safely under the data dir.
+        let content = self
+            .log_service
+            .get_log_content(&row.log_path)
+            .await
+            .map_err(|e| {
+                DeploymentError::Other(format!(
+                    "Failed to read captured log file for log {} (deployment {}): {}",
+                    log_id, deployment_id, e
+                ))
+            })?;
+
+        Ok((row, content))
     }
 
     pub async fn get_deployment_domains(
@@ -5057,5 +5136,127 @@ mod tests {
         let container = container.insert(db.as_ref()).await?;
 
         Ok((project, environment, deployment, container))
+    }
+
+    /// Insert a captured-log metadata row and write its backing file under the
+    /// service's log base path so the service can read it back. Returns the row.
+    async fn seed_captured_log(
+        db: &Arc<temps_database::DbConnection>,
+        log_base: &std::path::Path,
+        deployment: &deployments::Model,
+        container_name: &str,
+        content: &str,
+    ) -> Result<deployment_container_logs::Model, Box<dyn std::error::Error>> {
+        let row = deployment_container_logs::ActiveModel {
+            deployment_id: Set(deployment.id),
+            project_id: Set(deployment.project_id),
+            environment_id: Set(deployment.environment_id),
+            container_id: Set(format!("cid-{}", container_name)),
+            container_name: Set(container_name.to_string()),
+            service_name: Set(None),
+            node_id: Set(None),
+            log_path: Set(String::new()), // filled in after we know the row id
+            size_bytes: Set(content.len() as i64),
+            truncated: Set(false),
+            ..Default::default()
+        };
+        let row = row.insert(db.as_ref()).await?;
+
+        // Mirror the path scheme used by capture_container_logs.
+        let log_path = format!("deployment-container-logs/{}/{}.log", deployment.id, row.id);
+        let full_path = log_base.join(&log_path);
+        if let Some(parent) = full_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::write(&full_path, content.as_bytes()).await?;
+
+        let mut active: deployment_container_logs::ActiveModel = row.into();
+        active.log_path = Set(log_path);
+        let row = active.update(db.as_ref()).await?;
+        Ok(row)
+    }
+
+    #[tokio::test]
+    async fn test_list_deployment_container_logs_returns_captured_rows(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (_project, _environment, deployment) = setup_test_data(&db).await?;
+
+        let log_base = std::env::temp_dir();
+        seed_captured_log(&db, &log_base, &deployment, "web-1", "old logs").await?;
+        seed_captured_log(&db, &log_base, &deployment, "web-2", "newer logs").await?;
+
+        let service = create_deployment_service_for_test(db.clone());
+        let logs = service
+            .list_deployment_container_logs(deployment.project_id, deployment.id)
+            .await?;
+
+        assert_eq!(logs.len(), 2);
+        // All captured logs belong to the requested deployment.
+        assert!(logs.iter().all(|l| l.deployment_id == deployment.id));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_deployment_container_logs_wrong_project_not_found(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (_project, _environment, deployment) = setup_test_data(&db).await?;
+
+        let service = create_deployment_service_for_test(db.clone());
+        // A different project id must not see this deployment's logs — IDOR guard.
+        let result = service
+            .list_deployment_container_logs(deployment.project_id + 999, deployment.id)
+            .await;
+
+        assert!(matches!(result, Err(DeploymentError::NotFound(_))));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_deployment_container_log_content_reads_file(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (_project, _environment, deployment) = setup_test_data(&db).await?;
+
+        let log_base = std::env::temp_dir();
+        let row =
+            seed_captured_log(&db, &log_base, &deployment, "web-2", "hello from web-2").await?;
+
+        let service = create_deployment_service_for_test(db.clone());
+        let (got_row, content) = service
+            .get_deployment_container_log_content(deployment.project_id, deployment.id, row.id)
+            .await?;
+
+        assert_eq!(got_row.id, row.id);
+        assert_eq!(content, "hello from web-2");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_deployment_container_log_content_wrong_project_not_found(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (_project, _environment, deployment) = setup_test_data(&db).await?;
+
+        let log_base = std::env::temp_dir();
+        let row = seed_captured_log(&db, &log_base, &deployment, "web-2", "secret").await?;
+
+        let service = create_deployment_service_for_test(db.clone());
+        // Reading with a foreign project id must be denied even with the right log id.
+        let result = service
+            .get_deployment_container_log_content(
+                deployment.project_id + 999,
+                deployment.id,
+                row.id,
+            )
+            .await;
+
+        assert!(matches!(result, Err(DeploymentError::NotFound(_))));
+        Ok(())
     }
 }

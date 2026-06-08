@@ -1279,7 +1279,7 @@ fn validate_severity(sev: &str) -> Result<(), Problem> {
 /// Returns `Ok(())` if the caller may access the service, or `Err(Problem)`
 /// with a 404 response (does not distinguish "not found" from "forbidden"
 /// to avoid leaking the existence of services in other projects).
-async fn assert_service_owned_by_caller(
+pub(crate) async fn assert_service_owned_by_caller(
     service_id: i32,
     auth: &temps_auth::AuthContext,
     state: &AppState,

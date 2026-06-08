@@ -29,9 +29,10 @@ use utoipa::OpenApi;
 use crate::handlers::types::{
     ActivityDay, ActivityGraphQuery, ActivityGraphResponse, ContainerActionResponse,
     ContainerDetailResponse, ContainerInfoResponse, ContainerListResponse, ContainerLogsQuery,
-    ContainerMetricsResponse, DeploymentJobResponse, DeploymentJobsResponse,
-    DeploymentListResponse, DeploymentResponse, DeploymentStateResponse, EnvVarResponse,
-    PromoteDeploymentRequest, ResourceLimitsResponse,
+    ContainerMetricsResponse, DeploymentContainerLogContentResponse,
+    DeploymentContainerLogResponse, DeploymentContainerLogsListResponse, DeploymentJobResponse,
+    DeploymentJobsResponse, DeploymentListResponse, DeploymentResponse, DeploymentStateResponse,
+    EnvVarResponse, PromoteDeploymentRequest, ResourceLimitsResponse,
 };
 use temps_core::problemdetails;
 use temps_core::problemdetails::Problem;
@@ -45,6 +46,8 @@ use temps_core::problemdetails::Problem;
         get_deployment_jobs,
         get_deployment_job_logs,
         tail_deployment_job_logs,
+        list_deployment_container_logs,
+        get_deployment_container_log_content,
         rollback_to_deployment,
         promote_deployment,
         pause_deployment,
@@ -81,7 +84,10 @@ use temps_core::problemdetails::Problem;
         ActivityGraphQuery,
         ActivityGraphResponse,
         ActivityDay,
-        PromoteDeploymentRequest
+        PromoteDeploymentRequest,
+        DeploymentContainerLogResponse,
+        DeploymentContainerLogsListResponse,
+        DeploymentContainerLogContentResponse
     )),
     info(
         title = "Deployments API",
@@ -113,6 +119,17 @@ pub fn configure_routes() -> Router<Arc<super::types::AppState>> {
         .route(
             "/projects/{project_id}/deployments/{deployment_id}/jobs/{job_id}/logs",
             get(get_deployment_job_logs),
+        )
+        // Historical (captured) container logs for previous deployments. These
+        // survive teardown so users can read the logs of a container that no
+        // longer exists (e.g. "web-2" from a few days ago).
+        .route(
+            "/projects/{project_id}/deployments/{deployment_id}/container-logs",
+            get(list_deployment_container_logs),
+        )
+        .route(
+            "/projects/{project_id}/deployments/{deployment_id}/container-logs/{log_id}",
+            get(get_deployment_container_log_content),
         )
         // Deployment operations
         .route(
@@ -1275,6 +1292,93 @@ pub async fn get_deployment_job_logs(
         })?;
 
     Ok((StatusCode::OK, log_content))
+}
+
+/// List the captured (historical) container-log dumps for a deployment.
+///
+/// Container runtime logs are normally only available live from the running
+/// container. When a deployment is superseded its containers are torn down and
+/// those logs would be lost — so just before teardown we capture each
+/// container's logs to durable storage. This endpoint lists what was captured
+/// for a given (often older) deployment, so a user can read the logs of a
+/// container that no longer exists.
+#[utoipa::path(
+    tag = "Deployments",
+    get,
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("deployment_id" = i32, Path, description = "Deployment ID")
+    ),
+    responses(
+        (status = 200, description = "Captured container logs for the deployment", body = DeploymentContainerLogsListResponse),
+        (status = 404, description = "Deployment not found in this project"),
+        (status = 500, description = "Internal server error")
+    ),
+    path = "/projects/{project_id}/deployments/{deployment_id}/container-logs",
+    security(("bearer_token" = []))
+)]
+pub async fn list_deployment_container_logs(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path((project_id, deployment_id)): Path<(i32, i32)>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, DeploymentsRead);
+
+    let logs = state
+        .deployment_service
+        .list_deployment_container_logs(project_id, deployment_id)
+        .await?;
+
+    let response = DeploymentContainerLogsListResponse {
+        logs: logs
+            .into_iter()
+            .map(DeploymentContainerLogResponse::from)
+            .collect(),
+    };
+
+    Ok((StatusCode::OK, Json(response)).into_response())
+}
+
+/// Get the captured text content of a single historical container-log dump.
+#[utoipa::path(
+    tag = "Deployments",
+    get,
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("deployment_id" = i32, Path, description = "Deployment ID"),
+        ("log_id" = i32, Path, description = "Captured log ID")
+    ),
+    responses(
+        (status = 200, description = "Captured container log content", body = DeploymentContainerLogContentResponse),
+        (status = 404, description = "Captured log not found in this project"),
+        (status = 500, description = "Internal server error")
+    ),
+    path = "/projects/{project_id}/deployments/{deployment_id}/container-logs/{log_id}",
+    security(("bearer_token" = []))
+)]
+pub async fn get_deployment_container_log_content(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path((project_id, deployment_id, log_id)): Path<(i32, i32, i32)>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, DeploymentsRead);
+
+    let (row, content) = state
+        .deployment_service
+        .get_deployment_container_log_content(project_id, deployment_id, log_id)
+        .await?;
+
+    let response = DeploymentContainerLogContentResponse {
+        id: row.id,
+        container_name: row.container_name,
+        service_name: row.service_name,
+        size_bytes: row.size_bytes,
+        truncated: row.truncated,
+        captured_at: row.captured_at.timestamp_millis(),
+        content,
+    };
+
+    Ok((StatusCode::OK, Json(response)).into_response())
 }
 
 /// Tail logs for a specific deployment job in real-time via WebSocket

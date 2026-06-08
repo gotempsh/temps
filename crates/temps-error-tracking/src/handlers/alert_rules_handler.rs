@@ -1,5 +1,4 @@
 use super::types::AppState;
-use crate::services::ErrorTrackingError;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -9,6 +8,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use temps_auth::{permission_guard, project_scope_guard, RequireAuth};
+use temps_core::problemdetails::Problem;
 use temps_entities::error_alert_rules;
 use utoipa::{OpenApi, ToSchema};
 
@@ -150,8 +151,11 @@ impl From<error_alert_rules::Model> for AlertRuleResponse {
 )]
 pub async fn list_alert_rules(
     State(state): State<Arc<AppState>>,
+    RequireAuth(auth): RequireAuth,
     Path(project_id): Path<i32>,
-) -> Result<Json<Vec<AlertRuleResponse>>, ErrorTrackingError> {
+) -> Result<Json<Vec<AlertRuleResponse>>, Problem> {
+    permission_guard!(auth, ErrorTrackingRead);
+    project_scope_guard!(auth, project_id);
     let rules = state.alert_service.list_rules(project_id).await?;
     Ok(Json(
         rules.into_iter().map(AlertRuleResponse::from).collect(),
@@ -175,8 +179,11 @@ pub async fn list_alert_rules(
 )]
 pub async fn get_alert_rule(
     State(state): State<Arc<AppState>>,
+    RequireAuth(auth): RequireAuth,
     Path((project_id, rule_id)): Path<(i32, i32)>,
-) -> Result<Json<AlertRuleResponse>, ErrorTrackingError> {
+) -> Result<Json<AlertRuleResponse>, Problem> {
+    permission_guard!(auth, ErrorTrackingRead);
+    project_scope_guard!(auth, project_id);
     let rule = state.alert_service.get_rule(rule_id, project_id).await?;
     Ok(Json(AlertRuleResponse::from(rule)))
 }
@@ -198,9 +205,12 @@ pub async fn get_alert_rule(
 )]
 pub async fn create_alert_rule(
     State(state): State<Arc<AppState>>,
+    RequireAuth(auth): RequireAuth,
     Path(project_id): Path<i32>,
     Json(request): Json<CreateAlertRuleRequest>,
-) -> Result<(StatusCode, Json<AlertRuleResponse>), ErrorTrackingError> {
+) -> Result<(StatusCode, Json<AlertRuleResponse>), Problem> {
+    permission_guard!(auth, ErrorTrackingCreate);
+    project_scope_guard!(auth, project_id);
     let rule = state
         .alert_service
         .create_rule(
@@ -238,9 +248,12 @@ pub async fn create_alert_rule(
 )]
 pub async fn update_alert_rule(
     State(state): State<Arc<AppState>>,
+    RequireAuth(auth): RequireAuth,
     Path((project_id, rule_id)): Path<(i32, i32)>,
     Json(request): Json<UpdateAlertRuleRequest>,
-) -> Result<Json<AlertRuleResponse>, ErrorTrackingError> {
+) -> Result<Json<AlertRuleResponse>, Problem> {
+    permission_guard!(auth, ErrorTrackingWrite);
+    project_scope_guard!(auth, project_id);
     let rule = state
         .alert_service
         .update_rule(
@@ -277,8 +290,11 @@ pub async fn update_alert_rule(
 )]
 pub async fn delete_alert_rule(
     State(state): State<Arc<AppState>>,
+    RequireAuth(auth): RequireAuth,
     Path((project_id, rule_id)): Path<(i32, i32)>,
-) -> Result<StatusCode, ErrorTrackingError> {
+) -> Result<StatusCode, Problem> {
+    permission_guard!(auth, ErrorTrackingWrite);
+    project_scope_guard!(auth, project_id);
     state.alert_service.delete_rule(rule_id, project_id).await?;
 
     Ok(StatusCode::NO_CONTENT)

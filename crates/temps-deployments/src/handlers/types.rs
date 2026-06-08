@@ -54,6 +54,58 @@ pub struct DeploymentDomainResponse {
     pub domain: String,
 }
 
+/// Metadata for one captured (historical) container-log dump. Listed on the
+/// deployment detail page so a user can pick which past container's logs to read.
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct DeploymentContainerLogResponse {
+    pub id: i32,
+    pub deployment_id: i32,
+    pub container_id: String,
+    pub container_name: String,
+    pub service_name: Option<String>,
+    pub node_id: Option<i32>,
+    pub size_bytes: i64,
+    pub truncated: bool,
+    /// Unix epoch milliseconds of when the logs were captured (just before
+    /// teardown). Matches the timestamp convention used by `DeploymentResponse`.
+    pub captured_at: i64,
+}
+
+impl From<temps_entities::deployment_container_logs::Model> for DeploymentContainerLogResponse {
+    fn from(m: temps_entities::deployment_container_logs::Model) -> Self {
+        Self {
+            id: m.id,
+            deployment_id: m.deployment_id,
+            container_id: m.container_id,
+            container_name: m.container_name,
+            service_name: m.service_name,
+            node_id: m.node_id,
+            size_bytes: m.size_bytes,
+            truncated: m.truncated,
+            captured_at: m.captured_at.timestamp_millis(),
+        }
+    }
+}
+
+/// The list of captured container-log dumps for a deployment.
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct DeploymentContainerLogsListResponse {
+    pub logs: Vec<DeploymentContainerLogResponse>,
+}
+
+/// A single captured container-log dump, including its full text content.
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct DeploymentContainerLogContentResponse {
+    pub id: i32,
+    pub container_name: String,
+    pub service_name: Option<String>,
+    pub size_bytes: i64,
+    pub truncated: bool,
+    pub captured_at: i64,
+    /// The captured plain-text log content.
+    pub content: String,
+}
+
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct CreateProjectRequest {
     pub name: String,

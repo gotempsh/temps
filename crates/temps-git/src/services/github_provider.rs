@@ -176,6 +176,8 @@ impl GitHubProvider {
         reqwest::Client::builder()
             .user_agent("Temps-Engine/1.0")
             .timeout(std::time::Duration::from_secs(30))
+            // SSRF defense-in-depth: never follow redirects (see gitlab_provider).
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("Failed to build reqwest client with static config")
     }

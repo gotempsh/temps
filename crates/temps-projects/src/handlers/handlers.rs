@@ -14,8 +14,8 @@ use axum::{
     Json,
 };
 use std::sync::Arc;
-use temps_auth::permission_guard;
 use temps_auth::RequireAuth;
+use temps_auth::{permission_guard, project_scope_guard};
 use temps_core::RequestMetadata;
 use tracing::{debug, error, info};
 
@@ -303,6 +303,7 @@ pub async fn get_project(
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsRead);
+    project_scope_guard!(auth, id);
 
     info!("get project called with id: {}", id);
     let project = state
@@ -369,6 +370,7 @@ pub async fn update_project(
     Json(project): Json<CreateProjectRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+    project_scope_guard!(auth, id);
 
     let project_req = crate::services::types::CreateProjectRequest {
         name: project.name.clone(),
@@ -449,6 +451,7 @@ pub async fn delete_project(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsDelete);
+    project_scope_guard!(auth, id);
 
     // Get project details before deletion
     let project = state.project_service.get_project(id).await?;
@@ -508,6 +511,7 @@ pub async fn update_project_settings(
     Json(settings): Json<UpdateProjectSettingsRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+    project_scope_guard!(auth, project_id);
 
     let updated_project = state
         .project_service
@@ -589,6 +593,7 @@ pub async fn update_automatic_deploy(
     Json(request): Json<UpdateAutomaticDeployRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+    project_scope_guard!(auth, project_id);
 
     info!(
         "Updating automatic deployment setting for project: {}",
@@ -636,6 +641,7 @@ pub async fn update_git_settings(
     Json(settings): Json<UpdateGitSettingsRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+    project_scope_guard!(auth, project_id);
 
     info!(
         "Updating git settings for project: {} (branch: {}, repo: {}/{})",
@@ -726,6 +732,7 @@ pub async fn reinstall_gitlab_webhook(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+    project_scope_guard!(auth, project_id);
 
     info!("Reinstalling GitLab webhook for project: {}", project_id);
 
@@ -800,6 +807,7 @@ pub async fn update_project_deployment_config(
     Json(config): Json<UpdateDeploymentConfigRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+    project_scope_guard!(auth, project_id);
 
     info!("Updating deployment config for project: {}", project_id);
 
@@ -897,6 +905,7 @@ pub async fn trigger_project_pipeline(
     Json(payload): Json<super::types::TriggerPipelinePayload>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+    project_scope_guard!(auth, id);
 
     info!("Triggering pipeline for project with id: {}", id);
 
