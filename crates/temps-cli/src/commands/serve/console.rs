@@ -1203,27 +1203,11 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         debug!("UserService not available, skipping user initialization");
     }
 
-    // Start backup scheduler if BackupService is available.
-    // The scheduler enqueues due jobs; the in-process BackupExecutor (registered
-    // by BackupPlugin) picks them up and runs them.
-    if let Some(backup_service) = service_context.get_service::<temps_backup::BackupService>() {
-        let cancellation_token = tokio_util::sync::CancellationToken::new();
-        let scheduler_token = cancellation_token.clone();
-        let scheduler_service = backup_service.clone();
-
-        tokio::spawn(async move {
-            debug!("Starting backup scheduler");
-            if let Err(e) = scheduler_service
-                .start_backup_scheduler(scheduler_token)
-                .await
-            {
-                tracing::error!("Backup scheduler error: {}", e);
-            }
-        });
-        debug!("Backup scheduler started in background");
-        // Note: Currently no graceful shutdown mechanism for cancellation_token
-        // In the future, this could be wired to a shutdown signal handler
-    }
+    // NOTE: The backup scheduler is started by `BackupPlugin` during plugin
+    // initialization (see `temps-backup/src/plugin.rs`). Do NOT start it here as
+    // well -- spawning a second scheduler loop makes both loops independently
+    // find each due `backup_schedules` row and enqueue a `Job::BackupRequested`,
+    // producing two completed backup runs per service at the same timestamp.
 
     // Start certificate renewal scheduler (optional - fails gracefully if TlsService unavailable)
     if let Some(tls_service) = service_context.get_service::<temps_domains::TlsService>() {
