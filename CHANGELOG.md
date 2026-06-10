@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **On-demand (scale-to-zero) environments no longer 503 on the first request**: a sleeping environment is excluded from the proxy route table, so the first request must wake it and reload routes before it can be served. The wake path was the one caller still relying on fire-and-forget PostgreSQL `NOTIFY route_table_changes` (instead of the deterministic in-process `Job::ForceRouteReload` the deploy pipeline uses), did a single `resolve_context` with no retry, and treated a reload-wait timeout as success — so when the route hadn't reloaded yet the request fell back to the console upstream and the client saw a 503/404 for its own domain. `do_wake` now publishes `Job::ForceRouteReload` (in addition to the PG NOTIFY, kept for remote nodes — including on the no-containers path), `wait_for_route_reload` is lost-wakeup-safe and returns a real timeout signal, and the proxy re-resolves the route in a bounded loop after waking (returning an explicit retryable `503 wake_pending` rather than the console fallback). Concurrent requests parked in the wake path are capped with a semaphore to bound request-hold amplification in the proxy hot path.
 
 
 ## [0.1.0-beta.29] - 2026-06-09
