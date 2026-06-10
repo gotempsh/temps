@@ -271,6 +271,7 @@ impl ServeCommand {
                 Arc::new(temps_proxy::on_demand::OnDemandManager::new(
                     db.clone(),
                     Arc::new(adapter) as Arc<dyn temps_proxy::on_demand::ContainerLifecycle>,
+                    queue.clone(),
                 ))
             });
 

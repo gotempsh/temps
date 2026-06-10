@@ -16,10 +16,10 @@ use sea_orm::{
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use temps_core::OnDemandWaker;
+use temps_core::{ForceRouteReloadJob, Job, JobQueue, OnDemandWaker};
 use temps_entities::{deployment_containers, environments};
 use thiserror::Error;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, info, warn};
 
 /// Trait for starting/stopping containers. Implemented by the deployer crate.
@@ -100,10 +100,33 @@ pub struct OnDemandManager {
     /// Container lifecycle operations (injected).
     container_lifecycle: Arc<dyn ContainerLifecycle>,
 
+    /// Shared in-process job queue. After a wake, `do_wake` publishes
+    /// [`Job::ForceRouteReload`] on this queue so the in-process
+    /// `RouteReloadSubscriber` reloads the route table deterministically —
+    /// without a database connection in the critical path that can silently
+    /// wedge. This is the same mechanism the deployment pipeline uses; the raw
+    /// PG `NOTIFY route_table_changes` is still fired in addition, purely to
+    /// reach remote worker nodes that don't share this queue.
+    queue: Arc<dyn JobQueue>,
+
     /// Notified whenever the route table finishes a reload.
     /// Used by wake-on-request to know when routes are available after waking.
     route_reloaded: Notify,
+
+    /// Caps how many requests may be parked in the inline wake/re-resolve path
+    /// at once. The wake block runs in the Pingora request hot path and can hold
+    /// a request for several seconds (wait-for-reload + bounded re-resolve). An
+    /// unauthenticated client that knows a sleeping hostname could otherwise open
+    /// many connections and pin proxy worker tasks. Requests that can't get a
+    /// permit get an immediate retryable 503 instead of parking.
+    wake_slots: Arc<Semaphore>,
 }
+
+/// Maximum number of requests allowed to be parked in the inline wake path
+/// concurrently across this proxy instance. Generous enough to never throttle
+/// legitimate first-request bursts, small enough to bound task/connection
+/// pressure from an attacker hammering known sleeping hostnames.
+const MAX_CONCURRENT_WAKE_WAITERS: usize = 256;
 
 #[derive(Clone, Debug)]
 pub(crate) struct OnDemandConfig {
@@ -117,6 +140,7 @@ impl OnDemandManager {
     pub fn new(
         db: Arc<DatabaseConnection>,
         container_lifecycle: Arc<dyn ContainerLifecycle>,
+        queue: Arc<dyn JobQueue>,
     ) -> Self {
         Self {
             last_activity: DashMap::new(),
@@ -125,8 +149,33 @@ impl OnDemandManager {
             sleeping_by_domain: DashMap::new(),
             db,
             container_lifecycle,
+            queue,
             route_reloaded: Notify::new(),
+            wake_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_WAKE_WAITERS)),
         }
+    }
+
+    /// Try to reserve a slot for parking a request in the inline wake path.
+    ///
+    /// Returns a permit (held for the duration of the wake/re-resolve) when
+    /// capacity is available, or `None` when the proxy is already at
+    /// [`MAX_CONCURRENT_WAKE_WAITERS`]. Callers that get `None` should return an
+    /// immediate retryable 503 rather than parking, so an attacker hammering a
+    /// known sleeping hostname cannot pin an unbounded number of worker tasks.
+    pub fn try_acquire_wake_slot(&self) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.wake_slots).try_acquire_owned().ok()
+    }
+
+    /// Test-only constructor that injects a no-op job queue, so existing tests
+    /// don't need to thread a real queue through every call. Tests that assert
+    /// on queue behavior construct the manager via [`Self::new`] with a real
+    /// (counting) queue instead.
+    #[cfg(test)]
+    pub(crate) fn new_test(
+        db: Arc<DatabaseConnection>,
+        container_lifecycle: Arc<dyn ContainerLifecycle>,
+    ) -> Self {
+        Self::new(db, container_lifecycle, Arc::new(tests::NoopQueue))
     }
 
     // ── Activity Tracking ──
@@ -168,13 +217,29 @@ impl OnDemandManager {
     }
 
     /// Wait for the next route table reload, with a timeout.
-    /// Returns Ok(()) if a reload happened, Err on timeout.
-    pub async fn wait_for_route_reload(&self, timeout: Duration) -> Result<(), OnDemandError> {
-        match tokio::time::timeout(timeout, self.route_reloaded.notified()).await {
-            Ok(_) => Ok(()),
+    ///
+    /// Returns `true` if a reload was observed within `timeout`, `false` on
+    /// timeout. Callers treat `false` as non-fatal (re-resolve / retry), but a
+    /// truthful return lets them log and react instead of silently proceeding
+    /// with a stale route table.
+    ///
+    /// **Lost-wakeup safety:** `route_reloaded` is a bare [`Notify`] with no
+    /// stored permit — `notify_waiters()` only wakes *currently parked*
+    /// waiters. A reload that completes between `wake_environment` returning and
+    /// this method parking would be missed. We arm the `Notified` future
+    /// *before* awaiting so a notification fired the instant after we arm is
+    /// delivered to us. (The caller additionally re-resolves the route after
+    /// this returns, so even a genuinely missed signal cannot fail the request
+    /// as long as the route is present — see the proxy wake block.)
+    pub async fn wait_for_route_reload(&self, timeout: Duration) -> bool {
+        // Arm BEFORE returning to the await point: any notify_waiters() that
+        // fires after this line is guaranteed to be delivered to this future.
+        let notified = self.route_reloaded.notified();
+        match tokio::time::timeout(timeout, notified).await {
+            Ok(()) => true,
             Err(_) => {
                 warn!("Timed out waiting for route reload after wake");
-                Ok(()) // Don't fail — the route will appear on the next reload
+                false
             }
         }
     }
@@ -660,7 +725,34 @@ impl OnDemandManager {
             "Environment awake"
         );
 
-        // Fire PG NOTIFY so all proxy instances reload routes
+        // Reload routes deterministically, in-process. The woken environment was
+        // excluded from the route table while sleeping, so the route table MUST
+        // reload before the request can be resolved. Publishing
+        // `Job::ForceRouteReload` drives the in-process `RouteReloadSubscriber`
+        // (the same path the deploy pipeline uses) which has no database
+        // connection in its critical path and therefore cannot silently wedge
+        // the way a long-lived PG `LISTEN` connection can. The PG NOTIFY below
+        // is fired in addition, purely to reach remote worker nodes that don't
+        // share this in-process queue.
+        if let Err(e) = self
+            .queue
+            .send(Job::ForceRouteReload(ForceRouteReloadJob {
+                environment_id: Some(environment_id),
+                deployment_id: Some(deployment_id),
+            }))
+            .await
+        {
+            // Non-fatal: the PG NOTIFY below and the caller's bounded re-resolve
+            // loop are the fallbacks. Log so a wedged in-process queue is visible.
+            warn!(
+                environment_id = environment_id,
+                error = %e,
+                "Failed to publish in-process ForceRouteReload after wake; \
+                 falling back to PG NOTIFY"
+            );
+        }
+
+        // Fire PG NOTIFY so remote proxy/worker nodes reload routes too.
         self.notify_route_change().await;
 
         Ok(())
@@ -746,7 +838,57 @@ impl OnDemandWaker for OnDemandManager {
 mod tests {
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
+    use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex;
+
+    // ── Mock JobQueue ──
+
+    /// A job queue that drops everything. Used by [`OnDemandManager::new_test`]
+    /// for the many tests that don't care about reload signalling.
+    pub(crate) struct NoopQueue;
+
+    #[async_trait]
+    impl JobQueue for NoopQueue {
+        async fn send(&self, _job: Job) -> Result<(), temps_core::QueueError> {
+            Ok(())
+        }
+
+        fn subscribe(&self) -> Box<dyn temps_core::JobReceiver> {
+            // No test consumes from the noop queue; a never-ready receiver is
+            // sufficient and avoids pulling in a broadcast channel here.
+            Box::new(NoopReceiver)
+        }
+    }
+
+    struct NoopReceiver;
+
+    #[async_trait]
+    impl temps_core::JobReceiver for NoopReceiver {
+        async fn recv(&mut self) -> Result<Job, temps_core::QueueError> {
+            // Park forever — the noop queue never delivers.
+            std::future::pending().await
+        }
+    }
+
+    /// A job queue that records how many `ForceRouteReload` jobs were published,
+    /// so a test can assert the wake path posts the in-process reload request.
+    struct CountingQueue {
+        force_reloads: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl JobQueue for CountingQueue {
+        async fn send(&self, job: Job) -> Result<(), temps_core::QueueError> {
+            if matches!(job, Job::ForceRouteReload(_)) {
+                self.force_reloads.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+
+        fn subscribe(&self) -> Box<dyn temps_core::JobReceiver> {
+            Box::new(NoopReceiver)
+        }
+    }
 
     // ── Mock ContainerLifecycle ──
 
@@ -921,7 +1063,7 @@ mod tests {
     fn test_record_activity_updates_timestamp() {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = OnDemandManager::new(Arc::new(db), lifecycle);
+        let manager = OnDemandManager::new_test(Arc::new(db), lifecycle);
 
         manager.record_activity(1);
         let ts1 = manager
@@ -1020,7 +1162,7 @@ mod tests {
     fn test_sleeping_domain_lookup() {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = OnDemandManager::new(Arc::new(db), lifecycle);
+        let manager = OnDemandManager::new_test(Arc::new(db), lifecycle);
 
         assert!(manager.get_sleeping_environment("example.com").is_none());
 
@@ -1044,7 +1186,7 @@ mod tests {
     fn test_clear_sleeping_domains() {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = OnDemandManager::new(Arc::new(db), lifecycle);
+        let manager = OnDemandManager::new_test(Arc::new(db), lifecycle);
 
         manager.register_sleeping_domain(
             "a.com".to_string(),
@@ -1078,7 +1220,7 @@ mod tests {
     fn test_register_and_remove_environment() {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = OnDemandManager::new(Arc::new(db), lifecycle);
+        let manager = OnDemandManager::new_test(Arc::new(db), lifecycle);
 
         manager.register_on_demand_environment(42, 300, 30);
         assert!(manager.configs.contains_key(&42));
@@ -1172,7 +1314,7 @@ mod tests {
     async fn test_sweep_no_on_demand_environments() {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = OnDemandManager::new(Arc::new(db), lifecycle);
+        let manager = OnDemandManager::new_test(Arc::new(db), lifecycle);
 
         let slept = manager.sweep_idle_environments().await;
         assert!(slept.is_empty());
@@ -1241,7 +1383,7 @@ mod tests {
             .into_connection();
 
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = Arc::new(OnDemandManager::new(
+        let manager = Arc::new(OnDemandManager::new_test(
             Arc::new(db),
             Arc::clone(&lifecycle) as Arc<dyn ContainerLifecycle>,
         ));
@@ -1252,6 +1394,170 @@ mod tests {
 
         // Container should have been started
         assert_eq!(lifecycle.started_containers(), vec!["abc123"]);
+    }
+
+    #[tokio::test]
+    async fn test_wake_posts_force_route_reload() {
+        // A successful wake MUST publish Job::ForceRouteReload on the in-process
+        // queue so the route table reloads deterministically (not just PG NOTIFY).
+        // This is the fix for "first request to an on-demand env returns 503".
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // UPDATE sleeping=false WHERE sleeping=true -> 1 row
+            .append_exec_results(vec![MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            // find_by_id for env
+            .append_query_results(vec![vec![environments::Model {
+                id: 1,
+                name: "production".to_string(),
+                slug: "production".to_string(),
+                subdomain: "prod".to_string(),
+                last_deployment: None,
+                host: "".to_string(),
+                upstreams: temps_entities::upstream_config::UpstreamList::new(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                project_id: 10,
+                current_deployment_id: Some(100),
+                branch: None,
+                deleted_at: None,
+                deployment_config: None,
+                is_preview: false,
+                protected: false,
+                sleeping: false,
+                last_activity_at: None,
+            }]])
+            // containers query
+            .append_query_results(vec![vec![deployment_containers::Model {
+                id: 1,
+                deployment_id: 100,
+                container_id: "abc123".to_string(),
+                container_name: "my-app-abc123".to_string(),
+                container_port: 3000,
+                host_port: Some(32000),
+                image_name: Some("my-app:latest".to_string()),
+                status: Some("running".to_string()),
+                service_name: None,
+                created_at: chrono::Utc::now(),
+                deployed_at: chrono::Utc::now(),
+                ready_at: None,
+                deleted_at: None,
+                node_id: None,
+                exit_code: None,
+                exit_reason: None,
+                oom_killed: None,
+                error_message: None,
+                finished_at: None,
+                started_at: None,
+                cpu_limit_cores: None,
+            }]])
+            .into_connection();
+
+        let force_reloads = Arc::new(AtomicUsize::new(0));
+        let queue: Arc<dyn JobQueue> = Arc::new(CountingQueue {
+            force_reloads: force_reloads.clone(),
+        });
+        let lifecycle = Arc::new(MockLifecycle::new());
+        let manager = OnDemandManager::new(
+            Arc::new(db),
+            Arc::clone(&lifecycle) as Arc<dyn ContainerLifecycle>,
+            queue,
+        );
+
+        let result = manager.wake_environment(1, 30).await;
+        assert!(result.is_ok());
+        assert_eq!(
+            force_reloads.load(Ordering::SeqCst),
+            1,
+            "wake must publish exactly one ForceRouteReload"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_route_reload_lost_wakeup_safe() {
+        // Regression for the lost-wakeup race: a notify_route_reloaded() that
+        // fires the instant after wait_for_route_reload arms must still be
+        // delivered. We arm the wait, then notify from another task; the wait
+        // must resolve to `true` well within the timeout (not park for the full
+        // duration).
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let lifecycle = Arc::new(MockLifecycle::new());
+        let manager = Arc::new(OnDemandManager::new_test(
+            Arc::new(db),
+            Arc::clone(&lifecycle) as Arc<dyn ContainerLifecycle>,
+        ));
+
+        let m2 = Arc::clone(&manager);
+        let notifier = tokio::spawn(async move {
+            // Give the waiter a moment to park, then signal.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            m2.notify_route_reloaded();
+        });
+
+        let start = Instant::now();
+        let reloaded = manager.wait_for_route_reload(Duration::from_secs(5)).await;
+        let elapsed = start.elapsed();
+
+        notifier.await.unwrap();
+        assert!(reloaded, "wait must observe the reload signal");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "wait must wake promptly on notify, not park for the full timeout (took {elapsed:?})"
+        );
+    }
+
+    #[test]
+    fn test_wake_slot_acquire_and_release() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let lifecycle = Arc::new(MockLifecycle::new());
+        let manager = OnDemandManager::new_test(
+            Arc::new(db),
+            Arc::clone(&lifecycle) as Arc<dyn ContainerLifecycle>,
+        );
+
+        // A fresh manager hands out a slot.
+        let permit = manager.try_acquire_wake_slot();
+        assert!(permit.is_some(), "first slot should be available");
+
+        // Drain the rest of the pool and confirm exhaustion returns None.
+        let mut held = vec![permit.unwrap()];
+        while let Some(p) = manager.try_acquire_wake_slot() {
+            held.push(p);
+        }
+        assert_eq!(
+            held.len(),
+            MAX_CONCURRENT_WAKE_WAITERS,
+            "pool should hand out exactly MAX_CONCURRENT_WAKE_WAITERS permits"
+        );
+        assert!(
+            manager.try_acquire_wake_slot().is_none(),
+            "exhausted pool must return None instead of parking"
+        );
+
+        // Releasing a permit makes a slot available again.
+        held.pop();
+        assert!(
+            manager.try_acquire_wake_slot().is_some(),
+            "released slot should be re-acquirable"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_route_reload_times_out_to_false() {
+        // With no signal, the wait must return `false` (not a swallowed Ok) so
+        // the caller knows to re-resolve rather than trusting a stale table.
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let lifecycle = Arc::new(MockLifecycle::new());
+        let manager = OnDemandManager::new_test(
+            Arc::new(db),
+            Arc::clone(&lifecycle) as Arc<dyn ContainerLifecycle>,
+        );
+
+        let reloaded = manager
+            .wait_for_route_reload(Duration::from_millis(50))
+            .await;
+        assert!(!reloaded, "no signal within timeout must return false");
     }
 
     #[tokio::test]
@@ -1315,7 +1621,7 @@ mod tests {
             .into_connection();
 
         let lifecycle = Arc::new(MockLifecycle::with_fail_start());
-        let manager = OnDemandManager::new(Arc::new(db), lifecycle);
+        let manager = OnDemandManager::new_test(Arc::new(db), lifecycle);
 
         let result = manager.wake_environment(1, 30).await;
         assert!(result.is_err());
@@ -1357,7 +1663,7 @@ mod tests {
             .into_connection();
 
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = OnDemandManager::new(Arc::new(db), lifecycle);
+        let manager = OnDemandManager::new_test(Arc::new(db), lifecycle);
 
         let result = manager.wake_environment(1, 30).await;
         assert!(matches!(
@@ -1377,7 +1683,7 @@ mod tests {
             .into_connection();
 
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = OnDemandManager::new(Arc::new(db), lifecycle);
+        let manager = OnDemandManager::new_test(Arc::new(db), lifecycle);
 
         let result = manager.sleep_environment(1).await.unwrap();
         assert!(!result); // Already sleeping
@@ -1394,7 +1700,7 @@ mod tests {
             .into_connection();
 
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = OnDemandManager::new(Arc::new(db), lifecycle);
+        let manager = OnDemandManager::new_test(Arc::new(db), lifecycle);
 
         let result = manager.wake_environment(1, 30).await;
         assert!(result.is_ok()); // No-op, already awake
@@ -1509,7 +1815,7 @@ mod tests {
             .into_connection();
 
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = OnDemandManager::new(
+        let manager = OnDemandManager::new_test(
             Arc::new(db),
             Arc::clone(&lifecycle) as Arc<dyn ContainerLifecycle>,
         );
@@ -1531,7 +1837,7 @@ mod tests {
     fn test_sleeping_domain_lookup_with_port() {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = OnDemandManager::new(
+        let manager = OnDemandManager::new_test(
             Arc::new(db),
             Arc::clone(&lifecycle) as Arc<dyn ContainerLifecycle>,
         );
@@ -1564,7 +1870,7 @@ mod tests {
         // Environment with 300s idle timeout but recent activity → should NOT sleep
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = OnDemandManager::new(
+        let manager = OnDemandManager::new_test(
             Arc::new(db),
             Arc::clone(&lifecycle) as Arc<dyn ContainerLifecycle>,
         );
@@ -1585,7 +1891,7 @@ mod tests {
     fn test_multiple_domains_same_sleeping_environment() {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = OnDemandManager::new(
+        let manager = OnDemandManager::new_test(
             Arc::new(db),
             Arc::clone(&lifecycle) as Arc<dyn ContainerLifecycle>,
         );
@@ -1619,7 +1925,7 @@ mod tests {
     fn test_clear_sleeping_domains_removes_all() {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = OnDemandManager::new(
+        let manager = OnDemandManager::new_test(
             Arc::new(db),
             Arc::clone(&lifecycle) as Arc<dyn ContainerLifecycle>,
         );
@@ -1658,7 +1964,7 @@ mod tests {
     fn test_record_activity_creates_entry_if_missing() {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = OnDemandManager::new(
+        let manager = OnDemandManager::new_test(
             Arc::new(db),
             Arc::clone(&lifecycle) as Arc<dyn ContainerLifecycle>,
         );
@@ -1675,7 +1981,7 @@ mod tests {
     fn test_route_table_callback_populates_sleeping_domains() {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = Arc::new(OnDemandManager::new(
+        let manager = Arc::new(OnDemandManager::new_test(
             Arc::new(db),
             Arc::clone(&lifecycle) as Arc<dyn ContainerLifecycle>,
         ));
@@ -1736,7 +2042,7 @@ mod tests {
     fn test_route_table_callback_replaces_previous_entries() {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = Arc::new(OnDemandManager::new(
+        let manager = Arc::new(OnDemandManager::new_test(
             Arc::new(db),
             Arc::clone(&lifecycle) as Arc<dyn ContainerLifecycle>,
         ));
@@ -1852,7 +2158,7 @@ mod tests {
             .into_connection();
 
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = Arc::new(OnDemandManager::new(
+        let manager = Arc::new(OnDemandManager::new_test(
             Arc::new(db),
             Arc::clone(&lifecycle) as Arc<dyn ContainerLifecycle>,
         ));
@@ -1979,7 +2285,7 @@ mod tests {
             .into_connection();
 
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = Arc::new(OnDemandManager::new(
+        let manager = Arc::new(OnDemandManager::new_test(
             Arc::new(db),
             Arc::clone(&lifecycle) as Arc<dyn ContainerLifecycle>,
         ));
@@ -2072,7 +2378,7 @@ mod tests {
             .into_connection();
 
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = Arc::new(OnDemandManager::new(
+        let manager = Arc::new(OnDemandManager::new_test(
             Arc::new(db),
             Arc::clone(&lifecycle) as Arc<dyn ContainerLifecycle>,
         ));
@@ -2193,7 +2499,7 @@ mod tests {
         let lifecycle = Arc::new(MockLifecycle::with_selective_start_failures(vec![
             "c2".to_string()
         ]));
-        let manager = OnDemandManager::new(
+        let manager = OnDemandManager::new_test(
             Arc::new(db),
             Arc::clone(&lifecycle) as Arc<dyn ContainerLifecycle>,
         );
@@ -2248,7 +2554,7 @@ mod tests {
             .into_connection();
 
         let lifecycle = Arc::new(MockLifecycle::with_never_healthy());
-        let manager = OnDemandManager::new(
+        let manager = OnDemandManager::new_test(
             Arc::new(db),
             Arc::clone(&lifecycle) as Arc<dyn ContainerLifecycle>,
         );
@@ -2303,7 +2609,7 @@ mod tests {
 
         // Healthy after 2 checks (2 * 500ms = 1s, well within 30s timeout)
         let lifecycle = Arc::new(MockLifecycle::with_delayed_health(2));
-        let manager = OnDemandManager::new(
+        let manager = OnDemandManager::new_test(
             Arc::new(db),
             Arc::clone(&lifecycle) as Arc<dyn ContainerLifecycle>,
         );
@@ -2354,7 +2660,7 @@ mod tests {
         let lifecycle = Arc::new(MockLifecycle::with_selective_stop_failures(vec![
             "fail-stop".to_string(),
         ]));
-        let manager = OnDemandManager::new(
+        let manager = OnDemandManager::new_test(
             Arc::new(db),
             Arc::clone(&lifecycle) as Arc<dyn ContainerLifecycle>,
         );
@@ -2398,7 +2704,7 @@ mod tests {
             .into_connection();
 
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = Arc::new(OnDemandManager::new(
+        let manager = Arc::new(OnDemandManager::new_test(
             Arc::new(db),
             Arc::clone(&lifecycle) as Arc<dyn ContainerLifecycle>,
         ));
@@ -2455,7 +2761,7 @@ mod tests {
             .into_connection();
 
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = Arc::new(OnDemandManager::new(
+        let manager = Arc::new(OnDemandManager::new_test(
             Arc::new(db),
             Arc::clone(&lifecycle) as Arc<dyn ContainerLifecycle>,
         ));
@@ -2508,7 +2814,7 @@ mod tests {
         let lifecycle = Arc::new(MockLifecycle::with_selective_stop_failures(vec![
             "fail-c".to_string()
         ]));
-        let manager = Arc::new(OnDemandManager::new(
+        let manager = Arc::new(OnDemandManager::new_test(
             Arc::new(db),
             Arc::clone(&lifecycle) as Arc<dyn ContainerLifecycle>,
         ));
@@ -2540,7 +2846,7 @@ mod tests {
             .into_connection();
 
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = OnDemandManager::new(Arc::new(db), lifecycle);
+        let manager = OnDemandManager::new_test(Arc::new(db), lifecycle);
 
         let result = manager.wake_environment(1, 30).await;
         assert!(result.is_err());
@@ -2567,7 +2873,7 @@ mod tests {
             .into_connection();
 
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = OnDemandManager::new(Arc::new(db), lifecycle);
+        let manager = OnDemandManager::new_test(Arc::new(db), lifecycle);
 
         let result = manager.sleep_environment(1).await;
         assert!(result.is_err());
@@ -2594,7 +2900,7 @@ mod tests {
             .into_connection();
 
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = OnDemandManager::new(Arc::new(db), lifecycle);
+        let manager = OnDemandManager::new_test(Arc::new(db), lifecycle);
 
         let result = manager.sleep_environment(1).await.unwrap();
         assert!(!result, "Should return false when env has no deployment");
@@ -2619,7 +2925,7 @@ mod tests {
             .into_connection();
 
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = OnDemandManager::new(Arc::new(db), lifecycle);
+        let manager = OnDemandManager::new_test(Arc::new(db), lifecycle);
 
         let result = manager.wake_environment(1, 30).await;
         assert!(
@@ -2636,7 +2942,7 @@ mod tests {
     fn test_update_configs_replaces_and_initializes() {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = OnDemandManager::new(Arc::new(db), lifecycle);
+        let manager = OnDemandManager::new_test(Arc::new(db), lifecycle);
 
         // First batch
         manager.update_configs(vec![
@@ -2686,7 +2992,7 @@ mod tests {
     fn test_remove_environment_cleans_all_state() {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = OnDemandManager::new(Arc::new(db), lifecycle);
+        let manager = OnDemandManager::new_test(Arc::new(db), lifecycle);
 
         manager.register_on_demand_environment(42, 300, 30);
         manager.record_activity(42);
@@ -2718,7 +3024,7 @@ mod tests {
     fn test_rapid_activity_updates_no_panic() {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = Arc::new(OnDemandManager::new(Arc::new(db), lifecycle));
+        let manager = Arc::new(OnDemandManager::new_test(Arc::new(db), lifecycle));
 
         // Simulate rapid concurrent activity recording from multiple threads
         let mut handles = Vec::new();
@@ -2751,7 +3057,7 @@ mod tests {
     fn test_sleeping_domain_overwrite() {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = OnDemandManager::new(Arc::new(db), lifecycle);
+        let manager = OnDemandManager::new_test(Arc::new(db), lifecycle);
 
         manager.register_sleeping_domain(
             "app.example.com".to_string(),
@@ -2807,7 +3113,7 @@ mod tests {
             .into_connection();
 
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = OnDemandManager::new(
+        let manager = OnDemandManager::new_test(
             Arc::new(db),
             Arc::clone(&lifecycle) as Arc<dyn ContainerLifecycle>,
         );
@@ -2919,7 +3225,7 @@ mod tests {
             .into_connection();
 
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = OnDemandManager::new(Arc::new(db), lifecycle);
+        let manager = OnDemandManager::new_test(Arc::new(db), lifecycle);
 
         // Call through the OnDemandWaker trait
         let waker: &dyn OnDemandWaker = &manager;
@@ -2938,7 +3244,7 @@ mod tests {
             .into_connection();
 
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = OnDemandManager::new(Arc::new(db), lifecycle);
+        let manager = OnDemandManager::new_test(Arc::new(db), lifecycle);
 
         let waker: &dyn OnDemandWaker = &manager;
         let result = waker.sleep_environment(1).await;
@@ -2983,7 +3289,7 @@ mod tests {
     fn test_register_on_demand_preserves_existing_activity() {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = OnDemandManager::new(Arc::new(db), lifecycle);
+        let manager = OnDemandManager::new_test(Arc::new(db), lifecycle);
 
         // Record activity first
         manager.record_activity(1);
@@ -3020,7 +3326,7 @@ mod tests {
         // Config exists but no last_activity entry — should not panic
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = OnDemandManager::new(Arc::new(db), lifecycle);
+        let manager = OnDemandManager::new_test(Arc::new(db), lifecycle);
 
         // Manually insert config without activity
         manager.configs.insert(
@@ -3101,7 +3407,7 @@ mod tests {
             .into_connection();
 
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = Arc::new(OnDemandManager::new(
+        let manager = Arc::new(OnDemandManager::new_test(
             Arc::new(db),
             Arc::clone(&lifecycle) as Arc<dyn ContainerLifecycle>,
         ));
@@ -3143,7 +3449,7 @@ mod tests {
 
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = Arc::new(OnDemandManager::new(
+        let manager = Arc::new(OnDemandManager::new_test(
             Arc::new(db),
             Arc::clone(&lifecycle) as Arc<dyn ContainerLifecycle>,
         ));
@@ -3224,7 +3530,7 @@ mod tests {
             .into_connection();
 
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = Arc::new(OnDemandManager::new(
+        let manager = Arc::new(OnDemandManager::new_test(
             Arc::new(db),
             Arc::clone(&lifecycle) as Arc<dyn ContainerLifecycle>,
         ));
@@ -3295,7 +3601,7 @@ mod tests {
 
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = Arc::new(OnDemandManager::new(
+        let manager = Arc::new(OnDemandManager::new_test(
             Arc::new(db),
             Arc::clone(&lifecycle) as Arc<dyn ContainerLifecycle>,
         ));
@@ -3335,7 +3641,7 @@ mod tests {
 
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = Arc::new(OnDemandManager::new(
+        let manager = Arc::new(OnDemandManager::new_test(
             Arc::new(db),
             Arc::clone(&lifecycle) as Arc<dyn ContainerLifecycle>,
         ));
@@ -3372,7 +3678,7 @@ mod tests {
         // env has 300s timeout, idle for 120s → should NOT sleep
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = Arc::new(OnDemandManager::new(
+        let manager = Arc::new(OnDemandManager::new_test(
             Arc::new(db),
             Arc::clone(&lifecycle) as Arc<dyn ContainerLifecycle>,
         ));
@@ -3416,7 +3722,7 @@ mod tests {
             .into_connection();
 
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = Arc::new(OnDemandManager::new(
+        let manager = Arc::new(OnDemandManager::new_test(
             Arc::new(db),
             Arc::clone(&lifecycle) as Arc<dyn ContainerLifecycle>,
         ));
@@ -3451,7 +3757,7 @@ mod tests {
 
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let lifecycle = Arc::new(MockLifecycle::new());
-        let manager = Arc::new(OnDemandManager::new(
+        let manager = Arc::new(OnDemandManager::new_test(
             Arc::new(db),
             Arc::clone(&lifecycle) as Arc<dyn ContainerLifecycle>,
         ));
