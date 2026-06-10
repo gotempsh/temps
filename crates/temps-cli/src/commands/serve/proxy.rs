@@ -50,9 +50,19 @@ impl ContainerLifecycle for ContainerLifecycleAdapter {
     /// A `Running` container whose process hasn't yet bound its port would, on a
     /// scale-to-zero wake, get a request proxied to it before it can serve,
     /// producing a spurious upstream-connect 503 on the first request. So after
-    /// confirming `Running`, we TCP-probe the container's first mapped host port
-    /// (short timeout, treated as "not ready yet" on failure). Containers with no
-    /// mapped port fall back to the `Running` check — there's nothing to probe.
+    /// confirming `Running`, we TCP-probe a mapped host port (short timeout,
+    /// treated as "not ready yet" on failure so `do_wake`'s loop keeps polling).
+    ///
+    /// **Scope:** the probe targets `127.0.0.1:{host_port}` — the loopback
+    /// address the local node publishes container ports on. Containers running on
+    /// *remote* worker nodes are not reachable on this node's loopback; that
+    /// (along with the fact that the local deployer can't even
+    /// `get_container_info` a remote container) is handled by the multi-node wake
+    /// work tracked separately. For the local single-node case this is correct.
+    /// We probe the **lowest** published host port deterministically (Docker
+    /// reports ports as an unordered map, so `.first()` would be unstable for a
+    /// container that publishes more than one). Containers with no published port
+    /// fall back to the `Running` check — there's nothing to probe.
     async fn is_container_healthy(&self, container_id: &str) -> Result<bool, OnDemandError> {
         let info = self
             .deployer
@@ -68,7 +78,9 @@ impl ContainerLifecycle for ContainerLifecycleAdapter {
         }
 
         // No published port → nothing to probe; trust the Running status.
-        let Some(port) = info.ports.first().map(|p| p.host_port) else {
+        // Pick deterministically (lowest host port) — Docker's port map has no
+        // defined iteration order, so `.first()` could vary between polls.
+        let Some(port) = info.ports.iter().map(|p| p.host_port).min() else {
             return Ok(true);
         };
 
@@ -83,7 +95,23 @@ impl ContainerLifecycle for ContainerLifecycleAdapter {
         .await
         {
             Ok(Ok(_stream)) => Ok(true),
-            Ok(Err(_)) | Err(_) => Ok(false),
+            Ok(Err(e)) => {
+                tracing::debug!(
+                    container_id = %container_id,
+                    addr = %addr,
+                    error = %e,
+                    "Readiness probe connect failed; container not ready yet"
+                );
+                Ok(false)
+            }
+            Err(_) => {
+                tracing::debug!(
+                    container_id = %container_id,
+                    addr = %addr,
+                    "Readiness probe timed out; container not ready yet"
+                );
+                Ok(false)
+            }
         }
     }
 }
@@ -312,6 +340,32 @@ mod tests {
         assert!(
             !adapter.is_container_healthy("c1").await.unwrap(),
             "Running container whose port refuses connections must not be healthy"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_probes_lowest_port_deterministically() {
+        // Bind two listeners, keep only the LOWER-numbered one alive (close the
+        // higher). The probe must target the lowest published port, so the
+        // container is healthy iff the lowest port is the listening one — proving
+        // selection is by value, not by the (unordered) report order.
+        let a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pa = a.local_addr().unwrap().port();
+        let pb = b.local_addr().unwrap().port();
+        let (lo, hi, lo_listener, hi_listener) = if pa < pb {
+            (pa, pb, a, b)
+        } else {
+            (pb, pa, b, a)
+        };
+        drop(hi_listener); // higher port now closed; lower port still listening
+        let _keep = lo_listener; // keep the lower port bound for the probe
+
+        // Report ports high-then-low to prove order-independence.
+        let adapter = adapter_for(container_info(ContainerStatus::Running, vec![hi, lo]));
+        assert!(
+            adapter.is_container_healthy("c1").await.unwrap(),
+            "probe must target the lowest published port (the listening one)"
         );
     }
 }
