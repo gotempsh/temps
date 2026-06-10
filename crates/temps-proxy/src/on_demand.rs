@@ -223,17 +223,21 @@ impl OnDemandManager {
     /// truthful return lets them log and react instead of silently proceeding
     /// with a stale route table.
     ///
-    /// **Lost-wakeup safety:** `route_reloaded` is a bare [`Notify`] with no
-    /// stored permit — `notify_waiters()` only wakes *currently parked*
-    /// waiters. A reload that completes between `wake_environment` returning and
-    /// this method parking would be missed. We arm the `Notified` future
-    /// *before* awaiting so a notification fired the instant after we arm is
-    /// delivered to us. (The caller additionally re-resolves the route after
-    /// this returns, so even a genuinely missed signal cannot fail the request
-    /// as long as the route is present — see the proxy wake block.)
+    /// **Lost-wakeup note:** `route_reloaded` is a bare [`Notify`] with no
+    /// stored permit — `notify_waiters()` only wakes waiters that are *already
+    /// registered*, and a `Notified` future only registers when first polled.
+    /// Building the future before the `await` *narrows* the race window (a
+    /// notification fired after the future is first polled is delivered), but it
+    /// cannot fully close it: this signal carries no state to re-check, so a
+    /// reload that completes before this future is polled is still missed. That
+    /// is acceptable because the proxy caller does NOT rely on this signal for
+    /// correctness — it re-resolves the route in a bounded loop afterwards, so a
+    /// missed wakeup costs latency, not a failed request (see the proxy wake
+    /// block). This returns `bool` (rather than swallowing the timeout) so the
+    /// caller can log and react instead of silently trusting a stale table.
     pub async fn wait_for_route_reload(&self, timeout: Duration) -> bool {
-        // Arm BEFORE returning to the await point: any notify_waiters() that
-        // fires after this line is guaranteed to be delivered to this future.
+        // Build the Notified before awaiting to narrow (not eliminate) the
+        // lost-wakeup window; see the method docs.
         let notified = self.route_reloaded.notified();
         match tokio::time::timeout(timeout, notified).await {
             Ok(()) => true,
@@ -578,6 +582,14 @@ impl OnDemandManager {
                 environment_id = environment_id,
                 "No containers found to wake"
             );
+            // We've already committed sleeping=false, so the route table must
+            // reload to drop the sleeping exclusion — otherwise the DB and the
+            // in-memory routes disagree and the request's re-resolve loop spins
+            // until it times out. Trigger the same deterministic reload as the
+            // success path.
+            self.publish_route_reload(environment_id, deployment_id)
+                .await;
+            self.notify_route_change().await;
             return Ok(());
         }
 
@@ -725,34 +737,9 @@ impl OnDemandManager {
             "Environment awake"
         );
 
-        // Reload routes deterministically, in-process. The woken environment was
-        // excluded from the route table while sleeping, so the route table MUST
-        // reload before the request can be resolved. Publishing
-        // `Job::ForceRouteReload` drives the in-process `RouteReloadSubscriber`
-        // (the same path the deploy pipeline uses) which has no database
-        // connection in its critical path and therefore cannot silently wedge
-        // the way a long-lived PG `LISTEN` connection can. The PG NOTIFY below
-        // is fired in addition, purely to reach remote worker nodes that don't
-        // share this in-process queue.
-        if let Err(e) = self
-            .queue
-            .send(Job::ForceRouteReload(ForceRouteReloadJob {
-                environment_id: Some(environment_id),
-                deployment_id: Some(deployment_id),
-            }))
-            .await
-        {
-            // Non-fatal: the PG NOTIFY below and the caller's bounded re-resolve
-            // loop are the fallbacks. Log so a wedged in-process queue is visible.
-            warn!(
-                environment_id = environment_id,
-                error = %e,
-                "Failed to publish in-process ForceRouteReload after wake; \
-                 falling back to PG NOTIFY"
-            );
-        }
-
-        // Fire PG NOTIFY so remote proxy/worker nodes reload routes too.
+        // Reload routes (in-process ForceRouteReload + PG NOTIFY for remote nodes).
+        self.publish_route_reload(environment_id, deployment_id)
+            .await;
         self.notify_route_change().await;
 
         Ok(())
@@ -765,6 +752,34 @@ impl OnDemandManager {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
         now.as_secs()
+    }
+
+    /// Publish an in-process `Job::ForceRouteReload` so the `RouteReloadSubscriber`
+    /// reloads the route table deterministically after a wake. A woken environment
+    /// was excluded from the route table while sleeping, so the table MUST reload
+    /// before the request can resolve. This path (the same one the deploy pipeline
+    /// uses) has no database connection in its critical path and therefore cannot
+    /// silently wedge the way a long-lived PG `LISTEN` connection can. Callers fire
+    /// `notify_route_change()` in addition, to reach remote worker nodes that don't
+    /// share this in-process queue. Failure is non-fatal: the PG NOTIFY and the
+    /// proxy's bounded re-resolve loop are the fallbacks.
+    async fn publish_route_reload(&self, environment_id: i32, deployment_id: i32) {
+        if let Err(e) = self
+            .queue
+            .send(Job::ForceRouteReload(ForceRouteReloadJob {
+                environment_id: Some(environment_id),
+                deployment_id: Some(deployment_id),
+            }))
+            .await
+        {
+            warn!(
+                environment_id = environment_id,
+                deployment_id = deployment_id,
+                error = %e,
+                "Failed to publish in-process ForceRouteReload after wake; \
+                 falling back to PG NOTIFY"
+            );
+        }
     }
 
     async fn notify_route_change(&self) {
@@ -838,7 +853,6 @@ impl OnDemandWaker for OnDemandManager {
 mod tests {
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
-    use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex;
 
     // ── Mock JobQueue ──
@@ -870,17 +884,18 @@ mod tests {
         }
     }
 
-    /// A job queue that records how many `ForceRouteReload` jobs were published,
-    /// so a test can assert the wake path posts the in-process reload request.
+    /// A job queue that captures every `ForceRouteReload` job published, so a
+    /// test can assert both that the wake path posts the in-process reload
+    /// request AND that it carries the right environment/deployment IDs.
     struct CountingQueue {
-        force_reloads: Arc<AtomicUsize>,
+        force_reloads: Arc<Mutex<Vec<ForceRouteReloadJob>>>,
     }
 
     #[async_trait]
     impl JobQueue for CountingQueue {
         async fn send(&self, job: Job) -> Result<(), temps_core::QueueError> {
-            if matches!(job, Job::ForceRouteReload(_)) {
-                self.force_reloads.fetch_add(1, Ordering::SeqCst);
+            if let Job::ForceRouteReload(req) = job {
+                self.force_reloads.lock().unwrap().push(req);
             }
             Ok(())
         }
@@ -1454,7 +1469,7 @@ mod tests {
             }]])
             .into_connection();
 
-        let force_reloads = Arc::new(AtomicUsize::new(0));
+        let force_reloads = Arc::new(Mutex::new(Vec::<ForceRouteReloadJob>::new()));
         let queue: Arc<dyn JobQueue> = Arc::new(CountingQueue {
             force_reloads: force_reloads.clone(),
         });
@@ -1467,11 +1482,17 @@ mod tests {
 
         let result = manager.wake_environment(1, 30).await;
         assert!(result.is_ok());
+
+        let posted = force_reloads.lock().unwrap();
         assert_eq!(
-            force_reloads.load(Ordering::SeqCst),
+            posted.len(),
             1,
             "wake must publish exactly one ForceRouteReload"
         );
+        // Must carry the woken environment and its current deployment, so the
+        // RouteReloadSubscriber can match the RouteTableUpdated confirmation.
+        assert_eq!(posted[0].environment_id, Some(1));
+        assert_eq!(posted[0].deployment_id, Some(100));
     }
 
     #[tokio::test]
