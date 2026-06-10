@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **On-demand wake now waits for the app to actually accept connections, not just for Docker to report `Running`**: `ContainerLifecycleAdapter::is_container_healthy` (the readiness gate `do_wake` polls before completing a scale-to-zero wake) checked only `ContainerStatus::Running`, so a wake could finish before the application inside had bound its port — the first request would then be proxied to a not-yet-listening upstream and get a spurious 503. It now TCP-probes the container's first mapped host port after confirming `Running` (short timeout, treated as not-ready-yet on failure); containers with no published port fall back to the `Running` check. Closes the last independent first-request 503 path on on-demand environments (follow-up to the routing fix in v0.1.0-beta.30).
 
 
 ## [0.1.0-beta.30] - 2026-06-10
