@@ -139,7 +139,11 @@ type RenderRow =
     }
   | { kind: 'separator'; key: string }
 
-function formatTs(timestamp: string): string {
+// Format a row timestamp. When `showDate` is on (the visible range spans more
+// than one calendar day) we prefix the weekday + date — e.g.
+// "Mon Jun 10 13:23:18.361" — so a multi-day filter doesn't leave you guessing
+// which day a line belongs to. Single-day views stay compact (time only).
+function formatTs(timestamp: string, showDate = false): string {
   const d = new Date(timestamp)
   const base = d.toLocaleTimeString('en-US', {
     hour12: false,
@@ -147,7 +151,14 @@ function formatTs(timestamp: string): string {
     minute: '2-digit',
     second: '2-digit',
   })
-  return `${base}.${String(d.getMilliseconds()).padStart(3, '0')}`
+  const time = `${base}.${String(d.getMilliseconds()).padStart(3, '0')}`
+  if (!showDate) return time
+  const date = d.toLocaleDateString('en-US', {
+    weekday: 'short',
+    month: 'short',
+    day: '2-digit',
+  })
+  return `${date} ${time}`
 }
 
 // Flatten the match rope into render rows, interleaving each match's grep -C
@@ -235,10 +246,12 @@ function HistoryLogRow({
   row,
   columns,
   searchTerm,
+  showDate,
 }: {
   row: RenderRow
   columns: ColumnVisibility
   searchTerm?: string
+  showDate: boolean
 }) {
   if (row.kind === 'separator') {
     // Gap between two non-adjacent match windows (like grep's `--`). Not a
@@ -259,7 +272,7 @@ function HistoryLogRow({
   const level = isContext ? row.level : row.line.level
   const message = isContext ? row.message : row.line.message
   const service = isContext ? row.service : row.line.service
-  const ts = formatTs(timestamp)
+  const ts = formatTs(timestamp, showDate)
 
   return (
     <div
@@ -275,7 +288,12 @@ function HistoryLogRow({
       )}
     >
       {columns.timestamp && (
-        <span className="text-muted-foreground shrink-0 tabular-nums w-[85px]">
+        <span
+          className={cn(
+            'text-muted-foreground shrink-0 tabular-nums whitespace-nowrap',
+            showDate ? 'w-[180px]' : 'w-[85px]',
+          )}
+        >
           {ts}
         </span>
       )}
@@ -517,6 +535,18 @@ export default function HistoryLogViewer({
   // map and the view behaves exactly as before.
   const renderRows = useMemo(() => buildRenderRows(lines), [lines])
 
+  // Show the date in each row's timestamp only when the visible logs span more
+  // than one calendar day — otherwise a multi-day filter (e.g. Mon–Fri) leaves
+  // you unable to tell which day a "13:23:18" line is from. Single-day views
+  // stay compact (time only). Derived from the actual lines so it adapts to
+  // presets that straddle midnight, not just explicit custom ranges.
+  const showRowDate = useMemo(() => {
+    if (lines.length < 2) return false
+    const dayKey = (ts: string) => new Date(ts).toLocaleDateString('en-US')
+    const first = dayKey(lines[0].timestamp)
+    return lines.some((l) => dayKey(l.timestamp) !== first)
+  }, [lines])
+
   const virtualizer = useVirtualizer({
     count: renderRows.length,
     getScrollElement: () => parentRef.current,
@@ -693,8 +723,12 @@ export default function HistoryLogViewer({
   return (
     <TooltipProvider delayDuration={150}>
       <div className="p-4 space-y-4">
-        {/* Filters */}
-        <div className="flex flex-col sm:flex-row gap-3 items-start sm:items-center">
+        {/* Filter cluster: the control row and the level chips read as one
+            group (tight 8px internal rhythm) rather than two floating rows. */}
+        <div className="space-y-2">
+        {/* Row 1 — scope selectors: environment, service, time range. These
+            answer where/what/when, so they live together on the first row. */}
+        <div className="flex flex-wrap items-center gap-2">
           <Select value={selectedEnv} onValueChange={setSelectedEnv}>
             <SelectTrigger className="w-full sm:w-[200px]">
               <SelectValue placeholder="All environments" />
@@ -742,7 +776,7 @@ export default function HistoryLogViewer({
               self-contained — its trigger button is what the user clicks
               to actually edit the range, while this Select stays as the
               single source of truth for which mode is active. */}
-          <div className="flex items-center gap-1">
+          <div className="flex flex-wrap items-center gap-1">
             <Select
               value={timeRange}
               onValueChange={(v) => {
@@ -795,10 +829,14 @@ export default function HistoryLogViewer({
               />
             )}
           </div>
+        </div>
 
+        {/* Row 2 — refine controls: full-text search (grows to fill), grep -C
+            context lines, and the column toggle. */}
+        <div className="flex flex-wrap items-center gap-2">
           <Tooltip>
             <TooltipTrigger asChild>
-              <div className="relative flex-1 min-w-[200px]">
+              <div className="relative w-full min-w-[240px] flex-1 sm:w-auto">
                 <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
                 <Input
                   placeholder={
@@ -892,8 +930,13 @@ export default function HistoryLogViewer({
           </DropdownMenu>
         </div>
 
-        {/* Level filter chips */}
-        <div className="flex gap-1.5 flex-wrap">
+        {/* Level filter chips — kept in the filter cluster, labeled so the
+            row reads as an intentional filter axis rather than floating
+            buttons. */}
+        <div className="flex flex-wrap items-center gap-1.5">
+          <span className="text-xs font-medium text-muted-foreground mr-0.5">
+            Levels
+          </span>
           {LOG_LEVEL_OPTIONS.map((level) => (
             <button
               type="button"
@@ -918,6 +961,7 @@ export default function HistoryLogViewer({
               Clear
             </button>
           )}
+        </div>
         </div>
 
         {/* Error state */}
@@ -1037,6 +1081,7 @@ export default function HistoryLogViewer({
                     <HistoryLogRow
                       row={renderRows[virtualRow.index]}
                       columns={columns}
+                      showDate={showRowDate}
                       searchTerm={
                         !fulltextDisabled && debouncedText
                           ? debouncedText
