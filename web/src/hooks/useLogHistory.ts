@@ -28,7 +28,7 @@ export interface LogSearchLine {
   fields: Record<string, unknown> | null
   chunk_id: string
   line_offset: number
-  deploy_id: string | null
+  deploy_id: number | null
   /** Raw grep -C surrounding lines, present only when contextLines > 0. */
   context?: LineContext | null
 }
@@ -52,6 +52,8 @@ export interface LogSearchParams {
   pageSize?: number
   /** grep -C: raw lines to show before AND after each match (0 = off). */
   contextLines?: number
+  /** Filter to logs emitted by a single deployment (deployments.id). */
+  deployId?: number
 }
 
 // ── API call ───────────────────────────────────────────────────────────
@@ -71,6 +73,7 @@ async function searchLogs(params: LogSearchParams): Promise<SearchLogsResponse> 
   if (params.pageSize) body.page_size = params.pageSize
   if (params.contextLines && params.contextLines > 0)
     body.context_lines = params.contextLines
+  if (params.deployId != null) body.deploy_id = params.deployId
 
   const response = await client.post({
     url: '/logs/search',
@@ -97,6 +100,7 @@ export function useLogHistory(params: LogSearchParams, enabled = true) {
       params.cursor,
       params.pageSize,
       params.contextLines,
+      params.deployId,
     ],
     queryFn: () => searchLogs(params),
     enabled: enabled && !!params.projectId,

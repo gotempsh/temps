@@ -27,9 +27,9 @@ pub struct LogLine {
     pub env: String,
     /// Platform integer project ID from Docker label
     pub project_id: i32,
-    /// Active deploy UUID at time of log
+    /// Active deployment ID (deployments.id) at time of log
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deploy_id: Option<Uuid>,
+    pub deploy_id: Option<i32>,
 }
 
 /// Log output stream
@@ -101,7 +101,7 @@ pub struct ChunkMeta {
     pub env: String,
     pub service: String,
     pub container_id: String,
-    pub deploy_id: Option<Uuid>,
+    pub deploy_id: Option<i32>,
     pub started_at: DateTime<Utc>,
     pub ended_at: DateTime<Utc>,
     pub storage_key: String,
@@ -119,7 +119,7 @@ pub struct ContainerContext {
     pub env: String,
     pub service: String,
     pub container_id: String,
-    pub deploy_id: Option<Uuid>,
+    pub deploy_id: Option<i32>,
 }
 
 /// Search filter parameters
@@ -135,7 +135,7 @@ pub struct LogSearchFilter {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub envs: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deploy_id: Option<Uuid>,
+    pub deploy_id: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     /// Field-level filters: key=value exact match, key>value range
@@ -208,8 +208,7 @@ pub struct LogSearchLine {
     pub chunk_id: Uuid,
     pub line_offset: i32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schema(value_type = Option<String>)]
-    pub deploy_id: Option<Uuid>,
+    pub deploy_id: Option<i32>,
     /// Raw surrounding lines (grep -C). `None` unless `context_lines > 0` was
     /// requested. Overlapping windows between nearby matches are merged: the
     /// shared neighbors appear on the earlier match only, so the frontend can

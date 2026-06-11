@@ -195,6 +195,7 @@ impl LogSearchService {
                 service_filter,
                 filter.start_time,
                 effective_end,
+                filter.deploy_id,
             )
             .await?;
 
@@ -818,8 +819,8 @@ mod tests {
             50001
         }
 
-        fn test_deploy_id() -> Uuid {
-            Uuid::parse_str("d0000000-0000-0000-0000-000000000001").unwrap()
+        fn test_deploy_id() -> i32 {
+            171
         }
 
         /// Create a search service backed by the given filesystem storage.
@@ -1027,7 +1028,7 @@ mod tests {
                 env: "production".into(),
                 service: "web".into(),
                 container_id: "cnt-2".into(),
-                deploy_id: Some(Uuid::new_v4()),
+                deploy_id: Some(172),
             };
 
             let line_deploy = parse_json_line(

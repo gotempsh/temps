@@ -22,7 +22,6 @@ use tokio::sync::broadcast;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
-use uuid::Uuid;
 
 use crate::error::LogAggregatorError;
 use crate::parser::{parse_docker_timestamp, parse_log_line};
@@ -283,7 +282,7 @@ impl CollectorService {
             .unwrap_or_else(|| "unknown".to_string());
         let deploy_id = labels
             .get(LABEL_DEPLOY_ID)
-            .and_then(|id| Uuid::parse_str(id).ok());
+            .and_then(|id| id.parse::<i32>().ok());
 
         Ok(Some(ContainerContext {
             project_id,

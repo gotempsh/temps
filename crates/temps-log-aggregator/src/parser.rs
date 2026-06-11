@@ -295,7 +295,6 @@ pub fn parse_docker_timestamp(line: &str) -> (DateTime<Utc>, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uuid::Uuid;
 
     fn test_ctx() -> ContainerContext {
         ContainerContext {
@@ -472,7 +471,7 @@ mod tests {
             env: "2".to_string(),
             service: "api".to_string(),
             container_id: "container-abc".to_string(),
-            deploy_id: Some(Uuid::parse_str("660e8400-e29b-41d4-a716-446655440000").unwrap()),
+            deploy_id: Some(171),
         };
         let line = parse_log_line("test", Utc::now(), LogStream::Stdout, &ctx);
         assert_eq!(line.service, "api");

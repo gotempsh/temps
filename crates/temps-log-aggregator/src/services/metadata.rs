@@ -22,7 +22,7 @@ pub struct LogEventsQuery {
     pub end_time: DateTime<Utc>,
     pub levels: Vec<LogLevel>,
     pub services: Vec<String>,
-    pub deploy_id: Option<Uuid>,
+    pub deploy_id: Option<i32>,
     pub limit: u64,
 }
 
@@ -142,12 +142,17 @@ impl LogMetadataService {
     }
 
     /// Query chunk metadata for a project within a time range.
+    ///
+    /// When `deploy_id` is provided, only chunks tagged with that deployment ID
+    /// are returned. This is a SQL-level prefilter that skips entire chunks
+    /// before they are fetched and decompressed during archive search.
     pub async fn find_chunks(
         &self,
         project_id: i32,
         service: Option<&str>,
         start_time: DateTime<Utc>,
         end_time: DateTime<Utc>,
+        deploy_id: Option<i32>,
     ) -> Result<Vec<ChunkMeta>, LogAggregatorError> {
         let mut condition = Condition::all()
             .add(temps_entities::log_chunks::Column::ProjectId.eq(project_id))
@@ -157,6 +162,10 @@ impl LogMetadataService {
         if let Some(svc) = service {
             condition =
                 condition.add(temps_entities::log_chunks::Column::Service.eq(svc.to_string()));
+        }
+
+        if let Some(deploy) = deploy_id {
+            condition = condition.add(temps_entities::log_chunks::Column::DeployId.eq(deploy));
         }
 
         let chunks = temps_entities::log_chunks::Entity::find()

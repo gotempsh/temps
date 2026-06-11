@@ -1,7 +1,10 @@
 'use client'
 
 import { ProjectResponse } from '@/api/client'
-import { getEnvironmentsOptions } from '@/api/client/@tanstack/react-query.gen'
+import {
+  getEnvironmentsOptions,
+  getProjectDeploymentsOptions,
+} from '@/api/client/@tanstack/react-query.gen'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -38,6 +41,7 @@ import {
 } from '@/hooks/useLogHistory'
 import { useQuery } from '@tanstack/react-query'
 import { useVirtualizer } from '@tanstack/react-virtual'
+import { useSearchParams } from 'react-router-dom'
 import AnsiToHtml from 'ansi-to-html'
 import {
   AlertCircle,
@@ -103,6 +107,35 @@ const TIME_RANGES: Array<{ value: string; label: string; hours: number }> = [
 ]
 
 const CUSTOM_RANGE_VALUE = 'custom'
+
+// Minimal shape we read off a DeploymentResponse for the filter dropdown and
+// the deploy-window default. Kept local so the component doesn't depend on the
+// full generated type beyond these fields.
+interface DeploymentLike {
+  id: number
+  branch?: string | null
+  commit_hash?: string | null
+  commit_message?: string | null
+  tag?: string | null
+  created_at: number
+  started_at?: number | null
+  finished_at?: number | null
+}
+
+// Compact one-line label for a deployment, e.g. "#171 · feat/ovh-version · a1b2c3d".
+// Falls back through tag → first line of commit message → bare #id so there's
+// always something readable.
+function deploymentLabel(d: DeploymentLike): string {
+  const parts: string[] = [`#${d.id}`]
+  const ref = d.branch || d.tag
+  if (ref) parts.push(ref)
+  if (d.commit_hash) {
+    parts.push(d.commit_hash.slice(0, 7))
+  } else if (d.commit_message) {
+    parts.push(d.commit_message.split('\n')[0].slice(0, 40))
+  }
+  return parts.join(' · ')
+}
 
 function presetTimeRange(range: string): { start: string; end: string } {
   const now = new Date()
@@ -310,8 +343,20 @@ export default function HistoryLogViewer({
 }: {
   project: ProjectResponse
 }) {
+  const [searchParams, setSearchParams] = useSearchParams()
   const [selectedEnv, setSelectedEnv] = useState<string | undefined>()
   const [selectedService, setSelectedService] = useState<string | undefined>()
+  // Deployment filter (deployments.id). Seeded once from the ?deploy_id= URL
+  // param so a deep link lands pre-filtered; thereafter the URL is kept in sync
+  // by the effect below.
+  const [selectedDeploy, setSelectedDeploy] = useState<number | undefined>(
+    () => {
+      const raw = searchParams.get('deploy_id')
+      if (!raw) return undefined
+      const n = Number.parseInt(raw, 10)
+      return Number.isFinite(n) ? n : undefined
+    },
+  )
   const [selectedLevels, setSelectedLevels] = useState<LogLevel[]>([])
   const [searchText, setSearchText] = useState('')
   const [debouncedText, setDebouncedText] = useState('')
@@ -395,7 +440,7 @@ export default function HistoryLogViewer({
     timeRange === CUSTOM_RANGE_VALUE && customRange?.from && customRange?.to
       ? `${customRange.from.getTime()}-${customRange.to.getTime()}`
       : ''
-  const filterKey = `${selectedEnv}-${selectedService}-${selectedLevels.join(',')}-${debouncedText}-${timeRange}-${customRangeKey}-${contextLines}`
+  const filterKey = `${selectedEnv}-${selectedService}-${selectedDeploy}-${selectedLevels.join(',')}-${debouncedText}-${timeRange}-${customRangeKey}-${contextLines}`
   const prevFilterKeyRef = useRef(filterKey)
 
   // Debounce search text
@@ -425,6 +470,69 @@ export default function HistoryLogViewer({
       setSelectedEnv(String(environments[0].id))
     }
   }, [environments, selectedEnv])
+
+  // Project deployments, used to populate the Deployment filter dropdown. We
+  // pull a generous page so older deployments are still selectable; the list is
+  // small per-project and this is a metadata-only call.
+  const { data: deploymentsData } = useQuery({
+    ...getProjectDeploymentsOptions({
+      path: { id: project.id },
+      query: { per_page: 100 },
+    }),
+  })
+  const deployments = useMemo<DeploymentLike[]>(
+    () =>
+      (deploymentsData?.deployments ?? [])
+        .map((d) => ({
+          id: d.id,
+          branch: d.branch,
+          commit_hash: d.commit_hash,
+          commit_message: d.commit_message,
+          tag: d.tag,
+          created_at: d.created_at,
+          started_at: d.started_at,
+          finished_at: d.finished_at,
+        }))
+        .sort((a, b) => b.id - a.id),
+    [deploymentsData],
+  )
+
+  // Keep ?deploy_id= in the URL in sync with the selection so the view is
+  // shareable / refresh-stable. Uses replace so it doesn't pollute history.
+  useEffect(() => {
+    const current = searchParams.get('deploy_id')
+    const next = selectedDeploy != null ? String(selectedDeploy) : null
+    if (current === next) return
+    const params = new URLSearchParams(searchParams)
+    if (next === null) {
+      params.delete('deploy_id')
+    } else {
+      params.set('deploy_id', next)
+    }
+    setSearchParams(params, { replace: true })
+  }, [selectedDeploy, searchParams, setSearchParams])
+
+  // When the user picks a deployment, default the time window to that
+  // deployment's lifespan so they don't have to guess timestamps. Only fires on
+  // an actual *change* of selection (tracked via a ref), leaving the range
+  // editable afterward. A still-running deploy (no finished_at) spans up to now.
+  const lastDeployWindowRef = useRef<number | undefined>(selectedDeploy)
+  useEffect(() => {
+    if (selectedDeploy === lastDeployWindowRef.current) return
+    lastDeployWindowRef.current = selectedDeploy
+    if (selectedDeploy == null) return
+    const d = deployments.find((x) => x.id === selectedDeploy)
+    if (!d) return
+    // Deployment timestamps come from the API as epoch MILLISECONDS (e.g.
+    // created_at = 1777651454430), so they feed straight into new Date(ms) — do
+    // NOT multiply by 1000.
+    const startMs = d.started_at ?? d.created_at
+    if (!startMs) return
+    const from = new Date(startMs)
+    const to = d.finished_at ? new Date(d.finished_at) : new Date()
+    setCustomRange({ from, to })
+    setTimeRange(CUSTOM_RANGE_VALUE)
+  }, [selectedDeploy, deployments])
 
   // Resolve {start, end} from either the active preset or a custom DateRange.
   // For presets we recompute on every timeRange change (presetTimeRange calls
@@ -477,6 +585,7 @@ export default function HistoryLogViewer({
       levels: selectedLevels.length > 0 ? selectedLevels : undefined,
       envs: selectedEnv ? [selectedEnv] : undefined,
       services: selectedService ? [selectedService] : undefined,
+      deployId: selectedDeploy,
       text: !fulltextDisabled && debouncedText ? debouncedText : undefined,
       // Frontend asks for 500 per page; server caps at 2000.
       pageSize: 500,
@@ -545,6 +654,7 @@ export default function HistoryLogViewer({
       if (selectedLevels.length > 0) body.levels = selectedLevels
       if (selectedEnv) body.envs = [selectedEnv]
       if (selectedService) body.services = [selectedService]
+      if (selectedDeploy != null) body.deploy_id = selectedDeploy
       if (!fulltextDisabled && debouncedText) body.text = debouncedText
       if (contextLines > 0) body.context_lines = contextLines
 
@@ -584,6 +694,7 @@ export default function HistoryLogViewer({
     selectedLevels,
     selectedEnv,
     selectedService,
+    selectedDeploy,
     fulltextDisabled,
     debouncedText,
     contextLines,
@@ -732,6 +843,29 @@ export default function HistoryLogViewer({
                     {service}
                   </SelectItem>
                 ))}
+            </SelectContent>
+          </Select>
+
+          {/* Deployment filter. Selecting one scopes the logs to the chunks
+              tagged with that deployment's id AND defaults the time window to
+              the deploy's lifespan (see the effect above), so the user doesn't
+              have to know the timestamps. Mirrors ?deploy_id= in the URL. */}
+          <Select
+            value={selectedDeploy != null ? String(selectedDeploy) : 'all'}
+            onValueChange={(v) =>
+              setSelectedDeploy(v === 'all' ? undefined : Number.parseInt(v, 10))
+            }
+          >
+            <SelectTrigger className="w-full sm:w-auto sm:max-w-[320px]">
+              <SelectValue placeholder="All deployments" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All deployments</SelectItem>
+              {deployments.map((d) => (
+                <SelectItem key={d.id} value={String(d.id)}>
+                  {deploymentLabel(d)}
+                </SelectItem>
+              ))}
             </SelectContent>
           </Select>
 

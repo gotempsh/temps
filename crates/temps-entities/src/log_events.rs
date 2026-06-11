@@ -24,7 +24,7 @@ pub struct Model {
     pub chunk_id: Uuid,
     /// Line offset within the chunk for context retrieval
     pub line_offset: i32,
-    pub deploy_id: Option<Uuid>,
+    pub deploy_id: Option<i32>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -168,9 +168,8 @@ pub struct SearchLogsRequest {
     /// Filter by environments
     #[serde(default)]
     pub envs: Vec<String>,
-    /// Filter by deploy ID
-    #[schema(value_type = Option<String>)]
-    pub deploy_id: Option<Uuid>,
+    /// Filter by deployment ID (deployments.id)
+    pub deploy_id: Option<i32>,
     /// Full text search query
     pub text: Option<String>,
     /// Pagination cursor

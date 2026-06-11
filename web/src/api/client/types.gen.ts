@@ -3497,6 +3497,49 @@ export type DeploymentConfiguration = {
     working_dir?: string | null;
 };
 
+/**
+ * A single captured container-log dump, including its full text content.
+ */
+export type DeploymentContainerLogContentResponse = {
+    captured_at: number;
+    container_name: string;
+    /**
+     * The captured plain-text log content.
+     */
+    content: string;
+    id: number;
+    service_name?: string | null;
+    size_bytes: number;
+    truncated: boolean;
+};
+
+/**
+ * Metadata for one captured (historical) container-log dump. Listed on the
+ * deployment detail page so a user can pick which past container's logs to read.
+ */
+export type DeploymentContainerLogResponse = {
+    /**
+     * Unix epoch milliseconds of when the logs were captured (just before
+     * teardown). Matches the timestamp convention used by `DeploymentResponse`.
+     */
+    captured_at: number;
+    container_id: string;
+    container_name: string;
+    deployment_id: number;
+    id: number;
+    node_id?: number | null;
+    service_name?: string | null;
+    size_bytes: number;
+    truncated: boolean;
+};
+
+/**
+ * The list of captured container-log dumps for a deployment.
+ */
+export type DeploymentContainerLogsListResponse = {
+    logs: Array<DeploymentContainerLogResponse>;
+};
+
 export type DeploymentEnvironmentResponse = {
     domains: Array<string>;
     id: number;
@@ -7598,7 +7641,7 @@ export type LogRecord = {
 export type LogSearchLine = {
     chunk_id: string;
     context?: null | LineContext;
-    deploy_id?: string | null;
+    deploy_id?: number | null;
     fields?: unknown;
     level: LogLevel;
     line_offset: number;
@@ -11501,9 +11544,9 @@ export type SearchLogsRequest = {
      */
     cursor?: string | null;
     /**
-     * Filter by deploy ID
+     * Filter by deployment ID (deployments.id)
      */
-    deploy_id?: string | null;
+    deploy_id?: number | null;
     /**
      * End of time range (ISO 8601). Defaults to now.
      */
@@ -31547,6 +31590,82 @@ export type CancelDeploymentResponses = {
 };
 
 export type CancelDeploymentResponse = CancelDeploymentResponses[keyof CancelDeploymentResponses];
+
+export type ListDeploymentContainerLogsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Deployment ID
+         */
+        deployment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/deployments/{deployment_id}/container-logs';
+};
+
+export type ListDeploymentContainerLogsErrors = {
+    /**
+     * Deployment not found in this project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListDeploymentContainerLogsResponses = {
+    /**
+     * Captured container logs for the deployment
+     */
+    200: DeploymentContainerLogsListResponse;
+};
+
+export type ListDeploymentContainerLogsResponse = ListDeploymentContainerLogsResponses[keyof ListDeploymentContainerLogsResponses];
+
+export type GetDeploymentContainerLogContentData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Deployment ID
+         */
+        deployment_id: number;
+        /**
+         * Captured log ID
+         */
+        log_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/deployments/{deployment_id}/container-logs/{log_id}';
+};
+
+export type GetDeploymentContainerLogContentErrors = {
+    /**
+     * Captured log not found in this project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetDeploymentContainerLogContentResponses = {
+    /**
+     * Captured container log content
+     */
+    200: DeploymentContainerLogContentResponse;
+};
+
+export type GetDeploymentContainerLogContentResponse = GetDeploymentContainerLogContentResponses[keyof GetDeploymentContainerLogContentResponses];
 
 export type GetDeploymentJobsData = {
     body?: never;
