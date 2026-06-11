@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
--
+- **Filter runtime history logs by deployment**: the history log viewer now has a Deployment dropdown that scopes logs to a single deployment, alongside the existing environment/service/level/time filters. Selecting a deployment also defaults the time range to that deployment's lifespan (so you don't have to guess timestamps) and is reflected in the URL via `?deploy_id=` for shareable deep links. Backing this, the chunk `deploy_id` was switched from `uuid` to `integer` to match the deployment id (`deployments.id`) the system actually tags containers with — the previous `uuid` typing meant the collector silently parsed the integer deploy label to `NULL`, so every chunk stored no deployment and the filter matched nothing. The log collector now parses the `sh.temps.deploy_id` label as an `i32`, and the search path filters chunks by deployment at both the index (SQL) and line level.
 
 ### Changed
 -
