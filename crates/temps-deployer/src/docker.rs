@@ -2867,6 +2867,118 @@ CMD ["cat", "/hello.txt"]
         }
     }
 
+    /// Empirical proof of the "no limit unless opted in" contract: a deploy
+    /// with `cpu_limit: None` / `memory_limit_mb: None` must produce a Docker
+    /// container whose `HostConfig.NanoCpus` and `Memory` are 0 (unset =
+    /// uncapped), and an explicit limit must actually reach Docker. Inspects
+    /// the live container via bollard rather than trusting the request struct.
+    #[tokio::test]
+    #[serial]
+    async fn test_resource_limits_none_means_uncapped() {
+        let runtime = match create_test_docker_runtime().await {
+            Ok(r) => r,
+            Err(e) => {
+                println!("🔧 Docker not available, skipping: {}", e);
+                return;
+            }
+        };
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => d,
+            Err(e) => {
+                println!("🔧 Docker not available, skipping: {}", e);
+                return;
+            }
+        };
+        if docker.ping().await.is_err() {
+            println!("🔧 Docker ping failed, skipping");
+            return;
+        }
+
+        let base = |name: &str, limits: ResourceLimits| DeployRequest {
+            image_name: "alpine:latest".to_string(),
+            container_name: name.to_string(),
+            environment_vars: HashMap::new(),
+            secrets: HashMap::new(),
+            port_mappings: vec![],
+            network_name: None,
+            resource_limits: limits,
+            restart_policy: RestartPolicy::Never,
+            log_path: PathBuf::from(format!("/tmp/{}.log", name)),
+            command: Some(vec!["sleep".to_string(), "30".to_string()]),
+            log_config: Some(ContainerLogConfig::app_default()),
+            labels: HashMap::new(),
+        };
+
+        let inspect_caps = |id: String| {
+            let docker = docker.clone();
+            async move {
+                let i = docker
+                    .inspect_container(
+                        &id,
+                        None::<bollard::query_parameters::InspectContainerOptions>,
+                    )
+                    .await
+                    .expect("inspect");
+                let hc = i.host_config.expect("host_config");
+                (hc.nano_cpus.unwrap_or(0), hc.memory.unwrap_or(0))
+            }
+        };
+
+        // --- Case 1: no limits configured -> container must be UNCAPPED ---
+        let uncapped_name = "temps-rl-uncapped-test";
+        let _ = runtime.remove_container(uncapped_name).await;
+        let info = runtime
+            .deploy_container(base(
+                uncapped_name,
+                ResourceLimits {
+                    cpu_limit: None,
+                    memory_limit_mb: None,
+                    disk_limit_mb: None,
+                },
+            ))
+            .await
+            .expect("deploy uncapped");
+        let (nano_cpus, memory) = inspect_caps(info.container_id.clone()).await;
+        let _ = runtime.remove_container(&info.container_id).await;
+        println!(
+            "UNCAPPED deploy -> NanoCpus={} Memory={} (both must be 0)",
+            nano_cpus, memory
+        );
+        assert_eq!(
+            nano_cpus, 0,
+            "None cpu_limit leaked a CPU cap into the container ({})",
+            nano_cpus
+        );
+        assert_eq!(
+            memory, 0,
+            "None memory_limit_mb leaked a memory cap into the container ({})",
+            memory
+        );
+
+        // --- Case 2 (control): explicit limits MUST reach Docker ---
+        let capped_name = "temps-rl-capped-test";
+        let _ = runtime.remove_container(capped_name).await;
+        let info = runtime
+            .deploy_container(base(
+                capped_name,
+                ResourceLimits {
+                    cpu_limit: Some(0.5),
+                    memory_limit_mb: Some(64),
+                    disk_limit_mb: None,
+                },
+            ))
+            .await
+            .expect("deploy capped");
+        let (nano_cpus, memory) = inspect_caps(info.container_id.clone()).await;
+        let _ = runtime.remove_container(&info.container_id).await;
+        println!(
+            "CAPPED deploy -> NanoCpus={} Memory={} (expect 500000000 / 67108864)",
+            nano_cpus, memory
+        );
+        assert_eq!(nano_cpus, 500_000_000, "explicit 0.5 CPU not applied");
+        assert_eq!(memory, 64 * 1024 * 1024, "explicit 64MB not applied");
+    }
+
     #[tokio::test]
     async fn test_image_operations() {
         match create_test_docker_runtime().await {

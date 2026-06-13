@@ -107,13 +107,21 @@ pub struct ResourceUsage {
 }
 
 impl Default for ResourceUsage {
+    /// No limits by default — an environment is uncapped unless the operator
+    /// opts in by configuring `cpu_limit`/`memory_limit` on the project or
+    /// environment `deployment_config`. A `None` here flows through
+    /// `parse_cpu_cores`/`parse_memory_mb` (→ `None`) to the Docker
+    /// `HostConfig`, where `nano_cpus`/`memory` are left unset (= uncapped).
+    ///
+    /// Historically this seeded `1000000u`/`512Mi`, which silently capped any
+    /// deploy path that built a job without calling `.resources(...)` (e.g.
+    /// rollback/promote) even when no limit was configured.
     fn default() -> Self {
-        // Microcore convention: 1_000_000u = 1 core, 100_000u = 0.1 core.
         Self {
-            cpu_limit: Some("1000000u".to_string()),
-            memory_limit: Some("512Mi".to_string()),
-            cpu_request: Some("100000u".to_string()),
-            memory_request: Some("128Mi".to_string()),
+            cpu_limit: None,
+            memory_limit: None,
+            cpu_request: None,
+            memory_request: None,
         }
     }
 }
@@ -2001,6 +2009,29 @@ impl Default for DeployImageJobBuilder {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+
+    #[test]
+    fn resource_usage_default_is_uncapped() {
+        // Regression guard: the default MUST be all-None so any deploy path that
+        // builds a job without calling `.resources(...)` (rollback/promote)
+        // leaves the container uncapped rather than silently applying a phantom
+        // CPU/memory limit. `None` here → `parse_cpu_cores`/`parse_memory_mb`
+        // return None → Docker `HostConfig` nano_cpus/memory stay unset.
+        let d = ResourceUsage::default();
+        assert_eq!(
+            d.cpu_limit, None,
+            "default cpu_limit must be None (uncapped)"
+        );
+        assert_eq!(
+            d.memory_limit, None,
+            "default memory_limit must be None (uncapped)"
+        );
+        assert_eq!(d.cpu_request, None);
+        assert_eq!(d.memory_request, None);
+        // And it must parse to no limit at the deployer boundary.
+        assert_eq!(d.cpu_limit.as_deref().and_then(parse_cpu_cores), None);
+        assert_eq!(d.memory_limit.as_deref().and_then(parse_memory_mb), None);
+    }
 
     #[test]
     fn parse_cpu_cores_handles_millicores_and_whole_cores() {

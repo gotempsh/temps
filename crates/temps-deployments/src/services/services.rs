@@ -98,6 +98,34 @@ pub struct DeploymentService {
 }
 
 impl DeploymentService {
+    /// Resolve CPU/memory limits + requests for a deploy from the environment
+    /// config first, then the project config, leaving each field unset when
+    /// neither configures it (→ no Docker limit = uncapped). Mirrors the
+    /// resolution in `WorkflowExecutionService` so every deploy path (initial,
+    /// rollback, promote) treats resource limits as opt-in identically.
+    ///
+    /// CPU is stored as microcores in the DB (1_000_000 = 1 core), memory as MB;
+    /// emitted with the `u`/`Mi` suffixes the deployer's parsers understand.
+    fn resolve_resource_usage(
+        env_cfg: Option<&temps_entities::deployment_config::DeploymentConfig>,
+        proj_cfg: Option<&temps_entities::deployment_config::DeploymentConfig>,
+    ) -> crate::jobs::ResourceUsage {
+        let resolve = |getter: fn(
+            &temps_entities::deployment_config::DeploymentConfig,
+        ) -> Option<i32>|
+         -> Option<i32> {
+            env_cfg
+                .and_then(getter)
+                .or_else(|| proj_cfg.and_then(getter))
+        };
+        crate::jobs::ResourceUsage {
+            cpu_limit: resolve(|c| c.cpu_limit).map(|u| format!("{}u", u)),
+            memory_limit: resolve(|c| c.memory_limit).map(|mb| format!("{}Mi", mb)),
+            cpu_request: resolve(|c| c.cpu_request).map(|u| format!("{}u", u)),
+            memory_request: resolve(|c| c.memory_request).map(|mb| format!("{}Mi", mb)),
+        }
+    }
+
     pub fn new(
         db: Arc<temps_database::DbConnection>,
         log_service: Arc<temps_logs::LogService>,
@@ -1369,6 +1397,18 @@ impl DeploymentService {
                     ));
             }
 
+            // Resolve CPU/memory limits + requests (env → project), matching the
+            // normal deploy path (WorkflowExecutionService). Each field resolves
+            // independently; when neither side configures a value it stays unset
+            // so the deployer applies no Docker limit. Without this, a rollback
+            // would inherit `ResourceUsage::default()` (now all-None) and silently
+            // drop a configured limit — or, before the default was fixed, cap an
+            // unconfigured environment.
+            deploy_builder = deploy_builder.resources(Self::resolve_resource_usage(
+                environment.deployment_config.as_ref(),
+                project.deployment_config.as_ref(),
+            ));
+
             let deploy_job = deploy_builder
                 .build(self.deployer.clone())
                 .map_err(|e| DeploymentError::Other(format!("Failed to create deploy job: {}", e)))?
@@ -1906,6 +1946,14 @@ impl DeploymentService {
                         settings.container_logs.max_file,
                     ));
             }
+
+            // Resolve CPU/memory limits + requests (target env → project),
+            // matching the normal deploy path so a promotion preserves a
+            // configured limit and leaves an unconfigured environment uncapped.
+            deploy_builder = deploy_builder.resources(Self::resolve_resource_usage(
+                target_env.deployment_config.as_ref(),
+                project.deployment_config.as_ref(),
+            ));
 
             let deploy_job = deploy_builder
                 .build(self.deployer.clone())
@@ -5258,5 +5306,39 @@ mod tests {
 
         assert!(matches!(result, Err(DeploymentError::NotFound(_))));
         Ok(())
+    }
+
+    #[test]
+    fn resolve_resource_usage_is_opt_in_with_env_over_project() {
+        let cfg = |cpu: Option<i32>, mem: Option<i32>| DeploymentConfig {
+            cpu_limit: cpu,
+            memory_limit: mem,
+            ..Default::default()
+        };
+
+        // 1. Nothing configured anywhere -> fully uncapped (the default).
+        let none = DeploymentService::resolve_resource_usage(None, None);
+        assert_eq!(none.cpu_limit, None);
+        assert_eq!(none.memory_limit, None);
+
+        // 2. Project sets a limit, env doesn't -> inherit project (microcores → `u`, MB → `Mi`).
+        let proj = cfg(Some(2_000_000), Some(512));
+        let inherited = DeploymentService::resolve_resource_usage(None, Some(&proj));
+        assert_eq!(inherited.cpu_limit.as_deref(), Some("2000000u"));
+        assert_eq!(inherited.memory_limit.as_deref(), Some("512Mi"));
+
+        // 3. Env overrides project per-field (env cpu wins, project memory inherited).
+        let env = cfg(Some(500_000), None);
+        let overridden = DeploymentService::resolve_resource_usage(Some(&env), Some(&proj));
+        assert_eq!(overridden.cpu_limit.as_deref(), Some("500000u"));
+        assert_eq!(overridden.memory_limit.as_deref(), Some("512Mi"));
+
+        // 4. Env config present but with all-None limits -> still uncapped
+        //    (an environment existing must NOT imply a limit).
+        let empty_env = cfg(None, None);
+        let still_none =
+            DeploymentService::resolve_resource_usage(Some(&empty_env), Some(&cfg(None, None)));
+        assert_eq!(still_none.cpu_limit, None);
+        assert_eq!(still_none.memory_limit, None);
     }
 }

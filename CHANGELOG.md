@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **Deployed environments are no longer silently CPU/memory-capped when no limit is configured** (`temps-deployments`): `ResourceUsage::default()` seeded `1000000u` (1 core) / `512Mi`, so any deploy path that built a job without calling `.resources(...)` — notably `rollback_to_deployment` and `promote_deployment` — applied a phantom Docker `nano_cpus`/`memory` cap even though neither the project nor the environment `deployment_config` set one. (This became live in v0.1.0-beta when the microcore parser started honoring the suffix the default emits.) The default is now all-`None` (uncapped unless opted in), and rollback/promote resolve CPU/memory limits + requests env→project the same way the normal deploy path does — so a configured limit is preserved across rollback/promote, and an unconfigured environment runs with no Docker limit. Verified end-to-end: a `None`-limit deploy produces `HostConfig.NanoCpus=0`/`Memory=0`, while an explicit limit still reaches the container.
 
 
 ## [0.1.0-beta.31] - 2026-06-11
