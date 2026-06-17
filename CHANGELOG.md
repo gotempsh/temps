@@ -8,7 +8,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
--
+- **Anonymous product telemetry.** Temps now reports anonymous, aggregate
+  usage events (deploy attempted vs. succeeded/failed, project/service/feature
+  creation, where instances stall) so maintainers can tell whether the platform
+  is working for self-hosters. **No PII** is collected — events carry a random
+  per-instance id (never derived from anything machine-identifying), event
+  names, and non-identifying properties (counts, enum labels, durations). A
+  coarse, fixed-category reason is sent for failed deploys (never raw logs), and
+  the request IP is used transiently to derive a country code that is stored
+  while the IP itself is never persisted. Telemetry is **on by default**;
+  operators opt out with `TEMPS_TELEMETRY=0` and can redirect it with
+  `TEMPS_TELEMETRY_ENDPOINT`. The ingest API and its event schema are open
+  source (`telemetry-api/`).
+- **Custom health-check path.** Define the HTTP path used for the container
+  health check and the uptime monitor instead of the default `/` — set it in
+  `.temps.yaml` (`health.path`), at deploy time (`--health-check-path` on
+  `deploy:image` / `deploy:local-image` / `deploy:static`), or per-monitor
+  (`--check-path` on `monitors create`). Useful for APIs with a dedicated
+  endpoint such as `/api/healthz`.
+- **Configurable Postgres shared memory.** Managed Postgres services accept a
+  `shm_size_mb` setting (container `/dev/shm`), fixing "could not resize shared
+  memory segment … No space left on device" under parallel-query load. Changing
+  it recreates the container (shared memory is fixed at create time).
 
 ### Changed
 -
