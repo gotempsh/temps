@@ -103,6 +103,11 @@ impl TempsPlugin for ProvidersPlugin {
         // Config service — resolves the internal URL containers push OTLP to.
         let config_service = context.get_service::<temps_config::ConfigService>();
 
+        // Telemetry reporter — no-op when telemetry isn't registered.
+        let telemetry = context
+            .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
+            .unwrap_or_else(|| Arc::new(temps_core::telemetry::NoopTelemetryReporter));
+
         // Create QueryService
         let query_service = Arc::new(crate::QueryService::new(external_service_manager.clone()));
 
@@ -116,6 +121,7 @@ impl TempsPlugin for ProvidersPlugin {
             db,
             api_key_service,
             config_service,
+            telemetry,
         });
 
         // Configure routes with the app state

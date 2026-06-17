@@ -1,0 +1,20 @@
+{
+  "name": "@temps-sdk/telemetry-api",
+  "version": "0.1.0",
+  "description": "Anonymous product telemetry ingest API for Temps — stores deployment and lifecycle events in Postgres",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun run --watch src/index.ts",
+    "start": "bun run src/index.ts",
+    "migrate": "bun run src/db/migrate.ts",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "pg": "^8.13.3"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.11.10",
+    "bun-types": "latest"
+  }
+}

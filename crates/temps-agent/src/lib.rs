@@ -144,6 +144,10 @@ pub struct ServiceResourceLimits {
     /// Relative CPU weight (default 1024). Only used when `nano_cpus` is None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_shares: Option<i64>,
+    /// Shared memory (/dev/shm) size in MiB. None = Docker default (64 MiB).
+    /// Create-time only; changing it requires recreating the container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shm_size_mb: Option<i64>,
 }
 
 /// Port mapping for a service container.

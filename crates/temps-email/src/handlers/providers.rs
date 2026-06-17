@@ -160,6 +160,14 @@ pub async fn create_email_provider(
         error!("Failed to create audit log: {}", e);
     }
 
+    // Fire-and-forget anonymous telemetry — no identifying properties
+    state.telemetry.report(
+        temps_core::telemetry::TelemetryEvent::new(
+            temps_core::telemetry::TelemetryEventKind::EmailProviderConfigured,
+        )
+        .with("provider", provider.provider_type.clone()),
+    );
+
     let response = EmailProviderResponse {
         id: provider.id,
         name: provider.name,

@@ -72,12 +72,17 @@ impl TempsPlugin for EventsPlugin {
                 events_service.clone()
             };
 
+        let telemetry = context
+            .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
+            .unwrap_or_else(|| Arc::new(temps_core::telemetry::NoopTelemetryReporter));
+
         let state = Arc::new(crate::handlers::AppState {
             events_service: events_backend,
             events_writer: events_service,
             route_table,
             ip_address_service,
             cookie_crypto,
+            telemetry,
         });
 
         let routes = crate::handlers::configure_routes().with_state(state);
@@ -94,12 +99,17 @@ impl TempsPlugin for EventsPlugin {
         // PG-backed service since these endpoints don't query.
         let events_backend: Arc<dyn crate::services::AnalyticsEvents> = events_service.clone();
 
+        let telemetry = context
+            .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
+            .unwrap_or_else(|| Arc::new(temps_core::telemetry::NoopTelemetryReporter));
+
         let state = Arc::new(crate::handlers::AppState {
             events_service: events_backend,
             events_writer: events_service,
             route_table,
             ip_address_service,
             cookie_crypto,
+            telemetry,
         });
 
         let routes = crate::handlers::configure_public_routes().with_state(state);

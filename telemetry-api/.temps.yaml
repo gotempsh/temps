@@ -1,0 +1,6 @@
+# Temps platform configuration for the telemetry-api.
+# Deployed as a Dockerfile app. Reuses an existing managed Postgres (linked
+# at the project level, which injects the DB connection env vars).
+#
+# No cron jobs. No API key yet (ingest is open; auth + the dashboard UI ship
+# in a later deploy).

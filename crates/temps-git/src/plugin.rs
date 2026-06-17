@@ -195,6 +195,10 @@ impl TempsPlugin for GitPlugin {
             });
 
             // Register the GitAppState for route handlers
+            let telemetry = context
+                .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
+                .unwrap_or_else(|| Arc::new(temps_core::telemetry::NoopTelemetryReporter));
+
             let git_app_state = crate::handlers::types::create_git_app_state(
                 repository_service,
                 git_provider_manager,
@@ -203,6 +207,7 @@ impl TempsPlugin for GitPlugin {
                 github_service,
                 cache_manager,
                 connection_health_service,
+                telemetry,
             );
             context.register_plugin_state("git", git_app_state);
 

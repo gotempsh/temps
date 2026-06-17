@@ -15,6 +15,7 @@ pub mod openapi;
 pub mod plugin;
 pub mod problemdetails;
 pub mod retry;
+pub mod telemetry;
 pub mod tls;
 pub use problemdetails::ProblemDetails;
 mod app_settings;
@@ -47,6 +48,7 @@ pub use error::*;
 pub use error_builder::*;
 pub use jobs::*;
 pub use on_demand::*;
+pub use telemetry::{NoopTelemetryReporter, TelemetryEvent, TelemetryEventKind, TelemetryReporter};
 pub use utils::*;
 
 // Re-export external dependencies

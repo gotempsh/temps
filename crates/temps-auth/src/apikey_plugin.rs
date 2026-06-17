@@ -56,9 +56,19 @@ impl TempsPlugin for ApiKeyPlugin {
             let apikey_service = Arc::new(ApiKeyService::new(db.clone()));
             context.register_service(apikey_service.clone());
 
+            // Resolve the telemetry reporter; default to no-op so the plugin
+            // never hard-fails if the telemetry crate isn't registered.
+            let telemetry = context
+                .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
+                .unwrap_or_else(|| {
+                    Arc::new(temps_core::telemetry::NoopTelemetryReporter)
+                        as Arc<dyn temps_core::telemetry::TelemetryReporter>
+                });
+
             // Create ApiKeyState for handlers
             let apikey_state = Arc::new(ApiKeyState {
                 api_key_service: apikey_service,
+                telemetry,
             });
             context.register_service(apikey_state);
 

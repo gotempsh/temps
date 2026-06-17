@@ -59,13 +59,13 @@ pub struct EnvVarEnvironment {
     pub name: String,
 }
 
-// Constants for CPU allocation (in millicores, where 1000 = 1 CPU core)
+// Constants for CPU allocation (in millicores, where 1000 = 1 CPU core).
+// Only *requests* (scheduling minimums) are defaulted; CPU/memory *limits* are
+// intentionally left unset so new projects/environments run uncapped by default.
 pub const DEFAULT_CPU_REQUEST: i32 = 500_000; // 0.5 cores
-pub const DEFAULT_CPU_LIMIT: i32 = 2_000_000; // 2 cores
 
 // Constants for memory allocation (in MB)
 pub const DEFAULT_MEMORY_REQUEST: i32 = 128; // 128 MB
-pub const DEFAULT_MEMORY_LIMIT: i32 = 512; // 512 MB
 
 // Add these constants at the top of the file proper key management
 pub const NONCE_LENGTH: usize = 12;
@@ -168,12 +168,15 @@ impl ProjectService {
             })
             .transpose()?;
 
-        // Create deployment config with resource and deployment settings
+        // Create deployment config with resource and deployment settings.
+        // CPU/memory *limits* are intentionally left unset (None) so containers
+        // run uncapped by default — operators opt into a cap explicitly. Only the
+        // *requests* (scheduling minimums) are seeded.
         let deployment_config = Some(temps_entities::deployment_config::DeploymentConfig {
             cpu_request: Some(DEFAULT_CPU_REQUEST),
-            cpu_limit: Some(DEFAULT_CPU_LIMIT),
+            cpu_limit: None,
             memory_request: Some(DEFAULT_MEMORY_REQUEST),
-            memory_limit: Some(DEFAULT_MEMORY_LIMIT),
+            memory_limit: None,
             exposed_port: request.exposed_port,
             automatic_deploy: request.automatic_deploy,
             ..Default::default()
@@ -380,9 +383,10 @@ impl ProjectService {
                 project.id,
                 "production".to_string(),
                 Some(DEFAULT_CPU_REQUEST),
-                Some(DEFAULT_CPU_LIMIT),
+                // CPU/memory limits unset by default → uncapped containers.
+                None,
                 Some(DEFAULT_MEMORY_REQUEST),
-                Some(DEFAULT_MEMORY_LIMIT),
+                None,
                 project.main_branch.clone(),
             )
             .await

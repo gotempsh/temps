@@ -18,8 +18,10 @@ pub struct GitAppState {
     pub config_service: Arc<ConfigService>,
     pub cache_manager: Arc<GitProviderCacheManager>,
     pub connection_health_service: Arc<ConnectionHealthService>,
+    pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn create_git_app_state(
     repository_service: Arc<RepositoryService>,
     git_provider_manager: Arc<GitProviderManager>,
@@ -28,6 +30,7 @@ pub fn create_git_app_state(
     github_service: Arc<GithubAppService>,
     cache_manager: Arc<GitProviderCacheManager>,
     connection_health_service: Arc<ConnectionHealthService>,
+    telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
 ) -> Arc<GitAppState> {
     Arc::new(GitAppState {
         git_provider_manager,
@@ -37,6 +40,7 @@ pub fn create_git_app_state(
         config_service,
         cache_manager,
         connection_health_service,
+        telemetry,
     })
 }
 

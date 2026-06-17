@@ -136,6 +136,7 @@ mod tests {
             tracking_service,
             audit_service: Arc::new(MockAuditLogger),
             dns_provider_service: None,
+            telemetry: Arc::new(temps_core::telemetry::NoopTelemetryReporter),
         });
 
         (db, app_state)

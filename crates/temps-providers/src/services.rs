@@ -1066,6 +1066,7 @@ impl ExternalServiceManager {
                 memory_swap_mb: parse_i64("memory_swap_mb"),
                 nano_cpus: parse_i64("nano_cpus"),
                 cpu_shares: parse_i64("cpu_shares"),
+                shm_size_mb: parse_i64("shm_size_mb"),
             };
             if limits.is_unlimited() {
                 None
@@ -8347,6 +8348,7 @@ echo "[restore] Pre-seed complete"
                             .map(|m| m / (1024 * 1024)),
                         nano_cpus: hc.nano_cpus.filter(|&n| n > 0),
                         cpu_shares: hc.cpu_shares.filter(|&n| n > 0),
+                        shm_size_mb: hc.shm_size.filter(|&m| m > 0).map(|m| m / (1024 * 1024)),
                     })
                     .unwrap_or_default();
 
@@ -8540,6 +8542,27 @@ echo "[restore] Pre-seed complete"
                         .unwrap_or(0);
                     let removing_memory_cap = current_memory > 0 && limits.memory_mb.is_none();
 
+                    // Detect a shared-memory (`/dev/shm`) size change. Docker
+                    // cannot hot-apply `shm_size` — it's a create-time-only
+                    // HostConfig field with no slot in the update API — so a
+                    // changed shm requires removing + recreating the
+                    // container. Only flag when the operator explicitly set a
+                    // size that differs from what the live container has; an
+                    // unset (None) shm leaves whatever Docker already chose and
+                    // must not trigger a spurious recreate against the 64 MiB
+                    // default.
+                    let current_shm = info
+                        .host_config
+                        .as_ref()
+                        .and_then(|hc| hc.shm_size)
+                        .unwrap_or(0);
+                    let shm_changed = match limits.shm_size_mb {
+                        Some(mb) => {
+                            current_shm > 0 && mb.saturating_mul(1024 * 1024) != current_shm
+                        }
+                        None => false,
+                    };
+
                     if removing_memory_cap {
                         ResourceLimitApplyResult {
                             role,
@@ -8549,6 +8572,19 @@ echo "[restore] Pre-seed complete"
                                 "Docker cannot remove a memory limit on a live \
                                  container. Restart the service to apply unlimited \
                                  memory."
+                                    .to_string(),
+                            ),
+                        }
+                    } else if shm_changed {
+                        ResourceLimitApplyResult {
+                            role,
+                            container_name,
+                            outcome: "requires_recreate".to_string(),
+                            error: Some(
+                                "Changing shared-memory (/dev/shm) size requires \
+                                 deleting and recreating the container (a stop/start \
+                                 reuses the old container and keeps the old shm size). \
+                                 Recreate the service to apply the new shm size."
                                     .to_string(),
                             ),
                         }
@@ -8601,6 +8637,110 @@ echo "[restore] Pre-seed complete"
     /// pick up the new caps on next start. When the container is
     /// completely absent (e.g., never created on this node), only the
     /// stored config is updated and the apply step records "missing".
+    /// Delete and recreate a service's container so a new `/dev/shm` size
+    /// takes effect.
+    ///
+    /// `shm_size` is fixed when a Docker container is created — there is no
+    /// live update for it, and a plain stop+start reuses the existing
+    /// container (keeping the old shm). The only way to apply a new value is
+    /// to REMOVE the container and let the engine recreate it. We remove the
+    /// container with `v: false` so the **data volume is preserved** (the
+    /// engine's `remove()` trait method would also drop the volume — we must
+    /// not use it here), then call `initialize_service`, whose
+    /// `create_container` now takes the create branch and bakes in the new
+    /// `HostConfig.shm_size`.
+    ///
+    /// Scope: standalone, local-node services. Remote-node and cluster
+    /// services are rejected with a clear message so the caller surfaces
+    /// "recreate manually" rather than silently doing nothing.
+    async fn recreate_service_container_for_shm(
+        &self,
+        service: &external_services::Model,
+    ) -> Result<(), ExternalServiceError> {
+        // Remote-node containers live on a worker's Docker daemon, not on
+        // `self.docker`. Removing here would target the wrong daemon. The
+        // worker's create path already honors shm; the operator must
+        // redeploy/recreate the service on that node.
+        if service.node_id.is_some() {
+            return Err(ExternalServiceError::InternalError {
+                reason: format!(
+                    "Service {} runs on a remote node; recreate it on that node to apply the new shm size",
+                    service.id
+                ),
+            });
+        }
+
+        // Cluster recreate spans multiple members with ordering constraints
+        // (monitor → primary → replicas) and isn't covered by
+        // `initialize_service`. Don't pretend; tell the operator to recreate.
+        if service.topology == "cluster" {
+            return Err(ExternalServiceError::InternalError {
+                reason: format!(
+                    "Service {} is a cluster; recreate its members to apply the new shm size",
+                    service.id
+                ),
+            });
+        }
+
+        let service_type = ServiceType::from_str(&service.service_type).map_err(|_| {
+            ExternalServiceError::InvalidServiceType {
+                id: service.id,
+                service_type: service.service_type.clone(),
+            }
+        })?;
+        let instance = self.create_service_instance(service.name.clone(), service_type);
+        let container_name = instance.get_docker_container_name();
+
+        // Stop, then DELETE the container (volume preserved). Stop is
+        // best-effort — the container may already be stopped or gone.
+        let _ = self
+            .docker
+            .stop_container(
+                &container_name,
+                None::<bollard::query_parameters::StopContainerOptions>,
+            )
+            .await;
+        match self
+            .docker
+            .remove_container(
+                &container_name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    v: false, // keep the data volume — only the container is recreated
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+        {
+            Ok(()) => {
+                info!(
+                    service_id = service.id,
+                    container = %container_name,
+                    "Removed container to apply new /dev/shm size (data volume preserved)"
+                );
+            }
+            Err(e) => {
+                // "no such container" is benign — nothing to recreate-from,
+                // initialize_service will just create it fresh. Surface other
+                // errors so the caller can warn.
+                let msg = e.to_string();
+                if !msg.contains("No such container") && !msg.contains("no such container") {
+                    return Err(ExternalServiceError::InternalError {
+                        reason: format!(
+                            "Failed to remove container '{}' for shm recreate: {}",
+                            container_name, msg
+                        ),
+                    });
+                }
+            }
+        }
+
+        // Recreate from the now-persisted config (incl. the new resources
+        // block). With the old container gone, `create_container` takes the
+        // create branch and applies the new shm.
+        self.initialize_service(service.id).await
+    }
+
     pub async fn update_service_resource_limits(
         &self,
         service_id: i32,
@@ -8636,6 +8776,13 @@ echo "[restore] Pre-seed complete"
             },
             None => serde_json::json!({}),
         };
+
+        // Capture the prior shm size before we splice in the new block.
+        // shm_size is create-time-only in Docker, so a change here means the
+        // container must be removed + recreated — a plain live update can't
+        // honor it. We compare prior vs new and drive a recreate below.
+        let prior_limits = crate::externalsvc::ServiceResourceLimits::from_parameters(&config_json);
+        let shm_changed = prior_limits.shm_size_mb != new_limits.shm_size_mb;
 
         // Splice the resources block into the parameters JSON. Setting
         // `unlimited` removes the block so the service goes back to
@@ -8677,9 +8824,33 @@ echo "[restore] Pre-seed complete"
         active.config = Set(Some(encrypted));
         active.update(self.db.as_ref()).await?;
 
+        // When the shared-memory size changed, a live `update_container` can't
+        // honor it (shm_size is fixed at container-CREATE time in Docker). The
+        // container must be DELETED and recreated — a stop+start reuses the old
+        // container and keeps the old shm. `recreate_service_container_for_shm`
+        // removes the container (data volume preserved) so the engine's
+        // `create_container` rebuilds it with the new `HostConfig.shm_size`.
+        //
+        // Best-effort: the limits are already persisted, so a recreate failure
+        // must not roll them back. We log and fall through to report the
+        // per-member outcome — the operator can recreate manually.
+        if shm_changed {
+            if let Err(e) = self.recreate_service_container_for_shm(&service).await {
+                tracing::warn!(
+                    service_id,
+                    error = %e,
+                    "Failed to recreate service container after shm size change; \
+                     limits are persisted but the running container still has the \
+                     old shm size — recreate manually to apply"
+                );
+            }
+        }
+
         // Best-effort live apply. Errors here don't undo the persisted
         // limits — the operator can still recreate the container manually
-        // to pick them up.
+        // to pick them up. After a recreate above, the fresh container
+        // already has the new caps, so this reports "applied"/"missing"
+        // harmlessly.
         let applied = self
             .apply_limits_to_running_containers(&service, &new_limits)
             .await;
@@ -8704,6 +8875,11 @@ echo "[restore] Pre-seed complete"
 /// - memory_swap_mb  → memory_swap  (bytes; -1 = unlimited swap, 0 = no swap; we map None→0)
 /// - nano_cpus       → nano_cpus    (1e9 = 1 core; 0 = unlimited)
 /// - cpu_shares      → cpu_shares   (default 1024; 0 = default)
+///
+/// NOTE: `shm_size` is intentionally absent. Docker treats `/dev/shm` size
+/// as create-time-only; `ContainerUpdateBody` has no `shm_size` field.
+/// Changing shm requires REMOVING + RECREATING the container — handled by
+/// the auto-recreate path in `update_service_resource_limits`, NOT here.
 fn build_container_update_body(
     limits: &crate::externalsvc::ServiceResourceLimits,
 ) -> bollard::models::ContainerUpdateBody {

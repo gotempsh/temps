@@ -455,6 +455,20 @@ pub async fn create_oidc_provider(
         error!("Failed to create OIDC provider audit log: {}", e);
     }
 
+    // Emit anonymous telemetry. The `provider` property is allowlisted against
+    // known type labels so free-form admin-supplied names are never transmitted.
+    const KNOWN_OIDC_TEMPLATES: &[&str] = &[
+        "generic", "google", "github", "keycloak", "okta", "auth0", "azure-ad",
+    ];
+    let provider_label = KNOWN_OIDC_TEMPLATES
+        .iter()
+        .find(|t| **t == provider.template.as_str())
+        .copied();
+    state.telemetry.report(
+        temps_core::TelemetryEvent::new(temps_core::TelemetryEventKind::OidcProviderConfigured)
+            .with_opt("provider", provider_label),
+    );
+
     Ok((StatusCode::CREATED, Json(provider_to_response(&provider))))
 }
 

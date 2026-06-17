@@ -401,9 +401,10 @@ function LimitsInline({
   const memory = limits?.memory_mb ?? null
   const swap = limits?.memory_swap_mb ?? null
   const nano = limits?.nano_cpus ?? null
+  const shm = limits?.shm_size_mb ?? null
   const cpuCores = nano != null ? nano / 1_000_000_000 : null
 
-  if (memory == null && nano == null) {
+  if (memory == null && nano == null && shm == null) {
     return (
       <span className="text-[10px] uppercase tracking-wide text-muted-foreground/60">
         Unlimited
@@ -424,6 +425,11 @@ function LimitsInline({
         <span>
           <span className="text-foreground/80">{memory}</span> MiB
           {swap != null && swap > memory ? ` (+${swap - memory} swap)` : ''}
+        </span>
+      )}
+      {shm != null && (
+        <span>
+          <span className="text-foreground/80">{shm}</span> MiB shm
         </span>
       )}
     </span>

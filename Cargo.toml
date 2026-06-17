@@ -58,6 +58,7 @@ members = [
     "crates/temps-blob",
     "crates/temps-log-aggregator",
     "crates/temps-otel",
+    "crates/temps-telemetry",
     "crates/temps-environments",
     "crates/temps-screenshots",
     "crates/temps-embeddings",

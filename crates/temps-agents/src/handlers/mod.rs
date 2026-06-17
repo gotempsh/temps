@@ -206,6 +206,9 @@ pub struct AppState {
     /// Platform settings service used by the preview gateway handlers to
     /// persist image / auto-upgrade changes.
     pub platform_config_service: Arc<temps_config::ConfigService>,
+    /// Anonymous product-telemetry reporter. Fire-and-forget; never fails the
+    /// surrounding request. Defaults to a no-op when telemetry is not registered.
+    pub telemetry: Arc<dyn temps_core::TelemetryReporter>,
 }
 
 pub fn configure_routes() -> Router<Arc<AppState>> {

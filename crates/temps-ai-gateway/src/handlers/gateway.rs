@@ -424,6 +424,13 @@ async fn chat_completions(
                     "AI gateway streaming request started"
                 );
 
+                app_state.telemetry.report(
+                    temps_core::telemetry::TelemetryEvent::new(
+                        temps_core::telemetry::TelemetryEventKind::AiGatewayFirstRequest,
+                    )
+                    .with("provider", provider_id),
+                );
+
                 let wrapped = wrap_stream_with_usage_tracking(
                     stream,
                     app_state.usage_service.clone(),
@@ -509,6 +516,13 @@ async fn chat_completions(
                     latency_ms = latency.as_millis() as u64,
                     credential_type = credential_type_str(cred_type),
                     "AI gateway request completed"
+                );
+
+                app_state.telemetry.report(
+                    temps_core::telemetry::TelemetryEvent::new(
+                        temps_core::telemetry::TelemetryEventKind::AiGatewayFirstRequest,
+                    )
+                    .with("provider", provider_id),
                 );
 
                 let mut response_builder = axum::response::Response::builder()

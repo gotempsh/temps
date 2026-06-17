@@ -16,6 +16,7 @@ pub struct BackupAppState {
     /// In-process backup executor. Replaces the queue-based runner that
     /// previously sat between trigger paths and engines.
     pub backup_executor: Arc<BackupExecutor>,
+    pub telemetry: std::sync::Arc<dyn temps_core::telemetry::TelemetryReporter>,
 }
 
 pub fn create_backup_app_state(
@@ -25,6 +26,7 @@ pub fn create_backup_app_state(
     pg_upgrade_service: Arc<PostgresUpgradeService>,
     db: Arc<DatabaseConnection>,
     backup_executor: Arc<BackupExecutor>,
+    telemetry: std::sync::Arc<dyn temps_core::telemetry::TelemetryReporter>,
 ) -> Arc<BackupAppState> {
     Arc::new(BackupAppState {
         backup_service,
@@ -33,5 +35,6 @@ pub fn create_backup_app_state(
         pg_upgrade_service,
         db,
         backup_executor,
+        telemetry,
     })
 }

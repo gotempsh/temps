@@ -19,11 +19,12 @@
 //! last attempted step and `error_message` populated. The user can retry,
 //! which resumes from the current phase without redoing earlier phases.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use bollard::Docker;
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection, EntityTrait};
+use temps_core::telemetry::{NoopTelemetryReporter, TelemetryReporter};
 use temps_entities::postgres_major_upgrades;
 use temps_logs::LogService;
 use thiserror::Error;
@@ -433,6 +434,11 @@ pub struct PostgresUpgradeOrchestrator {
     backup_provider: Arc<dyn PreUpgradeBackupProvider>,
     lifecycle: Arc<dyn PostgresContainerLifecycle>,
     log_service: Arc<LogService>,
+    /// Late-bound telemetry reporter. Set via [`Self::set_telemetry`] after
+    /// construction so the orchestrator can be created without requiring the
+    /// telemetry reporter to be known at construction time. Falls back to a
+    /// no-op reporter when absent.
+    telemetry: OnceLock<Arc<dyn TelemetryReporter>>,
 }
 
 impl PostgresUpgradeOrchestrator {
@@ -449,7 +455,23 @@ impl PostgresUpgradeOrchestrator {
             backup_provider,
             lifecycle,
             log_service,
+            telemetry: OnceLock::new(),
         }
+    }
+
+    /// Attach an optional anonymous telemetry reporter. Call this after
+    /// [`Self::new`] before spawning the orchestrator task. Safe to skip —
+    /// the orchestrator falls back to a no-op reporter when unset.
+    pub fn set_telemetry(&self, reporter: Arc<dyn TelemetryReporter>) {
+        // Ignore the error: if already set (e.g., from a resumed upgrade path)
+        // we keep the first value.
+        let _ = self.telemetry.set(reporter);
+    }
+
+    /// Returns the registered reporter or a static no-op fallback.
+    fn telemetry(&self) -> &dyn TelemetryReporter {
+        static NOOP: NoopTelemetryReporter = NoopTelemetryReporter;
+        self.telemetry.get().map(|r| r.as_ref()).unwrap_or(&NOOP)
     }
 
     /// Drive the upgrade to completion or failure.
@@ -1858,7 +1880,18 @@ impl PostgresUpgradeOrchestrator {
     }
 
     async fn finalize_completed(&self, upgrade_id: i32) -> Result<(), PostgresUpgradeError> {
-        self.set_status(upgrade_id, status::COMPLETED, None).await?;
+        let row = self.set_status(upgrade_id, status::COMPLETED, None).await?;
+
+        // Fire-and-forget anonymous telemetry. Properties are non-identifying
+        // Postgres major version numbers only (e.g., "16", "17").
+        self.telemetry().report(
+            temps_core::telemetry::TelemetryEvent::new(
+                temps_core::telemetry::TelemetryEventKind::PgMajorUpgradeCompleted,
+            )
+            .with("from_version", row.from_version.clone())
+            .with("to_version", row.to_version.clone()),
+        );
+
         Ok(())
     }
 

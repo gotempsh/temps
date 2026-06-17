@@ -968,6 +968,42 @@ pub async fn update_environment_settings(
         // Continue with the operation even if audit logging fails
     }
 
+    // Telemetry: emit attack_mode_enabled only on the off→on transition.
+    if updated_environment.attack_mode == Some(true) && environment.attack_mode != Some(true) {
+        state.telemetry.report(
+            temps_core::telemetry::TelemetryEvent::new(
+                temps_core::telemetry::TelemetryEventKind::AttackModeEnabled,
+            )
+            .with("scope", "environment"),
+        );
+    }
+
+    // Telemetry: emit scale_to_zero_configured only on the off→on transition.
+    let prior_on_demand = environment
+        .deployment_config
+        .as_ref()
+        .map(|dc| dc.on_demand)
+        .unwrap_or(false);
+    let new_on_demand = updated_environment
+        .deployment_config
+        .as_ref()
+        .map(|dc| dc.on_demand)
+        .unwrap_or(false);
+    if new_on_demand && !prior_on_demand {
+        state.telemetry.report(
+            temps_core::telemetry::TelemetryEvent::new(
+                temps_core::telemetry::TelemetryEventKind::ScaleToZeroConfigured,
+            )
+            .with_opt(
+                "idle_timeout_seconds",
+                updated_environment
+                    .deployment_config
+                    .as_ref()
+                    .map(|dc| dc.idle_timeout_seconds),
+            ),
+        );
+    }
+
     let main_url = state
         .environment_service
         .compute_environment_url(&updated_environment.subdomain)
@@ -1532,6 +1568,20 @@ pub async fn create_environment(
         .environment_service
         .compute_environment_url(&environment.subdomain)
         .await;
+
+    state.telemetry.report(
+        temps_core::telemetry::TelemetryEvent::new(
+            temps_core::telemetry::TelemetryEventKind::EnvironmentCreated,
+        )
+        .with(
+            "kind",
+            if environment.is_preview {
+                "preview"
+            } else {
+                "persistent"
+            },
+        ),
+    );
 
     Ok((
         StatusCode::CREATED,

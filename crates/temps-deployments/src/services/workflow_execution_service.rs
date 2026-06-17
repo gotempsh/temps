@@ -25,6 +25,43 @@ use crate::jobs::{
 use crate::services::DeploymentJobTracker;
 use temps_screenshots::ScreenshotService;
 
+/// Map a deployment's free-form failure reason to a coarse, NON-identifying
+/// category for telemetry. The raw reason can contain build logs, file paths,
+/// or repo names, so it is never sent verbatim — only one of these stable
+/// labels (or `unknown`). Matching is on lowercased substrings.
+fn categorize_failure_reason(reason: Option<&str>) -> &'static str {
+    let Some(reason) = reason else {
+        return "unknown";
+    };
+    let r = reason.to_lowercase();
+
+    // Order matters: check the most specific signals first.
+    if r.contains("out of memory") || r.contains("oom") || r.contains("exit code 137") {
+        "oom"
+    } else if r.contains("timeout") || r.contains("timed out") || r.contains("deadline") {
+        "timeout"
+    } else if r.contains("health check") || r.contains("healthcheck") || r.contains("unhealthy") {
+        "health_check"
+    } else if r.contains("build") || r.contains("compile") || r.contains("nixpacks") {
+        "build_error"
+    } else if r.contains("clone")
+        || r.contains("network")
+        || r.contains("connection")
+        || r.contains("download")
+        || r.contains("dns")
+    {
+        "network"
+    } else if r.contains("image")
+        && (r.contains("not found") || r.contains("missing") || r.contains("no such"))
+    {
+        "image_missing"
+    } else if r.contains("cancel") {
+        "cancelled"
+    } else {
+        "unknown"
+    }
+}
+
 /// Service for executing deployment workflows
 pub struct WorkflowExecutionService {
     db: Arc<DbConnection>,
@@ -43,6 +80,10 @@ pub struct WorkflowExecutionService {
     node_scheduler: OnceCell<Arc<crate::services::NodeScheduler>>,
     encryption_service: OnceCell<Arc<temps_core::EncryptionService>>,
     file_store: OnceCell<Arc<dyn temps_file_store::FileStore>>,
+    /// Anonymous product telemetry reporter (late-bound, optional). Set via
+    /// [`Self::set_telemetry`]; defaults to a no-op when unset so the deploy
+    /// path never depends on telemetry being wired.
+    telemetry: OnceCell<Arc<dyn temps_core::telemetry::TelemetryReporter>>,
 }
 
 impl WorkflowExecutionService {
@@ -78,7 +119,22 @@ impl WorkflowExecutionService {
             node_scheduler: OnceCell::new(),
             encryption_service: OnceCell::new(),
             file_store: OnceCell::new(),
+            telemetry: OnceCell::new(),
         }
+    }
+
+    /// Set the anonymous telemetry reporter used to emit deploy-funnel events.
+    pub fn set_telemetry(&self, reporter: Arc<dyn temps_core::telemetry::TelemetryReporter>) {
+        let _ = self.telemetry.set(reporter);
+    }
+
+    /// The telemetry reporter, or a no-op when none has been wired. Always safe
+    /// to call `report()` on the result; it never blocks or fails.
+    fn telemetry(&self) -> Arc<dyn temps_core::telemetry::TelemetryReporter> {
+        self.telemetry
+            .get()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(temps_core::telemetry::NoopTelemetryReporter))
     }
 
     /// Set the node scheduler for multi-node deployments
@@ -120,6 +176,18 @@ impl WorkflowExecutionService {
         let deployment = self.get_deployment(deployment_id).await?;
         let project = self.get_project(deployment.project_id).await?;
         let environment = self.get_environment(deployment.environment_id).await?;
+
+        // Anonymous telemetry: a deploy is now being attempted. This runs once
+        // per deployment workflow. Properties are non-identifying enum labels
+        // (source type, build preset) plus whether this is a preview env.
+        self.telemetry().report(
+            temps_core::telemetry::TelemetryEvent::new(
+                temps_core::telemetry::TelemetryEventKind::DeployAttempted,
+            )
+            .with("source_type", project.source_type.to_string())
+            .with("preset", project.preset.to_string())
+            .with("is_preview", environment.is_preview),
+        );
 
         // Load all jobs for this deployment
         let db_jobs = self.get_deployment_jobs(deployment_id).await?;
@@ -1573,6 +1641,19 @@ impl WorkflowExecutionService {
                 ))
             })?;
 
+        // Non-identifying deploy labels for telemetry (best-effort). Looked up
+        // once here so both the success and failure telemetry below can report
+        // which preset / source type the deploy used — that's what lets us see
+        // *which* presets fail most, not just the overall failure rate.
+        let (telemetry_source_type, telemetry_preset) =
+            match projects::Entity::find_by_id(updated_deployment.project_id)
+                .one(self.db.as_ref())
+                .await
+            {
+                Ok(Some(p)) => (Some(p.source_type.to_string()), Some(p.preset.to_string())),
+                _ => (None, None),
+            };
+
         match status {
             temps_entities::types::PipelineStatus::Completed => {
                 // Get deployment URL from environment: prefer custom host, fall back to preview domain
@@ -1621,6 +1702,27 @@ impl WorkflowExecutionService {
                         deployment_id
                     );
                 }
+
+                // Anonymous telemetry: this is the single canonical terminal
+                // success point for a deployment. `first_deploy_succeeded` is
+                // emitted alongside; the central API dedupes it per instance.
+                // Both carry the non-identifying preset/source_type so success
+                // rates can be sliced by build type.
+                let telemetry = self.telemetry();
+                telemetry.report(
+                    temps_core::telemetry::TelemetryEvent::new(
+                        temps_core::telemetry::TelemetryEventKind::DeploySucceeded,
+                    )
+                    .with_opt("source_type", telemetry_source_type.clone())
+                    .with_opt("preset", telemetry_preset.clone()),
+                );
+                telemetry.report(
+                    temps_core::telemetry::TelemetryEvent::new(
+                        temps_core::telemetry::TelemetryEventKind::FirstDeploySucceeded,
+                    )
+                    .with_opt("source_type", telemetry_source_type.clone())
+                    .with_opt("preset", telemetry_preset.clone()),
+                );
             }
             temps_entities::types::PipelineStatus::Failed => {
                 let event = Job::DeploymentFailed(temps_core::DeploymentFailedJob {
@@ -1638,6 +1740,23 @@ impl WorkflowExecutionService {
                         deployment_id
                     );
                 }
+
+                // Anonymous telemetry: terminal failure point. The raw
+                // `cancelled_reason` may contain build logs / paths / repo
+                // names, so it is NEVER sent — only a coarse category label.
+                // preset/source_type are included so we can see which build
+                // types fail most (e.g. "nixpacks deploys OOM 3x more often").
+                self.telemetry().report(
+                    temps_core::telemetry::TelemetryEvent::new(
+                        temps_core::telemetry::TelemetryEventKind::DeployFailed,
+                    )
+                    .with(
+                        "reason",
+                        categorize_failure_reason(cancelled_reason.as_deref()),
+                    )
+                    .with_opt("source_type", telemetry_source_type.clone())
+                    .with_opt("preset", telemetry_preset.clone()),
+                );
             }
             temps_entities::types::PipelineStatus::Cancelled => {
                 let event = Job::DeploymentCancelled(temps_core::DeploymentCancelledJob {

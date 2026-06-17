@@ -60,11 +60,15 @@ impl TempsPlugin for SessionReplayPlugin {
             context.require_service::<crate::services::SessionReplayService>();
         let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
         let route_table = context.require_service::<temps_routes::CachedPeerTable>();
+        let telemetry = context
+            .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
+            .unwrap_or_else(|| std::sync::Arc::new(temps_core::telemetry::NoopTelemetryReporter));
         let routes = crate::handlers::configure_routes().with_state(Arc::new(
             crate::handlers::types::AppState {
                 session_replay_service,
                 audit_service,
                 route_table,
+                telemetry,
             },
         ));
 
@@ -76,11 +80,15 @@ impl TempsPlugin for SessionReplayPlugin {
             context.require_service::<crate::services::SessionReplayService>();
         let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
         let route_table = context.require_service::<temps_routes::CachedPeerTable>();
+        let telemetry = context
+            .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
+            .unwrap_or_else(|| std::sync::Arc::new(temps_core::telemetry::NoopTelemetryReporter));
         let routes = crate::handlers::configure_public_routes().with_state(Arc::new(
             crate::handlers::types::AppState {
                 session_replay_service,
                 audit_service,
                 route_table,
+                telemetry,
             },
         ));
 

@@ -49,6 +49,13 @@ impl TempsPlugin for DeploymentsPlugin {
             let image_builder = context.require_service::<dyn temps_deployer::ImageBuilder>();
             let git_provider_manager = context.require_service::<temps_git::GitProviderManager>();
             let encryption_service = context.require_service::<temps_core::EncryptionService>();
+
+            // Anonymous telemetry reporter (optional). Defaults to a no-op when
+            // the TelemetryPlugin isn't registered, so deploys never depend on it.
+            let telemetry = context
+                .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
+                .unwrap_or_else(|| Arc::new(temps_core::telemetry::NoopTelemetryReporter));
+
             // Create DeploymentService
             let deployment_service = Arc::new(DeploymentService::new(
                 db.clone(),
@@ -59,6 +66,8 @@ impl TempsPlugin for DeploymentsPlugin {
                 deployer.clone(),
                 encryption_service.clone(),
             ));
+            // Wire telemetry for deploy-funnel events (rollback_triggered).
+            deployment_service.set_telemetry(telemetry.clone());
             context.register_service(deployment_service.clone());
 
             // Also register as DeploymentCanceller trait for temps-environments
@@ -188,6 +197,11 @@ impl TempsPlugin for DeploymentsPlugin {
                 workflow_execution_service.set_file_store(file_store);
                 tracing::debug!("File store wired into workflow execution service");
             }
+
+            // Wire telemetry for deploy-funnel events (deploy_attempted,
+            // deploy_succeeded, deploy_failed, first_deploy_succeeded).
+            workflow_execution_service.set_telemetry(telemetry.clone());
+            tracing::debug!("Telemetry wired into workflow execution service");
 
             // Get ExternalServiceManager for accessing external service env vars
             let external_service_manager =

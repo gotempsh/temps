@@ -42,6 +42,7 @@ pub struct AppState {
     pub audit_service: Arc<dyn temps_core::AuditLogger>,
     pub ip_address_service: Option<Arc<IpAddressService>>,
     pub db: Option<Arc<sea_orm::DatabaseConnection>>,
+    pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
 }
 
 /// Maximum compressed body size for Sentry ingest routes (2 MiB).
@@ -147,6 +148,14 @@ async fn ingest_sentry_event(
     )
     .await;
 
+    // Check whether this project already has error groups (first-event dedupe).
+    // On lookup failure we assume groups exist (suppress) to avoid over-reporting.
+    let is_first_error = !state
+        .error_tracking_service
+        .has_error_groups(project_id)
+        .await
+        .unwrap_or(true);
+
     // Store event using the error tracking service
     match state
         .error_tracking_service
@@ -154,6 +163,13 @@ async fn ingest_sentry_event(
         .await
     {
         Ok(_) => {
+            if is_first_error {
+                state
+                    .telemetry
+                    .report(temps_core::telemetry::TelemetryEvent::new(
+                        temps_core::telemetry::TelemetryEventKind::ErrorTrackingFirstError,
+                    ));
+            }
             let response = SentryEventResponse {
                 id: parsed_event.event_id,
             };
@@ -259,6 +275,14 @@ async fn ingest_sentry_envelope(
     let peer = connect_info.map(|ext| ext.0 .0);
     let client_ip = temps_auth::resolve_client_ip(&headers, peer);
 
+    // Check whether this project already has error groups (first-event dedupe).
+    // On lookup failure we assume groups exist (suppress) to avoid over-reporting.
+    let mut is_first_error = !state
+        .error_tracking_service
+        .has_error_groups(project_id)
+        .await
+        .unwrap_or(true);
+
     // Store each event using the error tracking service
     for mut event in parsed_events {
         // Enrich with IP geolocation and visitor correlation
@@ -281,6 +305,15 @@ async fn ingest_sentry_envelope(
                 format!("Failed to store event: {}", e),
             )
                 .into_response();
+        }
+
+        if is_first_error {
+            state
+                .telemetry
+                .report(temps_core::telemetry::TelemetryEvent::new(
+                    temps_core::telemetry::TelemetryEventKind::ErrorTrackingFirstError,
+                ));
+            is_first_error = false; // emit at most once per request
         }
     }
 
@@ -515,6 +548,7 @@ mod tests {
             audit_service,
             ip_address_service: None,
             db: None,
+            telemetry: Arc::new(temps_core::telemetry::NoopTelemetryReporter),
         });
 
         TestContext {

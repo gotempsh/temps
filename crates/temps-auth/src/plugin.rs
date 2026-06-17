@@ -99,6 +99,15 @@ impl TempsPlugin for AuthPlugin {
                 }
             });
 
+            // Resolve the telemetry reporter; default to no-op so auth never
+            // hard-fails if the telemetry crate isn't registered.
+            let telemetry = context
+                .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
+                .unwrap_or_else(|| {
+                    Arc::new(temps_core::telemetry::NoopTelemetryReporter)
+                        as Arc<dyn temps_core::telemetry::TelemetryReporter>
+                });
+
             // Create AuthState for handlers
             let auth_state = Arc::new(AuthState::new(
                 db.clone(),
@@ -106,6 +115,7 @@ impl TempsPlugin for AuthPlugin {
                 encryption_service.clone(),
                 cookie_crypto.clone(),
                 notification_service.clone(),
+                telemetry,
             ));
             context.register_service(auth_state);
 

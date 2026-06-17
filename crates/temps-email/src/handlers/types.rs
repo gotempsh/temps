@@ -21,6 +21,7 @@ pub struct AppState {
     pub audit_service: Arc<dyn AuditLogger>,
     /// DNS provider service for automatic DNS record setup
     pub dns_provider_service: Option<Arc<DnsProviderService>>,
+    pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
 }
 
 // ========================================

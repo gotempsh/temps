@@ -575,6 +575,12 @@ pub async fn start_fix(
         );
     }
 
+    app_state.telemetry.report(
+        temps_core::TelemetryEvent::new(temps_core::TelemetryEventKind::AutofixerFixAccepted)
+            .with("source", run.source.clone())
+            .with_opt("ai_provider", run.ai_provider.clone()),
+    );
+
     // Spawn fix in background
     let autofixer = app_state.autofixer_service.clone();
     tokio::spawn(async move {
@@ -765,6 +771,12 @@ pub async fn cancel(
         .get_run(run_id)
         .await
         .map_err(Problem::from)?;
+
+    app_state.telemetry.report(
+        temps_core::TelemetryEvent::new(temps_core::TelemetryEventKind::AutofixerFixRejected)
+            .with("source", run.source.clone())
+            .with_opt("ai_provider", run.ai_provider.clone()),
+    );
 
     Ok(Json(AutofixerRunResponse::from(run)))
 }

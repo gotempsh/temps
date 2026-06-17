@@ -80,6 +80,12 @@ impl TempsPlugin for EmailPlugin {
             // Try to get DnsProviderService if available (optional dependency)
             let dns_provider_service = context.get_service::<DnsProviderService>();
 
+            // Pull telemetry reporter (optional — fall back to no-op so the plugin
+            // never hard-fails when telemetry isn't registered)
+            let telemetry = context
+                .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
+                .unwrap_or_else(|| Arc::new(temps_core::telemetry::NoopTelemetryReporter));
+
             // Create AppState for handlers
             let app_state = Arc::new(AppState {
                 provider_service,
@@ -89,6 +95,7 @@ impl TempsPlugin for EmailPlugin {
                 tracking_service,
                 audit_service,
                 dns_provider_service,
+                telemetry,
             });
             context.register_service(app_state);
 

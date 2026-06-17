@@ -28,6 +28,8 @@ pub struct AuthState {
     pub deployment_token_service: Arc<DeploymentTokenValidationService>,
     /// OIDC SSO service
     pub oidc_service: Arc<crate::oidc_service::OidcService>,
+    /// Anonymous product telemetry reporter
+    pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
 }
 
 impl AuthState {
@@ -38,6 +40,7 @@ impl AuthState {
         encryption_service: Arc<EncryptionService>,
         cookie_crypto: Arc<CookieCrypto>,
         notification_service: DynNotificationService,
+        telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
     ) -> Self {
         let auth_service = Arc::new(AuthService::new(db.clone(), notification_service));
         let api_key_service = Arc::new(ApiKeyService::new(db.clone()));
@@ -58,6 +61,7 @@ impl AuthState {
             cookie_crypto,
             deployment_token_service,
             oidc_service,
+            telemetry,
         }
     }
 }

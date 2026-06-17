@@ -20,8 +20,12 @@ pub struct AppState {
     /// Optional integration env-var provider. When absent (e.g. in tests without
     /// the providers plugin) the resolved view falls back to manual vars only.
     pub integration_env_provider: Option<Arc<dyn ProjectEnvVarsProvider>>,
+    /// Anonymous product telemetry reporter. Always present (may be a no-op when
+    /// telemetry is disabled or the reporter crate is not loaded).
+    pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn create_environment_app_state(
     environment_service: Arc<EnvironmentService>,
     env_var_service: Arc<EnvVarService>,
@@ -30,6 +34,7 @@ pub fn create_environment_app_state(
     deployment_service: Arc<dyn DeploymentCanceller>,
     on_demand_waker: Option<Arc<dyn temps_core::OnDemandWaker>>,
     integration_env_provider: Option<Arc<dyn ProjectEnvVarsProvider>>,
+    telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
 ) -> Arc<AppState> {
     Arc::new(AppState {
         environment_service,
@@ -39,6 +44,7 @@ pub fn create_environment_app_state(
         deployment_service,
         on_demand_waker,
         integration_env_provider,
+        telemetry,
     })
 }
 

@@ -7,4 +7,5 @@ pub struct AppState {
     pub session_replay_service: Arc<SessionReplayService>,
     pub audit_service: Arc<dyn temps_core::AuditLogger>,
     pub route_table: Arc<CachedPeerTable>,
+    pub telemetry: std::sync::Arc<dyn temps_core::telemetry::TelemetryReporter>,
 }

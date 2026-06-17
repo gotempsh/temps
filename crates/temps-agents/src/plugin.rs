@@ -593,6 +593,9 @@ impl TempsPlugin for AgentsPlugin {
                 definition_service,
                 docker: context.require_service::<bollard::Docker>(),
                 platform_config_service: context.require_service::<temps_config::ConfigService>(),
+                telemetry: context
+                    .get_service::<dyn temps_core::TelemetryReporter>()
+                    .unwrap_or_else(|| Arc::new(temps_core::NoopTelemetryReporter)),
             });
             context.register_plugin_state("agents", app_state);
 

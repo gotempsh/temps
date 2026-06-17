@@ -754,6 +754,11 @@ pub async fn init_session_replay(
     {
         Ok(session_id) => {
             debug!("Successfully initialized session replay: {}", session_id);
+            state
+                .telemetry
+                .report(temps_core::telemetry::TelemetryEvent::new(
+                    temps_core::telemetry::TelemetryEventKind::SessionReplayFirstSession,
+                ));
             Ok((
                 StatusCode::CREATED,
                 Json(SessionReplayInitResponse {

@@ -1638,10 +1638,24 @@ async fn create_backup_schedule(
         .create_backup_schedule(request)
         .await
     {
-        Ok(schedule) => Ok((
-            StatusCode::CREATED,
-            Json(BackupScheduleResponse::from(schedule)),
-        )),
+        Ok(schedule) => {
+            app_state.telemetry.report(
+                temps_core::telemetry::TelemetryEvent::new(
+                    temps_core::telemetry::TelemetryEventKind::BackupConfigured,
+                )
+                .with("backup_type", schedule.backup_type.clone())
+                .with("enabled", schedule.enabled)
+                .with("target_all_services", schedule.target_all_services)
+                .with("include_control_plane", schedule.include_control_plane)
+                .with("retention_period_days", schedule.retention_period)
+                .with("has_custom_timeout", schedule.max_runtime_secs.is_some())
+                .with("has_schedule", true),
+            );
+            Ok((
+                StatusCode::CREATED,
+                Json(BackupScheduleResponse::from(schedule)),
+            ))
+        }
         Err(e) => {
             error!("Failed to create backup schedule: {}", e);
             Err(Problem::from(e))

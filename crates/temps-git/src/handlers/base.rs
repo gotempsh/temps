@@ -583,6 +583,13 @@ pub async fn create_git_provider(
         )
         .await?;
 
+    state.telemetry.report(
+        temps_core::telemetry::TelemetryEvent::new(
+            temps_core::telemetry::TelemetryEventKind::GitProviderConnected,
+        )
+        .with("provider", provider.provider_type.clone()),
+    );
+
     Ok((
         StatusCode::CREATED,
         Json(ProviderResponse {

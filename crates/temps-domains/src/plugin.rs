@@ -105,6 +105,14 @@ impl TempsPlugin for DomainsPlugin {
             // Get audit service
             let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
 
+            // Get telemetry reporter (optional — default to noop so domains never hard-fail
+            // if the telemetry plugin isn't registered)
+            let telemetry = context
+                .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
+                .unwrap_or_else(|| {
+                    std::sync::Arc::new(temps_core::telemetry::NoopTelemetryReporter)
+                });
+
             // Create DomainAppState for handlers
             let domain_app_state = create_domain_app_state_with_dns(
                 tls_service,
@@ -112,6 +120,7 @@ impl TempsPlugin for DomainsPlugin {
                 domain_service,
                 dns_provider_service,
                 audit_service,
+                telemetry,
             );
             context.register_service(domain_app_state);
 

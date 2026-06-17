@@ -12166,6 +12166,12 @@ export type ServiceResourceLimits = {
      * CPU quota in nano-cpus. 1_000_000_000 = 1 full CPU core. None = unlimited.
      */
     nano_cpus?: number | null;
+    /**
+     * Shared memory (/dev/shm) size in MiB. None = Docker default (64 MiB).
+     * TODO(sdk-regen): added by hand ahead of `bun run openapi-ts` regen; the
+     * backend `ServiceResourceLimits` already carries this field.
+     */
+    shm_size_mb?: number | null;
 };
 
 /**

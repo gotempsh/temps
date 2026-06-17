@@ -30,6 +30,9 @@ pub struct AppState {
     /// metrics to (and the console port for its default). `None` in contexts
     /// where it isn't wired (e.g. some tests).
     pub config_service: Option<Arc<temps_config::ConfigService>>,
+    /// Telemetry reporter — fire-and-forget anonymous usage events.
+    /// Defaults to a no-op when telemetry is not registered.
+    pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]

@@ -184,6 +184,9 @@ pub async fn create_service(
         if let Some(cs) = limits.cpu_shares {
             host_config.cpu_shares = Some(cs);
         }
+        if let Some(mb) = limits.shm_size_mb {
+            host_config.shm_size = Some(mb.saturating_mul(1024 * 1024));
+        }
     }
 
     let container_config = bollard::models::ContainerCreateBody {

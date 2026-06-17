@@ -54,3 +54,10 @@ GeoLite2-*.mmdb
 # These are 250+ MB binaries that should never be committed.
 /temps-new
 /temps-old
+
+# Private telemetry dashboard — visualizes the anonymous product-telemetry
+# data. The ingest API + schema (telemetry-api/) stay PUBLIC for transparency,
+# but the dashboard contains internal business judgment (which metrics we watch,
+# what "good" looks like) and must NOT be open-sourced. See telemetry-api/ for
+# the public, auditable side.
+/telemetry-dashboard/

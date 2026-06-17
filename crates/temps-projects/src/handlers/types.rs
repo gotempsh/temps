@@ -20,6 +20,7 @@ pub struct AppState {
     pub custom_domain_service: Arc<CustomDomainService>,
     pub audit_service: Arc<dyn AuditLogger>,
     pub template_service: Arc<TemplateService>,
+    pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
 }
 
 // Domain-related types

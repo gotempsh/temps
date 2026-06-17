@@ -274,6 +274,7 @@ pub struct ServiceConfig {
 /// - `memory_swap_mb`→ `HostConfig.memory_swap`   (bytes; ≥ memory)
 /// - `nano_cpus`     → `HostConfig.nano_cpus`     (1e9 = 1 full CPU)
 /// - `cpu_shares`    → `HostConfig.cpu_shares`    (relative weight, default 1024)
+/// - `shm_size_mb`   → `HostConfig.shm_size`      (bytes; default 64 MiB)
 ///
 /// IMPORTANT: enabling hard memory limits causes the kernel OOM killer to
 /// terminate the container when the working set exceeds the limit. The
@@ -295,6 +296,14 @@ pub struct ServiceResourceLimits {
     /// Relative CPU weight (default 1024). Only used when `nano_cpus` is None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_shares: Option<i64>,
+    /// Shared memory (/dev/shm) size in MiB. None = Docker default (64 MiB).
+    /// Maps to HostConfig.shm_size (bytes). PostgreSQL uses /dev/shm for parallel
+    /// query workers and large work_mem; the 64 MiB default causes "could not
+    /// resize shared memory segment ... No space left on device" under load.
+    /// NOTE: shm_size is fixed at container-create time — Docker's live update
+    /// API cannot change it, so changing this value recreates the container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shm_size_mb: Option<i64>,
 }
 
 impl ServiceResourceLimits {
@@ -304,6 +313,7 @@ impl ServiceResourceLimits {
             && self.memory_swap_mb.is_none()
             && self.nano_cpus.is_none()
             && self.cpu_shares.is_none()
+            && self.shm_size_mb.is_none()
     }
 
     /// Validate that memory_swap >= memory when both are set, and that no
@@ -337,6 +347,11 @@ impl ServiceResourceLimits {
                 return Err(format!("cpu_shares must be > 0, got {}", cs));
             }
         }
+        if let Some(shm) = self.shm_size_mb {
+            if shm <= 0 {
+                return Err(format!("shm_size_mb must be > 0, got {}", shm));
+            }
+        }
         Ok(())
     }
 
@@ -366,6 +381,9 @@ impl ServiceResourceLimits {
         }
         if let Some(cs) = self.cpu_shares {
             host_config.cpu_shares = Some(cs);
+        }
+        if let Some(mb) = self.shm_size_mb {
+            host_config.shm_size = Some(mb.saturating_mul(1024 * 1024));
         }
     }
 }
@@ -1101,6 +1119,20 @@ mod resource_limits_tests {
         }
         .validate()
         .is_ok());
+
+        // shm_size_mb must be > 0
+        assert!(ServiceResourceLimits {
+            shm_size_mb: Some(0),
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+        assert!(ServiceResourceLimits {
+            shm_size_mb: Some(256),
+            ..Default::default()
+        }
+        .validate()
+        .is_ok());
     }
 
     #[test]
@@ -1117,6 +1149,7 @@ mod resource_limits_tests {
         assert_eq!(limits.nano_cpus, Some(1_000_000_000));
         assert_eq!(limits.cpu_shares, None);
         assert_eq!(limits.memory_swap_mb, None);
+        assert_eq!(limits.shm_size_mb, None);
     }
 
     #[test]
@@ -1141,6 +1174,19 @@ mod resource_limits_tests {
         // Untouched fields stay None — Docker default = unlimited.
         assert_eq!(hc.memory_swap, None);
         assert_eq!(hc.cpu_shares, None);
+        assert_eq!(hc.shm_size, None);
+    }
+
+    #[test]
+    fn apply_to_host_config_sets_shm() {
+        let limits = ServiceResourceLimits {
+            shm_size_mb: Some(256),
+            ..Default::default()
+        };
+        let mut hc = bollard::models::HostConfig::default();
+        limits.apply_to_host_config(&mut hc);
+        // 256 MiB = 268435456 bytes
+        assert_eq!(hc.shm_size, Some(256 * 1024 * 1024));
     }
 
     #[test]

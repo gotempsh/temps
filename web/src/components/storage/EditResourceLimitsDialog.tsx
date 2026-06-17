@@ -54,6 +54,13 @@ const DEFAULT_CPU_CORES = 1.0
 const DEFAULT_MEMORY_MB = 512
 
 /**
+ * Docker's default /dev/shm is 64 MiB. We seed the input with that so the
+ * displayed value matches what the container already has before the operator
+ * raises it (Postgres parallel queries commonly need 256+ MiB).
+ */
+const DEFAULT_SHM_MB = 64
+
+/**
  * Convert nano_cpus <-> fractional CPU cores. We expose cores in the UI
  * because "0.5 CPU" reads better than "500000000 nano_cpus" — but the
  * wire format requires nano_cpus (Docker's native units).
@@ -85,6 +92,10 @@ export function EditResourceLimitsDialog({
   const [swapMb, setSwapMb] = useState<string>(String(DEFAULT_MEMORY_MB))
   const [cpuEnabled, setCpuEnabled] = useState(false)
   const [cpuCores, setCpuCores] = useState<string>(String(DEFAULT_CPU_CORES))
+  // Shared memory (/dev/shm). Docker defaults to 64 MiB; unlike memory/CPU
+  // this is create-time-only, so changing it recreates the container.
+  const [shmEnabled, setShmEnabled] = useState(false)
+  const [shmMb, setShmMb] = useState<string>(String(DEFAULT_SHM_MB))
 
   // Re-seed the form whenever the dialog opens (or current limits arrive).
   // Without this the user sees stale state from the previous service when
@@ -115,6 +126,10 @@ export function EditResourceLimitsDialog({
         ? String(nanoCpusToCores(nano))
         : String(DEFAULT_CPU_CORES),
     )
+
+    const shm = currentLimits?.shm_size_mb ?? null
+    setShmEnabled(shm != null)
+    setShmMb(shm != null ? String(shm) : String(DEFAULT_SHM_MB))
   }, [open, currentLimits])
 
   // Reset input to a sane default when toggling a limit back on, so a
@@ -130,6 +145,12 @@ export function EditResourceLimitsDialog({
       setCpuCores(String(DEFAULT_CPU_CORES))
     }
     setCpuEnabled(v)
+  }
+  const handleShmToggle = (v: boolean) => {
+    if (v && (Number(shmMb) <= 0 || !Number.isFinite(Number(shmMb)))) {
+      setShmMb(String(DEFAULT_SHM_MB))
+    }
+    setShmEnabled(v)
   }
 
   // -- Validation ---------------------------------------------------------
@@ -152,8 +173,23 @@ export function EditResourceLimitsDialog({
         return 'CPU cores must be greater than zero.'
       }
     }
+    if (shmEnabled) {
+      const s = Number(shmMb)
+      if (!Number.isFinite(s) || s <= 0) {
+        return 'Shared memory must be a positive number of MiB.'
+      }
+    }
     return null
-  }, [memoryEnabled, memoryMb, swapEnabled, swapMb, cpuEnabled, cpuCores])
+  }, [
+    memoryEnabled,
+    memoryMb,
+    swapEnabled,
+    swapMb,
+    cpuEnabled,
+    cpuCores,
+    shmEnabled,
+    shmMb,
+  ])
 
   // -- Mutation -----------------------------------------------------------
   const queryClient = useQueryClient()
@@ -184,7 +220,7 @@ export function EditResourceLimitsDialog({
       } else if (recreate.length > 0) {
         toast.warning('Limits saved — restart required', {
           description:
-            'Removing a memory cap on a running container needs a recreate. Restart the service to apply.',
+            'Some changes (shared memory, or removing a memory cap) can\'t be applied live. Restart the service to recreate the container and apply them.',
         })
       } else if (members.length === 0) {
         toast.success('Resource limits saved', {
@@ -238,6 +274,9 @@ export function EditResourceLimitsDialog({
         memoryRounded != null ? memoryRounded + extraSwap : null,
       nano_cpus: cpuEnabled ? coresToNanoCpus(Number(cpuCores)) : null,
       cpu_shares: null,
+      // Create-time-only: the backend recreates the container to apply a
+      // changed /dev/shm size (Docker's live update API can't touch it).
+      shm_size_mb: shmEnabled ? Math.round(Number(shmMb)) : null,
     }
     mutation.mutate({ path: { id: serviceId }, body })
   }
@@ -254,10 +293,13 @@ export function EditResourceLimitsDialog({
           (swapEnabled ? Math.round(Number(swapMb)) || 0 : 0)
         : null
     const newNano = cpuEnabled ? coresToNanoCpus(Number(cpuCores)) : null
+    const currentShm = currentLimits?.shm_size_mb ?? null
+    const newShm = shmEnabled ? Math.round(Number(shmMb)) || null : null
     return (
       newMem !== currentMem ||
       newSwapTotal !== currentSwap ||
-      newNano !== currentNano
+      newNano !== currentNano ||
+      newShm !== currentShm
     )
   }, [
     currentLimits,
@@ -267,6 +309,8 @@ export function EditResourceLimitsDialog({
     swapMb,
     cpuEnabled,
     cpuCores,
+    shmEnabled,
+    shmMb,
   ])
 
   // Pretty-print the currently applied value as a small chip on each row.
@@ -278,6 +322,12 @@ export function EditResourceLimitsDialog({
     currentLimits?.nano_cpus != null
       ? `${formatCores(nanoCpusToCores(currentLimits.nano_cpus))} cores`
       : 'Unlimited'
+  // /dev/shm has a real Docker default (64 MiB) rather than "unlimited", so
+  // show that when the operator hasn't set an explicit size.
+  const currentShmLabel =
+    currentLimits?.shm_size_mb != null
+      ? `${currentLimits.shm_size_mb} MiB`
+      : `${DEFAULT_SHM_MB} MiB (default)`
   const currentSwapExtra =
     currentLimits?.memory_mb != null &&
     currentLimits?.memory_swap_mb != null &&
@@ -303,7 +353,8 @@ export function EditResourceLimitsDialog({
             </span>
           </DialogTitle>
           <DialogDescription className="text-xs">
-            Live changes — no restart needed.
+            Memory and CPU apply live. Changing shared memory recreates the
+            container.
           </DialogDescription>
         </DialogHeader>
 
@@ -395,6 +446,30 @@ export function EditResourceLimitsDialog({
             />
           </LimitSection>
 
+          {/* Shared memory (/dev/shm) -------------------------------- */}
+          <LimitSection
+            label="Shared memory"
+            currentLabel={currentShmLabel}
+            enabled={shmEnabled}
+            onToggle={handleShmToggle}
+            toggleId="resource-shm-toggle"
+            description={
+              'Shared memory (/dev/shm). Postgres uses it for parallel queries; ' +
+              'the 64 MB default can cause "No space left on device" errors. ' +
+              'Changing this recreates the container (brief downtime).'
+            }
+          >
+            <PresetInput
+              id="resource-shm-mb"
+              value={shmMb}
+              onChange={setShmMb}
+              presets={SHM_PRESETS}
+              unit="MiB"
+              min={64}
+              step={64}
+            />
+          </LimitSection>
+
           {validation ? (
             <Alert variant="destructive">
               <AlertTriangle className="h-4 w-4" />
@@ -450,6 +525,7 @@ export function EditResourceLimitsDialog({
 const MEMORY_PRESETS = [256, 512, 1024, 2048, 4096]
 const SWAP_PRESETS = [128, 256, 512, 1024]
 const CPU_PRESETS = [0.25, 0.5, 1, 2, 4]
+const SHM_PRESETS = [64, 128, 256, 512, 1024]
 
 function formatCores(n: number): string {
   return n % 1 === 0 ? n.toString() : n.toFixed(2).replace(/\.?0+$/, '')

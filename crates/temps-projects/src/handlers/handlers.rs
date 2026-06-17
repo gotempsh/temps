@@ -231,6 +231,14 @@ pub async fn create_project(
         // Continue with the operation even if audit logging fails
     }
 
+    state.telemetry.report(
+        temps_core::telemetry::TelemetryEvent::new(
+            temps_core::telemetry::TelemetryEventKind::ProjectCreated,
+        )
+        .with("source_type", new_project.source_type.to_string())
+        .with_opt("preset", new_project.preset.clone()),
+    );
+
     Ok(Json(ProjectResponse::map_from_project(new_project)))
 }
 
@@ -608,6 +616,15 @@ pub async fn update_automatic_deploy(
             error!("Error updating automatic deployment setting: {:?}", e);
             Problem::from(e)
         })?;
+
+    // Anonymous telemetry: only when auto-deploy is turned ON (adoption signal).
+    if request.automatic_deploy {
+        state
+            .telemetry
+            .report(temps_core::telemetry::TelemetryEvent::new(
+                temps_core::telemetry::TelemetryEventKind::AutoDeployEnabled,
+            ));
+    }
 
     Ok(Json(ProjectResponse::map_from_project(updated_project)))
 }

@@ -191,6 +191,16 @@ impl TempsPlugin for BackupPlugin {
                 info!("BackupJobProcessor started");
             }
 
+            let telemetry = context
+                .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
+                .unwrap_or_else(|| {
+                    std::sync::Arc::new(temps_core::telemetry::NoopTelemetryReporter)
+                });
+
+            // Thread the telemetry reporter into the pg upgrade service so
+            // orchestrators it spawns can emit PgMajorUpgradeCompleted.
+            pg_upgrade_service.set_telemetry(Arc::clone(&telemetry));
+
             let backup_app_state_inner = create_backup_app_state(
                 backup_service,
                 restore_service,
@@ -198,6 +208,7 @@ impl TempsPlugin for BackupPlugin {
                 pg_upgrade_service,
                 db.clone(),
                 Arc::clone(&executor),
+                telemetry,
             );
 
             context.register_service(backup_app_state_inner);

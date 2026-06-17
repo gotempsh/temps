@@ -74,11 +74,15 @@ impl TempsPlugin for ProjectsPlugin {
         let custom_domain_service = context.require_service::<CustomDomainService>();
         let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
         let template_service = context.require_service::<TemplateService>();
+        let telemetry = context
+            .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
+            .unwrap_or_else(|| Arc::new(temps_core::telemetry::NoopTelemetryReporter));
         let app_state = Arc::new(crate::handlers::AppState {
             project_service,
             custom_domain_service,
             audit_service,
             template_service,
+            telemetry,
         });
         let routes = crate::handlers::configure_routes().with_state(app_state);
         Some(PluginRoutes::new(routes))

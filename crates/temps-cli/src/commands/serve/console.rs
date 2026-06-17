@@ -27,6 +27,7 @@ use temps_blob::BlobPlugin;
 use temps_config::ConfigPlugin;
 use temps_config::ServerConfig;
 use temps_core::plugin::{PluginManager, TempsPlugin};
+use temps_telemetry::TelemetryPlugin;
 // `TempsPlugin` is used both directly (extra_plugins field) and through
 // `dyn TempsPlugin` in `ConsoleApiParams`.
 use temps_core::templates::TemplateService;
@@ -78,6 +79,45 @@ use utoipa_swagger_ui::SwaggerUi;
 static WEBSITE: Dir = include_dir!("$CARGO_MANIFEST_DIR/dist");
 
 /// Ensure the system user (id=0) exists in the database.
+/// Emit the anonymous `instance_started` telemetry event with non-identifying
+/// depth-of-usage counts (number of projects, environments, managed services,
+/// and worker nodes). These counts are a strong retention signal without
+/// revealing anything about *what* the operator is running.
+///
+/// Fully best-effort: any count query failure is swallowed (the count is simply
+/// omitted) and `report()` itself is fire-and-forget.
+async fn report_instance_started(
+    reporter: &dyn temps_core::telemetry::TelemetryReporter,
+    db: &sea_orm::DatabaseConnection,
+) {
+    use sea_orm::PaginatorTrait;
+    use temps_core::telemetry::{TelemetryEvent, TelemetryEventKind};
+
+    // Each count is independent and optional — a failure on one doesn't block
+    // the others or the event itself.
+    let project_count = temps_entities::projects::Entity::find()
+        .count(db)
+        .await
+        .ok();
+    let environment_count = temps_entities::environments::Entity::find()
+        .count(db)
+        .await
+        .ok();
+    let service_count = temps_entities::external_services::Entity::find()
+        .count(db)
+        .await
+        .ok();
+    let node_count = temps_entities::nodes::Entity::find().count(db).await.ok();
+
+    let event = TelemetryEvent::new(TelemetryEventKind::InstanceStarted)
+        .with_opt("project_count", project_count.map(|c| c as i64))
+        .with_opt("environment_count", environment_count.map(|c| c as i64))
+        .with_opt("service_count", service_count.map(|c| c as i64))
+        .with_opt("node_count", node_count.map(|c| c as i64));
+
+    reporter.report(event);
+}
+
 /// This user is referenced by webhook-created resources (e.g., GitHub App installations)
 /// that don't have an authenticated user context.
 async fn ensure_system_user(db: &sea_orm::DatabaseConnection) -> anyhow::Result<()> {
@@ -938,6 +978,16 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let config_plugin = Box::new(ConfigPlugin::new(config.clone()));
     plugin_manager.register_plugin(config_plugin);
 
+    // 1.5. TelemetryPlugin - registers the anonymous telemetry reporter
+    // (depends only on ServerConfig for the data dir). Registered early so
+    // every later plugin can require the Arc<dyn TelemetryReporter>.
+    debug!("Registering TelemetryPlugin");
+    let telemetry_plugin = Box::new(TelemetryPlugin::new(
+        config.clone(),
+        env!("CARGO_PKG_VERSION"),
+    ));
+    plugin_manager.register_plugin(telemetry_plugin);
+
     // 2. QueuePlugin - registers the pre-created job queue into the service context
     debug!("Registering QueuePlugin");
     let queue_plugin = Box::new(QueuePlugin::new(queue));
@@ -1222,6 +1272,17 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
 
     // Check if any users exist, if not prompt for admin email
     let service_context = plugin_manager.service_context();
+
+    // Emit the anonymous `instance_started` telemetry event now that the
+    // service registry is populated. Entirely best-effort: a missing reporter,
+    // a failed count query, or a dead endpoint must never affect startup.
+    if let Some(reporter) =
+        service_context.get_service::<dyn temps_core::telemetry::TelemetryReporter>()
+    {
+        if reporter.is_enabled() {
+            report_instance_started(reporter.as_ref(), db.as_ref()).await;
+        }
+    }
     if let Some(user_service) = service_context.get_service::<temps_auth::UserService>() {
         // Always ensure the system user (id=0) exists — needed for webhook-created
         // resources (e.g., GitHub App installations) that reference user_id=0
@@ -1597,11 +1658,15 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let node_service = Arc::new(NodeService::new(db.clone()));
     let encryption_service_for_nodes =
         service_context.require_service::<temps_core::EncryptionService>();
+    let node_telemetry = service_context
+        .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
+        .unwrap_or_else(|| Arc::new(temps_core::telemetry::NoopTelemetryReporter));
     let node_app_state = Arc::new(NodeAppState {
         node_service: node_service.clone(),
         db: db.clone(),
         config_service: config_service_for_nodes,
         encryption_service: encryption_service_for_nodes,
+        telemetry: node_telemetry,
     });
     let node_routes =
         temps_deployments::handlers::nodes::configure_routes().with_state(node_app_state);

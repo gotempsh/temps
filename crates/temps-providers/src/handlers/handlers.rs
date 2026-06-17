@@ -501,6 +501,21 @@ async fn create_service(
                 error!("Failed to create audit log: {}", e);
             }
 
+            app_state.telemetry.report(
+                temps_core::telemetry::TelemetryEvent::new(
+                    temps_core::telemetry::TelemetryEventKind::ServiceCreated,
+                )
+                .with("engine", service.service_type.to_string()),
+            );
+            if service.topology == "cluster" {
+                app_state.telemetry.report(
+                    temps_core::telemetry::TelemetryEvent::new(
+                        temps_core::telemetry::TelemetryEventKind::ServiceClusterCreated,
+                    )
+                    .with("engine", service.service_type.to_string()),
+                );
+            }
+
             Ok((StatusCode::CREATED, Json(service)))
         }
         Err(e) => {

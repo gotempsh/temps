@@ -13,6 +13,7 @@ pub struct DomainAppState {
     /// DNS provider service for automatic DNS record setup (optional)
     pub dns_provider_service: Option<Arc<DnsProviderService>>,
     pub audit_service: Arc<dyn AuditLogger>,
+    pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
 }
 
 pub fn create_domain_app_state(
@@ -20,6 +21,7 @@ pub fn create_domain_app_state(
     repository: Arc<dyn CertificateRepository>,
     domain_service: Arc<DomainService>,
     audit_service: Arc<dyn AuditLogger>,
+    telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
 ) -> Arc<DomainAppState> {
     Arc::new(DomainAppState {
         tls_service,
@@ -27,6 +29,7 @@ pub fn create_domain_app_state(
         domain_service,
         dns_provider_service: None,
         audit_service,
+        telemetry,
     })
 }
 
@@ -36,6 +39,7 @@ pub fn create_domain_app_state_with_dns(
     domain_service: Arc<DomainService>,
     dns_provider_service: Arc<DnsProviderService>,
     audit_service: Arc<dyn AuditLogger>,
+    telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
 ) -> Arc<DomainAppState> {
     Arc::new(DomainAppState {
         tls_service,
@@ -43,6 +47,7 @@ pub fn create_domain_app_state_with_dns(
         domain_service,
         dns_provider_service: Some(dns_provider_service),
         audit_service,
+        telemetry,
     })
 }
 

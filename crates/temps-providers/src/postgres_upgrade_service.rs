@@ -7,12 +7,13 @@
 //! the error surfaces as `ConcurrentUpgrade` (409) instead of a raw
 //! Postgres unique-violation.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use bollard::Docker;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
 };
+use temps_core::telemetry::{NoopTelemetryReporter, TelemetryReporter};
 use temps_entities::{external_services, postgres_major_upgrades};
 use temps_logs::LogService;
 use uuid::Uuid;
@@ -70,6 +71,9 @@ pub struct PostgresUpgradeService {
     backup_provider: Arc<dyn PreUpgradeBackupProvider>,
     lifecycle: Arc<dyn PostgresContainerLifecycle>,
     log_service: Arc<LogService>,
+    /// Late-bound anonymous telemetry reporter. Set via [`Self::set_telemetry`]
+    /// after construction. Falls back to no-op when unset.
+    telemetry: OnceLock<Arc<dyn TelemetryReporter>>,
 }
 
 impl PostgresUpgradeService {
@@ -86,7 +90,21 @@ impl PostgresUpgradeService {
             backup_provider,
             lifecycle,
             log_service,
+            telemetry: OnceLock::new(),
         }
+    }
+
+    /// Attach a telemetry reporter so orchestrators spawned by this service
+    /// can emit anonymous product events on completion.
+    pub fn set_telemetry(&self, reporter: Arc<dyn TelemetryReporter>) {
+        let _ = self.telemetry.set(reporter);
+    }
+
+    fn telemetry(&self) -> Arc<dyn TelemetryReporter> {
+        self.telemetry
+            .get()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(NoopTelemetryReporter))
     }
 
     /// Validate the request, insert the upgrade row, and spawn the
@@ -152,6 +170,7 @@ impl PostgresUpgradeService {
             self.lifecycle.clone(),
             self.log_service.clone(),
         );
+        orchestrator.set_telemetry(self.telemetry());
         let upgrade_id = inserted.id;
         let log_id_for_err = log_id.clone();
         let log_service = self.log_service.clone();
@@ -248,6 +267,7 @@ impl PostgresUpgradeService {
             self.lifecycle.clone(),
             self.log_service.clone(),
         );
+        orchestrator.set_telemetry(self.telemetry());
         let log_service = self.log_service.clone();
         let db_for_err = self.db.clone();
         tokio::spawn(async move {
@@ -364,6 +384,7 @@ impl PostgresUpgradeService {
             self.lifecycle.clone(),
             self.log_service.clone(),
         );
+        orchestrator.set_telemetry(self.telemetry());
         orchestrator.rollback(upgrade_id).await
     }
 
@@ -378,6 +399,7 @@ impl PostgresUpgradeService {
             self.lifecycle.clone(),
             self.log_service.clone(),
         );
+        orchestrator.set_telemetry(self.telemetry());
         orchestrator.sweep_expired_rollback_volumes().await
     }
 
@@ -423,6 +445,7 @@ impl PostgresUpgradeService {
                 self.lifecycle.clone(),
                 self.log_service.clone(),
             );
+            orchestrator.set_telemetry(self.telemetry());
             let log_service = self.log_service.clone();
             let log_id_for_err = log_id.clone();
             let db_for_err = self.db.clone();

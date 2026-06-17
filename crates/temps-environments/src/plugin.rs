@@ -68,6 +68,9 @@ impl TempsPlugin for EnvironmentsPlugin {
         let on_demand_waker = context.get_service::<dyn temps_core::OnDemandWaker>();
         let integration_env_provider =
             context.get_service::<dyn temps_core::ProjectEnvVarsProvider>();
+        let telemetry = context
+            .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
+            .unwrap_or_else(|| std::sync::Arc::new(temps_core::telemetry::NoopTelemetryReporter));
 
         let app_state = crate::handlers::create_environment_app_state(
             environment_service,
@@ -77,6 +80,7 @@ impl TempsPlugin for EnvironmentsPlugin {
             deployment_service,
             on_demand_waker,
             integration_env_provider,
+            telemetry,
         );
 
         let routes = crate::handlers::configure_routes().with_state(app_state);

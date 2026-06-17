@@ -24,6 +24,7 @@ use crate::services::{
 /// Application state trait for status page routes
 pub trait StatusPageAppState: Send + Sync + 'static {
     fn status_page_service(&self) -> &StatusPageService;
+    fn telemetry(&self) -> &std::sync::Arc<dyn temps_core::TelemetryReporter>;
 }
 
 /// OpenAPI documentation for status page endpoints
@@ -171,13 +172,19 @@ where
     T: StatusPageAppState,
 {
     permission_guard!(auth, StatusPageCreate);
-    app_state
+    let monitor = app_state
         .status_page_service()
         .monitor_service()
         .create_monitor(project_id, request)
         .await
-        .map(|monitor| (StatusCode::CREATED, Json(monitor)))
-        .map_err(map_error)
+        .map_err(map_error)?;
+
+    app_state.telemetry().report(
+        temps_core::TelemetryEvent::new(temps_core::TelemetryEventKind::StatusPagePublished)
+            .with("monitor_type", monitor.monitor_type.clone()),
+    );
+
+    Ok((StatusCode::CREATED, Json(monitor)))
 }
 
 /// List monitors for a project

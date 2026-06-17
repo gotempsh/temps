@@ -565,6 +565,17 @@ async fn provision_domain(
                     "Certificate successfully provisioned via DNS-01 for {}",
                     domain
                 );
+                app_state.telemetry.report(
+                    temps_core::telemetry::TelemetryEvent::new(
+                        temps_core::telemetry::TelemetryEventKind::SslCertificateIssued,
+                    )
+                    .with("success", true)
+                    .with(
+                        "verification_method",
+                        certificate.verification_method.clone(),
+                    )
+                    .with("is_wildcard", certificate.is_wildcard),
+                );
                 Ok((
                     StatusCode::OK,
                     Json(ProvisionResponse::Complete(DomainResponse::from(
@@ -619,6 +630,17 @@ async fn provision_domain(
     {
         Ok(certificate) => {
             info!("Certificate successfully provisioned for {}", domain);
+            app_state.telemetry.report(
+                temps_core::telemetry::TelemetryEvent::new(
+                    temps_core::telemetry::TelemetryEventKind::SslCertificateIssued,
+                )
+                .with("success", true)
+                .with(
+                    "verification_method",
+                    certificate.verification_method.clone(),
+                )
+                .with("is_wildcard", certificate.is_wildcard),
+            );
             Ok((
                 StatusCode::OK,
                 Json(ProvisionResponse::Complete(DomainResponse::from(
@@ -815,6 +837,15 @@ async fn finalize_order(
         })?;
 
     info!("Order finalized successfully for domain: {}", domain.domain);
+
+    app_state.telemetry.report(
+        temps_core::telemetry::TelemetryEvent::new(
+            temps_core::telemetry::TelemetryEventKind::SslCertificateIssued,
+        )
+        .with("success", true)
+        .with("verification_method", domain.verification_method.clone())
+        .with("is_wildcard", domain.is_wildcard),
+    );
 
     // Audit log
     let audit = DomainAudit {
@@ -1214,6 +1245,14 @@ async fn renew_domain(
             domain
         );
         if let Some(renewed) = app_state.domain_service.get_domain(&domain).await? {
+            app_state.telemetry.report(
+                temps_core::telemetry::TelemetryEvent::new(
+                    temps_core::telemetry::TelemetryEventKind::SslCertificateIssued,
+                )
+                .with("success", true)
+                .with("verification_method", renewed.verification_method.clone())
+                .with("is_wildcard", renewed.is_wildcard),
+            );
             return Ok((
                 StatusCode::OK,
                 Json(ProvisionResponse::Complete(DomainResponse::from(renewed))),
@@ -1232,6 +1271,14 @@ async fn renew_domain(
             info!(
                 "Certificate successfully renewed for HTTP-01 domain: {}",
                 domain
+            );
+            app_state.telemetry.report(
+                temps_core::telemetry::TelemetryEvent::new(
+                    temps_core::telemetry::TelemetryEventKind::SslCertificateIssued,
+                )
+                .with("success", true)
+                .with("verification_method", renewed.verification_method.clone())
+                .with("is_wildcard", renewed.is_wildcard),
             );
             Ok((
                 StatusCode::OK,

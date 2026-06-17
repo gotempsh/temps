@@ -40,6 +40,7 @@ pub struct AppState {
     pub route_table: Arc<CachedPeerTable>,
     pub ip_address_service: Arc<temps_geo::IpAddressService>,
     pub cookie_crypto: Arc<temps_core::CookieCrypto>,
+    pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
 }
 
 /// Get event counts with filtering
@@ -775,6 +776,11 @@ pub async fn record_event_metrics(
                 environment_id,
                 deployment_id
             );
+            state
+                .telemetry
+                .report(temps_core::telemetry::TelemetryEvent::new(
+                    temps_core::telemetry::TelemetryEventKind::AnalyticsFirstEventReceived,
+                ));
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => {
@@ -896,6 +902,11 @@ pub async fn record_console_event(
         "Console event recorded: {} for project {} env={}",
         payload.event_name, project_id, payload.environment_id
     );
+    state
+        .telemetry
+        .report(temps_core::telemetry::TelemetryEvent::new(
+            temps_core::telemetry::TelemetryEventKind::AnalyticsFirstEventReceived,
+        ));
 
     Ok(StatusCode::OK)
 }
@@ -1201,6 +1212,7 @@ mod tests {
             route_table,
             ip_address_service,
             cookie_crypto: cookie_crypto.clone(),
+            telemetry: Arc::new(temps_core::telemetry::NoopTelemetryReporter),
         });
 
         let auth_middleware = middleware::from_fn(
@@ -1598,6 +1610,7 @@ mod tests {
             route_table,
             ip_address_service,
             cookie_crypto,
+            telemetry: Arc::new(temps_core::telemetry::NoopTelemetryReporter),
         });
 
         // No auth middleware — should return 401

@@ -267,6 +267,9 @@ impl TempsPlugin for ErrorTrackingPlugin {
         // Public: Sentry/OTLP ingestion (called by apps with DSN tokens)
         let ip_address_service = context.get_service::<temps_geo::IpAddressService>();
         let sentry_db = context.get_service::<sea_orm::DatabaseConnection>();
+        let telemetry = context
+            .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
+            .unwrap_or_else(|| Arc::new(temps_core::telemetry::NoopTelemetryReporter));
 
         let sentry_state = Arc::new(crate::sentry::handlers::AppState {
             sentry_provider: sentry_provider.clone(),
@@ -274,6 +277,7 @@ impl TempsPlugin for ErrorTrackingPlugin {
             audit_service: audit_service.clone(),
             ip_address_service,
             db: sentry_db,
+            telemetry,
         });
         let sentry_routes = crate::sentry::handlers::configure_routes().with_state(sentry_state);
 

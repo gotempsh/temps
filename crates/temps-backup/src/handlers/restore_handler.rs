@@ -282,6 +282,15 @@ async fn start_restore(
         .await
         .map_err(Problem::from)?;
 
+    // Fire-and-forget anonymous telemetry for PITR restores.
+    if matches!(request.mode, RestoreRequestMode::Pitr { .. }) {
+        app_state
+            .telemetry
+            .report(temps_core::telemetry::TelemetryEvent::new(
+                temps_core::telemetry::TelemetryEventKind::PitrRestoreTriggered,
+            ));
+    }
+
     // Audit — the URL id is the TARGET service.
     let target_service = temps_entities::external_services::Entity::find_by_id(id)
         .one(app_state.db.as_ref())

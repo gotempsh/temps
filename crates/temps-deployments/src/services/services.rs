@@ -95,6 +95,9 @@ pub struct DeploymentService {
     docker_log_service: Arc<temps_logs::DockerLogService>,
     deployer: Arc<dyn temps_deployer::ContainerDeployer>,
     encryption_service: Arc<temps_core::EncryptionService>,
+    /// Anonymous product telemetry reporter (late-bound, optional). Set via
+    /// [`Self::set_telemetry`]; defaults to a no-op when unset.
+    telemetry: std::sync::OnceLock<Arc<dyn temps_core::telemetry::TelemetryReporter>>,
 }
 
 impl DeploymentService {
@@ -143,7 +146,22 @@ impl DeploymentService {
             docker_log_service,
             deployer,
             encryption_service,
+            telemetry: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Set the anonymous telemetry reporter used to emit deploy-funnel events
+    /// (currently `rollback_triggered`).
+    pub fn set_telemetry(&self, reporter: Arc<dyn temps_core::telemetry::TelemetryReporter>) {
+        let _ = self.telemetry.set(reporter);
+    }
+
+    /// The telemetry reporter, or a no-op when none has been wired.
+    fn telemetry(&self) -> Arc<dyn temps_core::telemetry::TelemetryReporter> {
+        self.telemetry
+            .get()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(temps_core::telemetry::NoopTelemetryReporter))
     }
     pub async fn get_filtered_container_logs(
         &self,
@@ -1194,6 +1212,12 @@ impl DeploymentService {
             "Created rollback deployment #{} (rolling back to #{}, image: {})",
             rollback_deployment_id, deployment_id, image_name
         );
+
+        // Anonymous telemetry: a rollback was initiated. No identifying props.
+        self.telemetry()
+            .report(temps_core::telemetry::TelemetryEvent::new(
+                temps_core::telemetry::TelemetryEventKind::RollbackTriggered,
+            ));
 
         // Check if preset is static - if so, just update environment without deploying
         if preset.project_type() == temps_presets::ProjectType::Static {
@@ -3785,6 +3809,7 @@ mod tests {
             docker_log_service,
             deployer,
             encryption_service: create_test_encryption_service(),
+            telemetry: std::sync::OnceLock::new(),
         }
     }
 
@@ -4018,6 +4043,7 @@ mod tests {
             docker_log_service,
             deployer,
             encryption_service: create_test_encryption_service(),
+            telemetry: std::sync::OnceLock::new(),
         }
     }
 

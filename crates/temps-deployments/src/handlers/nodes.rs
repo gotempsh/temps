@@ -35,6 +35,8 @@ pub struct NodeAppState {
     pub db: Arc<DatabaseConnection>,
     pub config_service: Arc<ConfigService>,
     pub encryption_service: Arc<temps_core::EncryptionService>,
+    /// Anonymous product telemetry reporter (worker_node_joined event).
+    pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -685,6 +687,15 @@ async fn register_node(
         .map_err(Problem::from)?;
 
     info!(node_id = node.id, name = %node.name, "Node registered successfully");
+
+    // Anonymous telemetry: a worker node joined. Only the non-identifying role
+    // label is sent (e.g. "worker") — never the node name, address, or keys.
+    app_state.telemetry.report(
+        temps_core::telemetry::TelemetryEvent::new(
+            temps_core::telemetry::TelemetryEventKind::WorkerNodeJoined,
+        )
+        .with("role", node.role.clone()),
+    );
 
     // ── Multi-host networking: best-effort overlay setup ──
     //
@@ -2186,6 +2197,7 @@ mod tests {
             db,
             config_service,
             encryption_service,
+            telemetry: Arc::new(temps_core::telemetry::NoopTelemetryReporter),
         });
         configure_routes().with_state(app_state)
     }

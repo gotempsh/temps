@@ -89,6 +89,12 @@ pub async fn create_custom_domain(
     // Fetch additional info for response
     let domain_with_info = get_domain_with_info(&state, custom_domain).await?;
 
+    state
+        .telemetry
+        .report(temps_core::telemetry::TelemetryEvent::new(
+            temps_core::telemetry::TelemetryEventKind::CustomDomainAdded,
+        ));
+
     Ok((
         StatusCode::CREATED,
         Json(CustomDomainResponse::from(domain_with_info)),

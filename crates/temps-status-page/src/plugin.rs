@@ -211,19 +211,28 @@ impl TempsPlugin for StatusPagePlugin {
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         let status_page_service = context.require_service::<StatusPageService>();
+        let telemetry = context
+            .get_service::<dyn temps_core::TelemetryReporter>()
+            .unwrap_or_else(|| Arc::new(temps_core::telemetry::NoopTelemetryReporter));
 
         struct AppState {
             status_page_service: Arc<StatusPageService>,
+            telemetry: Arc<dyn temps_core::TelemetryReporter>,
         }
 
         impl StatusPageAppState for AppState {
             fn status_page_service(&self) -> &StatusPageService {
                 &self.status_page_service
             }
+
+            fn telemetry(&self) -> &Arc<dyn temps_core::TelemetryReporter> {
+                &self.telemetry
+            }
         }
 
         let app_state = Arc::new(AppState {
             status_page_service,
+            telemetry,
         });
 
         let routes = create_router().with_state(app_state);

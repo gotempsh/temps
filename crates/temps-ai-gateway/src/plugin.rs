@@ -53,11 +53,18 @@ impl TempsPlugin for AiGatewayPlugin {
 
             let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
 
+            let telemetry = context
+                .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
+                .unwrap_or_else(|| {
+                    std::sync::Arc::new(temps_core::telemetry::NoopTelemetryReporter)
+                });
+
             let app_state = create_ai_gateway_app_state(
                 gateway_service,
                 provider_key_service,
                 usage_service,
                 audit_service,
+                telemetry,
             )
             .await;
             context.register_service(app_state);

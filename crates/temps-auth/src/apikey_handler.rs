@@ -27,6 +27,8 @@ pub struct ListApiKeysQuery {
 
 pub struct ApiKeyState {
     pub api_key_service: Arc<ApiKeyService>,
+    /// Anonymous product telemetry reporter
+    pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
 }
 
 #[utoipa::path(
@@ -53,14 +55,17 @@ pub async fn create_api_key(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ApiKeysCreate);
 
-    match state
+    let api_key = state
         .api_key_service
         .create_api_key(auth.user_id(), request.into())
         .await
-    {
-        Ok(api_key) => Ok((StatusCode::CREATED, Json(api_key))),
-        Err(e) => Err(e.to_problem()),
-    }
+        .map_err(|e| e.to_problem())?;
+
+    state.telemetry.report(temps_core::TelemetryEvent::new(
+        temps_core::TelemetryEventKind::ApiKeyCreated,
+    ));
+
+    Ok((StatusCode::CREATED, Json(api_key)))
 }
 
 #[utoipa::path(
