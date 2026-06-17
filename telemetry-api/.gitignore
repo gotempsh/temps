@@ -1,2 +1,5 @@
 .env
 node_modules/
+# GeoLite2 DB is provisioned at build/deploy time, never committed (MaxMind
+# license + size). Place GeoLite2-Country.mmdb (or a City DB) here locally.
+data/

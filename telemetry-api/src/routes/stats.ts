@@ -107,5 +107,26 @@ export function createStatsRoutes(pool: Pool) {
         cohorts,
       });
     },
+
+    // GET /v1/stats/countries — distinct active instances per country (30d).
+    // Uses the denormalized instance-day table; "unknown" buckets instances
+    // with no resolvable country (private IP, missing geo DB, etc.).
+    async getCountries(_req: Request): Promise<Response> {
+      const { rows } = await pool.query<{ country: string | null; instances: string }>(`
+        SELECT country, COUNT(DISTINCT anonymous_id)::text AS instances
+        FROM telemetry_instance_days
+        WHERE day >= CURRENT_DATE - INTERVAL '30 days'
+        GROUP BY country
+        ORDER BY instances DESC
+      `);
+
+      return Response.json({
+        window: "last_30_days",
+        countries: rows.map((r) => ({
+          country: r.country ?? "unknown",
+          instances: parseInt(r.instances, 10),
+        })),
+      });
+    },
   };
 }

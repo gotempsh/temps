@@ -15,6 +15,10 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY package.json bun.lock tsconfig.json ./
 COPY src ./src
 COPY migrations ./migrations
+# GeoLite2 DB for anonymous country lookup (gitignored; provisioned locally /
+# at build). geo.ts reads GEOLITE2_COUNTRY_DB (default /app/data/...). If the
+# dir is absent the build still works and geolocation degrades to null.
+COPY data ./data
 COPY docker-entrypoint.sh ./docker-entrypoint.sh
 RUN chmod +x ./docker-entrypoint.sh
 

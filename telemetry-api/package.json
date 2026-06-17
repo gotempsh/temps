@@ -11,6 +11,7 @@
     "test": "bun test"
   },
   "dependencies": {
+    "maxmind": "^5.0.6",
     "pg": "^8.13.3"
   },
   "devDependencies": {

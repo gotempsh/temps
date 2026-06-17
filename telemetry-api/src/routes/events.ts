@@ -1,4 +1,5 @@
 import type { Pool } from "pg";
+import { countryForRequest } from "../geo.js";
 
 // Known event types — kept in lockstep with the Rust binary's
 // `TelemetryEventKind::as_str()` (temps-core/src/telemetry.rs). The validator
@@ -138,29 +139,40 @@ function parseEvent(raw: unknown): IngestBody | { error: string } {
   };
 }
 
-async function insertEvent(pool: Pool, event: IngestBody): Promise<void> {
+// `country` is the 2-letter ISO code derived from the request IP at ingest time
+// (see geo.ts). The IP itself is never passed here or stored — only the country.
+async function insertEvent(
+  pool: Pool,
+  event: IngestBody,
+  country: string | null
+): Promise<void> {
   await pool.query(
     `INSERT INTO telemetry_events
-       (anonymous_id, event_type, properties, temps_version, occurred_at)
-     VALUES ($1, $2, $3, $4, $5)`,
+       (anonymous_id, event_type, properties, temps_version, occurred_at, country)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
     [
       event.anonymous_id,
       event.event_type,
       JSON.stringify(event.properties ?? {}),
       event.temps_version ?? null,
       event.occurred_at ?? new Date().toISOString(),
+      country,
     ]
   );
 
-  // Upsert the instance-day record for cheap DAI (daily active instances) queries
+  // Upsert the instance-day record for cheap DAI (daily active instances)
+  // queries. Backfill country if it was previously null (an instance's country
+  // shouldn't change, but the first event of the day may pre-date the lookup).
   await pool.query(
-    `INSERT INTO telemetry_instance_days (anonymous_id, day, temps_version)
-     VALUES ($1, $2::date, $3)
-     ON CONFLICT (anonymous_id, day) DO NOTHING`,
+    `INSERT INTO telemetry_instance_days (anonymous_id, day, temps_version, country)
+     VALUES ($1, $2::date, $3, $4)
+     ON CONFLICT (anonymous_id, day) DO UPDATE
+       SET country = COALESCE(telemetry_instance_days.country, EXCLUDED.country)`,
     [
       event.anonymous_id,
       (event.occurred_at ?? new Date().toISOString()).slice(0, 10),
       event.temps_version ?? null,
+      country,
     ]
   );
 }
@@ -181,8 +193,11 @@ export function createEventsRoutes(pool: Pool) {
         return Response.json({ error: parsed.error }, { status: 422 });
       }
 
+      // Derive country from the request IP (never stored) for this request.
+      const country = countryForRequest(req);
+
       try {
-        await insertEvent(pool, parsed);
+        await insertEvent(pool, parsed, country);
       } catch (err) {
         console.error("[events] db insert failed:", err);
         return Response.json({ error: "internal server error" }, { status: 500 });
@@ -226,9 +241,13 @@ export function createEventsRoutes(pool: Pool) {
         return Response.json({ error: "validation failed", details: errors }, { status: 422 });
       }
 
+      // One country for the whole batch — all events in a request share the
+      // same client IP. Derived transiently; the IP is never stored.
+      const country = countryForRequest(req);
+
       try {
         // Insert all events concurrently (pool handles connection reuse)
-        await Promise.all(parsed.map((e) => insertEvent(pool, e)));
+        await Promise.all(parsed.map((e) => insertEvent(pool, e, country)));
       } catch (err) {
         console.error("[events] batch insert failed:", err);
         return Response.json({ error: "internal server error" }, { status: 500 });

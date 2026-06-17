@@ -1,6 +1,7 @@
 import { getPool } from "./db/pool.js";
 import { createEventsRoutes } from "./routes/events.js";
 import { createStatsRoutes } from "./routes/stats.js";
+import { initGeo } from "./geo.js";
 
 const PORT = parseInt(process.env.PORT ?? "4200", 10);
 
@@ -11,6 +12,9 @@ async function main() {
   await client.query("SELECT 1");
   client.release();
   console.log("[server] database connection ok");
+
+  // Load the GeoLite2-Country DB once (degrades gracefully if absent).
+  await initGeo();
 
   const events = createEventsRoutes(pool);
   const stats = createStatsRoutes(pool);
@@ -44,6 +48,9 @@ async function main() {
       }
       if (method === "GET" && path === "/v1/stats/funnel") {
         return stats.getFunnel(req);
+      }
+      if (method === "GET" && path === "/v1/stats/countries") {
+        return stats.getCountries(req);
       }
 
       return Response.json({ error: "not found" }, { status: 404 });
