@@ -36,6 +36,7 @@ interface CreateOptions {
   name?: string
   type?: string
   interval?: string
+  checkPath?: string
   environmentId?: string
   yes?: boolean
 }
@@ -84,6 +85,10 @@ export function registerMonitorsCommands(program: Command): void {
     .option('-n, --name <name>', 'Monitor name')
     .option('-t, --type <type>', 'Monitor type (http, tcp, ping)')
     .option('-i, --interval <seconds>', 'Check interval in seconds (60, 300, 600, 900, 1800)')
+    .option(
+      '--check-path <path>',
+      'HTTP health-check path (must start with "/", e.g. /api/healthz). Defaults to "/" for HTTP monitors.',
+    )
     .option('--environment-id <id>', 'Environment ID (default: 0 for production)')
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .action(createMonitorAction)
@@ -232,6 +237,13 @@ async function createMonitorAction(options: CreateOptions): Promise<void> {
     environmentId = options.environmentId ? parseInt(options.environmentId, 10) : 0
   }
 
+  // Optional custom health-check path (e.g. /api/healthz). The backend validates
+  // too, but fail fast here with a friendly message.
+  const checkPath = options.checkPath?.trim()
+  if (checkPath && !checkPath.startsWith('/')) {
+    throw new Error(`--check-path must start with "/" (got "${checkPath}")`)
+  }
+
   await withSpinner('Creating monitor...', async () => {
     const { error } = await createMonitor({
       client,
@@ -241,6 +253,7 @@ async function createMonitorAction(options: CreateOptions): Promise<void> {
         monitor_type: monitorType,
         check_interval_seconds: checkInterval,
         environment_id: environmentId,
+        ...(checkPath ? { check_path: checkPath } : {}),
       },
     })
     if (error) {

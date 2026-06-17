@@ -200,6 +200,12 @@ pub struct DeploymentJobConfig {
     /// running status is verified). Set to `Some("/")` or a custom path to
     /// enable HTTP health checks after the container starts.
     pub health_check_path: Option<String>,
+    /// Explicit deploy-time health-check path override. When `Some`, this wins
+    /// over both `.temps.yaml` `health.path` (build job output) and the default
+    /// `health_check_path`. Used by image/static deploys that can't read
+    /// `.temps.yaml`. `None` means "no deploy-time override" (fall back to the
+    /// usual `.temps.yaml`/default resolution).
+    pub health_check_path_override: Option<String>,
     pub ingress_enabled: bool,
     pub ingress_host: Option<String>,
     /// Maximum time to wait for the application to become ready (container
@@ -236,6 +242,7 @@ impl Default for DeploymentJobConfig {
             secrets: HashMap::new(),
             resources: ResourceUsage::default(),
             health_check_path: Some("/".to_string()),
+            health_check_path_override: None,
             ingress_enabled: false,
             ingress_host: None,
             health_check_timeout_secs: 300,
@@ -1350,9 +1357,16 @@ impl DeployImageJob {
         // the container running status from Phase 1 is sufficient (useful for
         // rollbacks where the image was already verified, or services without
         // an HTTP endpoint).
-        // .temps.yaml health override takes priority over the default config.
-        let effective_health_path = health_check_override
-            .map(String::from)
+        // Precedence (highest first):
+        //   1. explicit deploy-time override (config.health_check_path_override) —
+        //      set by image/static deploys that can't read .temps.yaml
+        //   2. .temps.yaml health.path (build job output, passed as health_check_override)
+        //   3. default config.health_check_path ("/" unless explicitly cleared)
+        let effective_health_path = self
+            .config
+            .health_check_path_override
+            .clone()
+            .or_else(|| health_check_override.map(String::from))
             .or_else(|| self.config.health_check_path.clone());
         if let Some(ref health_path) = effective_health_path {
             self.log(
@@ -1646,6 +1660,33 @@ impl WorkflowTask for DeployImageJob {
             .await?;
         }
 
+        // An explicit deploy-time override (set by image/static deploys that can't
+        // read .temps.yaml) wins over the .temps.yaml value.
+        if let Some(ref override_path) = self.config.health_check_path_override {
+            self.log(
+                &context,
+                format!(
+                    "Using deploy-time health check path override: {}",
+                    override_path
+                ),
+            )
+            .await?;
+        }
+
+        // Persist the effective health-check path as this job's output so
+        // MarkDeploymentCompleteJob can propagate it to the environment's monitor
+        // (its check_path). For image/static deploys there is no build job output,
+        // so this is the only place the path becomes available downstream.
+        let effective_health_path = self
+            .config
+            .health_check_path_override
+            .clone()
+            .or_else(|| health_override.clone())
+            .or_else(|| self.config.health_check_path.clone());
+        if let Some(ref effective) = effective_health_path {
+            context.set_output(&self.job_id, "health_check_path", effective)?;
+        }
+
         // Deploy the image (logs written in real-time)
         let deployment_output = self
             .deploy_image(&image_output, &context, health_override)
@@ -1874,6 +1915,15 @@ impl DeployImageJobBuilder {
     /// or services without an HTTP endpoint.
     pub fn health_check_path(mut self, path: Option<String>) -> Self {
         self.config.health_check_path = path;
+        self
+    }
+
+    /// Set an explicit deploy-time health-check path override. When `Some`, it
+    /// takes priority over both `.temps.yaml` `health.path` and the default
+    /// `health_check_path`. Used by image/static deploys that can't read
+    /// `.temps.yaml`. Passing `None` leaves the usual resolution untouched.
+    pub fn health_check_path_override(mut self, path: Option<String>) -> Self {
+        self.config.health_check_path_override = path;
         self
     }
 
@@ -2222,6 +2272,50 @@ mod tests {
         assert_eq!(job.config.namespace, "production");
         assert_eq!(job.config.replicas, 3);
         assert_eq!(job.depends_on(), vec!["build_image".to_string()]);
+    }
+
+    #[test]
+    fn test_health_check_path_override_default_is_none() {
+        // By default there is no deploy-time override; only the standard
+        // health_check_path ("/") is set.
+        let job = DeployImageJobBuilder::new()
+            .job_id("d".to_string())
+            .build_job_id("build_image".to_string())
+            .target(DeploymentTarget::Docker {
+                registry_url: "local".to_string(),
+                network: None,
+            })
+            .service_name("app".to_string())
+            .build(Arc::new(TrackingMockContainerDeployer::new()))
+            .unwrap();
+
+        assert_eq!(job.config.health_check_path_override, None);
+        assert_eq!(job.config.health_check_path, Some("/".to_string()));
+    }
+
+    #[test]
+    fn test_health_check_path_override_flows_to_config() {
+        // An explicit deploy-time override is captured separately so it can win
+        // over .temps.yaml at execution time.
+        let job = DeployImageJobBuilder::new()
+            .job_id("d".to_string())
+            .build_job_id("build_image".to_string())
+            .target(DeploymentTarget::Docker {
+                registry_url: "local".to_string(),
+                network: None,
+            })
+            .service_name("app".to_string())
+            .health_check_path_override(Some("/api/healthz".to_string()))
+            .build(Arc::new(TrackingMockContainerDeployer::new()))
+            .unwrap();
+
+        assert_eq!(
+            job.config.health_check_path_override,
+            Some("/api/healthz".to_string())
+        );
+        // The default standard path is left untouched; precedence is resolved at
+        // execution time (override > .temps.yaml > default).
+        assert_eq!(job.config.health_check_path, Some("/".to_string()));
     }
 
     #[tokio::test]

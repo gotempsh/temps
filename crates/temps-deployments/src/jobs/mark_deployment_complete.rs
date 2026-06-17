@@ -853,12 +853,23 @@ impl MarkDeploymentCompleteJob {
             None
         };
 
-        // Extract health_check_path from any build job output in the workflow context
-        let health_check_path = context.outputs.values().find_map(|job_outputs| {
-            job_outputs
-                .get("health_check_path")
-                .and_then(|v| serde_json::from_value::<String>(v.clone()).ok())
-        });
+        // Resolve the health_check_path to propagate to the environment's uptime
+        // monitor (its check_path). Precedence:
+        //   1. Explicit deploy-time override on the deployment record's metadata —
+        //      set by image/static deploys that can't read .temps.yaml. This wins.
+        //   2. Any job output named "health_check_path" (build job from .temps.yaml,
+        //      or the deploy job's resolved effective path).
+        let health_check_path = deployment
+            .metadata
+            .as_ref()
+            .and_then(|m| m.health_check_path.clone())
+            .or_else(|| {
+                context.outputs.values().find_map(|job_outputs| {
+                    job_outputs
+                        .get("health_check_path")
+                        .and_then(|v| serde_json::from_value::<String>(v.clone()).ok())
+                })
+            });
 
         let event = Job::DeploymentSucceeded(temps_core::DeploymentSucceededJob {
             deployment_id: self.deployment_id,

@@ -32,6 +32,7 @@ interface DeployStaticOptions {
   wait?: boolean
   yes?: boolean
   metadata?: string
+  healthCheckPath?: string
   timeout?: string
 }
 
@@ -311,9 +312,16 @@ export async function deployStatic(options: DeployStaticOptions): Promise<void> 
 
     const deployUrl = `${apiUrl}/projects/${projectData.id}/environments/${environmentId}/deploy/static`
 
+    const healthCheckPath = options.healthCheckPath?.trim()
+    if (healthCheckPath && !healthCheckPath.startsWith('/')) {
+      failSpinner('--health-check-path must start with "/" (e.g. /api/healthz)')
+      return
+    }
+
     const deployBody = {
       static_bundle_id: bundle.id,
       metadata: options.metadata ? JSON.parse(options.metadata) : undefined,
+      ...(healthCheckPath ? { health_check_path: healthCheckPath } : {}),
     }
 
     const deployResponse = await fetch(deployUrl, {

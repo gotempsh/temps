@@ -79,6 +79,13 @@ pub struct DeployFromImageRequest {
     pub external_image_id: Option<i32>,
     /// Optional deployment metadata
     pub metadata: Option<serde_json::Value>,
+    /// Optional HTTP health-check path override (e.g. "/api/healthz").
+    /// Image deploys can't read `.temps.yaml`, so this sets the path the deployer
+    /// probes after the container starts and the path the environment's uptime
+    /// monitor checks. Must start with '/'. When omitted, defaults to "/".
+    #[serde(default)]
+    #[schema(example = "/api/healthz")]
+    pub health_check_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -87,6 +94,13 @@ pub struct DeployFromStaticRequest {
     pub static_bundle_id: i32,
     /// Optional deployment metadata
     pub metadata: Option<serde_json::Value>,
+    /// Optional HTTP health-check path override (e.g. "/api/healthz").
+    /// Static deploys can't read `.temps.yaml`, so this sets the path the deployer
+    /// probes after the container starts and the path the environment's uptime
+    /// monitor checks. Must start with '/'. When omitted, defaults to "/".
+    #[serde(default)]
+    #[schema(example = "/api/healthz")]
+    pub health_check_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -117,6 +131,58 @@ pub struct DeployFromImageUploadQuery {
     /// If not provided, a unique tag will be generated
     #[schema(example = "myapp:v1.0")]
     pub tag: Option<String>,
+    /// Optional HTTP health-check path override (e.g. "/api/healthz").
+    /// Must start with '/'. When omitted, defaults to "/".
+    #[schema(example = "/api/healthz")]
+    pub health_check_path: Option<String>,
+}
+
+/// Validate a deploy-time `health_check_path` override.
+///
+/// This value becomes both the deployer's HTTP probe path and the environment's
+/// uptime-monitor `check_path`, so it must be a safe relative path. Mirrors the
+/// status-page `validate_check_path` rules to prevent URL/header injection:
+/// - Must start with `/`
+/// - Must not contain `@` (userinfo injection) or `://` (scheme injection)
+/// - Must not contain CR, LF, NUL, or tab (request smuggling)
+/// - Capped at 2048 bytes
+///
+/// Returns a 400 `Problem` on failure.
+fn validate_health_check_path(path: &str) -> Result<(), Problem> {
+    let invalid = |detail: &str| {
+        problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Health Check Path")
+            .with_detail(detail.to_string())
+    };
+
+    if path.len() > 2048 {
+        return Err(invalid(&format!(
+            "health_check_path length {} exceeds 2048 byte limit",
+            path.len()
+        )));
+    }
+    if !path.starts_with('/') {
+        return Err(invalid("health_check_path must start with '/'"));
+    }
+    if path.contains('@') {
+        return Err(invalid(
+            "health_check_path must not contain '@' (userinfo injection)",
+        ));
+    }
+    if path.contains("://") {
+        return Err(invalid(
+            "health_check_path must not contain '://' (scheme injection)",
+        ));
+    }
+    if path
+        .chars()
+        .any(|c| c == '\r' || c == '\n' || c == '\0' || c == '\t')
+    {
+        return Err(invalid(
+            "health_check_path must not contain control characters",
+        ));
+    }
+    Ok(())
 }
 
 // Response Types
@@ -244,6 +310,11 @@ pub async fn deploy_from_image(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsCreate);
 
+    // Validate optional deploy-time health-check path override up front
+    if let Some(ref path) = req.health_check_path {
+        validate_health_check_path(path)?;
+    }
+
     // Resolve image_ref: either use provided value or fetch from external_image_id
     let (image_ref, external_image_id) = match (&req.image_ref, req.external_image_id) {
         // Both provided: use image_ref directly
@@ -364,6 +435,7 @@ pub async fn deploy_from_image(
         external_image_ref: Some(image_ref.clone()),
         external_image_id,
         deployment_source_type: Some(SourceType::DockerImage),
+        health_check_path: req.health_check_path.clone(),
         ..Default::default()
     };
 
@@ -544,6 +616,11 @@ pub async fn deploy_from_static(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsCreate);
 
+    // Validate optional deploy-time health-check path override up front
+    if let Some(ref path) = req.health_check_path {
+        validate_health_check_path(path)?;
+    }
+
     info!(
         "Deploying static bundle {} to project {} environment {}",
         req.static_bundle_id, project_id, environment_id
@@ -642,6 +719,7 @@ pub async fn deploy_from_static(
         static_bundle_id: Some(req.static_bundle_id),
         static_bundle_content_type: Some(bundle.content_type.clone()),
         deployment_source_type: Some(SourceType::StaticFiles),
+        health_check_path: req.health_check_path.clone(),
         ..Default::default()
     };
 
@@ -827,6 +905,11 @@ pub async fn deploy_from_image_upload(
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsCreate);
+
+    // Validate optional deploy-time health-check path override up front
+    if let Some(ref path) = query.health_check_path {
+        validate_health_check_path(path)?;
+    }
 
     info!(
         "Deploying from uploaded image tarball to project {} environment {}",
@@ -1033,6 +1116,7 @@ pub async fn deploy_from_image_upload(
         deployment_source_type: Some(SourceType::DockerImage),
         image_uploaded_locally: true,
         uploaded_image_id: Some(imported_image_id.clone()),
+        health_check_path: query.health_check_path.clone(),
         ..Default::default()
     };
 
@@ -1949,4 +2033,45 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             "/projects/{project_id}/static-bundles/{bundle_id}",
             get(get_static_bundle).delete(delete_static_bundle),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn health_check_path_accepts_valid_paths() {
+        assert!(validate_health_check_path("/").is_ok());
+        assert!(validate_health_check_path("/api/healthz").is_ok());
+        assert!(validate_health_check_path("/health?ready=1").is_ok());
+    }
+
+    #[test]
+    fn health_check_path_rejects_missing_leading_slash() {
+        assert!(validate_health_check_path("healthz").is_err());
+        assert!(validate_health_check_path("api/healthz").is_err());
+    }
+
+    #[test]
+    fn health_check_path_rejects_userinfo_injection() {
+        assert!(validate_health_check_path("/foo@evil.com/bar").is_err());
+    }
+
+    #[test]
+    fn health_check_path_rejects_scheme_injection() {
+        assert!(validate_health_check_path("/x://attacker.com/y").is_err());
+    }
+
+    #[test]
+    fn health_check_path_rejects_control_characters() {
+        assert!(validate_health_check_path("/foo\r\nHost: evil").is_err());
+        assert!(validate_health_check_path("/foo\tbar").is_err());
+        assert!(validate_health_check_path("/foo\0bar").is_err());
+    }
+
+    #[test]
+    fn health_check_path_rejects_overlong_path() {
+        let long = format!("/{}", "a".repeat(2048));
+        assert!(validate_health_check_path(&long).is_err());
+    }
 }

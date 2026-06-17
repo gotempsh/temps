@@ -28,6 +28,7 @@ interface DeployImageOptions {
   wait?: boolean
   yes?: boolean
   metadata?: string
+  healthCheckPath?: string
   timeout?: string
 }
 
@@ -238,6 +239,15 @@ export async function deployImage(options: DeployImageOptions): Promise<void> {
         failSpinner('Invalid metadata JSON')
         return
       }
+    }
+
+    if (options.healthCheckPath) {
+      const p = options.healthCheckPath.trim()
+      if (!p.startsWith('/')) {
+        failSpinner('--health-check-path must start with "/" (e.g. /api/healthz)')
+        return
+      }
+      deployBody.health_check_path = p
     }
 
     const deployResponse = await fetch(deployUrl, {

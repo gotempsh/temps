@@ -815,6 +815,21 @@ impl WorkflowExecutionService {
                     .log_id(db_job.log_id.clone())
                     .log_service(self.log_service.clone());
 
+                // Apply explicit deploy-time health-check path override (image/static
+                // deploys can't read .temps.yaml, so the deploy request carries it on
+                // the deployment metadata). When set, it wins over .temps.yaml.
+                if let Some(health_path) = deployment
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.health_check_path.clone())
+                {
+                    debug!(
+                        "🩺 Applying deploy-time health check path override: {}",
+                        health_path
+                    );
+                    builder = builder.health_check_path_override(Some(health_path));
+                }
+
                 // Inject node scheduler for multi-node support
                 if let Some(scheduler) = self.node_scheduler.get() {
                     builder = builder.node_scheduler(scheduler.clone());

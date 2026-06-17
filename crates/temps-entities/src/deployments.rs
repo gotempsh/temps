@@ -105,6 +105,13 @@ pub struct DeploymentMetadata {
     /// Used to verify the image exists before deployment
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uploaded_image_id: Option<String>,
+
+    /// Explicit deploy-time HTTP health-check path override.
+    /// Image/static deploys can't read `.temps.yaml`, so this lets the deploy
+    /// request set a custom path (e.g. "/api/healthz"). When present it takes
+    /// priority over any `.temps.yaml` `health.path` value. Always starts with '/'.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health_check_path: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize)]

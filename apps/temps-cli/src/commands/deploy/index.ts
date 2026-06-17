@@ -41,6 +41,10 @@ export function registerDeployCommands(program: Command): void {
     .option('--no-wait', 'Do not wait for deployment to complete')
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .option('--metadata <json>', 'Additional metadata (JSON format)')
+    .option(
+      '--health-check-path <path>',
+      'HTTP health-check path (must start with "/", e.g. /api/healthz). Overrides .temps.yaml; also updates the uptime monitor.',
+    )
     .option('--timeout <seconds>', 'Timeout in seconds for --wait', '300')
     .action(deployStatic)
 
@@ -56,6 +60,10 @@ export function registerDeployCommands(program: Command): void {
     .option('--no-wait', 'Do not wait for deployment to complete')
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .option('--metadata <json>', 'Additional metadata (JSON format)')
+    .option(
+      '--health-check-path <path>',
+      'HTTP health-check path (must start with "/", e.g. /api/healthz). Overrides .temps.yaml; also updates the uptime monitor.',
+    )
     .option('--timeout <seconds>', 'Timeout in seconds for --wait', '300')
     .action(deployImage)
 
@@ -76,6 +84,10 @@ export function registerDeployCommands(program: Command): void {
     .option('--no-wait', 'Do not wait for deployment to complete')
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .option('--metadata <json>', 'Additional metadata (JSON format)')
+    .option(
+      '--health-check-path <path>',
+      'HTTP health-check path (must start with "/", e.g. /api/healthz). Overrides .temps.yaml; also updates the uptime monitor.',
+    )
     .option('--timeout <seconds>', 'Timeout in seconds for --wait', '600')
     .action(deployLocalImage)
 

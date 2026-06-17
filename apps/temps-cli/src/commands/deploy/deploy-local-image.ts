@@ -39,6 +39,7 @@ interface DeployLocalImageOptions {
   wait?: boolean
   yes?: boolean
   metadata?: string
+  healthCheckPath?: string
   timeout?: string
 }
 
@@ -332,6 +333,13 @@ export async function deployLocalImage(options: DeployLocalImageOptions): Promis
     const queryParams = new URLSearchParams()
     if (options.tag) {
       queryParams.set('tag', options.tag)
+    }
+    const healthCheckPath = options.healthCheckPath?.trim()
+    if (healthCheckPath) {
+      if (!healthCheckPath.startsWith('/')) {
+        throw new Error('--health-check-path must start with "/" (e.g. /api/healthz)')
+      }
+      queryParams.set('health_check_path', healthCheckPath)
     }
     const finalUrl = queryParams.toString()
       ? `${uploadUrl}?${queryParams.toString()}`
