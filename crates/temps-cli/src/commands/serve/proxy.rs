@@ -135,8 +135,9 @@ pub fn start_proxy_server(
     // Create tokio runtime to fetch preview_domain from config service
     let rt = tokio::runtime::Runtime::new()?;
 
-    // Get preview_domain from settings
-    let preview_domain = rt.block_on(async {
+    // Fetch settings once: we need `preview_domain` for routing AND the full
+    // `AppSettings` to decide whether to wire ADR-018 on-demand TLS.
+    let settings = rt.block_on(async {
         let config_service = temps_config::ConfigService::new(
             Arc::new(temps_config::ServerConfig::new(
                 address.clone(),
@@ -148,16 +149,38 @@ pub fn start_proxy_server(
         );
 
         match config_service.get_settings().await {
-            Ok(settings) => Ok::<Option<String>, anyhow::Error>(Some(settings.preview_domain)),
+            Ok(settings) => Ok::<Option<temps_core::AppSettings>, anyhow::Error>(Some(settings)),
             Err(e) => {
                 warn!(
-                    "Failed to fetch preview_domain from settings: {}, using default 'localhost'",
+                    "Failed to fetch settings: {}, using defaults (preview_domain 'localhost', \
+                     on-demand TLS disabled)",
                     e
                 );
-                Ok(Some("localhost".to_string()))
+                Ok(None)
             }
         }
     })?;
+
+    let preview_domain = Some(
+        settings
+            .as_ref()
+            .map(|s| s.preview_domain.clone())
+            .unwrap_or_else(|| "localhost".to_string()),
+    );
+
+    // ADR-018 on-demand TLS: build the certificate manager when enabled in
+    // settings. `None` (the default, or when the feature can't be safely
+    // enabled) keeps the TLS callback's existing fail-fast behavior with no
+    // on-demand issuance — zero behavior change.
+    let on_demand_cert_manager = match settings.as_ref() {
+        Some(settings) => rt.block_on(super::on_demand_cert::build_on_demand_cert_manager(
+            settings,
+            db.clone(),
+            encryption_service.clone(),
+            route_table.clone(),
+        )),
+        None => None,
+    };
 
     let proxy_config = temps_proxy::ProxyConfig {
         address,
@@ -165,6 +188,7 @@ pub fn start_proxy_server(
         tls_address,
         preview_domain,
         disable_https_redirect,
+        on_demand_cert_manager,
     };
 
     info!(

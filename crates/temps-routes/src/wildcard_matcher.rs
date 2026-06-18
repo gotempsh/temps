@@ -158,6 +158,7 @@ mod tests {
             project: None,
             environment: None,
             deployment: None,
+            cert_eligible: false,
         }
     }
 

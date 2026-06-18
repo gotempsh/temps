@@ -67,6 +67,7 @@ pub mod oauth_states;
 pub mod oidc_login_states;
 pub mod oidc_providers;
 pub mod oidc_role_mappings;
+pub mod on_demand_cert_attempts;
 pub mod performance_metrics;
 pub mod postgres_major_upgrades;
 pub mod preset;

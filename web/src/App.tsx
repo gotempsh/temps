@@ -117,6 +117,9 @@ const AddDomain = lazy(() =>
 const DomainDetail = lazy(() =>
   import('./pages/DomainDetail').then((m) => ({ default: m.DomainDetail }))
 )
+const Certificates = lazy(() =>
+  import('./pages/Certificates').then((m) => ({ default: m.Certificates }))
+)
 const Backups = lazy(() =>
   import('./pages/Backups').then((m) => ({ default: m.Backups }))
 )
@@ -451,6 +454,7 @@ const FullAppRoutes = () => {
                 <Route path="/domains" element={<Domains />} />
                 <Route path="/domains/add" element={<AddDomain />} />
                 <Route path="/domains/:id" element={<DomainDetail />} />
+                <Route path="/certificates" element={<Certificates />} />
                 <Route path="/storage" element={<Storage />} />
                 <Route path="/storage/create" element={<CreateService />} />
                 <Route path="/storage/import" element={<ImportService />} />

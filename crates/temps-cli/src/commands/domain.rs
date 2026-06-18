@@ -40,6 +40,8 @@ pub enum DomainSubcommand {
     Import(ImportCertificateCommand),
     /// Provision a certificate via HTTP-01 challenge
     Provision(ProvisionDomainCommand),
+    /// Show on-demand TLS issuance status for a hostname (ADR-018)
+    CertStatus(CertStatusCommand),
     /// Manage ACME certificate orders
     Order(OrderCommand),
 }
@@ -91,6 +93,31 @@ pub struct AddDomainCommand {
 /// List all domains via API
 #[derive(Args)]
 pub struct ListDomainsApiCommand {
+    /// Temps API URL
+    #[arg(long, env = "TEMPS_API_URL")]
+    pub api_url: String,
+
+    /// Temps API token
+    #[arg(long, env = "TEMPS_API_TOKEN")]
+    pub api_token: String,
+
+    /// Only show hostnames in an on-demand TLS state (ADR-018), with
+    /// error category and backoff-until columns
+    #[arg(long, default_value = "false")]
+    pub on_demand: bool,
+
+    /// Output as JSON
+    #[arg(long, default_value = "false")]
+    pub json: bool,
+}
+
+/// Show on-demand TLS issuance status for a hostname
+#[derive(Args)]
+pub struct CertStatusCommand {
+    /// Hostname to inspect (e.g. "myapp.1.2.3.4.sslip.io")
+    #[arg(long, short = 'd')]
+    pub domain: String,
+
     /// Temps API URL
     #[arg(long, env = "TEMPS_API_URL")]
     pub api_url: String,
@@ -322,6 +349,44 @@ struct DomainResponse {
     created_at: i64,
     updated_at: i64,
     certificate: Option<String>,
+    /// On-demand TLS negative-cache deadline (ADR-018). Present once the
+    /// backend `DomainResponse` is extended in Layer 7; absent on older
+    /// servers, so it is `serde(default)` for forward/backward compat.
+    #[serde(default)]
+    on_demand_backoff_until: Option<i64>,
+}
+
+/// Latest on-demand TLS issuance attempt for a hostname (ADR-018 §5).
+///
+/// Returned by the planned Layer 7 endpoint `GET /domains/by-host/{hostname}/cert-status`,
+/// which joins the most-recent `on_demand_cert_attempts` row with the current
+/// `domains` row state.
+#[derive(Debug, Deserialize, Serialize)]
+struct CertStatusResponse {
+    hostname: String,
+    /// Current domain status (`on_demand_pending`, `on_demand_issuing`,
+    /// `active`, `on_demand_failed`, ...). `None` when no domain row exists yet.
+    status: Option<String>,
+    /// Negative-cache deadline; set while in a failed backoff window.
+    backoff_until: Option<i64>,
+    /// The most recent attempt row, if any attempts have been recorded.
+    last_attempt: Option<CertAttemptResponse>,
+}
+
+/// One `on_demand_cert_attempts` row (ADR-018 §5).
+#[derive(Debug, Deserialize, Serialize)]
+struct CertAttemptResponse {
+    id: i32,
+    hostname: String,
+    trigger: String,
+    challenge_served: Option<bool>,
+    acme_request_sent: Option<bool>,
+    acme_response_status: Option<String>,
+    outcome: String,
+    error_chain: Option<String>,
+    error_category: Option<String>,
+    duration_ms: Option<i32>,
+    created_at: i64,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -425,6 +490,7 @@ impl DomainCommand {
                 DomainSubcommand::Delete(cmd) => execute_delete(cmd).await,
                 DomainSubcommand::Import(cmd) => execute_import(cmd).await,
                 DomainSubcommand::Provision(cmd) => execute_provision(cmd).await,
+                DomainSubcommand::CertStatus(cmd) => execute_cert_status(cmd).await,
                 DomainSubcommand::Order(cmd) => match cmd.command {
                     OrderSubcommand::Create(c) => execute_order_create(c).await,
                     OrderSubcommand::Show(c) => execute_order_show(c).await,
@@ -730,6 +796,29 @@ fn print_domain_details(domain: &DomainResponse) {
 }
 
 // ========================================
+// On-demand TLS helpers (ADR-018)
+// ========================================
+
+/// Is this domain status one of the on-demand TLS state-machine states?
+fn is_on_demand_status(status: &str) -> bool {
+    matches!(
+        status,
+        "on_demand_pending" | "on_demand_issuing" | "on_demand_failed"
+    )
+}
+
+/// Colorize an on-demand or standard domain status for terminal output.
+fn colorize_domain_status(status: &str) -> colored::ColoredString {
+    match status {
+        "active" => status.bright_green(),
+        "pending" | "pending_dns" | "pending_validation" | "pending_http" | "on_demand_pending"
+        | "on_demand_issuing" => status.bright_yellow(),
+        "failed" | "expired" | "on_demand_failed" => status.bright_red(),
+        _ => status.normal(),
+    }
+}
+
+// ========================================
 // List domains (API)
 // ========================================
 
@@ -753,10 +842,21 @@ async fn execute_list_api(cmd: ListDomainsApiCommand) -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("Failed to parse response: {}", e))?;
 
+    // Filter to on-demand-state hostnames when --on-demand is set.
+    let domains: Vec<&DomainResponse> = if cmd.on_demand {
+        list_resp
+            .domains
+            .iter()
+            .filter(|d| is_on_demand_status(&d.status))
+            .collect()
+    } else {
+        list_resp.domains.iter().collect()
+    };
+
     if cmd.json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&list_resp.domains)
+            serde_json::to_string_pretty(&domains)
                 .map_err(|e| anyhow::anyhow!("Failed to serialize: {}", e))?
         );
         return Ok(());
@@ -767,20 +867,68 @@ async fn execute_list_api(cmd: ListDomainsApiCommand) -> anyhow::Result<()> {
         "{}",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".bright_cyan()
     );
-    println!(
-        "{}",
+    let title = if cmd.on_demand {
+        "                   On-Demand TLS Certificates"
+    } else {
         "                      Domain Certificates"
-            .bright_white()
-            .bold()
-    );
+    };
+    println!("{}", title.bright_white().bold());
     println!(
         "{}",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".bright_cyan()
     );
     println!();
 
-    if list_resp.domains.is_empty() {
-        println!("  {} No domains configured.", "ℹ".bright_blue());
+    if domains.is_empty() {
+        let msg = if cmd.on_demand {
+            "No hostnames are in an on-demand TLS state."
+        } else {
+            "No domains configured."
+        };
+        println!("  {} {}", "ℹ".bright_blue(), msg);
+        println!();
+        return Ok(());
+    }
+
+    if cmd.on_demand {
+        // On-demand view: surface error category + backoff-until (ADR-018 §5).
+        println!(
+            "  {:<5} {:<40} {:<18} {:<16} {:<20}",
+            "ID".bright_white().bold(),
+            "HOSTNAME".bright_white().bold(),
+            "STATUS".bright_white().bold(),
+            "ERROR CATEGORY".bright_white().bold(),
+            "BACKOFF UNTIL".bright_white().bold()
+        );
+        println!("  {}", "─".repeat(100));
+
+        for domain in &domains {
+            let error_category = domain
+                .last_error_type
+                .clone()
+                .unwrap_or_else(|| "-".to_string());
+
+            let backoff = domain
+                .on_demand_backoff_until
+                .map(format_millis_timestamp)
+                .unwrap_or_else(|| "-".to_string());
+
+            println!(
+                "  {:<5} {:<40} {:<18} {:<16} {:<20}",
+                domain.id.to_string().bright_white(),
+                domain.domain.bright_cyan(),
+                colorize_domain_status(&domain.status),
+                error_category,
+                backoff
+            );
+        }
+
+        println!();
+        println!(
+            "  {} Diagnose a hostname: {}",
+            "→".bright_blue(),
+            "temps domain cert-status -d <hostname>".bright_white()
+        );
         println!();
         return Ok(());
     }
@@ -795,16 +943,7 @@ async fn execute_list_api(cmd: ListDomainsApiCommand) -> anyhow::Result<()> {
     );
     println!("  {}", "─".repeat(90));
 
-    for domain in &list_resp.domains {
-        let status_colored = match domain.status.as_str() {
-            "active" => domain.status.bright_green(),
-            "pending" | "pending_dns" | "pending_validation" | "pending_http" => {
-                domain.status.bright_yellow()
-            }
-            "failed" | "expired" => domain.status.bright_red(),
-            _ => domain.status.normal(),
-        };
-
+    for domain in &domains {
         let domain_type = if domain.is_wildcard {
             "wildcard"
         } else {
@@ -820,7 +959,7 @@ async fn execute_list_api(cmd: ListDomainsApiCommand) -> anyhow::Result<()> {
             "  {:<5} {:<40} {:<18} {:<12} {:<12}",
             domain.id.to_string().bright_white(),
             domain.domain.bright_cyan(),
-            status_colored,
+            colorize_domain_status(&domain.status),
             domain_type,
             expiration
         );
@@ -1026,6 +1165,181 @@ async fn execute_provision(cmd: ProvisionDomainCommand) -> anyhow::Result<()> {
 
     println!();
     Ok(())
+}
+
+// ========================================
+// Cert status (on-demand TLS, ADR-018)
+// ========================================
+
+async fn execute_cert_status(cmd: CertStatusCommand) -> anyhow::Result<()> {
+    let client = reqwest::Client::new();
+    let url = api_url(
+        &cmd.api_url,
+        &format!(
+            "/domains/by-host/{}/cert-status",
+            urlencoding::encode(&cmd.domain)
+        ),
+    );
+
+    let response = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", cmd.api_token))
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to connect to API: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(handle_api_error(response).await);
+    }
+
+    let status_resp: CertStatusResponse = response
+        .json()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to parse response: {}", e))?;
+
+    if cmd.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&status_resp)
+                .map_err(|e| anyhow::anyhow!("Failed to serialize: {}", e))?
+        );
+        return Ok(());
+    }
+
+    println!();
+    println!(
+        "{}",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".bright_cyan()
+    );
+    println!(
+        "{}",
+        "                 On-Demand TLS Certificate Status"
+            .bright_white()
+            .bold()
+    );
+    println!(
+        "{}",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".bright_cyan()
+    );
+    println!();
+
+    println!(
+        "  {} {}",
+        "Hostname:".bright_white(),
+        status_resp.hostname.bright_cyan()
+    );
+
+    match status_resp.status.as_deref() {
+        Some(status) => {
+            println!(
+                "  {} {}",
+                "Status:".bright_white(),
+                colorize_domain_status(status)
+            );
+        }
+        None => {
+            println!(
+                "  {} {}",
+                "Status:".bright_white(),
+                "no domain record (never attempted)".bright_yellow()
+            );
+        }
+    }
+
+    if let Some(backoff) = status_resp.backoff_until {
+        println!(
+            "  {} {}",
+            "Backoff Until:".bright_white(),
+            format_millis_timestamp(backoff).bright_yellow()
+        );
+    }
+
+    match status_resp.last_attempt {
+        Some(attempt) => {
+            println!();
+            println!("  {}", "Latest Attempt:".bright_white().bold());
+
+            let outcome_colored = match attempt.outcome.as_str() {
+                "issued" => attempt.outcome.bright_green(),
+                "failed" => attempt.outcome.bright_red(),
+                _ => attempt.outcome.bright_yellow(),
+            };
+            println!("    {} {}", "Outcome:".bright_white(), outcome_colored);
+
+            println!(
+                "    {} {}",
+                "When:".bright_white(),
+                format_millis_timestamp(attempt.created_at).bright_cyan()
+            );
+            println!(
+                "    {} {}",
+                "Trigger:".bright_white(),
+                attempt.trigger.bright_cyan()
+            );
+
+            if let Some(ref category) = attempt.error_category {
+                println!(
+                    "    {} {}",
+                    "Error Category:".bright_white(),
+                    category.bright_red()
+                );
+            }
+
+            println!(
+                "    {} {}",
+                "Challenge Served:".bright_white(),
+                format_optional_bool(attempt.challenge_served)
+            );
+            println!(
+                "    {} {}",
+                "ACME Request Sent:".bright_white(),
+                format_optional_bool(attempt.acme_request_sent)
+            );
+
+            if let Some(ref acme_status) = attempt.acme_response_status {
+                println!(
+                    "    {} {}",
+                    "ACME Response:".bright_white(),
+                    acme_status.bright_cyan()
+                );
+            }
+
+            if let Some(duration) = attempt.duration_ms {
+                println!(
+                    "    {} {}ms",
+                    "Duration:".bright_white(),
+                    duration.to_string().bright_cyan()
+                );
+            }
+
+            if let Some(ref chain) = attempt.error_chain {
+                println!();
+                println!("    {}", "Error Chain:".bright_white().bold());
+                for line in chain.lines() {
+                    println!("      {}", line.bright_red());
+                }
+            }
+        }
+        None => {
+            println!();
+            println!(
+                "  {} No on-demand issuance attempts recorded for this hostname.",
+                "ℹ".bright_blue()
+            );
+        }
+    }
+
+    println!();
+    Ok(())
+}
+
+/// Render an `Option<bool>` as a human-readable, colorized cell.
+fn format_optional_bool(value: Option<bool>) -> colored::ColoredString {
+    match value {
+        Some(true) => "yes".bright_green(),
+        Some(false) => "no".bright_red(),
+        None => "n/a".normal(),
+    }
 }
 
 // ========================================
@@ -1860,5 +2174,114 @@ MIIBkTCB+wIJAKHBfpeg...
             api_url("http://localhost:3000/", "/domains"),
             "http://localhost:3000/domains"
         );
+    }
+
+    #[test]
+    fn test_is_on_demand_status() {
+        // On-demand state-machine states pass the filter (ADR-018 §3).
+        assert!(is_on_demand_status("on_demand_pending"));
+        assert!(is_on_demand_status("on_demand_issuing"));
+        assert!(is_on_demand_status("on_demand_failed"));
+
+        // Standard / manual domain states are excluded.
+        assert!(!is_on_demand_status("active"));
+        assert!(!is_on_demand_status("pending"));
+        assert!(!is_on_demand_status("pending_http"));
+        assert!(!is_on_demand_status("failed"));
+        assert!(!is_on_demand_status("expired"));
+        assert!(!is_on_demand_status(""));
+    }
+
+    #[test]
+    fn test_format_optional_bool() {
+        assert_eq!(format_optional_bool(Some(true)).to_string(), "yes");
+        assert_eq!(format_optional_bool(Some(false)).to_string(), "no");
+        assert_eq!(format_optional_bool(None).to_string(), "n/a");
+    }
+
+    #[test]
+    fn test_colorize_domain_status_does_not_panic() {
+        // Smoke-test all known statuses render some non-empty text.
+        for status in [
+            "active",
+            "pending",
+            "pending_http",
+            "on_demand_pending",
+            "on_demand_issuing",
+            "on_demand_failed",
+            "failed",
+            "expired",
+            "weird-unknown",
+        ] {
+            assert!(!colorize_domain_status(status).to_string().is_empty());
+        }
+    }
+
+    #[test]
+    fn test_cert_status_response_deserializes_without_attempt() {
+        // The Layer 7 endpoint may return a hostname with no attempts yet.
+        let json = r#"{
+            "hostname": "myapp.1.2.3.4.sslip.io",
+            "status": "on_demand_pending",
+            "backoff_until": null,
+            "last_attempt": null
+        }"#;
+        let parsed: CertStatusResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.hostname, "myapp.1.2.3.4.sslip.io");
+        assert_eq!(parsed.status.as_deref(), Some("on_demand_pending"));
+        assert!(parsed.backoff_until.is_none());
+        assert!(parsed.last_attempt.is_none());
+    }
+
+    #[test]
+    fn test_cert_status_response_deserializes_with_attempt() {
+        let json = r#"{
+            "hostname": "myapp.1.2.3.4.sslip.io",
+            "status": "on_demand_failed",
+            "backoff_until": 1700000000000,
+            "last_attempt": {
+                "id": 7,
+                "hostname": "myapp.1.2.3.4.sslip.io",
+                "trigger": "tls_callback",
+                "challenge_served": true,
+                "acme_request_sent": true,
+                "acme_response_status": "urn:ietf:params:acme:error:rateLimited",
+                "outcome": "failed",
+                "error_chain": "rate limited\n  caused by: too many certificates",
+                "error_category": "rate_limited",
+                "duration_ms": 4200,
+                "created_at": 1700000000000
+            }
+        }"#;
+        let parsed: CertStatusResponse = serde_json::from_str(json).unwrap();
+        let attempt = parsed.last_attempt.expect("attempt present");
+        assert_eq!(attempt.outcome, "failed");
+        assert_eq!(attempt.error_category.as_deref(), Some("rate_limited"));
+        assert_eq!(attempt.challenge_served, Some(true));
+        assert_eq!(attempt.duration_ms, Some(4200));
+    }
+
+    #[test]
+    fn test_domain_response_on_demand_backoff_defaults_to_none() {
+        // Older servers that don't yet return on_demand_backoff_until must
+        // still deserialize (serde(default)).
+        let json = r#"{
+            "id": 1,
+            "domain": "myapp.1.2.3.4.sslip.io",
+            "status": "on_demand_pending",
+            "expiration_time": null,
+            "last_renewed": null,
+            "dns_challenge_token": null,
+            "dns_challenge_value": null,
+            "last_error": null,
+            "last_error_type": null,
+            "is_wildcard": false,
+            "verification_method": "http-01",
+            "created_at": 1700000000000,
+            "updated_at": 1700000000000,
+            "certificate": null
+        }"#;
+        let parsed: DomainResponse = serde_json::from_str(json).unwrap();
+        assert!(parsed.on_demand_backoff_until.is_none());
     }
 }

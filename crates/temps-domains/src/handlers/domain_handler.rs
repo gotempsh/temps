@@ -1,9 +1,10 @@
 use super::types::{
-    AcmeOrderResponse, ChallengeError, ChallengeValidationStatus, CreateDomainRequest,
-    DnsChallengeRecordResult, DnsCompletionResponse, DomainAppState, DomainChallengeResponse,
-    DomainError, DomainResponse, HttpChallengeDebugResponse, ListDomainsResponse,
-    ListOrdersResponse, ProvisionResponse, SetupDnsChallengeRequest, SetupDnsChallengeResponse,
-    TxtRecord,
+    AcmeOrderResponse, CertStatusResponse, ChallengeError, ChallengeValidationStatus,
+    CreateDomainRequest, DnsChallengeRecordResult, DnsCompletionResponse, DomainAppState,
+    DomainChallengeResponse, DomainError, DomainResponse, HttpChallengeDebugResponse,
+    ListDomainsResponse, ListOnDemandCertsResponse, ListOrdersResponse,
+    OnDemandCertAttemptResponse, OnDemandCertRow, ProvisionResponse, SetupDnsChallengeRequest,
+    SetupDnsChallengeResponse, TxtRecord,
 };
 use crate::tls::{ProviderError, RepositoryError, TlsError};
 use crate::DomainServiceError;
@@ -200,6 +201,24 @@ impl From<DomainServiceError> for Problem {
                     .detail(msg)
                     .build()
             }
+            DomainServiceError::OnDemandRateLimited {
+                hostname, detail, ..
+            } => ErrorBuilder::new(StatusCode::TOO_MANY_REQUESTS)
+                .title("Let's Encrypt Rate Limit Reached")
+                .detail(format!(
+                    "On-demand TLS for {hostname} was rate limited by Let's Encrypt: {detail}"
+                ))
+                .build(),
+            DomainServiceError::OnDemandIssuanceFailed {
+                hostname,
+                category,
+                error_chain,
+            } => ErrorBuilder::new(StatusCode::BAD_GATEWAY)
+                .title("On-demand TLS Issuance Failed")
+                .detail(format!(
+                    "On-demand TLS issuance for {hostname} failed ({category}): {error_chain}"
+                ))
+                .build(),
         }
     }
 }
@@ -222,7 +241,9 @@ impl From<DomainServiceError> for Problem {
         get_domain_order,
         list_orders,
         get_http_challenge_debug,
-        setup_dns_challenge
+        setup_dns_challenge,
+        list_on_demand_certs,
+        get_on_demand_cert_status
     ),
     components(
         schemas(
@@ -241,7 +262,11 @@ impl From<DomainServiceError> for Problem {
             ChallengeError,
             SetupDnsChallengeRequest,
             SetupDnsChallengeResponse,
-            DnsChallengeRecordResult
+            DnsChallengeRecordResult,
+            ListOnDemandCertsResponse,
+            OnDemandCertRow,
+            OnDemandCertAttemptResponse,
+            CertStatusResponse
         )
     ),
     info(
@@ -2094,12 +2119,189 @@ async fn create_acme_txt_record(
     }
 }
 
+/// Query parameters for listing on-demand cert attempts.
+#[derive(Debug, Clone, serde::Deserialize, utoipa::IntoParams)]
+pub struct ListOnDemandCertsParams {
+    /// Page number (1-indexed)
+    #[param(example = 1)]
+    pub page: Option<u64>,
+    /// Number of items per page (max 100)
+    #[param(example = 20)]
+    pub page_size: Option<u64>,
+}
+
+impl ListOnDemandCertsParams {
+    pub fn normalize(&self) -> (u64, u64) {
+        let page = self.page.unwrap_or(1).max(1);
+        let page_size = self.page_size.unwrap_or(20).clamp(1, 100);
+        (page, page_size)
+    }
+}
+
+/// List on-demand TLS certificate attempts
+///
+/// Returns rows from the append-only `on_demand_cert_attempts` audit log
+/// (ADR-018 §5), newest first, each joined with the current authoritative cert
+/// state (`status`, `expiration_time`, `backoff_until`) from the `domains` row.
+/// This backs the console "Certificates" surface. No certificate or private-key
+/// material is returned — only audit metadata.
+#[utoipa::path(
+    get,
+    path = "/domains/on-demand-certs",
+    responses(
+        (status = 200, description = "On-demand cert attempts retrieved successfully", body = ListOnDemandCertsResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ListOnDemandCertsParams,
+    ),
+    tag = "Domains",
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+async fn list_on_demand_certs(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<DomainAppState>>,
+    Query(params): Query<ListOnDemandCertsParams>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, DomainsRead);
+
+    let (page, page_size) = params.normalize();
+
+    debug!(
+        "Listing on-demand cert attempts (page={}, page_size={}) for user: {}",
+        page,
+        page_size,
+        auth.user_id()
+    );
+
+    let (rows, total) = app_state
+        .domain_service
+        .list_on_demand_attempts(page, page_size)
+        .await
+        .map_err(|e| {
+            error!("Failed to list on-demand cert attempts: {}", e);
+            e
+        })?;
+
+    let certs: Vec<OnDemandCertRow> = rows
+        .into_iter()
+        .map(|row| {
+            let (status, expiration_time, backoff_until) = match row.domain {
+                Some(d) => (
+                    Some(d.status),
+                    d.expiration_time.map(|dt| dt.timestamp_millis()),
+                    d.on_demand_backoff_until.map(|dt| dt.timestamp_millis()),
+                ),
+                None => (None, None, None),
+            };
+            OnDemandCertRow {
+                hostname: row.attempt.hostname.clone(),
+                status,
+                expiration_time,
+                backoff_until,
+                attempt: OnDemandCertAttemptResponse::from(row.attempt),
+            }
+        })
+        .collect();
+
+    Ok((
+        StatusCode::OK,
+        Json(ListOnDemandCertsResponse {
+            certs,
+            total,
+            page,
+            page_size,
+        }),
+    ))
+}
+
+/// Get on-demand TLS certificate status for a hostname
+///
+/// Returns the current cert lifecycle state for a single hostname (from the
+/// `domains` row) plus the most recent on-demand issuance attempt (from the
+/// `on_demand_cert_attempts` audit log). This is the operator's first-line
+/// diagnostic, surfaced by `temps domain cert-status` (ADR-018 §5). Returns the
+/// hostname with `None` fields when no on-demand activity exists for it (never a
+/// 404, so the CLI can render "no attempts recorded").
+#[utoipa::path(
+    get,
+    path = "/domains/by-host/{hostname}/cert-status",
+    responses(
+        (status = 200, description = "On-demand cert status retrieved successfully", body = CertStatusResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("hostname" = String, Path, description = "Domain hostname")
+    ),
+    tag = "Domains",
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+async fn get_on_demand_cert_status(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<DomainAppState>>,
+    Path(hostname): Path<String>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, DomainsRead);
+
+    debug!(
+        "Getting on-demand cert status for hostname: {} (user: {})",
+        hostname,
+        auth.user_id()
+    );
+
+    let status = app_state
+        .domain_service
+        .on_demand_cert_status(&hostname)
+        .await
+        .map_err(|e| {
+            error!(
+                "Failed to get on-demand cert status for {}: {}",
+                hostname, e
+            );
+            e
+        })?;
+
+    let (domain_status, backoff_until) = match status.domain {
+        Some(d) => (
+            Some(d.status),
+            d.on_demand_backoff_until.map(|dt| dt.timestamp_millis()),
+        ),
+        None => (None, None),
+    };
+
+    Ok((
+        StatusCode::OK,
+        Json(CertStatusResponse {
+            hostname,
+            status: domain_status,
+            backoff_until,
+            last_attempt: status.latest_attempt.map(OnDemandCertAttemptResponse::from),
+        }),
+    ))
+}
+
 pub fn configure_routes() -> Router<Arc<DomainAppState>> {
     Router::new()
         .route("/domains", post(create_domain))
         .route("/domains", get(list_domains))
+        // On-demand cert observability (ADR-018 §5). NOTE: declared before the
+        // `/domains/{domain}` catch-all so `on-demand-certs` is not captured as
+        // a `{domain}` path parameter.
+        .route("/domains/on-demand-certs", get(list_on_demand_certs))
         .route("/domains/{domain}", get(get_domain_by_id))
         .route("/domains/{domain}/status", get(check_domain_status))
+        .route(
+            "/domains/by-host/{hostname}/cert-status",
+            get(get_on_demand_cert_status),
+        )
         .route("/domains/by-host/{hostname}", get(get_domain_by_host))
         // Domain-based routes (using domain name)
         .route("/domains/{domain}", delete(delete_domain))

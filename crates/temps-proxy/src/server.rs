@@ -41,6 +41,11 @@ pub struct TlsExtensionData {
 /// Dynamic certificate callback for TLS
 struct DynamicCertLoader {
     cert_loader: Arc<CertificateLoader>,
+    /// On-demand HTTP-01 TLS manager (ADR-018). When present and the SNI has no
+    /// active cert, the callback asks it to provision one in the background and
+    /// still returns `Ok(None)` immediately (Option B: fail-fast, do not block
+    /// the handshake). `None` preserves the pre-ADR behavior exactly.
+    on_demand_cert_manager: Option<Arc<crate::on_demand_cert::OnDemandCertManager>>,
 }
 
 #[async_trait]
@@ -111,6 +116,18 @@ impl TlsAccept for DynamicCertLoader {
             }
             Ok(None) => {
                 debug!("No certificate found for SNI: {}", sni);
+                // ADR-018 on-demand TLS hook (Option B, §1): trigger background
+                // issuance for allowlisted, stable, in-zone hostnames, then fall
+                // through and return `Ok(None)` immediately. We never block the
+                // handshake here — the first request fails fast; the client's
+                // retry succeeds once the cert is `active`. The gate (zone +
+                // route + dedup + backoff + rate caps) is O(1) and runs inline.
+                // Peer IP isn't readily available in the OpenSSL TLS callback, so
+                // the per-IP novelty limiter is passed `None`; the zone, route,
+                // dedup, backoff, and global hourly-cap checks remain in force.
+                if let Some(ref manager) = self.on_demand_cert_manager {
+                    let _ = manager.try_enqueue(&sni, None);
+                }
             }
             Err(e) => {
                 debug!("Error loading certificate for {}: {}", sni, e);
@@ -345,9 +362,14 @@ pub fn setup_proxy_server(
             encryption_service.clone(),
         ));
 
-        // Create TLS callback handler
-        let tls_callbacks: Box<dyn TlsAccept + Send + Sync> =
-            Box::new(DynamicCertLoader { cert_loader });
+        // Create TLS callback handler. The on-demand cert manager (ADR-018) is
+        // taken from the proxy config; `None` keeps the legacy fail-fast-only
+        // behavior. tls_cert_loader stays a pure DB lookup — the manager lives
+        // only in DynamicCertLoader, never in the loader (ADR §7).
+        let tls_callbacks: Box<dyn TlsAccept + Send + Sync> = Box::new(DynamicCertLoader {
+            cert_loader,
+            on_demand_cert_manager: proxy_config.on_demand_cert_manager.clone(),
+        });
 
         // Create TLS settings with dynamic certificate callback and HTTP/2 support
         let mut tls_settings = TlsSettings::with_callbacks(tls_callbacks)

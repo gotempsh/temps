@@ -238,8 +238,9 @@ impl ProxyCommand {
         // Create tokio runtime to fetch preview_domain from config service
         let rt = tokio::runtime::Runtime::new()?;
 
-        // Get preview_domain from settings
-        let preview_domain = rt.block_on(async {
+        // Fetch settings once: needed for `preview_domain`, ADR-017 version-skew
+        // detection, and the ADR-018 on-demand TLS decision.
+        let settings = rt.block_on(async {
             let config_service = temps_config::ConfigService::new(
                 Arc::new(temps_config::ServerConfig::new(
                     address.clone(),
@@ -286,26 +287,25 @@ impl ProxyCommand {
                             );
                         }
                     }
-                    Ok::<Option<String>, anyhow::Error>(Some(settings.preview_domain))
+                    Ok::<Option<temps_core::AppSettings>, anyhow::Error>(Some(settings))
                 }
                 Err(e) => {
-                    warn!("Failed to fetch preview_domain from settings: {}, using default 'localhost'", e);
-                    Ok(Some("localhost".to_string()))
+                    warn!("Failed to fetch settings: {}, using defaults (preview_domain 'localhost', on-demand TLS disabled)", e);
+                    Ok(None)
                 }
             }
         })?;
 
-        let proxy_config = temps_proxy::ProxyConfig {
-            address,
-            console_address,
-            tls_address,
-            preview_domain,
-            disable_https_redirect: self.disable_https_redirect,
-        };
+        let preview_domain = Some(
+            settings
+                .as_ref()
+                .map(|s| s.preview_domain.clone())
+                .unwrap_or_else(|| "localhost".to_string()),
+        );
 
         info!(
             "Starting proxy server with preview_domain: {:?}",
-            proxy_config.preview_domain
+            preview_domain
         );
 
         // Create job queue for route table update notifications
@@ -314,6 +314,32 @@ impl ProxyCommand {
 
         // Initialize route table with listener (preview_domain loaded from settings)
         let route_table = Arc::new(temps_proxy::CachedPeerTable::new(db.clone()));
+
+        // ADR-018 on-demand TLS: build the certificate manager when enabled in
+        // settings. Constructed after the route table exists (the gate's
+        // cert-eligible route check reads it). `None` (the default, or when the
+        // feature can't be safely enabled) keeps the TLS callback's existing
+        // fail-fast behavior with no on-demand issuance — zero behavior change.
+        let on_demand_cert_manager = match settings.as_ref() {
+            Some(settings) => rt.block_on(
+                crate::commands::serve::on_demand_cert::build_on_demand_cert_manager(
+                    settings,
+                    db.clone(),
+                    encryption_service.clone(),
+                    route_table.clone(),
+                ),
+            ),
+            None => None,
+        };
+
+        let proxy_config = temps_proxy::ProxyConfig {
+            address,
+            console_address,
+            tls_address,
+            preview_domain,
+            disable_https_redirect: self.disable_https_redirect,
+            on_demand_cert_manager,
+        };
         let listener = Arc::new(temps_routes::RouteTableListener::new(
             route_table.clone(),
             self.database_url.clone(),

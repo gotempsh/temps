@@ -49,6 +49,10 @@ pub struct AppSettings {
     // Workspace preview gateway settings (single shared container per node)
     pub preview_gateway: PreviewGatewaySettings,
 
+    // On-demand (lazy) HTTP-01 TLS issuance settings (ADR-018). Off by default;
+    // auto-enabled by `temps setup` for QuickStart (sslip.io) installs.
+    pub on_demand_tls: OnDemandTlsSettings,
+
     // AI configuration settings (global config repo for skills, MCP servers, etc.)
     pub ai_config: AiConfigSettings,
 
@@ -461,6 +465,63 @@ impl Default for PreviewGatewaySettings {
     }
 }
 
+/// On-demand (lazy) HTTP-01 TLS issuance settings (ADR-018).
+///
+/// When `enabled`, the proxy's `certificate_callback` triggers ACME HTTP-01
+/// issuance for allowlisted, STABLE hostnames (per-environment aliases and the
+/// console host) that have no active cert, rather than silently failing the
+/// handshake. Ephemeral per-deployment hostnames are NEVER certed (ADR §2).
+///
+/// Off by default — operators opt in explicitly, except QuickStart (`sslip.io`)
+/// installs where `temps setup` auto-enables it and derives `zone`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct OnDemandTlsSettings {
+    /// Master switch. When `false` (default) the proxy's on-demand cert gate
+    /// rejects every SNI and no issuance is ever triggered.
+    #[schema(example = false)]
+    pub enabled: bool,
+
+    /// Zone suffix for the allowlist gate. A hostname passes the gate only if
+    /// it is a direct subdomain of this zone (e.g. zone `1.2.3.4.sslip.io`
+    /// admits `myapp.1.2.3.4.sslip.io` but not `deep.sub.1.2.3.4.sslip.io`).
+    /// `None` (default) means "auto-derive from `external_url`"; if no zone can
+    /// be derived the gate rejects all SNI, disabling the feature.
+    #[schema(example = "1.2.3.4.sslip.io")]
+    pub zone: Option<String>,
+
+    /// Maximum number of ACME issuance flows allowed to run simultaneously
+    /// (the concurrent-issuance semaphore, ADR §4 Layer 1). Min 1.
+    #[schema(minimum = 1, example = 3)]
+    pub max_concurrent: u32,
+
+    /// Global cap on total on-demand issuances per hour across all hostnames
+    /// (ADR §4 Layer 3). The operator's self-imposed safety net, separate from
+    /// the Let's Encrypt rate limit.
+    #[schema(minimum = 1, example = 10)]
+    pub hourly_cap: u32,
+
+    /// How ephemeral per-deployment hostnames behave when they have no cert
+    /// (they are NEVER certed — see ADR §2). One of:
+    ///   - `"http"` (default): serve plain HTTP on :80.
+    ///   - `"redirect_to_env"`: 308-redirect to the stable per-environment URL,
+    ///     which IS certed.
+    #[schema(example = "http")]
+    pub deployment_url_mode: String,
+}
+
+impl Default for OnDemandTlsSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            zone: None,
+            max_concurrent: 3,
+            hourly_cap: 10,
+            deployment_url_mode: "http".to_string(),
+        }
+    }
+}
+
 // ============================================================
 // Monitoring / metrics settings
 // ============================================================
@@ -545,6 +606,7 @@ impl Default for AppSettings {
             multi_node: MultiNodeSettings::default(),
             agent_sandbox: AgentSandboxSettings::default(),
             preview_gateway: PreviewGatewaySettings::default(),
+            on_demand_tls: OnDemandTlsSettings::default(),
             ai_config: AiConfigSettings::default(),
             insecure_tls: false,
             build_limits: BuildLimitsSettings::default(),
@@ -730,5 +792,64 @@ impl AppSettings {
             })
             .unwrap_or_else(|| format!("http://host.docker.internal:{console_port}"));
         raw.trim_end_matches('/').to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn on_demand_tls_defaults_are_off_and_sensible() {
+        let s = OnDemandTlsSettings::default();
+        assert!(!s.enabled, "on-demand TLS must be opt-in (off by default)");
+        assert_eq!(s.zone, None);
+        assert_eq!(s.max_concurrent, 3);
+        assert_eq!(s.hourly_cap, 10);
+        assert_eq!(s.deployment_url_mode, "http");
+    }
+
+    #[test]
+    fn app_settings_default_includes_on_demand_tls_disabled() {
+        let s = AppSettings::default();
+        assert!(!s.on_demand_tls.enabled);
+        assert_eq!(s.on_demand_tls.deployment_url_mode, "http");
+    }
+
+    #[test]
+    fn legacy_settings_json_without_on_demand_tls_deserializes() {
+        // An old `settings.data` row written before ADR-018 has no
+        // `on_demand_tls` key. `#[serde(default)]` must fill it in with the
+        // disabled default so pre-migration rows keep loading.
+        let legacy = serde_json::json!({
+            "external_url": "https://paas.example.com",
+            "preview_domain": "localho.st"
+        });
+        let parsed = AppSettings::from_json(legacy);
+        assert_eq!(
+            parsed.external_url.as_deref(),
+            Some("https://paas.example.com")
+        );
+        assert!(!parsed.on_demand_tls.enabled);
+        assert_eq!(parsed.on_demand_tls.max_concurrent, 3);
+        assert_eq!(parsed.on_demand_tls.hourly_cap, 10);
+    }
+
+    #[test]
+    fn on_demand_tls_round_trips_through_json() {
+        let mut s = AppSettings::default();
+        s.on_demand_tls.enabled = true;
+        s.on_demand_tls.zone = Some("1.2.3.4.sslip.io".to_string());
+        s.on_demand_tls.max_concurrent = 5;
+        s.on_demand_tls.hourly_cap = 25;
+        s.on_demand_tls.deployment_url_mode = "redirect_to_env".to_string();
+
+        let json = s.to_json();
+        let back = AppSettings::from_json(json);
+        assert!(back.on_demand_tls.enabled);
+        assert_eq!(back.on_demand_tls.zone.as_deref(), Some("1.2.3.4.sslip.io"));
+        assert_eq!(back.on_demand_tls.max_concurrent, 5);
+        assert_eq!(back.on_demand_tls.hourly_cap, 25);
+        assert_eq!(back.on_demand_tls.deployment_url_mode, "redirect_to_env");
     }
 }

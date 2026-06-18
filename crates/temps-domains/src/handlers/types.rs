@@ -80,6 +80,10 @@ pub struct DomainResponse {
     pub updated_at: i64,
     /// The PEM-encoded certificate chain (can be displayed in browser or downloaded)
     pub certificate: Option<String>,
+    /// On-demand TLS negative-cache deadline (epoch millis), when this hostname's
+    /// on-demand HTTP-01 issuance is in backoff after a failure (ADR-018 §4).
+    /// `None` means no active backoff.
+    pub on_demand_backoff_until: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -137,6 +141,9 @@ impl From<temps_entities::domains::Model> for DomainResponse {
             created_at: domain.created_at.timestamp_millis(),
             updated_at: domain.updated_at.timestamp_millis(),
             certificate: domain.certificate,
+            on_demand_backoff_until: domain
+                .on_demand_backoff_until
+                .map(|dt| dt.timestamp_millis()),
         }
     }
 }
@@ -177,6 +184,9 @@ impl From<crate::tls::models::Certificate> for DomainResponse {
             created_at: chrono::Utc::now().timestamp_millis(),
             updated_at: chrono::Utc::now().timestamp_millis(),
             certificate: Some(cert.certificate_pem),
+            // The `Certificate` model carries no on-demand backoff state; that
+            // lives on the `domains` row, surfaced via the other `From` impl.
+            on_demand_backoff_until: None,
         }
     }
 }
@@ -338,4 +348,102 @@ pub struct SetupDnsChallengeResponse {
     pub results: Vec<DnsChallengeRecordResult>,
     /// Human-readable summary message
     pub message: String,
+}
+
+// ========================================
+// On-demand TLS observability types (ADR-018 §5)
+// ========================================
+
+/// A single on-demand HTTP-01 issuance attempt from the append-only
+/// `on_demand_cert_attempts` audit log. Carries the full forensic detail for one
+/// attempt; the current cert state lives on the enclosing row's domain fields.
+///
+/// Contains no private-key or certificate material — only audit metadata — so it
+/// is safe to return without masking.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct OnDemandCertAttemptResponse {
+    pub id: i32,
+    /// SNI hostname that triggered the attempt.
+    pub hostname: String,
+    /// What triggered the attempt (always `"tls_callback"` today).
+    pub trigger: String,
+    /// Did the proxy serve the `/.well-known/acme-challenge/` request?
+    pub challenge_served: Option<bool>,
+    /// Did we reach the Let's Encrypt API?
+    pub acme_request_sent: Option<bool>,
+    /// HTTP status or ACME error type returned by Let's Encrypt, when known.
+    pub acme_response_status: Option<String>,
+    /// Final outcome: `"issued"`, `"failed"`, `"skipped_duplicate"`,
+    /// `"skipped_gate"`, `"skipped_rate_limit"`, or `"skipped_no_route"`.
+    pub outcome: String,
+    /// Full `Display` chain of the error (all `source()` levels), when failed.
+    pub error_chain: Option<String>,
+    /// Coarse error category for UI labelling: `"rate_limited"`, `"dns_failure"`,
+    /// `"acme_order_expired"`, `"challenge_mismatch"`, `"timeout"`, `"internal"`.
+    pub error_category: Option<String>,
+    /// End-to-end issuance duration in milliseconds (0/None for skipped).
+    pub duration_ms: Option<i32>,
+    /// When the attempt was recorded (epoch millis).
+    pub created_at: i64,
+}
+
+impl From<temps_entities::on_demand_cert_attempts::Model> for OnDemandCertAttemptResponse {
+    fn from(m: temps_entities::on_demand_cert_attempts::Model) -> Self {
+        Self {
+            id: m.id,
+            hostname: m.hostname,
+            trigger: m.trigger,
+            challenge_served: m.challenge_served,
+            acme_request_sent: m.acme_request_sent,
+            acme_response_status: m.acme_response_status,
+            outcome: m.outcome,
+            error_chain: m.error_chain,
+            error_category: m.error_category,
+            duration_ms: m.duration_ms,
+            created_at: m.created_at.timestamp_millis(),
+        }
+    }
+}
+
+/// One row of the on-demand certificates list: the most-recent attempt for a
+/// hostname plus the current authoritative cert state from its `domains` row.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct OnDemandCertRow {
+    /// SNI hostname.
+    pub hostname: String,
+    /// Current cert lifecycle status from the `domains` row, when one exists:
+    /// `on_demand_pending`, `on_demand_issuing`, `active`, `on_demand_failed`,
+    /// etc. `None` when no `domains` row exists yet for this hostname.
+    pub status: Option<String>,
+    /// Certificate expiration (epoch millis), when an active cert exists.
+    pub expiration_time: Option<i64>,
+    /// On-demand negative-cache deadline (epoch millis), when in backoff.
+    pub backoff_until: Option<i64>,
+    /// The audit record for the attempt this row represents (newest first in
+    /// the list).
+    pub attempt: OnDemandCertAttemptResponse,
+}
+
+/// Paginated list of on-demand cert attempts (ADR-018 §5 console "Certificates"
+/// surface). Joined with current `domains.status`, newest first.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ListOnDemandCertsResponse {
+    pub certs: Vec<OnDemandCertRow>,
+    pub total: u64,
+    pub page: u64,
+    pub page_size: u64,
+}
+
+/// Current on-demand cert status for a single hostname (ADR-018 §5). Backs
+/// `GET /domains/by-host/{hostname}/cert-status`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CertStatusResponse {
+    /// SNI hostname.
+    pub hostname: String,
+    /// Current cert lifecycle status from the `domains` row, when one exists.
+    pub status: Option<String>,
+    /// On-demand negative-cache deadline (epoch millis), when in backoff.
+    pub backoff_until: Option<i64>,
+    /// The most recent on-demand issuance attempt for this hostname, if any.
+    pub last_attempt: Option<OnDemandCertAttemptResponse>,
 }

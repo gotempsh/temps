@@ -14,6 +14,7 @@ pub mod config;
 pub mod crawler_detector;
 pub mod handler;
 pub mod on_demand;
+pub mod on_demand_cert;
 pub mod plugin;
 pub mod preview_auth;
 pub mod proxy;

@@ -23,6 +23,11 @@ pub struct Model {
     pub last_error_type: Option<String>,
     pub is_wildcard: bool,
     pub verification_method: String,
+    /// On-demand TLS negative cache (ADR-018 §4 Layer 2). When a hostname's
+    /// on-demand issuance fails, this is set to `now + exponential_delay`; the
+    /// proxy's `certificate_callback` refuses to re-enqueue a job for the same
+    /// hostname until this timestamp elapses. `None` means "no active backoff".
+    pub on_demand_backoff_until: Option<DBDateTime>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }

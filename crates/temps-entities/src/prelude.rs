@@ -32,6 +32,7 @@ pub use super::magic_link_tokens::Entity as MagicLinkTokens;
 pub use super::notification_preferences::Entity as NotificationPreferences;
 pub use super::notification_providers::Entity as NotificationProviders;
 pub use super::notifications::Entity as Notifications;
+pub use super::on_demand_cert_attempts::Entity as OnDemandCertAttempts;
 pub use super::performance_metrics::Entity as PerformanceMetrics;
 pub use super::postgres_major_upgrades::Entity as PostgresMajorUpgrades;
 pub use super::project_custom_domains::Entity as ProjectCustomDomains;

@@ -57,6 +57,7 @@ import {
   Settings2,
   Shield,
   ShieldAlert,
+  ShieldCheck,
   SlidersHorizontal,
   Sparkles,
   Users,
@@ -98,7 +99,15 @@ interface PlatformNavItem {
 const navWorkflow: PlatformNavItem[] = [
   { title: 'Projects', url: '/projects', icon: Folder },
   { title: 'Sandboxes', url: '/sandboxes', icon: Box },
-  { title: 'Domains', url: '/domains', icon: Globe },
+  {
+    title: 'Domains',
+    url: '/domains',
+    icon: Globe,
+    subItems: [
+      { title: 'Domains', url: '/domains', icon: Globe },
+      { title: 'Certificates', url: '/certificates', icon: ShieldCheck },
+    ],
+  },
   {
     title: 'Storage',
     url: '/storage',

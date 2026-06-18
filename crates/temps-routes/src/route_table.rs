@@ -229,6 +229,17 @@ pub struct RouteInfo {
     pub environment: Option<Arc<environments::Model>>,
     /// Cached deployment model (None for custom_routes)
     pub deployment: Option<Arc<deployments::Model>>,
+    /// Whether this hostname is eligible for on-demand TLS issuance (ADR-018 §2,
+    /// third gate check). `true` for STABLE, low-cardinality hostnames — the
+    /// per-environment alias and console host — whose cert lives for the life of
+    /// the environment. `false` for EPHEMERAL, high-cardinality per-deployment
+    /// hostnames (the deployment-slug fallback) and for operator-configured
+    /// custom domains / internal-only names, which must NOT trigger on-demand
+    /// issuance (issuing a cert for `myapp-prod-42` is wasted against the shared
+    /// sslip.io community bucket and trips the LE per-hostname limits on a
+    /// redeploy loop). The proxy's on-demand cert gate reads this O(1) so the
+    /// TLS callback never needs a DB lookup to exclude ephemeral hostnames.
+    pub cert_eligible: bool,
 }
 
 impl RouteInfo {
@@ -439,6 +450,32 @@ impl CachedPeerTable {
         None
     }
 
+    /// Resolve a hostname across every lookup strategy in the same order the
+    /// proxy's `UpstreamResolver` uses: TLS/SNI exact+wildcard, then HTTP-host
+    /// exact+wildcard, then the legacy `routes` map. Stable per-environment
+    /// hostnames (env_domains, the env subdomain, the env preview alias) live in
+    /// the legacy map, so the on-demand TLS gate (ADR-018 §2 second/third check)
+    /// MUST consult all three — checking only `get_route_by_sni` would miss them
+    /// and reject every certable host. O(1) per map, no I/O.
+    pub fn resolve_route_for_sni(&self, sni: &str) -> Option<RouteInfo> {
+        if let Some(route) = self.get_route_by_sni(sni) {
+            return Some(route);
+        }
+        // get_route_by_host covers http_routes exact, http_wildcards, and the
+        // legacy routes map (its step 3), which together hold the stable env
+        // hostnames the on-demand gate cares about.
+        self.get_route_by_host(sni)
+    }
+
+    /// Insert a route directly into the legacy routes map. Test/seed support for
+    /// callers in other crates (e.g. the proxy's on-demand cert gate tests) that
+    /// need a populated route table without standing up a database. Not used on
+    /// the production load path — `load_routes` owns that.
+    #[doc(hidden)]
+    pub fn insert_route_for_test(&self, host: &str, route: RouteInfo) {
+        self.routes.write().insert(host.to_string(), route);
+    }
+
     /// Load all routes from the database into the cache with full models.
     /// This queries environment_domains, custom_routes, and project_custom_domains.
     /// Returns a list of sleeping on-demand environments that were skipped during route loading.
@@ -589,6 +626,8 @@ impl CachedPeerTable {
                                 project: project.cloned(),
                                 environment: Some(Arc::clone(environment)),
                                 deployment: Some(Arc::clone(deployment)),
+                                // STABLE per-environment alias — certable (ADR-018 §2).
+                                cert_eligible: true,
                             },
                         );
 
@@ -647,6 +686,9 @@ impl CachedPeerTable {
                 project: None, // Custom routes don't have project context
                 environment: None,
                 deployment: None,
+                // Operator-configured custom route mapping, not an on-demand zone
+                // host — never trigger on-demand issuance (ADR-018 §2).
+                cert_eligible: false,
             };
 
             let is_wildcard = custom_route.domain.starts_with("*.");
@@ -819,6 +861,11 @@ impl CachedPeerTable {
                                 project: project.cloned(),
                                 environment: Some(Arc::clone(environment)),
                                 deployment: Some(Arc::clone(deployment)),
+                                // Operator-configured custom domain — out of the
+                                // on-demand sslip.io zone; not on-demand certable
+                                // (ADR-018 §2). Custom-domain TLS is provisioned
+                                // through the normal manual/DNS-01 path.
+                                cert_eligible: false,
                             },
                         );
 
@@ -1060,6 +1107,8 @@ impl CachedPeerTable {
                                 project: project.cloned(),
                                 environment: environment.cloned(),
                                 deployment: Some(Arc::clone(deployment)),
+                                // STABLE per-environment hostname — certable (ADR-018 §2).
+                                cert_eligible: true,
                             },
                         );
                         match &backend {
@@ -1092,6 +1141,10 @@ impl CachedPeerTable {
                                 project: project.cloned(),
                                 environment: environment.cloned(),
                                 deployment: Some(Arc::clone(deployment)),
+                                // STABLE per-environment preview hostname —
+                                // certable (ADR-018 §2). This is the env alias,
+                                // one per environment, not a per-deployment name.
+                                cert_eligible: true,
                             },
                         );
                         match &backend {
@@ -1141,6 +1194,10 @@ impl CachedPeerTable {
                                         project: project.cloned(),
                                         environment: environment.cloned(),
                                         deployment: Some(Arc::clone(deployment)),
+                                        // Internal-only `*.temps.local` name — not
+                                        // publicly reachable by Let's Encrypt, so
+                                        // never on-demand certable (ADR-018 §2).
+                                        cert_eligible: false,
                                     },
                                 );
                                 debug!(
@@ -1220,6 +1277,10 @@ impl CachedPeerTable {
                                     project: project.cloned(),
                                     environment: environment.cloned(),
                                     deployment: Some(Arc::clone(deployment)),
+                                    // STABLE per-service env hostname
+                                    // (`<service>-<env>.<preview>`) — one per
+                                    // environment+service, certable (ADR-018 §2).
+                                    cert_eligible: true,
                                 };
 
                                 // Route: {service}-{env_subdomain}.{preview_domain}
@@ -1355,6 +1416,12 @@ impl CachedPeerTable {
                                 project: Some(Arc::clone(project)),
                                 environment: Some(Arc::clone(environment)),
                                 deployment: Some(Arc::clone(deployment)),
+                                // EPHEMERAL per-deployment fallback hostname
+                                // (`<deployment-slug>.<preview>`) — a new name on
+                                // every deploy. NEVER on-demand certable: it would
+                                // churn certs against the shared sslip.io bucket
+                                // and trip LE per-hostname limits (ADR-018 §2).
+                                cert_eligible: false,
                             },
                         );
                         match &backend {
@@ -1714,6 +1781,7 @@ mod tests {
             project: None,
             environment: None,
             deployment: None,
+            cert_eligible: false,
         };
 
         assert_eq!(route.get_backend_addr(), "127.0.0.1:8080");
@@ -1740,6 +1808,7 @@ mod tests {
             project: None,
             environment: None,
             deployment: None,
+            cert_eligible: false,
         };
 
         assert_eq!(route.redirect_to, Some("https://example.com".to_string()));
@@ -1762,6 +1831,7 @@ mod tests {
             project: None,
             environment: None,
             deployment: None,
+            cert_eligible: false,
         };
 
         assert_eq!(route.get_backend_addr(), "192.168.1.100:3000");
@@ -1799,6 +1869,7 @@ mod tests {
             project: None,
             environment: None,
             deployment: None,
+            cert_eligible: false,
         };
 
         // Test round-robin load balancing
@@ -1819,6 +1890,7 @@ mod tests {
             project: None,
             environment: None,
             deployment: None,
+            cert_eligible: false,
         };
 
         assert!(route.is_static());
@@ -1923,6 +1995,7 @@ mod tests {
             project: None,
             environment: None,
             deployment: None,
+            cert_eligible: false,
         };
 
         // Test all convenience methods
@@ -1947,6 +2020,7 @@ mod tests {
             project: None,
             environment: None,
             deployment: None,
+            cert_eligible: false,
         };
 
         // Test all convenience methods

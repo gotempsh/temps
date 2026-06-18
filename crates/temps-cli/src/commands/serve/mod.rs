@@ -2,6 +2,7 @@ pub(crate) mod admin_gate;
 mod admin_gate_handler;
 pub(crate) mod admin_gate_service;
 pub mod console;
+pub(crate) mod on_demand_cert;
 pub(crate) mod proxy;
 mod shutdown;
 
