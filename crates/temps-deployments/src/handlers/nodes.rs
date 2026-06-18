@@ -1191,8 +1191,10 @@ async fn edge_routes(
 
         use temps_entities::domains;
 
+        // Include "active_renewal_failed": those domains still hold a valid cert that
+        // edge nodes must keep serving until it actually expires.
         let active_domains = domains::Entity::find()
-            .filter(domains::Column::Status.eq("active"))
+            .filter(domains::Column::Status.is_in(domains::CERT_SERVING_STATUSES))
             .all(app_state.db.as_ref())
             .await
             .map_err(|e| {

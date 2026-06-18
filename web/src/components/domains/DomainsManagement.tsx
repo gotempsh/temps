@@ -44,6 +44,10 @@ import {
 import { useState } from 'react'
 import { toast } from 'sonner'
 import { formatExpiryRemaining, formatLocalDate } from '@/lib/date'
+import {
+  STATUS_ACTIVE_RENEWAL_FAILED,
+  isServingCert,
+} from '@/lib/domain-status'
 import { DNSConfigurationHelper } from './DNSConfigurationHelper'
 import { usePlatformCapabilities } from '@/hooks/usePlatformCapabilities'
 import { useNavigate } from 'react-router-dom'
@@ -372,14 +376,22 @@ function DomainStatusBadge({ status }: { status: string }) {
   const variant: 'default' | 'secondary' | 'destructive' | 'warning' =
     status === 'active'
       ? 'default'
-      : status === 'failed'
-        ? 'destructive'
-        : status === 'pending_dns'
-          ? 'warning'
-          : 'secondary'
+      : status === STATUS_ACTIVE_RENEWAL_FAILED
+        ? 'warning'
+        : status === 'failed'
+          ? 'destructive'
+          : status === 'pending_dns'
+            ? 'warning'
+            : 'secondary'
+  // "active_renewal_failed" is verbose; show a clearer label while keeping the
+  // serving state obvious (the cert is still live).
+  const label =
+    status === STATUS_ACTIVE_RENEWAL_FAILED
+      ? 'renewal failed'
+      : status.replace('_', ' ')
   return (
     <Badge variant={variant} className="text-xs">
-      {status.replace('_', ' ')}
+      {label}
     </Badge>
   )
 }
@@ -418,7 +430,7 @@ function DomainRowMenu({
             <Globe className="mr-2 h-4 w-4" />
             View details
           </DropdownMenuItem>
-          {domain.status === 'active' && canManageCertificates && (
+          {isServingCert(domain.status) && canManageCertificates && (
             <DropdownMenuItem
               onSelect={(e) => {
                 e.preventDefault()
@@ -458,7 +470,7 @@ function DomainsCompactRows({
       <ul role="list" className="divide-y">
         {domains.map((domain) => {
           const expiringSoon =
-            domain.status === 'active' &&
+            isServingCert(domain.status) &&
             isExpiringSoon(domain.expiration_time || 0)
           const expires = domain.expiration_time
             ? formatLocalDate(domain.expiration_time)

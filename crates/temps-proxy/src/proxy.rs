@@ -2036,7 +2036,8 @@ async fn host_has_active_cert(db: &DbConnection, host: &str) -> bool {
     // Exact match
     let exact = domains::Entity::find()
         .filter(domains::Column::Domain.eq(host))
-        .filter(domains::Column::Status.eq("active"))
+        // "active_renewal_failed" still serves a valid cert, so it counts here too.
+        .filter(domains::Column::Status.is_in(domains::CERT_SERVING_STATUSES))
         .filter(domains::Column::Certificate.is_not_null())
         .one(db)
         .await
@@ -2052,7 +2053,7 @@ async fn host_has_active_cert(db: &DbConnection, host: &str) -> bool {
         let wildcard = format!("*.{}", parts[1..].join("."));
         let wc = domains::Entity::find()
             .filter(domains::Column::Domain.eq(&wildcard))
-            .filter(domains::Column::Status.eq("active"))
+            .filter(domains::Column::Status.is_in(domains::CERT_SERVING_STATUSES))
             .filter(domains::Column::Certificate.is_not_null())
             .one(db)
             .await

@@ -759,6 +759,8 @@ fn print_domain_details(domain: &DomainResponse) {
 
     let status_colored = match domain.status.as_str() {
         "active" => domain.status.bright_green(),
+        // Still serving a valid cert, but renewal failed — warn (yellow), not green/red.
+        "active_renewal_failed" => domain.status.bright_yellow(),
         "pending" | "pending_dns" | "pending_validation" | "pending_http" => {
             domain.status.bright_yellow()
         }
@@ -811,6 +813,8 @@ fn is_on_demand_status(status: &str) -> bool {
 fn colorize_domain_status(status: &str) -> colored::ColoredString {
     match status {
         "active" => status.bright_green(),
+        // Still serving a valid cert, but renewal failed — warn (yellow), not green/red.
+        "active_renewal_failed" => status.bright_yellow(),
         "pending" | "pending_dns" | "pending_validation" | "pending_http" | "on_demand_pending"
         | "on_demand_issuing" => status.bright_yellow(),
         "failed" | "expired" | "on_demand_failed" => status.bright_red(),

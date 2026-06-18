@@ -4,17 +4,8 @@ import { CheckCircle2, Circle, X, ChevronRight } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Progress } from '@/components/ui/progress'
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
 import { cn } from '@/lib/utils'
 import { useActivationSignals } from '@/hooks/useActivationSignals'
-import { GitProviderFlow } from '@/components/git-providers/GitProviderFlow'
-import { useQueryClient } from '@tanstack/react-query'
-import { listConnectionsOptions } from '@/api/client/@tanstack/react-query.gen'
 
 const DISMISSED_KEY = 'temps_getting_started_dismissed'
 
@@ -22,20 +13,15 @@ interface ChecklistItem {
   label: string
   description: string
   done: boolean
-  // items handled by a modal pass action='modal'; others use href navigation
-  action: 'modal' | 'navigate'
-  href?: string
+  href: string
   cta: string
-  modalKey?: string
 }
 
 export function GettingStartedCard() {
   const navigate = useNavigate()
-  const queryClient = useQueryClient()
   const [dismissed, setDismissed] = useState(
     () => localStorage.getItem(DISMISSED_KEY) === 'true'
   )
-  const [gitModalOpen, setGitModalOpen] = useState(false)
 
   const signals = useActivationSignals()
 
@@ -44,15 +30,15 @@ export function GettingStartedCard() {
       label: 'Connect a Git provider',
       description: 'Link GitHub, GitLab, or Bitbucket to enable git-push deploys.',
       done: signals.gitConnected,
-      action: 'modal',
-      modalKey: 'git',
+      // Navigate to the full page rather than a modal — the in-modal
+      // GitProviderFlow overflows on smaller viewports (horizontal scroll).
+      href: '/git-providers/add',
       cta: 'Connect Git',
     },
     {
       label: 'Deploy your first project',
       description: 'Connect a Git repo or push a Docker image to get a live URL.',
       done: signals.hasProject,
-      action: 'navigate',
       href: '/projects/new',
       cta: 'Create project',
     },
@@ -61,7 +47,6 @@ export function GettingStartedCard() {
       description:
         'Point a wildcard DNS record at this server and get HTTPS for all apps.',
       done: signals.wildcardDomainReady,
-      action: 'navigate',
       href: '/domains/add',
       cta: 'Add domain',
     },
@@ -69,7 +54,6 @@ export function GettingStartedCard() {
       label: 'Configure notifications',
       description: 'Get alerted on Slack, email, or webhook when deployments fail.',
       done: signals.notificationsConfigured,
-      action: 'navigate',
       href: '/settings/notifications',
       cta: 'Set up',
     },
@@ -88,23 +72,10 @@ export function GettingStartedCard() {
 
   function handleItemClick(item: ChecklistItem) {
     if (item.done) return
-    if (item.action === 'modal' && item.modalKey === 'git') {
-      setGitModalOpen(true)
-    } else if (item.href) {
-      navigate(item.href)
-    }
-  }
-
-  function handleGitSuccess() {
-    // Invalidate connections so the checklist updates immediately
-    queryClient.invalidateQueries({ queryKey: listConnectionsOptions({}).queryKey })
-    setGitModalOpen(false)
-    // Send them straight to project creation — no idle step
-    navigate('/projects/new')
+    navigate(item.href)
   }
 
   return (
-    <>
       <Card className="border-border/60">
         <CardHeader className="pb-3">
           <div className="flex items-start justify-between gap-2">
@@ -190,21 +161,5 @@ export function GettingStartedCard() {
           ))}
         </CardContent>
       </Card>
-
-      {/* Git provider modal — keeps user on dashboard, redirects to new
-          project on success so Git connect → first deploy is one flow */}
-      <Dialog open={gitModalOpen} onOpenChange={setGitModalOpen}>
-        <DialogContent className="max-w-2xl max-h-[85vh] overflow-y-auto">
-          <DialogHeader>
-            <DialogTitle>Connect a Git provider</DialogTitle>
-          </DialogHeader>
-          <GitProviderFlow
-            mode="onboarding"
-            onSuccess={handleGitSuccess}
-            onCancel={() => setGitModalOpen(false)}
-          />
-        </DialogContent>
-      </Dialog>
-    </>
   )
 }

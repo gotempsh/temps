@@ -2101,8 +2101,11 @@ impl SetupCommand {
         };
         println!();
 
-        // Check if domain already has a valid certificate
-        if domain.status == "active" && domain.certificate.is_some() {
+        // Check if domain already has a valid certificate. "active_renewal_failed"
+        // still has a usable cert (only its last renewal failed), so it counts too.
+        if temps_entities::domains::CERT_SERVING_STATUSES.contains(&domain.status.as_str())
+            && domain.certificate.is_some()
+        {
             println!(
                 "   {} Domain '{}' already has a valid certificate!",
                 "🎉".bright_green(),
@@ -2450,7 +2453,12 @@ impl SetupCommand {
             match rt.block_on(domain_service.complete_challenge(&wildcard_domain, &admin_email)) {
                 Ok(completed_domain) => {
                     print_spinner_done();
-                    if completed_domain.status == "active" && completed_domain.certificate.is_some()
+                    // Success means a cert is being served. "active_renewal_failed" also
+                    // serves a cert, so accept any CERT_SERVING_STATUSES value (consistent
+                    // with the pre-check above) rather than a bare == "active".
+                    if temps_entities::domains::CERT_SERVING_STATUSES
+                        .contains(&completed_domain.status.as_str())
+                        && completed_domain.certificate.is_some()
                     {
                         print_substep(&format!(
                             "{} SSL certificate issued successfully!",

@@ -3,13 +3,11 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useDashboardAnalytics } from '@/hooks/useDashboardAnalytics'
 import { useDashboardHealth } from '@/hooks/useDashboardHealth'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { useSettings } from '@/hooks/useSettings'
 import { ExternalConnectivityAlert } from '@/components/alerts/ExternalConnectivityAlert'
 import { DiskSpaceAlert } from '@/components/alerts/DiskSpaceAlert'
 import { GettingStartedCard } from '@/components/dashboard/GettingStartedCard'
 import { MetricCard } from '@/components/dashboard/MetricCard'
 import { ProjectCard } from '@/components/dashboard/ProjectCard'
-import { ImprovedOnboardingDashboard } from '@/components/onboarding/ImprovedOnboardingDashboard'
 import { MetricCardSkeleton } from '@/components/skeletons/MetricCardSkeleton'
 import { ProjectCardSkeleton } from '@/components/skeletons/ProjectCardSkeleton'
 import { Button } from '@/components/ui/button'
@@ -83,32 +81,10 @@ function formatTrendChange(trendPercentage: number | null | undefined): {
 
 const ITEMS_PER_PAGE = 9
 
-// Mirrors the storage key used by ImprovedOnboardingDashboard. When the
-// dashboard reaches its 'complete' step it persists the state here; we
-// read it on Projects mount so that finishing the wizard doesn't leave
-// the user stuck on the 100%-progress screen with no project list.
-const ONBOARDING_STATE_KEY = 'temps_onboarding_state'
-
-function isOnboardingComplete(): boolean {
-  try {
-    const raw = localStorage.getItem(ONBOARDING_STATE_KEY)
-    if (!raw) return false
-    const state = JSON.parse(raw) as { currentStep?: string }
-    return state.currentStep === 'complete'
-  } catch {
-    return false
-  }
-}
-
 export function Projects() {
   const { setBreadcrumbs } = useBreadcrumbs()
   const navigate = useNavigate()
   const [page, setPage] = useState(1)
-
-  // Server-side setup completion flag — set by `temps setup` (all modes).
-  // Takes precedence over localStorage so installs configured via CLI never
-  // hit the "Configure Base Domain" wizard wall.
-  const { data: settings, isLoading: settingsLoading } = useSettings()
 
   const { data: projectsData, isLoading } = useQuery({
     ...getProjectsOptions({
@@ -244,34 +220,18 @@ export function Projects() {
           className: 'text-xs text-muted-foreground flex items-center mt-1',
         })
 
-  // Show the onboarding flow only when the user hasn't finished it AND
-  // there are no projects. Two completion signals are checked:
-  //   1. settings.setup_complete — server-side, set by `temps setup` (all
-  //      modes). Installs configured via CLI bypass the wizard entirely so
-  //      the "Configure Base Domain" wall never appears.
-  //   2. localStorage temps_onboarding_state.currentStep === 'complete' —
-  //      set by ImprovedOnboardingDashboard when the user clicks through.
-  // Either signal is sufficient to skip the wizard.
-  const setupComplete = settings?.setup_complete === true
-  const wizardDone = setupComplete || isOnboardingComplete()
-
-  // Wait for settings to load before deciding — avoids a flash of the wizard
-  // on installs where setup_complete is true but the fetch hasn't resolved yet.
-  if (!isLoading && !settingsLoading && !hasProjects && !wizardDone) {
-    return (
-      <div className="sm:p-8">
-        <ImprovedOnboardingDashboard />
-      </div>
-    )
-  }
-
   return (
     <div className="p-4 sm:p-8 space-y-6">
       <ExternalConnectivityAlert showInDashboard dismissible />
       <DiskSpaceAlert dismissible />
       <GettingStartedCard />
 
-      {/* Metric cards (merged from former Dashboard page). */}
+      {/* Metric cards (merged from former Dashboard page). Hidden on an empty
+          instance — with no projects every figure is zero, so the cards are
+          vanity data that pushes the recommended actions below the fold. The
+          stats/MRR queries are already gated on `hasProjects`, so nothing is
+          fetched while this is hidden. */}
+      {hasProjects && (
       <div className="grid gap-3 grid-cols-2 sm:gap-4 md:grid-cols-4 md:gap-6">
         {generalStatsQuery.isLoading ? (
           <MetricCardSkeleton />
@@ -338,6 +298,7 @@ export function Projects() {
           </Link>
         )}
       </div>
+      )}
 
       {/* Header */}
       <div className="flex flex-col gap-3 sm:flex-row sm:justify-between sm:items-center">
@@ -371,18 +332,41 @@ export function Projects() {
           </>
         ) : projectsData?.projects.length === 0 ? (
           !gitProviders || gitProviders.length === 0 ? (
-            // No git + no projects: let the Getting Started card above drive
-            // the user. Just show a minimal prompt so the grid isn't bare.
+            // No git + no projects. The Getting Started card above also covers
+            // this, but it's dismissible — so this state carries its own CTAs
+            // and doesn't reference "above" (which may be gone). Git is the
+            // recommended path; Docker/static deploys don't need it.
             <div className="col-span-full flex flex-col items-center justify-center rounded-lg border border-dashed p-8 text-center animate-in fade-in-50">
               <div className="flex h-20 w-20 items-center justify-center rounded-full bg-muted">
                 <GitBranch className="h-10 w-10 text-muted-foreground" />
               </div>
               <h2 className="mt-6 text-xl font-semibold">
-                Start by connecting a Git provider
+                Connect a Git provider to deploy
               </h2>
               <p className="mt-2 text-center text-sm text-muted-foreground max-w-md">
-                Link GitHub, GitLab, or Bitbucket above to deploy your first project.
+                Link GitHub, GitLab, or Bitbucket for git-push deploys — or
+                create a project directly from a Docker image or static files.
               </p>
+              <div className="flex flex-wrap justify-center gap-3 mt-6">
+                <Button asChild>
+                  <Link
+                    to="/git-providers/add"
+                    className="flex items-center gap-2"
+                  >
+                    <GitBranch className="h-4 w-4" />
+                    Connect Git provider
+                  </Link>
+                </Button>
+                <Button asChild variant="outline">
+                  <Link
+                    to="/projects/new"
+                    className="flex items-center gap-2"
+                  >
+                    <FolderPlus className="h-4 w-4" />
+                    New Project
+                  </Link>
+                </Button>
+              </div>
             </div>
           ) : (
             <div className="col-span-full flex flex-col items-center justify-center rounded-lg border border-dashed p-8 text-center animate-in fade-in-50">

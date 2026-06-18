@@ -8,13 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
--
+- **`active_renewal_failed` domain status.** A domain whose certificate is still
+  valid but whose last renewal attempt failed now enters a distinct
+  degraded-but-serving state instead of being silently disabled. The proxy keeps
+  serving the existing certificate (the cert-serving queries match a new
+  `CERT_SERVING_STATUSES` set), and the console/CLI surface a "renewal failed"
+  warning so operators can fix the renewal before the certificate expires.
 
 ### Changed
 -
 
 ### Fixed
--
+- **Cancelling or failing a certificate renewal no longer drops the existing
+  valid certificate.** Previously, cancelling an in-flight renewal (or a renewal
+  that failed) reset the domain's status away from `active`; because the proxy
+  only serves certificates for `active` domains, a still-valid certificate
+  silently stopped being served and HTTPS broke. Renewal cancel/failure now
+  preserves the live certificate when it is still usable (present cert + key and
+  not within a 5-minute clock-skew margin of expiry), and a renewal-failure that
+  occurs while a valid certificate remains keeps serving it under the new
+  `active_renewal_failed` status. Also fixed a latent bug where the
+  challenge-failure path computed a status update but never persisted it.
 
 
 ## [0.1.0-beta.34] - 2026-06-17

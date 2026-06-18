@@ -139,6 +139,11 @@ function DomainStatusBadge({ status }: { status: string }) {
       label: 'Active',
       className: 'bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300',
     },
+    // Still serving a live cert, but the last renewal failed — warn, don't alarm.
+    active_renewal_failed: {
+      label: 'Renewal failed',
+      className: 'bg-amber-100 text-amber-700 dark:bg-amber-900 dark:text-amber-300',
+    },
     pending: {
       label: 'Pending',
       className: 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900 dark:text-yellow-300',

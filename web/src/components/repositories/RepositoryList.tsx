@@ -1,6 +1,7 @@
-import { useState, useMemo, useEffect } from 'react'
+import { useState, useMemo, useEffect, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
+  listConnectionsOptions,
   listRepositoriesByConnectionOptions,
   syncRepositoriesMutation,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -114,6 +115,40 @@ export function RepositoryList({
     retry: false,
   })
 
+  // Track the connection's live sync state so the UI can explain that repos
+  // are still being fetched instead of showing a misleading "No repositories
+  // found" empty state. The backend flips `syncing` / `synced_repository_count`
+  // on the connection row; we poll those fields every 2s while a sync is in
+  // flight (mirrors GitProviderDetail.tsx) and stop once it settles.
+  const { data: connectionsData } = useQuery({
+    ...listConnectionsOptions(),
+    enabled: !!connectionId,
+    refetchInterval: (query) => {
+      const conn = query.state.data?.connections?.find(
+        (c) => c.id === connectionId
+      )
+      return conn?.syncing ? 2000 : false
+    },
+    refetchIntervalInBackground: false,
+  })
+
+  const connection = connectionsData?.connections?.find(
+    (c) => c.id === connectionId
+  )
+  const isConnectionSyncing = connection?.syncing ?? false
+  const syncedRepositoryCount = connection?.synced_repository_count ?? 0
+
+  // When a background sync finishes (syncing flips true -> false), the newly
+  // persisted repositories won't show up until the list query re-runs. Refetch
+  // once on that edge so the page fills in without a manual refresh.
+  const wasSyncingRef = useRef(isConnectionSyncing)
+  useEffect(() => {
+    if (wasSyncingRef.current && !isConnectionSyncing) {
+      refetch()
+    }
+    wasSyncingRef.current = isConnectionSyncing
+  }, [isConnectionSyncing, refetch])
+
   // Sync repositories mutation
   const syncMutation = useMutation({
     ...syncRepositoriesMutation(),
@@ -125,7 +160,7 @@ export function RepositoryList({
       // "finished". Client-side progress tracking lives on the connection
       // row's `syncing` / `synced_repository_count` fields.
       toast.success('Repository sync started', {
-        description: 'Watch the connection page for live progress.',
+        description: 'Repositories will appear here as they sync.',
       })
       queryClient.invalidateQueries({
         queryKey: ['listConnections'],
@@ -292,6 +327,20 @@ export function RepositoryList({
         </div>
       )}
 
+      {/* Live sync banner — the connection is still pulling repositories from
+          the provider. Shown above the list so it's visible even when some
+          repos have already streamed in. */}
+      {isConnectionSyncing && (
+        <Alert>
+          <RefreshCw className="h-4 w-4 animate-spin" />
+          <AlertDescription>
+            {syncedRepositoryCount > 0
+              ? `Syncing repositories… ${syncedRepositoryCount.toLocaleString()} found so far. New repositories will appear automatically.`
+              : 'Syncing repositories from this connection… This usually takes a few seconds.'}
+          </AlertDescription>
+        </Alert>
+      )}
+
       {/* Repository Grid */}
       {isLoading ? (
         <div
@@ -311,31 +360,53 @@ export function RepositoryList({
           ))}
         </div>
       ) : paginatedRepositories.length === 0 ? (
-        <Card className="p-12">
-          <div className="flex flex-col items-center justify-center text-center space-y-4">
-            <FolderGit2 className="h-12 w-12 text-muted-foreground" />
-            <div>
-              <h3 className="font-semibold">No repositories found</h3>
-              <p className="text-sm text-muted-foreground mt-1">
-                {searchQuery
-                  ? 'Try adjusting your search or filters'
-                  : 'No repositories available from this connection'}
-              </p>
+        isConnectionSyncing && !searchQuery ? (
+          // A sync is already running and nothing has landed yet — explain the
+          // wait instead of offering a redundant "Sync Repositories" button
+          // (which would just hit a SyncInProgress conflict). The 2s poll above
+          // refreshes the list automatically as repos stream in.
+          <Card className="p-12">
+            <div className="flex flex-col items-center justify-center text-center space-y-4">
+              <RefreshCw className="h-12 w-12 text-muted-foreground animate-spin" />
+              <div>
+                <h3 className="font-semibold">Syncing repositories…</h3>
+                <p className="text-sm text-muted-foreground mt-1">
+                  {syncedRepositoryCount > 0
+                    ? `${syncedRepositoryCount.toLocaleString()} found so far — they'll appear here in a moment.`
+                    : 'Fetching repositories from this connection. This usually takes a few seconds.'}
+                </p>
+              </div>
             </div>
-            {!searchQuery && (
-              <Button
-                onClick={handleSyncRepositories}
-                disabled={syncMutation.isPending}
-                className="gap-2"
-              >
-                <RefreshCw
-                  className={`h-4 w-4 ${syncMutation.isPending ? 'animate-spin' : ''}`}
-                />
-                {syncMutation.isPending ? 'Syncing...' : 'Sync Repositories'}
-              </Button>
-            )}
-          </div>
-        </Card>
+          </Card>
+        ) : (
+          <Card className="p-12">
+            <div className="flex flex-col items-center justify-center text-center space-y-4">
+              <FolderGit2 className="h-12 w-12 text-muted-foreground" />
+              <div>
+                <h3 className="font-semibold">No repositories found</h3>
+                <p className="text-sm text-muted-foreground mt-1">
+                  {searchQuery
+                    ? 'Try adjusting your search or filters'
+                    : 'No repositories available from this connection'}
+                </p>
+              </div>
+              {!searchQuery && (
+                <Button
+                  onClick={handleSyncRepositories}
+                  disabled={syncMutation.isPending || isConnectionSyncing}
+                  className="gap-2"
+                >
+                  <RefreshCw
+                    className={`h-4 w-4 ${syncMutation.isPending || isConnectionSyncing ? 'animate-spin' : ''}`}
+                  />
+                  {syncMutation.isPending || isConnectionSyncing
+                    ? 'Syncing...'
+                    : 'Sync Repositories'}
+                </Button>
+              )}
+            </div>
+          </Card>
+        )
       ) : (
         <div
           className={cn(

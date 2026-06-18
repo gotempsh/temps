@@ -38,6 +38,10 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { usePlatformCapabilities } from '@/hooks/usePlatformCapabilities'
 import { formatExpiryRemaining, formatLocalDateTime, formatUTCDate } from '@/lib/date'
+import {
+  STATUS_ACTIVE_RENEWAL_FAILED,
+  isServingCert,
+} from '@/lib/domain-status'
 import { useIsFetching, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { formatDistanceToNowStrict } from 'date-fns'
 import {
@@ -90,7 +94,9 @@ export function DomainDetail() {
 
   const { data: order, isLoading: isOrderLoading } = useQuery({
     ...getDomainOrderOptions({ path: { domain_id: Number(id) } }),
-    enabled: !!id && domain?.status !== 'active',
+    // Only fetch an in-progress ACME order when the domain isn't already serving a
+    // cert. "active_renewal_failed" is still serving, so treat it like "active".
+    enabled: !!id && !isServingCert(domain?.status),
     retry: false,
   })
 
@@ -321,6 +327,8 @@ export function DomainDetail() {
       case 'active':
       case 'valid':
         return 'default' as const
+      case STATUS_ACTIVE_RENEWAL_FAILED:
+        return 'warning' as const
       case 'pending':
       case 'processing':
         return 'secondary' as const
@@ -415,7 +423,7 @@ export function DomainDetail() {
     domain.verification_method === 'dns-01' ? 'Start renewal' : 'Renew certificate'
 
   const primaryActionButton = (() => {
-    if (domain.status === 'active') return null
+    if (isServingCert(domain.status)) return null
     if (canCreateOrder) {
       return (
         <Button
@@ -551,7 +559,20 @@ export function DomainDetail() {
       <div className="lg:col-span-2 space-y-6">
         <Card>
           <div className="p-6 space-y-4">
-            {domain.status === 'active' && (
+            {domain.status === STATUS_ACTIVE_RENEWAL_FAILED && (
+              <Alert variant="warning">
+                <AlertTriangle className="size-4" />
+                <AlertTitle>Certificate renewal failed</AlertTitle>
+                <AlertDescription>
+                  The current certificate is still valid and being served, but the
+                  last automatic renewal attempt failed. Renew it before it expires
+                  to avoid downtime.
+                  {domain.last_error ? ` Last error: ${domain.last_error}` : ''}
+                </AlertDescription>
+              </Alert>
+            )}
+
+            {isServingCert(domain.status) && (
               <ActiveCertificateInner
                 domain={domain}
                 onRenew={canRenew ? handleRenewDomain : undefined}
@@ -916,7 +937,7 @@ export function DomainDetail() {
                   </Button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end" className="w-48">
-                  {canRenew && domain.status === 'active' && (
+                  {canRenew && isServingCert(domain.status) && (
                     <DropdownMenuItem
                       onSelect={() => handleRenewDomain()}
                       disabled={renewDomain.isPending}
@@ -936,7 +957,7 @@ export function DomainDetail() {
                   )}
                   {activeOrder && isPendingState && (
                     <>
-                      {canRenew && domain.status === 'active' && <DropdownMenuSeparator />}
+                      {canRenew && isServingCert(domain.status) && <DropdownMenuSeparator />}
                       <DropdownMenuItem
                         onSelect={handleCancelOrder}
                         disabled={!canManageCertificates || cancelOrder.isPending}
@@ -963,7 +984,7 @@ export function DomainDetail() {
           </Alert>
         )}
 
-        {domain.status === 'active' && isExpiringSoon(domain.expiration_time) && (
+        {isServingCert(domain.status) && isExpiringSoon(domain.expiration_time) && (
           <ExpiringSoonAlert
             expirationTime={domain.expiration_time}
             canRenew={canRenew}

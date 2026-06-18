@@ -82,24 +82,46 @@ impl DomainService {
         }
     }
 
-    /// Determine the status a domain should fall back to when a renewal/order is
-    /// abandoned (cancelled or failed). If the domain still holds a usable
-    /// certificate (present key + cert that has not yet expired) we must return it
-    /// to `"active"` so the proxy keeps serving the live HTTPS cert — only the
-    /// `tls_cert_loader` query filters on `status = "active"`, so leaving a valid
-    /// cert under any other status silently takes the domain offline. When there
-    /// is no usable certificate we fall back to `"pending"`.
-    fn fallback_status_for(domain: &domains::Model) -> &'static str {
+    /// Whether a domain still holds a certificate that can safely keep being served:
+    /// non-empty cert + key, and an expiration that is comfortably in the future.
+    ///
+    /// A 5-minute safety margin is applied to the expiry check so we never report a
+    /// cert as usable when it is about to expire within the time it takes the proxy
+    /// to load it and finish a handshake (and to absorb minor clock skew between this
+    /// server and TLS clients). A missing `expiration_time` is treated as not-usable:
+    /// we can't prove the cert is still valid.
+    fn has_usable_certificate(domain: &domains::Model) -> bool {
         let has_material = domain.certificate.as_ref().is_some_and(|c| !c.is_empty())
             && domain.private_key.as_ref().is_some_and(|k| !k.is_empty());
 
-        // Treat a missing expiration as not-usable: we can't prove it's still valid.
-        let not_expired = domain.expiration_time.is_some_and(|exp| exp > Utc::now());
+        let safety_margin = chrono::Duration::minutes(5);
+        let not_expiring_imminently = domain
+            .expiration_time
+            .is_some_and(|exp| exp > Utc::now() + safety_margin);
 
-        if has_material && not_expired {
-            "active"
+        has_material && not_expiring_imminently
+    }
+
+    /// Status to fall back to when a renewal/order is abandoned.
+    ///
+    /// `renewal_failed = true`  → the renewal attempt failed. If a usable cert is still
+    /// present we move to `STATUS_ACTIVE_RENEWAL_FAILED`: the proxy keeps serving the
+    /// live cert (that status is in `CERT_SERVING_STATUSES`) while the degraded state
+    /// stays visible to operators so they can fix the renewal before the cert expires.
+    ///
+    /// `renewal_failed = false` → a clean, operator-initiated cancellation. If a usable
+    /// cert is present we keep `STATUS_ACTIVE`; there is nothing wrong to flag.
+    ///
+    /// In both cases, if there is no usable cert to fall back to we return `"pending"`
+    /// (the domain is genuinely without HTTPS and needs a fresh order).
+    fn fallback_status_for(domain: &domains::Model, renewal_failed: bool) -> &'static str {
+        if !Self::has_usable_certificate(domain) {
+            return "pending";
+        }
+        if renewal_failed {
+            domains::STATUS_ACTIVE_RENEWAL_FAILED
         } else {
-            "pending"
+            domains::STATUS_ACTIVE
         }
     }
 
@@ -511,14 +533,30 @@ impl DomainService {
                 );
 
                 // A failed renewal must not take down a domain that is still serving a
-                // valid certificate: keep it "active" when usable cert material remains,
-                // otherwise mark it "failed". (The proxy only loads certs for "active"
-                // domains, so "failed" with a live cert silently breaks HTTPS.)
-                let fallback_status = Self::fallback_status_for(&domain);
+                // valid certificate. When usable cert material remains we move to
+                // STATUS_ACTIVE_RENEWAL_FAILED — still served by the proxy (it's in
+                // CERT_SERVING_STATUSES), but a distinct state so operators are alerted
+                // and can fix the renewal before the existing cert actually expires.
+                // With no usable cert we mark it "failed" (HTTPS is genuinely down).
+                let fallback_status = if Self::has_usable_certificate(&domain) {
+                    domains::STATUS_ACTIVE_RENEWAL_FAILED
+                } else {
+                    "failed"
+                };
+
+                if fallback_status == domains::STATUS_ACTIVE_RENEWAL_FAILED {
+                    warn!(
+                        "Renewal failed for domain {} but its existing certificate is still \
+                         valid; keeping it served as '{}'. Operator action needed before expiry.",
+                        domain_name, fallback_status
+                    );
+                }
 
                 // Persist the error so the failure is visible, and actually write it —
                 // the previous implementation built this ActiveModel but never called
-                // update(), silently dropping the status/error change.
+                // update(), silently dropping the status/error change. The full error is
+                // already logged above; store the top-level display string only so
+                // provider/ACME internals aren't surfaced verbatim in API responses.
                 let mut domain_active: domains::ActiveModel = domain.into();
                 domain_active.status = Set(fallback_status.to_string());
                 domain_active.last_error = Set(Some(e.to_string()));
@@ -706,15 +744,17 @@ impl DomainService {
 
         // Cancelling an in-flight renewal must NOT take down a domain that is still
         // serving a valid certificate. The cert/key columns are left untouched here,
-        // but the proxy only loads certs for domains with status = "active", so if we
-        // blindly reset to "pending" the live cert stops being served. Fall back to
+        // but the proxy only loads certs for domains in CERT_SERVING_STATUSES, so if we
+        // blindly reset to "pending" the live cert stops being served. This is a clean,
+        // operator-initiated cancellation (not a renewal failure), so fall back to
         // "active" when a usable cert is still present, otherwise "pending".
-        let fallback_status = Self::fallback_status_for(&domain);
+        let fallback_status = Self::fallback_status_for(&domain, false);
+        let cert_preserved = fallback_status != "pending";
         info!(
             "Cancelling order for domain {}: resetting status to '{}' (existing certificate {})",
             domain_name,
             fallback_status,
-            if fallback_status == "active" {
+            if cert_preserved {
                 "preserved"
             } else {
                 "absent or expired"
@@ -728,8 +768,15 @@ impl DomainService {
         domain_active.dns_challenge_value = Set(None);
         domain_active.http_challenge_token = Set(None);
         domain_active.http_challenge_key_authorization = Set(None);
-        domain_active.last_error = Set(Some("Order cancelled by user".to_string()));
-        domain_active.last_error_type = Set(Some("cancelled".to_string()));
+        if cert_preserved {
+            // Nothing went wrong — the domain keeps serving its existing cert. Don't
+            // leave a stale "error" surfaced to operators for a healthy domain.
+            domain_active.last_error = Set(None);
+            domain_active.last_error_type = Set(None);
+        } else {
+            domain_active.last_error = Set(Some("Order cancelled by user".to_string()));
+            domain_active.last_error_type = Set(Some("cancelled".to_string()));
+        }
 
         let updated_domain = domain_active.update(self.db.as_ref()).await?;
 
@@ -1955,40 +2002,83 @@ mod tests {
     }
 
     #[test]
-    fn test_fallback_status_preserves_active_for_valid_cert() {
-        // Present cert + key, expires in the future → stay "active" so the proxy
-        // keeps serving the live certificate.
+    fn test_clean_cancel_preserves_active_for_valid_cert() {
+        // Clean cancel (renewal_failed = false) with a valid cert → stay "active"
+        // so the proxy keeps serving the live certificate.
         let domain = domain_with_cert(
             Some("-----CERT-----"),
             Some("-----KEY-----"),
             Some(Utc::now() + chrono::Duration::days(30)),
         );
-        assert_eq!(DomainService::fallback_status_for(&domain), "active");
+        assert_eq!(
+            DomainService::fallback_status_for(&domain, false),
+            domains::STATUS_ACTIVE
+        );
+    }
+
+    #[test]
+    fn test_failed_renewal_keeps_serving_but_flags_degraded() {
+        // Renewal failure (renewal_failed = true) with a still-valid cert →
+        // "active_renewal_failed": still served, but a distinct, alertable state.
+        let domain = domain_with_cert(
+            Some("-----CERT-----"),
+            Some("-----KEY-----"),
+            Some(Utc::now() + chrono::Duration::days(30)),
+        );
+        assert_eq!(
+            DomainService::fallback_status_for(&domain, true),
+            domains::STATUS_ACTIVE_RENEWAL_FAILED
+        );
+        // The serving status set the proxy filters on must include it.
+        assert!(domains::CERT_SERVING_STATUSES.contains(&domains::STATUS_ACTIVE_RENEWAL_FAILED));
     }
 
     #[test]
     fn test_fallback_status_pending_for_expired_cert() {
-        // Cert material present but already expired → "pending" (nothing usable to serve).
+        // Cert material present but already expired → "pending" regardless of the
+        // renewal_failed flag (nothing usable to serve).
         let domain = domain_with_cert(
             Some("-----CERT-----"),
             Some("-----KEY-----"),
             Some(Utc::now() - chrono::Duration::days(1)),
         );
-        assert_eq!(DomainService::fallback_status_for(&domain), "pending");
+        assert_eq!(
+            DomainService::fallback_status_for(&domain, false),
+            "pending"
+        );
+        assert_eq!(DomainService::fallback_status_for(&domain, true), "pending");
+    }
+
+    #[test]
+    fn test_fallback_status_pending_within_clock_skew_margin() {
+        // Cert that expires within the 5-minute safety margin must be treated as
+        // not-usable, so a handshake can't complete with an about-to-expire cert.
+        let domain = domain_with_cert(
+            Some("-----CERT-----"),
+            Some("-----KEY-----"),
+            Some(Utc::now() + chrono::Duration::minutes(2)),
+        );
+        assert!(!DomainService::has_usable_certificate(&domain));
+        assert_eq!(DomainService::fallback_status_for(&domain, true), "pending");
     }
 
     #[test]
     fn test_fallback_status_pending_when_no_cert() {
         // No cert at all (fresh domain whose first order was cancelled) → "pending".
         let domain = domain_with_cert(None, None, None);
-        assert_eq!(DomainService::fallback_status_for(&domain), "pending");
+        assert_eq!(
+            DomainService::fallback_status_for(&domain, false),
+            "pending"
+        );
+        assert_eq!(DomainService::fallback_status_for(&domain, true), "pending");
     }
 
     #[test]
     fn test_fallback_status_pending_when_cert_without_expiry() {
         // Cert/key present but no expiration recorded → can't prove validity → "pending".
         let domain = domain_with_cert(Some("-----CERT-----"), Some("-----KEY-----"), None);
-        assert_eq!(DomainService::fallback_status_for(&domain), "pending");
+        assert!(!DomainService::has_usable_certificate(&domain));
+        assert_eq!(DomainService::fallback_status_for(&domain, true), "pending");
     }
 
     #[test]
@@ -1999,7 +2089,10 @@ mod tests {
             None,
             Some(Utc::now() + chrono::Duration::days(30)),
         );
-        assert_eq!(DomainService::fallback_status_for(&cert_only), "pending");
+        assert_eq!(
+            DomainService::fallback_status_for(&cert_only, true),
+            "pending"
+        );
 
         let empty_strings = domain_with_cert(
             Some(""),
@@ -2007,7 +2100,7 @@ mod tests {
             Some(Utc::now() + chrono::Duration::days(30)),
         );
         assert_eq!(
-            DomainService::fallback_status_for(&empty_strings),
+            DomainService::fallback_status_for(&empty_strings, true),
             "pending"
         );
     }

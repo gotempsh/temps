@@ -56,7 +56,9 @@ impl CertificateLoader {
     ) -> Result<Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>> {
         let domain_entity = domains::Entity::find()
             .filter(domains::Column::Domain.eq(domain))
-            .filter(domains::Column::Status.eq("active"))
+            // Serve the cert for "active" AND "active_renewal_failed": the latter still
+            // holds a valid cert (renewal failed but it hasn't expired yet).
+            .filter(domains::Column::Status.is_in(domains::CERT_SERVING_STATUSES))
             .one(self.db.as_ref())
             .await?;
 
