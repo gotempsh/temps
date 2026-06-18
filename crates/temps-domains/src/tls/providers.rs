@@ -62,10 +62,22 @@ fn build_http_client_with_ca(ca_pem: &[u8]) -> Result<Box<dyn HttpClient>, Provi
     let mut roots = RootCertStore::empty();
 
     // Load system roots first so the client can still reach other HTTPS endpoints.
-    // `load_native_certs` returns a `CertificateResult` (not `Result`): iterate
-    // over `.certs` and silently ignore any `.errors` (best-effort behaviour).
-    for cert in rustls_native_certs::load_native_certs().certs {
-        let _ = roots.add(cert);
+    // `load_native_certs` returns a `CertificateResult` (not `Result`): best-effort
+    // — but surface any load/add errors so an environment with no/partial system
+    // trust store (minimal containers) is diagnosable instead of silently leaving
+    // only the custom CA trusted. (Security review LOW.)
+    let native = rustls_native_certs::load_native_certs();
+    if !native.errors.is_empty() {
+        tracing::warn!(
+            error_count = native.errors.len(),
+            "loading system root certificates reported errors; ACME client will trust \
+             only the certs that loaded plus the supplied custom CA"
+        );
+    }
+    for cert in native.certs {
+        if let Err(e) = roots.add(cert) {
+            tracing::warn!(error = %e, "failed to add a system root certificate to the ACME trust store");
+        }
     }
 
     // Parse and add the caller-supplied CA PEM bundle.
@@ -88,9 +100,12 @@ fn build_http_client_with_ca(ca_pem: &[u8]) -> Result<Box<dyn HttpClient>, Provi
         .with_root_certificates(roots)
         .with_no_client_auth();
 
+    // `https_only`: never silently fall back to plaintext, even if a
+    // misconfigured `ACME_DIRECTORY_URL` uses `http://` — that would transmit
+    // ACME account credentials/key material in cleartext. (Security review LOW.)
     let connector = HttpsConnectorBuilder::new()
         .with_tls_config(tls_config)
-        .https_or_http()
+        .https_only()
         .enable_http1()
         .enable_http2()
         .build();
@@ -203,7 +218,7 @@ fn build_insecure_http_client() -> Result<Box<dyn HttpClient>, ProviderError> {
 
     let connector = HttpsConnectorBuilder::new()
         .with_tls_config(tls_config)
-        .https_or_http()
+        .https_only()
         .enable_http1()
         .enable_http2()
         .build();
@@ -321,6 +336,22 @@ impl LetsEncryptProvider {
     /// When neither applies, behaviour is byte-for-byte identical to before
     /// (default `instant-acme` client, full system-root TLS validation).
     fn acme_http_client(&self) -> Result<Option<Box<dyn HttpClient>>, ProviderError> {
+        // Whenever we build a custom client, the directory URL must be https://.
+        // The custom connectors are https_only, but fail loudly here rather than
+        // let a misconfigured http:// URL produce a confusing connect error.
+        // (Security review LOW.)
+        let needs_custom_client =
+            std::env::var("ACME_INSECURE").as_deref() == Ok("1") || self.custom_ca_pem.is_some();
+        if needs_custom_client {
+            let url = self.get_acme_url();
+            if !url.starts_with("https://") {
+                return Err(ProviderError::Configuration(format!(
+                    "ACME directory URL must use https:// when a custom CA / insecure \
+                     client is configured, got: {url}"
+                )));
+            }
+        }
+
         // TEST-ONLY insecure path, gated STRICTLY on the env var being exactly "1".
         // SECURITY: this disables TLS verification — never enable in production.
         if std::env::var("ACME_INSECURE").as_deref() == Ok("1") {
