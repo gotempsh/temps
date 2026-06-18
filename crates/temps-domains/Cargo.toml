@@ -25,7 +25,13 @@ log = { workspace = true }
 chrono = { workspace = true }
 sea-orm = { workspace = true }
 hickory-resolver = "0.26"
-instant-acme = "0.7.2"
+instant-acme = "0.8.5"
+hyper = { version = "1", default-features = false }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "tls12", "ring"] }
+hyper-util = { version = "0.1", default-features = false, features = ["client", "client-legacy", "http1", "tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+rustls-native-certs = "0.8"
 rcgen = { version = "0.13.2", features = ["x509-parser"] }
 thiserror = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = [
@@ -49,3 +55,6 @@ testcontainers = { workspace = true }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 axum-test = "16.3"
 webpki-roots = "0.26"
+bollard = { workspace = true }
+futures-util = { workspace = true }
+tar = { workspace = true }

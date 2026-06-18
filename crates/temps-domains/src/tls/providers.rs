@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use instant_acme::{
     Account, AccountCredentials, AuthorizationStatus, ChallengeType as AcmeChallengeType,
-    Identifier, NewAccount, NewOrder, Order, OrderStatus,
+    HttpClient, Identifier, NewAccount, NewOrder, Order, OrderStatus,
 };
 use rcgen::{CertificateParams, DistinguishedName, KeyPair};
 use serde_json;
@@ -13,6 +13,210 @@ use tracing::{debug, error, info};
 use super::errors::ProviderError;
 use super::models::*;
 use super::repository::CertificateRepository;
+
+/// Build an `instant-acme`-compatible hyper+hyper-rustls HTTP client that trusts
+/// the given PEM CA bundle in addition to the system roots.
+///
+/// This is the injection point for test CAs (e.g. Pebble's self-signed cert) and
+/// for corporate internal ACME servers. A future ACME request timeout would also
+/// live here (e.g. `HyperClient::builder(...).connection_verbose(true).pool_idle_timeout(...)`).
+///
+/// The function returns `Err` only when the PEM data cannot be parsed or the
+/// connector cannot be built — both are configuration errors, not network errors.
+///
+/// instant-acme 0.8.5's client injects a `User-Agent: instant-acme/<ver>` header
+/// on every request it builds, so Pebble's RFC 8555 §6.1 User-Agent requirement
+/// is satisfied without any extra wrapper here.
+/// Test-only re-export of `build_http_client_with_ca` so integration tests in
+/// `domain_service.rs` can verify the underlying hyper client directly.
+#[cfg(test)]
+pub fn build_http_client_for_test(ca_pem: &[u8]) -> Result<Box<dyn HttpClient>, ProviderError> {
+    build_http_client_with_ca(ca_pem)
+}
+
+/// Ensure a process-level rustls `CryptoProvider` is installed before we build
+/// any `rustls::ClientConfig`.
+///
+/// instant-acme 0.8.5 enables hyper-rustls's `aws-lc-rs` backend by default,
+/// while the rest of this workspace standardises on `ring` (via
+/// testcontainers/bollard and our own `hyper-rustls`/`rustls` feature flags).
+/// With BOTH the `ring` and `aws-lc-rs` rustls features compiled in, rustls can
+/// no longer auto-pick a process-level provider, and `ClientConfig::builder()`
+/// panics with "Could not automatically determine the process-level
+/// CryptoProvider". The server binary already installs `ring` at startup
+/// (`temps-cli`), so this only bites in standalone test/library contexts.
+///
+/// We pin `ring` here to match the workspace and call this before constructing
+/// any client config. `install_default` returns `Err` if a provider is already
+/// installed; that is fine — we ignore it (idempotent), mirroring the lazy
+/// install pattern in `temps-query-postgres` and `temps-cli`.
+fn ensure_crypto_provider_installed() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+fn build_http_client_with_ca(ca_pem: &[u8]) -> Result<Box<dyn HttpClient>, ProviderError> {
+    use hyper_rustls::HttpsConnectorBuilder;
+    use hyper_util::{client::legacy::Client as HyperClient, rt::TokioExecutor};
+    use rustls::RootCertStore;
+
+    let mut roots = RootCertStore::empty();
+
+    // Load system roots first so the client can still reach other HTTPS endpoints.
+    // `load_native_certs` returns a `CertificateResult` (not `Result`): iterate
+    // over `.certs` and silently ignore any `.errors` (best-effort behaviour).
+    for cert in rustls_native_certs::load_native_certs().certs {
+        let _ = roots.add(cert);
+    }
+
+    // Parse and add the caller-supplied CA PEM bundle.
+    let mut cursor = std::io::Cursor::new(ca_pem);
+    for cert in rustls_pemfile::certs(&mut cursor) {
+        let cert = cert.map_err(|e| {
+            ProviderError::Configuration(format!("Failed to parse custom CA PEM: {}", e))
+        })?;
+        roots.add(cert).map_err(|e| {
+            ProviderError::Configuration(format!("Failed to add custom CA cert: {}", e))
+        })?;
+    }
+
+    // Pin the rustls crypto provider (ring) so `ClientConfig::builder()` does
+    // not panic when both `ring` and `aws-lc-rs` are compiled in (the latter is
+    // pulled in transitively by instant-acme 0.8.5). See the helper docs.
+    ensure_crypto_provider_installed();
+
+    let tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+    let connector = HttpsConnectorBuilder::new()
+        .with_tls_config(tls_config)
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .build();
+
+    // instant-acme 0.8.5 builds requests with a `BodyWrapper<Bytes>` body and
+    // provides a blanket `impl HttpClient for HyperClient<C, BodyWrapper<Bytes>>`,
+    // so the bare hyper client is directly usable as a `Box<dyn HttpClient>`.
+    let client: HyperClient<_, instant_acme::BodyWrapper<bytes::Bytes>> =
+        HyperClient::builder(TokioExecutor::new()).build(connector);
+
+    Ok(Box::new(client))
+}
+
+/// A `rustls` server-certificate verifier that accepts ANY certificate without
+/// performing chain, hostname, expiry, or signature validation.
+///
+/// ############################  DANGER  ############################
+/// This DISABLES ALL TLS VERIFICATION. It exists SOLELY so the integration
+/// test suite can talk to Pebble's self-signed `https://localhost:14000/dir`
+/// ACME directory, which presents a cert no system trust store contains. It
+/// MUST NEVER be reachable in production: the only thing that constructs it is
+/// `build_insecure_http_client`, which is itself gated STRICTLY on the
+/// `ACME_INSECURE=1` environment variable (a TEST-ONLY switch). Do not relax
+/// that gate, do not call this from any non-test code path, and never set
+/// `ACME_INSECURE` in a production deployment — doing so makes ACME traffic
+/// trivially MITM-able.
+/// ##################################################################
+#[derive(Debug)]
+struct NoCertVerifier {
+    /// The signature schemes the underlying crypto provider can verify. We still
+    /// have to advertise a non-empty, correct list here even though we accept
+    /// every signature, otherwise rustls rejects the handshake.
+    supported_schemes: Vec<rustls::SignatureScheme>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls_pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls_pki_types::CertificateDer<'_>],
+        _server_name: &rustls_pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls_pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        // DANGER: accept any certificate unconditionally (TEST-ONLY).
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls_pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        // DANGER: accept any signature unconditionally (TEST-ONLY).
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls_pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        // DANGER: accept any signature unconditionally (TEST-ONLY).
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.supported_schemes.clone()
+    }
+}
+
+/// Build an `instant-acme`-compatible HTTP client that DISABLES TLS
+/// verification entirely (accepts self-signed / invalid / expired certs).
+///
+/// ############################  DANGER  ############################
+/// This client trusts every server certificate without validation. It is
+/// TEST-ONLY and exists exclusively so the integration tests can reach
+/// Pebble's self-signed ACME directory. The single caller
+/// (`LetsEncryptProvider::acme_http_client`) invokes this ONLY when the
+/// `ACME_INSECURE=1` environment variable is set. NEVER enable `ACME_INSECURE`
+/// in production — it makes the ACME channel MITM-able and would let an
+/// attacker issue/observe certificates for your domains.
+/// ##################################################################
+fn build_insecure_http_client() -> Result<Box<dyn HttpClient>, ProviderError> {
+    use hyper_rustls::HttpsConnectorBuilder;
+    use hyper_util::{client::legacy::Client as HyperClient, rt::TokioExecutor};
+
+    // Pull the supported signature schemes from the default (ring) crypto
+    // provider so the no-verify verifier still advertises a correct scheme
+    // list during the handshake.
+    let supported_schemes = rustls::crypto::ring::default_provider()
+        .signature_verification_algorithms
+        .supported_schemes();
+
+    let verifier = std::sync::Arc::new(NoCertVerifier { supported_schemes });
+
+    // Pin the rustls crypto provider (ring) so `ClientConfig::builder()` does
+    // not panic when both `ring` and `aws-lc-rs` are compiled in (the latter is
+    // pulled in transitively by instant-acme 0.8.5). See the helper docs.
+    ensure_crypto_provider_installed();
+
+    // DANGER: `.dangerous().with_custom_certificate_verifier(..)` installs the
+    // no-verify verifier above, disabling all certificate validation.
+    let tls_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+
+    let connector = HttpsConnectorBuilder::new()
+        .with_tls_config(tls_config)
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .build();
+
+    // instant-acme 0.8.5 builds requests with a `BodyWrapper<Bytes>` body and
+    // provides a blanket `impl HttpClient for HyperClient<C, BodyWrapper<Bytes>>`,
+    // so the bare hyper client is directly usable as a `Box<dyn HttpClient>`.
+    // instant-acme injects its own User-Agent header (RFC 8555 §6.1) per request.
+    let client: HyperClient<_, instant_acme::BodyWrapper<bytes::Bytes>> =
+        HyperClient::builder(TokioExecutor::new()).build(connector);
+
+    Ok(Box::new(client))
+}
 
 #[async_trait]
 pub trait CertificateProvider: Send + Sync {
@@ -46,6 +250,17 @@ pub trait CertificateProvider: Send + Sync {
 pub struct LetsEncryptProvider {
     repository: Arc<dyn CertificateRepository>,
     environment: String,
+    /// Optional PEM-encoded CA bundle to trust when connecting to the ACME
+    /// directory. When `None` the default `hyper-rustls` client (native roots)
+    /// is used. When `Some`, a custom hyper+hyper-rustls client is built with
+    /// this CA added to the trust store — see `build_http_client_with_ca`.
+    ///
+    /// Use this for Pebble (test ACME CA) or internal corporate ACME servers
+    /// whose CA is not in the system trust store. Set via `with_custom_ca_pem`
+    /// or the `ACME_CA_CERT_PEM` env var (path to a PEM file). Do NOT use this
+    /// to disable TLS verification — the custom-CA path still performs full
+    /// chain validation against the explicitly-supplied CA.
+    custom_ca_pem: Option<Vec<u8>>,
 }
 
 impl LetsEncryptProvider {
@@ -54,10 +269,24 @@ impl LetsEncryptProvider {
         let environment =
             std::env::var("LETSENCRYPT_MODE").unwrap_or_else(|_| "production".to_string());
 
+        // Allow a custom CA PEM file path via env var (e.g. for Pebble in CI).
+        let custom_ca_pem = std::env::var("ACME_CA_CERT_PEM")
+            .ok()
+            .and_then(|path| std::fs::read(&path).ok());
+
         Self {
             repository,
             environment,
+            custom_ca_pem,
         }
+    }
+
+    /// Inject a custom CA PEM bundle into this provider. The provider will
+    /// build a hyper+hyper-rustls client that trusts this CA in addition to
+    /// the system roots. Intended for Pebble and corporate internal CAs.
+    pub fn with_custom_ca_pem(mut self, ca_pem: Vec<u8>) -> Self {
+        self.custom_ca_pem = Some(ca_pem);
+        self
     }
 
     fn get_acme_url(&self) -> String {
@@ -71,6 +300,42 @@ impl LetsEncryptProvider {
         } else {
             instant_acme::LetsEncrypt::Staging.url().to_string()
         }
+    }
+
+    /// Decide which HTTP client `instant-acme` should use for this provider.
+    ///
+    /// Returns `Ok(None)` for the DEFAULT path (no custom client) so that
+    /// `Account::create` / `Account::from_credentials` use `instant-acme`'s
+    /// built-in client unchanged. Returns `Ok(Some(client))` only when a custom
+    /// client is required:
+    ///
+    /// 1. `ACME_INSECURE=1` (TEST-ONLY) — builds a client that DISABLES TLS
+    ///    verification so the integration tests can reach Pebble's self-signed
+    ///    ACME directory. See the DANGER notice on `build_insecure_http_client`.
+    ///    This takes precedence over the custom-CA path. It MUST NEVER be set in
+    ///    production: it makes the ACME channel MITM-able.
+    /// 2. A `custom_ca_pem` is configured (e.g. Pebble's CA, or a corporate
+    ///    internal ACME CA) — builds a client that trusts that CA in addition
+    ///    to the system roots while still performing FULL chain validation.
+    ///
+    /// When neither applies, behaviour is byte-for-byte identical to before
+    /// (default `instant-acme` client, full system-root TLS validation).
+    fn acme_http_client(&self) -> Result<Option<Box<dyn HttpClient>>, ProviderError> {
+        // TEST-ONLY insecure path, gated STRICTLY on the env var being exactly "1".
+        // SECURITY: this disables TLS verification — never enable in production.
+        if std::env::var("ACME_INSECURE").as_deref() == Ok("1") {
+            tracing::warn!(
+                "ACME_INSECURE=1 is set: TLS verification for the ACME directory is DISABLED. \
+                 This is TEST-ONLY (Pebble) and MUST NEVER be used in production."
+            );
+            return Ok(Some(build_insecure_http_client()?));
+        }
+
+        if let Some(ca_pem) = &self.custom_ca_pem {
+            return Ok(Some(build_http_client_with_ca(ca_pem)?));
+        }
+
+        Ok(None)
     }
 
     async fn get_or_create_acme_account(
@@ -96,23 +361,36 @@ impl LetsEncryptProvider {
                 ProviderError::Configuration(format!("Failed to deserialize account: {}", e))
             })?;
 
-            let acme_account = Account::from_credentials(account_creds)
+            // 0.8.5 uses a builder: a custom HTTP client (Pebble CA / insecure)
+            // selects `builder_with_http`; otherwise the default client builder.
+            let builder = match self.acme_http_client()? {
+                Some(http) => Account::builder_with_http(http),
+                None => Account::builder().map_err(|e| {
+                    ProviderError::Acme(format!("Failed to build ACME account client: {}", e))
+                })?,
+            };
+            let acme_account = builder
+                .from_credentials(account_creds)
                 .await
                 .map_err(|e| ProviderError::Acme(format!("Failed to load account: {}", e)))?;
 
             Ok((acme_account, account_creds_clone))
         } else {
             let acme_url = self.get_acme_url();
-            let (acme_account, credentials) = Account::create(
-                &NewAccount {
-                    contact: &[format!("mailto:{}", email).as_str()],
-                    terms_of_service_agreed: true,
-                    only_return_existing: false,
-                },
-                &acme_url,
-                None,
-            )
-            .await?;
+            let contact = format!("mailto:{}", email);
+            let new_account = NewAccount {
+                contact: &[contact.as_str()],
+                terms_of_service_agreed: true,
+                only_return_existing: false,
+            };
+            // 0.8.5 uses a builder + owned directory URL; `external_account` is None.
+            let builder = match self.acme_http_client()? {
+                Some(http) => Account::builder_with_http(http),
+                None => Account::builder().map_err(|e| {
+                    ProviderError::Acme(format!("Failed to build ACME account client: {}", e))
+                })?,
+            };
+            let (acme_account, credentials) = builder.create(&new_account, acme_url, None).await?;
 
             let account_creds_str = serde_json::to_string(&credentials).map_err(|e| {
                 ProviderError::Configuration(format!("Failed to serialize account: {}", e))
@@ -149,8 +427,10 @@ impl LetsEncryptProvider {
         let private_key = KeyPair::generate()?;
         let csr = params.serialize_request(&private_key)?;
 
-        // Finalize order
-        order.finalize(csr.der()).await?;
+        // Finalize order. In instant-acme 0.8.5 the CSR-based finalize is
+        // `finalize_csr` (`finalize` is the rcgen-convenience variant that
+        // generates its own key+CSR — we build our own above, so use `finalize_csr`).
+        order.finalize_csr(csr.der()).await?;
 
         // Wait for certificate
         let cert_chain_pem = loop {
@@ -201,41 +481,45 @@ impl LetsEncryptProvider {
         &self,
         domain: &str,
         order: &mut Order,
-        authorizations: Vec<instant_acme::Authorization>,
     ) -> Result<ChallengeData, ProviderError> {
-        let authz = authorizations.first().ok_or_else(|| {
-            ProviderError::ValidationFailed("No authorizations found".to_string())
-        })?;
+        // Capture the order URL before borrowing `order` mutably for the
+        // authorization stream (0.8.5: `authorizations()` takes `&mut self`).
+        let order_url = order.url().to_string();
 
-        // Check authorization status
-        match authz.status {
+        // 0.8.5: drive the `Authorizations` stream. HTTP-01 single-domain orders
+        // have exactly one authorization; take the first one.
+        let mut authzs = order.authorizations();
+        let mut handle = authzs
+            .next()
+            .await
+            .ok_or_else(|| ProviderError::ValidationFailed("No authorizations found".to_string()))?
+            .map_err(|e| ProviderError::Acme(format!("Failed to fetch authorization: {}", e)))?;
+
+        // Check authorization status (read via Deref to AuthorizationState).
+        match handle.status {
             AuthorizationStatus::Valid => {
                 // This shouldn't happen since we check all_valid before calling this,
-                // but handle it gracefully
+                // but handle it gracefully.
                 return Err(ProviderError::ValidationFailed(
                     "Authorization is already valid, no challenge needed".to_string(),
                 ));
             }
             AuthorizationStatus::Pending => {
-                // Need to complete challenge
+                // Need to complete challenge.
             }
-            _ => {
+            other => {
                 return Err(ProviderError::ValidationFailed(format!(
                     "Authorization has unexpected status: {:?}",
-                    authz.status
+                    other
                 )));
             }
         }
 
-        let challenge = authz
-            .challenges
-            .iter()
-            .find(|c| c.r#type == AcmeChallengeType::Http01)
-            .ok_or_else(|| {
-                ProviderError::UnsupportedChallenge("No HTTP-01 challenge found".to_string())
-            })?;
+        let challenge = handle.challenge(AcmeChallengeType::Http01).ok_or_else(|| {
+            ProviderError::UnsupportedChallenge("No HTTP-01 challenge found".to_string())
+        })?;
 
-        let key_auth = order.key_authorization(challenge);
+        let key_auth = challenge.key_authorization();
 
         Ok(ChallengeData {
             challenge_type: ChallengeType::Http01,
@@ -244,7 +528,7 @@ impl LetsEncryptProvider {
             key_authorization: key_auth.as_str().to_string(),
             validation_url: Some(challenge.url.clone()),
             dns_txt_records: vec![], // No DNS records for HTTP-01
-            order_url: Some(order.url().to_string()),
+            order_url: Some(order_url),
         })
     }
 
@@ -252,82 +536,89 @@ impl LetsEncryptProvider {
         &self,
         domain: &str,
         order: &mut Order,
-        authorizations: Vec<instant_acme::Authorization>,
     ) -> Result<ChallengeData, ProviderError> {
-        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-        use sha2::{Digest, Sha256};
-
-        if authorizations.is_empty() {
-            return Err(ProviderError::ValidationFailed(
-                "No authorizations found".to_string(),
-            ));
-        }
+        // Capture the order URL before the mutable authorization-stream borrow.
+        let order_url = order.url().to_string();
 
         // Extract base domain for DNS record name
         let dns_record_domain = domain.strip_prefix("*.").unwrap_or(domain);
 
-        // For wildcard domains with base domain, we'll have multiple authorizations
-        // Collect ALL DNS TXT records that need to be added
+        // For wildcard domains with base domain, we'll have multiple authorizations.
+        // Collect ALL DNS TXT records that need to be added.
         let mut dns_txt_records = Vec::new();
         let mut first_challenge_url: Option<String> = None;
         let mut first_token = String::new();
         let mut first_key_auth = String::new();
+        let mut saw_any = false;
 
-        for authz in &authorizations {
-            // Skip authorizations that are already valid (cached from previous validation)
+        // 0.8.5: drive the `Authorizations` stream off `&mut order`.
+        let mut authzs = order.authorizations();
+        while let Some(result) = authzs.next().await {
+            let mut handle = result.map_err(|e| {
+                ProviderError::Acme(format!("Failed to fetch authorization: {}", e))
+            })?;
+            saw_any = true;
+
+            // The identifier is borrowed from the handle; format it to an owned
+            // string for diagnostics so it does not outlive the handle reborrow.
+            let identifier = handle.identifier().to_string();
+
+            // Skip authorizations that are already valid (cached from previous validation).
             // ACME servers cache successful validations for ~30 days, so we may encounter
-            // authorizations that don't need new challenges
-            match authz.status {
+            // authorizations that don't need new challenges.
+            match handle.status {
                 AuthorizationStatus::Valid => {
                     debug!(
-                        "Authorization for {:?} is already valid, skipping challenge",
-                        authz.identifier
+                        "Authorization for {} is already valid, skipping challenge",
+                        identifier
                     );
                     continue;
                 }
                 AuthorizationStatus::Pending => {
-                    // Need to complete challenge
+                    // Need to complete challenge.
                 }
-                _ => {
+                other => {
                     return Err(ProviderError::ValidationFailed(format!(
-                        "Authorization for {:?} has unexpected status: {:?}",
-                        authz.identifier, authz.status
+                        "Authorization for {} has unexpected status: {:?}",
+                        identifier, other
                     )));
                 }
             }
 
-            let challenge = authz
-                .challenges
-                .iter()
-                .find(|c| c.r#type == AcmeChallengeType::Dns01)
-                .ok_or_else(|| {
-                    ProviderError::UnsupportedChallenge(format!(
-                        "No DNS-01 challenge found for {:?}",
-                        authz.identifier
-                    ))
-                })?;
+            let challenge = handle.challenge(AcmeChallengeType::Dns01).ok_or_else(|| {
+                ProviderError::UnsupportedChallenge(format!(
+                    "No DNS-01 challenge found for {}",
+                    identifier
+                ))
+            })?;
 
-            let key_auth = order.key_authorization(challenge);
+            let key_auth = challenge.key_authorization();
+            // 0.8.5: `KeyAuthorization::dns_value()` computes base64url(SHA256(..))
+            // for us, replacing the previous manual Sha256 + URL_SAFE_NO_PAD block.
+            let txt_value = key_auth.dns_value();
+            let challenge_url = challenge.url.clone();
+            let token = challenge.token.clone();
+            let key_auth_str = key_auth.as_str().to_string();
 
-            // For DNS-01 challenges, ACME requires base64url(SHA256(key_authorization))
-            let mut hasher = Sha256::new();
-            hasher.update(key_auth.as_str().as_bytes());
-            let hash = hasher.finalize();
-            let txt_value = URL_SAFE_NO_PAD.encode(hash);
-
-            // Add DNS TXT record with its validation URL
+            // Add DNS TXT record with its validation URL.
             dns_txt_records.push(DnsTxtRecord {
                 name: format!("_acme-challenge.{}", dns_record_domain),
                 value: txt_value,
-                validation_url: challenge.url.clone(),
+                validation_url: challenge_url.clone(),
             });
 
-            // Store first challenge details for backward compatibility
+            // Store first challenge details for backward compatibility.
             if first_challenge_url.is_none() {
-                first_challenge_url = Some(challenge.url.clone());
-                first_token = challenge.token.clone();
-                first_key_auth = key_auth.as_str().to_string();
+                first_challenge_url = Some(challenge_url);
+                first_token = token;
+                first_key_auth = key_auth_str;
             }
+        }
+
+        if !saw_any {
+            return Err(ProviderError::ValidationFailed(
+                "No authorizations found".to_string(),
+            ));
         }
 
         info!(
@@ -344,7 +635,7 @@ impl LetsEncryptProvider {
             key_authorization: first_key_auth,
             validation_url: first_challenge_url,
             dns_txt_records,
-            order_url: Some(order.url().to_string()),
+            order_url: Some(order_url),
         })
     }
 
@@ -368,7 +659,21 @@ impl LetsEncryptProvider {
                     return Ok(());
                 }
                 OrderStatus::Invalid => {
-                    let error_msg = format!("Order validation failed after {} attempt(s)", attempt);
+                    // Pull the per-challenge error detail off the order's
+                    // authorizations so the failure is actionable (e.g. the ACME
+                    // server's "Connection refused" / "incorrect key
+                    // authorization" message) instead of a bare "validation
+                    // failed". Best-effort: if we cannot fetch the detail we
+                    // still return a typed error.
+                    let detail = self.collect_authorization_errors(order).await;
+                    let error_msg = if detail.is_empty() {
+                        format!("Order validation failed after {} attempt(s)", attempt)
+                    } else {
+                        format!(
+                            "Order validation failed after {} attempt(s): {}",
+                            attempt, detail
+                        )
+                    };
                     error!("{}", error_msg);
                     return Err(ProviderError::ChallengeFailed(error_msg));
                 }
@@ -397,6 +702,35 @@ impl LetsEncryptProvider {
             "Order validation timed out after {} attempts",
             MAX_ATTEMPTS
         )))
+    }
+
+    /// Walk the order's authorizations and collect any per-challenge ACME error
+    /// details (type + detail) into a single human-readable string. Used to turn
+    /// a bare `OrderStatus::Invalid` into an actionable message. Best-effort: a
+    /// fetch failure simply contributes its own message rather than aborting.
+    async fn collect_authorization_errors(&self, order: &mut Order) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        let mut authzs = order.authorizations();
+        while let Some(result) = authzs.next().await {
+            match result {
+                Ok(handle) => {
+                    let identifier = handle.identifier().to_string();
+                    for challenge in handle.challenges.iter() {
+                        if let Some(err) = challenge.error.as_ref() {
+                            parts.push(format!(
+                                "[{} {:?}] {}: {}",
+                                identifier,
+                                challenge.r#type,
+                                err.r#type.as_deref().unwrap_or("(no type)"),
+                                err.detail.as_deref().unwrap_or("(no detail)")
+                            ));
+                        }
+                    }
+                }
+                Err(e) => parts.push(format!("failed to fetch authorization: {}", e)),
+            }
+        }
+        parts.join("; ")
     }
 }
 
@@ -438,11 +772,8 @@ impl CertificateProvider for LetsEncryptProvider {
 
         let (acme_account, _) = self.get_or_create_acme_account(email).await?;
 
-        let mut order = acme_account
-            .new_order(&NewOrder {
-                identifiers: &identifiers,
-            })
-            .await?;
+        // 0.8.5: `NewOrder` fields are private — use the constructor.
+        let mut order = acme_account.new_order(&NewOrder::new(&identifiers)).await?;
 
         // Check if order is already ready (renewal case)
         if order.state().status == OrderStatus::Ready {
@@ -453,17 +784,30 @@ impl CertificateProvider for LetsEncryptProvider {
             return Ok(ProvisioningResult::Certificate(cert));
         }
 
-        let authorizations = order.authorizations().await?;
+        // Check if all authorizations are already valid (cached from previous validation).
+        // This can happen when Let's Encrypt has cached the authorization (~30 days).
+        // 0.8.5: drive the `Authorizations` stream to inspect each status. Fetched
+        // state is cached on the order, so the handlers below re-iterate without
+        // additional network round-trips.
+        let mut authz_count: usize = 0;
+        let mut all_valid = true;
+        {
+            let mut authzs = order.authorizations();
+            while let Some(result) = authzs.next().await {
+                let handle = result.map_err(|e| {
+                    ProviderError::Acme(format!("Failed to fetch authorization: {}", e))
+                })?;
+                authz_count += 1;
+                if handle.status != AuthorizationStatus::Valid {
+                    all_valid = false;
+                }
+            }
+        }
 
-        // Check if all authorizations are already valid (cached from previous validation)
-        // This can happen when Let's Encrypt has cached the authorization (~30 days)
-        let all_valid = authorizations
-            .iter()
-            .all(|authz| authz.status == AuthorizationStatus::Valid);
-        if all_valid && !authorizations.is_empty() {
+        if all_valid && authz_count > 0 {
             info!(
                 "All {} authorizations are already valid (cached), generating certificate directly",
-                authorizations.len()
+                authz_count
             );
             let cert = self
                 .generate_certificate_from_order(domain, &mut order)
@@ -473,15 +817,11 @@ impl CertificateProvider for LetsEncryptProvider {
 
         match challenge {
             ChallengeType::Http01 => {
-                let challenge_data = self
-                    .handle_http_challenge(domain, &mut order, authorizations)
-                    .await?;
+                let challenge_data = self.handle_http_challenge(domain, &mut order).await?;
                 Ok(ProvisioningResult::Challenge(challenge_data))
             }
             ChallengeType::Dns01 => {
-                let challenge_data = self
-                    .handle_dns_challenge(domain, &mut order, authorizations)
-                    .await?;
+                let challenge_data = self.handle_dns_challenge(domain, &mut order).await?;
                 Ok(ProvisioningResult::Challenge(challenge_data))
             }
         }
@@ -508,41 +848,62 @@ impl CertificateProvider for LetsEncryptProvider {
         debug!("Loading existing ACME order from URL: {}", order_url);
         let mut order = acme_account.order(order_url.clone()).await?;
 
-        // Handle different challenge types
-        match challenge_data.challenge_type {
-            ChallengeType::Http01 => {
-                // For HTTP-01, use the validation_url from challenge_data
-                if let Some(validation_url) = &challenge_data.validation_url {
-                    debug!(
-                        "Setting HTTP-01 challenge ready for domain: {} (URL: {})",
-                        domain, validation_url
-                    );
-                    order.set_challenge_ready(validation_url).await?;
-                } else {
-                    return Err(ProviderError::Configuration(
-                        "HTTP-01 challenge validation URL not found".to_string(),
-                    ));
-                }
-            }
+        // 0.8.5: `Order::set_challenge_ready(url)` was removed. Instead, drive the
+        // `Authorizations` stream, obtain the `ChallengeHandle` for the requested
+        // type on each (still-pending) authorization, and call `set_ready()` on it
+        // (the handle carries its own challenge URL). This preserves the previous
+        // behaviour: HTTP-01 marks the single challenge ready; DNS-01 marks every
+        // authorization's challenge ready (important for wildcards with multiple
+        // authorizations).
+        let acme_challenge_type = match challenge_data.challenge_type {
+            ChallengeType::Http01 => AcmeChallengeType::Http01,
             ChallengeType::Dns01 => {
-                // For DNS-01, set ALL challenge URLs as ready (important for wildcards with multiple authorizations)
-                // Each DNS TXT record has its own validation URL that must be set ready
                 if challenge_data.dns_txt_records.is_empty() {
                     return Err(ProviderError::Configuration(
                         "No DNS TXT records found for DNS-01 challenge".to_string(),
                     ));
                 }
-
-                for txt_record in &challenge_data.dns_txt_records {
-                    debug!(
-                        "Setting challenge ready for DNS record: {} = {} (URL: {})",
-                        txt_record.name, txt_record.value, txt_record.validation_url
-                    );
-                    order
-                        .set_challenge_ready(&txt_record.validation_url)
-                        .await?;
-                }
+                AcmeChallengeType::Dns01
             }
+        };
+
+        let mut marked_ready: usize = 0;
+        {
+            let mut authzs = order.authorizations();
+            while let Some(result) = authzs.next().await {
+                let mut handle = result.map_err(|e| {
+                    ProviderError::Acme(format!("Failed to fetch authorization: {}", e))
+                })?;
+
+                // Skip authorizations that are already valid (cached validations).
+                if handle.status == AuthorizationStatus::Valid {
+                    continue;
+                }
+
+                let mut challenge =
+                    handle
+                        .challenge(acme_challenge_type.clone())
+                        .ok_or_else(|| {
+                            ProviderError::UnsupportedChallenge(format!(
+                            "No {:?} challenge found for authorization while completing challenge",
+                            acme_challenge_type
+                        ))
+                        })?;
+
+                debug!(
+                    "Setting {:?} challenge ready for domain {} (URL: {})",
+                    challenge_data.challenge_type, domain, challenge.url
+                );
+                challenge.set_ready().await?;
+                marked_ready += 1;
+            }
+        }
+
+        if marked_ready == 0 {
+            return Err(ProviderError::Configuration(format!(
+                "No pending {:?} challenge found for domain {} when completing challenge",
+                challenge_data.challenge_type, domain
+            )));
         }
 
         // Wait for validation
@@ -622,25 +983,21 @@ impl LetsEncryptProvider {
         // Load the order from Let's Encrypt
         let mut order = acme_account.order(order_url.to_string()).await?;
 
-        // Get authorizations
-        let authorizations = order.authorizations().await?;
+        // 0.8.5: drive the `Authorizations` stream. We only inspect the first
+        // authorization's challenges (typically one per single-domain order).
+        let mut authzs = order.authorizations();
+        let handle = match authzs.next().await {
+            Some(result) => result.map_err(|e| {
+                ProviderError::Acme(format!("Failed to fetch authorization: {}", e))
+            })?,
+            None => {
+                debug!("No authorizations found for order");
+                return Ok(None);
+            }
+        };
 
-        if authorizations.is_empty() {
-            debug!("No authorizations found for order");
-            return Ok(None);
-        }
-
-        // Get the first authorization's challenges (typically there's one for single domain)
-        let first_auth = &authorizations[0];
-        let challenges = &first_auth.challenges;
-
-        if challenges.is_empty() {
-            debug!("No challenges found in authorization");
-            return Ok(None);
-        }
-
-        // Find the first HTTP-01 or DNS-01 challenge
-        let challenge = challenges.iter().find(|c| {
+        // `challenges` is reachable on `AuthorizationState` via `Deref`.
+        let challenge = handle.challenges.iter().find(|c| {
             matches!(
                 c.r#type,
                 AcmeChallengeType::Http01 | AcmeChallengeType::Dns01

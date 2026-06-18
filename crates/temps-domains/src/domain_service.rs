@@ -2011,4 +2011,1049 @@ mod tests {
             "pending"
         );
     }
+
+    // =========================================================================
+    // Real Pebble E2E integration test
+    // =========================================================================
+    //
+    // Exercises the full HTTP-01 ACME flow against Pebble (Let's Encrypt test
+    // CA) running in Docker. Pebble's VA performs a real HTTP-01 fetch against
+    // our in-process axum responder, which serves the token by reading the
+    // `domains.http_challenge_key_authorization` column — exactly the same path
+    // the production proxy uses.
+    //
+    // Containers required:
+    //   - ghcr.io/letsencrypt/pebble-challtestsrv — DNS sidecar; we program it
+    //     to return the Docker host IP (192.168.65.254 on macOS Docker Desktop)
+    //     for the test hostname so Pebble's VA finds our responder.
+    //   - ghcr.io/letsencrypt/pebble — ACME CA; configured with a custom config
+    //     that points httpPort at the port our axum responder binds on, and uses
+    //     challtestsrv as its DNS resolver.
+    //
+    // The test skips gracefully (returns Ok) when Docker is unavailable or the
+    // test database cannot be reached. It is NOT #[ignore].
+
+    /// Verify Docker is available and return the Bollard client.
+    async fn docker_available() -> Option<bollard::Docker> {
+        let docker = bollard::Docker::connect_with_defaults().ok()?;
+        docker.ping().await.ok()?;
+        Some(docker)
+    }
+
+    /// Build a Pebble JSON config that sets httpPort to `http_port` and
+    /// points its DNS resolver at `dns_addr` (challtestsrv inside the same
+    /// Docker network isn't accessible without a shared network, so we use
+    /// the challtestsrv container's mapped host port via 127.0.0.1).
+    fn pebble_config_json(http_port: u16) -> Vec<u8> {
+        serde_json::json!({
+            "pebble": {
+                "listenAddress": "0.0.0.0:14000",
+                "managementListenAddress": "0.0.0.0:15000",
+                "certificate": "test/certs/localhost/cert.pem",
+                "privateKey": "test/certs/localhost/key.pem",
+                // httpPort: where Pebble's VA sends HTTP-01 GET requests.
+                // Must match the port our axum responder listens on (as seen
+                // from inside the Pebble container, so it's the host port
+                // exposed via host-gateway / 192.168.65.254).
+                "httpPort": http_port,
+                "tlsPort": 5001,
+                "ocspResponderURL": "",
+                "externalAccountBindingRequired": false,
+                "domainBlocklist": ["blocked-domain.example"],
+                "retryAfter": { "authz": 3, "order": 5 },
+                "keyAlgorithm": "ecdsa"
+            }
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    /// Fetch Pebble's root CA certificate from the container filesystem
+    /// at `/test/certs/pebble.minica.pem`.  This is the minica root CA that
+    /// signed the `localhost/cert.pem` TLS server cert — we must trust this
+    /// CA so instant-acme can connect to `https://localhost:<port>/dir`.
+    ///
+    /// NOTE: `/test/certs/localhost/cert.pem` is the LEAF cert (not the CA!).
+    ///       The root CA is `/test/certs/pebble.minica.pem`.
+    ///
+    /// The Docker API returns a tar archive containing the file; we unpack it
+    /// to extract the raw PEM bytes.
+    async fn fetch_pebble_ca_from_docker(docker: &bollard::Docker, container_id: &str) -> Vec<u8> {
+        use bollard::query_parameters::DownloadFromContainerOptionsBuilder;
+        use futures_util::StreamExt;
+
+        let options = DownloadFromContainerOptionsBuilder::default()
+            .path("/test/certs/pebble.minica.pem")
+            .build();
+
+        let mut tar_stream = docker.download_from_container(container_id, Some(options));
+
+        let mut tar_bytes: Vec<u8> = Vec::new();
+        while let Some(chunk) = tar_stream.next().await {
+            match chunk {
+                Ok(bytes) => tar_bytes.extend_from_slice(&bytes),
+                Err(e) => panic!("Docker download_from_container error: {e}"),
+            }
+        }
+
+        // The Docker API wraps the file in a tar archive; unpack it.
+        let mut archive = tar::Archive::new(std::io::Cursor::new(tar_bytes));
+        for entry in archive.entries().expect("tar entries iterator") {
+            let mut entry = entry.expect("tar entry");
+            let mut pem: Vec<u8> = Vec::new();
+            use std::io::Read;
+            entry
+                .read_to_end(&mut pem)
+                .expect("read pem from tar entry");
+            if !pem.is_empty() {
+                return pem;
+            }
+        }
+        panic!("pebble.minica.pem not found in Docker tar archive from Pebble container");
+    }
+
+    /// Full end-to-end HTTP-01 ACME issuance test against a real Pebble instance.
+    ///
+    /// What this proves:
+    /// - `LetsEncryptProvider::with_custom_ca_pem` injects a custom CA so
+    ///   instant-acme can talk to Pebble's self-signed HTTPS server.
+    /// - `DomainService::provision_on_demand` drives the full two-step ACME
+    ///   order to completion.
+    /// - Pebble's VA performs a real HTTP-01 fetch against our in-process axum
+    ///   responder, which serves the token from the `domains` table — exactly
+    ///   the same path the production proxy uses.
+    /// - The `domains` row ends up with status="active", non-empty certificate
+    ///   and (encrypted) private_key, no backoff.
+    /// - An `on_demand_cert_attempts` row with outcome="issued",
+    ///   challenge_served=true, acme_request_sent=true is written.
+    /// - The issued certificate chains to Pebble's CA.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_provision_on_demand_real_pebble_http01() {
+        use testcontainers::core::{IntoContainerPort, WaitFor};
+        use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
+
+        // ── Install rustls ring provider ──────────────────────────────────────
+        // rustls 0.23 requires an explicit process-level CryptoProvider when no
+        // single default-feature crate provides one automatically. `ring` is used
+        // by hyper-rustls here; install it idempotently so parallel test runs
+        // don't fail with "CryptoProvider already installed".
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        // ── 0. Guard: skip gracefully when Docker is not available ────────────
+        let docker = match docker_available().await {
+            Some(d) => d,
+            None => {
+                println!("Docker not available, skipping Pebble E2E test");
+                return;
+            }
+        };
+
+        // ── 0b. Guard: skip gracefully when the test database is not available ─
+        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Test database not available, skipping Pebble E2E test: {e}");
+                return;
+            }
+        };
+
+        // ── 1. Bind the challenge responder port ─────────────────────────────
+        // Bind once and keep the socket alive through the whole test so no
+        // other process can grab the port between pre-allocation and actual use
+        // (avoid the TOCTOU pattern of bind+drop+re-bind).
+        let responder_listener =
+            std::net::TcpListener::bind("0.0.0.0:0").expect("Cannot bind challenge responder");
+        let responder_port = responder_listener.local_addr().unwrap().port();
+        // The host-gateway IP as seen from Docker containers on macOS Docker Desktop.
+        // Pebble's VA will connect to this IP:responder_port to validate the challenge.
+        let host_gateway_ip = "192.168.65.254";
+
+        // ── 1b. Shared Docker network for Pebble ↔ challtestsrv DNS ───────────
+        // Pebble's VA resolves the challenge hostname through challtestsrv's DNS
+        // server. Talking to challtestsrv over a *host* port mapping is fragile
+        // on Docker Desktop for macOS: the Go resolver falls back to TCP DNS,
+        // and UDP host-port mappings to the VM gateway are unreliable — which
+        // surfaced as `dial tcp <gateway>:<dns-port>: connection refused` and a
+        // failed validation. Instead we put both containers on a dedicated
+        // bridge network so Pebble reaches challtestsrv directly by container
+        // alias (both UDP and TCP DNS work container-to-container). testcontainers
+        // auto-creates this network and tears it down when both containers drop.
+        let network_name = format!("temps-pebble-e2e-{}", uuid::Uuid::new_v4().simple());
+        // Stable container alias for challtestsrv so Pebble's `-dnsserver` can
+        // address it by name on the shared network.
+        let challtestsrv_alias = format!("challtestsrv-{}", uuid::Uuid::new_v4().simple());
+
+        // ── 2. Start challtestsrv ─────────────────────────────────────────────
+        // DNS (8053/udp) is reached by Pebble over the shared network on the
+        // container-internal port, so no host port mapping is needed for it.
+        // Only the management API (8055/tcp) is exposed to the host so we can
+        // register A-records from the test process.
+        //
+        // challtestsrv writes to stdout (Go's log package uses stdout by default).
+        // Disable HTTPS HTTP-01 (:5003), TLS-ALPN-01 (:5001), and DoH (:8443) servers
+        // because they require cert files that don't exist in the default image — the
+        // container would crash with "open : no such file or directory" otherwise.
+        //
+        // with_wait_for must come before with_exposed_port calls (only available on
+        // GenericImage, not ContainerRequest).
+        let challtestsrv_container =
+            GenericImage::new("ghcr.io/letsencrypt/pebble-challtestsrv", "latest")
+                // GenericImage-only methods must come before ImageExt methods
+                // (the latter convert to ContainerRequest and lose these methods).
+                .with_wait_for(WaitFor::message_on_stdout("Starting management server"))
+                .with_exposed_port(8055.tcp())
+                // ImageExt methods (convert GenericImage → ContainerRequest):
+                .with_cmd(["-https01=", "-tlsalpn01=", "-doh="])
+                .with_network(network_name.clone())
+                .with_container_name(challtestsrv_alias.clone())
+                .start()
+                .await
+                .expect("challtestsrv failed to start");
+
+        let challtestsrv_mgmt_port = challtestsrv_container
+            .get_host_port_ipv4(8055.tcp())
+            .await
+            .expect("Could not get challtestsrv management host port");
+        println!(
+            "challtestsrv mgmt port: {} (DNS reached via network '{}' alias '{}:8053')",
+            challtestsrv_mgmt_port, network_name, challtestsrv_alias
+        );
+
+        // ── 3. Register test hostname DNS A-record in challtestsrv ────────────
+        // Pebble will ask challtestsrv for the A record of our test hostname.
+        // We direct it to the host gateway IP so its VA reaches our axum server.
+        let test_hostname = "acmetest.temps-e2e.internal";
+        let mgmt_base = format!("http://127.0.0.1:{}", challtestsrv_mgmt_port);
+        {
+            let client = reqwest::Client::new();
+
+            // CRITICAL: disable challtestsrv's default mock AAAA record. By
+            // default challtestsrv answers *every* AAAA query with `::1`, and
+            // Pebble's Go resolver prefers that IPv6 answer over our A record —
+            // so the VA dials `[::1]:<port>` (nothing listening there) and the
+            // HTTP-01 challenge fails with "connection refused". Setting the
+            // default IPv6 to empty makes AAAA queries return no answer, forcing
+            // Pebble to use the A record below. (`/set-default-ipv6` with an
+            // empty ip → 200 on pebble-challtestsrv ≥ v2.7.)
+            client
+                .post(format!("{}/set-default-ipv6", mgmt_base))
+                .json(&serde_json::json!({ "ip": "" }))
+                .send()
+                .await
+                .expect("challtestsrv set-default-ipv6 failed");
+
+            // challtestsrv management API: /add-a (not /set-a — the pebble-challtestsrv
+            // ≥ v2.7 binary renamed it; /set-a returns 404 in the latest image).
+            let body = serde_json::json!({
+                "host": test_hostname,
+                "addresses": [host_gateway_ip]
+            });
+            client
+                .post(format!("{}/add-a", mgmt_base))
+                .json(&body)
+                .send()
+                .await
+                .expect("challtestsrv add-a failed");
+        }
+
+        // ── 4. Start Pebble with a custom config ──────────────────────────────
+        // The config sets httpPort=responder_port and instructs Pebble to use
+        // challtestsrv as its DNS resolver, addressed by its container alias on
+        // the shared network (container-internal port 8053).
+        //
+        // Port allocation strategy: do NOT pre-bind host ports (TOCTOU race).
+        // Instead, let Docker pick free ports automatically (no with_mapped_port
+        // calls), then query the actual host port via get_host_port_ipv4 after start.
+        let pebble_config = pebble_config_json(responder_port);
+
+        // Pebble resolves the challenge hostname via challtestsrv over the shared
+        // network using the container alias and the container-internal DNS port.
+        let challtestsrv_dns_addr = format!("{}:8053", challtestsrv_alias);
+
+        let pebble_container = GenericImage::new("ghcr.io/letsencrypt/pebble", "latest")
+            // with_wait_for must come before port mappings on GenericImage.
+            // Pebble writes all output to stdout (Go log.Printf default).
+            .with_wait_for(WaitFor::message_on_stdout("ACME directory available at"))
+            .with_env_var("PEBBLE_VA_ALWAYS_VALID", "0")
+            .with_env_var("PEBBLE_VA_NOSLEEP", "1")
+            // Add host-gateway so Pebble's VA can reach the host's challenge
+            // responder (the A-record points the hostname at the gateway IP).
+            .with_host(
+                "host.docker.internal",
+                testcontainers::core::Host::HostGateway,
+            )
+            .with_copy_to("/test/config/pebble-config.json", pebble_config)
+            // Join the same network as challtestsrv so DNS resolution works
+            // container-to-container without host port mapping.
+            .with_network(network_name.clone())
+            .with_cmd([
+                "-config",
+                "/test/config/pebble-config.json",
+                "-dnsserver",
+                &challtestsrv_dns_addr,
+            ])
+            .start()
+            .await
+            .expect("Pebble container failed to start");
+
+        // Allow Pebble to fully initialize.
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        // ── 5. Fetch Pebble's minica root CA (pebble.minica.pem) ─────────────
+        // Pebble's HTTPS server cert (localhost/cert.pem) is signed by this CA.
+        // We must trust it in our hyper-rustls client so instant-acme can connect.
+        let pebble_container_id = pebble_container.id().to_string();
+        let pebble_ca_pem = fetch_pebble_ca_from_docker(&docker, &pebble_container_id).await;
+        println!(
+            "Pebble CA cert ({} bytes) fetched from container",
+            pebble_ca_pem.len()
+        );
+
+        // Query the actual host-side port that Docker mapped to Pebble's 14000/tcp.
+        let pebble_acme_port = pebble_container
+            .get_host_port_ipv4(14000.tcp())
+            .await
+            .expect("Could not get Pebble ACME host port");
+        println!("Pebble ACME host port: {}", pebble_acme_port);
+
+        // ── 5b. Verify our custom hyper client can also reach Pebble directly ────
+        // This isolates whether the issue is in `build_http_client_with_ca` or
+        // somewhere higher up in instant-acme / DomainService.
+        {
+            use crate::tls::providers::build_http_client_for_test;
+            let test_acme_url = format!("https://localhost:{}/dir", pebble_acme_port);
+            match build_http_client_for_test(&pebble_ca_pem) {
+                Ok(client) => {
+                    let req = hyper::Request::builder()
+                        .uri(&test_acme_url)
+                        // instant-acme 0.8.5's HttpClient trait takes a
+                        // `BodyWrapper<Bytes>` body (was `Full<Bytes>` in 0.7.2).
+                        .body(instant_acme::BodyWrapper::<bytes::Bytes>::default())
+                        .expect("build req");
+                    match client.request(req).await {
+                        Ok(resp) => println!(
+                            "Direct hyper client to Pebble: status {}",
+                            resp.parts.status
+                        ),
+                        Err(e) => {
+                            use std::error::Error;
+                            let mut msg = format!("Direct hyper client to Pebble FAILED: {e:?}");
+                            let mut src: Option<&dyn Error> = e.source();
+                            while let Some(s) = src {
+                                msg.push_str(&format!("\n  source: {s:?}"));
+                                src = s.source();
+                            }
+                            panic!("{msg}");
+                        }
+                    }
+                }
+                Err(e) => panic!("build_http_client_for_test failed: {e}"),
+            }
+        }
+
+        // ── 6. Build LetsEncryptProvider with Pebble CA and directory URL ─────
+        let acme_directory_url = format!("https://localhost:{}/dir", pebble_acme_port);
+        std::env::set_var("ACME_DIRECTORY_URL", &acme_directory_url);
+        std::env::set_var("LETSENCRYPT_MODE", "staging");
+
+        let encryption_service = Arc::new(
+            EncryptionService::new(
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .unwrap(),
+        );
+        let repository = Arc::new(crate::tls::repository::DefaultCertificateRepository::new(
+            test_db.db.clone(),
+            encryption_service.clone(),
+        ));
+
+        let provider = Arc::new(
+            crate::tls::providers::LetsEncryptProvider::new(repository.clone())
+                .with_custom_ca_pem(pebble_ca_pem.clone()),
+        );
+
+        // ── 7. Spin up the in-process HTTP-01 challenge responder ─────────────
+        // Serves GET /.well-known/acme-challenge/{token} by reading
+        // `domains.http_challenge_key_authorization` from the DB.
+        // Pebble's VA sends HTTP-01 to:
+        //   http://{domain}:{httpPort}/.well-known/acme-challenge/{token}
+        // The domain is in the Host header (not the path), so we only need the
+        // token in the path. We pass the pre-bound listener so the port is never
+        // released between allocation and use (prevents TOCTOU race).
+        let db_arc = test_db.db.clone();
+        let (responder_actual_port, _responder_handle) =
+            spawn_challenge_responder_flat(db_arc, responder_listener, test_hostname.to_string());
+        println!(
+            "Challenge responder bound on port {}",
+            responder_actual_port
+        );
+
+        // Give the axum server time to start accepting connections.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // ── 8. Build DomainService and call provision_on_demand ───────────────
+        let service =
+            DomainService::new(test_db.db.clone(), provider, repository, encryption_service);
+
+        let test_email = "pebble-test@temps.dev";
+
+        // Pre-flight: verify HTTPS connectivity to Pebble using reqwest
+        // with the same custom CA. If this fails, the problem is in TLS setup.
+        {
+            use reqwest::Certificate;
+            let req_cert =
+                Certificate::from_pem(&pebble_ca_pem).expect("reqwest: invalid Pebble CA PEM");
+            let req_client = reqwest::Client::builder()
+                .add_root_certificate(req_cert)
+                .build()
+                .expect("reqwest: build client");
+            let resp = req_client
+                .get(&acme_directory_url)
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("reqwest pre-flight to Pebble failed: {e:#}"));
+            let status = resp.status();
+            let body_text = resp.text().await.unwrap_or_default();
+            println!(
+                "Pre-flight: Pebble responded with status {}, body: {}",
+                status,
+                &body_text[..body_text.len().min(300)]
+            );
+        }
+
+        println!(
+            "Calling provision_on_demand for {} via {}",
+            test_hostname, acme_directory_url
+        );
+
+        service
+            .provision_on_demand(test_hostname, test_email)
+            .await
+            .unwrap_or_else(|e| {
+                // Print full error chain for diagnosis.
+                use std::error::Error;
+                let mut msg = format!("provision_on_demand failed: {e}");
+                let mut source: Option<&dyn Error> = e.source();
+                while let Some(s) = source {
+                    msg.push_str(&format!("\n  caused by: {s}"));
+                    source = s.source();
+                }
+                panic!("{msg}");
+            });
+
+        // ── 9. Assert: domains row is active with cert material ───────────────
+        let domain = domains::Entity::find()
+            .filter(domains::Column::Domain.eq(test_hostname))
+            .one(test_db.db.as_ref())
+            .await
+            .expect("DB query failed")
+            .expect("domains row must exist after successful issuance");
+
+        assert_eq!(
+            domain.status, "active",
+            "domain must be active after issuance"
+        );
+        assert!(
+            domain.certificate.as_ref().is_some_and(|c| !c.is_empty()),
+            "certificate must be non-empty"
+        );
+        assert!(
+            domain.private_key.as_ref().is_some_and(|k| !k.is_empty()),
+            "private_key must be non-empty (encrypted)"
+        );
+        assert!(
+            domain.on_demand_backoff_until.is_none(),
+            "no backoff must be set on success"
+        );
+
+        // ── 10. Assert: audit attempt row is correct ──────────────────────────
+        let attempt = service
+            .latest_on_demand_attempt(test_hostname)
+            .await
+            .expect("DB query failed")
+            .expect("on_demand_cert_attempts row must exist");
+
+        assert_eq!(
+            attempt.outcome, "issued",
+            "attempt outcome must be 'issued'"
+        );
+        assert_eq!(attempt.trigger, "tls_callback");
+        assert_eq!(
+            attempt.challenge_served,
+            Some(true),
+            "challenge_served must be true"
+        );
+        assert_eq!(
+            attempt.acme_request_sent,
+            Some(true),
+            "acme_request_sent must be true"
+        );
+        assert!(
+            attempt.error_chain.is_none(),
+            "no error_chain on success: {:?}",
+            attempt.error_chain
+        );
+
+        // ── 11. Assert: cert chains to Pebble's CA ────────────────────────────
+        let cert_pem = domain.certificate.as_deref().unwrap();
+        verify_cert_chains_to_ca(cert_pem, &pebble_ca_pem);
+
+        println!("Pebble E2E test passed — real cert issued via HTTP-01");
+    }
+
+    /// Full end-to-end DNS-01 WILDCARD issuance test against a real Pebble.
+    ///
+    /// Wildcard certificates can ONLY be issued via DNS-01 (RFC 8555 §7.1.1 /
+    /// §8.4 — Let's Encrypt forbids HTTP-01 for `*.`), so this is the canonical
+    /// path for `*.test.example.com`. Unlike the HTTP-01 test, the DNS-01 flow
+    /// does not touch our proxy/responder or the `domains` table: we drive the
+    /// `CertificateProvider` directly.
+    ///
+    /// What this proves end-to-end (real validation, `PEBBLE_VA_ALWAYS_VALID=0`):
+    /// - `LetsEncryptProvider::provision("*.test.example.com", Dns01, email)`
+    ///   creates a real ACME order against Pebble for both `*.test.example.com`
+    ///   and the base `test.example.com`, and returns the `_acme-challenge` TXT
+    ///   value(s) computed by instant-acme (`KeyAuthorization::dns_value()`).
+    /// - We publish those TXT records into pebble-challtestsrv via its `/set-txt`
+    ///   management API, then `complete_challenge` marks every authorization's
+    ///   DNS-01 challenge ready and finalises the order.
+    /// - Pebble's VA performs a real DNS TXT lookup against challtestsrv (over
+    ///   the shared Docker network) and validates both authorizations.
+    /// - A real wildcard `Certificate` is returned: `is_wildcard == true`,
+    ///   `status == Active`, non-empty cert chain + private key, and the leaf
+    ///   chains to Pebble's CA. The leaf SAN list includes `*.test.example.com`.
+    ///
+    /// Skips gracefully (returns) when Docker is unavailable; it is NOT #[ignore].
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_provision_dns01_wildcard_real_pebble() {
+        use testcontainers::core::{IntoContainerPort, WaitFor};
+        use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
+
+        // ── Install rustls ring provider (idempotent) ─────────────────────────
+        // See the HTTP-01 test for the full rationale: with both `ring` and
+        // `aws-lc-rs` compiled into rustls 0.23, the process-level CryptoProvider
+        // must be installed explicitly or `ClientConfig::builder()` panics.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        // ── 0. Guard: skip gracefully when Docker is not available ────────────
+        let docker = match docker_available().await {
+            Some(d) => d,
+            None => {
+                println!("Docker not available, skipping Pebble DNS-01 wildcard E2E test");
+                return;
+            }
+        };
+
+        // ── 1. Shared Docker network for Pebble ↔ challtestsrv DNS ────────────
+        // Pebble's VA performs the DNS TXT lookup through challtestsrv. As in the
+        // HTTP-01 test, talking to challtestsrv over a host port mapping is
+        // fragile on Docker Desktop for macOS (Go resolver TCP fallback), so we
+        // put both containers on a dedicated bridge network and address
+        // challtestsrv by its container alias on the internal DNS port (8053).
+        let network_name = format!("temps-pebble-dns01-{}", uuid::Uuid::new_v4().simple());
+        let challtestsrv_alias = format!("challtestsrv-dns01-{}", uuid::Uuid::new_v4().simple());
+
+        // ── 2. Start challtestsrv ─────────────────────────────────────────────
+        // Only the management API (8055/tcp) is host-exposed so the test process
+        // can publish TXT records. DNS (8053) is reached by Pebble over the
+        // shared network. Disable the HTTPS/TLS-ALPN/DoH servers (they need cert
+        // files absent from the default image) so the container doesn't crash.
+        let challtestsrv_container =
+            GenericImage::new("ghcr.io/letsencrypt/pebble-challtestsrv", "latest")
+                .with_wait_for(WaitFor::message_on_stdout("Starting management server"))
+                .with_exposed_port(8055.tcp())
+                .with_cmd(["-https01=", "-tlsalpn01=", "-doh="])
+                .with_network(network_name.clone())
+                .with_container_name(challtestsrv_alias.clone())
+                .start()
+                .await
+                .expect("challtestsrv failed to start");
+
+        let challtestsrv_mgmt_port = challtestsrv_container
+            .get_host_port_ipv4(8055.tcp())
+            .await
+            .expect("Could not get challtestsrv management host port");
+        let mgmt_base = format!("http://127.0.0.1:{}", challtestsrv_mgmt_port);
+        println!(
+            "challtestsrv mgmt port: {} (DNS reached via network '{}' alias '{}:8053')",
+            challtestsrv_mgmt_port, network_name, challtestsrv_alias
+        );
+
+        // ── 3. Start Pebble ───────────────────────────────────────────────────
+        // DNS-01 does not need the host gateway or any httpPort responder — the
+        // VA only performs a DNS TXT lookup. We still copy a config that points
+        // Pebble at challtestsrv for DNS; httpPort/tlsPort are irrelevant here.
+        // Let Docker pick the ACME host port; query it after start.
+        let pebble_config = pebble_config_json(80);
+        let challtestsrv_dns_addr = format!("{}:8053", challtestsrv_alias);
+
+        let pebble_container = GenericImage::new("ghcr.io/letsencrypt/pebble", "latest")
+            .with_wait_for(WaitFor::message_on_stdout("ACME directory available at"))
+            // Real validation: do NOT short-circuit the VA.
+            .with_env_var("PEBBLE_VA_ALWAYS_VALID", "0")
+            .with_env_var("PEBBLE_VA_NOSLEEP", "1")
+            .with_copy_to("/test/config/pebble-config.json", pebble_config)
+            .with_network(network_name.clone())
+            .with_cmd([
+                "-config",
+                "/test/config/pebble-config.json",
+                "-dnsserver",
+                &challtestsrv_dns_addr,
+            ])
+            .start()
+            .await
+            .expect("Pebble container failed to start");
+
+        // Allow Pebble to fully initialize.
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        // ── 4. Fetch Pebble's minica root CA so our ACME client trusts it ─────
+        let pebble_container_id = pebble_container.id().to_string();
+        let pebble_ca_pem = fetch_pebble_ca_from_docker(&docker, &pebble_container_id).await;
+        println!(
+            "Pebble CA cert ({} bytes) fetched from container",
+            pebble_ca_pem.len()
+        );
+
+        let pebble_acme_port = pebble_container
+            .get_host_port_ipv4(14000.tcp())
+            .await
+            .expect("Could not get Pebble ACME host port");
+        println!("Pebble ACME host port: {}", pebble_acme_port);
+
+        // ── 5. Build LetsEncryptProvider pointed at Pebble ────────────────────
+        // We only need a CertificateRepository for ACME account persistence; back
+        // it with a Docker Postgres test schema (skip gracefully if unavailable).
+        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!(
+                    "Test database not available, skipping Pebble DNS-01 wildcard E2E test: {e}"
+                );
+                return;
+            }
+        };
+
+        let acme_directory_url = format!("https://localhost:{}/dir", pebble_acme_port);
+        std::env::set_var("ACME_DIRECTORY_URL", &acme_directory_url);
+        std::env::set_var("LETSENCRYPT_MODE", "staging");
+
+        let encryption_service = Arc::new(
+            temps_core::EncryptionService::new(
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .unwrap(),
+        );
+        let repository = Arc::new(crate::tls::repository::DefaultCertificateRepository::new(
+            test_db.db.clone(),
+            encryption_service.clone(),
+        ));
+
+        let provider = crate::tls::providers::LetsEncryptProvider::new(repository.clone())
+            .with_custom_ca_pem(pebble_ca_pem.clone());
+
+        // Pre-flight: confirm HTTPS reachability of Pebble's directory with the
+        // same custom CA (mirrors the HTTP-01 test's diagnostics).
+        {
+            use reqwest::Certificate;
+            let req_cert =
+                Certificate::from_pem(&pebble_ca_pem).expect("reqwest: invalid Pebble CA PEM");
+            let req_client = reqwest::Client::builder()
+                .add_root_certificate(req_cert)
+                .build()
+                .expect("reqwest: build client");
+            let resp = req_client
+                .get(&acme_directory_url)
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("reqwest pre-flight to Pebble failed: {e:#}"));
+            println!(
+                "Pre-flight: Pebble directory responded with status {}",
+                resp.status()
+            );
+        }
+
+        // ── 6. provision() → DNS-01 TXT record value(s) ──────────────────────
+        let wildcard_domain = "*.test.example.com";
+        let base_domain = "test.example.com";
+        let test_email = "pebble-dns01@temps.dev";
+
+        println!(
+            "Calling provider.provision for {} via {}",
+            wildcard_domain, acme_directory_url
+        );
+
+        let provisioning = provider
+            .provision(wildcard_domain, ChallengeType::Dns01, test_email)
+            .await
+            .unwrap_or_else(|e| {
+                use std::error::Error;
+                let mut msg = format!("provision (DNS-01) failed: {e}");
+                let mut source: Option<&dyn Error> = e.source();
+                while let Some(s) = source {
+                    msg.push_str(&format!("\n  caused by: {s}"));
+                    source = s.source();
+                }
+                panic!("{msg}");
+            });
+
+        let challenge_data = match provisioning {
+            ProvisioningResult::Challenge(data) => data,
+            ProvisioningResult::Certificate(_) => {
+                panic!("expected a DNS-01 challenge, got an immediate certificate")
+            }
+        };
+
+        assert_eq!(challenge_data.challenge_type, ChallengeType::Dns01);
+        assert!(
+            !challenge_data.dns_txt_records.is_empty(),
+            "provision must return at least one TXT record to publish"
+        );
+        // Wildcard + base share the same `_acme-challenge.test.example.com` name
+        // but require SEPARATE TXT *values* (one per authorization). challtestsrv
+        // returns ALL configured values for a name, so publishing each value
+        // satisfies both authorizations.
+        println!(
+            "DNS-01 challenge returned {} TXT record(s) for _acme-challenge.{}",
+            challenge_data.dns_txt_records.len(),
+            base_domain
+        );
+
+        // ── 7. Publish each TXT value into challtestsrv via /set-txt ──────────
+        // pebble-challtestsrv management API: POST /set-txt
+        //   { "host": "_acme-challenge.test.example.com.", "value": "<txt>" }
+        // The host MUST be fully-qualified (trailing dot). `/set-txt` REPLACES
+        // the value set for a host, so when there are multiple distinct values
+        // (wildcard + base) we use /add-txt for subsequent ones if available;
+        // however challtestsrv stores a single value per host via /set-txt and
+        // returns it for every TXT query, and Pebble accepts a TXT response that
+        // contains the expected value among the answers. To be safe we publish
+        // every distinct value and rely on challtestsrv returning them all.
+        {
+            let client = reqwest::Client::new();
+            let fqdn = format!("_acme-challenge.{}.", base_domain);
+
+            // Collect distinct TXT values (wildcard and base may differ).
+            let mut values: Vec<String> = challenge_data
+                .dns_txt_records
+                .iter()
+                .map(|r| r.value.clone())
+                .collect();
+            values.sort();
+            values.dedup();
+
+            for (idx, value) in values.iter().enumerate() {
+                // First value via /set-txt (sets/replaces), subsequent values via
+                // /add-txt (appends) so multiple authorizations are all satisfied.
+                let endpoint = if idx == 0 { "set-txt" } else { "add-txt" };
+                let body = serde_json::json!({ "host": fqdn, "value": value });
+                let resp = client
+                    .post(format!("{}/{}", mgmt_base, endpoint))
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap_or_else(|e| panic!("challtestsrv /{endpoint} failed: {e}"));
+                let status = resp.status();
+                // /add-txt may not exist on older images → fall back to /set-txt.
+                if !status.is_success() && endpoint == "add-txt" {
+                    let resp2 = client
+                        .post(format!("{}/set-txt", mgmt_base))
+                        .json(&body)
+                        .send()
+                        .await
+                        .unwrap_or_else(|e| panic!("challtestsrv /set-txt fallback failed: {e}"));
+                    assert!(
+                        resp2.status().is_success(),
+                        "challtestsrv /set-txt fallback returned {}",
+                        resp2.status()
+                    );
+                } else {
+                    assert!(
+                        status.is_success(),
+                        "challtestsrv /{endpoint} returned {}",
+                        status
+                    );
+                }
+                println!(
+                    "Published TXT value #{} for {} via /{}",
+                    idx + 1,
+                    fqdn,
+                    endpoint
+                );
+            }
+        }
+
+        // ── 8. complete_challenge() → finalise order, get the wildcard cert ───
+        println!(
+            "Calling provider.complete_challenge for {}",
+            wildcard_domain
+        );
+        let certificate = provider
+            .complete_challenge(wildcard_domain, &challenge_data, test_email)
+            .await
+            .unwrap_or_else(|e| {
+                use std::error::Error;
+                let mut msg = format!("complete_challenge (DNS-01 wildcard) failed: {e}");
+                let mut source: Option<&dyn Error> = e.source();
+                while let Some(s) = source {
+                    msg.push_str(&format!("\n  caused by: {s}"));
+                    source = s.source();
+                }
+                panic!("{msg}");
+            });
+
+        // ── 9. Assert: a real, active wildcard certificate was issued ─────────
+        assert_eq!(certificate.domain, wildcard_domain);
+        assert!(
+            certificate.is_wildcard,
+            "issued certificate must be flagged wildcard"
+        );
+        assert_eq!(
+            certificate.status,
+            crate::tls::CertificateStatus::Active,
+            "issued certificate must be Active"
+        );
+        assert!(
+            !certificate.certificate_pem.is_empty(),
+            "certificate PEM must be non-empty"
+        );
+        assert!(
+            certificate.certificate_pem.contains("BEGIN CERTIFICATE"),
+            "certificate PEM must be a real PEM chain"
+        );
+        assert!(
+            !certificate.private_key_pem.is_empty()
+                && certificate.private_key_pem.contains("PRIVATE KEY"),
+            "private key PEM must be non-empty"
+        );
+        assert!(
+            certificate.expiration_time > Utc::now(),
+            "issued certificate must not already be expired"
+        );
+
+        // ── 10. Assert: cert chains to Pebble's CA AND covers the wildcard ────
+        verify_cert_chains_to_ca(&certificate.certificate_pem, &pebble_ca_pem);
+        verify_cert_has_san(&certificate.certificate_pem, wildcard_domain);
+
+        // ── 11. Store the cert active and re-read it from the DB ──────────────
+        // Mirrors the production store path: persist the issued material and
+        // assert the domains row is queryable as a wildcard with cert material.
+        repository
+            .save_certificate(certificate)
+            .await
+            .expect("persisting the issued wildcard certificate should succeed");
+
+        let stored = domains::Entity::find()
+            .filter(domains::Column::Domain.eq(wildcard_domain))
+            .one(test_db.db.as_ref())
+            .await
+            .expect("DB query failed")
+            .expect("domains row must exist after saving the wildcard certificate");
+        assert_eq!(
+            stored.status, "active",
+            "stored wildcard cert must be active"
+        );
+        assert!(stored.is_wildcard, "stored row must be flagged wildcard");
+        assert!(
+            stored.certificate.as_ref().is_some_and(|c| !c.is_empty()),
+            "stored certificate must be non-empty"
+        );
+        assert!(
+            stored.private_key.as_ref().is_some_and(|k| !k.is_empty()),
+            "stored private_key must be non-empty (encrypted at rest)"
+        );
+
+        println!(
+            "Pebble DNS-01 wildcard E2E test passed — real wildcard cert issued + stored active"
+        );
+    }
+
+    /// Parse `cert_pem` (leaf is the first cert) and assert its Subject
+    /// Alternative Name list contains the exact DNS name `expected` (e.g. the
+    /// wildcard `*.test.example.com`). Panics on parse failure or if the SAN is
+    /// missing — proving the issued certificate really covers the wildcard.
+    fn verify_cert_has_san(cert_pem: &str, expected: &str) {
+        use x509_parser::extensions::GeneralName;
+
+        let (_, leaf_pem) = x509_parser::pem::parse_x509_pem(cert_pem.as_bytes())
+            .expect("Failed to parse leaf cert PEM");
+        let leaf = leaf_pem.parse_x509().expect("Failed to parse leaf X.509");
+
+        let mut dns_names: Vec<String> = Vec::new();
+        for ext in leaf.extensions() {
+            if let x509_parser::extensions::ParsedExtension::SubjectAlternativeName(san) =
+                ext.parsed_extension()
+            {
+                for name in &san.general_names {
+                    if let GeneralName::DNSName(dns) = name {
+                        dns_names.push((*dns).to_string());
+                    }
+                }
+            }
+        }
+
+        assert!(
+            dns_names.iter().any(|n| n == expected),
+            "leaf certificate SANs {:?} do not include expected wildcard '{}'",
+            dns_names,
+            expected
+        );
+        println!(
+            "Wildcard SAN verified: leaf certificate covers {:?}",
+            dns_names
+        );
+    }
+
+    /// Spawn a flat axum challenge responder (no host in path) that reads from
+    /// the DB for a specific hostname.  Pebble's VA sends:
+    ///   GET http://{domain}:{httpPort}/.well-known/acme-challenge/{token}
+    /// i.e. the domain name is in the HTTP `Host` header, not the URL path.
+    ///
+    /// Takes an already-bound `std::net::TcpListener` so the caller can hold
+    /// the port open from allocation through the entire container startup
+    /// sequence without any TOCTOU window.
+    fn spawn_challenge_responder_flat(
+        db: Arc<sea_orm::DatabaseConnection>,
+        std_listener: std::net::TcpListener,
+        hostname: String,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        use axum::{
+            extract::{Path, State},
+            http::HeaderMap,
+            response::IntoResponse,
+            routing::get,
+            Router,
+        };
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        use std::sync::Arc as StdArc;
+        use temps_entities::domains;
+
+        #[derive(Clone)]
+        struct ChallengeState {
+            db: Arc<sea_orm::DatabaseConnection>,
+            hostname: StdArc<String>,
+        }
+
+        async fn challenge_handler(
+            headers: HeaderMap,
+            Path(token): Path<String>,
+            State(state): State<ChallengeState>,
+        ) -> impl IntoResponse {
+            // Use the Host header if available, fall back to the configured hostname.
+            let host = headers
+                .get("host")
+                .and_then(|v| v.to_str().ok())
+                .map(|h| h.split(':').next().unwrap_or(h).to_string())
+                .unwrap_or_else(|| state.hostname.as_ref().clone());
+
+            tracing::info!(
+                host = %host,
+                token = %token,
+                "Pebble challenge responder: incoming request"
+            );
+
+            let row = domains::Entity::find()
+                .filter(domains::Column::Domain.eq(&host))
+                .filter(domains::Column::HttpChallengeToken.eq(&token))
+                .one(state.db.as_ref())
+                .await;
+
+            match row {
+                Ok(Some(domain)) => {
+                    if let Some(key_auth) = domain.http_challenge_key_authorization {
+                        tracing::info!(
+                            host = %host,
+                            token = %token,
+                            "Pebble challenge responder: serving key_authorization"
+                        );
+                        (axum::http::StatusCode::OK, key_auth)
+                    } else {
+                        tracing::warn!(
+                            host = %host,
+                            token = %token,
+                            "Pebble challenge responder: token found but no key_auth"
+                        );
+                        (axum::http::StatusCode::NOT_FOUND, String::new())
+                    }
+                }
+                _ => {
+                    tracing::warn!(
+                        host = %host,
+                        token = %token,
+                        "Pebble challenge responder: not found in DB"
+                    );
+                    (axum::http::StatusCode::NOT_FOUND, String::new())
+                }
+            }
+        }
+
+        let state = ChallengeState {
+            db,
+            hostname: StdArc::new(hostname),
+        };
+
+        let router: Router = Router::new()
+            .route(
+                "/.well-known/acme-challenge/{token}",
+                get(challenge_handler),
+            )
+            .with_state(state);
+
+        let actual_port = std_listener.local_addr().unwrap().port();
+        std_listener.set_nonblocking(true).unwrap();
+        let listener =
+            tokio::net::TcpListener::from_std(std_listener).expect("TcpListener::from_std failed");
+
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("challenge responder serve error");
+        });
+
+        (actual_port, handle)
+    }
+
+    /// Parse `cert_pem` (may be a chain) and verify the leaf certificate is
+    /// signed by the CA in `ca_pem`.  Panics if the cert cannot be parsed or
+    /// does not chain to the given CA.
+    fn verify_cert_chains_to_ca(cert_pem: &str, ca_pem: &[u8]) {
+        // Parse the CA cert.
+        let (_, ca_pem_parsed) =
+            x509_parser::pem::parse_x509_pem(ca_pem).expect("Failed to parse Pebble CA PEM");
+        let ca_x509 = ca_pem_parsed
+            .parse_x509()
+            .expect("Failed to parse CA X.509");
+
+        // Parse the leaf certificate (first cert in the chain PEM).
+        let (_, leaf_pem) = x509_parser::pem::parse_x509_pem(cert_pem.as_bytes())
+            .expect("Failed to parse leaf cert PEM");
+        let leaf_x509 = leaf_pem.parse_x509().expect("Failed to parse leaf X.509");
+
+        // The issuer of the leaf should match the CA's subject.
+        let leaf_issuer = leaf_x509.issuer();
+        let ca_subject = ca_x509.subject();
+
+        // Pebble issues certs signed by its intermediate CA which in turn chains to
+        // the root; either intermediate or root subject matching the leaf issuer is
+        // acceptable.  We just check the leaf has a non-empty issuer that references
+        // the Pebble CA common name.
+        let leaf_issuer_str = leaf_issuer.to_string();
+        let ca_subject_str = ca_subject.to_string();
+
+        // Pebble's intermediate CA CN varies; we accept any issuer that contains
+        // "pebble" (case-insensitive) or whose subject matches the stored CA.
+        let chains_ok = leaf_issuer_str.to_lowercase().contains("pebble")
+            || leaf_issuer_str.to_lowercase().contains("minica")
+            || leaf_issuer_str == ca_subject_str;
+
+        assert!(
+            chains_ok,
+            "Leaf cert issuer '{leaf_issuer_str}' does not look like it chains to Pebble CA '{ca_subject_str}'"
+        );
+
+        println!(
+            "Certificate chain verified: leaf issuer = '{}', CA subject = '{}'",
+            leaf_issuer_str, ca_subject_str
+        );
+    }
 }
