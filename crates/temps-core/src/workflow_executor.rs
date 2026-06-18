@@ -81,6 +81,13 @@ impl WorkflowExecutor {
         Self { job_tracker }
     }
 
+    fn is_cancellation_error(error: &WorkflowError) -> bool {
+        matches!(
+            error,
+            WorkflowError::WorkflowCancelled | WorkflowError::BuildCancelled
+        )
+    }
+
     /// Execute a workflow with proper dependency resolution and parallel execution
     pub async fn execute_workflow(
         &self,
@@ -554,8 +561,17 @@ impl WorkflowExecutor {
                             (job_id_clone, job_result)
                         }
                         Err(e) => {
-                            let error_msg = format!("❌ Job failed: {}", e);
-                            error!("❌ Job '{}' failed: {}", job_id_clone, e);
+                            let is_cancellation = Self::is_cancellation_error(&e);
+                            let error_msg = if is_cancellation {
+                                format!("Job cancelled: {}", e)
+                            } else {
+                                format!("Job failed: {}", e)
+                            };
+                            if is_cancellation {
+                                warn!("Job '{}' cancelled: {}", job_id_clone, e);
+                            } else {
+                                error!("Job '{}' failed: {}", job_id_clone, e);
+                            }
 
                             // Log the error to the job's context so it appears in the job logs
                             if let Err(log_err) = error_context.log(&error_msg).await {
@@ -565,15 +581,19 @@ impl WorkflowExecutor {
                                 );
                             }
 
-                            // Call cleanup on job failure
-                            warn!("🧹 Calling cleanup for failed job '{}'", job_id_clone);
+                            // Call cleanup on job failure or cancellation
+                            warn!("Calling cleanup for stopped job '{}'", job_id_clone);
                             if let Err(cleanup_err) = job.cleanup(&error_context).await {
                                 error!("Failed to cleanup job '{}': {}", job_id_clone, cleanup_err);
                             }
 
                             (
                                 job_id_clone,
-                                JobResult::failure(error_context, e.to_string()),
+                                if is_cancellation {
+                                    JobResult::cancelled(error_context)
+                                } else {
+                                    JobResult::failure(error_context, e.to_string())
+                                },
                             )
                         }
                     }
@@ -679,6 +699,18 @@ mod tests {
         cancelled: bool,
     }
 
+    #[test]
+    fn test_cancellation_errors_are_not_failures() {
+        assert!(WorkflowExecutor::is_cancellation_error(
+            &WorkflowError::WorkflowCancelled
+        ));
+        assert!(WorkflowExecutor::is_cancellation_error(
+            &WorkflowError::BuildCancelled
+        ));
+        assert!(!WorkflowExecutor::is_cancellation_error(
+            &WorkflowError::JobExecutionFailed("Build failed".to_string())
+        ));
+    }
     #[async_trait::async_trait]
     impl WorkflowCancellationProvider for TestCancellationProvider {
         async fn is_cancelled(&self, _workflow_run_id: &str) -> Result<bool, WorkflowError> {

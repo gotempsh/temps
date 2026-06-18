@@ -1194,7 +1194,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
             "SELECT \
                 assumeNotNull(project_id) AS project_id, \
                 count() AS total_requests, \
-                countIf(status_code >= 400) AS total_errors, \
+                countIf(status_code >= 500) AS total_errors, \
                 ifNull(avg(response_time_ms), 0) AS avg_response_time_ms \
              FROM proxy_logs FINAL \
              WHERE {} \

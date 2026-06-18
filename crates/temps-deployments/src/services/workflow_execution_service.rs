@@ -330,8 +330,9 @@ impl WorkflowExecutionService {
             Err(e) => {
                 // Check if this is a cancellation error
                 let error_message = format!("{}", e);
-                let is_cancellation =
-                    error_message.contains("cancelled") || error_message.contains("Cancelled");
+                let lower_error_message = error_message.to_lowercase();
+                let is_cancellation = lower_error_message.contains("cancelled")
+                    || lower_error_message.contains("canceled");
 
                 if is_cancellation {
                     info!(

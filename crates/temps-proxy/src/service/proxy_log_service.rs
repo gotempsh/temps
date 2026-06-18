@@ -814,7 +814,7 @@ impl ProxyLogService {
             SELECT
                 project_id,
                 COALESCE(COUNT(*), 0) as total_requests,
-                COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) as total_errors,
+                COALESCE(SUM(CASE WHEN status_code >= 500 THEN 1 ELSE 0 END), 0) as total_errors,
                 COALESCE(AVG(response_time_ms)::float8, 0) as avg_response_time_ms
             FROM proxy_logs
             WHERE timestamp >= $1
@@ -1859,7 +1859,7 @@ pub struct ProjectHealthSummary {
     pub project_id: i32,
     /// Total requests in the period
     pub total_requests: i64,
-    /// Total errors (status >= 400) in the period
+    /// Total server errors (status >= 500) in the period
     pub total_errors: i64,
     /// Average response time in ms
     pub avg_response_time_ms: f64,
