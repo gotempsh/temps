@@ -1,6 +1,6 @@
 export const metadata = {
   title: 'Deploy a Laravel App',
-  description: 'Deploy a Laravel application on Temps with PostgreSQL, queue workers, and automatic HTTPS.',
+  description: 'Deploy a Laravel application on Temps with PostgreSQL or MariaDB, queue workers, and automatic HTTPS.',
   alternates: {
     canonical: '/docs/deploy-laravel',
   },
@@ -8,14 +8,14 @@ export const metadata = {
 
 # Deploy a Laravel App
 
-This tutorial walks you through deploying a Laravel application on Temps with PostgreSQL, Nginx, and PHP-FPM. By the end, you will have a production Laravel app with automatic HTTPS. {{ className: 'lead' }}
+This tutorial walks you through deploying a Laravel application on Temps with PostgreSQL or MariaDB, Nginx, and PHP-FPM. By the end, you will have a production Laravel app with automatic HTTPS. {{ className: 'lead' }}
 
 ---
 
 ## What you will build {{ anchor: true, id: 'what-you-will-build' }}
 
 - A Laravel app deployed from a Git repository
-- PostgreSQL database provisioned and connected
+- PostgreSQL or MariaDB database provisioned and connected
 - Nginx + PHP-FPM in a single container
 - Automatic HTTPS and deployment on every push
 
@@ -130,6 +130,23 @@ bunx @temps-sdk/cli services create -p my-laravel-app -t postgres -n "laravel-db
 ```
 
 The `DATABASE_URL` environment variable is automatically injected.
+
+### Using MariaDB instead
+
+If your Laravel app is already configured for MySQL, create a MariaDB service instead of PostgreSQL:
+
+```bash
+bunx @temps-sdk/cli services create -p my-laravel-app -t mariadb -n "laravel-db"
+```
+
+Set `DB_CONNECTION=mysql`. Temps injects a MySQL-compatible `DATABASE_URL` plus `MYSQL_*` and `MARIADB_*` variables for the linked MariaDB service.
+
+For a MariaDB/MySQL build, install the PHP MySQL extension instead of PostgreSQL support:
+
+```dockerfile
+RUN apk add --no-cache nginx && \
+    docker-php-ext-install pdo_mysql opcache
+```
 
 ---
 
