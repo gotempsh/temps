@@ -6900,6 +6900,31 @@ echo "[restore] Pre-seed complete"
             let service_instance =
                 self.create_service_instance(service.name.clone(), service_type_enum);
 
+            if service_type_enum == ServiceType::Mariadb {
+                let parameters = self.get_service_parameters(service_id).await?;
+                if parameters.get("container_name").is_some() {
+                    let service_config = ServiceConfig {
+                        name: service.name.clone(),
+                        service_type: service_type_enum,
+                        version: service.version.clone(),
+                        parameters: serde_json::to_value(parameters).map_err(|e| {
+                            ExternalServiceError::InternalError {
+                                reason: format!("Failed to serialize parameters: {}", e),
+                            }
+                        })?,
+                    };
+                    service_instance.init(service_config).await.map_err(|e| {
+                        ExternalServiceError::StopFailed {
+                            id: service_id,
+                            reason: format!(
+                                "Failed to initialize imported MariaDB service before stop: {}",
+                                e
+                            ),
+                        }
+                    })?;
+                }
+            }
+
             service_instance
                 .stop()
                 .await
@@ -8054,7 +8079,9 @@ echo "[restore] Pre-seed complete"
 
             // Detect service type based on image name
             #[allow(deprecated)]
-            let service_type = if image.contains("postgres")
+            let service_type = if crate::mariadb_query::is_mariadb_compatible_image(&image) {
+                ServiceType::Mariadb
+            } else if image.contains("postgres")
                 || image.contains("timescaledb")
                 || image.contains("pgvector")
             {
@@ -8144,7 +8171,7 @@ echo "[restore] Pre-seed complete"
 
         for (key, value) in &request.parameters {
             match key.as_str() {
-                "username" | "password" => {
+                "username" | "password" | "database" | "root_password" => {
                     if let Some(str_value) = value.as_str() {
                         credentials.insert(key.clone(), str_value.to_string());
                     }
@@ -8161,9 +8188,15 @@ echo "[restore] Pre-seed complete"
         #[allow(deprecated)]
         let service_config = match request.service_type {
             ServiceType::Mariadb => {
-                return Err(anyhow::anyhow!(
-                    "MariaDB container import is not implemented yet; see https://github.com/bherila/temps/issues/3"
-                ));
+                let mariadb = MariaDbService::new(request.name.clone(), Arc::clone(&self.docker));
+                mariadb
+                    .import_from_container(
+                        request.container_id.clone(),
+                        request.name.clone(),
+                        credentials,
+                        additional_config,
+                    )
+                    .await?
             }
             ServiceType::Postgres => {
                 let postgres = PostgresService::new(request.name.clone(), Arc::clone(&self.docker));

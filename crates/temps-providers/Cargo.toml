@@ -32,6 +32,7 @@ futures = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true }
 sea-orm = { workspace = true }
+sqlx = { workspace = true }
 redis = { version = "0.28.2", features = ["tokio-comp", "connection-manager"] }
 mongodb = "3.7.0"
 aws-sdk-s3 = { workspace = true }
