@@ -113,9 +113,15 @@ impl ManagedS3BackendSelection {
     }
 
     pub fn validate_for_service_create(&self) -> Result<()> {
-        if self.backend.requires_external_provider() && self.provider_socket.is_none() {
+        if self.backend.requires_external_provider() {
+            // The out-of-process provider dispatch is not yet wired into
+            // service creation: `create_service_instance` maps both S3 and Blob
+            // to `RustfsService`, so accepting a Garage selection here would
+            // silently provision RustFS under a Garage label. Reject it rather
+            // than misrepresent what was provisioned. The `provider_socket`
+            // field remains part of the contract for when that path lands.
             return Err(anyhow!(
-                "managed S3 backend '{}' must be handled by an out-of-process provider; set provider_socket to the external provider Unix socket path",
+                "managed S3 backend '{}' is not yet supported: Temps cannot provision it because the out-of-process provider dispatch is not implemented; use the default 'rustfs' backend",
                 self.backend.as_str()
             ));
         }
@@ -204,11 +210,27 @@ mod tests {
         .unwrap();
         assert_eq!(selection.backend, ManagedS3BackendKind::Garage);
         assert_eq!(selection.buckets, vec!["uploads", "private-files"]);
-        selection.validate_for_service_create().unwrap();
     }
 
     #[test]
-    fn garage_requires_external_provider_socket() {
+    fn garage_is_rejected_until_provider_dispatch_exists() {
+        // Even with a provider_socket set, Garage must be rejected at creation
+        // time because nothing dispatches to the external provider yet — the
+        // service would otherwise be provisioned as RustFS under a Garage label.
+        let selection = ManagedS3BackendSelection::from_parameters(&serde_json::json!({
+            "backend": "garage",
+            "provider_socket": "/run/temps/providers/garage.sock"
+        }))
+        .unwrap();
+        let error = selection
+            .validate_for_service_create()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not yet supported"));
+    }
+
+    #[test]
+    fn garage_without_socket_is_also_rejected() {
         let selection = ManagedS3BackendSelection::from_parameters(&serde_json::json!({
             "backend": "garage"
         }))
@@ -217,7 +239,7 @@ mod tests {
             .validate_for_service_create()
             .unwrap_err()
             .to_string();
-        assert!(error.contains("out-of-process provider"));
+        assert!(error.contains("not yet supported"));
     }
 
     #[test]
