@@ -6,8 +6,9 @@ use super::{
 };
 use anyhow::Result;
 use async_trait::async_trait;
+use bollard::exec::CreateExecOptions;
 use bollard::query_parameters::{InspectContainerOptions, StopContainerOptions};
-use bollard::Docker;
+use bollard::{body_full, Docker};
 use futures::{StreamExt, TryStreamExt};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -17,11 +18,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
-use tracing::{debug, info};
+use tracing::{debug, error, info, warn};
 
 const MARIADB_INTERNAL_PORT: &str = "3306";
 const DEFAULT_MARIADB_IMAGE: &str = "mariadb:lts";
 const MIN_PASSWORD_LENGTH: usize = 8;
+const MARIADB_BACKUP_EXEC_TIMEOUT: Duration = Duration::from_secs(4 * 3600);
 
 /// Input configuration for creating a MariaDB service.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -71,6 +73,10 @@ pub struct MariaDbInputConfig {
     #[serde(default = "default_docker_image")]
     #[schemars(example = "example_docker_image", default = "default_docker_image")]
     pub docker_image: String,
+
+    /// Existing Docker container name for imported services.
+    #[serde(default)]
+    pub container_name: Option<String>,
 }
 
 /// Internal runtime configuration for MariaDB service.
@@ -83,6 +89,8 @@ pub struct MariaDbConfig {
     pub password: String,
     pub root_password: String,
     pub docker_image: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_name: Option<String>,
 }
 
 impl From<MariaDbInputConfig> for MariaDbConfig {
@@ -99,6 +107,7 @@ impl From<MariaDbInputConfig> for MariaDbConfig {
             password: input.password.unwrap_or_else(generate_password),
             root_password: input.root_password.unwrap_or_else(generate_password),
             docker_image: input.docker_image,
+            container_name: input.container_name,
         }
     }
 }
@@ -194,6 +203,13 @@ impl MariaDbService {
 
     fn get_container_name(&self) -> String {
         format!("mariadb-{}", self.name)
+    }
+
+    fn get_live_container_name(&self, config: &MariaDbConfig) -> String {
+        config
+            .container_name
+            .clone()
+            .unwrap_or_else(|| self.get_container_name())
     }
 
     fn get_mariadb_config(&self, service_config: ServiceConfig) -> Result<MariaDbConfig> {
@@ -435,15 +451,21 @@ impl MariaDbService {
         Err(anyhow::anyhow!("MariaDB container health check timed out"))
     }
 
-    async fn run_container_command(&self, cmd: Vec<String>, timeout: Duration) -> Result<String> {
-        let container_name = self.get_container_name();
+    async fn run_container_command(
+        &self,
+        container_name: &str,
+        cmd: Vec<String>,
+        env: Option<Vec<String>>,
+        timeout: Duration,
+    ) -> Result<String> {
         tokio::time::timeout(timeout, async {
             let exec = self
                 .docker
                 .create_exec(
-                    &container_name,
+                    container_name,
                     bollard::exec::CreateExecOptions {
                         cmd: Some(cmd),
+                        env,
                         attach_stdout: Some(true),
                         attach_stderr: Some(true),
                         ..Default::default()
@@ -497,14 +519,24 @@ impl MariaDbService {
     }
 
     async fn run_admin_sql(&self, config: &MariaDbConfig, sql: &str) -> Result<()> {
+        let container_name = self.get_live_container_name(config);
         self.run_container_command(
+            &container_name,
             vec![
-                "mariadb".to_string(),
-                "-uroot".to_string(),
-                format!("-p{}", config.root_password),
-                "-e".to_string(),
-                sql.to_string(),
+                "sh".to_string(),
+                "-c".to_string(),
+                "if command -v mariadb >/dev/null 2>&1; then \
+                     mariadb -uroot -e \"$TEMPS_MARIADB_SQL\"; \
+                 else \
+                     mysql -uroot -e \"$TEMPS_MARIADB_SQL\"; \
+                 fi"
+                .to_string(),
             ],
+            Some(vec![
+                format!("MYSQL_PWD={}", config.root_password),
+                format!("MARIADB_PWD={}", config.root_password),
+                format!("TEMPS_MARIADB_SQL={}", sql),
+            ]),
             Duration::from_secs(15),
         )
         .await
@@ -512,16 +544,23 @@ impl MariaDbService {
     }
 
     async fn ping(&self, config: &MariaDbConfig) -> Result<()> {
+        let container_name = self.get_live_container_name(config);
         self.run_container_command(
+            &container_name,
             vec![
-                "mariadb-admin".to_string(),
-                "ping".to_string(),
-                "-h".to_string(),
-                "127.0.0.1".to_string(),
-                "-uroot".to_string(),
-                format!("-p{}", config.root_password),
-                "--silent".to_string(),
+                "sh".to_string(),
+                "-c".to_string(),
+                "if command -v mariadb-admin >/dev/null 2>&1; then \
+                     mariadb-admin ping -h 127.0.0.1 -uroot --silent; \
+                 else \
+                     mysqladmin ping -h 127.0.0.1 -uroot --silent; \
+                 fi"
+                .to_string(),
             ],
+            Some(vec![
+                format!("MYSQL_PWD={}", config.root_password),
+                format!("MARIADB_PWD={}", config.root_password),
+            ]),
             Duration::from_secs(5),
         )
         .await
@@ -562,7 +601,7 @@ impl MariaDbService {
     ) -> Result<HashMap<String, String>> {
         let config = self.get_mariadb_config(service_config)?;
         Self::build_env_vars(
-            &self.get_container_name(),
+            &self.get_live_container_name(&config),
             MARIADB_INTERNAL_PORT,
             resource_name,
             &config.username,
@@ -713,6 +752,254 @@ impl MariaDbService {
     fn sql_string_literal(value: &str) -> String {
         format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
     }
+
+    fn env_to_map(env: Option<Vec<String>>) -> HashMap<String, String> {
+        env.unwrap_or_default()
+            .into_iter()
+            .filter_map(|entry| {
+                let (key, value) = entry.split_once('=')?;
+                Some((key.to_string(), value.to_string()))
+            })
+            .collect()
+    }
+
+    fn first_non_empty<'a>(values: impl IntoIterator<Item = Option<&'a String>>) -> Option<String> {
+        values
+            .into_iter()
+            .flatten()
+            .find(|value| !value.trim().is_empty())
+            .cloned()
+    }
+
+    fn json_string(value: &serde_json::Value, key: &str) -> Option<String> {
+        value
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(ToString::to_string)
+    }
+
+    fn extract_host_port(container: &bollard::models::ContainerInspectResponse) -> Option<String> {
+        container
+            .network_settings
+            .as_ref()
+            .and_then(|settings| settings.ports.as_ref())
+            .and_then(|ports| ports.get("3306/tcp"))
+            .and_then(|bindings| bindings.as_ref())
+            .and_then(|bindings| bindings.first())
+            .and_then(|binding| binding.host_port.clone())
+    }
+
+    async fn verify_import_connection(
+        username: &str,
+        password: &str,
+        port: &str,
+        database: &str,
+    ) -> Result<()> {
+        let connection_url = format!(
+            "mysql://{}:{}@localhost:{}/{}",
+            urlencoding::encode(username),
+            urlencoding::encode(password),
+            port,
+            urlencoding::encode(database)
+        );
+
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .max_connections(1)
+            .connect(&connection_url)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to connect to MariaDB-compatible container at localhost:{} with provided credentials: {}",
+                    port,
+                    e
+                )
+            })?;
+        pool.close().await;
+        Ok(())
+    }
+
+    fn backup_key_from_location(location: &str, bucket: &str) -> String {
+        let bucket_prefix = format!("s3://{}/", bucket);
+        location
+            .strip_prefix(&bucket_prefix)
+            .unwrap_or(location)
+            .to_string()
+    }
+
+    async fn dump_all_databases_to_gzip_file(
+        &self,
+        config: &MariaDbConfig,
+        output_path: &std::path::Path,
+    ) -> Result<()> {
+        use std::io::Write;
+
+        let container_name = self.get_live_container_name(config);
+        let env = vec![
+            format!("MYSQL_PWD={}", config.root_password),
+            format!("MARIADB_PWD={}", config.root_password),
+        ];
+        let cmd = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "if command -v mariadb >/dev/null 2>&1; then client=mariadb; else client=mysql; fi; \
+             if command -v mariadb-dump >/dev/null 2>&1; then dump=mariadb-dump; else dump=mysqldump; fi; \
+             dbs=$($client -N -B -uroot -e \"SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME NOT IN ('information_schema','mysql','performance_schema','sys') ORDER BY SCHEMA_NAME\"); \
+             if [ -z \"$dbs\" ]; then \
+                 echo '-- No user databases to dump'; \
+                 exit 0; \
+             fi; \
+             $dump --databases $dbs --single-transaction --quick -uroot"
+            .to_string(),
+        ];
+
+        tokio::time::timeout(MARIADB_BACKUP_EXEC_TIMEOUT, async {
+            let exec = self
+                .docker
+                .create_exec(
+                    &container_name,
+                    CreateExecOptions {
+                        cmd: Some(cmd.iter().map(|s| s.as_str()).collect()),
+                        env: Some(env.iter().map(|s| s.as_str()).collect()),
+                        attach_stdout: Some(true),
+                        attach_stderr: Some(true),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to create MariaDB dump exec: {}", e))?;
+
+            let mut encoder = flate2::write::GzEncoder::new(
+                std::fs::File::create(output_path)?,
+                flate2::Compression::default(),
+            );
+            let mut stderr = String::new();
+
+            let output = self
+                .docker
+                .start_exec(&exec.id, None)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to start MariaDB dump exec: {}", e))?;
+
+            if let bollard::exec::StartExecResults::Attached { mut output, .. } = output {
+                while let Some(result) = output.next().await {
+                    match result {
+                        Ok(bollard::container::LogOutput::StdOut { message }) => {
+                            encoder.write_all(&message)?;
+                        }
+                        Ok(bollard::container::LogOutput::StdErr { message }) => {
+                            stderr.push_str(&String::from_utf8_lossy(&message));
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            return Err(anyhow::anyhow!(
+                                "Failed to stream MariaDB dump output: {}",
+                                e
+                            ));
+                        }
+                    }
+                }
+            }
+
+            encoder.finish()?;
+
+            let inspect = self
+                .docker
+                .inspect_exec(&exec.id)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to inspect MariaDB dump exec: {}", e))?;
+            let exit_code = inspect.exit_code.unwrap_or(-1);
+            if exit_code != 0 {
+                return Err(anyhow::anyhow!(
+                    "MariaDB dump failed with exit code {}: {}",
+                    exit_code,
+                    stderr.trim()
+                ));
+            }
+
+            let size_bytes = std::fs::metadata(output_path)?.len();
+            if size_bytes == 0 {
+                return Err(anyhow::anyhow!(
+                    "MariaDB backup failed: dump file has zero size"
+                ));
+            }
+
+            if !stderr.trim().is_empty() {
+                debug!("MariaDB dump stderr: {}", stderr.trim());
+            }
+
+            Ok(())
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "MariaDB dump timed out after {}s",
+                MARIADB_BACKUP_EXEC_TIMEOUT.as_secs()
+            )
+        })?
+    }
+
+    async fn restore_sql_file(
+        &self,
+        config: &MariaDbConfig,
+        sql_path: &std::path::Path,
+    ) -> Result<()> {
+        let container_name = self.get_live_container_name(config);
+        let restore_filename = "temps_mariadb_restore.sql";
+
+        let tar_data = {
+            let mut archive = tar::Builder::new(Vec::new());
+            archive.append_path_with_name(sql_path, restore_filename)?;
+            archive.finish()?;
+            archive.into_inner()?
+        };
+
+        self.docker
+            .upload_to_container(
+                &container_name,
+                Some(bollard::query_parameters::UploadToContainerOptions {
+                    path: "/tmp".to_string(),
+                    ..Default::default()
+                }),
+                body_full(bytes::Bytes::from(tar_data)),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to upload MariaDB restore SQL: {}", e))?;
+
+        let restore_path = format!("/tmp/{}", restore_filename);
+        let restore_cmd = format!(
+            "if command -v mariadb >/dev/null 2>&1; then \
+                 mariadb -uroot < {}; \
+             else \
+                 mysql -uroot < {}; \
+             fi",
+            restore_path, restore_path
+        );
+        let env = vec![
+            format!("MYSQL_PWD={}", config.root_password),
+            format!("MARIADB_PWD={}", config.root_password),
+        ];
+
+        let result = super::exec_util::run_exec(
+            &self.docker,
+            &container_name,
+            vec!["sh".into(), "-c".into(), restore_cmd],
+            Some(env),
+            MARIADB_BACKUP_EXEC_TIMEOUT,
+        )
+        .await;
+
+        let _ = super::exec_util::run_exec(
+            &self.docker,
+            &container_name,
+            vec!["rm".into(), "-f".into(), restore_path],
+            None,
+            Duration::from_secs(30),
+        )
+        .await;
+
+        result.map(|_| ())
+    }
 }
 
 #[async_trait]
@@ -738,8 +1025,16 @@ impl ExternalService for MariaDbService {
         *self.config.write().await = Some(mariadb_config.clone());
         *self.resource_limits.write().await = resource_limits.clone();
 
-        self.create_container(&self.docker, &mariadb_config, &resource_limits)
-            .await?;
+        if mariadb_config.container_name.is_none() {
+            self.create_container(&self.docker, &mariadb_config, &resource_limits)
+                .await?;
+        } else {
+            info!(
+                "MariaDB service '{}' is imported from container '{}'; skipping container creation",
+                self.name,
+                self.get_live_container_name(&mariadb_config)
+            );
+        }
 
         let runtime_config_json = serde_json::to_value(&mariadb_config)
             .map_err(|e| anyhow::anyhow!("Failed to serialize MariaDB runtime config: {}", e))?;
@@ -857,7 +1152,11 @@ impl ExternalService for MariaDbService {
     }
 
     async fn start(&self) -> Result<()> {
-        let container_name = self.get_container_name();
+        let existing_config = self.config.read().await.as_ref().cloned();
+        let container_name = existing_config
+            .as_ref()
+            .map(|config| self.get_live_container_name(config))
+            .unwrap_or_else(|| self.get_container_name());
         info!("Starting MariaDB container {}", container_name);
 
         let containers = self
@@ -873,13 +1172,14 @@ impl ExternalService for MariaDbService {
             .await?;
 
         if containers.is_empty() {
-            let config = self
-                .config
-                .read()
-                .await
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("MariaDB configuration not found"))?
-                .clone();
+            let config = existing_config
+                .ok_or_else(|| anyhow::anyhow!("MariaDB configuration not found"))?;
+            if config.container_name.is_some() {
+                return Err(anyhow::anyhow!(
+                    "Imported MariaDB container '{}' not found",
+                    container_name
+                ));
+            }
             let limits = self.resource_limits.read().await.clone();
             self.create_container(&self.docker, &config, &limits)
                 .await?;
@@ -907,7 +1207,13 @@ impl ExternalService for MariaDbService {
     }
 
     async fn stop(&self) -> Result<()> {
-        let container_name = self.get_container_name();
+        let container_name = self
+            .config
+            .read()
+            .await
+            .as_ref()
+            .map(|config| self.get_live_container_name(config))
+            .unwrap_or_else(|| self.get_container_name());
         let containers = self
             .docker
             .list_containers(Some(bollard::query_parameters::ListContainersOptions {
@@ -994,13 +1300,13 @@ impl ExternalService for MariaDbService {
             .get("password")
             .ok_or_else(|| anyhow::anyhow!("Missing password parameter"))?;
 
-        Self::build_env_vars(
-            &self.get_container_name(),
-            MARIADB_INTERNAL_PORT,
-            database,
-            username,
-            password,
-        )
+        let host = parameters
+            .get("container_name")
+            .cloned()
+            .or_else(|| parameters.get("host").cloned())
+            .unwrap_or_else(|| self.get_container_name());
+
+        Self::build_env_vars(&host, MARIADB_INTERNAL_PORT, database, username, password)
     }
 
     fn get_docker_environment_variables(
@@ -1106,7 +1412,10 @@ impl ExternalService for MariaDbService {
         let config = self.get_mariadb_config(service_config)?;
 
         if temps_core::DeploymentMode::is_docker() {
-            Ok((self.get_container_name(), MARIADB_INTERNAL_PORT.to_string()))
+            Ok((
+                self.get_live_container_name(&config),
+                MARIADB_INTERNAL_PORT.to_string(),
+            ))
         } else {
             Ok(("localhost".to_string(), config.port))
         }
@@ -1118,6 +1427,329 @@ impl ExternalService for MariaDbService {
 
     fn get_docker_internal_port(&self) -> String {
         MARIADB_INTERNAL_PORT.to_string()
+    }
+
+    async fn backup_to_s3(
+        &self,
+        s3_client: &aws_sdk_s3::Client,
+        _s3_credentials: &super::S3Credentials,
+        backup: temps_entities::backups::Model,
+        s3_source: &temps_entities::s3_sources::Model,
+        subpath: &str,
+        _subpath_root: &str,
+        pool: &temps_database::DbConnection,
+        external_service: &temps_entities::external_services::Model,
+        service_config: ServiceConfig,
+    ) -> Result<super::BackupOutcome> {
+        use chrono::Utc;
+        use sea_orm::*;
+
+        info!("Starting MariaDB backup to S3 via mariadb-dump");
+
+        let config = self.get_mariadb_config(service_config)?;
+        let backup_record = temps_entities::external_service_backups::Entity::insert(
+            temps_entities::external_service_backups::ActiveModel {
+                service_id: Set(external_service.id),
+                backup_id: Set(backup.id),
+                backup_type: Set("full".to_string()),
+                state: Set("running".to_string()),
+                started_at: Set(Utc::now()),
+                s3_location: Set(String::new()),
+                metadata: Set(serde_json::json!({
+                    "service_type": "mariadb",
+                    "service_name": self.name,
+                    "backup_tool": "mariadb-dump",
+                })),
+                compression_type: Set("gzip".to_string()),
+                created_by: Set(0),
+                ..Default::default()
+            },
+        )
+        .exec_with_returning(pool)
+        .await?;
+
+        let temp_dir = tempfile::tempdir()?;
+        let dump_path = temp_dir
+            .path()
+            .join(format!("mariadb_backup_{}.sql.gz", uuid::Uuid::new_v4()));
+
+        let result = async {
+            self.dump_all_databases_to_gzip_file(&config, &dump_path)
+                .await?;
+
+            let size_bytes = tokio::fs::metadata(&dump_path).await?.len() as i64;
+            let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
+            let backup_key = format!(
+                "{}/mariadb_backup_{}.sql.gz",
+                subpath.trim_matches('/'),
+                timestamp
+            );
+
+            let body = aws_sdk_s3::primitives::ByteStream::from_path(&dump_path).await?;
+            s3_client
+                .put_object()
+                .bucket(&s3_source.bucket_name)
+                .key(&backup_key)
+                .body(body)
+                .content_type("application/x-gzip")
+                .send()
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to upload backup to s3://{}/{}: {}",
+                        s3_source.bucket_name,
+                        backup_key,
+                        e
+                    )
+                })?;
+
+            Ok::<(String, i64), anyhow::Error>((backup_key, size_bytes))
+        }
+        .await;
+
+        match result {
+            Ok((backup_key, size_bytes)) => {
+                let mut update: temps_entities::external_service_backups::ActiveModel =
+                    backup_record.clone().into();
+                update.state = Set("completed".to_string());
+                update.finished_at = Set(Some(Utc::now()));
+                update.s3_location = Set(backup_key.clone());
+                update.size_bytes = Set(Some(size_bytes));
+                update.update(pool).await?;
+
+                info!(
+                    "MariaDB backup completed successfully: {} ({} bytes)",
+                    backup_key, size_bytes
+                );
+                Ok(super::BackupOutcome::new(backup_key, Some(size_bytes)))
+            }
+            Err(e) => {
+                let error_msg = format!("MariaDB backup failed: {}", e);
+                error!("{}", error_msg);
+                let mut update: temps_entities::external_service_backups::ActiveModel =
+                    backup_record.into();
+                update.state = Set("failed".to_string());
+                update.error_message = Set(Some(error_msg.clone()));
+                update.finished_at = Set(Some(Utc::now()));
+                if let Err(update_err) = update.update(pool).await {
+                    error!(
+                        "Failed to mark MariaDB backup row as failed: {}",
+                        update_err
+                    );
+                }
+                Err(e)
+            }
+        }
+    }
+
+    async fn restore_from_s3(
+        &self,
+        s3_client: &aws_sdk_s3::Client,
+        _s3_credentials: &super::S3Credentials,
+        backup_location: &str,
+        s3_source: &temps_entities::s3_sources::Model,
+        service_config: ServiceConfig,
+    ) -> Result<()> {
+        use std::io::Read;
+
+        info!("Starting MariaDB restore from S3: {}", backup_location);
+
+        let config = self.get_mariadb_config(service_config)?;
+        let backup_key = Self::backup_key_from_location(backup_location, &s3_source.bucket_name);
+        let response = s3_client
+            .get_object()
+            .bucket(&s3_source.bucket_name)
+            .key(&backup_key)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to download MariaDB backup from S3: {}", e))?;
+
+        let backup_data = response
+            .body
+            .collect()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to read MariaDB backup data: {}", e))?
+            .into_bytes();
+
+        let temp_dir = tempfile::tempdir()?;
+        let sql_path = temp_dir.path().join("restore.sql");
+
+        if backup_key.ends_with(".gz") {
+            let mut decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(backup_data));
+            let mut sql = Vec::new();
+            decoder.read_to_end(&mut sql)?;
+            tokio::fs::write(&sql_path, sql).await?;
+        } else {
+            tokio::fs::write(&sql_path, backup_data).await?;
+        }
+
+        self.restore_sql_file(&config, &sql_path).await?;
+        info!("MariaDB restore completed successfully");
+        Ok(())
+    }
+
+    async fn import_from_container(
+        &self,
+        container_id: String,
+        service_name: String,
+        credentials: HashMap<String, String>,
+        additional_config: serde_json::Value,
+    ) -> Result<ServiceConfig> {
+        let container = self
+            .docker
+            .inspect_container(
+                &container_id,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to inspect container '{}': {}", container_id, e)
+            })?;
+
+        let container_config = container.config.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("Could not inspect config for container '{}'", container_id)
+        })?;
+        let image = container_config.image.clone().ok_or_else(|| {
+            anyhow::anyhow!("Could not determine image for container '{}'", container_id)
+        })?;
+        if !crate::mariadb_query::is_mariadb_compatible_image(&image) {
+            return Err(anyhow::anyhow!(
+                "Container '{}' image '{}' is not MariaDB/MySQL-compatible",
+                container_id,
+                image
+            ));
+        }
+        let imported_container_name = container
+            .name
+            .as_deref()
+            .unwrap_or(&container_id)
+            .trim_start_matches('/')
+            .to_string();
+
+        let env = Self::env_to_map(container_config.env.clone());
+        let database_override = Self::json_string(&additional_config, "database");
+        let port_override = Self::json_string(&additional_config, "port");
+
+        let root_password = Self::first_non_empty([
+            credentials.get("root_password"),
+            credentials.get("password").filter(|_| {
+                credentials
+                    .get("username")
+                    .map(|u| u.eq_ignore_ascii_case("root"))
+                    .unwrap_or(false)
+            }),
+            env.get("MARIADB_ROOT_PASSWORD"),
+            env.get("MYSQL_ROOT_PASSWORD"),
+        ])
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "root_password is required for MariaDB import unless the container exposes MARIADB_ROOT_PASSWORD or MYSQL_ROOT_PASSWORD"
+            )
+        })?;
+
+        let database = Self::first_non_empty([
+            credentials.get("database"),
+            database_override.as_ref(),
+            env.get("MARIADB_DATABASE"),
+            env.get("MYSQL_DATABASE"),
+        ])
+        .unwrap_or_else(|| "mysql".to_string());
+
+        let username = Self::first_non_empty([
+            credentials.get("username"),
+            env.get("MARIADB_USER"),
+            env.get("MYSQL_USER"),
+        ])
+        .unwrap_or_else(|| "root".to_string());
+
+        let password = Self::first_non_empty([
+            credentials.get("password"),
+            env.get("MARIADB_PASSWORD"),
+            env.get("MYSQL_PASSWORD"),
+        ])
+        .unwrap_or_else(|| {
+            if username.eq_ignore_ascii_case("root") {
+                root_password.clone()
+            } else {
+                String::new()
+            }
+        });
+
+        if password.is_empty() {
+            return Err(anyhow::anyhow!(
+                "password is required for MariaDB import when username is not root"
+            ));
+        }
+
+        Self::validate_identifier("database", &database)?;
+        Self::validate_identifier("username", &username)?;
+        Self::validate_password("password", &password)?;
+        Self::validate_password("root_password", &root_password)?;
+
+        let port = port_override
+            .or_else(|| Self::extract_host_port(&container))
+            .unwrap_or_else(|| MARIADB_INTERNAL_PORT.to_string());
+
+        Self::verify_import_connection(&username, &password, &port, &database).await?;
+        info!("Successfully verified MariaDB-compatible connection for import");
+
+        let network_ready = {
+            match ensure_network_exists(&self.docker).await {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!(
+                        "Failed to ensure Temps Docker network before MariaDB import attach: {:?}",
+                        e
+                    );
+                    false
+                }
+            }
+        };
+
+        if network_ready {
+            let network_name = temps_core::NETWORK_NAME.as_str();
+            let request = bollard::models::NetworkConnectRequest {
+                container: container_id.clone(),
+                ..Default::default()
+            };
+            match self.docker.connect_network(network_name, request).await {
+                Ok(()) => info!(
+                    "Attached imported MariaDB-compatible container '{}' to {}",
+                    imported_container_name, network_name
+                ),
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 403, ..
+                }) => debug!(
+                    "Imported MariaDB-compatible container '{}' is already attached to {}",
+                    imported_container_name, network_name
+                ),
+                Err(e) => warn!(
+                    "Failed to attach imported MariaDB-compatible container '{}' to {}: {}",
+                    imported_container_name, network_name, e
+                ),
+            }
+        }
+
+        let version = image
+            .rfind(':')
+            .map(|tag_pos| image[tag_pos + 1..].to_string())
+            .unwrap_or_else(|| "latest".to_string());
+
+        Ok(ServiceConfig {
+            name: service_name,
+            service_type: ServiceType::Mariadb,
+            version: Some(version),
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": port,
+                "database": database,
+                "username": username,
+                "password": password,
+                "root_password": root_password,
+                "docker_image": image,
+                "container_name": imported_container_name,
+            }),
+        })
     }
 }
 

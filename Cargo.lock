@@ -12438,6 +12438,7 @@ dependencies = [
  "sea-orm",
  "serde",
  "serde_json",
+ "sqlx",
  "tar",
  "tempfile",
  "temps-auth",

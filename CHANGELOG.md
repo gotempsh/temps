@@ -31,9 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dependency. The new `mariadb` service type uses the official `mariadb:lts`
   container image, generates separate application and root passwords, provisions
   per-project/per-environment databases, and exposes both `MYSQL_*` and
-  `MARIADB_*` runtime environment variables plus `DATABASE_URL`. Query explorer,
-  existing-container import, and backup/restore support remain intentionally
-  separate follow-up items.
+  `MARIADB_*` runtime environment variables plus `DATABASE_URL`. MariaDB is
+  supported in the query explorer, existing MariaDB/MySQL-compatible containers
+  can be imported as MariaDB services, and full logical backup/restore uses
+  `mariadb-dump` with `mysqldump` fallback for non-system databases.
 
 - **changelog:** Skip preview comment on fork PRs
 
