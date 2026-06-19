@@ -1189,6 +1189,14 @@ impl ExternalServiceManager {
                         config: Set(Some(encrypted_config)),
                         node_id: Set(request.node_id),
                         topology: Set(topology_for_txn),
+                        // Monitoring is on by default for every new service. For DB
+                        // engines (postgres/redis/mongodb) the metrics poller picks up
+                        // any service with this flag set — zero extra footprint, no
+                        // restart. For OTLP-push engines (rustfs/s3) the create handler
+                        // provisions the ingest key right after creation. The entity
+                        // default stays `false` so existing rows and out-of-band inserts
+                        // are unaffected.
+                        metrics_enabled: Set(true),
                         created_at: Set(Utc::now()),
                         updated_at: Set(Utc::now()),
                         ..Default::default()

@@ -18,7 +18,6 @@ import {
 } from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { CreateActionButton } from '@/components/ui/create-action-button'
 import {
   DropdownMenu,
@@ -34,6 +33,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertCircle,
   CheckCircle2,
+  ChevronRight,
   Globe,
   Loader2,
   MoreVertical,
@@ -150,18 +150,24 @@ export function DnsProviders() {
     <div className="flex-1 overflow-auto">
       <div className="space-y-6 p-4 sm:p-6">
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <div>
-            <h1 className="text-2xl font-bold">DNS Providers</h1>
-            <p className="text-muted-foreground">
+          <div className="min-w-0">
+            <h1 className="text-xl font-bold sm:text-2xl">DNS Providers</h1>
+            <p className="text-sm text-muted-foreground sm:text-base">
               Manage your DNS providers for automatic DNS record configuration
             </p>
           </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <Button variant="outline" size="sm" onClick={() => refetch()}>
-              <RefreshCw className="mr-2 h-4 w-4" />
-              Refresh
+          <div className="flex items-center gap-2 self-start sm:self-auto">
+            <Button
+              variant="outline"
+              size="icon"
+              onClick={() => refetch()}
+              aria-label="Refresh"
+              title="Refresh"
+            >
+              <RefreshCw className="h-4 w-4" />
             </Button>
             <CreateActionButton
+              size="sm"
               onClick={() => navigate('/dns-providers/add')}
               label="Add DNS Provider"
             />
@@ -177,171 +183,150 @@ export function DnsProviders() {
               support if the issue persists.
             </AlertDescription>
           </Alert>
+        ) : isLoading ? (
+          <div className="divide-y rounded-lg border">
+            {Array.from({ length: 3 }).map((_, i) => (
+              <div
+                key={i}
+                className="flex items-center gap-4 px-4 py-3 animate-pulse"
+              >
+                <div className="size-9 shrink-0 rounded-md bg-muted" />
+                <div className="flex-1 min-w-0 space-y-1.5">
+                  <div className="h-4 w-48 bg-muted rounded" />
+                  <div className="h-3 w-64 bg-muted rounded" />
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : !dnsProviders?.length ? (
+          <EmptyPlaceholder
+            icon={Globe}
+            title="No DNS providers found"
+            description="Get started by adding a DNS provider like Cloudflare or Namecheap to enable automatic DNS record management"
+          >
+            <Button onClick={() => navigate('/dns-providers/add')}>
+              <Plus className="mr-2 h-4 w-4" />
+              Add DNS Provider
+            </Button>
+          </EmptyPlaceholder>
         ) : (
-          <Card>
-            <CardHeader>
-              <CardTitle>Active Providers</CardTitle>
-            </CardHeader>
-            <CardContent>
-              {isLoading ? (
-                <div className="grid gap-4">
-                  {Array.from({ length: 3 }).map((_, i) => (
-                    <div
-                      key={i}
-                      className="p-4 border rounded-lg space-y-3 animate-pulse"
-                    >
-                      <div className="flex items-center justify-between">
-                        <div className="h-5 w-48 bg-muted rounded" />
-                        <div className="h-6 w-20 bg-muted rounded" />
-                      </div>
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                        <div className="space-y-2">
-                          <div className="h-4 w-24 bg-muted rounded" />
-                          <div className="h-4 w-32 bg-muted rounded" />
-                        </div>
-                        <div className="space-y-2">
-                          <div className="h-4 w-24 bg-muted rounded" />
-                          <div className="h-4 w-32 bg-muted rounded" />
-                        </div>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              ) : !dnsProviders?.length ? (
-                <EmptyPlaceholder
-                  icon={Globe}
-                  title="No DNS providers found"
-                  description="Get started by adding a DNS provider like Cloudflare or Namecheap to enable automatic DNS record management"
+          <div className="overflow-hidden rounded-lg border">
+            <ul role="list" className="divide-y">
+              {dnsProviders.map((provider) => (
+                <li
+                  key={provider.id}
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => navigate(`/dns-providers/${provider.id}`)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault()
+                      navigate(`/dns-providers/${provider.id}`)
+                    }
+                  }}
+                  className="flex cursor-pointer items-center gap-3 px-3 py-3 transition-colors hover:bg-muted/40 focus:bg-muted/40 focus:outline-none sm:gap-4 sm:px-4"
                 >
-                  <Button onClick={() => navigate('/dns-providers/add')}>
-                    <Plus className="mr-2 h-4 w-4" />
-                    Add DNS Provider
-                  </Button>
-                </EmptyPlaceholder>
-              ) : (
-                <div className="grid gap-4">
-                  {dnsProviders.map((provider) => (
-                    <div
-                      key={provider.id}
-                      className="group relative p-4 border rounded-lg transition-colors hover:bg-muted/50 cursor-pointer"
-                      onClick={() =>
-                        navigate(`/dns-providers/${provider.id}`)
-                      }
-                    >
-                      <div className="flex flex-col sm:flex-row sm:items-center gap-4">
-                        <div className="flex-1 min-w-0 space-y-1">
-                          <div className="flex items-center gap-3">
-                            {getProviderIcon(provider.provider_type)}
-                            <span className="font-medium truncate">
-                              {provider.name}
-                            </span>
-                            <Badge variant="outline">
-                              {formatProviderType(provider.provider_type)}
-                            </Badge>
-                            {provider.is_active ? (
-                              <Badge
-                                variant="secondary"
-                                className="flex items-center gap-1"
-                              >
-                                <CheckCircle2 className="h-3 w-3" />
-                                Active
-                              </Badge>
-                            ) : (
-                              <Badge
-                                variant="destructive"
-                                className="flex items-center gap-1"
-                              >
-                                <XCircle className="h-3 w-3" />
-                                Inactive
-                              </Badge>
-                            )}
-                          </div>
-                          <div className="grid grid-cols-1 sm:flex sm:items-center gap-x-6 gap-y-1 text-sm text-muted-foreground">
-                            {provider.description && (
-                              <div className="flex items-center gap-2">
-                                <span className="truncate max-w-[300px]">
-                                  {provider.description}
-                                </span>
-                              </div>
-                            )}
-                            {provider.last_error && (
-                              <div className="flex items-center gap-2 text-destructive">
-                                <AlertCircle className="h-4 w-4" />
-                                <span className="truncate max-w-[200px]">
-                                  {provider.last_error}
-                                </span>
-                              </div>
-                            )}
-                            <div className="flex items-center gap-2">
-                              <span>Created </span>
-                              <TimeAgo
-                                date={provider.created_at}
-                                className=""
-                              />
-                            </div>
-                          </div>
-                        </div>
-                        <div
-                          className="flex items-center gap-2"
-                          onClick={(e) => e.stopPropagation()}
+                  <div className="flex size-9 shrink-0 items-center justify-center rounded-md bg-muted">
+                    {getProviderIcon(provider.provider_type)}
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <p className="truncate text-sm font-medium">
+                        {provider.name}
+                      </p>
+                      <Badge variant="secondary" className="text-xs">
+                        {formatProviderType(provider.provider_type)}
+                      </Badge>
+                      {provider.is_active ? (
+                        <Badge
+                          variant="outline"
+                          className="flex items-center gap-1 text-xs"
                         >
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            onClick={() => handleTestConnection(provider)}
-                            disabled={testConnectionMut.isPending}
-                            className="gap-2"
-                          >
-                            {testConnectionMut.isPending ? (
-                              <Loader2 className="h-4 w-4 animate-spin" />
-                            ) : (
-                              <TestTube2 className="h-4 w-4" />
-                            )}
-                            Test
-                          </Button>
-                          <DropdownMenu>
-                            <DropdownMenuTrigger asChild>
-                              <Button variant="ghost" size="icon">
-                                <MoreVertical className="h-4 w-4" />
-                              </Button>
-                            </DropdownMenuTrigger>
-                            <DropdownMenuContent align="end">
-                              <DropdownMenuItem
-                                onClick={() =>
-                                  navigate(
-                                    `/dns-providers/${provider.id}`
-                                  )
-                                }
-                              >
-                                View Details
-                              </DropdownMenuItem>
-                              <DropdownMenuItem
-                                onClick={() => handleTestConnection(provider)}
-                              >
-                                <TestTube2 className="h-4 w-4 mr-2" />
-                                Test Connection
-                              </DropdownMenuItem>
-                              <DropdownMenuSeparator />
-                              <DropdownMenuItem
-                                className="text-destructive cursor-pointer"
-                                onSelect={(e) => {
-                                  e.preventDefault()
-                                  setProviderToDelete(provider)
-                                }}
-                              >
-                                <Trash2 className="h-4 w-4 mr-2" />
-                                Delete Provider
-                              </DropdownMenuItem>
-                            </DropdownMenuContent>
-                          </DropdownMenu>
-                        </div>
-                      </div>
+                          <CheckCircle2 className="h-3 w-3" />
+                          Active
+                        </Badge>
+                      ) : (
+                        <Badge
+                          variant="destructive"
+                          className="flex items-center gap-1 text-xs"
+                        >
+                          <XCircle className="h-3 w-3" />
+                          Inactive
+                        </Badge>
+                      )}
                     </div>
-                  ))}
-                </div>
-              )}
-            </CardContent>
-          </Card>
+                    {provider.last_error ? (
+                      <p className="mt-0.5 flex items-center gap-1 truncate text-xs text-destructive">
+                        <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+                        <span className="truncate">{provider.last_error}</span>
+                      </p>
+                    ) : (
+                      <p className="mt-0.5 truncate text-xs text-muted-foreground">
+                        {provider.description
+                          ? `${provider.description} · `
+                          : ''}
+                        created <TimeAgo date={provider.created_at} />
+                      </p>
+                    )}
+                  </div>
+                  <div
+                    className="flex shrink-0 items-center gap-1 sm:gap-2"
+                    onClick={(e) => e.stopPropagation()}
+                    onPointerDown={(e) => e.stopPropagation()}
+                  >
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => handleTestConnection(provider)}
+                      disabled={testConnectionMut.isPending}
+                      className="hidden gap-2 sm:inline-flex"
+                    >
+                      {testConnectionMut.isPending ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <TestTube2 className="h-4 w-4" />
+                      )}
+                      Test
+                    </Button>
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button variant="ghost" size="icon" className="h-8 w-8">
+                          <MoreVertical className="h-4 w-4" />
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end">
+                        <DropdownMenuItem
+                          onClick={() =>
+                            navigate(`/dns-providers/${provider.id}`)
+                          }
+                        >
+                          View Details
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          onClick={() => handleTestConnection(provider)}
+                        >
+                          <TestTube2 className="h-4 w-4 mr-2" />
+                          Test Connection
+                        </DropdownMenuItem>
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem
+                          className="text-destructive cursor-pointer"
+                          onSelect={(e) => {
+                            e.preventDefault()
+                            setProviderToDelete(provider)
+                          }}
+                        >
+                          <Trash2 className="h-4 w-4 mr-2" />
+                          Delete Provider
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  </div>
+                  <ChevronRight className="hidden size-4 shrink-0 text-muted-foreground/50 sm:block" />
+                </li>
+              ))}
+            </ul>
+          </div>
         )}
       </div>
 

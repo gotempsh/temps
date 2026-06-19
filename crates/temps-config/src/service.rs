@@ -878,7 +878,15 @@ impl ConfigService {
     ) -> Result<String, ConfigServiceError> {
         let settings = self.get_settings().await?;
 
-        // Determine protocol and port from external_url if set, otherwise default to https
+        // Determine protocol and port from external_url if set.
+        //
+        // This MUST match how the deployment overview builds the visitable URL
+        // (`temps-deployments::compute_environment_url`/`compute_deployment_url`)
+        // so that uptime monitors check the same endpoint the app actually
+        // serves on. When `external_url` is unset (typical local install), the
+        // app is reachable over HTTP on the proxy listener port (e.g. :8080),
+        // NOT over HTTPS on :443 — defaulting to https here made monitors ping
+        // an unreachable URL and report a false "Major Outage".
         let (protocol, port) = if let Some(ref external_url) = settings.external_url {
             if let Ok(parsed) = url::Url::parse(external_url) {
                 (parsed.scheme().to_string(), parsed.port())
@@ -890,7 +898,7 @@ impl ConfigService {
                 ("https".to_string(), None)
             }
         } else {
-            ("https".to_string(), None)
+            ("http".to_string(), Some(self.proxy_port()))
         };
 
         // Use preview_domain if set, otherwise fallback to DEFAULT_LOCAL_DOMAIN

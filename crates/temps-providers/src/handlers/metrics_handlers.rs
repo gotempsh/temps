@@ -938,7 +938,11 @@ async fn toggle_service_metrics(
 ///
 /// Non-fatal — failures are logged but do not fail the metrics-enable request.
 /// The user can retry by toggling metrics off and on again.
-async fn provision_otlp_ingest_key(
+///
+/// Also called by the create-service handler so newly-created OTLP-push services
+/// (rustfs/s3) come up with metrics already wired, matching `metrics_enabled`
+/// defaulting to `true` at creation.
+pub(crate) async fn provision_otlp_ingest_key(
     state: &AppState,
     service: &external_services::Model,
     user_id: i32,

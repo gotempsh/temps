@@ -501,6 +501,43 @@ async fn create_service(
                 error!("Failed to create audit log: {}", e);
             }
 
+            // Monitoring is on by default for new services (metrics_enabled is set
+            // to true at creation). Wire up the supporting state here, in the handler
+            // layer where api_key_service / config_service live. All side effects are
+            // non-fatal — a monitoring-setup failure must not fail service creation.
+            //
+            // - Seed default alert rules for the engine (idempotent, all engines).
+            // - For OTLP-push engines (rustfs/s3) provision the ingest key + URL and
+            //   apply it. The container was just created, so this restart lands on a
+            //   service that is effectively still first-booting.
+            let engine = service.service_type.to_string();
+            if let Err(e) =
+                temps_monitoring::seed_default_rules(app_state.db.as_ref(), service.id, &engine)
+                    .await
+            {
+                error!(
+                    service_id = service.id,
+                    engine = %engine,
+                    error = %e,
+                    "Failed to seed default alert rules at creation; continuing"
+                );
+            }
+
+            if matches!(engine.as_str(), "rustfs" | "s3") {
+                if let Ok(model) = app_state
+                    .external_service_manager
+                    .get_service(service.id)
+                    .await
+                {
+                    crate::handlers::metrics_handlers::provision_otlp_ingest_key(
+                        &app_state,
+                        &model,
+                        auth.user_id(),
+                    )
+                    .await;
+                }
+            }
+
             app_state.telemetry.report(
                 temps_core::telemetry::TelemetryEvent::new(
                     temps_core::telemetry::TelemetryEventKind::ServiceCreated,

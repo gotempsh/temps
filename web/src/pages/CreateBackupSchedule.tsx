@@ -17,14 +17,6 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { ScheduleServicesSelector } from '@/components/backups/ScheduleServicesSelector'
 import { Button } from '@/components/ui/button'
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardFooter,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
@@ -220,16 +212,16 @@ export function CreateBackupSchedule() {
         </Button>
       </div>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>New backup schedule</CardTitle>
-          <CardDescription>
-            Run this S3 source's backup on a recurring cron schedule.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-6">
-          <div className="grid gap-2">
-            <Label htmlFor="name">Schedule Name</Label>
+      <div>
+        <h1 className="text-xl font-bold sm:text-2xl">New backup schedule</h1>
+        <p className="text-sm text-muted-foreground sm:text-base">
+          Run this S3 source's backup on a recurring cron schedule.
+        </p>
+      </div>
+
+      <div className="space-y-6">
+        <div className="grid gap-2">
+          <Label htmlFor="name">Schedule Name</Label>
             <Input
               id="name"
               placeholder="Daily Backup"
@@ -428,22 +420,21 @@ export function CreateBackupSchedule() {
               for S3 mirror).
             </p>
           </div>
-        </CardContent>
+      </div>
 
-        <CardFooter className="justify-end gap-2">
-          <Button variant="outline" asChild>
-            <Link to={`/backups/s3-sources/${id}`}>Cancel</Link>
-          </Button>
-          <Button
-            onClick={handleSubmit}
-            disabled={createMutation.isPending || attachMutation.isPending}
-          >
-            {createMutation.isPending || attachMutation.isPending
-              ? 'Creating…'
-              : 'Create schedule'}
-          </Button>
-        </CardFooter>
-      </Card>
+      <div className="flex justify-end gap-2">
+        <Button variant="outline" asChild>
+          <Link to={`/backups/s3-sources/${id}`}>Cancel</Link>
+        </Button>
+        <Button
+          onClick={handleSubmit}
+          disabled={createMutation.isPending || attachMutation.isPending}
+        >
+          {createMutation.isPending || attachMutation.isPending
+            ? 'Creating…'
+            : 'Create schedule'}
+        </Button>
+      </div>
     </div>
   )
 }

@@ -139,12 +139,11 @@ export function AddDomain() {
           </div>
         </div>
 
-        <Card>
-          <div className="p-4 sm:p-6">
-            <Form {...form}>
-              <form
-                onSubmit={form.handleSubmit(handleSubmit)}
-                className="space-y-6"
+        <div>
+          <Form {...form}>
+            <form
+              onSubmit={form.handleSubmit(handleSubmit)}
+              className="space-y-6"
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' && step !== 'confirm') {
                     e.preventDefault()
@@ -501,10 +500,9 @@ export function AddDomain() {
                     </div>
                   </div>
                 )}
-              </form>
-            </Form>
-          </div>
-        </Card>
+            </form>
+          </Form>
+        </div>
       </div>
     </div>
   )

@@ -494,22 +494,24 @@ export default function DnsProviderDetail() {
               </CardDescription>
             </CardHeader>
             <CardContent>
-              <div className="grid gap-2">
+              <ul role="list" className="divide-y rounded-md border">
                 {zones.zones.map((zone) => (
-                  <div
+                  <li
                     key={zone.id}
-                    className="flex items-center justify-between p-3 border rounded-lg"
+                    className="flex items-center justify-between gap-3 px-3 py-2.5"
                   >
-                    <div>
-                      <p className="font-medium">{zone.name}</p>
-                      <p className="text-sm text-muted-foreground">
+                    <div className="min-w-0">
+                      <p className="truncate font-medium">{zone.name}</p>
+                      <p className="truncate text-sm text-muted-foreground">
                         ID: {zone.id}
                       </p>
                     </div>
-                    <Badge variant="outline">{zone.status}</Badge>
-                  </div>
+                    <Badge variant="outline" className="shrink-0">
+                      {zone.status}
+                    </Badge>
+                  </li>
                 ))}
-              </div>
+              </ul>
             </CardContent>
           </Card>
         )}
@@ -550,15 +552,15 @@ export default function DnsProviderDetail() {
                 </p>
               </div>
             ) : (
-              <div className="grid gap-3">
+              <ul role="list" className="divide-y rounded-md border">
                 {managedDomains.map((domain) => (
-                  <div
+                  <li
                     key={domain.id}
-                    className="flex items-center justify-between p-4 border rounded-lg"
+                    className="flex items-center justify-between gap-3 px-4 py-3"
                   >
-                    <div className="space-y-1">
-                      <div className="flex items-center gap-2">
-                        <p className="font-medium">{domain.domain}</p>
+                    <div className="min-w-0 space-y-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <p className="truncate font-medium">{domain.domain}</p>
                         {domain.verified ? (
                           <Badge
                             variant="secondary"
@@ -581,17 +583,17 @@ export default function DnsProviderDetail() {
                         )}
                       </div>
                       {domain.zone_id && (
-                        <p className="text-sm text-muted-foreground">
+                        <p className="truncate text-sm text-muted-foreground">
                           Zone ID: {domain.zone_id}
                         </p>
                       )}
                       {domain.verification_error && (
-                        <p className="text-sm text-destructive">
+                        <p className="truncate text-sm text-destructive">
                           {domain.verification_error}
                         </p>
                       )}
                     </div>
-                    <div className="flex items-center gap-2">
+                    <div className="flex shrink-0 items-center gap-2">
                       {!domain.verified && (
                         <Button
                           variant="outline"
@@ -616,9 +618,9 @@ export default function DnsProviderDetail() {
                         <Trash2 className="h-4 w-4" />
                       </Button>
                     </div>
-                  </div>
+                  </li>
                 ))}
-              </div>
+              </ul>
             )}
           </CardContent>
         </Card>
