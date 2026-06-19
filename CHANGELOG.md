@@ -8,7 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
--
+- **Opt-in MariaDB external services**: Temps can now create standalone
+  MariaDB services for hosted projects without changing its internal Postgres
+  dependency. The new `mariadb` service type uses the official `mariadb:lts`
+  container image, generates separate application and root passwords, provisions
+  per-project/per-environment databases, and exposes both `MYSQL_*` and
+  `MARIADB_*` runtime environment variables plus `DATABASE_URL`. Query explorer,
+  existing-container import, and backup/restore support remain intentionally
+  separate follow-up items.
 
 ### Changed
 -

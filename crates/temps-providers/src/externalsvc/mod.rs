@@ -6,6 +6,7 @@ use utoipa::ToSchema;
 
 pub mod cluster_role;
 pub mod exec_util;
+pub mod mariadb;
 pub mod mongodb;
 pub mod postgres;
 pub mod postgres_cluster;
@@ -33,6 +34,7 @@ pub(crate) static DEPLOYMENT_MODE_MUTEX: std::sync::Mutex<()> = std::sync::Mutex
 
 // Re-export services for easier access
 pub use cluster_role::{ClusterRole, PgAutoFailoverState};
+pub use mariadb::MariaDbService;
 pub use mongodb::MongodbService;
 pub use postgres::PostgresService;
 pub use postgres_cluster::PostgresClusterService;
@@ -521,6 +523,7 @@ pub struct NewServiceRestoreResult {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ServiceType {
+    Mariadb,
     Mongodb,
     Postgres,
     Redis,
@@ -543,6 +546,7 @@ impl std::fmt::Display for ServiceType {
     #[allow(deprecated)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ServiceType::Mariadb => write!(f, "mariadb"),
             ServiceType::Mongodb => write!(f, "mongodb"),
             ServiceType::Postgres => write!(f, "postgres"),
             ServiceType::Redis => write!(f, "redis"),
@@ -560,6 +564,7 @@ impl ServiceType {
     #[allow(deprecated)]
     pub fn from_str(s: &str) -> Result<Self> {
         match s.to_lowercase().as_str() {
+            "mariadb" => Ok(ServiceType::Mariadb),
             "mongodb" => Ok(ServiceType::Mongodb),
             "postgres" => Ok(ServiceType::Postgres),
             "redis" => Ok(ServiceType::Redis),
@@ -576,6 +581,7 @@ impl ServiceType {
     #[allow(deprecated)]
     pub fn get_all() -> Vec<ServiceType> {
         vec![
+            ServiceType::Mariadb,
             ServiceType::Mongodb,
             ServiceType::Postgres,
             ServiceType::Redis,

@@ -160,6 +160,11 @@ impl QueryService {
 
         // Create connection based on service type
         let connection: Arc<dyn DataSource> = match service.service_type {
+            crate::externalsvc::ServiceType::Mariadb => {
+                return Err(DataError::OperationNotSupported(
+                    "MariaDB query explorer is not implemented yet".to_string(),
+                ));
+            }
             crate::externalsvc::ServiceType::Postgres => {
                 // Deserialize parameters into typed PostgresInputConfig
                 let config: PostgresInputConfig =
@@ -583,6 +588,11 @@ impl QueryService {
 
         // Determine which database/identifier to connect to based on service type and path depth
         let database = match service.service_type {
+            crate::externalsvc::ServiceType::Mariadb => {
+                return Err(DataError::OperationNotSupported(
+                    "MariaDB query explorer is not implemented yet".to_string(),
+                ));
+            }
             crate::externalsvc::ServiceType::Postgres => {
                 if path.depth() == 0 {
                     // Root level - use configured database for connection

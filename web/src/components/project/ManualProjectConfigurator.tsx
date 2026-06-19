@@ -63,6 +63,11 @@ const SERVICE_TYPES = [
     description: 'Reliable Relational Database',
   },
   {
+    id: 'mariadb' as ServiceTypeRoute,
+    name: 'MariaDB',
+    description: 'MySQL-compatible Relational Database',
+  },
+  {
     id: 'redis' as ServiceTypeRoute,
     name: 'Redis',
     description: 'In-Memory Data Store',
