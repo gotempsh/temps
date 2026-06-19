@@ -26,7 +26,8 @@ DO $$
 BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'alarms' AND column_name = 'service_id'
+        WHERE table_schema = current_schema()
+          AND table_name = 'alarms' AND column_name = 'service_id'
     ) THEN
         ALTER TABLE alarms
             ADD COLUMN service_id INT REFERENCES external_services(id) ON DELETE SET NULL;
@@ -56,7 +57,8 @@ DO $$
 BEGIN
     IF EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'alarms' AND column_name = 'service_id'
+        WHERE table_schema = current_schema()
+          AND table_name = 'alarms' AND column_name = 'service_id'
     ) THEN
         ALTER TABLE alarms DROP COLUMN service_id;
     END IF;

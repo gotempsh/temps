@@ -29,6 +29,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   occurs while a valid certificate remains keeps serving it under the new
   `active_renewal_failed` status. Also fixed a latent bug where the
   challenge-failure path computed a status update but never persisted it.
+- **Idempotent column-add migrations now scope their existence checks to the
+  current schema.** The `IF NOT EXISTS` guards in the monitoring-settings,
+  `api_keys.service_id`, and `alarms.service_id` migrations queried
+  `information_schema.columns` without a `table_schema` filter. When several
+  schemas share one database (as in the parallel test harness), a column added
+  in one schema made the guard skip the `ALTER` in another, and the follow-up
+  `CREATE INDEX` then failed with `column "service_id" does not exist`. The
+  guards now filter on `table_schema = current_schema()`.
 
 
 ## [0.1.0-beta.34] - 2026-06-17

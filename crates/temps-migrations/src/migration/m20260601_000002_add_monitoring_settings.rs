@@ -29,7 +29,8 @@ BEGIN
     -- external_services: opt-in metrics scraping
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'external_services'
+        WHERE table_schema = current_schema()
+          AND table_name = 'external_services'
           AND column_name = 'metrics_enabled'
     ) THEN
         ALTER TABLE external_services
@@ -39,7 +40,8 @@ BEGIN
     -- deployments: opt-in OTLP / Prometheus scraping
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'deployments'
+        WHERE table_schema = current_schema()
+          AND table_name = 'deployments'
           AND column_name = 'metrics_enabled'
     ) THEN
         ALTER TABLE deployments
@@ -48,7 +50,8 @@ BEGIN
 
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'deployments'
+        WHERE table_schema = current_schema()
+          AND table_name = 'deployments'
           AND column_name = 'metrics_port'
     ) THEN
         ALTER TABLE deployments
@@ -57,7 +60,8 @@ BEGIN
 
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'deployments'
+        WHERE table_schema = current_schema()
+          AND table_name = 'deployments'
           AND column_name = 'metrics_path'
     ) THEN
         ALTER TABLE deployments
@@ -81,28 +85,32 @@ DO $$
 BEGIN
     IF EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'deployments' AND column_name = 'metrics_path'
+        WHERE table_schema = current_schema()
+          AND table_name = 'deployments' AND column_name = 'metrics_path'
     ) THEN
         ALTER TABLE deployments DROP COLUMN metrics_path;
     END IF;
 
     IF EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'deployments' AND column_name = 'metrics_port'
+        WHERE table_schema = current_schema()
+          AND table_name = 'deployments' AND column_name = 'metrics_port'
     ) THEN
         ALTER TABLE deployments DROP COLUMN metrics_port;
     END IF;
 
     IF EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'deployments' AND column_name = 'metrics_enabled'
+        WHERE table_schema = current_schema()
+          AND table_name = 'deployments' AND column_name = 'metrics_enabled'
     ) THEN
         ALTER TABLE deployments DROP COLUMN metrics_enabled;
     END IF;
 
     IF EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'external_services' AND column_name = 'metrics_enabled'
+        WHERE table_schema = current_schema()
+          AND table_name = 'external_services' AND column_name = 'metrics_enabled'
     ) THEN
         ALTER TABLE external_services DROP COLUMN metrics_enabled;
     END IF;
