@@ -28,7 +28,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   installs on 4 GiB and 8 GiB hosts.
 
 ### Fixed
--
+- **Laravel MariaDB docs use runtime service env vars**: the Laravel tutorial
+  now keeps `php artisan config:cache` out of the Docker build so Temps-injected
+  runtime variables are not baked incorrectly into the image, documents
+  `DATABASE_URL`/`MYSQL_*`/`MARIADB_*` fallbacks for MariaDB-backed Laravel
+  configs, and keeps `php artisan migrate --force` as a one-off release step
+  rather than a per-container start command.
 
 
 ## [0.1.0-beta.35] - 2026-06-19
