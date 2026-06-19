@@ -291,6 +291,13 @@ pub async fn check_explorer_support(
 
     // Check if service type supports querying
     let (supported, capabilities, filter_schema, hierarchy, reason) = match service.service_type {
+        crate::externalsvc::ServiceType::Mariadb => (
+            false,
+            vec![],
+            None,
+            vec![],
+            Some("MariaDB query explorer is not implemented yet".to_string()),
+        ),
         crate::externalsvc::ServiceType::Postgres => {
             // Get filter schema from QueryService
             let filter_schema = app_state

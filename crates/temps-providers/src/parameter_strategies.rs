@@ -34,7 +34,9 @@ fn is_valid_pg_identifier(s: &str) -> bool {
         return false;
     }
     let mut chars = s.chars();
-    let first = chars.next().expect("non-empty checked above");
+    let Some(first) = chars.next() else {
+        return false;
+    };
     if !first.is_ascii_alphabetic() && first != '_' {
         return false;
     }
@@ -102,6 +104,77 @@ fn validate_postgres_credentials(params: &HashMap<String, JsonValue>) -> Result<
         if !pw.is_empty() {
             is_valid_pg_password(pw).map_err(|reason| format!("invalid 'password': {}", reason))?;
         }
+    }
+    Ok(())
+}
+
+fn is_valid_mariadb_identifier(s: &str) -> bool {
+    if s.is_empty() || s.len() > 63 {
+        return false;
+    }
+    let mut chars = s.chars();
+    let first = chars.next().expect("non-empty checked above");
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn validate_mariadb_password(label: &str, s: &str) -> Result<(), String> {
+    if s.is_empty() {
+        return Ok(());
+    }
+    if s.len() < 8 {
+        return Err(format!("{} must be at least 8 characters", label));
+    }
+    if s.len() > 256 {
+        return Err(format!("{} too long (max 256 characters)", label));
+    }
+    for (i, c) in s.chars().enumerate() {
+        match c {
+            '\'' => {
+                return Err(format!(
+                    "{} contains a single quote at position {}",
+                    label, i
+                ))
+            }
+            '\\' => return Err(format!("{} contains a backslash at position {}", label, i)),
+            '\0' => return Err(format!("{} contains a null byte", label)),
+            '\n' | '\r' => return Err(format!("{} contains a newline", label)),
+            c if c.is_control() => {
+                return Err(format!(
+                    "{} contains control character (U+{:04X}) at position {}",
+                    label, c as u32, i
+                ))
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_mariadb_credentials(params: &HashMap<String, JsonValue>) -> Result<(), String> {
+    if let Some(JsonValue::String(user)) = params.get("username") {
+        if !user.is_empty() && !is_valid_mariadb_identifier(user) {
+            return Err(format!(
+                "invalid 'username' {:?}: must match ^[A-Za-z_][A-Za-z0-9_]{{0,62}}$",
+                user
+            ));
+        }
+    }
+    if let Some(JsonValue::String(db)) = params.get("database") {
+        if !db.is_empty() && !is_valid_mariadb_identifier(db) {
+            return Err(format!(
+                "invalid 'database' {:?}: must match ^[A-Za-z_][A-Za-z0-9_]{{0,62}}$",
+                db
+            ));
+        }
+    }
+    if let Some(JsonValue::String(pw)) = params.get("password") {
+        validate_mariadb_password("password", pw)?;
+    }
+    if let Some(JsonValue::String(pw)) = params.get("root_password") {
+        validate_mariadb_password("root_password", pw)?;
     }
     Ok(())
 }
@@ -265,6 +338,145 @@ impl ParameterStrategy for PostgresParameterStrategy {
 
     fn service_name(&self) -> &'static str {
         "PostgreSQL"
+    }
+}
+
+/// MariaDB parameter strategy
+pub struct MariaDbParameterStrategy;
+
+impl ParameterStrategy for MariaDbParameterStrategy {
+    fn validate_for_creation(&self, params: &HashMap<String, JsonValue>) -> Result<(), String> {
+        validate_mariadb_credentials(params)
+    }
+
+    fn auto_generate_missing(&self, params: &mut HashMap<String, JsonValue>) -> Result<(), String> {
+        if is_empty_value(params.get("host")) {
+            params.insert(
+                "host".to_string(),
+                JsonValue::String("localhost".to_string()),
+            );
+        }
+
+        if is_empty_value(params.get("database")) {
+            params.insert("database".to_string(), JsonValue::String("app".to_string()));
+        }
+
+        if is_empty_value(params.get("username")) {
+            params.insert("username".to_string(), JsonValue::String("app".to_string()));
+        }
+
+        if is_empty_value(params.get("port")) {
+            if let Some(port) = find_available_port(3306) {
+                params.insert("port".to_string(), JsonValue::String(port.to_string()));
+            }
+        }
+
+        if is_empty_value(params.get("docker_image")) {
+            params.insert(
+                "docker_image".to_string(),
+                JsonValue::String("mariadb:lts".to_string()),
+            );
+        }
+
+        if is_empty_value(params.get("password")) {
+            params.insert(
+                "password".to_string(),
+                JsonValue::String(generate_secure_password()),
+            );
+        }
+
+        if is_empty_value(params.get("root_password")) {
+            params.insert(
+                "root_password".to_string(),
+                JsonValue::String(generate_secure_password()),
+            );
+        }
+
+        Ok(())
+    }
+
+    fn validate_for_update(&self, updates: &HashMap<String, JsonValue>) -> Result<(), String> {
+        for key in updates.keys() {
+            if !self.updateable_keys().contains(&key.as_str()) {
+                return Err(format!(
+                    "Cannot update parameter '{}' for MariaDB. Read-only parameters: {}. Updateable parameters: {}",
+                    key,
+                    self.readonly_keys().join(", "),
+                    self.updateable_keys().join(", ")
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn updateable_keys(&self) -> Vec<&'static str> {
+        vec!["port", "docker_image"]
+    }
+
+    fn readonly_keys(&self) -> Vec<&'static str> {
+        vec!["host", "database", "username", "password", "root_password"]
+    }
+
+    fn merge_updates(
+        &self,
+        existing: &mut HashMap<String, JsonValue>,
+        updates: HashMap<String, JsonValue>,
+    ) -> Result<(), String> {
+        self.validate_for_update(&updates)?;
+
+        for (key, value) in updates {
+            existing.insert(key, value);
+        }
+        Ok(())
+    }
+
+    fn get_schema(&self) -> Option<JsonValue> {
+        Some(json!({
+            "type": "object",
+            "title": "MariaDB Parameters",
+            "properties": {
+                "database": {
+                    "type": "string",
+                    "description": "Initial database name (read-only after creation)",
+                    "default": "app"
+                },
+                "username": {
+                    "type": "string",
+                    "description": "Application database user (read-only after creation)",
+                    "default": "app"
+                },
+                "password": {
+                    "type": "string",
+                    "description": "Application user password (read-only after creation, auto-generated if not provided)",
+                    "example": "secure_password"
+                },
+                "root_password": {
+                    "type": "string",
+                    "description": "Root password used by Temps for provisioning (read-only after creation, auto-generated if not provided)",
+                    "example": "secure_root_password"
+                },
+                "host": {
+                    "type": "string",
+                    "description": "Host address (read-only after creation)",
+                    "default": "localhost"
+                },
+                "port": {
+                    "type": "integer",
+                    "description": "Port (updateable)",
+                    "default": 3306
+                },
+                "docker_image": {
+                    "type": "string",
+                    "description": "Docker image (updateable, e.g., mariadb:lts)",
+                    "default": "mariadb:lts"
+                }
+            },
+            "readonly": ["host", "database", "username", "password", "root_password"]
+        }))
+    }
+
+    fn service_name(&self) -> &'static str {
+        "MariaDB"
     }
 }
 
@@ -940,6 +1152,7 @@ impl ParameterStrategy for MongodbParameterStrategy {
 /// Helper: Get strategy for a service type
 pub fn get_strategy(service_type: &str) -> Option<Box<dyn ParameterStrategy>> {
     match service_type {
+        "mariadb" => Some(Box::new(MariaDbParameterStrategy)),
         "postgres" => Some(Box::new(PostgresParameterStrategy)),
         "redis" => Some(Box::new(RedisParameterStrategy)),
         // S3 now uses RustFS by default
@@ -1079,6 +1292,50 @@ mod tests {
 
         let result = strategy.validate_for_update(&updates);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_mariadb_generates_defaults() {
+        let strategy = MariaDbParameterStrategy;
+        let mut params = HashMap::new();
+
+        strategy
+            .validate_for_creation(&params)
+            .expect("empty MariaDB params should use defaults");
+        strategy
+            .auto_generate_missing(&mut params)
+            .expect("defaults should generate");
+
+        assert_eq!(
+            params.get("database"),
+            Some(&JsonValue::String("app".to_string()))
+        );
+        assert_eq!(
+            params.get("username"),
+            Some(&JsonValue::String("app".to_string()))
+        );
+        assert_eq!(
+            params.get("docker_image"),
+            Some(&JsonValue::String("mariadb:lts".to_string()))
+        );
+        assert!(params.get("password").and_then(|v| v.as_str()).is_some());
+        assert!(params
+            .get("root_password")
+            .and_then(|v| v.as_str())
+            .is_some());
+    }
+
+    #[test]
+    fn test_mariadb_rejects_readonly_update() {
+        let strategy = MariaDbParameterStrategy;
+        let mut updates = HashMap::new();
+        updates.insert(
+            "root_password".to_string(),
+            JsonValue::String("new-secure-password".to_string()),
+        );
+
+        let result = strategy.validate_for_update(&updates);
+        assert!(result.is_err());
     }
 
     #[test]

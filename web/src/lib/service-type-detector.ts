@@ -6,7 +6,8 @@ import { ServiceTypeRoute } from '@/api/client/types.gen'
  * - "postgres:18-alpine" → "postgres"
  * - "mongo:latest" → "mongodb"
  * - "redis:7" → "redis"
- * - "mysql:8" → "mysql"
+ * - "mariadb:lts" → "mariadb"
+ * - "mysql:8" → "mariadb"
  * - "rustfs/rustfs:1.0.0" → "rustfs"
  * - "minio/minio:latest" → "s3" (legacy)
  */
@@ -19,8 +20,8 @@ export function extractServiceTypeFromImage(image: string): ServiceTypeRoute | n
   const serviceTypeMap: Record<string, ServiceTypeRoute> = {
     postgres: 'postgres',
     postgresql: 'postgres',
-    mysql: 'mysql',
-    mariadb: 'mysql',
+    mysql: 'mariadb',
+    mariadb: 'mariadb',
     mongo: 'mongodb',
     mongodb: 'mongodb',
     redis: 'redis',

@@ -1,7 +1,8 @@
 use crate::externalsvc::{
-    mongodb::MongodbService, postgres::PostgresService, postgres_cluster::PostgresClusterService,
-    redis::RedisService, rustfs::RustfsService, s3::S3Service, AvailableContainer,
-    ClusterMemberSpec, ExternalService, HealthProbeStatus, ServiceConfig, ServiceType,
+    mariadb::MariaDbService, mongodb::MongodbService, postgres::PostgresService,
+    postgres_cluster::PostgresClusterService, redis::RedisService, rustfs::RustfsService,
+    s3::S3Service, AvailableContainer, ClusterMemberSpec, ExternalService, HealthProbeStatus,
+    ServiceConfig, ServiceType,
 };
 use crate::parameter_strategies;
 use crate::remote_service_client::{
@@ -823,6 +824,7 @@ impl ExternalServiceManager {
         service_type: ServiceType,
     ) -> Box<dyn ExternalService> {
         match service_type {
+            ServiceType::Mariadb => Box::new(MariaDbService::new(name, self.docker.clone())),
             ServiceType::Mongodb => Box::new(MongodbService::new(name, self.docker.clone())),
             ServiceType::Postgres => Box::new(PostgresService::new(name, self.docker.clone())),
             // Note: PostgresCluster is handled via create_cluster_service_instance, not here
@@ -908,6 +910,31 @@ impl ExternalServiceManager {
         parameters: &HashMap<String, String>,
     ) -> Result<RemoteServiceCreateParams, ExternalServiceError> {
         let (image, container_port, env, volume_path, command) = match service_type {
+            ServiceType::Mariadb => {
+                let image = parameters
+                    .get("docker_image")
+                    .cloned()
+                    .unwrap_or_else(|| "mariadb:lts".to_string());
+                let root_password = parameters.get("root_password").cloned().unwrap_or_default();
+                let password = parameters.get("password").cloned().unwrap_or_default();
+                let database = parameters
+                    .get("database")
+                    .cloned()
+                    .unwrap_or_else(|| "app".to_string());
+                let username = parameters
+                    .get("username")
+                    .cloned()
+                    .unwrap_or_else(|| "app".to_string());
+
+                let env = HashMap::from([
+                    ("MARIADB_ROOT_PASSWORD".to_string(), root_password),
+                    ("MARIADB_DATABASE".to_string(), database),
+                    ("MARIADB_USER".to_string(), username),
+                    ("MARIADB_PASSWORD".to_string(), password),
+                    ("MARIADB_AUTO_UPGRADE".to_string(), "1".to_string()),
+                ]);
+                (image, 3306u16, env, "/var/lib/mysql".to_string(), None)
+            }
             ServiceType::Postgres => {
                 let image = parameters
                     .get("docker_image")
@@ -6707,7 +6734,12 @@ echo "[restore] Pre-seed complete"
         matches!(
             key,
             // Only include truly inferred values
-            "port" | "connection_string" | "local_address" | "inferred_port" | "password"
+            "port"
+                | "connection_string"
+                | "local_address"
+                | "inferred_port"
+                | "password"
+                | "root_password"
         )
     }
 
@@ -8212,6 +8244,11 @@ echo "[restore] Pre-seed complete"
         // Get the appropriate service instance and call import
         #[allow(deprecated)]
         let service_config = match request.service_type {
+            ServiceType::Mariadb => {
+                return Err(anyhow::anyhow!(
+                    "MariaDB container import is not implemented yet; see https://github.com/bherila/temps/issues/3"
+                ));
+            }
             ServiceType::Postgres => {
                 let postgres = PostgresService::new(request.name.clone(), Arc::clone(&self.docker));
                 postgres
