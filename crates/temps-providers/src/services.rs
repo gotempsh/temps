@@ -1,8 +1,13 @@
 use crate::externalsvc::{
-    mariadb::MariaDbService, mongodb::MongodbService, postgres::PostgresService,
-    postgres_cluster::PostgresClusterService, redis::RedisService, rustfs::RustfsService,
-    s3::S3Service, AvailableContainer, ClusterMemberSpec, ExternalService, HealthProbeStatus,
-    ServiceConfig, ServiceType,
+    mariadb::{MariaDbService, MariaDbSizeProfile},
+    mongodb::MongodbService,
+    postgres::PostgresService,
+    postgres_cluster::PostgresClusterService,
+    redis::RedisService,
+    rustfs::RustfsService,
+    s3::S3Service,
+    AvailableContainer, ClusterMemberSpec, ExternalService, HealthProbeStatus, ServiceConfig,
+    ServiceType,
 };
 use crate::parameter_strategies;
 use crate::remote_service_client::{
@@ -896,6 +901,10 @@ impl ExternalServiceManager {
                     .get("docker_image")
                     .cloned()
                     .unwrap_or_else(|| "mariadb:lts".to_string());
+                let size_profile = parameters
+                    .get("size_profile")
+                    .and_then(|value| MariaDbSizeProfile::parse(value))
+                    .unwrap_or_default();
                 let root_password = parameters.get("root_password").cloned().unwrap_or_default();
                 let password = parameters.get("password").cloned().unwrap_or_default();
                 let database = parameters
@@ -914,7 +923,13 @@ impl ExternalServiceManager {
                     ("MARIADB_PASSWORD".to_string(), password),
                     ("MARIADB_AUTO_UPGRADE".to_string(), "1".to_string()),
                 ]);
-                (image, 3306u16, env, "/var/lib/mysql".to_string(), None)
+                (
+                    image,
+                    3306u16,
+                    env,
+                    "/var/lib/mysql".to_string(),
+                    Some(size_profile.server_args()),
+                )
             }
             ServiceType::Postgres => {
                 let image = parameters
@@ -1077,30 +1092,10 @@ impl ExternalServiceManager {
         let container_name_for_volume = format!("{}-{}", service_type, service_name);
         let volume_name = format!("{}_data", container_name_for_volume);
 
-        // Resource limits, when provided, are stored as flat string keys in
-        // `parameters` (set alongside `memory_mb=512`, `nano_cpus=1000000000`,
-        // etc.) so they survive the `HashMap<String, String>` round-trip
-        // used by the cluster manager. Missing keys → unlimited.
-        let resource_limits = {
-            let parse_i64 = |key: &str| -> Option<i64> {
-                parameters
-                    .get(key)
-                    .and_then(|s| s.trim().parse::<i64>().ok())
-                    .filter(|&n| n > 0)
-            };
-            let limits = crate::externalsvc::ServiceResourceLimits {
-                memory_mb: parse_i64("memory_mb"),
-                memory_swap_mb: parse_i64("memory_swap_mb"),
-                nano_cpus: parse_i64("nano_cpus"),
-                cpu_shares: parse_i64("cpu_shares"),
-                shm_size_mb: parse_i64("shm_size_mb"),
-            };
-            if limits.is_unlimited() {
-                None
-            } else {
-                Some(limits)
-            }
-        };
+        // Resource limits may arrive as the modern nested `resources` block or
+        // as legacy flat string keys (`memory_mb=512`, `nano_cpus=1000000000`,
+        // etc.). Missing limits mean unlimited.
+        let resource_limits = Self::remote_resource_limits_from_parameters(parameters);
 
         Ok(RemoteServiceCreateParams {
             name: container_name,
@@ -1116,6 +1111,39 @@ impl ExternalServiceManager {
             command,
             resource_limits,
         })
+    }
+
+    fn remote_resource_limits_from_parameters(
+        parameters: &HashMap<String, String>,
+    ) -> Option<crate::externalsvc::ServiceResourceLimits> {
+        if let Some(resources) = parameters.get("resources") {
+            if let Ok(limits) =
+                serde_json::from_str::<crate::externalsvc::ServiceResourceLimits>(resources)
+            {
+                if !limits.is_unlimited() {
+                    return Some(limits);
+                }
+            }
+        }
+
+        let parse_i64 = |key: &str| -> Option<i64> {
+            parameters
+                .get(key)
+                .and_then(|s| s.trim().parse::<i64>().ok())
+                .filter(|&n| n > 0)
+        };
+        let limits = crate::externalsvc::ServiceResourceLimits {
+            memory_mb: parse_i64("memory_mb"),
+            memory_swap_mb: parse_i64("memory_swap_mb"),
+            nano_cpus: parse_i64("nano_cpus"),
+            cpu_shares: parse_i64("cpu_shares"),
+            shm_size_mb: parse_i64("shm_size_mb"),
+        };
+        if limits.is_unlimited() {
+            None
+        } else {
+            Some(limits)
+        }
     }
 
     /// Get the container name for a service (used for remote operations).

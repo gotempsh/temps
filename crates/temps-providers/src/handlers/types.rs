@@ -319,7 +319,7 @@ impl ProviderMetadata {
             Self {
                 service_type: ServiceTypeRoute::Mariadb,
                 display_name: "MariaDB".to_string(),
-                description: "MariaDB relational database".to_string(),
+                description: "Shared MariaDB server with per-project databases".to_string(),
                 icon_url: "https://cdn.simpleicons.org/mariadb/003545".to_string(),
                 color: "#003545".to_string(),
             },

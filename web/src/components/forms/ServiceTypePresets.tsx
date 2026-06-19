@@ -219,7 +219,7 @@ function useMariDbPreset(): PresetState {
     ui: (
       <PresetGroup
         label="MariaDB version"
-        description="Use the official MariaDB LTS image, or provide another MariaDB-compatible image."
+        description="Create a shared MariaDB server. Linked projects get separate databases inside it; use the size profile below to tune the container for the host."
         options={MARIADB_OPTIONS}
         selected={selected}
         customValue={custom}

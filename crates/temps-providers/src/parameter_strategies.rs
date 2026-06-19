@@ -1,3 +1,4 @@
+use crate::externalsvc::{mariadb::MariaDbSizeProfile, ServiceResourceLimits};
 use serde_json::{json, Value as JsonValue};
 use std::collections::HashMap;
 
@@ -179,6 +180,39 @@ fn validate_mariadb_credentials(params: &HashMap<String, JsonValue>) -> Result<(
     Ok(())
 }
 
+fn mariadb_size_profile_from_params(
+    params: &HashMap<String, JsonValue>,
+) -> Result<MariaDbSizeProfile, String> {
+    match params.get("size_profile") {
+        value if is_empty_value(value) => Ok(MariaDbSizeProfile::Small),
+        Some(JsonValue::String(profile)) => MariaDbSizeProfile::parse(profile).ok_or_else(|| {
+            format!(
+                "invalid 'size_profile' {:?}: expected one of small, standard, dedicated",
+                profile
+            )
+        }),
+        Some(other) => Err(format!(
+            "invalid 'size_profile' {:?}: expected a string",
+            other
+        )),
+        None => Ok(MariaDbSizeProfile::Small),
+    }
+}
+
+fn validate_service_resource_limits(params: &HashMap<String, JsonValue>) -> Result<(), String> {
+    let Some(resources) = params.get("resources") else {
+        return Ok(());
+    };
+    if resources.is_null() {
+        return Ok(());
+    }
+    let limits: ServiceResourceLimits = serde_json::from_value(resources.clone())
+        .map_err(|e| format!("invalid 'resources' block: {}", e))?;
+    limits
+        .validate()
+        .map_err(|e| format!("invalid 'resources' block: {}", e))
+}
+
 /// Strategy for validating and managing parameters for a specific service type
 pub trait ParameterStrategy: Send + Sync {
     /// Validate parameters for service creation - ensures all required parameters are present
@@ -346,7 +380,10 @@ pub struct MariaDbParameterStrategy;
 
 impl ParameterStrategy for MariaDbParameterStrategy {
     fn validate_for_creation(&self, params: &HashMap<String, JsonValue>) -> Result<(), String> {
-        validate_mariadb_credentials(params)
+        validate_mariadb_credentials(params)?;
+        mariadb_size_profile_from_params(params)?;
+        validate_service_resource_limits(params)?;
+        Ok(())
     }
 
     fn auto_generate_missing(&self, params: &mut HashMap<String, JsonValue>) -> Result<(), String> {
@@ -376,6 +413,20 @@ impl ParameterStrategy for MariaDbParameterStrategy {
                 "docker_image".to_string(),
                 JsonValue::String("mariadb:lts".to_string()),
             );
+        }
+
+        let size_profile = mariadb_size_profile_from_params(params)?;
+        if is_empty_value(params.get("size_profile")) {
+            params.insert(
+                "size_profile".to_string(),
+                JsonValue::String(size_profile.as_str().to_string()),
+            );
+        }
+
+        if is_empty_value(params.get("resources")) {
+            let resources = serde_json::to_value(size_profile.default_resource_limits())
+                .map_err(|e| format!("failed to serialize MariaDB default resources: {}", e))?;
+            params.insert("resources".to_string(), resources);
         }
 
         if is_empty_value(params.get("password")) {
@@ -414,7 +465,15 @@ impl ParameterStrategy for MariaDbParameterStrategy {
     }
 
     fn readonly_keys(&self) -> Vec<&'static str> {
-        vec!["host", "database", "username", "password", "root_password"]
+        vec![
+            "host",
+            "database",
+            "username",
+            "password",
+            "root_password",
+            "size_profile",
+            "resources",
+        ]
     }
 
     fn merge_updates(
@@ -469,9 +528,15 @@ impl ParameterStrategy for MariaDbParameterStrategy {
                     "type": "string",
                     "description": "Docker image (updateable, e.g., mariadb:lts)",
                     "default": "mariadb:lts"
+                },
+                "size_profile": {
+                    "type": "string",
+                    "description": "Managed MariaDB resource/tuning profile. A MariaDB service is shared; linked projects get separate databases inside it.",
+                    "default": "small",
+                    "enum": ["small", "standard", "dedicated"]
                 }
             },
-            "readonly": ["host", "database", "username", "password", "root_password"]
+            "readonly": ["host", "database", "username", "password", "root_password", "size_profile", "resources"]
         }))
     }
 
@@ -1323,6 +1388,20 @@ mod tests {
             params.get("docker_image"),
             Some(&JsonValue::String("mariadb:lts".to_string()))
         );
+        assert_eq!(
+            params.get("size_profile"),
+            Some(&JsonValue::String("small".to_string()))
+        );
+        let resources: ServiceResourceLimits = serde_json::from_value(
+            params
+                .get("resources")
+                .expect("MariaDB defaults should include resource limits")
+                .clone(),
+        )
+        .expect("default MariaDB resources should deserialize");
+        assert_eq!(resources.memory_mb, Some(512));
+        assert_eq!(resources.memory_swap_mb, Some(768));
+        assert_eq!(resources.nano_cpus, Some(750_000_000));
         assert!(params.get("password").and_then(|v| v.as_str()).is_some());
         assert!(params
             .get("root_password")
@@ -1340,6 +1419,19 @@ mod tests {
         );
 
         let result = strategy.validate_for_update(&updates);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_mariadb_rejects_invalid_size_profile() {
+        let strategy = MariaDbParameterStrategy;
+        let mut params = HashMap::new();
+        params.insert(
+            "size_profile".to_string(),
+            JsonValue::String("oversized".to_string()),
+        );
+
+        let result = strategy.validate_for_creation(&params);
         assert!(result.is_err());
     }
 

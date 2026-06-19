@@ -65,7 +65,7 @@ const SERVICE_TYPES = [
   {
     id: 'mariadb' as ServiceTypeRoute,
     name: 'MariaDB',
-    description: 'MySQL-compatible Relational Database',
+    description: 'Shared MySQL-compatible Database',
   },
   {
     id: 'redis' as ServiceTypeRoute,
