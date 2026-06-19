@@ -7,7 +7,7 @@ use crate::externalsvc::{
     rustfs::RustfsService,
     s3::S3Service,
     AvailableContainer, ClusterMemberSpec, ExternalService, HealthProbeStatus,
-    ManagedS3BackendSelection, ServiceConfig, ServiceType,
+    ManagedS3BackendKind, ManagedS3BackendSelection, ServiceConfig, ServiceType,
 };
 use crate::parameter_strategies;
 use crate::remote_service_client::{
@@ -790,17 +790,19 @@ impl ExternalServiceManager {
     ) -> Result<String, ExternalServiceError> {
         // Get service parameters
         let service_config = self.get_service_config(service.id).await?;
+        let service_type = ServiceType::from_str(&service.service_type).map_err(|_| {
+            ExternalServiceError::InvalidServiceType {
+                id: service.id,
+                service_type: service.service_type.clone(),
+            }
+        })?;
 
         // Create service instance
-        let service_instance = self.create_service_instance(
+        let service_instance = self.create_service_instance_for_parameter_value(
             service.name.clone(),
-            ServiceType::from_str(&service.service_type).map_err(|_| {
-                ExternalServiceError::InvalidServiceType {
-                    id: service.id,
-                    service_type: service.service_type.clone(),
-                }
-            })?,
-        );
+            service_type,
+            &service_config.parameters,
+        )?;
 
         // Get local address from service instance
         let address = service_instance
@@ -866,6 +868,63 @@ impl ExternalServiceManager {
         }
     }
 
+    #[allow(deprecated)]
+    fn create_service_instance_for_parameters(
+        &self,
+        name: String,
+        service_type: ServiceType,
+        parameters: &HashMap<String, serde_json::Value>,
+    ) -> Result<Box<dyn ExternalService>, ExternalServiceError> {
+        let parameter_value =
+            serde_json::to_value(parameters).map_err(|e| ExternalServiceError::InternalError {
+                reason: format!("Failed to inspect managed S3 backend parameters: {}", e),
+            })?;
+        self.create_service_instance_for_parameter_value(name, service_type, &parameter_value)
+    }
+
+    #[allow(deprecated)]
+    fn create_service_instance_for_parameter_value(
+        &self,
+        name: String,
+        service_type: ServiceType,
+        parameters: &serde_json::Value,
+    ) -> Result<Box<dyn ExternalService>, ExternalServiceError> {
+        if !matches!(service_type, ServiceType::S3 | ServiceType::Blob) {
+            return Ok(self.create_service_instance(name, service_type));
+        }
+
+        let backend_selection =
+            ManagedS3BackendSelection::from_parameters(parameters).map_err(|e| {
+                ExternalServiceError::ParameterValidationFailed {
+                    service_id: 0,
+                    reason: e.to_string(),
+                }
+            })?;
+        backend_selection
+            .validate_for_service_create()
+            .map_err(|e| ExternalServiceError::ParameterValidationFailed {
+                service_id: 0,
+                reason: e.to_string(),
+            })?;
+
+        match backend_selection.backend {
+            ManagedS3BackendKind::Rustfs => Ok(self.create_service_instance(name, service_type)),
+            ManagedS3BackendKind::Minio if service_type == ServiceType::S3 => {
+                Ok(Box::new(S3Service::new(
+                    name,
+                    self.docker.clone(),
+                    self.encryption_service.clone(),
+                )))
+            }
+            ManagedS3BackendKind::Minio => Err(ExternalServiceError::ParameterValidationFailed {
+                service_id: 0,
+                reason: "managed S3 backend 'minio' is only supported for S3 services; use the default 'rustfs' backend for Blob services"
+                    .to_string(),
+            }),
+            ManagedS3BackendKind::Garage => unreachable!("Garage is rejected by validation"),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Remote-node helpers
     // -----------------------------------------------------------------------
@@ -914,7 +973,24 @@ impl ExternalServiceManager {
         service_type: &ServiceType,
         parameters: &HashMap<String, String>,
     ) -> Result<RemoteServiceCreateParams, ExternalServiceError> {
-        let (image, container_port, env, volume_path, command) = match service_type {
+        #[allow(deprecated)]
+        let backend_service_type = match (
+            *service_type,
+            parameters
+                .get("backend")
+                .map(|backend| backend.trim().to_ascii_lowercase()),
+        ) {
+            (ServiceType::S3, Some(backend)) if backend == "minio" => ServiceType::Minio,
+            (ServiceType::Blob, Some(backend)) if backend == "minio" => {
+                return Err(ExternalServiceError::ParameterValidationFailed {
+                    service_id: 0,
+                    reason: "managed S3 backend 'minio' is only supported for S3 services; use the default 'rustfs' backend for Blob services".to_string(),
+                });
+            }
+            _ => *service_type,
+        };
+
+        let (image, container_port, env, volume_path, command) = match backend_service_type {
             ServiceType::Mariadb => {
                 let image = parameters
                     .get("docker_image")
@@ -1106,9 +1182,9 @@ impl ExternalServiceManager {
             .unwrap_or(container_port);
 
         let container_name = self
-            .create_service_instance(service_name.to_string(), *service_type)
+            .create_service_instance(service_name.to_string(), backend_service_type)
             .get_name();
-        let container_name_for_volume = format!("{}-{}", service_type, service_name);
+        let container_name_for_volume = format!("{}-{}", backend_service_type, service_name);
         let volume_name = format!("{}_data", container_name_for_volume);
 
         // Resource limits may arrive as the modern nested `resources` block or
@@ -1210,11 +1286,54 @@ impl ExternalServiceManager {
         info!("Creating new external service");
         let service_slug = Self::generate_slug(&request.name);
 
-        // Get the parameter strategy for this service type
-        let strategy = parameter_strategies::get_strategy(&request.service_type.to_string())
+        let backend_selection =
+            if matches!(request.service_type, ServiceType::S3 | ServiceType::Blob) {
+                let parameter_value = serde_json::to_value(&request.parameters).map_err(|e| {
+                    ExternalServiceError::InternalError {
+                        reason: format!("Failed to inspect managed S3 backend parameters: {}", e),
+                    }
+                })?;
+                let backend_selection =
+                    ManagedS3BackendSelection::from_parameters(&parameter_value).map_err(|e| {
+                        ExternalServiceError::ParameterValidationFailed {
+                            service_id: 0,
+                            reason: e.to_string(),
+                        }
+                    })?;
+                backend_selection
+                    .validate_for_service_create()
+                    .map_err(|e| ExternalServiceError::ParameterValidationFailed {
+                        service_id: 0,
+                        reason: e.to_string(),
+                    })?;
+                Some(backend_selection)
+            } else {
+                None
+            };
+
+        #[allow(deprecated)]
+        let strategy_service_type = match backend_selection
+            .as_ref()
+            .map(|selection| selection.backend)
+        {
+            Some(ManagedS3BackendKind::Minio) if request.service_type == ServiceType::S3 => {
+                ServiceType::Minio
+            }
+            Some(ManagedS3BackendKind::Minio) => {
+                return Err(ExternalServiceError::ParameterValidationFailed {
+                    service_id: 0,
+                    reason: "managed S3 backend 'minio' is only supported for S3 services; use the default 'rustfs' backend for Blob services".to_string(),
+                });
+            }
+            _ => request.service_type,
+        };
+
+        // Get the parameter strategy for the selected backend defaults. The
+        // stored service type remains the requested S3-compatible type.
+        let strategy = parameter_strategies::get_strategy(&strategy_service_type.to_string())
             .ok_or(ExternalServiceError::InvalidServiceType {
                 id: 0,
-                service_type: request.service_type.to_string(),
+                service_type: strategy_service_type.to_string(),
             })?;
 
         // Validate required parameters
@@ -1224,25 +1343,6 @@ impl ExternalServiceManager {
                 service_id: 0,
                 reason,
             })?;
-
-        if matches!(request.service_type, ServiceType::S3 | ServiceType::Blob) {
-            let parameter_value = serde_json::to_value(&request.parameters).map_err(|e| {
-                ExternalServiceError::InternalError {
-                    reason: format!("Failed to inspect managed S3 backend parameters: {}", e),
-                }
-            })?;
-            let backend_selection = ManagedS3BackendSelection::from_parameters(&parameter_value)
-                .map_err(|e| ExternalServiceError::ParameterValidationFailed {
-                    service_id: 0,
-                    reason: e.to_string(),
-                })?;
-            backend_selection
-                .validate_for_service_create()
-                .map_err(|e| ExternalServiceError::ParameterValidationFailed {
-                    service_id: 0,
-                    reason: e.to_string(),
-                })?;
-        }
 
         // Auto-generate missing optional parameters
         let mut parameters = request.parameters.clone();
@@ -1413,7 +1513,6 @@ impl ExternalServiceManager {
             }
         })?;
 
-        let _service_instance = self.create_service_instance(service.name.clone(), service_type);
         let parameters = self.get_service_parameters(service_id).await?;
 
         let config = ServiceConfig {
@@ -1484,7 +1583,11 @@ impl ExternalServiceManager {
             }
         })?;
         let config = self.get_service_config(service_id).await?;
-        let instance = self.create_service_instance(service.name.clone(), service_type);
+        let instance = self.create_service_instance_for_parameter_value(
+            service.name.clone(),
+            service_type,
+            &config.parameters,
+        )?;
         instance
             .apply_ingest_key(config)
             .await
@@ -1545,8 +1648,11 @@ impl ExternalServiceManager {
                 }
             })?;
 
-        let service_instance =
-            self.create_service_instance(service_info.name.clone(), service_type);
+        let service_instance = self.create_service_instance_for_parameters(
+            service_info.name.clone(),
+            service_type,
+            &parameters,
+        )?;
 
         Ok(ExternalServiceDetails {
             service: service_info,
@@ -1616,8 +1722,11 @@ impl ExternalServiceManager {
                 service_type: service.service_type.clone(),
             }
         })?;
-        let service_instance =
-            self.create_service_instance(service.name.clone(), service_type_enum);
+        let service_instance = self.create_service_instance_for_parameter_value(
+            service.name.clone(),
+            service_type_enum,
+            &new_config.parameters,
+        )?;
 
         // Call the upgrade method on the service instance. `upgrade()`
         // returns `anyhow::Result` (shared across every provider), so a
@@ -1950,10 +2059,16 @@ impl ExternalServiceManager {
         } else {
             // Standalone: remove single container
             info!("Removing service {} container", service_id);
+            let parameters = self.get_service_parameters(service_id).await?;
             if let Some(node_id) = service.node_id {
                 let client = self.get_remote_client(node_id).await?;
-                let container_name =
-                    self.get_container_name_for_service(&service.name, &service_type_enum);
+                let container_name = self
+                    .create_service_instance_for_parameters(
+                        service.name.clone(),
+                        service_type_enum,
+                        &parameters,
+                    )?
+                    .get_name();
                 client.remove_service(&container_name).await.map_err(|e| {
                     ExternalServiceError::DeletionFailed {
                         id: service_id,
@@ -1961,8 +2076,11 @@ impl ExternalServiceManager {
                     }
                 })?;
             } else {
-                let service_instance =
-                    self.create_service_instance(service.name.clone(), service_type_enum);
+                let service_instance = self.create_service_instance_for_parameters(
+                    service.name.clone(),
+                    service_type_enum,
+                    &parameters,
+                )?;
                 service_instance.remove().await.map_err(|e| {
                     ExternalServiceError::DeletionFailed {
                         id: service_id,
@@ -4086,8 +4204,11 @@ echo "[restore] Pre-seed complete"
         }
 
         // Local node — use existing Docker-based service logic
-        let service_instance =
-            self.create_service_instance(service.name.clone(), service_type_enum);
+        let service_instance = self.create_service_instance_for_parameters(
+            service.name.clone(),
+            service_type_enum,
+            &parameters,
+        )?;
 
         let config = ServiceConfig {
             name: service.name.clone(),
@@ -6907,12 +7028,18 @@ echo "[restore] Pre-seed complete"
                 service_type: service.service_type.clone(),
             }
         })?;
+        let parameters = self.get_service_parameters(service_id).await?;
 
         // Remote node — delegate to agent
         if let Some(node_id) = service.node_id {
             let client = self.get_remote_client(node_id).await?;
-            let container_name =
-                self.get_container_name_for_service(&service.name, &service_type_enum);
+            let container_name = self
+                .create_service_instance_for_parameters(
+                    service.name.clone(),
+                    service_type_enum,
+                    &parameters,
+                )?
+                .get_name();
 
             match client.start_service(&container_name).await {
                 Ok(()) => {}
@@ -6935,8 +7062,11 @@ echo "[restore] Pre-seed complete"
             }
         } else {
             // Local node
-            let service_instance =
-                self.create_service_instance(service.name.clone(), service_type_enum);
+            let service_instance = self.create_service_instance_for_parameters(
+                service.name.clone(),
+                service_type_enum,
+                &parameters,
+            )?;
 
             match service_instance.start().await {
                 Ok(()) => {}
@@ -7039,12 +7169,18 @@ echo "[restore] Pre-seed complete"
                 service_type: service.service_type.clone(),
             }
         })?;
+        let parameters = self.get_service_parameters(service_id).await?;
 
         // Remote node — delegate to agent
         if let Some(node_id) = service.node_id {
             let client = self.get_remote_client(node_id).await?;
-            let container_name =
-                self.get_container_name_for_service(&service.name, &service_type_enum);
+            let container_name = self
+                .create_service_instance_for_parameters(
+                    service.name.clone(),
+                    service_type_enum,
+                    &parameters,
+                )?
+                .get_name();
 
             client.stop_service(&container_name).await.map_err(|e| {
                 ExternalServiceError::StopFailed {
@@ -7054,8 +7190,11 @@ echo "[restore] Pre-seed complete"
             })?;
         } else {
             // Local node
-            let service_instance =
-                self.create_service_instance(service.name.clone(), service_type_enum);
+            let service_instance = self.create_service_instance_for_parameters(
+                service.name.clone(),
+                service_type_enum,
+                &parameters,
+            )?;
 
             if service_type_enum == ServiceType::Mariadb {
                 let parameters = self.get_service_parameters(service_id).await?;
@@ -7183,7 +7322,11 @@ echo "[restore] Pre-seed complete"
             return Ok(cluster_vars);
         }
 
-        let service_instance = self.create_service_instance(service.name.clone(), service_type);
+        let service_instance = self.create_service_instance_for_parameters(
+            service.name.clone(),
+            service_type,
+            &parameters,
+        )?;
 
         // Convert parameters to strings for the service
         let params_str = Self::params_to_strings(&parameters);
@@ -7267,7 +7410,11 @@ echo "[restore] Pre-seed complete"
         }
 
         // Standalone: delegate to the service instance's get_runtime_env_vars
-        let service_instance = self.create_service_instance(service.name.clone(), service_type);
+        let service_instance = self.create_service_instance_for_parameters(
+            service.name.clone(),
+            service_type,
+            &parameters,
+        )?;
         let service_config = ServiceConfig {
             name: service.name.clone(),
             service_type,
@@ -7318,8 +7465,12 @@ echo "[restore] Pre-seed complete"
             }
         })?;
 
-        let service_instance = self.create_service_instance(service.name.clone(), service_type);
         let parameters = self.get_service_parameters(service_id).await?;
+        let service_instance = self.create_service_instance_for_parameters(
+            service.name.clone(),
+            service_type,
+            &parameters,
+        )?;
         let service_config = ServiceConfig {
             name: service.name.clone(),
             service_type,
@@ -7466,7 +7617,11 @@ echo "[restore] Pre-seed complete"
             return Ok(cluster_vars);
         }
 
-        let service_instance = self.create_service_instance(service.name.clone(), service_type);
+        let service_instance = self.create_service_instance_for_parameters(
+            service.name.clone(),
+            service_type,
+            &parameters,
+        )?;
 
         // Convert parameters to strings for the service
         let params_str = Self::params_to_strings(&parameters);
@@ -7689,7 +7844,11 @@ echo "[restore] Pre-seed complete"
             });
         }
 
-        let service_instance = self.create_service_instance(service.name.clone(), service_type);
+        let service_instance = self.create_service_instance_for_parameters(
+            service.name.clone(),
+            service_type,
+            &parameters,
+        )?;
         // Convert parameters to strings for the service
         let params_str = Self::params_to_strings(&parameters);
 
@@ -7852,7 +8011,11 @@ echo "[restore] Pre-seed complete"
             return Ok(cluster_vars);
         }
 
-        let service_instance = self.create_service_instance(service.name.clone(), service_type);
+        let service_instance = self.create_service_instance_for_parameters(
+            service.name.clone(),
+            service_type,
+            &parameters,
+        )?;
         let service_config = ServiceConfig {
             name: service.name.clone(),
             service_type,
@@ -7896,8 +8059,11 @@ echo "[restore] Pre-seed complete"
         let parameters = self.get_service_parameters(service.id).await?;
         let service_type = ServiceType::from_str(&service_info.service_type.to_string())?;
 
-        let service_instance =
-            self.create_service_instance(service_info.name.clone(), service_type);
+        let service_instance = self.create_service_instance_for_parameters(
+            service_info.name.clone(),
+            service_type,
+            &parameters,
+        )?;
 
         Ok(ExternalServiceDetails {
             service: service_info,
@@ -7933,7 +8099,11 @@ echo "[restore] Pre-seed complete"
 
         let parameters = self.get_service_parameters(service_id).await?;
         let params_str = Self::params_to_strings(&parameters);
-        let service_instance = self.create_service_instance(service.name.clone(), service_type);
+        let service_instance = self.create_service_instance_for_parameters(
+            service.name.clone(),
+            service_type,
+            &parameters,
+        )?;
 
         let mut all_vars = HashMap::new();
 
@@ -8101,7 +8271,11 @@ echo "[restore] Pre-seed complete"
             return Ok(cluster_vars.keys().cloned().collect());
         }
 
-        let service_instance = self.create_service_instance(service.name.clone(), service_type);
+        let service_instance = self.create_service_instance_for_parameters(
+            service.name.clone(),
+            service_type,
+            &parameters,
+        )?;
 
         // Convert parameters to strings for the service
         let params_str = Self::params_to_strings(&parameters);
@@ -8130,19 +8304,22 @@ echo "[restore] Pre-seed complete"
         let parameters = self.get_service_parameters(service_id_val).await?;
 
         // Cluster services: use multi-host env vars from service_members
-        let env_vars = if let Some(cluster_vars) =
-            self.build_cluster_env_vars(&service, &parameters).await?
-        {
-            cluster_vars
-        } else {
-            let service_instance = self.create_service_instance(service.name.clone(), service_type);
-            let params_str = Self::params_to_strings(&parameters);
-            service_instance
-                .get_environment_variables(&params_str)
-                .map_err(|e| ExternalServiceError::InternalError {
-                    reason: format!("Failed to get environment variables: {}", e),
-                })?
-        };
+        let env_vars =
+            if let Some(cluster_vars) = self.build_cluster_env_vars(&service, &parameters).await? {
+                cluster_vars
+            } else {
+                let service_instance = self.create_service_instance_for_parameters(
+                    service.name.clone(),
+                    service_type,
+                    &parameters,
+                )?;
+                let params_str = Self::params_to_strings(&parameters);
+                service_instance
+                    .get_environment_variables(&params_str)
+                    .map_err(|e| ExternalServiceError::InternalError {
+                        reason: format!("Failed to get environment variables: {}", e),
+                    })?
+            };
 
         // Mask sensitive values based on variable names
         let masked_vars = env_vars
@@ -8544,7 +8721,12 @@ echo "[restore] Pre-seed complete"
                     service_type: service.service_type.clone(),
                 }
             })?;
-            let instance = self.create_service_instance(service.name.clone(), service_type);
+            let parameters = self.get_service_parameters(service.id).await?;
+            let instance = self.create_service_instance_for_parameters(
+                service.name.clone(),
+                service_type,
+                &parameters,
+            )?;
             Ok(vec![(
                 "standalone".to_string(),
                 instance.get_docker_container_name(),
@@ -8923,7 +9105,12 @@ echo "[restore] Pre-seed complete"
                 service_type: service.service_type.clone(),
             }
         })?;
-        let instance = self.create_service_instance(service.name.clone(), service_type);
+        let parameters = self.get_service_parameters(service.id).await?;
+        let instance = self.create_service_instance_for_parameters(
+            service.name.clone(),
+            service_type,
+            &parameters,
+        )?;
         let container_name = instance.get_docker_container_name();
 
         // Stop, then DELETE the container (volume preserved). Stop is

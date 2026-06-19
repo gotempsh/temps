@@ -30,7 +30,7 @@ Managed services are databases and storage systems that Temps provisions as Dock
 | **MariaDB** | `mariadb:lts` | MySQL-compatible relational database |
 | **Redis** | `gotempsh/redis-walg:8-bookworm` | Caching, sessions, pub/sub, and queues |
 | **MongoDB** | `gotempsh/mongodb-walg:8.0` | Document database |
-| **S3 Storage** | `rustfs/rustfs:1.0.0-alpha.78` | S3-compatible object storage (powered by RustFS) |
+| **S3 Storage** | `rustfs/rustfs:1.0.0-alpha.78` | S3-compatible object storage (`rustfs` by default; `garage` and `minio` optional) |
 
 Temps also provides higher-level abstractions built on these services:
 
@@ -115,10 +115,11 @@ curl -X POST "https://your-temps-instance/api/external-services" \
 | `username` | `admin` | No (read-only) |
 | `password` | Auto-generated | No (read-only) |
 
-**S3 / RustFS:**
+**S3-compatible storage:**
 
 | Parameter | Default | Editable after creation |
 |-----------|---------|----------------------|
+| `backend` | `rustfs` (`garage` or `minio` optional) | No (read-only) |
 | `port` | Auto-assigned from 9000 | Yes |
 | `console_port` | Auto-assigned from 9001 | Yes |
 | `docker_image` | `rustfs/rustfs:1.0.0-alpha.78` | Yes |

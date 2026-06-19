@@ -1,9 +1,9 @@
 //! Managed S3-compatible backend protocol.
 //!
-//! This module intentionally defines Garage support as an out-of-process
-//! provider contract rather than a compiled `garage` implementation. Temps can
-//! stay permissively licensed while provider binaries manage AGPL services over
-//! standard process/API boundaries (S3, Garage admin HTTP/CLI, Docker, etc.).
+//! This module defines the backend selector for managed S3-compatible services.
+//! RustFS is the default local backend, Garage is modeled as an
+//! out-of-process provider contract, and MinIO is available as another
+//! S3-compatible backend selector.
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -20,6 +20,7 @@ pub const DEFAULT_MANAGED_S3_BACKEND: ManagedS3BackendKind = ManagedS3BackendKin
 pub enum ManagedS3BackendKind {
     Rustfs,
     Garage,
+    Minio,
 }
 
 impl ManagedS3BackendKind {
@@ -27,8 +28,9 @@ impl ManagedS3BackendKind {
         match value.to_ascii_lowercase().as_str() {
             "" | "rustfs" => Ok(Self::Rustfs),
             "garage" => Ok(Self::Garage),
+            "minio" => Ok(Self::Minio),
             other => Err(anyhow!(
-                "unsupported managed S3 backend '{}'; supported backends are rustfs and garage",
+                "unsupported managed S3 backend '{}'; supported backends are rustfs, garage, and minio",
                 other
             )),
         }
@@ -38,6 +40,7 @@ impl ManagedS3BackendKind {
         match self {
             Self::Rustfs => "rustfs",
             Self::Garage => "garage",
+            Self::Minio => "minio",
         }
     }
 
@@ -79,7 +82,7 @@ impl ManagedS3BackendSelection {
             Some(serde_json::Value::String(value)) => ManagedS3BackendKind::parse(value)?,
             Some(other) => {
                 return Err(anyhow!(
-                    "managed S3 backend must be a string (rustfs or garage), got {}",
+                    "managed S3 backend must be a string (rustfs, garage, or minio), got {}",
                     other
                 ))
             }
@@ -210,6 +213,16 @@ mod tests {
         .unwrap();
         assert_eq!(selection.backend, ManagedS3BackendKind::Garage);
         assert_eq!(selection.buckets, vec!["uploads", "private-files"]);
+    }
+
+    #[test]
+    fn parses_minio_backend() {
+        let selection = ManagedS3BackendSelection::from_parameters(&serde_json::json!({
+            "backend": "minio"
+        }))
+        .unwrap();
+        assert_eq!(selection.backend, ManagedS3BackendKind::Minio);
+        assert!(selection.validate_for_service_create().is_ok());
     }
 
     #[test]

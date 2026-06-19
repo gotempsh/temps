@@ -40,6 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Managed S3 backend driver contract**: `temps-providers` now defines a `ManagedS3Backend` protocol for RustFS-compatible and Garage-compatible object-storage lifecycle operations, keeping `rustfs` as the default while requiring `garage` to be managed by an out-of-process provider over `provider_socket` so AGPL storage engines are not compiled into the Temps binary.
+- **MinIO as an S3 backend option**: Managed `s3` services can now select `backend=minio` alongside the default `rustfs` and Garage backend selector, so operators can keep MinIO compatibility without creating a separate current service type.
 
 - **notifications:** Add Cloudflare Email Sending provider ([#160](https://github.com/gotempsh/temps/issues/160))
 - **otel:** ClickHouse-first OTEL metrics storage with full-fidelity decode

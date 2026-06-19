@@ -37,7 +37,7 @@ Temps provides fully managed database and storage services that you can provisio
     - **PostgreSQL** — Production-ready relational database
     - **MariaDB** — MySQL-compatible relational database
     - **Redis** — High-performance caching and pub/sub
-    - **S3 Storage** — Object storage compatible with MinIO and AWS S3
+    - **S3 Storage** — Object storage compatible with AWS S3 SDKs
 
     All services are provisioned on your infrastructure, giving you complete control over your data.
   </Col>
@@ -336,7 +336,7 @@ When linked to a project, Redis connection details are available as `REDIS_URL`,
 
 ### Creating S3 Storage
 
-Provision MinIO-compatible object storage for files, backups, and assets:
+Provision S3-compatible object storage for files, backups, and assets:
 
 <Row>
   <Col>
@@ -359,12 +359,19 @@ Provision MinIO-compatible object storage for files, backups, and assets:
 
     | Option | Description | Default |
     |--------|-------------|---------|
+    | `backend` | Storage backend: `rustfs`, `garage`, or `minio` | `rustfs` |
     | `size` | Storage allocation | 50GB |
     | `public-read` | Public read access | false |
     | `versioning` | Object versioning | Disabled |
     | `lifecycle` | Auto-delete rules | None |
   </Col>
 </Row>
+
+<Note>
+RustFS is the default backend. Garage is modeled as an external provider
+backend, and MinIO is available for compatibility with existing
+S3-compatible workflows.
+</Note>
 
 ### Connecting to S3
 
@@ -562,7 +569,7 @@ Scaling operations are performed with zero downtime. Your applications remain co
 | **PostgreSQL** | ✅ Built-in | ⚠️ Vercel Postgres (extra) | ❌ External only | ✅ Built-in |
 | **MariaDB / MySQL-compatible** | ✅ Built-in | ❌ External only | ❌ External only | ✅ Built-in |
 | **Redis** | ✅ Built-in | ⚠️ Vercel KV (extra) | ❌ External only | ✅ Built-in |
-| **S3 Storage** | ✅ MinIO-compatible | ⚠️ Vercel Blob (extra) | ❌ External only | ❌ External only |
+| **S3 Storage** | ✅ S3-compatible | ⚠️ Vercel Blob (extra) | ❌ External only | ❌ External only |
 | **Connection Limits** | ❌ No limits | ✅ Metered/capped | ✅ Metered/capped | ⚠️ Plan-based |
 | **Storage Cost** | ❌ Your infrastructure | ✅ $0.15/GB/month | ✅ $0.10/GB/month | ✅ Pay per GB |
 | **Backups** | ✅ Automatic | ⚠️ Enterprise only | ⚠️ Add-on | ✅ Automatic |
