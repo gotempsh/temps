@@ -1,6 +1,6 @@
 export const metadata = {
   title: 'Managed Services',
-  description: 'Provision and manage PostgreSQL, Redis, and S3 storage directly within Temps—no third-party services required.',
+  description: 'Provision and manage PostgreSQL, MariaDB, Redis, and S3 storage directly within Temps—no third-party services required.',
   alternates: {
     canonical: '/docs/managed-services',
   },
@@ -9,6 +9,7 @@ export const metadata = {
 export const sections = [
   { title: 'Available Services', id: 'available-services' },
   { title: 'PostgreSQL Database', id: 'postgresql-database' },
+  { title: 'MariaDB Database', id: 'mariadb-database' },
   { title: 'Redis Caching', id: 'redis-caching' },
   { title: 'S3 Object Storage', id: 's3-object-storage' },
   { title: 'Service Management', id: 'service-management' },
@@ -22,7 +23,7 @@ export const sections = [
 Temps provides fully managed database and storage services that you can provision and link to your projects in seconds. Unlike platforms like Vercel that require external services, Temps includes everything you need. {{ className: 'lead' }}
 
 <Note>
-**Competitive Advantage**: While platforms like Vercel require third-party database providers (Vercel Postgres, Vercel KV), Temps includes managed PostgreSQL, Redis, and S3 storage out of the box—no additional accounts or billing required.
+**Competitive Advantage**: While platforms like Vercel require third-party database providers (Vercel Postgres, Vercel KV), Temps includes managed PostgreSQL, MariaDB, Redis, and S3 storage out of the box—no additional accounts or billing required.
 </Note>
 
 ---
@@ -31,9 +32,10 @@ Temps provides fully managed database and storage services that you can provisio
 
 <Row>
   <Col>
-    Temps offers three types of managed services that integrate seamlessly with your projects:
+    Temps offers managed services that integrate seamlessly with your projects:
 
     - **PostgreSQL** — Production-ready relational database
+    - **MariaDB** — MySQL-compatible relational database
     - **Redis** — High-performance caching and pub/sub
     - **S3 Storage** — Object storage compatible with MinIO and AWS S3
 
@@ -45,6 +47,9 @@ Temps provides fully managed database and storage services that you can provisio
     temps service create postgres my-db \
       --version 16 \
       --storage 10GB
+
+    # Create a MariaDB database
+    temps service create mariadb my-mysql-db
 
     # Create a Redis instance
     temps service create redis my-cache \
@@ -171,6 +176,47 @@ Run migrations during deployment by configuring build hooks:
   }
 }
 ```
+
+---
+
+## MariaDB Database {{ anchor: true, id: 'mariadb-database' }}
+
+Create a MariaDB service when your application expects a MySQL-compatible database. Temps uses MariaDB images by default, but keeps Temps' own internal database on PostgreSQL with TimescaleDB.
+
+<Row>
+  <Col>
+    **Via Dashboard:**
+    1. Navigate to **Services** -> **Create Service**
+    2. Select **MariaDB**
+    3. Choose the default `mariadb:lts` image or provide a compatible image
+    4. Pick a size profile for the host
+    5. Click **Create Database**
+
+    **Via CLI:**
+    ```bash
+    temps service create mariadb app-db
+    ```
+  </Col>
+  <Col>
+    **Configuration Options:**
+
+    | Option | Description | Default |
+    |--------|-------------|---------|
+    | `docker_image` | MariaDB-compatible image | `mariadb:lts` |
+    | `port` | Host port binding | Auto-assigned from 3306 |
+    | `size_profile` | Memory/connection tuning profile | `small` |
+    | `database` | Initial database | `app` |
+    | `username` | Application user | `app` |
+  </Col>
+</Row>
+
+When linked to a project, one MariaDB service creates a separate database for each project/environment pair. The service is shared by default, so a small VPS can run one MariaDB container instead of one database daemon per project.
+
+<Note>
+MariaDB is opt-in. A fresh Temps install does not pull or start MariaDB. The container is created only when you create or import a MariaDB external service.
+</Note>
+
+Temps injects `DATABASE_URL`, `MYSQL_URL`, `MYSQL_*`, `MARIADB_URL`, and `MARIADB_*` variables. The connection URL uses the `mysql://` scheme because most frameworks and drivers connect to MariaDB through MySQL-compatible drivers.
 
 ---
 
@@ -501,11 +547,11 @@ Scaling operations are performed with zero downtime. Your applications remain co
 
 **Recommended Resource Allocation:**
 
-| Use Case | PostgreSQL | Redis | S3 Storage |
-|----------|-----------|-------|------------|
-| **Small Project** | 1GB RAM, 10GB storage | 256MB | 10GB |
-| **Medium Project** | 2GB RAM, 50GB storage | 1GB | 100GB |
-| **Large Project** | 4GB+ RAM, 200GB+ storage | 4GB+ | 500GB+ |
+| Use Case | PostgreSQL | MariaDB | Redis | S3 Storage |
+|----------|-----------|---------|-------|------------|
+| **Small Project** | 1GB RAM, 10GB storage | Small profile | 256MB | 10GB |
+| **Medium Project** | 2GB RAM, 50GB storage | Standard profile | 1GB | 100GB |
+| **Large Project** | 4GB+ RAM, 200GB+ storage | Dedicated profile | 4GB+ | 500GB+ |
 
 ---
 
@@ -514,6 +560,7 @@ Scaling operations are performed with zero downtime. Your applications remain co
 | Feature | Temps | Vercel | Netlify | Railway |
 |---------|-------|--------|---------|---------|
 | **PostgreSQL** | ✅ Built-in | ⚠️ Vercel Postgres (extra) | ❌ External only | ✅ Built-in |
+| **MariaDB / MySQL-compatible** | ✅ Built-in | ❌ External only | ❌ External only | ✅ Built-in |
 | **Redis** | ✅ Built-in | ⚠️ Vercel KV (extra) | ❌ External only | ✅ Built-in |
 | **S3 Storage** | ✅ MinIO-compatible | ⚠️ Vercel Blob (extra) | ❌ External only | ❌ External only |
 | **Connection Limits** | ❌ No limits | ✅ Metered/capped | ✅ Metered/capped | ⚠️ Plan-based |

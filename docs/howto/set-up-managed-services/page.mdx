@@ -1,7 +1,7 @@
 export const metadata = {
   title: 'Set Up Managed Services',
   description:
-    'Provision PostgreSQL, Redis, MongoDB, and S3 storage as Docker containers managed by Temps. Link them to projects for automatic credential injection.',
+    'Provision PostgreSQL, MariaDB, Redis, MongoDB, and S3 storage as Docker containers managed by Temps. Link them to projects for automatic credential injection.',
   alternates: {
     canonical: '/docs/set-up-managed-services',
   },
@@ -27,6 +27,7 @@ Managed services are databases and storage systems that Temps provisions as Dock
 | Service | Default Image | Use case |
 |---------|--------------|----------|
 | **PostgreSQL** | `gotempsh/postgres-walg:18-bookworm` | Primary database with WAL-G streaming backups |
+| **MariaDB** | `mariadb:lts` | MySQL-compatible relational database |
 | **Redis** | `gotempsh/redis-walg:8-bookworm` | Caching, sessions, pub/sub, and queues |
 | **MongoDB** | `gotempsh/mongodb-walg:8.0` | Document database |
 | **S3 Storage** | `rustfs/rustfs:1.0.0-alpha.78` | S3-compatible object storage (powered by RustFS) |
@@ -37,6 +38,10 @@ Temps also provides higher-level abstractions built on these services:
 |---------|-----------|---------|
 | **KV** | Redis | Key-value storage accessible via the Temps SDK |
 | **Blob** | RustFS | File/blob storage accessible via the Temps SDK |
+
+<Note>
+MariaDB and RustFS-backed services are opt-in. Installing or starting Temps does not pull or run a MariaDB container, and it does not pull or run RustFS unless you create or enable an S3, Blob, or RustFS service. Temps still uses PostgreSQL with TimescaleDB for its own internal database.
+</Note>
 
 ---
 
@@ -79,6 +84,18 @@ curl -X POST "https://your-temps-instance/api/external-services" \
 | `database` | `postgres` | No (read-only) |
 | `username` | `postgres` | No (read-only) |
 | `password` | Auto-generated (16 chars) | No (read-only) |
+
+**MariaDB:**
+
+| Parameter | Default | Editable after creation |
+|-----------|---------|----------------------|
+| `port` | Auto-assigned from 3306 | Yes |
+| `docker_image` | `mariadb:lts` | Yes |
+| `size_profile` | `small` | Yes |
+| `database` | `app` | No (read-only) |
+| `username` | `app` | No (read-only) |
+| `password` | Auto-generated | No (read-only) |
+| `root_password` | Auto-generated | No (read-only) |
 
 **Redis:**
 
@@ -139,9 +156,11 @@ curl -X POST "https://your-temps-instance/api/external-services/{service_id}/pro
 
 ### What happens when you link
 
-1. **Per-project isolation** — For PostgreSQL, a dedicated database is created named `{project_slug}_{environment_slug}`. For Redis, a database number (0-15) is assigned. For S3, a dedicated bucket is created.
+1. **Per-project isolation** — For PostgreSQL and MariaDB, a dedicated database is created named `{project_slug}_{environment_slug}`. For Redis, a database number (0-15) is assigned. For S3/RustFS, a dedicated bucket is created.
 2. **Environment variables** — Connection credentials are generated using the Docker container name as the hostname (for internal networking) and injected on the next deploy.
-3. **One per type** — Only one service of each type can be linked to a project. To switch PostgreSQL instances, unlink the current one first.
+3. **One per type** — Only one service of each type can be linked to a project. To switch database instances of the same type, unlink the current one first.
+
+For MariaDB, Temps injects `DATABASE_URL`, `MYSQL_URL`, `MYSQL_*`, `MARIADB_URL`, and `MARIADB_*` variables. The URL scheme is `mysql://` for compatibility with common MySQL-compatible drivers and frameworks.
 
 ### Preview environment variables
 
@@ -174,7 +193,7 @@ Unlinking does not delete the database or data inside the service — it only st
 
 ## Import an existing container {{ anchor: true, id: 'import-an-existing-container' }}
 
-If you already have a PostgreSQL or Redis container running on your server, you can import it into Temps instead of creating a new one.
+If you already have a PostgreSQL, MariaDB/MySQL-compatible, Redis, MongoDB, or S3-compatible container running on your server, you can import it into Temps instead of creating a new one.
 
 1. Go to **Services**
 2. Click **Import Container**

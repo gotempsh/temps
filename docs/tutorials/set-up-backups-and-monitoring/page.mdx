@@ -128,7 +128,7 @@ With storage connected, run a manual backup to verify everything works.
 Temps starts the backup immediately. The process:
 
 1. **Temps database** — The internal PostgreSQL database (with TimescaleDB extension) is backed up first. Temps uses WAL-G for efficient streaming backups when available, falling back to `pg_dump` otherwise.
-2. **Managed services** — Every managed service you have provisioned (PostgreSQL databases, Redis instances, S3 storage) is backed up individually.
+2. **Managed services** — Every managed service you have provisioned (PostgreSQL databases, MariaDB databases, Redis instances, S3/RustFS storage) is backed up individually.
 3. **Metadata** — A `metadata.json` file is generated with checksums, sizes, timestamps, and service inventory.
 4. **Upload** — Everything is uploaded to your S3 bucket and the backup index is updated.
 
@@ -477,7 +477,7 @@ This command:
 1. Downloads the backup from S3
 2. Decompresses the database dump
 3. Restores the Temps PostgreSQL database using `pg_restore`
-4. Restores all managed service backups (PostgreSQL databases, Redis instances, etc.)
+4. Restores all managed service backups (PostgreSQL databases, MariaDB databases, Redis instances, etc.)
 
 **Step 3: Restart Temps**
 
