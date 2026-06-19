@@ -1,0 +1,49 @@
+{
+  "name": "@temps-sdk/api",
+  "version": "0.1.0",
+  "description": "Typed OpenAPI client for the Temps platform REST API. Generated from the Temps OpenAPI spec with @hey-api/openapi-ts.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./client": {
+      "types": "./dist/client/index.d.ts",
+      "import": "./dist/client/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "sideEffects": false,
+  "scripts": {
+    "generate": "openapi-ts",
+    "build": "tsc -p tsconfig.build.json",
+    "prepublishOnly": "bun run generate && bun run build",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@hey-api/client-fetch": "^0.13.1"
+  },
+  "devDependencies": {
+    "@hey-api/openapi-ts": "^0.88.0",
+    "typescript": "^5.6.0"
+  },
+  "keywords": [
+    "temps",
+    "openapi",
+    "api-client",
+    "sdk",
+    "paas"
+  ]
+}
