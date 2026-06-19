@@ -1,6 +1,5 @@
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
-import { Button } from '@/components/ui/button'
 import {
   Card,
   CardContent,
@@ -21,7 +20,6 @@ import {
   Router,
   Server,
 } from 'lucide-react'
-import { useNavigate } from 'react-router-dom'
 
 /**
  * Component that displays DNS configuration instructions based on the platform access mode
@@ -40,7 +38,6 @@ export function DNSConfigurationHelper() {
   const { data: settings } = useSettings()
 
   const targetIP = getDNSTargetIP()
-  const navigate = useNavigate()
 
   // Hide if platform is fully configured (external_url and preview_domain are set)
   if (settings?.external_url && settings?.preview_domain) {
@@ -138,14 +135,6 @@ export function DNSConfigurationHelper() {
             <li>Cloudflare Tunnel for secure access</li>
             <li>VPS deployment with public IP</li>
           </ul>
-          <Button
-            variant="outline"
-            size="sm"
-            className="mt-3"
-            onClick={() => navigate('/setup/connectivity')}
-          >
-            Configure External Access
-          </Button>
         </AlertDescription>
       </Alert>
     )

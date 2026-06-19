@@ -35,13 +35,15 @@ export function GettingStartedCard() {
       href: '/git-providers/add',
       cta: 'Connect Git',
     },
-    {
-      label: 'Deploy your first project',
-      description: 'Connect a Git repo or push a Docker image to get a live URL.',
-      done: signals.hasProject,
-      href: '/projects/new',
-      cta: 'Create project',
-    },
+    // NOTE: "Deploy your first project" is intentionally omitted — this card
+    // only renders once at least one project exists (the empty-state
+    // onboarding owns the no-projects moment), so that step would always be
+    // complete and add nothing.
+    //
+    // Ordered by importance: foundational platform setup that affects every
+    // deployment (HTTPS routing, failure alerts, the DNS automation that backs
+    // them) comes before per-app extras (databases and their backups), with
+    // team collaboration last.
     {
       label: 'Add a wildcard domain',
       description:
@@ -56,6 +58,37 @@ export function GettingStartedCard() {
       done: signals.notificationsConfigured,
       href: '/settings/notifications',
       cta: 'Set up',
+    },
+    {
+      label: 'Add a DNS provider',
+      description:
+        'Connect Cloudflare or Route53 for automatic wildcard SSL certificates.',
+      done: signals.dnsProviderConnected,
+      href: '/dns-providers/add',
+      cta: 'Connect',
+    },
+    {
+      label: 'Add a database',
+      description:
+        'Provision a managed Postgres, Redis, or MongoDB to attach to a project.',
+      done: signals.hasDatabase,
+      href: '/storage/create',
+      cta: 'Add database',
+    },
+    {
+      label: 'Set up backups',
+      description:
+        'Schedule automatic backups so your databases are protected.',
+      done: signals.backupsConfigured,
+      href: '/backups',
+      cta: 'Set up',
+    },
+    {
+      label: 'Invite your team',
+      description: 'Add teammates so they can manage projects and deployments.',
+      done: signals.teamInvited,
+      href: '/settings/users',
+      cta: 'Invite',
     },
   ]
 
@@ -81,7 +114,7 @@ export function GettingStartedCard() {
           <div className="flex items-start justify-between gap-2">
             <div className="space-y-1">
               <CardTitle className="text-base font-semibold">
-                Getting started
+                Finish setting up
               </CardTitle>
               <p className="text-sm text-muted-foreground">
                 {completedCount} of {items.length} done

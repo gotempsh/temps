@@ -4,6 +4,10 @@ import {
   listDomainsOptions,
   getProjectsOptions,
   listNotificationProvidersOptions,
+  listServicesOptions,
+  listBackupSchedulesOptions,
+  listDnsProvidersOptions,
+  listUsersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { useSettings } from './useSettings'
 
@@ -18,6 +22,14 @@ export interface ActivationSignals {
   externalUrlSet: boolean
   /** At least one enabled notification provider */
   notificationsConfigured: boolean
+  /** At least one managed database/service created */
+  hasDatabase: boolean
+  /** At least one backup schedule configured */
+  backupsConfigured: boolean
+  /** At least one DNS provider connected */
+  dnsProviderConnected: boolean
+  /** More than just the initial admin — i.e. a teammate was invited */
+  teamInvited: boolean
   /** True once all signals are loaded (used to avoid flash of incomplete state) */
   isLoaded: boolean
   /** Number of completed items out of total */
@@ -25,7 +37,7 @@ export interface ActivationSignals {
   totalCount: number
 }
 
-const TOTAL = 5
+const TOTAL = 9
 
 export function useActivationSignals(): ActivationSignals {
   const { data: settings, isLoading: settingsLoading } = useSettings()
@@ -50,12 +62,37 @@ export function useActivationSignals(): ActivationSignals {
     retry: false,
   })
 
+  const { data: servicesData, isLoading: servicesLoading } = useQuery({
+    ...listServicesOptions({}),
+    retry: false,
+  })
+
+  const { data: backupSchedulesData, isLoading: backupSchedulesLoading } =
+    useQuery({
+      ...listBackupSchedulesOptions({}),
+      retry: false,
+    })
+
+  const { data: dnsProvidersData, isLoading: dnsProvidersLoading } = useQuery({
+    ...listDnsProvidersOptions({}),
+    retry: false,
+  })
+
+  const { data: usersData, isLoading: usersLoading } = useQuery({
+    ...listUsersOptions({ query: { include_deleted: false } }),
+    retry: false,
+  })
+
   const isLoaded =
     !settingsLoading &&
     !connectionsLoading &&
     !domainsLoading &&
     !projectsLoading &&
-    !providersLoading
+    !providersLoading &&
+    !servicesLoading &&
+    !backupSchedulesLoading &&
+    !dnsProvidersLoading &&
+    !usersLoading
 
   const gitConnected =
     (connections?.connections?.filter((c) => c.is_active).length ?? 0) > 0
@@ -73,12 +110,26 @@ export function useActivationSignals(): ActivationSignals {
     Array.isArray(providersData) &&
     providersData.some((p) => p.enabled)
 
+  const hasDatabase = (servicesData?.length ?? 0) > 0
+
+  const backupsConfigured = (backupSchedulesData?.length ?? 0) > 0
+
+  const dnsProviderConnected = (dnsProvidersData?.length ?? 0) > 0
+
+  // The initial admin always exists, so "team invited" means more than one
+  // active user.
+  const teamInvited = (usersData?.length ?? 0) > 1
+
   const completed = [
     gitConnected,
     wildcardDomainReady,
     hasProject,
     externalUrlSet,
     notificationsConfigured,
+    hasDatabase,
+    backupsConfigured,
+    dnsProviderConnected,
+    teamInvited,
   ].filter(Boolean).length
 
   return {
@@ -87,6 +138,10 @@ export function useActivationSignals(): ActivationSignals {
     hasProject,
     externalUrlSet,
     notificationsConfigured,
+    hasDatabase,
+    backupsConfigured,
+    dnsProviderConnected,
+    teamInvited,
     isLoaded,
     completedCount: completed,
     totalCount: TOTAL,

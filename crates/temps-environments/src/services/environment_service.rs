@@ -138,8 +138,41 @@ impl EnvironmentService {
             "http"
         };
 
-        // Simple format: <scheme>://<slug>.<preview_domain>
-        format!("{}://{}.{}", protocol, environment_slug, base_domain)
+        // Append the proxy port when it isn't the protocol's default — the
+        // proxy listens on `ServerConfig.address` (e.g. `:8080`), so without
+        // this the URL points at :80/:443 and is unreachable on a local /
+        // non-standard-port instance. Only applies to the preview-domain path:
+        // when `external_url` is set, that URL already encodes the real public
+        // host/port (typically 443) and the internal proxy port is irrelevant.
+        let port_suffix = self.port_suffix(protocol, settings.external_url.is_some());
+
+        // <scheme>://<slug>.<preview_domain>[:port]
+        format!(
+            "{}://{}.{}{}",
+            protocol, environment_slug, base_domain, port_suffix
+        )
+    }
+
+    /// Returns `:<port>` when the proxy listens on a non-default port for the
+    /// given scheme (i.e. not 80 for http, not 443 for https), otherwise an
+    /// empty string. The port comes from the Rust proxy listener address via
+    /// [`ConfigService::proxy_port`] — the single source of truth — rather than
+    /// being parsed out of `preview_domain`.
+    ///
+    /// `external_url_set` short-circuits to no suffix: behind a reverse proxy /
+    /// public domain the externally-visible port is whatever `external_url`
+    /// uses, not the internal proxy listener port.
+    fn port_suffix(&self, protocol: &str, external_url_set: bool) -> String {
+        if external_url_set {
+            return String::new();
+        }
+        let port = self.config_service.proxy_port();
+        let is_default = (protocol == "http" && port == 80) || (protocol == "https" && port == 443);
+        if is_default {
+            String::new()
+        } else {
+            format!(":{}", port)
+        }
     }
 
     /// Compute the full FQDN for an environment (without protocol)
@@ -159,7 +192,8 @@ impl EnvironmentService {
         } else {
             "http"
         };
-        format!("{}://{}", protocol, domain)
+        let port_suffix = self.port_suffix(protocol, settings.external_url.is_some());
+        format!("{}://{}{}", protocol, domain, port_suffix)
     }
 
     #[allow(clippy::too_many_arguments)]

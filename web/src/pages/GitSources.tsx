@@ -15,15 +15,9 @@ import {
   AlertDialogFooter,
   AlertDialogHeader,
   AlertDialogTitle,
-  AlertDialogTrigger,
 } from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import {
-  Card,
-  CardContent,
-  CardHeader,
-} from '@/components/ui/card'
 import { CreateActionButton } from '@/components/ui/create-action-button'
 import {
   DropdownMenu,
@@ -81,8 +75,10 @@ export function GitSources() {
     meta: {
       errorTitle: 'Failed to remove git provider',
     },
+    // NOTE: the success/error/loading toasts are owned by the `toast.promise`
+    // wrapper in `handleConfirmDeleteProvider`. Don't toast here too, or every
+    // removal shows two identical "removed successfully" toasts.
     onSuccess: () => {
-      toast.success('Git provider removed successfully')
       refetch()
       setProviderToDelete(null)
     },
@@ -137,17 +133,19 @@ export function GitSources() {
         return
       }
 
-      // If provider can be deleted, proceed with deletion
-      await toast.promise(
-        deleteProviderMut.mutateAsync({
-          path: { provider_id: providerToDelete.id },
-        }),
-        {
-          loading: 'Removing Git provider...',
-          success: 'Git provider removed successfully',
-          error: 'Failed to remove provider',
-        }
-      )
+      // If provider can be deleted, proceed with deletion. Await the mutation
+      // itself (which rejects on failure) so the line below only runs on
+      // success and the catch handles errors; `toast.promise` drives the
+      // loading/success/error toasts off the same promise.
+      const deletion = deleteProviderMut.mutateAsync({
+        path: { provider_id: providerToDelete.id },
+      })
+      toast.promise(deletion, {
+        loading: 'Removing Git provider...',
+        success: 'Git provider removed successfully',
+        error: 'Failed to remove provider',
+      })
+      await deletion
 
       // Refresh the provider list after successful deletion
       queryClient.invalidateQueries({ queryKey: ['listGitProviders'] })
@@ -183,12 +181,12 @@ export function GitSources() {
           <div className="flex items-center gap-2 self-start sm:self-auto">
             <Button
               variant="outline"
-              size="sm"
+              size="icon"
               onClick={() => refetch()}
               aria-label="Refresh"
+              title="Refresh"
             >
-              <RefreshCw className="h-4 w-4 sm:mr-2" />
-              <span className="hidden sm:inline">Refresh</span>
+              <RefreshCw className="h-4 w-4" />
             </Button>
             <CreateActionButton
               size="sm"
@@ -291,54 +289,21 @@ export function GitSources() {
                         <DropdownMenuSeparator />
                       </>
                     )}
-                    <AlertDialog>
-                      <AlertDialogTrigger asChild>
-                        <DropdownMenuItem
-                          className="text-destructive cursor-pointer"
-                          onSelect={(e) => {
-                            e.preventDefault()
-                            setProviderToDelete(provider)
-                          }}
-                        >
-                          <Trash2 className="h-4 w-4 mr-2" />
-                          Remove Provider
-                        </DropdownMenuItem>
-                      </AlertDialogTrigger>
-                      <AlertDialogContent>
-                        <AlertDialogHeader>
-                          <AlertDialogTitle>
-                            Remove Git Provider
-                          </AlertDialogTitle>
-                          <AlertDialogDescription>
-                            Are you sure you want to remove &quot;
-                            {provider.name}&quot;? This action cannot be undone
-                            and will remove all associated connections and
-                            repositories.
-                          </AlertDialogDescription>
-                        </AlertDialogHeader>
-                        <AlertDialogFooter>
-                          <AlertDialogCancel
-                            onClick={() => setProviderToDelete(null)}
-                          >
-                            Cancel
-                          </AlertDialogCancel>
-                          <AlertDialogAction
-                            className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-                            disabled={deleteProviderMut.isPending}
-                            onClick={handleConfirmDeleteProvider}
-                          >
-                            {deleteProviderMut.isPending ? (
-                              <>
-                                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                                Removing...
-                              </>
-                            ) : (
-                              'Remove Provider'
-                            )}
-                          </AlertDialogAction>
-                        </AlertDialogFooter>
-                      </AlertDialogContent>
-                    </AlertDialog>
+                    {/* Just set state here — the confirm dialog is rendered
+                        once, outside the dropdown (see below). Nesting an
+                        AlertDialog inside the menu unmounts it when the menu
+                        closes, so the dialog never opened and the click felt
+                        dead. */}
+                    <DropdownMenuItem
+                      className="text-destructive cursor-pointer"
+                      onSelect={(e) => {
+                        e.preventDefault()
+                        setProviderToDelete(provider)
+                      }}
+                    >
+                      <Trash2 className="h-4 w-4 mr-2" />
+                      Remove Provider
+                    </DropdownMenuItem>
                   </DropdownMenuContent>
                 </DropdownMenu>
               </div>
@@ -400,6 +365,50 @@ export function GitSources() {
           })()
         )}
       </div>
+
+      {/* Single controlled confirm dialog, rendered once at the page level so
+          it survives the dropdown closing. Driven by `providerToDelete`. */}
+      <AlertDialog
+        open={!!providerToDelete}
+        onOpenChange={(open) => {
+          if (!open) setProviderToDelete(null)
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Remove Git Provider</AlertDialogTitle>
+            <AlertDialogDescription>
+              Are you sure you want to remove &quot;{providerToDelete?.name}
+              &quot;? This action cannot be undone and will remove all
+              associated connections and repositories.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel onClick={() => setProviderToDelete(null)}>
+              Cancel
+            </AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              disabled={deleteProviderMut.isPending}
+              // Don't let Radix auto-close the dialog on click — we close it
+              // ourselves once the async delete (and its safety check) resolves.
+              onClick={(e) => {
+                e.preventDefault()
+                handleConfirmDeleteProvider()
+              }}
+            >
+              {deleteProviderMut.isPending ? (
+                <>
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  Removing...
+                </>
+              ) : (
+                'Remove Provider'
+              )}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }

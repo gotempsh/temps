@@ -301,13 +301,6 @@ const settingsNavItems: NavigationItem[] = [
     icon: BarChart3,
     keywords: ['metrics', 'monitoring', 'thresholds', 'alerts', 'cpu', 'memory', 'resources'],
   },
-  // Utility
-  {
-    title: 'External Connectivity',
-    url: '/setup/connectivity',
-    icon: Network,
-    keywords: ['connections', 'integrations', 'external', 'tunnel', 'cloudflare'],
-  },
 ]
 
 const observeNavItems: NavigationItem[] = [

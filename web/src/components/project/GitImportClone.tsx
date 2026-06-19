@@ -272,19 +272,41 @@ export function GitImportClone({
     return <GitBranch className={className} />
   }
 
+  // Optional `?connection=<id>` param lets callers deep-link straight to a
+  // specific connection's repository list — used by the first-run "connect a
+  // Git provider" happy path, which sends the user here right after creating a
+  // PAT connection so they continue to repo selection without a detour.
+  const connectionIdFromUrl =
+    mode === 'navigation' ? searchParams.get('connection') : null
+
   useEffect(() => {
-    if (
-      connections &&
-      connections.connections.length > 0 &&
-      !selectedConnection &&
-      isInitialLoad
-    ) {
+    if (!connections || connections.connections.length === 0) return
+
+    // If the URL names a connection that has since appeared in the list, snap
+    // to it — even after the initial load. A PAT connection created moments ago
+    // may not be in `listConnections` on the first render, so we wait for it
+    // rather than getting stuck on the fallback first connection.
+    if (connectionIdFromUrl) {
+      const preferred = connections.connections.find(
+        (c) => c.id.toString() === connectionIdFromUrl
+      )
+      if (preferred && selectedConnection !== connectionIdFromUrl) {
+        queueMicrotask(() => {
+          setSelectedConnection(preferred.id.toString())
+          setIsInitialLoad(false)
+        })
+        return
+      }
+    }
+
+    // Default: select the first connection once, on initial load.
+    if (!selectedConnection && isInitialLoad) {
       queueMicrotask(() => {
         setSelectedConnection(connections.connections[0].id.toString())
         setIsInitialLoad(false)
       })
     }
-  }, [connections, selectedConnection, isInitialLoad])
+  }, [connections, selectedConnection, isInitialLoad, connectionIdFromUrl])
 
   // Parse owner/repo from full_name
   const [owner, repo] = (selectedRepository?.full_name || '/').split('/')

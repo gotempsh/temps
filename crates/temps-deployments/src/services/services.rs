@@ -2407,7 +2407,11 @@ impl DeploymentService {
                 (protocol, None)
             }
         } else {
-            ("http", None)
+            // No external_url: the public port IS the proxy listener port from
+            // the Rust server config (e.g. :8080 on a local instance). Without
+            // this the URL drops to :80 and is unreachable on a non-standard
+            // port. `proxy_port()` is the single source of truth.
+            ("http", Some(self.config_service.proxy_port()))
         };
 
         // Construct the URL with port if present
@@ -2452,7 +2456,11 @@ impl DeploymentService {
                 (protocol, None)
             }
         } else {
-            ("http", None)
+            // No external_url: the public port IS the proxy listener port from
+            // the Rust server config (e.g. :8080 on a local instance). Without
+            // this the URL drops to :80 and is unreachable on a non-standard
+            // port. `proxy_port()` is the single source of truth.
+            ("http", Some(self.config_service.proxy_port()))
         };
 
         // Construct the URL with port if present

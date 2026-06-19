@@ -3,8 +3,7 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useDashboardAnalytics } from '@/hooks/useDashboardAnalytics'
 import { useDashboardHealth } from '@/hooks/useDashboardHealth'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { ExternalConnectivityAlert } from '@/components/alerts/ExternalConnectivityAlert'
-import { DiskSpaceAlert } from '@/components/alerts/DiskSpaceAlert'
+import { FirstProjectOnboarding } from '@/components/dashboard/FirstProjectOnboarding'
 import { GettingStartedCard } from '@/components/dashboard/GettingStartedCard'
 import { MetricCard } from '@/components/dashboard/MetricCard'
 import { ProjectCard } from '@/components/dashboard/ProjectCard'
@@ -24,8 +23,6 @@ import {
   DollarSign,
   Eye,
   FolderGit2,
-  FolderPlus,
-  GitBranch,
   Minus,
   TrendingDown,
   TrendingUp,
@@ -222,9 +219,13 @@ export function Projects() {
 
   return (
     <div className="p-4 sm:p-8 space-y-6">
-      <ExternalConnectivityAlert showInDashboard dismissible />
-      <DiskSpaceAlert dismissible />
-      <GettingStartedCard />
+      {/* The Getting Started checklist and the first-run "Deploy your first
+          project" empty state both cover connecting Git + the first deploy —
+          showing both at once is redundant and buries the deploy CTAs. On an
+          empty instance the empty state below owns that story; the checklist
+          returns once a project exists, to nudge the remaining setup (wildcard
+          domain, notifications). */}
+      {hasProjects && <GettingStartedCard />}
 
       {/* Metric cards (merged from former Dashboard page). Hidden on an empty
           instance — with no projects every figure is zero, so the cards are
@@ -331,68 +332,13 @@ export function Projects() {
             ))}
           </>
         ) : projectsData?.projects.length === 0 ? (
-          !gitProviders || gitProviders.length === 0 ? (
-            // No git + no projects. The Getting Started card above also covers
-            // this, but it's dismissible — so this state carries its own CTAs
-            // and doesn't reference "above" (which may be gone). Git is the
-            // recommended path; Docker/static deploys don't need it.
-            <div className="col-span-full flex flex-col items-center justify-center rounded-lg border border-dashed p-8 text-center animate-in fade-in-50">
-              <div className="flex h-20 w-20 items-center justify-center rounded-full bg-muted">
-                <GitBranch className="h-10 w-10 text-muted-foreground" />
-              </div>
-              <h2 className="mt-6 text-xl font-semibold">
-                Connect a Git provider to deploy
-              </h2>
-              <p className="mt-2 text-center text-sm text-muted-foreground max-w-md">
-                Link GitHub, GitLab, or Bitbucket for git-push deploys — or
-                create a project directly from a Docker image or static files.
-              </p>
-              <div className="flex flex-wrap justify-center gap-3 mt-6">
-                <Button asChild>
-                  <Link
-                    to="/git-providers/add"
-                    className="flex items-center gap-2"
-                  >
-                    <GitBranch className="h-4 w-4" />
-                    Connect Git provider
-                  </Link>
-                </Button>
-                <Button asChild variant="outline">
-                  <Link
-                    to="/projects/new"
-                    className="flex items-center gap-2"
-                  >
-                    <FolderPlus className="h-4 w-4" />
-                    New Project
-                  </Link>
-                </Button>
-              </div>
-            </div>
-          ) : (
-            <div className="col-span-full flex flex-col items-center justify-center rounded-lg border border-dashed p-8 text-center animate-in fade-in-50">
-              <div className="flex h-20 w-20 items-center justify-center rounded-full bg-muted">
-                <FolderPlus className="h-10 w-10 text-muted-foreground" />
-              </div>
-              <h2 className="mt-6 text-xl font-semibold">
-                Deploy your first project
-              </h2>
-              <p className="mt-2 text-center text-sm text-muted-foreground">
-                Create a project from a Git repo or a Docker image.
-              </p>
-              <div className="flex gap-3 mt-6">
-                <CreateActionButton to="/projects/new" label="New Project" />
-                <Button asChild variant="outline">
-                  <Link
-                    to="/projects/import-wizard"
-                    className="flex items-center gap-2"
-                  >
-                    <Upload className="h-4 w-4" />
-                    Import Project
-                  </Link>
-                </Button>
-              </div>
-            </div>
-          )
+          // First-run onboarding. The component is context-aware: when a Git
+          // provider is already connected it routes straight into the import
+          // wizard (skipping the connect step), and it always surfaces the
+          // "deploy a project with a database" and CLI paths.
+          <FirstProjectOnboarding
+            gitConnected={!!gitProviders && gitProviders.length > 0}
+          />
         ) : (
           <>
             {projectsData?.projects.map((project, index) => (
