@@ -37,6 +37,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `mariadb-dump` with `mysqldump` fallback for non-system databases.
 
 - **changelog:** Skip preview comment on fork PRs
+### Changed
+- **MariaDB services default to a small-host profile**: new managed MariaDB
+  services now materialize `size_profile=small` into a conservative `resources`
+  block (`512` MiB memory, `768` MiB memory+swap, `750000000` nano-cpus) and
+  start `mariadbd` with tuned connection/cache/buffer settings. The create
+  service UI now presents MariaDB as a shared database server whose linked
+  projects get separate databases, reducing accidental one-container-per-website
+  installs on 4 GiB and 8 GiB hosts.
 
 ### Fixed
 

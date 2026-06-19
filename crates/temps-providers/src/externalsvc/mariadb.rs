@@ -25,6 +25,93 @@ const DEFAULT_MARIADB_IMAGE: &str = "mariadb:lts";
 const MIN_PASSWORD_LENGTH: usize = 8;
 const MARIADB_BACKUP_EXEC_TIMEOUT: Duration = Duration::from_secs(4 * 3600);
 
+/// Resource/tuning profile for Temps-managed MariaDB containers.
+///
+/// A MariaDB service is a shared database server: linked projects receive
+/// separate databases inside this container, not separate MariaDB daemons.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MariaDbSizeProfile {
+    /// Conservative default for single-node 4 GiB and 8 GiB hosts.
+    #[default]
+    Small,
+    /// Larger shared service profile for hosts with more spare memory.
+    Standard,
+    /// Minimal cgroup limits; use when the host is dedicated to this service.
+    Dedicated,
+}
+
+impl MariaDbSizeProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Small => "small",
+            Self::Standard => "standard",
+            Self::Dedicated => "dedicated",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "small" => Some(Self::Small),
+            "standard" => Some(Self::Standard),
+            "dedicated" => Some(Self::Dedicated),
+            _ => None,
+        }
+    }
+
+    pub fn default_resource_limits(self) -> ServiceResourceLimits {
+        match self {
+            Self::Small => ServiceResourceLimits {
+                memory_mb: Some(512),
+                memory_swap_mb: Some(768),
+                nano_cpus: Some(750_000_000),
+                cpu_shares: None,
+                shm_size_mb: None,
+            },
+            Self::Standard => ServiceResourceLimits {
+                memory_mb: Some(1024),
+                memory_swap_mb: Some(1536),
+                nano_cpus: Some(1_500_000_000),
+                cpu_shares: None,
+                shm_size_mb: None,
+            },
+            Self::Dedicated => ServiceResourceLimits {
+                memory_mb: None,
+                memory_swap_mb: None,
+                nano_cpus: None,
+                cpu_shares: Some(2048),
+                shm_size_mb: None,
+            },
+        }
+    }
+
+    pub fn server_args(self) -> Vec<String> {
+        let (
+            buffer_pool,
+            max_connections,
+            table_open_cache,
+            thread_cache_size,
+            tmp_table_size,
+            performance_schema,
+        ) = match self {
+            Self::Small => ("128M", "50", "256", "16", "32M", "OFF"),
+            Self::Standard => ("384M", "100", "400", "32", "64M", "ON"),
+            Self::Dedicated => ("1024M", "200", "800", "64", "128M", "ON"),
+        };
+
+        vec![
+            "--skip-name-resolve".to_string(),
+            format!("--innodb-buffer-pool-size={buffer_pool}"),
+            format!("--max-connections={max_connections}"),
+            format!("--table-open-cache={table_open_cache}"),
+            format!("--thread-cache-size={thread_cache_size}"),
+            format!("--tmp-table-size={tmp_table_size}"),
+            format!("--max-heap-table-size={tmp_table_size}"),
+            format!("--performance-schema={performance_schema}"),
+        ]
+    }
+}
+
 /// Input configuration for creating a MariaDB service.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[schemars(
@@ -74,6 +161,10 @@ pub struct MariaDbInputConfig {
     #[schemars(example = "example_docker_image", default = "default_docker_image")]
     pub docker_image: String,
 
+    /// Managed service size/tuning profile.
+    #[serde(default)]
+    pub size_profile: MariaDbSizeProfile,
+
     /// Existing Docker container name for imported services.
     #[serde(default)]
     pub container_name: Option<String>,
@@ -89,6 +180,8 @@ pub struct MariaDbConfig {
     pub password: String,
     pub root_password: String,
     pub docker_image: String,
+    #[serde(default)]
+    pub size_profile: MariaDbSizeProfile,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container_name: Option<String>,
 }
@@ -107,6 +200,7 @@ impl From<MariaDbInputConfig> for MariaDbConfig {
             password: input.password.unwrap_or_else(generate_password),
             root_password: input.root_password.unwrap_or_else(generate_password),
             docker_image: input.docker_image,
+            size_profile: input.size_profile,
             container_name: input.container_name,
         }
     }
@@ -297,6 +391,9 @@ impl MariaDbService {
                 })?;
         }
 
+        self.warn_if_host_capacity_tight(docker, config, resource_limits)
+            .await;
+
         let service_label_key = format!("{}service_type", temps_core::DOCKER_LABEL_PREFIX);
         let name_label_key = format!("{}service_name", temps_core::DOCKER_LABEL_PREFIX);
         let container_labels = HashMap::from([
@@ -359,6 +456,7 @@ impl MariaDbService {
             exposed_ports: Some(Vec::from(["3306/tcp".to_string()])),
             env: Some(env_vars),
             labels: Some(container_labels),
+            cmd: Some(config.size_profile.server_args()),
             host_config: Some(bollard::models::HostConfig {
                 restart_policy: Some(bollard::models::RestartPolicy {
                     name: Some(bollard::models::RestartPolicyNameEnum::ALWAYS),
@@ -408,6 +506,86 @@ impl MariaDbService {
 
         info!("MariaDB container {} created and started", container.id);
         Ok(())
+    }
+
+    async fn warn_if_host_capacity_tight(
+        &self,
+        docker: &Docker,
+        config: &MariaDbConfig,
+        resource_limits: &ServiceResourceLimits,
+    ) {
+        let Ok(containers) = docker
+            .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+                all: true,
+                ..Default::default()
+            }))
+            .await
+        else {
+            return;
+        };
+
+        let service_label_key = format!("{}service_type", temps_core::DOCKER_LABEL_PREFIX);
+        let existing_mariadb_count = containers
+            .iter()
+            .filter(|container| {
+                let labeled = container
+                    .labels
+                    .as_ref()
+                    .and_then(|labels| labels.get(&service_label_key))
+                    .map(|value| value == "mariadb")
+                    .unwrap_or(false);
+                let named = container.names.as_ref().is_some_and(|names| {
+                    names
+                        .iter()
+                        .any(|name| name.trim_start_matches('/').starts_with("mariadb-"))
+                });
+                labeled || named
+            })
+            .count();
+
+        let host_memory_mb = Self::host_memory_mb();
+        let requested_memory_mb =
+            resource_limits
+                .memory_mb
+                .unwrap_or_else(|| match config.size_profile {
+                    MariaDbSizeProfile::Small => 512,
+                    MariaDbSizeProfile::Standard => 1024,
+                    MariaDbSizeProfile::Dedicated => 0,
+                });
+
+        if let Some(host_memory_mb) = host_memory_mb {
+            let projected = if requested_memory_mb > 0 {
+                requested_memory_mb * (existing_mariadb_count as i64 + 1)
+            } else {
+                0
+            };
+            if host_memory_mb <= 8192 && existing_mariadb_count >= 1 {
+                warn!(
+                    service = %self.name,
+                    profile = config.size_profile.as_str(),
+                    existing_mariadb_services = existing_mariadb_count,
+                    host_memory_mb,
+                    projected_mariadb_limit_mb = projected,
+                    "Creating another MariaDB service container on a small host. Prefer sharing one MariaDB service across projects; Temps links create separate per-project databases inside that service."
+                );
+            }
+        } else if existing_mariadb_count >= 2 {
+            warn!(
+                service = %self.name,
+                profile = config.size_profile.as_str(),
+                existing_mariadb_services = existing_mariadb_count,
+                "Creating another MariaDB service container. Prefer sharing one MariaDB service across projects; Temps links create separate per-project databases inside that service."
+            );
+        }
+    }
+
+    fn host_memory_mb() -> Option<i64> {
+        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let total_kb = meminfo.lines().find_map(|line| {
+            let rest = line.strip_prefix("MemTotal:")?;
+            rest.split_whitespace().next()?.parse::<i64>().ok()
+        })?;
+        Some(total_kb / 1024)
     }
 
     async fn wait_for_container_health(&self, docker: &Docker, container_id: &str) -> Result<()> {
@@ -1138,14 +1316,26 @@ impl ExternalService for MariaDbService {
                 let editable = match key.as_str() {
                     "port" => true,
                     "docker_image" => true,
+                    "size_profile" => false,
                     "host" | "database" | "username" | "password" | "root_password" => false,
                     _ => false,
                 };
 
-                if let Some(prop) = schema_json["properties"][&key].as_object_mut() {
+                if let Some(prop) = properties.get_mut(&key).and_then(|p| p.as_object_mut()) {
                     prop.insert("x-editable".to_string(), serde_json::json!(editable));
                 }
             }
+
+            properties.insert(
+                "size_profile".to_string(),
+                serde_json::json!({
+                    "type": "string",
+                    "description": "MariaDB resource/tuning profile. Small is the default for shared 4 GiB and 8 GiB Temps hosts; linked projects get separate databases inside this service.",
+                    "default": "small",
+                    "enum": ["small", "standard", "dedicated"],
+                    "x-editable": false
+                }),
+            );
         }
 
         Some(schema_json)
@@ -1747,6 +1937,7 @@ impl ExternalService for MariaDbService {
                 "password": password,
                 "root_password": root_password,
                 "docker_image": image,
+                "size_profile": "dedicated",
                 "container_name": imported_container_name,
             }),
         })
@@ -1796,6 +1987,60 @@ mod tests {
         assert_eq!(
             env.get("DATABASE_URL"),
             Some(&"mysql://app:secretpass@mariadb-app:3306/project_prod".to_string())
+        );
+    }
+
+    #[test]
+    fn small_profile_sets_conservative_resources_and_server_args() {
+        let resources = MariaDbSizeProfile::Small.default_resource_limits();
+        assert_eq!(resources.memory_mb, Some(512));
+        assert_eq!(resources.memory_swap_mb, Some(768));
+        assert_eq!(resources.nano_cpus, Some(750_000_000));
+
+        let args = MariaDbSizeProfile::Small.server_args();
+        assert!(args.contains(&"--innodb-buffer-pool-size=128M".to_string()));
+        assert!(args.contains(&"--max-connections=50".to_string()));
+        assert!(args.contains(&"--performance-schema=OFF".to_string()));
+    }
+
+    #[test]
+    fn parses_size_profile_from_config() {
+        let config = MariaDbConfig::from(MariaDbInputConfig {
+            host: "localhost".to_string(),
+            port: Some("3306".to_string()),
+            database: "app".to_string(),
+            username: "app".to_string(),
+            password: Some("secretpass".to_string()),
+            root_password: Some("rootpass1".to_string()),
+            docker_image: DEFAULT_MARIADB_IMAGE.to_string(),
+            size_profile: MariaDbSizeProfile::Standard,
+            container_name: None,
+        });
+
+        assert_eq!(config.size_profile, MariaDbSizeProfile::Standard);
+    }
+
+    #[test]
+    fn parameter_schema_exposes_create_time_size_profile() {
+        let service = MariaDbService::new(
+            "schema-test".to_string(),
+            Arc::new(Docker::connect_with_http_defaults().expect("docker client")),
+        );
+        let schema = service
+            .get_parameter_schema()
+            .expect("schema should be available");
+        let size_profile = schema
+            .get("properties")
+            .and_then(|p| p.get("size_profile"))
+            .expect("size_profile should be present");
+
+        assert_eq!(
+            size_profile.get("default").and_then(|v| v.as_str()),
+            Some("small")
+        );
+        assert_eq!(
+            size_profile.get("x-editable").and_then(|v| v.as_bool()),
+            Some(false)
         );
     }
 }
