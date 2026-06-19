@@ -72,12 +72,18 @@ fn default_backend_kind() -> ManagedS3BackendKind {
 
 impl ManagedS3BackendSelection {
     pub fn from_parameters(parameters: &serde_json::Value) -> Result<Self> {
-        let backend = parameters
-            .get("backend")
-            .and_then(|v| v.as_str())
-            .map(ManagedS3BackendKind::parse)
-            .transpose()?
-            .unwrap_or(DEFAULT_MANAGED_S3_BACKEND);
+        // Treat absent/null as the default, parse strings, and reject any
+        // present-but-non-string value rather than silently defaulting.
+        let backend = match parameters.get("backend") {
+            None | Some(serde_json::Value::Null) => DEFAULT_MANAGED_S3_BACKEND,
+            Some(serde_json::Value::String(value)) => ManagedS3BackendKind::parse(value)?,
+            Some(other) => {
+                return Err(anyhow!(
+                    "managed S3 backend must be a string (rustfs or garage), got {}",
+                    other
+                ))
+            }
+        };
 
         let buckets = parameters
             .get("buckets")
@@ -212,5 +218,24 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("out-of-process provider"));
+    }
+
+    #[test]
+    fn non_string_backend_is_rejected() {
+        let error = ManagedS3BackendSelection::from_parameters(&serde_json::json!({
+            "backend": 123
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("must be a string"));
+    }
+
+    #[test]
+    fn null_backend_falls_back_to_default() {
+        let selection = ManagedS3BackendSelection::from_parameters(&serde_json::json!({
+            "backend": serde_json::Value::Null
+        }))
+        .unwrap();
+        assert_eq!(selection.backend, DEFAULT_MANAGED_S3_BACKEND);
     }
 }
