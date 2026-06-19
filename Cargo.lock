@@ -11078,6 +11078,7 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "sha2 0.10.9",
+ "sqlx",
  "sysinfo 0.33.1",
  "temps-auth",
  "temps-core",

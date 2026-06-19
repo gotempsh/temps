@@ -44,6 +44,12 @@ impl TempsPlugin for ConfigPlugin {
             // Create ConfigService
             let config_service =
                 Arc::new(ConfigService::new(self.server_config.clone(), db.clone()));
+
+            // Start the cross-process settings cache invalidation listener on
+            // THIS shared singleton (Postgres LISTEN/NOTIFY on `settings_change`).
+            // Non-fatal on failure: the 5s cache TTL remains the safety net.
+            config_service.start_settings_listener();
+
             context.register_service(config_service);
 
             tracing::debug!("Config plugin services registered successfully");

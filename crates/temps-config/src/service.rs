@@ -10,6 +10,7 @@ use tokio::{
     fs as tokio_fs,
     io::{AsyncReadExt, AsyncWriteExt},
 };
+use tracing::{debug, info, warn};
 // Well-known paths relative to data_dir
 pub const STATIC_DIR_NAME: &str = "static";
 pub const PIPELINE_LOGS_DIR_NAME: &str = "logs";
@@ -338,6 +339,13 @@ pub struct ConfigService {
     /// write-through by `update_settings`; otherwise refreshed after
     /// `SETTINGS_CACHE_TTL`.
     settings_cache: tokio::sync::RwLock<Option<(AppSettings, std::time::Instant)>>,
+    /// Background task that LISTENs on the Postgres `settings_change` channel and
+    /// invalidates `settings_cache` the instant another process writes settings.
+    /// The 5s `SETTINGS_CACHE_TTL` remains as a safety net for any missed NOTIFY.
+    /// Stored so it can be aborted on `Drop`. Only the plugin singleton spawns
+    /// this (via [`ConfigService::start_settings_listener`]); throwaway
+    /// `ConfigService::new()` instances never start it.
+    listener_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl ConfigService {
@@ -346,6 +354,7 @@ impl ConfigService {
             config,
             db,
             settings_cache: tokio::sync::RwLock::new(None),
+            listener_handle: std::sync::Mutex::new(None),
         }
     }
 
@@ -638,6 +647,114 @@ impl ConfigService {
         Ok(())
     }
 
+    /// Drop the cached `AppSettings` snapshot so the next `get_settings` call
+    /// re-reads from the database. Called by the `settings_change` LISTEN task
+    /// when another process writes settings, and on listener
+    /// reconnect-recovery (so a NOTIFY missed during a connection gap can't
+    /// strand stale data). Takes the async write lock, so it must be awaited.
+    pub async fn invalidate_settings_cache(&self) {
+        *self.settings_cache.write().await = None;
+        debug!("Invalidated AppSettings cache (settings_change NOTIFY)");
+    }
+
+    /// Spawn the background task that LISTENs on the Postgres `settings_change`
+    /// channel and invalidates the in-memory settings cache the instant any
+    /// process writes the settings row. This makes cross-process settings
+    /// changes take effect immediately instead of waiting out the 5s
+    /// `SETTINGS_CACHE_TTL` (which stays as the missed-NOTIFY safety net).
+    ///
+    /// Invoked once from `ConfigPlugin` against the shared singleton, so the
+    /// task always invalidates the cache of the instance everyone reads from.
+    /// Startup failure to connect is non-fatal — the TTL still refreshes the
+    /// cache, just with up to 5s of latency. Mirrors the listener structure in
+    /// `temps-routes::project_change_listener`.
+    pub fn start_settings_listener(self: &std::sync::Arc<Self>) {
+        let service = self.clone();
+        let database_url = self.get_database_url();
+
+        let handle = tokio::spawn(async move {
+            use sqlx::postgres::{PgListener, PgPool};
+
+            // Establish the initial connection + subscription. A failure here is
+            // non-fatal: the cache TTL still expires settings within 5s.
+            let pool = match PgPool::connect(&database_url).await {
+                Ok(pool) => pool,
+                Err(e) => {
+                    warn!(
+                        "settings_change listener: failed to connect to Postgres ({}); \
+                         falling back to {}s cache TTL only",
+                        e,
+                        SETTINGS_CACHE_TTL.as_secs()
+                    );
+                    return;
+                }
+            };
+
+            let mut pg_listener = match PgListener::connect_with(&pool).await {
+                Ok(listener) => listener,
+                Err(e) => {
+                    warn!(
+                        "settings_change listener: failed to create PgListener ({}); \
+                         falling back to {}s cache TTL only",
+                        e,
+                        SETTINGS_CACHE_TTL.as_secs()
+                    );
+                    return;
+                }
+            };
+
+            if let Err(e) = pg_listener.listen("settings_change").await {
+                warn!(
+                    "settings_change listener: failed to subscribe ({}); \
+                     falling back to {}s cache TTL only",
+                    e,
+                    SETTINGS_CACHE_TTL.as_secs()
+                );
+                return;
+            }
+            info!("Started listening for settings_change events");
+
+            // Pure event-driven loop: invalidate on each NOTIFY. After a
+            // listener error we reconnect, re-subscribe, and invalidate once to
+            // catch any change missed during the gap.
+            loop {
+                match pg_listener.recv().await {
+                    Ok(_notification) => {
+                        service.invalidate_settings_cache().await;
+                    }
+                    Err(e) => {
+                        warn!("Error receiving settings_change notification: {}", e);
+
+                        // Back off, then attempt to reconnect.
+                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+                        match PgListener::connect_with(&pool).await {
+                            Ok(mut new_listener) => {
+                                if let Err(e) = new_listener.listen("settings_change").await {
+                                    warn!("Failed to re-subscribe to settings_change: {}", e);
+                                } else {
+                                    pg_listener = new_listener;
+                                    info!("Reconnected to settings_change listener");
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to reconnect settings_change listener: {}", e);
+                            }
+                        }
+
+                        // Recovery: invalidate so a NOTIFY missed during the gap
+                        // can't leave the cache holding stale settings.
+                        service.invalidate_settings_cache().await;
+                    }
+                }
+            }
+        });
+
+        if let Ok(mut guard) = self.listener_handle.lock() {
+            *guard = Some(handle);
+        }
+    }
+
     /// Update a specific field in the settings
     pub async fn update_setting_field<F>(&self, update_fn: F) -> Result<(), ConfigServiceError>
     where
@@ -804,6 +921,17 @@ impl ConfigService {
     }
 }
 
+impl Drop for ConfigService {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.listener_handle.lock() {
+            if let Some(handle) = guard.take() {
+                handle.abort();
+                debug!("settings_change listener stopped");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -905,6 +1033,34 @@ mod tests {
             svc.get_settings().await.unwrap().preview_domain,
             "new.example.com",
             "update_settings must write through to the cache"
+        );
+    }
+
+    // A settings_change NOTIFY must force the next get_settings() to re-read
+    // from the DB instead of serving the stale cached snapshot (the whole point
+    // of the cross-process invalidation path; the listener calls this method).
+    #[tokio::test]
+    async fn invalidate_settings_cache_forces_db_reread() {
+        // Two DIFFERENT query results: the first get_settings() consumes "v1"
+        // and caches it; after invalidation the second get_settings() consumes
+        // "v2". If invalidation failed, the second call would serve the cached
+        // "v1" and never reach the queued "v2" result.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![settings_row("v1")], vec![settings_row("v2")]])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+
+        // First read populates the cache with "v1".
+        assert_eq!(svc.get_settings().await.unwrap().preview_domain, "v1");
+
+        // Simulate the listener firing on a cross-process write.
+        svc.invalidate_settings_cache().await;
+
+        // Next read must hit the DB again and return the new "v2" value.
+        assert_eq!(
+            svc.get_settings().await.unwrap().preview_domain,
+            "v2",
+            "invalidate_settings_cache must force a fresh DB read, not serve the cached v1"
         );
     }
 }
