@@ -6,6 +6,7 @@ use utoipa::ToSchema;
 
 pub mod cluster_role;
 pub mod exec_util;
+pub mod managed_s3;
 pub mod mariadb;
 pub mod mariadb_binlog_health;
 pub mod mongodb;
@@ -36,6 +37,7 @@ pub(crate) static DEPLOYMENT_MODE_MUTEX: std::sync::Mutex<()> = std::sync::Mutex
 
 // Re-export services for easier access
 pub use cluster_role::{ClusterRole, PgAutoFailoverState};
+pub use managed_s3::{ManagedS3Backend, ManagedS3BackendKind, ManagedS3BackendSelection};
 pub use mariadb::{BinlogManifest, MariaDbService};
 pub use mongodb::MongodbService;
 pub use postgres::PostgresService;

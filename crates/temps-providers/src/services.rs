@@ -6,8 +6,8 @@ use crate::externalsvc::{
     redis::RedisService,
     rustfs::RustfsService,
     s3::S3Service,
-    AvailableContainer, ClusterMemberSpec, ExternalService, HealthProbeStatus, ServiceConfig,
-    ServiceType,
+    AvailableContainer, ClusterMemberSpec, ExternalService, HealthProbeStatus,
+    ManagedS3BackendSelection, ServiceConfig, ServiceType,
 };
 use crate::parameter_strategies;
 use crate::remote_service_client::{
@@ -1224,6 +1224,25 @@ impl ExternalServiceManager {
                 service_id: 0,
                 reason,
             })?;
+
+        if matches!(request.service_type, ServiceType::S3 | ServiceType::Blob) {
+            let parameter_value = serde_json::to_value(&request.parameters).map_err(|e| {
+                ExternalServiceError::InternalError {
+                    reason: format!("Failed to inspect managed S3 backend parameters: {}", e),
+                }
+            })?;
+            let backend_selection = ManagedS3BackendSelection::from_parameters(&parameter_value)
+                .map_err(|e| ExternalServiceError::ParameterValidationFailed {
+                    service_id: 0,
+                    reason: e.to_string(),
+                })?;
+            backend_selection
+                .validate_for_service_create()
+                .map_err(|e| ExternalServiceError::ParameterValidationFailed {
+                    service_id: 0,
+                    reason: e.to_string(),
+                })?;
+        }
 
         // Auto-generate missing optional parameters
         let mut parameters = request.parameters.clone();
