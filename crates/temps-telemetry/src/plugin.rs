@@ -49,7 +49,22 @@ impl TempsPlugin for TelemetryPlugin {
                 &self.server_config.data_dir,
                 self.temps_version.clone(),
             ) {
-                Ok(svc) => Arc::new(svc),
+                Ok(svc) => {
+                    // Wire the DB so once-per-instance milestones
+                    // (report_once) are durable across restarts and across the
+                    // split proxy/console processes. The DB service is registered
+                    // before this plugin; if it's somehow absent, report_once
+                    // degrades to a per-process in-memory guard.
+                    if let Some(db) = context.get_service::<sea_orm::DatabaseConnection>() {
+                        svc.set_db(db);
+                    } else {
+                        tracing::warn!(
+                            "Telemetry: database service not available; once-per-instance \
+                             milestones will be guarded per-process only (not durable)"
+                        );
+                    }
+                    Arc::new(svc)
+                }
                 Err(e) => {
                     tracing::warn!(
                         error = %e,

@@ -94,13 +94,51 @@ async fn report_instance_started(
     reporter.report(build_instance_event(TelemetryEventKind::InstanceStarted, db).await);
 }
 
-/// Build an instance lifecycle/heartbeat event carrying the same set of
-/// non-identifying depth-of-usage counts (projects, environments, managed
-/// services, worker nodes). Shared by `instance_started` and the periodic
-/// `instance_heartbeat` so both report the fleet snapshot identically.
+/// Coarse, non-identifying RAM capacity band for the host. We deliberately
+/// bucket (rather than send exact byte counts) so the value can't contribute to
+/// fingerprinting: it answers "are people running Temps on tiny VPSes vs beefy
+/// boxes?" without revealing the machine's real specs. Returns `None` if the
+/// total can't be read.
+fn capacity_tier_from_total_ram() -> Option<&'static str> {
+    use sysinfo::SystemExt;
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    // sysinfo 0.29 reports total_memory() in BYTES.
+    let total_bytes = sys.total_memory();
+    if total_bytes == 0 {
+        return None;
+    }
+    let gib = total_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    // Bands chosen around common VPS sizes; coarse on purpose.
+    let tier = if gib < 1.5 {
+        "xs" // ~1 GiB and under
+    } else if gib < 3.0 {
+        "small" // ~2 GiB
+    } else if gib < 6.0 {
+        "medium" // ~4 GiB
+    } else if gib < 12.0 {
+        "large" // ~8 GiB
+    } else if gib < 24.0 {
+        "xl" // ~16 GiB
+    } else {
+        "xxl" // 24 GiB+
+    };
+    Some(tier)
+}
+
+/// Build an instance lifecycle/heartbeat event carrying a small set of
+/// non-identifying signals:
+/// - depth-of-usage counts (projects, environments, managed services, worker
+///   nodes),
+/// - `has_git_provider`: whether the instance has wired up at least one git
+///   provider connection (a key activation signal — git-push deploys are the
+///   core workflow),
+/// - `capacity_tier`: a COARSE RAM band (never exact specs; see
+///   [`capacity_tier_from_total_ram`]).
 ///
-/// Each count is independent and optional — a failure on one doesn't block the
-/// others or the event itself.
+/// Shared by `instance_started` and the periodic `instance_heartbeat` so both
+/// report the fleet snapshot identically. Each field is independent and
+/// optional — a failure on one doesn't block the others or the event itself.
 async fn build_instance_event(
     kind: temps_core::telemetry::TelemetryEventKind,
     db: &sea_orm::DatabaseConnection,
@@ -122,11 +160,23 @@ async fn build_instance_event(
         .ok();
     let node_count = temps_entities::nodes::Entity::find().count(db).await.ok();
 
+    // Whether git is configured on this instance at all (>= 1 provider
+    // connection). Just a boolean — no provider type, no URLs, no tokens.
+    let has_git_provider = temps_entities::git_provider_connections::Entity::find()
+        .count(db)
+        .await
+        .ok()
+        .map(|c| c > 0);
+
+    let capacity_tier = capacity_tier_from_total_ram();
+
     TelemetryEvent::new(kind)
         .with_opt("project_count", project_count.map(|c| c as i64))
         .with_opt("environment_count", environment_count.map(|c| c as i64))
         .with_opt("service_count", service_count.map(|c| c as i64))
         .with_opt("node_count", node_count.map(|c| c as i64))
+        .with_opt("has_git_provider", has_git_provider)
+        .with_opt("capacity_tier", capacity_tier)
 }
 
 /// Interval between anonymous `instance_heartbeat` events. Daily — the minimum

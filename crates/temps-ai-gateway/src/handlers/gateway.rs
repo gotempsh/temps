@@ -424,7 +424,11 @@ async fn chat_completions(
                     "AI gateway streaming request started"
                 );
 
-                app_state.telemetry.report(
+                // Once-per-instance: "the AI gateway has been used here", not
+                // "an AI request happened". Guard so it fires once (carrying the
+                // provider of that first request), not on every request.
+                app_state.telemetry.report_once(
+                    "ai_gateway_first_request",
                     temps_core::telemetry::TelemetryEvent::new(
                         temps_core::telemetry::TelemetryEventKind::AiGatewayFirstRequest,
                     )
@@ -518,7 +522,11 @@ async fn chat_completions(
                     "AI gateway request completed"
                 );
 
-                app_state.telemetry.report(
+                // Once-per-instance: "the AI gateway has been used here", not
+                // "an AI request happened". Guard so it fires once (carrying the
+                // provider of that first request), not on every request.
+                app_state.telemetry.report_once(
+                    "ai_gateway_first_request",
                     temps_core::telemetry::TelemetryEvent::new(
                         temps_core::telemetry::TelemetryEventKind::AiGatewayFirstRequest,
                     )

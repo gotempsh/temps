@@ -10992,6 +10992,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "sysinfo 0.29.11",
  "tar",
  "temps-agent",
  "temps-agents",
@@ -12675,7 +12676,9 @@ name = "temps-telemetry"
 version = "0.1.0-beta.36"
 dependencies = [
  "async-trait",
+ "chrono",
  "reqwest",
+ "sea-orm",
  "serde",
  "serde_json",
  "temps-config",

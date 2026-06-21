@@ -776,11 +776,15 @@ pub async fn record_event_metrics(
                 environment_id,
                 deployment_id
             );
-            state
-                .telemetry
-                .report(temps_core::telemetry::TelemetryEvent::new(
+            // Once-per-instance: this event means "analytics is in use on this
+            // instance", not "an analytics event arrived". Guard it so it fires
+            // once in the instance's lifetime, not on every pageview.
+            state.telemetry.report_once(
+                "analytics_first_event_received",
+                temps_core::telemetry::TelemetryEvent::new(
                     temps_core::telemetry::TelemetryEventKind::AnalyticsFirstEventReceived,
-                ));
+                ),
+            );
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => {
@@ -902,11 +906,14 @@ pub async fn record_console_event(
         "Console event recorded: {} for project {} env={}",
         payload.event_name, project_id, payload.environment_id
     );
-    state
-        .telemetry
-        .report(temps_core::telemetry::TelemetryEvent::new(
+    // Once-per-instance (see record_event): guard so this fires once, not on
+    // every console-ingested event.
+    state.telemetry.report_once(
+        "analytics_first_event_received",
+        temps_core::telemetry::TelemetryEvent::new(
             temps_core::telemetry::TelemetryEventKind::AnalyticsFirstEventReceived,
-        ));
+        ),
+    );
 
     Ok(StatusCode::OK)
 }

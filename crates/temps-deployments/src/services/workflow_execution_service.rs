@@ -1732,7 +1732,12 @@ impl WorkflowExecutionService {
                     .with_opt("source_type", telemetry_source_type.clone())
                     .with_opt("preset", telemetry_preset.clone()),
                 );
-                telemetry.report(
+                // Once-per-instance: "this instance shipped its first deploy".
+                // Guard so it fires once (the central API previously deduped
+                // this; report_once makes the binary itself emit exactly once),
+                // not on every successful deploy.
+                telemetry.report_once(
+                    "first_deploy_succeeded",
                     temps_core::telemetry::TelemetryEvent::new(
                         temps_core::telemetry::TelemetryEventKind::FirstDeploySucceeded,
                     )

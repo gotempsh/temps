@@ -240,6 +240,27 @@ pub trait TelemetryReporter: Send + Sync {
     /// Report an event. Never blocks on the network and never fails the caller.
     fn report(&self, event: TelemetryEvent);
 
+    /// Report a "first-touch" milestone event **at most once per instance, ever**.
+    ///
+    /// Use this for events whose name promises a single lifetime occurrence
+    /// (e.g. `analytics_first_event_received`, `ai_gateway_first_request`,
+    /// `first_deploy_succeeded`) but whose callsite fires per-action (every
+    /// pageview / request / deploy). Without this guard those events become a
+    /// firehose: telemetry volume scales with the self-hoster's production
+    /// traffic, which both skews the metric and leaks a coarse activity signal.
+    ///
+    /// `milestone` is a stable key (use the event's wire name) used to dedupe.
+    /// Implementations MUST be fire-and-forget like [`Self::report`] and MUST
+    /// guarantee the hot path stays cheap (an in-process check before any
+    /// durable lookup), so a busy instance pays no per-event cost after the
+    /// first emit.
+    ///
+    /// The default implementation simply forwards to [`Self::report`] every time
+    /// (no dedupe) — concrete reporters override it with the real once-guard.
+    fn report_once(&self, _milestone: &'static str, event: TelemetryEvent) {
+        self.report(event);
+    }
+
     /// Whether telemetry is currently enabled. Callsites can use this to skip
     /// building expensive property bags when reporting is off.
     fn is_enabled(&self) -> bool;
