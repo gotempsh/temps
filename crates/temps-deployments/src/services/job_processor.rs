@@ -313,7 +313,8 @@ async fn find_environments_for_branch(
     if !matched_envs.is_empty() {
         info!(
             "Found {} environment(s) matching branch '{}'",
-            matched_envs.len(), branch_name
+            matched_envs.len(),
+            branch_name
         );
         return Ok(matched_envs);
     }
@@ -604,9 +605,9 @@ fn is_automatic_deploy_enabled(
 ) -> bool {
     // Environment-level explicit value takes precedence; fall back to project then false.
     let effective = match (project_config, environment_config) {
-        (_, Some(env_cfg)) => env_cfg.automatic_deploy.or_else(|| {
-            project_config.and_then(|p| p.automatic_deploy)
-        }),
+        (_, Some(env_cfg)) => env_cfg
+            .automatic_deploy
+            .or_else(|| project_config.and_then(|p| p.automatic_deploy)),
         (Some(project_cfg), None) => project_cfg.automatic_deploy,
         (None, None) => None,
     };
@@ -655,9 +656,7 @@ async fn process_git_push_event(
     // track the same branch; each is deployed independently according to its
     // own automatic_deploy policy (env-wins semantics).
     let environments =
-        match find_environments_for_branch(db.clone(), &project, job.branch.as_deref())
-            .await
-        {
+        match find_environments_for_branch(db.clone(), &project, job.branch.as_deref()).await {
             Ok(envs) => envs,
             Err(e) => {
                 error!(
@@ -676,8 +675,8 @@ async fn process_git_push_event(
         return;
     }
 
-    use sea_orm::{EntityTrait, PaginatorTrait, QueryOrder};
     use chrono::Utc;
+    use sea_orm::{EntityTrait, PaginatorTrait, QueryOrder};
 
     // Fetch commit info once — it's the same for every environment receiving this push.
     let commit_info =
@@ -759,7 +758,12 @@ async fn process_git_push_event(
             .filter(deployments::Column::ProjectId.eq(project.id))
             .filter(deployments::Column::EnvironmentId.eq(environment.id))
             .filter(deployments::Column::CommitSha.eq(&job.commit))
-            .filter(deployments::Column::State.is_in(vec!["pending", "running", "deploying", "ready"]))
+            .filter(deployments::Column::State.is_in(vec![
+                "pending",
+                "running",
+                "deploying",
+                "ready",
+            ]))
             .order_by_desc(deployments::Column::CreatedAt)
             .one(db.as_ref())
             .await;
@@ -799,7 +803,10 @@ async fn process_git_push_event(
                 .as_ref()
                 .map(|b| b.replace(['/', '_', '.'], "-").to_lowercase())
                 .unwrap_or_else(|| "unknown".to_string());
-            format!("{}-{}-{}", project.slug, sanitized_branch, deployment_number)
+            format!(
+                "{}-{}-{}",
+                project.slug, sanitized_branch, deployment_number
+            )
         } else {
             format!("{}-{}", project.slug, deployment_number)
         };
@@ -814,8 +821,8 @@ async fn process_git_push_event(
             environment.deployment_config.clone()
         };
 
-        let deployment_config_snapshot =
-            merged_config.map(|config| DeploymentConfigSnapshot::from_config(&config, HashMap::new()));
+        let deployment_config_snapshot = merged_config
+            .map(|config| DeploymentConfigSnapshot::from_config(&config, HashMap::new()));
 
         let deployment_metadata = DeploymentMetadata {
             git_push_event: Some(GitPushEvent {
@@ -893,7 +900,8 @@ async fn process_git_push_event(
             Ok(created_jobs) => {
                 info!(
                     "Created {} jobs for deployment {} from GitPushEvent",
-                    created_jobs.len(), deployment_id
+                    created_jobs.len(),
+                    deployment_id
                 );
 
                 match JobProcessorService::update_deployment_status(
@@ -916,7 +924,10 @@ async fn process_git_push_event(
                     .await
                 {
                     Ok(_) => {
-                        info!("Workflow execution completed for deployment {}", deployment_id);
+                        info!(
+                            "Workflow execution completed for deployment {}",
+                            deployment_id
+                        );
                     }
                     Err(e) => {
                         let error_message = format!("{}", e);
@@ -1576,9 +1587,10 @@ mod tests {
         let production_env = production_env.insert(db.as_ref()).await?;
 
         // Test finding environment for "main" branch
-        let found_env =
-            find_or_create_environment_for_branch(db.clone(), &project, Some("main")).await?;
+        let found_envs = find_environments_for_branch(db.clone(), &project, Some("main")).await?;
 
+        assert_eq!(found_envs.len(), 1, "exactly one env matches branch 'main'");
+        let found_env = &found_envs[0];
         assert_eq!(found_env.id, production_env.id);
         assert_eq!(found_env.name, "Production");
         assert_eq!(found_env.branch, Some("main".to_string()));
@@ -1644,10 +1656,11 @@ mod tests {
         let preview_env = preview_env.insert(db.as_ref()).await?;
 
         // Test finding environment for "feature-auth" branch (no exact match)
-        let found_env =
-            find_or_create_environment_for_branch(db.clone(), &project, Some("feature-auth"))
-                .await?;
+        let found_envs =
+            find_environments_for_branch(db.clone(), &project, Some("feature-auth")).await?;
 
+        assert_eq!(found_envs.len(), 1, "falls back to the single preview env");
+        let found_env = &found_envs[0];
         assert_eq!(found_env.id, preview_env.id);
         assert_eq!(found_env.name, "preview");
         assert_eq!(found_env.branch, None); // Preview has no specific branch
@@ -1706,11 +1719,12 @@ mod tests {
         assert!(preview_before.is_none(), "Preview should not exist yet");
 
         // Test finding environment for "feature-xyz" branch (should create preview)
-        let found_env =
-            find_or_create_environment_for_branch(db.clone(), &project, Some("feature-xyz"))
-                .await?;
+        let found_envs =
+            find_environments_for_branch(db.clone(), &project, Some("feature-xyz")).await?;
 
         // Verify preview environment was created
+        assert_eq!(found_envs.len(), 1, "creates one generic preview env");
+        let found_env = &found_envs[0];
         assert_eq!(found_env.name, "preview");
         assert_eq!(found_env.slug, "preview");
         assert_eq!(found_env.subdomain, "auto-create-preview-test-preview");
@@ -1772,19 +1786,22 @@ mod tests {
         let _production_env = _production_env.insert(db.as_ref()).await?;
 
         // Find environment for first feature branch (creates preview)
-        let env1 =
-            find_or_create_environment_for_branch(db.clone(), &project, Some("feature-auth"))
-                .await?;
+        let envs1 =
+            find_environments_for_branch(db.clone(), &project, Some("feature-auth")).await?;
 
         // Find environment for second feature branch (reuses preview)
-        let env2 =
-            find_or_create_environment_for_branch(db.clone(), &project, Some("feature-payments"))
-                .await?;
+        let envs2 =
+            find_environments_for_branch(db.clone(), &project, Some("feature-payments")).await?;
 
         // Find environment for third feature branch (reuses preview)
-        let env3 =
-            find_or_create_environment_for_branch(db.clone(), &project, Some("bugfix-login"))
-                .await?;
+        let envs3 =
+            find_environments_for_branch(db.clone(), &project, Some("bugfix-login")).await?;
+
+        // Each call returns exactly the one shared preview environment
+        assert_eq!(envs1.len(), 1);
+        assert_eq!(envs2.len(), 1);
+        assert_eq!(envs3.len(), 1);
+        let (env1, env2, env3) = (&envs1[0], &envs2[0], &envs3[0]);
 
         // All three should return the same preview environment
         assert_eq!(env1.id, env2.id);
@@ -1863,10 +1880,11 @@ mod tests {
         let _env2 = _env2.insert(db.as_ref()).await?;
 
         // Test finding environment with no branch specified
-        let found_env = find_or_create_environment_for_branch(db.clone(), &project, None).await?;
+        let found_envs = find_environments_for_branch(db.clone(), &project, None).await?;
 
-        // Should return first environment (by database order)
-        assert_eq!(found_env.id, env1.id);
+        // Should return the first environment (by database order)
+        assert_eq!(found_envs.len(), 1, "no branch → single first env");
+        assert_eq!(found_envs[0].id, env1.id);
 
         Ok(())
     }
@@ -1932,10 +1950,11 @@ mod tests {
 
         // Test finding environment for feature branch
         // Should create NEW preview (ignore deleted one)
-        let found_env =
-            find_or_create_environment_for_branch(db.clone(), &project, Some("feature-test"))
-                .await?;
+        let found_envs =
+            find_environments_for_branch(db.clone(), &project, Some("feature-test")).await?;
 
+        assert_eq!(found_envs.len(), 1, "creates one fresh preview env");
+        let found_env = &found_envs[0];
         assert_eq!(found_env.name, "preview");
         assert!(
             found_env.deleted_at.is_none(),

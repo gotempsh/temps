@@ -989,8 +989,8 @@ impl DomainService {
                 // This prevents burning LE rate limits when concurrent TLS handshakes
                 // all race to trigger on-demand issuance before the cert is in place.
                 if existing.status == "active"
-                    && existing.certificate.as_deref().unwrap_or("").len() > 0
-                    && existing.private_key.as_deref().unwrap_or("").len() > 0
+                    && !existing.certificate.as_deref().unwrap_or("").is_empty()
+                    && !existing.private_key.as_deref().unwrap_or("").is_empty()
                 {
                     info!(
                         hostname = %hostname,
