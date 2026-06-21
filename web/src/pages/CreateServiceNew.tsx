@@ -2,6 +2,7 @@ import {
   adminListNodesOptions,
   createServiceMutation,
   getProviderMetadataOptions,
+  getProvidersMetadataOptions,
   getServiceTypeParametersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import {
@@ -410,22 +411,60 @@ export function CreateService() {
     })
   }
 
+  const { data: providers, isLoading: isLoadingProviders } = useQuery({
+    ...getProvidersMetadataOptions(),
+    enabled: !serviceType,
+  })
+
   if (!serviceType) {
     return (
       <div className="flex-1 overflow-auto">
         <div className="sm:p-4 space-y-6 md:p-6 max-w-4xl mx-auto">
-          <div className="space-y-2">
+          <div className="space-y-1">
+            <Link to="/storage">
+              <Button variant="ghost" size="sm" className="gap-2 -ml-2 mb-2">
+                <ArrowLeft className="h-4 w-4" />
+                Back to Databases
+              </Button>
+            </Link>
             <h1 className="text-2xl font-semibold">Create Service</h1>
-            <p className="text-muted-foreground">
-              Please select a service type from the URL parameter.
-            </p>
+            <p className="text-muted-foreground">Choose a service type to get started.</p>
           </div>
-          <Link to="/storage">
-            <Button variant="outline">
-              <ArrowLeft className="h-4 w-4 mr-2" />
-              Back to Storage
-            </Button>
-          </Link>
+          {isLoadingProviders ? (
+            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
+              {[...Array(6)].map((_, i) => (
+                <div key={i} className="h-24 bg-muted animate-pulse rounded-lg" />
+              ))}
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
+              {providers?.map((provider) => (
+                <button
+                  key={provider.service_type}
+                  type="button"
+                  onClick={() => navigate(`/storage/create?type=${provider.service_type}`)}
+                  className="flex items-center gap-4 rounded-lg border p-4 text-left hover:bg-accent transition-colors"
+                >
+                  <div
+                    className="flex items-center justify-center rounded-md p-2 shrink-0"
+                    style={{ backgroundColor: provider.color }}
+                  >
+                    <img
+                      src={provider.icon_url}
+                      alt={provider.display_name}
+                      width={28}
+                      height={28}
+                      className="brightness-0 invert"
+                    />
+                  </div>
+                  <div className="min-w-0">
+                    <p className="font-medium">{provider.display_name}</p>
+                    <p className="text-xs text-muted-foreground truncate">{provider.description}</p>
+                  </div>
+                </button>
+              ))}
+            </div>
+          )}
         </div>
       </div>
     )

@@ -295,6 +295,24 @@ pub type OnSleepingCallback =
 pub type OnReloadCallback =
     Arc<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
 
+/// Async callback fired after every successful `load_routes()` with the list of
+/// hostnames that have `cert_eligible = true` in the new route table.
+///
+/// Used by the on-demand TLS manager (ADR-018) to eagerly pre-provision
+/// certificates the moment a deployment goes live, so the cert is ready before
+/// the user's first HTTPS request rather than provisioning on the first handshake
+/// (which produces a visible `ERR_TLS_HANDSHAKE` for the first visitor).
+///
+/// The callback receives only cert-eligible hostnames (stable per-environment
+/// aliases, not ephemeral per-deployment slugs). The on-demand manager's own gate
+/// checks (dedup, backoff, rate-limit, zone) still apply inside the callback, so
+/// calling it on every reload is idempotent.
+pub type OnCertEligibleCallback = Arc<
+    dyn Fn(Vec<String>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
 pub struct CachedPeerTable {
     /// Exact hostname -> RouteInfo for HTTP routes (route_type = 'http')
     /// Used for matching on HTTP Host header (Layer 7)
@@ -325,6 +343,12 @@ pub struct CachedPeerTable {
     /// in lockstep with the route table.
     on_reload_callback: parking_lot::Mutex<Option<OnReloadCallback>>,
 
+    /// Optional async callback invoked after each successful reload with
+    /// the list of cert-eligible hostnames. Used for eager TLS pre-provisioning
+    /// (ADR-018): the proxy wires the on-demand cert manager here so new
+    /// deployment routes get a cert issued before the first HTTPS request.
+    on_cert_eligible_callback: parking_lot::Mutex<Option<OnCertEligibleCallback>>,
+
     /// Monotonically increasing version of the in-memory `routes` map.
     /// Bumped at the end of every successful `load_routes()`. Workers
     /// long-poll `GET /internal/.../routes/snapshot?since=N` and the
@@ -351,6 +375,7 @@ impl CachedPeerTable {
             db,
             on_sleeping_callback: parking_lot::Mutex::new(None),
             on_reload_callback: parking_lot::Mutex::new(None),
+            on_cert_eligible_callback: parking_lot::Mutex::new(None),
             generation: std::sync::atomic::AtomicU64::new(0),
             generation_changed: Arc::new(tokio::sync::Notify::new()),
         }
@@ -411,6 +436,27 @@ impl CachedPeerTable {
     /// FQDN records in lockstep with the route table.
     pub fn set_on_reload_callback(&self, callback: OnReloadCallback) {
         *self.on_reload_callback.lock() = Some(callback);
+    }
+
+    /// Set an async callback fired after every successful `load_routes()` with
+    /// the list of cert-eligible hostnames in the new route table. Used by the
+    /// proxy to eagerly pre-provision TLS certificates (ADR-018) so new
+    /// deployments get a cert before the first HTTPS request arrives.
+    pub fn set_on_cert_eligible_callback(&self, callback: OnCertEligibleCallback) {
+        *self.on_cert_eligible_callback.lock() = Some(callback);
+    }
+
+    /// Return all currently-loaded hostnames with `cert_eligible = true`.
+    ///
+    /// Used for an immediate one-time provisioning pass after the cert manager
+    /// is wired up (covers domains already in the table from the initial load).
+    pub fn cert_eligible_hosts(&self) -> Vec<String> {
+        self.routes
+            .read()
+            .iter()
+            .filter(|(_, r)| r.cert_eligible)
+            .map(|(host, _)| host.clone())
+            .collect()
     }
 
     /// Get route by HTTP Host header
@@ -1526,6 +1572,26 @@ impl CachedPeerTable {
             tokio::spawn(async move {
                 callback().await;
             });
+        }
+
+        // Eager TLS pre-provisioning (ADR-018): fire the cert-eligible callback
+        // with the stable per-environment hostnames from the just-loaded table.
+        // The proxy wires the on-demand cert manager here so every new deployment
+        // gets a cert issued immediately rather than on the first failing handshake.
+        let on_cert_eligible = self.on_cert_eligible_callback.lock().as_ref().cloned();
+        if let Some(callback) = on_cert_eligible {
+            let cert_hosts: Vec<String> = self
+                .routes
+                .read()
+                .iter()
+                .filter(|(_, r)| r.cert_eligible)
+                .map(|(host, _)| host.clone())
+                .collect();
+            if !cert_hosts.is_empty() {
+                tokio::spawn(async move {
+                    callback(cert_hosts).await;
+                });
+            }
         }
 
         // Persist the new generation into the durable singleton so

@@ -233,6 +233,7 @@ impl EnvironmentService {
             return Ok(restored);
         }
 
+        let name = name.to_lowercase();
         let env_slug = slugify(&name);
 
         // Create main_url using project_slug-env_slug format
@@ -511,6 +512,7 @@ impl EnvironmentService {
         }
 
         // Generate the environment identifier
+        let name = name.to_lowercase();
         let env_slug = slugify(&name);
 
         // Create main_url using project_slug-env_slug format
@@ -606,7 +608,7 @@ impl EnvironmentService {
             deployment_config.replicas = replicas;
         }
         if let Some(automatic_deploy) = settings.automatic_deploy {
-            deployment_config.automatic_deploy = automatic_deploy;
+            deployment_config.automatic_deploy = Some(automatic_deploy);
         }
         if let Some(performance_metrics_enabled) = settings.performance_metrics_enabled {
             deployment_config.performance_metrics_enabled = performance_metrics_enabled;

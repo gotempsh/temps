@@ -6,6 +6,7 @@ use temps_core::CookieCrypto;
 use temps_database::DbConnection;
 use temps_deployer::ContainerDeployer;
 use temps_proxy::on_demand::{ContainerLifecycle, OnDemandError, OnDemandManager};
+use temps_proxy::on_demand_cert::EnqueueOutcome;
 use temps_proxy::ProxyShutdownSignal;
 use tracing::{info, warn};
 
@@ -181,6 +182,59 @@ pub fn start_proxy_server(
         )),
         None => None,
     };
+
+    // ADR-018 eager cert pre-provisioning: wire the on-demand cert manager into
+    // the route table so every `load_routes()` call — triggered by new
+    // deployments — immediately enqueues TLS issuance for each cert-eligible
+    // hostname. The existing gate checks (dedup, backoff, rate-limit, zone) inside
+    // `try_enqueue` make this idempotent: only genuinely new or retryable hosts
+    // produce issuance jobs. This eliminates the `ERR_TLS_HANDSHAKE` on the first
+    // request to a freshly-deployed app.
+    if let Some(ref cert_manager) = on_demand_cert_manager {
+        let cert_manager_for_callback = cert_manager.clone();
+        route_table.set_on_cert_eligible_callback(std::sync::Arc::new(
+            move |hostnames: Vec<String>| {
+                let cert_manager = cert_manager_for_callback.clone();
+                Box::pin(async move {
+                    let mut enqueued = 0u32;
+                    for hostname in &hostnames {
+                        if let EnqueueOutcome::Enqueued = cert_manager.try_enqueue(hostname, None)
+                        {
+                            enqueued += 1;
+                        }
+                    }
+                    if enqueued > 0 {
+                        tracing::info!(
+                            enqueued,
+                            total = hostnames.len(),
+                            "on-demand TLS: eagerly pre-provisioning {} cert(s) for new/updated routes",
+                            enqueued
+                        );
+                    }
+                }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+            },
+        ));
+
+        // One-time immediate pass for cert-eligible routes already in the table
+        // (populated by the initial load that runs before this code executes).
+        let initial_hosts = route_table.cert_eligible_hosts();
+        if !initial_hosts.is_empty() {
+            let mut enqueued = 0u32;
+            for hostname in &initial_hosts {
+                if let EnqueueOutcome::Enqueued = cert_manager.try_enqueue(hostname, None) {
+                    enqueued += 1;
+                }
+            }
+            if enqueued > 0 {
+                tracing::info!(
+                    enqueued,
+                    total = initial_hosts.len(),
+                    "on-demand TLS: eagerly pre-provisioning {} cert(s) for existing routes at startup",
+                    enqueued
+                );
+            }
+        }
+    }
 
     let proxy_config = temps_proxy::ProxyConfig {
         address,

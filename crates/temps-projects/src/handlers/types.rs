@@ -345,8 +345,7 @@ impl ProjectResponse {
                 automatic_deploy: project
                     .deployment_config
                     .clone()
-                    .map(|c| c.automatic_deploy)
-                    .unwrap_or(false),
+                    .and_then(|c| c.automatic_deploy),
                 performance_metrics_enabled: project
                     .deployment_config
                     .clone()

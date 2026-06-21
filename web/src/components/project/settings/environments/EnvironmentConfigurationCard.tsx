@@ -113,6 +113,7 @@ export function EnvironmentConfigurationCard({
     anti_affinity: environment.deployment_config?.antiAffinity ?? true,
     target_nodes: (environment.deployment_config?.targetNodes ?? []) as number[],
     target_labels: (environment.deployment_config?.targetLabels ?? {}) as Record<string, string>,
+    automatic_deploy: environment.deployment_config?.automaticDeploy ?? true,
     on_demand: environment.deployment_config?.onDemand ?? false,
     idle_timeout_seconds: environment.deployment_config?.idleTimeoutSeconds?.toString() ?? '300',
     wake_timeout_seconds: environment.deployment_config?.wakeTimeoutSeconds?.toString() ?? '30',
@@ -166,7 +167,8 @@ export function EnvironmentConfigurationCard({
       anti_affinity: environment.deployment_config?.antiAffinity ?? true,
       target_nodes: (environment.deployment_config?.targetNodes ?? []) as number[],
       target_labels: (environment.deployment_config?.targetLabels ?? {}) as Record<string, string>,
-      on_demand: environment.deployment_config?.onDemand ?? false,
+      automatic_deploy: environment.deployment_config?.automaticDeploy ?? true,
+    on_demand: environment.deployment_config?.onDemand ?? false,
       idle_timeout_seconds: environment.deployment_config?.idleTimeoutSeconds?.toString() ?? '300',
       wake_timeout_seconds: environment.deployment_config?.wakeTimeoutSeconds?.toString() ?? '30',
       password_enabled: environment.deployment_config?.security?.passwordProtection?.enabled ?? false,
@@ -239,6 +241,7 @@ export function EnvironmentConfigurationCard({
           ? parseInt(formData.exposed_port)
           : null,
         protected: formData.protected,
+        automatic_deploy: formData.automatic_deploy,
         // Tri-state: null clears the override (inherit project), true/false force it.
         attack_mode: attackModeToPayload(formData.attack_mode),
         anti_affinity: formData.anti_affinity,
@@ -300,6 +303,22 @@ export function EnvironmentConfigurationCard({
                 <p className="text-xs text-muted-foreground mt-2">
                   Deployments will be triggered from this branch
                 </p>
+              </div>
+
+              {/* Deploy on push toggle */}
+              <div className="flex items-start sm:items-center gap-3 p-3 border rounded-lg mt-4">
+                <div className="flex-1 min-w-0">
+                  <Label className="text-sm font-medium">Deploy on push</Label>
+                  <p className="text-xs text-muted-foreground">
+                    Automatically deploy when a commit is pushed to this branch. Disable to deploy on demand only.
+                  </p>
+                </div>
+                <Switch
+                  checked={formData.automatic_deploy}
+                  onCheckedChange={(checked) =>
+                    setFormData((prev) => ({ ...prev, automatic_deploy: checked }))
+                  }
+                />
               </div>
             </div>
 

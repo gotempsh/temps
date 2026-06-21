@@ -54,11 +54,19 @@ impl CertificateLoader {
         &self,
         domain: &str,
     ) -> Result<Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>> {
+        // Do NOT filter by status: any domain row with both certificate and
+        // private_key populated can serve TLS regardless of ACME lifecycle state.
+        // This prevents two failure modes:
+        //   1. A valid cert becoming unserveable while re-issuance is in progress
+        //      (request_challenge sets status → "challenge_requested", which is not
+        //      in CERT_SERVING_STATUSES, so the old cert would stop being served
+        //      during the ~5-second challenge window — triggering concurrent retries
+        //      that exhaust the LE "5 duplicate certs per 7 days" limit).
+        //   2. An "on_demand_failed" domain row still holding a valid unexpired cert
+        //      (e.g. when rate-limited) becoming completely unserveable instead of
+        //      continuing to serve the last-known-good cert.
         let domain_entity = domains::Entity::find()
             .filter(domains::Column::Domain.eq(domain))
-            // Serve the cert for "active" AND "active_renewal_failed": the latter still
-            // holds a valid cert (renewal failed but it hasn't expired yet).
-            .filter(domains::Column::Status.is_in(domains::CERT_SERVING_STATUSES))
             .one(self.db.as_ref())
             .await?;
 
