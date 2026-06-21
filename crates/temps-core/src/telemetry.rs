@@ -31,6 +31,7 @@ use std::collections::BTreeMap;
 pub enum TelemetryEventKind {
     // ---- Instance lifecycle ----
     InstanceStarted,
+    InstanceHeartbeat,
     InstanceSetupCompleted,
     UpgradeCompleted,
     WorkerNodeJoined,
@@ -91,6 +92,7 @@ impl TelemetryEventKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::InstanceStarted => "instance_started",
+            Self::InstanceHeartbeat => "instance_heartbeat",
             Self::InstanceSetupCompleted => "instance_setup_completed",
             Self::UpgradeCompleted => "upgrade_completed",
             Self::WorkerNodeJoined => "worker_node_joined",
@@ -142,6 +144,7 @@ impl TelemetryEventKind {
     pub fn all() -> &'static [TelemetryEventKind] {
         &[
             Self::InstanceStarted,
+            Self::InstanceHeartbeat,
             Self::InstanceSetupCompleted,
             Self::UpgradeCompleted,
             Self::WorkerNodeJoined,
@@ -276,8 +279,8 @@ mod tests {
     fn all_covers_every_variant() {
         // If a variant is added but not added to all(), as_str() on it will be
         // missing from the list and this length check is a cheap tripwire.
-        // 34 events as of the initial product-telemetry design.
-        assert_eq!(TelemetryEventKind::all().len(), 34);
+        // 35 events (34 initial + instance_heartbeat).
+        assert_eq!(TelemetryEventKind::all().len(), 35);
     }
 
     #[test]

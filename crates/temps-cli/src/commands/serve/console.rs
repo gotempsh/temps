@@ -90,11 +90,24 @@ async fn report_instance_started(
     reporter: &dyn temps_core::telemetry::TelemetryReporter,
     db: &sea_orm::DatabaseConnection,
 ) {
-    use sea_orm::PaginatorTrait;
-    use temps_core::telemetry::{TelemetryEvent, TelemetryEventKind};
+    use temps_core::telemetry::TelemetryEventKind;
+    reporter.report(build_instance_event(TelemetryEventKind::InstanceStarted, db).await);
+}
 
-    // Each count is independent and optional — a failure on one doesn't block
-    // the others or the event itself.
+/// Build an instance lifecycle/heartbeat event carrying the same set of
+/// non-identifying depth-of-usage counts (projects, environments, managed
+/// services, worker nodes). Shared by `instance_started` and the periodic
+/// `instance_heartbeat` so both report the fleet snapshot identically.
+///
+/// Each count is independent and optional — a failure on one doesn't block the
+/// others or the event itself.
+async fn build_instance_event(
+    kind: temps_core::telemetry::TelemetryEventKind,
+    db: &sea_orm::DatabaseConnection,
+) -> temps_core::telemetry::TelemetryEvent {
+    use sea_orm::PaginatorTrait;
+    use temps_core::telemetry::TelemetryEvent;
+
     let project_count = temps_entities::projects::Entity::find()
         .count(db)
         .await
@@ -109,13 +122,47 @@ async fn report_instance_started(
         .ok();
     let node_count = temps_entities::nodes::Entity::find().count(db).await.ok();
 
-    let event = TelemetryEvent::new(TelemetryEventKind::InstanceStarted)
+    TelemetryEvent::new(kind)
         .with_opt("project_count", project_count.map(|c| c as i64))
         .with_opt("environment_count", environment_count.map(|c| c as i64))
         .with_opt("service_count", service_count.map(|c| c as i64))
-        .with_opt("node_count", node_count.map(|c| c as i64));
+        .with_opt("node_count", node_count.map(|c| c as i64))
+}
 
-    reporter.report(event);
+/// Interval between anonymous `instance_heartbeat` events. Daily — the minimum
+/// grain that keeps "active instances" (which is bucketed per day) accurate, so
+/// a live-but-idle instance still registers as active each day it's running.
+const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Spawn a detached task that emits an anonymous `instance_heartbeat` once per
+/// [`HEARTBEAT_INTERVAL`] for as long as the server runs. This is what makes the
+/// "active instances" metric mean "alive" rather than merely "did something" —
+/// an instance that isn't deploying today still checks in.
+///
+/// The very first heartbeat fires after one interval (the `instance_started`
+/// event already covers "active today" at boot, so we don't double-send on
+/// startup). Fully best-effort and respects opt-out: a disabled reporter makes
+/// `report()` a no-op, and a dead endpoint never affects the server.
+fn spawn_heartbeat_task(
+    reporter: std::sync::Arc<dyn temps_core::telemetry::TelemetryReporter>,
+    db: std::sync::Arc<sea_orm::DatabaseConnection>,
+) {
+    use temps_core::telemetry::TelemetryEventKind;
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+        // The first tick completes immediately; skip it so the first heartbeat
+        // lands one full interval after boot (boot is already covered by
+        // instance_started).
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let event =
+                build_instance_event(TelemetryEventKind::InstanceHeartbeat, db.as_ref()).await;
+            reporter.report(event);
+            tracing::debug!("emitted anonymous instance_heartbeat telemetry event");
+        }
+    });
 }
 
 /// This user is referenced by webhook-created resources (e.g., GitHub App installations)
@@ -1281,6 +1328,10 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     {
         if reporter.is_enabled() {
             report_instance_started(reporter.as_ref(), db.as_ref()).await;
+            // Keep "active instances" honest: a daily heartbeat so a live-but-idle
+            // instance still checks in even when it isn't deploying. No-op when
+            // telemetry is disabled (guarded above + report() no-ops anyway).
+            spawn_heartbeat_task(reporter.clone(), db.clone());
         }
     }
     if let Some(user_service) = service_context.get_service::<temps_auth::UserService>() {
