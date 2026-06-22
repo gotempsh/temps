@@ -22,8 +22,8 @@ pub enum OutputFormat {
 
 #[derive(Args)]
 pub struct ApiKeyCommand {
-    /// Database connection URL
-    #[arg(long, env = "TEMPS_DATABASE_URL")]
+    /// Database connection URL (set via TEMPS_DATABASE_URL env var; not accepted as a flag to prevent credentials leaking into process listings)
+    #[arg(long, env = "TEMPS_DATABASE_URL", hide_env_values = true)]
     pub database_url: String,
 
     /// Name for the API key (for identification)

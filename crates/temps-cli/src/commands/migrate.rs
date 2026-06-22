@@ -6,7 +6,7 @@
 //!
 //! ```text
 //!   1. Download the new temps binary
-//!   2. temps migrate --database-url=...   # apply schema changes, server down
+//!   2. TEMPS_DATABASE_URL=... temps migrate   # apply schema changes, server down
 //!   3. Restart the server with the new binary
 //! ```
 //!
@@ -39,8 +39,8 @@ use tracing::info;
 
 #[derive(Args)]
 pub struct MigrateCommand {
-    /// Database connection URL
-    #[arg(long, env = "TEMPS_DATABASE_URL")]
+    /// Database connection URL (set via TEMPS_DATABASE_URL env var; not accepted as a flag to prevent credentials leaking into process listings)
+    #[arg(long, env = "TEMPS_DATABASE_URL", hide_env_values = true)]
     pub database_url: String,
 
     /// Show the pending migrations and exit without applying them.

@@ -70,8 +70,8 @@ pub enum OutputFormat {
 
 #[derive(Args)]
 pub struct SetupCommand {
-    /// Database connection URL
-    #[arg(long, env = "TEMPS_DATABASE_URL")]
+    /// Database connection URL (set via TEMPS_DATABASE_URL env var; not accepted as a flag to prevent credentials leaking into process listings)
+    #[arg(long, env = "TEMPS_DATABASE_URL", hide_env_values = true)]
     pub database_url: String,
 
     /// Data directory for storing configuration and runtime files
@@ -2798,7 +2798,7 @@ fn finish_setup(
     println!();
     println!("   {} Start the server:", "1.".bright_cyan());
     println!(
-        "      {} temps serve --database-url=<URL>",
+        "      {} TEMPS_DATABASE_URL=<URL> temps serve",
         "$".bright_cyan()
     );
     println!();

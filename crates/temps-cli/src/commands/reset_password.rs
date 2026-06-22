@@ -11,8 +11,8 @@ use tracing::{debug, info};
 
 #[derive(Args)]
 pub struct ResetPasswordCommand {
-    /// Database connection URL
-    #[arg(long, env = "TEMPS_DATABASE_URL")]
+    /// Database connection URL (set via TEMPS_DATABASE_URL env var; not accepted as a flag to prevent credentials leaking into process listings)
+    #[arg(long, env = "TEMPS_DATABASE_URL", hide_env_values = true)]
     pub database_url: String,
 
     /// Data directory for storing configuration and runtime files
