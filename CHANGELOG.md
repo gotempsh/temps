@@ -14,7 +14,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **`--database-url` password no longer leaks into process listings.** When the
+  database URL was passed as a CLI flag (`temps serve --database-url=postgres://user:pass@host/db`),
+  the full connection string — including the password — was visible to any user
+  on the server via `pgrep -af`, `ps aux`, or `/proc/self/cmdline`. Temps now
+  scrubs the value from its own argv immediately after clap parses the args, so
+  the process table shows `xxx` in place of the real password. The `--help`
+  output also masks the env value (`hide_env_values`). The `--database-url` flag
+  continues to work for backwards compatibility; using `TEMPS_DATABASE_URL` as
+  an environment variable remains the recommended approach since env vars are
+  never visible in process listings.
 
 
 ## [0.1.0-beta.36] - 2026-06-20
