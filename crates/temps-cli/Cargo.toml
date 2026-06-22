@@ -119,6 +119,7 @@ glob = "0.3"
 uuid = { workspace = true }
 bytes = { workspace = true }
 http-body-util = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 # `tower`'s `util` feature provides `ServiceExt::oneshot`, used to drive the

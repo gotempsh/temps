@@ -105,8 +105,8 @@ struct ListBackupsArgs {
 
 #[derive(Args)]
 struct RestoreBackupArgs {
-    /// Database connection URL to restore to
-    #[arg(long, env = "TEMPS_DATABASE_URL")]
+    /// Database connection URL to restore to (set via TEMPS_DATABASE_URL env var; not accepted as a flag to prevent credentials leaking into process listings)
+    #[arg(long, env = "TEMPS_DATABASE_URL", hide_env_values = true)]
     database_url: String,
 
     /// S3 access key ID
@@ -172,8 +172,8 @@ struct RestoreServiceArgs {
     #[arg(long, env = "TEMPS_ENCRYPTION_KEY")]
     encryption_key: String,
 
-    /// Database URL for the temps database (needed to query service config)
-    #[arg(long, env = "TEMPS_DATABASE_URL")]
+    /// Database URL for the temps database (needed to query service config) (set via TEMPS_DATABASE_URL env var; not accepted as a flag to prevent credentials leaking into process listings)
+    #[arg(long, env = "TEMPS_DATABASE_URL", hide_env_values = true)]
     database_url: String,
 
     /// S3 region
