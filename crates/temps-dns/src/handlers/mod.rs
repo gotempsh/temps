@@ -12,19 +12,19 @@ pub mod dns_sync;
 pub mod managed_records;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{delete, get, post},
-    Extension, Json, Router,
+    Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_auth::{permission_check, Permission, RequireAuth};
-use temps_core::audit::{AuditContext, AuditOperation};
 use temps_core::problemdetails::{self, Problem};
-use temps_core::RequestMetadata;
-use tracing::error;
+use temps_core::{
+    AuditContext, AuditOperation, ForceRouteReloadJob, Job, PublicHostnameStrategy, RequestMetadata,
+};
 use utoipa::{OpenApi, ToSchema};
 
 use crate::errors::DnsError;
@@ -33,16 +33,81 @@ use crate::providers::{
     DnsZone, GcpCredentials, NamecheapCredentials, PebbleCredentials, ProviderCredentials,
     Route53Credentials,
 };
+use crate::services::hostname_sync::HostnameModeResult;
 use crate::services::{
     AddManagedDomainRequest, CreateProviderRequest, DnsProviderService, DnsRecordService,
     UpdateManagedDomainRequest, UpdateProviderRequest,
 };
+
+/// Audit record for managed-domain write operations.
+#[derive(Debug, Clone, serde::Serialize)]
+struct ManagedDomainAudit {
+    context: AuditContext,
+    provider_id: i32,
+    domain: String,
+    action: String,
+}
+
+impl AuditOperation for ManagedDomainAudit {
+    fn operation_type(&self) -> String {
+        self.action.clone()
+    }
+    fn user_id(&self) -> i32 {
+        self.context.user_id
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+impl From<HostnameModeResult> for HostnamePreviewResponse {
+    fn from(r: HostnameModeResult) -> Self {
+        let hostname_changes: Vec<HostnameChange> = r
+            .hostname_changes
+            .into_iter()
+            .map(|c| HostnameChange {
+                kind: c.kind,
+                id: c.id,
+                old: c.old,
+                new: c.new,
+            })
+            .collect();
+        let dns_changes: Vec<DnsRecordChange> = r
+            .dns_changes
+            .into_iter()
+            .map(|c| DnsRecordChange {
+                action: c.action,
+                name: c.name,
+                record_type: c.record_type,
+                value: c.value,
+            })
+            .collect();
+        let total = hostname_changes.len() + dns_changes.len();
+        HostnamePreviewResponse {
+            hostname_changes,
+            dns_changes,
+            zone_access_ok: r.zone_access_ok,
+            total,
+        }
+    }
+}
 
 /// Application state for DNS handlers
 pub struct DnsAppState {
     pub provider_service: Arc<DnsProviderService>,
     pub record_service: Arc<DnsRecordService>,
     pub managed_record_service: Arc<crate::services::ManagedDnsRecordService>,
+    /// Queue used to trigger a route reload after a hostname-mode change so
+    /// derived (Standard/Flat) hostnames take effect.
+    pub queue: Arc<dyn temps_core::JobQueue>,
+    /// Audit logger for write operations.
     pub audit_service: Arc<dyn temps_core::AuditLogger>,
 }
 
@@ -211,6 +276,9 @@ pub struct DnsProviderResponse {
     pub description: Option<String>,
     pub last_used_at: Option<String>,
     pub last_error: Option<String>,
+    /// Whether this provider benefits from the flat hostname mode (e.g. Cloudflare
+    /// Universal SSL). The UI surfaces/recommends the Flat toggle when true.
+    pub flat_hostnames_supported: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -224,47 +292,40 @@ pub struct AddManagedDomainApiRequest {
     pub auto_manage: bool,
     #[serde(default)]
     pub proxied_by_default: bool,
-}
-
-#[derive(Debug, Clone, Deserialize, ToSchema)]
-pub struct UpdateManagedDomainApiRequest {
-    pub auto_manage: Option<bool>,
-    pub proxied_by_default: Option<bool>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct ManagedDomainUpdatedAudit {
-    context: AuditContext,
-    provider_id: i32,
-    domain: String,
-    auto_manage: bool,
-    proxied_by_default: bool,
-}
-
-impl AuditOperation for ManagedDomainUpdatedAudit {
-    fn operation_type(&self) -> String {
-        "DNS_MANAGED_DOMAIN_UPDATED".to_string()
-    }
-
-    fn user_id(&self) -> i32 {
-        self.context.user_id
-    }
-
-    fn ip_address(&self) -> Option<String> {
-        self.context.ip_address.clone()
-    }
-
-    fn user_agent(&self) -> &str {
-        &self.context.user_agent
-    }
-
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(anyhow::Error::from)
-    }
+    /// Generated hostname layout: `"standard"` (default) or `"flat"`.
+    #[serde(default)]
+    pub generated_hostname_mode: Option<String>,
+    /// Opt in to reconciling generated hostnames into this domain's DNS zone.
+    #[serde(default)]
+    pub sync_generated_records: bool,
 }
 
 fn default_true() -> bool {
     true
+}
+
+/// Request to update a managed domain's settings.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct UpdateManagedDomainApiRequest {
+    /// `"standard"` or `"flat"`. Persisted as-is; switching to `"flat"` does not
+    /// recompute existing hostnames — use the apply endpoint for that.
+    pub generated_hostname_mode: Option<String>,
+    /// Toggle DNS record sync for this domain.
+    pub sync_generated_records: Option<bool>,
+    /// Toggle automatic DNS management for this domain.
+    pub auto_manage: Option<bool>,
+    /// Default proxy mode for newly managed records; `false` is an explicit override.
+    pub proxied_by_default: Option<bool>,
+}
+
+/// Request to apply a hostname mode (recompute + optional DNS sync).
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct ApplyHostnameModeRequest {
+    /// Target mode to apply: `"standard"` or `"flat"`.
+    pub mode: String,
+    /// Also reconcile the provider's DNS zone for the affected hostnames.
+    #[serde(default)]
+    pub sync_dns: bool,
 }
 
 /// Managed domain response
@@ -279,26 +340,70 @@ pub struct ManagedDomainResponse {
     pub verified: bool,
     pub verified_at: Option<String>,
     pub verification_error: Option<String>,
+    /// Generated hostname layout: `"standard"` or `"flat"`.
+    pub generated_hostname_mode: String,
+    /// Whether generated hostnames are reconciled into the provider's DNS zone.
+    pub sync_generated_records: bool,
+    /// Last token zone-access check: `Some(true)`/`Some(false)`/`None` (unchecked).
+    pub zone_access_ok: Option<bool>,
+    /// Detail for a failed zone-access check.
+    pub zone_access_error: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
 
 impl From<temps_entities::dns_managed_domains::Model> for ManagedDomainResponse {
-    fn from(managed: temps_entities::dns_managed_domains::Model) -> Self {
+    fn from(d: temps_entities::dns_managed_domains::Model) -> Self {
         Self {
-            id: managed.id,
-            provider_id: managed.provider_id,
-            domain: managed.domain,
-            zone_id: managed.zone_id,
-            auto_manage: managed.auto_manage,
-            proxied_by_default: managed.proxied_by_default,
-            verified: managed.verified,
-            verified_at: managed.verified_at.map(|time| time.to_rfc3339()),
-            verification_error: managed.verification_error,
-            created_at: managed.created_at.to_rfc3339(),
-            updated_at: managed.updated_at.to_rfc3339(),
+            id: d.id,
+            provider_id: d.provider_id,
+            domain: d.domain,
+            zone_id: d.zone_id,
+            auto_manage: d.auto_manage,
+            proxied_by_default: d.proxied_by_default,
+            verified: d.verified,
+            verified_at: d.verified_at.map(|t| t.to_rfc3339()),
+            verification_error: d.verification_error,
+            generated_hostname_mode: d.generated_hostname_mode,
+            sync_generated_records: d.sync_generated_records,
+            zone_access_ok: d.zone_access_ok,
+            zone_access_error: d.zone_access_error,
+            created_at: d.created_at.to_rfc3339(),
+            updated_at: d.updated_at.to_rfc3339(),
         }
     }
+}
+
+/// A single generated-hostname change in a flatten preview/apply.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct HostnameChange {
+    /// `"deployment"` or `"environment"`.
+    pub kind: String,
+    /// Row id of the affected record.
+    pub id: i32,
+    pub old: String,
+    pub new: String,
+}
+
+/// A single DNS record change the Cloudflare sync would make.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct DnsRecordChange {
+    /// `"create"`, `"update"`, or `"delete"`.
+    pub action: String,
+    pub name: String,
+    /// Record type, e.g. `"A"` or `"CNAME"`.
+    pub record_type: String,
+    pub value: String,
+}
+
+/// Combined preview of a hostname-mode change.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct HostnamePreviewResponse {
+    pub hostname_changes: Vec<HostnameChange>,
+    pub dns_changes: Vec<DnsRecordChange>,
+    /// Whether the provider token can manage this zone (None if not checked).
+    pub zone_access_ok: Option<bool>,
+    pub total: usize,
 }
 
 /// Connection test result
@@ -360,28 +465,6 @@ impl From<DnsError> for Problem {
             DnsError::ApiError(msg) => problemdetails::new(StatusCode::BAD_GATEWAY)
                 .with_title("API Error")
                 .with_detail(msg),
-            DnsError::DomainNotManaged(domain) => problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Domain Not Managed")
-                .with_detail(format!(
-                    "Domain {} is not managed by any DNS provider; connect a provider and add the domain under its managed domains first",
-                    domain
-                )),
-            DnsError::RecordConflict { .. } => problemdetails::new(StatusCode::CONFLICT)
-                .with_title("DNS Record Conflict")
-                .with_detail(error.to_string()),
-            DnsError::NotOwnedByInstance { .. } => problemdetails::new(StatusCode::CONFLICT)
-                .with_title("Record Owned By Another Temps Install")
-                .with_detail(error.to_string()),
-            DnsError::ProxiedDepthUnsupported { .. } => {
-                problemdetails::new(StatusCode::BAD_REQUEST)
-                    .with_title("Proxied Subdomain Depth Not Supported")
-                    .with_detail(error.to_string())
-            }
-            DnsError::ProxyNotSupportedByProvider { .. } => {
-                problemdetails::new(StatusCode::BAD_REQUEST)
-                    .with_title("Proxy Not Supported By Provider")
-                    .with_detail(error.to_string())
-            }
             _ => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Internal Error")
                 .with_detail(error.to_string()),
@@ -420,6 +503,7 @@ async fn list_dns_providers(
                 .provider_service
                 .get_masked_credentials(&p)
                 .unwrap_or_else(|_| serde_json::json!({}));
+            let flat_supported = state.provider_service.flat_hostnames_supported(&p);
 
             DnsProviderResponse {
                 id: p.id,
@@ -430,6 +514,7 @@ async fn list_dns_providers(
                 description: p.description,
                 last_used_at: p.last_used_at.map(|t| t.to_rfc3339()),
                 last_error: p.last_error,
+                flat_hostnames_supported: flat_supported,
                 created_at: p.created_at.to_rfc3339(),
                 updated_at: p.updated_at.to_rfc3339(),
             }
@@ -486,6 +571,7 @@ async fn create_dns_provider(
         .provider_service
         .get_masked_credentials(&provider)
         .unwrap_or_else(|_| serde_json::json!({}));
+    let flat_supported = state.provider_service.flat_hostnames_supported(&provider);
 
     let response = DnsProviderResponse {
         id: provider.id,
@@ -496,6 +582,7 @@ async fn create_dns_provider(
         description: provider.description,
         last_used_at: provider.last_used_at.map(|t| t.to_rfc3339()),
         last_error: provider.last_error,
+        flat_hostnames_supported: flat_supported,
         created_at: provider.created_at.to_rfc3339(),
         updated_at: provider.updated_at.to_rfc3339(),
     };
@@ -529,6 +616,7 @@ async fn get_dns_provider(
         .provider_service
         .get_masked_credentials(&provider)
         .unwrap_or_else(|_| serde_json::json!({}));
+    let flat_supported = state.provider_service.flat_hostnames_supported(&provider);
 
     let response = DnsProviderResponse {
         id: provider.id,
@@ -539,6 +627,7 @@ async fn get_dns_provider(
         description: provider.description,
         last_used_at: provider.last_used_at.map(|t| t.to_rfc3339()),
         last_error: provider.last_error,
+        flat_hostnames_supported: flat_supported,
         created_at: provider.created_at.to_rfc3339(),
         updated_at: provider.updated_at.to_rfc3339(),
     };
@@ -602,6 +691,7 @@ async fn update_provider(
         .provider_service
         .get_masked_credentials(&provider)
         .unwrap_or_else(|_| serde_json::json!({}));
+    let flat_supported = state.provider_service.flat_hostnames_supported(&provider);
 
     let response = DnsProviderResponse {
         id: provider.id,
@@ -612,6 +702,7 @@ async fn update_provider(
         description: provider.description,
         last_used_at: provider.last_used_at.map(|t| t.to_rfc3339()),
         last_error: provider.last_error,
+        flat_hostnames_supported: flat_supported,
         created_at: provider.created_at.to_rfc3339(),
         updated_at: provider.updated_at.to_rfc3339(),
     };
@@ -737,13 +828,13 @@ async fn add_managed_domain(
                 domain: request.domain,
                 auto_manage: request.auto_manage,
                 proxied_by_default: request.proxied_by_default,
+                generated_hostname_mode: request.generated_hostname_mode,
+                sync_generated_records: request.sync_generated_records,
             },
         )
         .await?;
 
-    let response = ManagedDomainResponse::from(managed);
-
-    Ok((StatusCode::CREATED, Json(response)))
+    Ok((StatusCode::CREATED, Json(ManagedDomainResponse::from(managed))))
 }
 
 /// List managed domains for a provider
@@ -768,10 +859,8 @@ async fn list_managed_domains(
 
     let domains = state.provider_service.list_managed_domains(id).await?;
 
-    let responses: Vec<ManagedDomainResponse> = domains
-        .into_iter()
-        .map(ManagedDomainResponse::from)
-        .collect();
+    let responses: Vec<ManagedDomainResponse> =
+        domains.into_iter().map(ManagedDomainResponse::from).collect();
 
     Ok(Json(responses))
 }
@@ -802,65 +891,6 @@ async fn remove_managed_domain(
         .await?;
 
     Ok(StatusCode::NO_CONTENT)
-}
-
-/// Update managed-domain automation and proxy defaults.
-#[utoipa::path(
-    tag = "DNS Providers",
-    patch,
-    path = "/dns-providers/{provider_id}/domains/{domain}",
-    request_body = UpdateManagedDomainApiRequest,
-    responses(
-        (status = 200, description = "Managed domain updated", body = ManagedDomainResponse),
-        (status = 400, description = "Invalid request"),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Insufficient permissions"),
-        (status = 404, description = "Domain not found"),
-    ),
-    security(("bearer_auth" = []))
-)]
-async fn update_managed_domain(
-    RequireAuth(auth): RequireAuth,
-    State(state): State<Arc<DnsAppState>>,
-    Extension(metadata): Extension<RequestMetadata>,
-    Path((provider_id, domain)): Path<(i32, String)>,
-    Json(request): Json<UpdateManagedDomainApiRequest>,
-) -> Result<impl IntoResponse, Problem> {
-    permission_check!(auth, Permission::SettingsWrite);
-
-    let managed = state
-        .provider_service
-        .update_managed_domain(
-            provider_id,
-            &domain,
-            UpdateManagedDomainRequest {
-                auto_manage: request.auto_manage,
-                proxied_by_default: request.proxied_by_default,
-            },
-        )
-        .await?;
-
-    let audit = ManagedDomainUpdatedAudit {
-        context: AuditContext {
-            user_id: auth.user_id(),
-            ip_address: Some(metadata.ip_address),
-            user_agent: metadata.user_agent,
-        },
-        provider_id,
-        domain: managed.domain.clone(),
-        auto_manage: managed.auto_manage,
-        proxied_by_default: managed.proxied_by_default,
-    };
-    if let Err(error) = state.audit_service.create_audit_log(&audit).await {
-        error!(
-            provider_id,
-            domain = %managed.domain,
-            error = %error,
-            "failed to create managed-domain update audit log"
-        );
-    }
-
-    Ok(Json(ManagedDomainResponse::from(managed)))
 }
 
 /// Verify a managed domain
@@ -898,9 +928,165 @@ async fn verify_managed_domain(
         .find(|d| d.domain == domain)
         .ok_or_else(|| DnsError::DomainNotFound(domain))?;
 
-    let response = ManagedDomainResponse::from(managed);
+    Ok(Json(ManagedDomainResponse::from(managed)))
+}
 
-    Ok(Json(response))
+/// Update a managed domain's settings (hostname mode, sync opt-in, auto-manage).
+#[utoipa::path(
+    tag = "DNS Providers",
+    patch,
+    path = "/dns-providers/{provider_id}/domains/{domain}",
+    request_body = UpdateManagedDomainApiRequest,
+    responses(
+        (status = 200, description = "Managed domain updated", body = ManagedDomainResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Domain not found"),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn update_managed_domain(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<DnsAppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path((provider_id, domain)): Path<(i32, String)>,
+    Json(request): Json<UpdateManagedDomainApiRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_check!(auth, Permission::SettingsWrite);
+
+    let updated = state
+        .provider_service
+        .update_managed_domain(
+            provider_id,
+            &domain,
+            UpdateManagedDomainRequest {
+                generated_hostname_mode: request.generated_hostname_mode,
+                sync_generated_records: request.sync_generated_records,
+                auto_manage: request.auto_manage,
+                proxied_by_default: request.proxied_by_default,
+            },
+        )
+        .await?;
+
+    log_managed_domain_audit(&state, &auth, &metadata, provider_id, &domain, "DNS_MANAGED_DOMAIN_UPDATED").await;
+
+    Ok(Json(ManagedDomainResponse::from(updated)))
+}
+
+/// Query parameters for the hostname-mode preview.
+#[derive(Debug, Clone, Deserialize)]
+struct HostnamePreviewQuery {
+    /// Target mode: `"standard"` or `"flat"`.
+    mode: String,
+    /// Whether to include the DNS record changes the sync would make.
+    #[serde(default)]
+    sync: bool,
+}
+
+/// Preview the impact of switching a managed domain's hostname mode.
+#[utoipa::path(
+    tag = "DNS Providers",
+    get,
+    path = "/dns-providers/{provider_id}/domains/{domain}/hostname-preview",
+    params(
+        ("mode" = String, Query, description = "Target mode: standard|flat"),
+        ("sync" = Option<bool>, Query, description = "Include DNS record changes"),
+    ),
+    responses(
+        (status = 200, description = "Hostname mode preview", body = HostnamePreviewResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Domain not found"),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn preview_hostname_mode(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<DnsAppState>>,
+    Path((provider_id, domain)): Path<(i32, String)>,
+    Query(query): Query<HostnamePreviewQuery>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_check!(auth, Permission::SettingsRead);
+
+    let target = PublicHostnameStrategy::from_db_str(&query.mode);
+    let result = state
+        .provider_service
+        .preview_hostname_mode(provider_id, &domain, target, query.sync)
+        .await?;
+
+    Ok(Json(HostnamePreviewResponse::from(result)))
+}
+
+/// Apply a hostname mode to a managed domain (persist + optional DNS sync +
+/// route reload).
+#[utoipa::path(
+    tag = "DNS Providers",
+    post,
+    path = "/dns-providers/{provider_id}/domains/{domain}/apply-hostname-mode",
+    request_body = ApplyHostnameModeRequest,
+    responses(
+        (status = 200, description = "Hostname mode applied", body = HostnamePreviewResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions or token lacks zone access"),
+        (status = 404, description = "Domain not found"),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn apply_hostname_mode(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<DnsAppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path((provider_id, domain)): Path<(i32, String)>,
+    Json(request): Json<ApplyHostnameModeRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_check!(auth, Permission::SettingsWrite);
+
+    let target = PublicHostnameStrategy::from_db_str(&request.mode);
+    let result = state
+        .provider_service
+        .apply_hostname_mode(provider_id, &domain, target, request.sync_dns)
+        .await?;
+
+    // Trigger a full route reload so derived (Standard/Flat) hostnames take
+    // effect. Failure to enqueue is logged but does not fail the request.
+    if let Err(e) = state
+        .queue
+        .send(Job::ForceRouteReload(ForceRouteReloadJob {
+            environment_id: None,
+            deployment_id: None,
+        }))
+        .await
+    {
+        tracing::error!("Failed to enqueue route reload after hostname mode change: {}", e);
+    }
+
+    log_managed_domain_audit(&state, &auth, &metadata, provider_id, &domain, "DNS_HOSTNAME_MODE_APPLIED").await;
+
+    Ok(Json(HostnamePreviewResponse::from(result)))
+}
+
+/// Emit an audit log for a managed-domain write; failure is logged, not fatal.
+async fn log_managed_domain_audit(
+    state: &Arc<DnsAppState>,
+    auth: &temps_auth::AuthContext,
+    metadata: &RequestMetadata,
+    provider_id: i32,
+    domain: &str,
+    action: &str,
+) {
+    let audit = ManagedDomainAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        provider_id,
+        domain: domain.to_string(),
+        action: action.to_string(),
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        tracing::error!("Failed to create audit log: {}", e);
+    }
 }
 
 // ========================================
@@ -935,6 +1121,14 @@ pub fn configure_routes() -> Router<Arc<DnsAppState>> {
         .route(
             "/dns-providers/{provider_id}/domains/{domain}/verify",
             post(verify_managed_domain),
+        )
+        .route(
+            "/dns-providers/{provider_id}/domains/{domain}/hostname-preview",
+            get(preview_hostname_mode),
+        )
+        .route(
+            "/dns-providers/{provider_id}/domains/{domain}/apply-hostname-mode",
+            post(apply_hostname_mode),
         )
         // Ownership-guarded managed records (ADR-031)
         .route(
@@ -985,9 +1179,11 @@ pub fn configure_internal_routes() -> Router<Arc<dns_sync::DnsSyncAppState>> {
         list_provider_zones,
         add_managed_domain,
         list_managed_domains,
-        update_managed_domain,
         remove_managed_domain,
+        update_managed_domain,
         verify_managed_domain,
+        preview_hostname_mode,
+        apply_hostname_mode,
         managed_records::get_record_ownership,
         managed_records::set_managed_record,
         managed_records::remove_managed_record,
@@ -1003,17 +1199,21 @@ pub fn configure_internal_routes() -> Router<Arc<dns_sync::DnsSyncAppState>> {
             DnsProviderResponse,
             AddManagedDomainApiRequest,
             UpdateManagedDomainApiRequest,
+            ApplyHostnameModeRequest,
             ManagedDomainResponse,
+            HostnameChange,
+            DnsRecordChange,
+            HostnamePreviewResponse,
+            managed_records::SetManagedRecordRequest,
+            managed_records::ImportManagedRecordRequest,
+            managed_records::RecordOwnershipResponse,
+            managed_records::ImportManagedRecordResponse,
             ConnectionTestResult,
             ZoneListResponse,
             RecordListResponse,
             DnsProviderType,
             DnsZone,
             DnsRecord,
-            managed_records::SetManagedRecordRequest,
-            managed_records::ImportManagedRecordRequest,
-            managed_records::RecordOwnershipResponse,
-            managed_records::ImportManagedRecordResponse,
             dns_sync::EndpointDto,
             dns_sync::DnsChangesResponse,
             dns_sync::DnsAckRequest,

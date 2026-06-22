@@ -84,6 +84,7 @@ pub async fn load(platform_config: &Arc<ConfigService>) -> PreviewUrlParts {
             } else {
                 s.preview_domain.trim_start_matches("*.").to_string()
             };
+            let domain = temps_core::public_base_domain(&s.preview_domain);
 
             let port = port.filter(|p| {
                 !((protocol == "https" && *p == 443) || (protocol == "http" && *p == 80))

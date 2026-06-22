@@ -17,7 +17,9 @@ use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
 use crate::handlers::{self, dns_sync::DnsSyncAppState, DnsApiDoc, DnsAppState};
-use crate::services::{DnsProviderService, DnsRecordService, DnsRegistry, ManagedDnsRecordService};
+use crate::services::{
+    DnsProviderService, DnsRecordService, DnsRegistry, ManagedDnsRecordService,
+};
 
 /// DNS Plugin for managing DNS providers and automatic DNS record configuration
 pub struct DnsPlugin;
@@ -55,12 +57,17 @@ impl TempsPlugin for DnsPlugin {
             ));
             context.register_service(provider_service.clone());
 
+            // Expose the provider service as the public hostname resolver so
+            // other crates (routes, deployments) can resolve per-domain
+            // Standard/Flat modes without depending on temps-dns.
+            let hostname_resolver =
+                provider_service.clone() as Arc<dyn temps_core::PublicHostnameResolver>;
+            context.register_service(hostname_resolver);
+
             // Create DnsRecordService
             let record_service = Arc::new(DnsRecordService::new(provider_service.clone()));
             context.register_service(record_service.clone());
 
-            // Ownership-guarded record management (ADR-031) — the only path
-            // for public A/AAAA/CNAME records in user zones.
             let managed_record_service = Arc::new(ManagedDnsRecordService::new(
                 db.clone(),
                 provider_service.clone(),
@@ -68,13 +75,14 @@ impl TempsPlugin for DnsPlugin {
             ));
             context.register_service(managed_record_service.clone());
 
-            let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
-
             // Create DnsAppState for handlers
+            let queue = context.require_service::<dyn temps_core::JobQueue>();
+            let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
             let app_state = Arc::new(DnsAppState {
                 provider_service,
                 record_service,
                 managed_record_service,
+                queue,
                 audit_service,
             });
             context.register_service(app_state);

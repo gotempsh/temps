@@ -709,6 +709,7 @@ impl DnsProvider for AzureProvider {
             proxy: false,
             auto_ssl: false,
             wildcard: true,
+            flat_hostnames: false,
         }
     }
 

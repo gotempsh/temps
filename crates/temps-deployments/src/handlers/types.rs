@@ -55,6 +55,8 @@ pub struct AppState {
     /// case. Resolved once in `configure_routes` via
     /// `context.get_service::<dyn temps_core::ProjectAccessChecker>()`.
     pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+    /// Resolves the per-managed-domain public hostname strategy (Standard/Flat).
+    pub hostname_resolver: Arc<dyn temps_core::PublicHostnameResolver>,
 }
 
 use crate::services::types::Deployment;

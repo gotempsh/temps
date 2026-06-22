@@ -446,6 +446,7 @@ impl DnsProvider for DigitalOceanProvider {
             proxy: false,
             auto_ssl: false,
             wildcard: true,
+            flat_hostnames: false,
         }
     }
 

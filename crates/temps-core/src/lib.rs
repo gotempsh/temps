@@ -17,6 +17,8 @@ pub mod plugin;
 pub mod problemdetails;
 pub mod project_access;
 pub mod retention;
+pub mod public_hostname;
+pub mod public_hostname_resolver;
 pub mod retry;
 pub mod secrets_manager;
 pub mod telemetry;
@@ -58,6 +60,10 @@ pub use retention::{
     FixedRetentionResolver, RetentionResolver, RetentionResolverSlot, RetentionTable,
 };
 pub use secrets_manager::SecretsManagerResolver;
+pub use public_hostname::{base_domain as public_base_domain, PublicHostnameStrategy};
+pub use public_hostname_resolver::{
+    match_strategy, PublicHostnameResolver, StandardHostnameResolver,
+};
 pub use telemetry::{NoopTelemetryReporter, TelemetryEvent, TelemetryEventKind, TelemetryReporter};
 pub use traces::{
     TraceQueryFilter, TraceReader, TraceReaderError, TraceSpanDto, TraceSpanEventDto,
