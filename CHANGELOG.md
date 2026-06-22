@@ -154,8 +154,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.0-beta.41] - 2026-07-02
 
 ### CI
+### Added
+- **Per-managed-domain flat hostname mode**: each DNS managed domain now has a
+  `generated_hostname_mode` (`standard`/`flat`), selected where the provider is
+  configured rather than in global settings. The `flat` mode keeps generated
+  service hostnames one label beneath `preview_domain` so a provider's
+  single-label wildcard cert (e.g. Cloudflare Free/Pro Universal SSL) covers
+  them. Providers advertise a `flat_hostnames` capability so the UI surfaces and
+  recommends the option only where it helps (Cloudflare). Labels are sanitized
+  and truncated with stable short-hash suffixes when they exceed DNS limits.
+- **Hostname-mode preview & apply**: switching a domain to flat shows an impact
+  preview (changed hostnames + the DNS records a sync would reconcile + the
+  token's zone-access state) before an explicit apply that recomputes hostnames
+  and triggers a route reload.
+- **Per-hostname DNS zone sync**: opt-in per managed domain
+  (`sync_generated_records`). When a public `edge_target` is configured, the
+  apply step reconciles one proxied record per generated hostname against the
+  provider's live zone (A/AAAA for an IP target, otherwise CNAME), only ever
+  removing records that match Temps-generated hosts.
+- **Token zone-access flag**: Cloudflare 401/403 responses now surface as a
+  distinct permission error, and verifying a managed domain records whether the
+  token can actually manage the zone (`zone_access_ok` / `zone_access_error`) so
+  the UI can warn about a mis-scoped token.
 
 - **changelog:** Skip preview comment on fork PRs
+### Changed
+- The global `public_hostnames` platform setting (strategy + templates) is
+  removed in favour of the per-managed-domain mode above. On upgrade, an
+  instance that had the global strategy set to `flat` has that intent carried
+  onto its existing managed domains; instances with no managed domains revert to
+  the standard layout for future generation. A new global `edge_target` setting
+  configures where synced DNS records point.
 
 ### Fixed
 

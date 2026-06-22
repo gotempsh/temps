@@ -25,6 +25,7 @@ use temps_auth::{
     permission_guard, project_access_guard, project_permission_guard, project_scope_guard,
 };
 use temps_core::{AuditContext, RequestMetadata};
+use temps_core::{AppSettings, AuditContext, PublicHostnameStrategy, RequestMetadata};
 use tracing::{debug, error, info, warn};
 use utoipa::OpenApi;
 
@@ -54,6 +55,37 @@ use temps_core::problemdetails::Problem;
 // defence-in-depth measure for the ADR-028 Phase B rollout. Adding the guard
 // to every handler in this file would be redundant noise: the token is already
 // rejected by the earlier `permission_guard!` call.
+fn public_url_for_hostname(settings: &AppSettings, hostname: &str) -> String {
+    let (protocol, port) = if let Some(ref external_url) = settings.external_url {
+        if let Ok(parsed) = url::Url::parse(external_url) {
+            (parsed.scheme().to_string(), parsed.port())
+        } else if external_url.starts_with("http://") {
+            ("http".to_string(), None)
+        } else {
+            ("https".to_string(), None)
+        }
+    } else {
+        ("https".to_string(), None)
+    };
+
+    let port =
+        port.filter(|p| !((protocol == "https" && *p == 443) || (protocol == "http" && *p == 80)));
+
+    match port {
+        Some(port) => format!("{}://{}:{}", protocol, hostname, port),
+        None => format!("{}://{}", protocol, hostname),
+    }
+}
+
+fn public_service_url(
+    settings: &AppSettings,
+    strategy: PublicHostnameStrategy,
+    environment: &str,
+    service: &str,
+) -> String {
+    let hostname = strategy.service_hostname(&settings.preview_domain, environment, service);
+    public_url_for_hostname(settings, &hostname)
+}
 
 #[derive(OpenApi)]
 #[openapi(
@@ -907,6 +939,13 @@ pub async fn list_containers(
         .flatten()
         .map(|e| e.subdomain);
 
+    // Resolve the hostname strategy for this instance's preview domain once,
+    // before the synchronous response-building closure below.
+    let hostname_strategy = state
+        .hostname_resolver
+        .strategy_for(&app_settings.preview_domain)
+        .await;
+
     // Read public_ports from project's preset_config
     let public_ports: Vec<temps_entities::preset::ComposePublicPort> =
         temps_entities::projects::Entity::find_by_id(project_id)
@@ -944,6 +983,9 @@ pub async fn list_containers(
                     };
                     format!("{}://{}.{}", url_scheme, label, preview_domain)
                 })
+                env_subdomain
+                    .as_ref()
+                    .map(|sub| public_service_url(&app_settings, hostname_strategy, sub, svc))
             });
             ContainerInfoResponse::from_info(info, node_name, service_name, service_url)
         })
@@ -1722,6 +1764,13 @@ pub async fn get_container_detail(
                 };
                 format!("{}://{}.{}", url_scheme2, label, preview_domain)
             })
+            let hostname_strategy = state
+                .hostname_resolver
+                .strategy_for(&app_settings.preview_domain)
+                .await;
+
+            env_subdomain
+                .map(|sub| public_service_url(&app_settings, hostname_strategy, &sub, svc_name))
         } else {
             None
         }
@@ -3361,6 +3410,8 @@ mod tests {
             ),
             deployment_gate: None,
             project_access_checker: None,
+            hostname_resolver: Arc::new(temps_core::StandardHostnameResolver)
+                as Arc<dyn temps_core::PublicHostnameResolver>,
         })
     }
 

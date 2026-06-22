@@ -27,6 +27,7 @@ use crate::services::node_service::{
     HeartbeatRequest, NodeError, NodeService, RegisterNodeRequest,
 };
 use temps_core::problemdetails::{self, Problem};
+use temps_core::{AppSettings, PublicHostnameStrategy};
 use temps_deployer::ContainerDeployer;
 
 /// App state for node registration handlers
@@ -1455,6 +1456,8 @@ async fn edge_routes(
 
         for env in &all_envs {
             let full_domain = format!("{}.{}", env.subdomain, preview_domain);
+            let full_domain = PublicHostnameStrategy::Standard
+                .environment_hostname(&app_settings.preview_domain, &env.subdomain);
             // Skip if already added from environment_domains
             if routes.iter().any(|r| r.domain == full_domain) {
                 continue;

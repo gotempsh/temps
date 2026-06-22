@@ -18,3 +18,49 @@ Cover advanced networking for complex deployments.
 **Network Nick** - Needs VPNs, private networks, firewall config, advanced networking.
 
 ## Key Content: Port configuration, internal networking, VPC, firewall rules, proxy configuration, load balancing
+
+## Flat Hostnames for Wildcard-TLS Providers
+
+Temps generates preview hostnames from the platform preview domain — for
+example `my-app-staging.example.com` under `example.com`. Compose services with
+public ports also get generated hostnames; by default those use the
+`service-environment.example.com` order (the **Standard** layout).
+
+Some proxied DNS/TLS providers — including Cloudflare Universal SSL on free and
+Pro plans — only cover the apex plus one wildcard label such as `*.example.com`.
+They do not cover deeper hosts like `api.staging.example.com`. The **Flat**
+hostname mode keeps generated service hostnames exactly one label beneath the
+preview domain so a single-label wildcard cert covers them.
+
+### Per-managed-domain configuration
+
+The hostname mode is set **per managed domain**, where you configure the DNS
+provider — not in global settings. Open **DNS Providers**, select your provider,
+and for the managed domain toggle **Flat hostnames (Universal SSL)**. Providers
+that benefit from flat hostnames (such as Cloudflare) surface and recommend the
+option; others default to Standard.
+
+Switching to Flat is an explicit, breaking change. Temps shows an impact preview
+(the generated hostnames that change, plus any DNS records the sync would
+reconcile) before you confirm. On apply, generated hostnames are recomputed and
+routes reload; existing nested hostnames stop resolving. Custom domains are never
+touched.
+
+| Purpose | Standard | Flat |
+| --- | --- | --- |
+| Environment | `staging.example.com` | `staging.example.com` |
+| Public compose service | `api-staging.example.com` | `staging-api.example.com` |
+
+Generated DNS labels are sanitized and truncated to 63 characters with a stable
+short-hash suffix when needed.
+
+### DNS record sync
+
+When you set a public **Edge target** in **Settings** and enable **Sync DNS
+records** on a managed domain, Temps reconciles one proxied record per generated
+hostname against the provider's zone — an `A`/`AAAA` record when the edge target
+is an IP, otherwise a `CNAME`. Only records matching Temps-generated hostnames
+are ever removed; user-created records are left intact.
+
+If the provider token cannot access the zone, Temps flags it on the managed
+domain (and in the preview) and skips the sync rather than failing silently.

@@ -8,9 +8,15 @@ import {
   testProviderConnection,
   updateProvider,
   verifyManagedDomain,
+  type HostnamePreviewResponse,
   type ManagedDomainResponse,
   type UpdateDnsProviderRequest,
 } from '@/api/client'
+import {
+  applyHostnameMode,
+  previewHostnameMode,
+  updateManagedDomainSettings,
+} from '@/api/managedDomains'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import {
   AlertDialog,
@@ -280,6 +286,64 @@ export default function DnsProviderDetail() {
     },
     onError: (err: Error) => {
       toast.error('Failed to verify domain', {
+        description: err.message,
+      })
+    },
+  })
+
+  // Per-domain hostname mode: preview before an explicit, breaking apply.
+  const [hostnamePreview, setHostnamePreview] = useState<{
+    domain: string
+    target: 'standard' | 'flat'
+    syncDns: boolean
+    result: HostnamePreviewResponse
+  } | null>(null)
+
+  const previewModeMut = useMutation({
+    mutationFn: (vars: {
+      domain: string
+      target: 'standard' | 'flat'
+      syncDns: boolean
+    }) =>
+      previewHostnameMode(providerId, vars.domain, vars.target, vars.syncDns),
+    onSuccess: (result, vars) => {
+      setHostnamePreview({ ...vars, result })
+    },
+    onError: (err: Error) => {
+      toast.error('Failed to preview hostname change', {
+        description: err.message,
+      })
+    },
+  })
+
+  const applyModeMut = useMutation({
+    mutationFn: (vars: {
+      domain: string
+      target: 'standard' | 'flat'
+      syncDns: boolean
+    }) => applyHostnameMode(providerId, vars.domain, vars.target, vars.syncDns),
+    onSuccess: () => {
+      toast.success('Hostname mode applied')
+      setHostnamePreview(null)
+      refetchDomains()
+    },
+    onError: (err: Error) => {
+      toast.error('Failed to apply hostname mode', {
+        description: err.message,
+      })
+    },
+  })
+
+  const syncToggleMut = useMutation({
+    mutationFn: (vars: { domain: string; enabled: boolean }) =>
+      updateManagedDomainSettings(providerId, vars.domain, {
+        sync_generated_records: vars.enabled,
+      }),
+    onSuccess: () => {
+      refetchDomains()
+    },
+    onError: (err: Error) => {
+      toast.error('Failed to update DNS sync setting', {
         description: err.message,
       })
     },
@@ -581,6 +645,26 @@ export default function DnsProviderDetail() {
                         {domain.auto_manage && (
                           <Badge variant="outline">Auto-managed</Badge>
                         )}
+                        <Badge
+                          variant={
+                            domain.generated_hostname_mode === 'flat'
+                              ? 'default'
+                              : 'outline'
+                          }
+                        >
+                          {domain.generated_hostname_mode === 'flat'
+                            ? 'Flat hostnames'
+                            : 'Standard hostnames'}
+                        </Badge>
+                        {domain.zone_access_ok === false && (
+                          <Badge
+                            variant="destructive"
+                            className="flex items-center gap-1"
+                          >
+                            <XCircle className="h-3 w-3" />
+                            Token lacks zone access
+                          </Badge>
+                        )}
                       </div>
                       {domain.zone_id && (
                         <p className="truncate text-sm text-muted-foreground">
@@ -591,6 +675,42 @@ export default function DnsProviderDetail() {
                         <p className="truncate text-sm text-destructive">
                           {domain.verification_error}
                         </p>
+                      )}
+                      {domain.zone_access_error && (
+                        <p className="truncate text-sm text-destructive">
+                          {domain.zone_access_error}
+                        </p>
+                      )}
+                      {provider?.flat_hostnames_supported && (
+                        <div className="flex flex-wrap items-center gap-4 pt-1">
+                          <label className="flex items-center gap-2 text-sm">
+                            <Switch
+                              checked={domain.generated_hostname_mode === 'flat'}
+                              onCheckedChange={(checked) =>
+                                previewModeMut.mutate({
+                                  domain: domain.domain,
+                                  target: checked ? 'flat' : 'standard',
+                                  syncDns: domain.sync_generated_records,
+                                })
+                              }
+                              disabled={previewModeMut.isPending}
+                            />
+                            Flat hostnames (Universal SSL)
+                          </label>
+                          <label className="flex items-center gap-2 text-sm">
+                            <Switch
+                              checked={domain.sync_generated_records}
+                              onCheckedChange={(checked) =>
+                                syncToggleMut.mutate({
+                                  domain: domain.domain,
+                                  enabled: checked,
+                                })
+                              }
+                              disabled={syncToggleMut.isPending}
+                            />
+                            Sync DNS records
+                          </label>
+                        </div>
                       )}
                     </div>
                     <div className="flex shrink-0 items-center gap-2">
@@ -625,6 +745,107 @@ export default function DnsProviderDetail() {
           </CardContent>
         </Card>
       </div>
+
+      {/* Hostname mode preview / confirm dialog */}
+      <Dialog
+        open={!!hostnamePreview}
+        onOpenChange={(open) => {
+          if (!open) setHostnamePreview(null)
+        }}
+      >
+        <DialogContent className="max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>
+              Switch {hostnamePreview?.domain} to{' '}
+              {hostnamePreview?.target === 'flat' ? 'Flat' : 'Standard'} hostnames
+            </DialogTitle>
+            <DialogDescription>
+              This is a breaking change: generated hostnames are recomputed,
+              routes reload, and certificates re-issue. Existing nested hostnames
+              stop resolving. Custom domains are not affected.
+            </DialogDescription>
+          </DialogHeader>
+
+          {hostnamePreview?.result.zone_access_ok === false && (
+            <Alert variant="destructive">
+              <AlertCircle className="h-4 w-4" />
+              <AlertTitle>Token cannot access this zone</AlertTitle>
+              <AlertDescription>
+                DNS records will not be synced until the provider token is granted
+                access to the zone.
+              </AlertDescription>
+            </Alert>
+          )}
+
+          <div className="max-h-80 space-y-4 overflow-y-auto">
+            <div>
+              <p className="mb-1 text-sm font-medium">
+                Hostname changes (
+                {hostnamePreview?.result.hostname_changes.length ?? 0})
+              </p>
+              {hostnamePreview?.result.hostname_changes.length ? (
+                <ul className="space-y-1 text-sm">
+                  {hostnamePreview.result.hostname_changes.map((c, i) => (
+                    <li key={i} className="font-mono text-xs">
+                      {c.old} → {c.new}
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="text-sm text-muted-foreground">
+                  No generated hostnames change.
+                </p>
+              )}
+            </div>
+
+            {hostnamePreview?.syncDns && (
+              <div>
+                <p className="mb-1 text-sm font-medium">
+                  DNS record changes (
+                  {hostnamePreview?.result.dns_changes.length ?? 0})
+                </p>
+                {hostnamePreview?.result.dns_changes.length ? (
+                  <ul className="space-y-1 text-sm">
+                    {hostnamePreview.result.dns_changes.map((c, i) => (
+                      <li key={i} className="font-mono text-xs">
+                        {c.action} {c.record_type} {c.name}
+                        {c.value ? ` → ${c.value}` : ''}
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="text-sm text-muted-foreground">
+                    No DNS record changes.
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
+
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setHostnamePreview(null)}>
+              Cancel
+            </Button>
+            <Button
+              onClick={() =>
+                hostnamePreview &&
+                applyModeMut.mutate({
+                  domain: hostnamePreview.domain,
+                  target: hostnamePreview.target,
+                  syncDns: hostnamePreview.syncDns,
+                })
+              }
+              disabled={applyModeMut.isPending}
+            >
+              {applyModeMut.isPending ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                'Apply change'
+              )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* Edit Dialog */}
       <Dialog open={isEditDialogOpen} onOpenChange={setIsEditDialogOpen}>

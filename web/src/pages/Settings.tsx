@@ -48,6 +48,14 @@ type SettingsFormData = Pick<
   | 'letsencrypt'
 >
 
+  'external_url' | 'internal_url' | 'preview_domain' | 'edge_target' | 'screenshots'
+>
+
+function optionalString(value: string | null | undefined): string | null {
+  const trimmed = value?.trim() ?? ''
+  return trimmed.length > 0 ? trimmed : null
+}
+
 export function Settings() {
   const { setBreadcrumbs } = useBreadcrumbs()
   const { data: settings, isLoading, error } = useSettings()
@@ -66,6 +74,7 @@ export function Settings() {
       external_url: '',
       internal_url: '',
       preview_domain: 'localho.st',
+      edge_target: '',
       screenshots: {
         enabled: false,
         provider: 'local',
@@ -96,6 +105,7 @@ export function Settings() {
         external_url: settings.external_url || '',
         internal_url: settings.internal_url || '',
         preview_domain: settings.preview_domain || 'localho.st',
+        edge_target: settings.edge_target || '',
         screenshots: settings.screenshots || {
           enabled: false,
           provider: 'local',
@@ -113,6 +123,15 @@ export function Settings() {
     try {
       await updateSettings.mutateAsync(data)
       reset(data)
+      const normalized: SettingsFormData = {
+        ...data,
+        edge_target: optionalString(data.edge_target),
+      }
+      await updateSettings.mutateAsync(normalized)
+      reset({
+        ...normalized,
+        edge_target: normalized.edge_target || '',
+      })
       toast.success('Settings saved successfully')
     } catch (err: any) {
       const detail =
@@ -333,6 +352,19 @@ export function Settings() {
             <p className="text-sm text-muted-foreground">
               Staging certificates are not trusted by browsers — use only for
               testing to avoid Let&apos;s Encrypt&apos;s production rate limits.
+            <Label htmlFor="edge-target">Edge target (for DNS sync)</Label>
+            <Input
+              id="edge-target"
+              type="text"
+              placeholder="203.0.113.10 or edge.example.com"
+              {...register('edge_target')}
+            />
+            <p className="text-sm text-muted-foreground">
+              Public address that generated DNS records point at when a managed
+              domain opts into record sync. An IP creates A/AAAA records; a
+              hostname creates CNAME records. Leave blank to disable DNS sync.
+              The Standard vs Flat hostname layout is configured per managed
+              domain under DNS providers.
             </p>
           </div>
         </CardContent>

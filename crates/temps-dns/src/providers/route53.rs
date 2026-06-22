@@ -532,6 +532,7 @@ impl DnsProvider for Route53Provider {
             proxy: false,
             auto_ssl: false,
             wildcard: true,
+            flat_hostnames: false,
         }
     }
 

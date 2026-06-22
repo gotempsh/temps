@@ -26,6 +26,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use temps_core::DeploymentMode;
+use temps_core::public_hostname_resolver::match_strategy;
+use temps_core::{AppSettings, DeploymentMode, PublicHostnameStrategy};
 use temps_entities::custom_routes::RouteType;
 use temps_entities::{deployments, environments, nodes, projects};
 use tracing::{debug, error, info, warn};
@@ -555,6 +557,32 @@ impl CachedPeerTable {
             .unwrap_or_else(|| "localho.st".to_string());
 
         debug!("Loaded preview_domain from settings: {}", preview_domain);
+            .map(|s| AppSettings::from_json(s.data))
+            .unwrap_or_default();
+        let preview_domain = app_settings.preview_domain.clone();
+
+        // Build a base-domain -> strategy map from managed domains once per
+        // rebuild. Only the per-service hostname layout varies by strategy; env
+        // and deployment hosts are strategy-independent.
+        let hostname_strategies: std::collections::HashMap<String, PublicHostnameStrategy> =
+            temps_entities::dns_managed_domains::Entity::find()
+                .all(self.db.as_ref())
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|d| {
+                    (
+                        d.domain.to_ascii_lowercase(),
+                        PublicHostnameStrategy::from_db_str(&d.generated_hostname_mode),
+                    )
+                })
+                .collect();
+
+        debug!(
+            "Loaded public hostname settings: preview_domain={}, managed_domain_modes={}",
+            preview_domain,
+            hostname_strategies.len()
+        );
 
         debug!("Loading route table from database...");
 
@@ -978,6 +1006,8 @@ impl CachedPeerTable {
                         wake_timeout_seconds: wake_timeout,
                     });
                     let full_domain = format!("{}.{}", main_url, preview_domain);
+                    let full_domain =
+                        PublicHostnameStrategy::Standard.environment_hostname(&preview_domain, main_url);
                     sleeping_environments.push(SleepingEnvironmentEntry {
                         domain: full_domain,
                         environment_id: env.id,
@@ -1177,6 +1207,8 @@ impl CachedPeerTable {
 
                     // Also add route with preview_domain suffix if configured
                     let full_domain = format!("{}.{}", main_url, preview_domain);
+                    let full_domain =
+                        PublicHostnameStrategy::Standard.environment_hostname(&preview_domain, main_url);
                     if !routes.contains_key(&full_domain) {
                         routes.insert(
                             full_domain.clone(),
@@ -1338,6 +1370,13 @@ impl CachedPeerTable {
                                     svc_label
                                 };
                                 let svc_domain = format!("{}.{}", svc_label, preview_domain);
+                                let svc_strategy =
+                                    match_strategy(&hostname_strategies, &preview_domain);
+                                let svc_domain = svc_strategy.service_hostname(
+                                    &preview_domain,
+                                    main_url,
+                                    pub_service,
+                                );
                                 if let std::collections::hash_map::Entry::Vacant(e) =
                                     routes.entry(svc_domain.clone())
                                 {
@@ -1451,6 +1490,8 @@ impl CachedPeerTable {
                     // Generate a fallback route using deployment slug if no other routes exist
                     // This ensures every active deployment is accessible
                     let fallback_domain = format!("{}.{}", deployment.slug, preview_domain);
+                    let fallback_domain =
+                        PublicHostnameStrategy::Standard.deployment_hostname(&preview_domain, &deployment.slug);
 
                     if !routes.contains_key(&fallback_domain) {
                         routes.insert(
