@@ -242,6 +242,7 @@ mod tests {
             consecutive_health_failures: 0,
             health_metadata: None,
             metrics_enabled: false,
+            default_backup_provisioned: false,
         }
     }
 

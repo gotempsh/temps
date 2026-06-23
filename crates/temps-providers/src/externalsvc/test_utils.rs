@@ -439,6 +439,7 @@ pub fn create_mock_external_service(
         consecutive_health_failures: 0,
         health_metadata: None,
         metrics_enabled: false,
+        default_backup_provisioned: false,
     }
 }
 
