@@ -12,6 +12,8 @@
 //!   (retention) is set too high — the MariaDB analog of `pg_wal` bloat.
 //! - **Non-ROW binlog format** (`binlog_format != ROW`): STATEMENT/MIXED
 //!   formats can replay non-deterministically, degrading PITR fidelity.
+//! - **Non-InnoDB tables** (MyISAM/Aria): not crash-safe and don't recover
+//!   consistently under PITR — a known cause of point-in-time-restore failure.
 //!
 //! The probe is read-only, runs on a single short-lived `sqlx` MySQL
 //! connection using root credentials, and returns a structured snapshot that
@@ -65,6 +67,11 @@ pub enum BinlogWarning {
     /// `binlog_format` is not `ROW`. STATEMENT/MIXED replication can replay
     /// non-deterministically, degrading PITR fidelity.
     NonRowBinlogFormat { format: String },
+    /// One or more user tables use a non-transactional storage engine
+    /// (MyISAM/Aria). These are not crash-safe and do not recover consistently
+    /// under PITR — a base + binlog-replay restore can leave them torn. Convert
+    /// such tables to InnoDB for reliable point-in-time recovery.
+    NonInnodbTables { count: usize },
 }
 
 impl BinlogWarning {
@@ -76,6 +83,7 @@ impl BinlogWarning {
             Self::BinlogDisabled => BinlogWarningSeverity::Critical,
             Self::LargeBinlogBacklog { .. } => BinlogWarningSeverity::Warning,
             Self::NonRowBinlogFormat { .. } => BinlogWarningSeverity::Warning,
+            Self::NonInnodbTables { .. } => BinlogWarningSeverity::Warning,
         }
     }
 }
@@ -104,6 +112,10 @@ pub struct MariadbBinlogHealth {
     /// Whether GTID strict mode is enabled. Informational — surfaced so the
     /// UI can show replication-consistency posture alongside binlog health.
     pub gtid_strict_mode: bool,
+    /// Number of user tables on a non-InnoDB (non-transactional) storage
+    /// engine. PITR is unreliable for these (MyISAM/Aria aren't crash-safe).
+    /// 0 is healthy.
+    pub non_innodb_table_count: usize,
     /// Computed warnings, ordered by severity (critical first).
     pub warnings: Vec<BinlogWarning>,
 }
@@ -178,6 +190,9 @@ async fn collect_snapshot(conn_str: &str) -> Option<MariadbBinlogHealth> {
     let (segment_count, total_binlog_bytes) =
         fetch_binary_logs(&pool).await.unwrap_or((0, 0));
 
+    // Non-InnoDB user tables make PITR unreliable; surface a count.
+    let non_innodb_table_count = fetch_non_innodb_table_count(&pool).await.unwrap_or(0);
+
     pool.close().await;
 
     let mut snapshot = MariadbBinlogHealth {
@@ -187,6 +202,7 @@ async fn collect_snapshot(conn_str: &str) -> Option<MariadbBinlogHealth> {
         segment_count,
         total_binlog_bytes,
         gtid_strict_mode,
+        non_innodb_table_count,
         warnings: Vec::new(),
     };
     snapshot.warnings = compute_warnings(&snapshot);
@@ -239,6 +255,25 @@ async fn fetch_binary_logs(pool: &sqlx::MySqlPool) -> Option<(usize, i64)> {
     Some((segment_count, total_bytes))
 }
 
+/// Count user tables whose storage engine is not InnoDB. System schemas are
+/// excluded. MyISAM/Aria tables aren't crash-safe and break consistent PITR.
+/// Returns `None` on query failure (treated as 0 — best-effort).
+async fn fetch_non_innodb_table_count(pool: &sqlx::MySqlPool) -> Option<usize> {
+    let row = sqlx::query(
+        "SELECT COUNT(*) AS c FROM information_schema.TABLES \
+         WHERE TABLE_TYPE = 'BASE TABLE' AND ENGINE IS NOT NULL AND ENGINE <> 'InnoDB' \
+         AND TABLE_SCHEMA NOT IN ('mysql','information_schema','performance_schema','sys')",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()??;
+    let c: i64 = row
+        .try_get::<i64, _>("c")
+        .or_else(|_| row.try_get::<u64, _>("c").map(|v| v as i64))
+        .ok()?;
+    Some(c.max(0) as usize)
+}
+
 /// Pure warning computation. No I/O — fully unit-testable.
 fn compute_warnings(snapshot: &MariadbBinlogHealth) -> Vec<BinlogWarning> {
     let mut warnings = Vec::new();
@@ -266,6 +301,12 @@ fn compute_warnings(snapshot: &MariadbBinlogHealth) -> Vec<BinlogWarning> {
         });
     }
 
+    if snapshot.non_innodb_table_count > 0 {
+        warnings.push(BinlogWarning::NonInnodbTables {
+            count: snapshot.non_innodb_table_count,
+        });
+    }
+
     // Sort: critical first, then warning.
     warnings.sort_by_key(|w| match w.severity() {
         BinlogWarningSeverity::Critical => 0,
@@ -287,6 +328,7 @@ mod tests {
             segment_count: 3,
             total_binlog_bytes: 256 * 1024 * 1024, // 256 MiB
             gtid_strict_mode: true,
+            non_innodb_table_count: 0,
             warnings: Vec::new(),
         }
     }
@@ -310,6 +352,28 @@ mod tests {
             warnings[0].severity(),
             BinlogWarningSeverity::Critical
         );
+    }
+
+    #[test]
+    fn non_innodb_tables_warn_when_binlog_on() {
+        let mut s = healthy_snapshot();
+        s.non_innodb_table_count = 4;
+        let warnings = compute_warnings(&s);
+        let w = warnings
+            .iter()
+            .find(|w| matches!(w, BinlogWarning::NonInnodbTables { .. }))
+            .expect("should warn about non-InnoDB tables");
+        assert!(matches!(w, BinlogWarning::NonInnodbTables { count } if *count == 4));
+        assert_eq!(w.severity(), BinlogWarningSeverity::Warning);
+    }
+
+    #[test]
+    fn non_innodb_warning_suppressed_when_binlog_disabled() {
+        // BinlogDisabled dominates and short-circuits everything else.
+        let mut s = healthy_snapshot();
+        s.log_bin = false;
+        s.non_innodb_table_count = 4;
+        assert_eq!(compute_warnings(&s), vec![BinlogWarning::BinlogDisabled]);
     }
 
     #[test]
