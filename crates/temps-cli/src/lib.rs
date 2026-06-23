@@ -288,7 +288,7 @@ fn scrub_sensitive_argv() {
                 return;
             }
             // argv[0] is argc slots before the NULL.
-            let argv = argv_null.sub(argc) as *mut *mut libc::c_char;
+            let argv = argv_null.sub(argc);
             // Sanity-check: argv[0] must match the first cmdline token.
             let first = *argv;
             if first.is_null() {
