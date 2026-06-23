@@ -7,6 +7,7 @@ use utoipa::ToSchema;
 pub mod cluster_role;
 pub mod exec_util;
 pub mod mariadb;
+pub mod mariadb_binlog_health;
 pub mod mongodb;
 pub mod port_util;
 pub mod postgres;
