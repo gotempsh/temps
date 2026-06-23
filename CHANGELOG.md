@@ -17,41 +17,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   supported in the query explorer, existing MariaDB/MySQL-compatible containers
   can be imported as MariaDB services, and full logical backup/restore uses
   `mariadb-dump` with `mysqldump` fallback for non-system databases.
-- **On-demand HTTP-01 TLS now covers the console host.** `temps serve` derives
-  `console.<zone>` and passes it to the proxy's `OnDemandCertConfig.console_host`,
-  exempting exactly the console host from the cert-eligible-route check (it is
-  served as a fall-through and has no `CachedPeerTable` route) while still
-  requiring it to be in-zone — so QuickStart installs get HTTPS for the console
-  and apps without an eager per-host provisioning step. Every other host still
-  needs a cert-eligible route, preserving the random-SNI flood defense.
-- **`temps setup --letsencrypt-email <addr>` (env `LETSENCRYPT_EMAIL`).** The
-  ACME contact address is now configured explicitly and written to
-  `settings.letsencrypt.email`. An empty value is ignored, so re-running setup
-  without the flag does not wipe a configured address. This is the single source
-  of truth for ACME issuance — see the Fixed entry below for the behaviour change.
-- **Per-environment "Deploy on push" toggle.** `DeploymentConfig.automatic_deploy`
-  is now `Option<bool>`, letting each environment that tracks a branch decide
-  deploy-on-push vs on-demand independently, with env-wins merge semantics (the
-  environment value overrides the project default). Surfaced as a toggle on
-  `EnvironmentConfigurationCard`; multiple environments tracking the same branch
-  now each deploy according to their own setting.
-- **Daily anonymous instance heartbeat for active-instance accuracy.** A new
-  `InstanceHeartbeat` telemetry event fires once per 24h (first beat one interval
-  after boot) carrying the same non-identifying depth-of-usage counts as
-  `instance_started` (projects, environments, managed services, worker nodes) so
-  a live-but-idle install is no longer undercounted as inactive. Spawned only when
-  the reporter is enabled; a no-op under the `TEMPS_TELEMETRY=0` opt-out. Heartbeat
-  and `instance_started` also now carry `has_git_provider` (bool) and a coarse
-  `capacity_tier` RAM band (xs/small/medium/large/xl/xxl, never exact specs).
-- **Settings → Cleanup page.** New UI (`CleanupPage`) to configure automatic
-  resource cleanup: enable/disable, `run_hour_utc`, `image_max_age_days`,
-  `keep_deployments_per_env`, `build_cache_max_age_days`, and
-  `build_cache_max_size_mb`.
-- **Settings → OTLP ingest card.** New `OtelIngestCard` to view and toggle the
-  OTLP ingest key from platform settings (`updateOtelIngest`).
-- **Type-to-confirm delete for external services.** `DeleteServiceButton` /
-  `ServiceDetail` now require typing the service name to confirm deletion, and
-  `ServiceHealthCard` surfaces a degraded-status alert.
 
 ### Changed
 - **MariaDB services default to a small-host profile**: new managed MariaDB
@@ -61,39 +26,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   service UI now presents MariaDB as a shared database server whose linked
   projects get separate databases, reducing accidental one-container-per-website
   installs on 4 GiB and 8 GiB hosts.
-- **On-demand TLS auto-enable is now gated on reachability, not the domain
-  suffix.** `temps setup` previously turned on on-demand HTTP-01 TLS only for
-  `*.sslip.io` installs; the gate is now `!preview_domain.is_empty() &&
-  !is_loopback_zone(preview_domain)`, so any non-empty, non-loopback base domain
-  (sslip.io or a custom wildcard domain like `apps.example.com`) qualifies, and
-  loopback/local mode is the only disqualifier. A pre-loaded wildcard cert still
-  pre-empts on-demand issuance for every host it covers.
-- **Full deployment/build logs replay on first load.** The tail replay backlog
-  (`DEFAULT_TAIL_REPLAY_LINES` in `temps-logs`) was raised from 1000 to 100,000
-  lines so opening a log view shows the complete log instead of a silently
-  truncated tail; `tail_log_with_replay` is now exposed.
-- **Container teardown is bounded per pass.** `mark_deployment_complete` and
-  `workflow_execution_service` now cap teardown work at
-  `MAX_TEARDOWN_DEPLOYMENTS_PER_PASS` and apply a per-container
-  `CONTAINER_TEARDOWN_TIMEOUT_SECS`, so a slow or stuck container teardown can no
-  longer stall the whole pass.
-- **First-touch telemetry milestones now fire exactly once per instance.** Five
-  "first" events (`analytics_first_event_received`, `session_replay_first_session`,
-  `ai_gateway_first_request`, `first_deploy_succeeded`, `error_tracking_first_error`)
-  previously re-fired on every matching action, so telemetry volume scaled with the
-  self-hoster's production traffic. They are now emitted once via
-  `TelemetryReporter::report_once`, backed by a durable `telemetry_milestones`
-  table (migration `m20260621_000001_create_telemetry_milestones`) with an
-  in-process guard, giving exactly-once semantics across restarts and the split
-  proxy/console processes. No-op under the `TEMPS_TELEMETRY=0` opt-out.
-- **New environment names are lowercased on creation** (e.g. `Test` → `test`).
-- **Branch picker is a searchable combobox.** `BranchSelector` now filters
-  branches as you type and shows protected-branch badges.
-- **`@temps-sdk/analytics-browser` ships a full (rrweb-inlined) build and a CDN
-  bundle.** A new `auto-full` entry inlines rrweb/`@rrweb/packer` so session
-  recording works without the `--external` light build, and the package now
-  exposes a `./cdn` export plus `unpkg`/`jsdelivr` (`dist/temps.min.js`) for
-  script-tag installs.
 
 ### Fixed
 - **Laravel MariaDB docs use runtime service env vars**: the Laravel tutorial
@@ -136,6 +68,108 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   captured command output on command timeouts. It also stops polling a drained
   output stream, preventing restore workflows from hanging when Docker closes
   stdout/stderr before `inspect_exec` reports completion.
+
+### Tests
+- **Full-chain MariaDB PITR Docker E2E coverage**: `crates/temps-backup/tests/mariadb_pitr_e2e.rs`
+  exercises the real physical backup engine, S3 binlog archiver, and
+  `restore_pitr(Time)` path against Dockerized MariaDB, MinIO, and Postgres,
+  asserting that rows before the recovery timestamp are restored while later
+  rows are excluded. The `docker-tests` feature and `docker-backup` GitHub
+  Actions matrix group keep the heavyweight test opt-in locally and enforced in
+  CI.
+- **GitHub Actions cargo test pipelines preserve failures**: the Rust test
+  workflow now enables `pipefail` before piping cargo test output through
+  `tee`, disables cargo color for parseable test result lines, and makes failed
+  test extraction non-fatal, so failed unit or integration tests cannot be
+  reported as successful before retry parsing runs.
+- **MariaDB PITR E2E does not retry after long failures**: the `docker-backup`
+  GitHub Actions group now fails immediately after a failed full-chain E2E
+  attempt, preserving the first diagnostic log instead of spending another
+  timeout window rerunning the same expensive scenario.
+- **MariaDB PITR E2E emits provider phase logs**: the Docker E2E initializes a
+  test-only tracing subscriber for `temps_providers::externalsvc::mariadb`, so
+  CI logs show where a full-chain restore is spending time.
+- **MariaDB PITR E2E runs as a dedicated CI job**: `.github/workflows/rust-tests.yml`
+  now runs the full-chain Docker E2E outside the generic integration matrix,
+  starts it immediately, and gives it explicit image-pull, binary-build,
+  test-run, and diagnostics steps, so GitHub Actions exposes progress and
+  hard-stops stuck runs faster.
+
+## [0.1.0-beta.38] - 2026-06-23
+
+### Added
+- **On-demand HTTP-01 TLS now covers the console host.** `temps serve` derives
+  `console.<zone>` and passes it to the proxy's `OnDemandCertConfig.console_host`,
+  exempting exactly the console host from the cert-eligible-route check (it is
+  served as a fall-through and has no `CachedPeerTable` route) while still
+  requiring it to be in-zone — so QuickStart installs get HTTPS for the console
+  and apps without an eager per-host provisioning step. Every other host still
+  needs a cert-eligible route, preserving the random-SNI flood defense.
+- **`temps setup --letsencrypt-email <addr>` (env `LETSENCRYPT_EMAIL`).** The
+  ACME contact address is now configured explicitly and written to
+  `settings.letsencrypt.email`. An empty value is ignored, so re-running setup
+  without the flag does not wipe a configured address. This is the single source
+  of truth for ACME issuance — see the Fixed entry below for the behaviour change.
+- **Per-environment "Deploy on push" toggle.** `DeploymentConfig.automatic_deploy`
+  is now `Option<bool>`, letting each environment that tracks a branch decide
+  deploy-on-push vs on-demand independently, with env-wins merge semantics (the
+  environment value overrides the project default). Surfaced as a toggle on
+  `EnvironmentConfigurationCard`; multiple environments tracking the same branch
+  now each deploy according to their own setting.
+- **Daily anonymous instance heartbeat for active-instance accuracy.** A new
+  `InstanceHeartbeat` telemetry event fires once per 24h (first beat one interval
+  after boot) carrying the same non-identifying depth-of-usage counts as
+  `instance_started` (projects, environments, managed services, worker nodes) so
+  a live-but-idle install is no longer undercounted as inactive. Spawned only when
+  the reporter is enabled; a no-op under the `TEMPS_TELEMETRY=0` opt-out. Heartbeat
+  and `instance_started` also now carry `has_git_provider` (bool) and a coarse
+  `capacity_tier` RAM band (xs/small/medium/large/xl/xxl, never exact specs).
+- **Settings → Cleanup page.** New UI (`CleanupPage`) to configure automatic
+  resource cleanup: enable/disable, `run_hour_utc`, `image_max_age_days`,
+  `keep_deployments_per_env`, `build_cache_max_age_days`, and
+  `build_cache_max_size_mb`.
+- **Settings → OTLP ingest card.** New `OtelIngestCard` to view and toggle the
+  OTLP ingest key from platform settings (`updateOtelIngest`).
+- **Type-to-confirm delete for external services.** `DeleteServiceButton` /
+  `ServiceDetail` now require typing the service name to confirm deletion, and
+  `ServiceHealthCard` surfaces a degraded-status alert.
+
+### Changed
+- **On-demand TLS auto-enable is now gated on reachability, not the domain
+  suffix.** `temps setup` previously turned on on-demand HTTP-01 TLS only for
+  `*.sslip.io` installs; the gate is now `!preview_domain.is_empty() &&
+  !is_loopback_zone(preview_domain)`, so any non-empty, non-loopback base domain
+  (sslip.io or a custom wildcard domain like `apps.example.com`) qualifies, and
+  loopback/local mode is the only disqualifier. A pre-loaded wildcard cert still
+  pre-empts on-demand issuance for every host it covers.
+- **Full deployment/build logs replay on first load.** The tail replay backlog
+  (`DEFAULT_TAIL_REPLAY_LINES` in `temps-logs`) was raised from 1000 to 100,000
+  lines so opening a log view shows the complete log instead of a silently
+  truncated tail; `tail_log_with_replay` is now exposed.
+- **Container teardown is bounded per pass.** `mark_deployment_complete` and
+  `workflow_execution_service` now cap teardown work at
+  `MAX_TEARDOWN_DEPLOYMENTS_PER_PASS` and apply a per-container
+  `CONTAINER_TEARDOWN_TIMEOUT_SECS`, so a slow or stuck container teardown can no
+  longer stall the whole pass.
+- **First-touch telemetry milestones now fire exactly once per instance.** Five
+  "first" events (`analytics_first_event_received`, `session_replay_first_session`,
+  `ai_gateway_first_request`, `first_deploy_succeeded`, `error_tracking_first_error`)
+  previously re-fired on every matching action, so telemetry volume scaled with the
+  self-hoster's production traffic. They are now emitted once via
+  `TelemetryReporter::report_once`, backed by a durable `telemetry_milestones`
+  table (migration `m20260621_000001_create_telemetry_milestones`) with an
+  in-process guard, giving exactly-once semantics across restarts and the split
+  proxy/console processes. No-op under the `TEMPS_TELEMETRY=0` opt-out.
+- **New environment names are lowercased on creation** (e.g. `Test` → `test`).
+- **Branch picker is a searchable combobox.** `BranchSelector` now filters
+  branches as you type and shows protected-branch badges.
+- **`@temps-sdk/analytics-browser` ships a full (rrweb-inlined) build and a CDN
+  bundle.** A new `auto-full` entry inlines rrweb/`@rrweb/packer` so session
+  recording works without the `--external` light build, and the package now
+  exposes a `./cdn` export plus `unpkg`/`jsdelivr` (`dist/temps.min.js`) for
+  script-tag installs.
+
+### Fixed
 - **Scale-to-zero wake no longer returns a spurious 503 on the first request.**
   The wake path reported a container "ready" as soon as a TCP connect to its
   mapped host port succeeded, but Docker's userland proxy (`docker-proxy`,
@@ -177,31 +211,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an environment variable remains the recommended approach since env vars are
   never visible in process listings.
 
-### Tests
-- **Full-chain MariaDB PITR Docker E2E coverage**: `crates/temps-backup/tests/mariadb_pitr_e2e.rs`
-  exercises the real physical backup engine, S3 binlog archiver, and
-  `restore_pitr(Time)` path against Dockerized MariaDB, MinIO, and Postgres,
-  asserting that rows before the recovery timestamp are restored while later
-  rows are excluded. The `docker-tests` feature and `docker-backup` GitHub
-  Actions matrix group keep the heavyweight test opt-in locally and enforced in
-  CI.
-- **GitHub Actions cargo test pipelines preserve failures**: the Rust test
-  workflow now enables `pipefail` before piping cargo test output through
-  `tee`, disables cargo color for parseable test result lines, and makes failed
-  test extraction non-fatal, so failed unit or integration tests cannot be
-  reported as successful before retry parsing runs.
-- **MariaDB PITR E2E does not retry after long failures**: the `docker-backup`
-  GitHub Actions group now fails immediately after a failed full-chain E2E
-  attempt, preserving the first diagnostic log instead of spending another
-  timeout window rerunning the same expensive scenario.
-- **MariaDB PITR E2E emits provider phase logs**: the Docker E2E initializes a
-  test-only tracing subscriber for `temps_providers::externalsvc::mariadb`, so
-  CI logs show where a full-chain restore is spending time.
-- **MariaDB PITR E2E runs as a dedicated CI job**: `.github/workflows/rust-tests.yml`
-  now runs the full-chain Docker E2E outside the generic integration matrix,
-  starts it immediately, and gives it explicit image-pull, binary-build,
-  test-run, and diagnostics steps, so GitHub Actions exposes progress and
-  hard-stops stuck runs faster.
 
 ## [0.1.0-beta.36] - 2026-06-20
 
@@ -213,6 +222,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   empty string"), taking down the whole Traces page via the error boundary.
   Empty/missing service names are now filtered out of the dropdown, and the
   trace table shows `(unnamed)`/`unknown` fallbacks instead of blank cells.
+
 
 ## [0.1.0-beta.35] - 2026-06-19
 
