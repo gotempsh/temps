@@ -198,6 +198,26 @@ fn binlog_server_args(server_id: u32, interval: BinlogArchiveInterval) -> Vec<St
     ]
 }
 
+/// Manifest describing which binary-log segments have been shipped to S3 for
+/// a MariaDB service. Stored at the `binlog/manifest.json` key. The restore
+/// path reads this to know the contiguous set of segments available to replay.
+///
+/// Filenames are stored bare (e.g. `mysql-bin.000007`), without the `.gz`
+/// suffix the on-disk S3 objects carry.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BinlogManifest {
+    /// The highest segment shipped so far (lexicographically). `None` before
+    /// the first segment is archived. Gates the to-ship set on each run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_shipped_file: Option<String>,
+    /// RFC 3339 timestamp of the last successful manifest update.
+    #[serde(default)]
+    pub updated_at: String,
+    /// Every segment shipped to S3, in ship order.
+    #[serde(default)]
+    pub shipped_files: Vec<String>,
+}
+
 /// Input configuration for creating a MariaDB service.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[schemars(
@@ -1115,6 +1135,373 @@ impl MariaDbService {
             .strip_prefix(&bucket_prefix)
             .unwrap_or(location)
             .to_string()
+    }
+
+    // ── Binary-log archiver (PITR "frequent scheduled ship" half) ──────────
+    //
+    // MariaDB has no continuous archiver, so a background task periodically
+    // ships closed binary-log segments to S3. The active (last) segment is
+    // never shipped because it is still being written. A manifest object
+    // records which segments have been shipped so the run is idempotent and
+    // the restore path knows what is available to replay.
+
+    /// Ship every closed (rotated) binary-log segment that has not yet been
+    /// archived to S3, advancing the manifest only past segments that actually
+    /// uploaded successfully. Returns the number of segments shipped this run.
+    ///
+    /// Steps:
+    /// 1. `FLUSH BINARY LOGS` rotates the active segment closed.
+    /// 2. `SHOW BINARY LOGS` lists segments; the last one is still active.
+    /// 3. The S3 manifest's `last_shipped_file` gates what is new.
+    /// 4. Each newer closed segment is downloaded, gzipped, and PUT.
+    /// 5. The manifest is rewritten to reflect what landed.
+    ///
+    /// Credentials are passed via `MYSQL_PWD`/`MARIADB_PWD` exec env, never on
+    /// argv, and are never logged.
+    pub async fn archive_binlogs(
+        &self,
+        s3_client: &aws_sdk_s3::Client,
+        s3_source: &temps_entities::s3_sources::Model,
+        config: &MariaDbConfig,
+    ) -> Result<usize> {
+        let container_name = self.get_live_container_name(config);
+        let bucket = &s3_source.bucket_name;
+        let prefix = s3_source.bucket_path.trim_matches('/');
+
+        // 1. Rotate so the currently-active segment closes and becomes
+        //    shippable on this (or a subsequent) run.
+        self.flush_binary_logs(config).await?;
+
+        // 2. Enumerate segments. The last entry is the new active segment.
+        let raw = self.show_binary_logs(config).await?;
+        let all_files = Self::parse_show_binary_logs(&raw);
+        let closed = Self::closed_binlog_files(&all_files);
+        if closed.is_empty() {
+            debug!(
+                service = %self.name,
+                "No closed MariaDB binlog segments to archive yet"
+            );
+            return Ok(0);
+        }
+
+        // 3. Read the manifest to learn what we have already shipped.
+        let mut manifest = self
+            .read_binlog_manifest(s3_client, bucket, prefix)
+            .await
+            .unwrap_or_default();
+
+        // 4. Compute the to-ship set: closed segments lexicographically
+        //    greater than last_shipped_file (excludes the active file and
+        //    anything already shipped).
+        let to_ship = Self::binlogs_to_ship(&all_files, manifest.last_shipped_file.as_deref());
+        if to_ship.is_empty() {
+            debug!(service = %self.name, "MariaDB binlogs already up to date in S3");
+            return Ok(0);
+        }
+
+        info!(
+            service = %self.name,
+            count = to_ship.len(),
+            "Shipping MariaDB binlog segment(s) to S3"
+        );
+
+        let mut shipped = 0usize;
+        for file in &to_ship {
+            let key = Self::binlog_object_key(prefix, &self.name, file);
+            match self
+                .ship_one_binlog(s3_client, bucket, &container_name, file, &key)
+                .await
+            {
+                Ok(()) => {
+                    // Advance the manifest only past files that actually
+                    // uploaded, so a mid-run failure never claims an unshipped
+                    // segment is present.
+                    manifest.last_shipped_file = Some(file.clone());
+                    if !manifest.shipped_files.contains(file) {
+                        manifest.shipped_files.push(file.clone());
+                    }
+                    shipped += 1;
+                    info!(service = %self.name, binlog = %file, "Shipped MariaDB binlog segment");
+                }
+                Err(e) => {
+                    // Stop at the first failure: segments must be shipped in
+                    // order so the replay chain stays contiguous. Persist
+                    // progress so far below.
+                    warn!(
+                        service = %self.name,
+                        binlog = %file,
+                        "Failed to ship MariaDB binlog segment, stopping run: {}",
+                        e
+                    );
+                    break;
+                }
+            }
+        }
+
+        // 5. Persist the manifest reflecting what actually landed.
+        if shipped > 0 {
+            manifest.updated_at = chrono::Utc::now().to_rfc3339();
+            if let Err(e) = self
+                .write_binlog_manifest(s3_client, bucket, prefix, &manifest)
+                .await
+            {
+                // The segments are uploaded; only the manifest write failed.
+                // The next run re-reads the (stale) manifest and re-ships the
+                // same segments idempotently (overwrite is a no-op of content).
+                warn!(
+                    service = %self.name,
+                    "Shipped {} MariaDB binlog segment(s) but failed to update manifest: {}",
+                    shipped,
+                    e
+                );
+                return Err(e);
+            }
+        }
+
+        Ok(shipped)
+    }
+
+    /// `FLUSH BINARY LOGS` — rotates the active binlog so it closes.
+    async fn flush_binary_logs(&self, config: &MariaDbConfig) -> Result<()> {
+        self.run_admin_sql(config, "FLUSH BINARY LOGS").await
+    }
+
+    /// Raw `SHOW BINARY LOGS` output (tab-separated rows: filename, size, ...).
+    async fn show_binary_logs(&self, config: &MariaDbConfig) -> Result<String> {
+        let container_name = self.get_live_container_name(config);
+        self.run_container_command(
+            &container_name,
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "if command -v mariadb >/dev/null 2>&1; then \
+                     mariadb -N -B -uroot -e 'SHOW BINARY LOGS'; \
+                 else \
+                     mysql -N -B -uroot -e 'SHOW BINARY LOGS'; \
+                 fi"
+                .to_string(),
+            ],
+            Some(vec![
+                format!("MYSQL_PWD={}", config.root_password),
+                format!("MARIADB_PWD={}", config.root_password),
+            ]),
+            Duration::from_secs(15),
+        )
+        .await
+    }
+
+    /// Download a single binlog segment out of the container, gzip it, and PUT
+    /// it to its S3 key. Reads the file as a tar stream so the raw bytes are
+    /// preserved (an `exec cat` through the log-mux corrupts binary data).
+    async fn ship_one_binlog(
+        &self,
+        s3_client: &aws_sdk_s3::Client,
+        bucket: &str,
+        container_name: &str,
+        file: &str,
+        key: &str,
+    ) -> Result<()> {
+        use std::io::Write;
+
+        let bytes = self.read_binlog_from_container(container_name, file).await?;
+
+        let gzipped = {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(&bytes)?;
+            encoder.finish()?
+        };
+
+        s3_client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(aws_sdk_s3::primitives::ByteStream::from(gzipped))
+            .content_type("application/x-gzip")
+            .send()
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to upload binlog to s3://{}/{}: {}", bucket, key, e)
+            })?;
+
+        Ok(())
+    }
+
+    /// Read `/var/lib/mysql/{file}` out of the container as raw bytes via the
+    /// Docker tar download API (preserves binary content).
+    async fn read_binlog_from_container(
+        &self,
+        container_name: &str,
+        file: &str,
+    ) -> Result<Vec<u8>> {
+        use std::io::Read;
+
+        let path = format!("/var/lib/mysql/{}", file);
+        let options = bollard::query_parameters::DownloadFromContainerOptionsBuilder::default()
+            .path(&path)
+            .build();
+
+        let mut tar_stream = self
+            .docker
+            .download_from_container(container_name, Some(options));
+
+        let mut tar_bytes: Vec<u8> = Vec::new();
+        while let Some(chunk) = tar_stream.next().await {
+            let bytes = chunk.map_err(|e| {
+                anyhow::anyhow!("Failed to download binlog {} from container: {}", file, e)
+            })?;
+            tar_bytes.extend_from_slice(&bytes);
+        }
+
+        let mut archive = tar::Archive::new(std::io::Cursor::new(tar_bytes));
+        let entries = archive
+            .entries()
+            .map_err(|e| anyhow::anyhow!("Failed to read binlog tar archive for {}: {}", file, e))?;
+        for entry in entries {
+            let mut entry =
+                entry.map_err(|e| anyhow::anyhow!("Failed to read binlog tar entry: {}", e))?;
+            let mut content = Vec::new();
+            entry
+                .read_to_end(&mut content)
+                .map_err(|e| anyhow::anyhow!("Failed to read binlog bytes for {}: {}", file, e))?;
+            if !content.is_empty() {
+                return Ok(content);
+            }
+        }
+        Err(anyhow::anyhow!(
+            "Binlog segment {} not found in container tar archive",
+            file
+        ))
+    }
+
+    /// Fetch + parse the binlog manifest from S3. Returns the default (empty)
+    /// manifest when no manifest exists yet.
+    async fn read_binlog_manifest(
+        &self,
+        s3_client: &aws_sdk_s3::Client,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<BinlogManifest> {
+        let key = Self::binlog_manifest_key(prefix, &self.name);
+        let resp = match s3_client
+            .get_object()
+            .bucket(bucket)
+            .key(&key)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            // Missing manifest is normal on first run.
+            Err(_) => return Ok(BinlogManifest::default()),
+        };
+
+        let bytes = resp
+            .body
+            .collect()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to read binlog manifest body: {}", e))?
+            .into_bytes();
+
+        serde_json::from_slice::<BinlogManifest>(&bytes)
+            .map_err(|e| anyhow::anyhow!("Failed to parse binlog manifest: {}", e))
+    }
+
+    /// Serialize + PUT the manifest to S3.
+    async fn write_binlog_manifest(
+        &self,
+        s3_client: &aws_sdk_s3::Client,
+        bucket: &str,
+        prefix: &str,
+        manifest: &BinlogManifest,
+    ) -> Result<()> {
+        let key = Self::binlog_manifest_key(prefix, &self.name);
+        let body = serde_json::to_vec(manifest)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize binlog manifest: {}", e))?;
+        s3_client
+            .put_object()
+            .bucket(bucket)
+            .key(&key)
+            .body(aws_sdk_s3::primitives::ByteStream::from(body))
+            .content_type("application/json")
+            .send()
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to upload binlog manifest to s3://{}/{}: {}",
+                    bucket,
+                    key,
+                    e
+                )
+            })?;
+        Ok(())
+    }
+
+    /// Parse `SHOW BINARY LOGS` output into segment filenames, in order.
+    /// Each row is tab-separated (`filename\tsize[\t...]`); blank lines and
+    /// the `Log_name` header (when present) are ignored.
+    pub(crate) fn parse_show_binary_logs(raw: &str) -> Vec<String> {
+        raw.lines()
+            .filter_map(|line| {
+                let name = line.split('\t').next()?.trim();
+                if name.is_empty() || name == "Log_name" {
+                    return None;
+                }
+                Some(name.to_string())
+            })
+            .collect()
+    }
+
+    /// All segments except the last — the last one is the currently-active
+    /// file that is still being written and must not be shipped.
+    pub(crate) fn closed_binlog_files(all_files: &[String]) -> Vec<String> {
+        if all_files.len() <= 1 {
+            return Vec::new();
+        }
+        all_files[..all_files.len() - 1].to_vec()
+    }
+
+    /// Given the full ordered segment list and the manifest's
+    /// `last_shipped_file`, compute the segments to ship this run:
+    /// closed (not the active/last file), strictly lexicographically greater
+    /// than `last_shipped_file`. `mysql-bin.NNNNNN` names sort correctly
+    /// lexicographically.
+    pub(crate) fn binlogs_to_ship(all_files: &[String], last_shipped: Option<&str>) -> Vec<String> {
+        Self::closed_binlog_files(all_files)
+            .into_iter()
+            .filter(|f| match last_shipped {
+                Some(last) => f.as_str() > last,
+                None => true,
+            })
+            .collect()
+    }
+
+    /// S3 object key for a single gzipped binlog segment.
+    /// `{prefix}/external_services/mariadb/{service}/binlog/{file}.gz`
+    /// (the leading `{prefix}/` is dropped when `prefix` is empty).
+    pub(crate) fn binlog_object_key(prefix: &str, service_name: &str, file: &str) -> String {
+        let tail = format!(
+            "external_services/mariadb/{}/binlog/{}.gz",
+            service_name, file
+        );
+        if prefix.is_empty() {
+            tail
+        } else {
+            format!("{}/{}", prefix, tail)
+        }
+    }
+
+    /// S3 object key for the binlog manifest.
+    /// `{prefix}/external_services/mariadb/{service}/binlog/manifest.json`.
+    pub(crate) fn binlog_manifest_key(prefix: &str, service_name: &str) -> String {
+        let tail = format!(
+            "external_services/mariadb/{}/binlog/manifest.json",
+            service_name
+        );
+        if prefix.is_empty() {
+            tail
+        } else {
+            format!("{}/{}", prefix, tail)
+        }
     }
 
     async fn dump_all_databases_to_gzip_file(
@@ -2231,6 +2618,142 @@ mod tests {
             prop.get("x-editable").and_then(|v| v.as_bool()),
             Some(true)
         );
+    }
+
+    #[test]
+    fn parse_show_binary_logs_extracts_filenames_in_order() {
+        // Typical `mariadb -N -B` output: tab-separated, no header.
+        let raw = "mysql-bin.000001\t1234\nmysql-bin.000002\t5678\nmysql-bin.000003\t90\n";
+        assert_eq!(
+            MariaDbService::parse_show_binary_logs(raw),
+            vec![
+                "mysql-bin.000001".to_string(),
+                "mysql-bin.000002".to_string(),
+                "mysql-bin.000003".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_show_binary_logs_ignores_header_and_blank_lines() {
+        // Some clients (non -N) emit a header row and trailing blank lines.
+        let raw = "Log_name\tFile_size\nmysql-bin.000007\t100\n\n";
+        assert_eq!(
+            MariaDbService::parse_show_binary_logs(raw),
+            vec!["mysql-bin.000007".to_string()]
+        );
+    }
+
+    #[test]
+    fn closed_binlog_files_excludes_active_last_segment() {
+        let all = vec![
+            "mysql-bin.000001".to_string(),
+            "mysql-bin.000002".to_string(),
+            "mysql-bin.000003".to_string(),
+        ];
+        // The last segment is active and must not be shippable.
+        assert_eq!(
+            MariaDbService::closed_binlog_files(&all),
+            vec!["mysql-bin.000001".to_string(), "mysql-bin.000002".to_string()]
+        );
+
+        // A single segment is the active one — nothing closed yet.
+        assert!(MariaDbService::closed_binlog_files(&["mysql-bin.000001".to_string()]).is_empty());
+        assert!(MariaDbService::closed_binlog_files(&[]).is_empty());
+    }
+
+    #[test]
+    fn binlogs_to_ship_excludes_active_and_already_shipped() {
+        let all = vec![
+            "mysql-bin.000001".to_string(),
+            "mysql-bin.000002".to_string(),
+            "mysql-bin.000003".to_string(),
+            "mysql-bin.000004".to_string(), // active — never shipped
+        ];
+
+        // Nothing shipped yet: ship all closed segments (1..=3), not the active 4.
+        assert_eq!(
+            MariaDbService::binlogs_to_ship(&all, None),
+            vec![
+                "mysql-bin.000001".to_string(),
+                "mysql-bin.000002".to_string(),
+                "mysql-bin.000003".to_string(),
+            ]
+        );
+
+        // last_shipped=000002: only 000003 is new (000004 is active).
+        assert_eq!(
+            MariaDbService::binlogs_to_ship(&all, Some("mysql-bin.000002")),
+            vec!["mysql-bin.000003".to_string()]
+        );
+
+        // last_shipped=000003: everything closed is already shipped.
+        assert!(MariaDbService::binlogs_to_ship(&all, Some("mysql-bin.000003")).is_empty());
+    }
+
+    #[test]
+    fn binlogs_to_ship_lexicographic_ordering_holds_across_rollover() {
+        // mysql-bin.NNNNNN names sort lexicographically the same as numerically
+        // within the fixed-width range.
+        let all = vec![
+            "mysql-bin.000009".to_string(),
+            "mysql-bin.000010".to_string(),
+            "mysql-bin.000011".to_string(), // active
+        ];
+        assert_eq!(
+            MariaDbService::binlogs_to_ship(&all, Some("mysql-bin.000009")),
+            vec!["mysql-bin.000010".to_string()]
+        );
+    }
+
+    #[test]
+    fn binlog_object_key_handles_empty_and_nonempty_prefix() {
+        // Non-empty bucket_path prefix.
+        assert_eq!(
+            MariaDbService::binlog_object_key("backups/prod", "orders-db", "mysql-bin.000007"),
+            "backups/prod/external_services/mariadb/orders-db/binlog/mysql-bin.000007.gz"
+        );
+        // Empty prefix drops the leading segment.
+        assert_eq!(
+            MariaDbService::binlog_object_key("", "orders-db", "mysql-bin.000007"),
+            "external_services/mariadb/orders-db/binlog/mysql-bin.000007.gz"
+        );
+    }
+
+    #[test]
+    fn binlog_manifest_key_handles_empty_and_nonempty_prefix() {
+        assert_eq!(
+            MariaDbService::binlog_manifest_key("backups/prod", "orders-db"),
+            "backups/prod/external_services/mariadb/orders-db/binlog/manifest.json"
+        );
+        assert_eq!(
+            MariaDbService::binlog_manifest_key("", "orders-db"),
+            "external_services/mariadb/orders-db/binlog/manifest.json"
+        );
+    }
+
+    #[test]
+    fn binlog_manifest_round_trips_json_shape() {
+        let manifest = BinlogManifest {
+            last_shipped_file: Some("mysql-bin.000007".to_string()),
+            updated_at: "2026-06-23T00:00:00+00:00".to_string(),
+            shipped_files: vec![
+                "mysql-bin.000003".to_string(),
+                "mysql-bin.000004".to_string(),
+            ],
+        };
+        let json = serde_json::to_value(&manifest).expect("serialize");
+        assert_eq!(json["last_shipped_file"], "mysql-bin.000007");
+        assert_eq!(json["shipped_files"][0], "mysql-bin.000003");
+        let parsed: BinlogManifest = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(parsed, manifest);
+    }
+
+    #[test]
+    fn binlog_manifest_default_is_empty() {
+        let m = BinlogManifest::default();
+        assert!(m.last_shipped_file.is_none());
+        assert!(m.shipped_files.is_empty());
     }
 
     #[test]

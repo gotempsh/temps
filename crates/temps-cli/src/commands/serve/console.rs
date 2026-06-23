@@ -1743,6 +1743,8 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
             external_service_manager,
             notification_service,
             ExternalServiceHealthConfig::default(),
+            docker.clone(),
+            service_context.require_service::<temps_core::EncryptionService>(),
         ));
 
         // Register so the providers plugin can pick it up and expose a
