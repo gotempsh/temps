@@ -112,6 +112,92 @@ impl MariaDbSizeProfile {
     }
 }
 
+/// How often closed binary-log segments are shipped to S3 — the PITR
+/// granularity (recovery-point objective) for a MariaDB service.
+///
+/// MariaDB has no continuous archiver, so a background task ships rotated
+/// binlogs on this cadence (see the binlog archiver). Smaller intervals lower
+/// the worst-case data loss on restore at the cost of more frequent S3
+/// uploads; the residual RPO is one interval. `binlog_expire_logs_seconds` is
+/// derived from this value to always exceed the ship interval, so a segment is
+/// never purged locally before it has been archived.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub enum BinlogArchiveInterval {
+    /// Ship every minute — lowest RPO, highest S3 churn.
+    #[serde(rename = "1m")]
+    Min1,
+    /// Ship every 5 minutes (default).
+    #[default]
+    #[serde(rename = "5m")]
+    Min5,
+    /// Ship every 15 minutes.
+    #[serde(rename = "15m")]
+    Min15,
+    /// Ship every 60 minutes — lowest churn, highest RPO.
+    #[serde(rename = "60m")]
+    Min60,
+}
+
+impl BinlogArchiveInterval {
+    /// Ship cadence in seconds.
+    pub fn seconds(self) -> u64 {
+        match self {
+            Self::Min1 => 60,
+            Self::Min5 => 300,
+            Self::Min15 => 900,
+            Self::Min60 => 3600,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Min1 => "1m",
+            Self::Min5 => "5m",
+            Self::Min15 => "15m",
+            Self::Min60 => "60m",
+        }
+    }
+
+    /// Local binlog retention (`binlog_expire_logs_seconds`). Kept well beyond
+    /// the ship interval (>= 6x, floor 1h) so a segment is never purged before
+    /// the archiver has shipped it — the continuity invariant for PITR.
+    pub fn binlog_expire_seconds(self) -> u64 {
+        (self.seconds() * 6).max(3600)
+    }
+}
+
+/// Derive a stable, non-zero `server-id` for a MariaDB service from its name.
+///
+/// `--log-bin` requires a non-zero `server-id`. These standalone servers do
+/// not replicate with each other, so uniqueness is not strictly required, but
+/// deriving a stable value from the name keeps it consistent across recreates
+/// and avoids collisions if two are ever wired into replication. FNV-1a hash
+/// mapped into `1..=2_000_000_000`.
+fn stable_server_id(name: &str) -> u32 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
+    for b in name.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV-1a prime
+    }
+    (h % 2_000_000_000) as u32 + 1
+}
+
+/// Binary-logging server args appended to a MariaDB container's command so the
+/// service is PITR-capable: ROW-format binlog, a stable server-id, durable
+/// flushing (`sync_binlog=1` so a committed-but-unsynced binlog tail is not
+/// lost on crash), and a derived retention window.
+///
+/// Credentials are never involved here — these are purely server tuning flags.
+fn binlog_server_args(server_id: u32, interval: BinlogArchiveInterval) -> Vec<String> {
+    vec![
+        "--log-bin=mysql-bin".to_string(),
+        "--binlog-format=ROW".to_string(),
+        format!("--server-id={server_id}"),
+        "--sync-binlog=1".to_string(),
+        format!("--binlog-expire-logs-seconds={}", interval.binlog_expire_seconds()),
+    ]
+}
+
 /// Input configuration for creating a MariaDB service.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[schemars(
@@ -165,6 +251,11 @@ pub struct MariaDbInputConfig {
     #[serde(default)]
     pub size_profile: MariaDbSizeProfile,
 
+    /// Point-in-time-recovery granularity: how often binary logs are shipped
+    /// to S3. Smaller = less data lost on restore, more frequent uploads.
+    #[serde(default)]
+    pub binlog_archive_interval: BinlogArchiveInterval,
+
     /// Existing Docker container name for imported services.
     #[serde(default)]
     pub container_name: Option<String>,
@@ -182,6 +273,8 @@ pub struct MariaDbConfig {
     pub docker_image: String,
     #[serde(default)]
     pub size_profile: MariaDbSizeProfile,
+    #[serde(default)]
+    pub binlog_archive_interval: BinlogArchiveInterval,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container_name: Option<String>,
 }
@@ -201,6 +294,7 @@ impl From<MariaDbInputConfig> for MariaDbConfig {
             root_password: input.root_password.unwrap_or_else(generate_password),
             docker_image: input.docker_image,
             size_profile: input.size_profile,
+            binlog_archive_interval: input.binlog_archive_interval,
             container_name: input.container_name,
         }
     }
@@ -407,6 +501,11 @@ impl MariaDbService {
             format!("MARIADB_USER={}", config.username),
             format!("MARIADB_PASSWORD={}", config.password),
             "MARIADB_AUTO_UPGRADE=1".to_string(),
+            // Pin the server timezone to UTC so binlog event timestamps — and
+            // therefore PITR `mysqlbinlog --stop-datetime` targets — are
+            // unambiguous. RecoveryTarget::Time is UTC; without this the
+            // recovery target could be misinterpreted in the host's local TZ.
+            "TZ=UTC".to_string(),
         ];
 
         let volume_name = format!("mariadb_data_{}", self.name);
@@ -456,7 +555,20 @@ impl MariaDbService {
             exposed_ports: Some(Vec::from(["3306/tcp".to_string()])),
             env: Some(env_vars),
             labels: Some(container_labels),
-            cmd: Some(config.size_profile.server_args()),
+            // Tuning args + binary-logging args. Binlog is enabled by default
+            // so the service is PITR-capable from creation (the MariaDB analog
+            // of Postgres WAL archiving). Enabling binlog requires the flags at
+            // server start, so existing containers created before this adopt it
+            // on their next recreate (e.g. image upgrade); we do not force a
+            // disruptive recreate of a healthy running container here.
+            cmd: Some({
+                let mut args = config.size_profile.server_args();
+                args.extend(binlog_server_args(
+                    stable_server_id(&self.name),
+                    config.binlog_archive_interval,
+                ));
+                args
+            }),
             host_config: Some(bollard::models::HostConfig {
                 restart_policy: Some(bollard::models::RestartPolicy {
                     name: Some(bollard::models::RestartPolicyNameEnum::ALWAYS),
@@ -1316,6 +1428,10 @@ impl ExternalService for MariaDbService {
                 let editable = match key.as_str() {
                     "port" => true,
                     "docker_image" => true,
+                    // PITR granularity can be tuned at runtime: the archiver
+                    // picks up a new cadence live; the derived
+                    // binlog_expire_logs_seconds takes effect on next recreate.
+                    "binlog_archive_interval" => true,
                     "size_profile" => false,
                     "host" | "database" | "username" | "password" | "root_password" => false,
                     _ => false,
@@ -1334,6 +1450,17 @@ impl ExternalService for MariaDbService {
                     "default": "small",
                     "enum": ["small", "standard", "dedicated"],
                     "x-editable": false
+                }),
+            );
+
+            properties.insert(
+                "binlog_archive_interval".to_string(),
+                serde_json::json!({
+                    "type": "string",
+                    "description": "Point-in-time-recovery granularity: how often binary logs are shipped to S3. Smaller intervals lose less data on restore (lower RPO) but upload more often. The worst-case data loss on restore is one interval.",
+                    "default": "5m",
+                    "enum": ["1m", "5m", "15m", "60m"],
+                    "x-editable": true
                 }),
             );
         }
@@ -2014,10 +2141,96 @@ mod tests {
             root_password: Some("rootpass1".to_string()),
             docker_image: DEFAULT_MARIADB_IMAGE.to_string(),
             size_profile: MariaDbSizeProfile::Standard,
+            binlog_archive_interval: BinlogArchiveInterval::Min15,
             container_name: None,
         });
 
         assert_eq!(config.size_profile, MariaDbSizeProfile::Standard);
+        assert_eq!(
+            config.binlog_archive_interval,
+            BinlogArchiveInterval::Min15
+        );
+    }
+
+    #[test]
+    fn binlog_archive_interval_defaults_to_5m() {
+        assert_eq!(BinlogArchiveInterval::default(), BinlogArchiveInterval::Min5);
+        assert_eq!(BinlogArchiveInterval::default().as_str(), "5m");
+    }
+
+    #[test]
+    fn binlog_interval_seconds_and_expire() {
+        // Retention must always exceed the ship interval (>= 6x, floor 1h) so
+        // a segment is never purged before it is archived.
+        for iv in [
+            BinlogArchiveInterval::Min1,
+            BinlogArchiveInterval::Min5,
+            BinlogArchiveInterval::Min15,
+            BinlogArchiveInterval::Min60,
+        ] {
+            assert!(
+                iv.binlog_expire_seconds() >= iv.seconds() * 6,
+                "{}: expire must be >= 6x interval",
+                iv.as_str()
+            );
+            assert!(
+                iv.binlog_expire_seconds() >= 3600,
+                "{}: expire floor is 1h",
+                iv.as_str()
+            );
+        }
+        assert_eq!(BinlogArchiveInterval::Min60.seconds(), 3600);
+        assert_eq!(BinlogArchiveInterval::Min60.binlog_expire_seconds(), 21600);
+    }
+
+    #[test]
+    fn binlog_interval_serde_round_trips_wire_format() {
+        let cfg: MariaDbInputConfig =
+            serde_json::from_value(serde_json::json!({ "binlog_archive_interval": "1m" }))
+                .expect("parse");
+        assert_eq!(cfg.binlog_archive_interval, BinlogArchiveInterval::Min1);
+    }
+
+    #[test]
+    fn binlog_server_args_has_expected_flags_and_no_credentials() {
+        let args = binlog_server_args(42, BinlogArchiveInterval::Min5);
+        assert!(args.contains(&"--log-bin=mysql-bin".to_string()));
+        assert!(args.contains(&"--binlog-format=ROW".to_string()));
+        assert!(args.contains(&"--server-id=42".to_string()));
+        assert!(args.contains(&"--sync-binlog=1".to_string()));
+        assert!(args.contains(&"--binlog-expire-logs-seconds=3600".to_string()));
+        // Server tuning flags only — never a password.
+        assert!(!args.iter().any(|a| a.contains("password") || a.contains("PWD")));
+    }
+
+    #[test]
+    fn stable_server_id_is_deterministic_and_nonzero() {
+        let a = stable_server_id("orders-db");
+        let b = stable_server_id("orders-db");
+        let c = stable_server_id("analytics-db");
+        assert_eq!(a, b, "must be stable across calls");
+        assert_ne!(a, 0, "server-id must be non-zero for --log-bin");
+        assert_ne!(a, c, "distinct names should generally differ");
+    }
+
+    #[test]
+    fn parameter_schema_exposes_editable_binlog_interval() {
+        let service = MariaDbService::new(
+            "schema-test".to_string(),
+            Arc::new(Docker::connect_with_http_defaults().expect("docker client")),
+        );
+        let schema = service
+            .get_parameter_schema()
+            .expect("schema should be available");
+        let prop = schema
+            .get("properties")
+            .and_then(|p| p.get("binlog_archive_interval"))
+            .expect("binlog_archive_interval should be present");
+        assert_eq!(prop.get("default").and_then(|v| v.as_str()), Some("5m"));
+        assert_eq!(
+            prop.get("x-editable").and_then(|v| v.as_bool()),
+            Some(true)
+        );
     }
 
     #[test]
