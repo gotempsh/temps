@@ -94,6 +94,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   starts it immediately, and gives it explicit image-pull, binary-build,
   test-run, and diagnostics steps, so GitHub Actions exposes progress and
   hard-stops stuck runs faster.
+- **Postgres upgrade Docker tests use real backup FK rows**:
+  `postgres_upgrade` integration fixtures now insert a matching `backups` row
+  for the fake pre-upgrade backup id, keeping the existing rollback/upgrade
+  assertions valid after FK enforcement.
 
 ## [0.1.0-beta.38] - 2026-06-23
 

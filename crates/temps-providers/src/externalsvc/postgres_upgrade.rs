@@ -2790,14 +2790,16 @@ mod tests {
         use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection, EntityTrait};
         use serde_json::json;
         use std::sync::{
-            atomic::{AtomicU64, Ordering},
+            atomic::{AtomicI32, AtomicU64, Ordering},
             Arc, Mutex,
         };
         use std::time::{Duration, Instant};
         use tempfile::TempDir;
         use temps_core::EncryptionService;
         use temps_database::test_utils::TestDatabase;
-        use temps_entities::{external_services, postgres_major_upgrades, users};
+        use temps_entities::{
+            backups, external_services, postgres_major_upgrades, s3_sources, users,
+        };
         use temps_logs::LogService;
 
         use crate::postgres_lifecycle::PostgresLifecycleAdapter;
@@ -3105,35 +3107,101 @@ mod tests {
             }
         }
 
-        /// Stub `PreUpgradeBackupProvider` — always returns a synthetic
-        /// backup id (42) without touching S3. The orchestrator only reads
-        /// this id back onto the row; no downstream check validates it.
+        /// Stub `PreUpgradeBackupProvider` — creates a real control-plane
+        /// backup row without touching S3. The orchestrator stores the
+        /// returned id on `postgres_major_upgrades.pre_upgrade_backup_id`,
+        /// which has a real FK to `backups.id` in the test database.
         pub struct StubBackupProvider {
+            db: Arc<DatabaseConnection>,
             pub calls: Arc<AtomicU64>,
+            pub last_backup_id: Arc<AtomicI32>,
         }
 
         impl StubBackupProvider {
-            pub fn new() -> Self {
+            pub fn new(db: Arc<DatabaseConnection>) -> Self {
                 Self {
+                    db,
                     calls: Arc::new(AtomicU64::new(0)),
+                    last_backup_id: Arc::new(AtomicI32::new(0)),
                 }
             }
         }
 
         #[async_trait]
         impl PreUpgradeBackupProvider for StubBackupProvider {
-            async fn default_s3_source_id(&self, _service_id: i32) -> Result<Option<i32>, String> {
-                Ok(Some(1))
+            async fn default_s3_source_id(&self, service_id: i32) -> Result<Option<i32>, String> {
+                let now = chrono::Utc::now();
+                let source = s3_sources::ActiveModel {
+                    id: sea_orm::NotSet,
+                    name: Set(format!(
+                        "upgrade-test-s3-{}-{}",
+                        service_id,
+                        now.timestamp_nanos_opt().unwrap_or(0)
+                    )),
+                    bucket_name: Set("upgrade-test-bucket".to_string()),
+                    region: Set("us-east-1".to_string()),
+                    endpoint: Set(Some("http://127.0.0.1:9000".to_string())),
+                    bucket_path: Set("postgres-upgrade-tests".to_string()),
+                    access_key_id: Set("test-access-key".to_string()),
+                    secret_key: Set("test-secret-key".to_string()),
+                    force_path_style: Set(Some(true)),
+                    is_default: Set(true),
+                    created_at: Set(now),
+                    updated_at: Set(now),
+                }
+                .insert(self.db.as_ref())
+                .await
+                .map_err(|e| format!("insert test s3 source: {}", e))?;
+
+                Ok(Some(source.id))
             }
 
             async fn create_pre_upgrade_backup(
                 &self,
-                _service_id: i32,
-                _s3_source_id: i32,
-                _created_by: i32,
+                service_id: i32,
+                s3_source_id: i32,
+                created_by: i32,
             ) -> Result<i32, String> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
-                Ok(42)
+                let now = chrono::Utc::now();
+                let backup_uuid = format!(
+                    "upgrade-pre-backup-{}-{}",
+                    service_id,
+                    now.timestamp_nanos_opt().unwrap_or(0)
+                );
+                let backup = backups::ActiveModel {
+                    id: sea_orm::NotSet,
+                    name: Set(format!("Pre-upgrade backup {}", service_id)),
+                    backup_id: Set(backup_uuid.clone()),
+                    schedule_id: Set(None),
+                    backup_type: Set("pre_upgrade".to_string()),
+                    state: Set("completed".to_string()),
+                    started_at: Set(now),
+                    finished_at: Set(Some(now)),
+                    size_bytes: Set(Some(0)),
+                    file_count: Set(Some(0)),
+                    s3_source_id: Set(s3_source_id),
+                    s3_location: Set(format!("s3://upgrade-test-bucket/{}", backup_uuid)),
+                    error_message: Set(None),
+                    metadata: Set(serde_json::json!({
+                        "test": true,
+                        "service_id": service_id,
+                        "purpose": "postgres_major_upgrade_pre_backup"
+                    })
+                    .to_string()),
+                    checksum: Set(None),
+                    compression_type: Set("none".to_string()),
+                    created_by: Set(created_by),
+                    expires_at: Set(None),
+                    tags: Set("[]".to_string()),
+                    schedule_run_id: sea_orm::NotSet,
+                }
+                .insert(self.db.as_ref())
+                .await
+                .map_err(|e| format!("insert test backup: {}", e))?;
+
+                self.last_backup_id.store(backup.id, Ordering::SeqCst);
+                Ok(backup.id)
             }
         }
 
@@ -3278,7 +3346,7 @@ mod tests {
 
         let ctx = UpgradeTestCtx::new("rollback").await;
         let backup_provider: Arc<dyn PreUpgradeBackupProvider> =
-            Arc::new(StubBackupProvider::new());
+            Arc::new(StubBackupProvider::new(ctx.test_db.db.clone()));
         let lifecycle: Arc<dyn PostgresContainerLifecycle> = ctx.lifecycle_adapter.clone();
 
         // Seed pre-upgrade data on v17.
@@ -3439,7 +3507,7 @@ mod tests {
         }
 
         let ctx = UpgradeTestCtx::new("happy").await;
-        let backup_provider = Arc::new(StubBackupProvider::new());
+        let backup_provider = Arc::new(StubBackupProvider::new(ctx.test_db.db.clone()));
         let backup_provider_trait: Arc<dyn PreUpgradeBackupProvider> = backup_provider.clone();
         let lifecycle: Arc<dyn PostgresContainerLifecycle> = ctx.lifecycle_adapter.clone();
 
@@ -3478,7 +3546,11 @@ mod tests {
             assert!(row.finished_at.is_some(), "finished_at unset");
             assert_eq!(
                 row.pre_upgrade_backup_id,
-                Some(42),
+                Some(
+                    backup_provider
+                        .last_backup_id
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                ),
                 "pre_upgrade_backup_id not persisted"
             );
             assert!(
@@ -3585,7 +3657,7 @@ mod tests {
 
         let ctx = UpgradeTestCtx::new("snap-order").await;
         let backup_provider: Arc<dyn PreUpgradeBackupProvider> =
-            Arc::new(StubBackupProvider::new());
+            Arc::new(StubBackupProvider::new(ctx.test_db.db.clone()));
 
         // Wrap the real adapter in a recorder so we can observe call order.
         let recorder = RecordingLifecycle::new(ctx.lifecycle_adapter.clone());
@@ -3744,7 +3816,7 @@ mod tests {
 
         let ctx = UpgradeTestCtx::new("stream-drain").await;
         let backup_provider: Arc<dyn PreUpgradeBackupProvider> =
-            Arc::new(StubBackupProvider::new());
+            Arc::new(StubBackupProvider::new(ctx.test_db.db.clone()));
         let lifecycle: Arc<dyn PostgresContainerLifecycle> = ctx.lifecycle_adapter.clone();
 
         let result = async {
@@ -3843,7 +3915,7 @@ mod tests {
 
         let ctx = UpgradeTestCtx::new("dump-idem").await;
         let backup_provider: Arc<dyn PreUpgradeBackupProvider> =
-            Arc::new(StubBackupProvider::new());
+            Arc::new(StubBackupProvider::new(ctx.test_db.db.clone()));
         let lifecycle: Arc<dyn PostgresContainerLifecycle> = ctx.lifecycle_adapter.clone();
 
         let result = async {
@@ -3913,7 +3985,7 @@ mod tests {
             // state, the whole retry should complete FAST (< 60s typ).
             let retry_start = std::time::Instant::now();
             let orch2 = ctx.orchestrator(
-                Arc::new(StubBackupProvider::new()),
+                Arc::new(StubBackupProvider::new(ctx.test_db.db.clone())),
                 ctx.lifecycle_adapter.clone(),
             );
             orch2
