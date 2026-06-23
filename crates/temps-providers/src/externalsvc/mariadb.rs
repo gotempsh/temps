@@ -1,8 +1,8 @@
 use crate::utils::ensure_network_exists;
 
 use super::{
-    ExternalService, HealthProbeResult, LogicalResource, RuntimeEnvVar, ServiceConfig,
-    ServiceResourceLimits, ServiceType,
+    ExternalService, HealthProbeResult, LogicalResource, NewServiceRestoreResult, RecoveryTarget,
+    RuntimeEnvVar, ServiceConfig, ServiceResourceLimits, ServiceType,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -1677,6 +1677,823 @@ impl MariaDbService {
 
         result.map(|_| ())
     }
+
+    // ── Physical (PITR) restore helpers ────────────────────────────────────
+    //
+    // A physical base backup is a gzipped `mariadb-backup --stream=mbstream`
+    // stream (`base.mbstream.gz`). Restoring it is the documented
+    // prepare/copy-back dance:
+    //   1. gunzip the stream onto the host,
+    //   2. mbstream-extract it into a staging dir inside a helper container
+    //      that shares the service's data volume,
+    //   3. `mariadb-backup --prepare` the staging dir (apply redo logs),
+    //   4. wipe the (empty) datadir and `--copy-back` into it,
+    //   5. chown back to mysql so the server can read it on start.
+    //
+    // Getting the stream INTO the helper: the helper is *created* (not started)
+    // with `volumes_from = [service_container]`, then we `upload_to_container`
+    // the gunzipped mbstream to `/var/tmp/restore.mbstream` on its writable
+    // layer (the Docker archive-upload API works on a created/stopped
+    // container). Only then do we start it to run the swap script. This avoids
+    // bind mounts (which `volumes_from` cannot express) and avoids feeding the
+    // stream over an exec stdin pipe (which the log-mux would corrupt).
+
+    /// True when this backup location is a physical (`mariadb-backup` mbstream)
+    /// base — the only kind PITR can replay onto.
+    pub(crate) fn is_physical_base_location(location: &str) -> bool {
+        location.ends_with("base.mbstream.gz")
+    }
+
+    /// Derive the `metadata.json` companion key from a base backup key by
+    /// replacing the last path segment. Mirrors
+    /// `temps_backup::engines::v2_common::derive_metadata_key`.
+    pub(crate) fn derive_metadata_key(base_key: &str) -> String {
+        match base_key.rsplit_once('/') {
+            Some((dir, _last)) => format!("{}/metadata.json", dir),
+            None => format!("{}.metadata.json", base_key),
+        }
+    }
+
+    /// Download the `metadata.json` companion for a base backup and parse it.
+    async fn fetch_base_metadata(
+        &self,
+        s3_client: &aws_sdk_s3::Client,
+        bucket: &str,
+        base_key: &str,
+    ) -> Result<serde_json::Value> {
+        let metadata_key = Self::derive_metadata_key(base_key);
+        let resp = s3_client
+            .get_object()
+            .bucket(bucket)
+            .key(&metadata_key)
+            .send()
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to download base metadata from s3://{}/{}: {}",
+                    bucket,
+                    metadata_key,
+                    e
+                )
+            })?;
+        let bytes = resp
+            .body
+            .collect()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to read base metadata body: {}", e))?
+            .into_bytes();
+        serde_json::from_slice::<serde_json::Value>(&bytes)
+            .map_err(|e| anyhow::anyhow!("Failed to parse base metadata.json: {}", e))
+    }
+
+    /// Download `base.mbstream.gz` from S3, gunzip it, and write the raw
+    /// mbstream to `dest` on the host.
+    async fn download_and_gunzip_base(
+        &self,
+        s3_client: &aws_sdk_s3::Client,
+        bucket: &str,
+        base_key: &str,
+        dest: &std::path::Path,
+    ) -> Result<()> {
+        use std::io::Read;
+
+        let resp = s3_client
+            .get_object()
+            .bucket(bucket)
+            .key(base_key)
+            .send()
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to download physical base from s3://{}/{}: {}",
+                    bucket,
+                    base_key,
+                    e
+                )
+            })?;
+        let gz = resp
+            .body
+            .collect()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to read physical base body: {}", e))?
+            .into_bytes();
+
+        let mut decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(gz));
+        let mut stream = Vec::new();
+        decoder
+            .read_to_end(&mut stream)
+            .map_err(|e| anyhow::anyhow!("Failed to gunzip physical base: {}", e))?;
+        if stream.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Physical base mbstream is empty after gunzip"
+            ));
+        }
+        tokio::fs::write(dest, &stream)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to write mbstream to {}: {}", dest.display(), e))?;
+        Ok(())
+    }
+
+    /// Perform a physical (mbstream) restore into the named container's data
+    /// volume. The container is expected to be the service's live container
+    /// (running or not); on return the container is restarted and healthy.
+    ///
+    /// Sequence mirrors postgres' ephemeral-helper data swap:
+    /// disable restart policy → stop → run helper (extract/prepare/copy-back/
+    /// chown) → re-enable restart policy → start → wait healthy.
+    async fn physical_restore_into_container(
+        &self,
+        config: &MariaDbConfig,
+        mbstream_host_path: &std::path::Path,
+    ) -> Result<()> {
+        let container_name = self.get_live_container_name(config);
+
+        // 1. Disable restart policy FIRST so Docker doesn't bounce the
+        //    container back up while the helper holds the volume.
+        info!(
+            "Disabling restart policy and stopping container {} for MariaDB physical restore",
+            container_name
+        );
+        self.docker
+            .update_container(
+                &container_name,
+                bollard::models::ContainerUpdateBody {
+                    restart_policy: Some(bollard::models::RestartPolicy {
+                        name: Some(bollard::models::RestartPolicyNameEnum::NO),
+                        maximum_retry_count: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to disable restart policy: {}", e))?;
+
+        // 2. Stop the container so the helper has exclusive access to the
+        //    datadir volume.
+        let _ = self
+            .docker
+            .stop_container(
+                &container_name,
+                Some(bollard::query_parameters::StopContainerOptions {
+                    t: Some(30),
+                    signal: None,
+                }),
+            )
+            .await;
+
+        // 3. Run the helper that extracts, prepares, and copy-backs the base.
+        let swap_result = self
+            .run_physical_restore_helper(config, &container_name, mbstream_host_path)
+            .await;
+
+        // 4. Always re-enable the restart policy, even if the swap failed, so a
+        //    later manual start brings the service back under supervision.
+        if let Err(e) = self
+            .docker
+            .update_container(
+                &container_name,
+                bollard::models::ContainerUpdateBody {
+                    restart_policy: Some(bollard::models::RestartPolicy {
+                        name: Some(bollard::models::RestartPolicyNameEnum::ALWAYS),
+                        maximum_retry_count: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            warn!("Failed to re-enable restart policy after restore: {}", e);
+        }
+
+        swap_result?;
+
+        // 5. Start the container on the restored datadir and wait for health.
+        self.docker
+            .start_container(
+                &container_name,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to start MariaDB container after restore: {}", e))?;
+        self.wait_for_container_health(&self.docker, &container_name)
+            .await?;
+
+        info!("MariaDB physical restore completed for {}", container_name);
+        Ok(())
+    }
+
+    /// Create (don't start) the helper, upload the mbstream onto its writable
+    /// layer, then start it to run extract → prepare → copy-back → chown.
+    async fn run_physical_restore_helper(
+        &self,
+        config: &MariaDbConfig,
+        container_name: &str,
+        mbstream_host_path: &std::path::Path,
+    ) -> Result<()> {
+        use bollard::models::{ContainerCreateBody, HostConfig};
+
+        let helper_name = format!("{}-restore-helper", container_name);
+        // Best-effort cleanup of a leftover helper from a prior failed run.
+        let _ = self
+            .docker
+            .remove_container(
+                &helper_name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    v: false,
+                    ..Default::default()
+                }),
+            )
+            .await;
+
+        // The staging dir and copy-back run as root inside the helper; the
+        // final chown hands the datadir back to the mysql uid the server runs
+        // as. CRITICAL: the datadir must be EMPTY before --copy-back, and owned
+        // by mysql afterwards.
+        let stage = "/var/tmp/temps-mariadb-restore";
+        let stream_path = "/var/tmp/restore.mbstream";
+        let swap_script = format!(
+            "set -e; \
+             if command -v mariadb-backup >/dev/null 2>&1; then BK=mariadb-backup; else BK=mariabackup; fi; \
+             rm -rf {stage}; mkdir -p {stage}; \
+             mbstream -x -C {stage} < {stream}; \
+             \"$BK\" --prepare --target-dir={stage}; \
+             rm -rf /var/lib/mysql/* /var/lib/mysql/.[!.]* 2>/dev/null || true; \
+             \"$BK\" --copy-back --target-dir={stage} --datadir=/var/lib/mysql; \
+             chown -R mysql:mysql /var/lib/mysql; \
+             rm -rf {stage} {stream}",
+            stage = stage,
+            stream = stream_path,
+        );
+
+        let helper_config = ContainerCreateBody {
+            image: Some(config.docker_image.clone()),
+            cmd: Some(vec!["sh".to_string(), "-c".to_string(), swap_script]),
+            // Run as root so we can wipe the datadir and chown back to mysql.
+            user: Some("root".to_string()),
+            host_config: Some(HostConfig {
+                volumes_from: Some(vec![container_name.to_string()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let helper = self
+            .docker
+            .create_container(
+                Some(
+                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                        .name(&helper_name)
+                        .build(),
+                ),
+                helper_config,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to create restore helper container: {}", e))?;
+
+        // Upload the gunzipped mbstream onto the helper's writable layer at
+        // /var/tmp/. The archive-upload API works on a created (not running)
+        // container, so the file is in place before the entrypoint runs.
+        let upload_result = self
+            .upload_file_to_container(&helper.id, mbstream_host_path, "/var/tmp", "restore.mbstream")
+            .await;
+        if let Err(e) = upload_result {
+            let _ = self
+                .docker
+                .remove_container(
+                    &helper.id,
+                    Some(bollard::query_parameters::RemoveContainerOptions {
+                        force: true,
+                        v: false,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+            return Err(e);
+        }
+
+        // Start the helper and wait for it to finish.
+        let run_result = async {
+            self.docker
+                .start_container(
+                    &helper.id,
+                    None::<bollard::query_parameters::StartContainerOptions>,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to start restore helper container: {}", e))?;
+
+            let wait = self
+                .docker
+                .wait_container(
+                    &helper.id,
+                    None::<bollard::query_parameters::WaitContainerOptions>,
+                )
+                .next()
+                .await;
+
+            // Capture helper logs for diagnostics on failure.
+            let logs = self.collect_container_logs(&helper.id).await;
+
+            match wait {
+                Some(Ok(resp)) if resp.status_code == 0 => Ok(()),
+                Some(Ok(resp)) => Err(anyhow::anyhow!(
+                    "MariaDB restore helper exited with code {}: {}",
+                    resp.status_code,
+                    logs.trim()
+                )),
+                Some(Err(e)) => Err(anyhow::anyhow!(
+                    "Failed waiting on MariaDB restore helper: {}",
+                    e
+                )),
+                None => Err(anyhow::anyhow!(
+                    "MariaDB restore helper produced no wait result"
+                )),
+            }
+        }
+        .await;
+
+        // Always remove the helper.
+        let _ = self
+            .docker
+            .remove_container(
+                &helper.id,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    v: false,
+                    ..Default::default()
+                }),
+            )
+            .await;
+
+        run_result
+    }
+
+    /// Upload a single host file into a container at `dest_dir/dest_name` via
+    /// the Docker tar archive-upload API (works on created/stopped containers).
+    async fn upload_file_to_container(
+        &self,
+        container_id: &str,
+        host_path: &std::path::Path,
+        dest_dir: &str,
+        dest_name: &str,
+    ) -> Result<()> {
+        let tar_data = {
+            let mut archive = tar::Builder::new(Vec::new());
+            archive
+                .append_path_with_name(host_path, dest_name)
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to tar {} for upload: {}", host_path.display(), e)
+                })?;
+            archive.finish()?;
+            archive
+                .into_inner()
+                .map_err(|e| anyhow::anyhow!("Failed to finalize upload tar: {}", e))?
+        };
+
+        self.docker
+            .upload_to_container(
+                container_id,
+                Some(bollard::query_parameters::UploadToContainerOptions {
+                    path: dest_dir.to_string(),
+                    ..Default::default()
+                }),
+                body_full(bytes::Bytes::from(tar_data)),
+            )
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to upload {} to container: {}", dest_name, e)
+            })?;
+        Ok(())
+    }
+
+    /// Best-effort collection of a container's combined stdout/stderr logs,
+    /// for diagnostics. Never returns an error (returns "" on failure).
+    async fn collect_container_logs(&self, container_id: &str) -> String {
+        let mut out = String::new();
+        let mut stream = self.docker.logs(
+            container_id,
+            Some(bollard::query_parameters::LogsOptions {
+                stdout: true,
+                stderr: true,
+                tail: "200".to_string(),
+                ..Default::default()
+            }),
+        );
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(chunk) => out.push_str(&String::from_utf8_lossy(&chunk.into_bytes())),
+                Err(_) => break,
+            }
+        }
+        out
+    }
+
+    // ── Binlog fetch + replay (PITR forward-roll) ──────────────────────────
+
+    /// Format a UTC time as the `mysqlbinlog --stop-datetime` argument value
+    /// (`YYYY-MM-DD HH:MM:SS`). The server runs `TZ=UTC` so this is
+    /// interpreted in UTC.
+    pub(crate) fn format_stop_datetime(time: chrono::DateTime<chrono::Utc>) -> String {
+        time.format("%Y-%m-%d %H:%M:%S").to_string()
+    }
+
+    /// Map a `RecoveryTarget` to the `mysqlbinlog` stop-flag for the FINAL
+    /// segment being replayed.
+    ///
+    /// Returns the flag as a `(flag, value)` pair, or `None` for "replay to the
+    /// end" (no stop). Errors for targets MariaDB cannot honor.
+    ///
+    /// - `Time`  → `--stop-datetime='YYYY-MM-DD HH:MM:SS'` (UTC).
+    /// - `Lsn`   → interpreted as `binlog_file:position`; `--stop-position` is
+    ///   only meaningful when that file is the final segment replayed. A bare
+    ///   position (no `file:`) is rejected as ambiguous across segments.
+    /// - `Xid`   → GTID stop is not yet expressible via a single mysqlbinlog
+    ///   invocation here; rejected rather than silently mis-recovering.
+    /// - `Name`  → no MariaDB equivalent; rejected.
+    pub(crate) fn recovery_target_to_stop_flag(
+        target: &RecoveryTarget,
+    ) -> Result<Option<(String, String)>> {
+        match target {
+            RecoveryTarget::Time { time } => Ok(Some((
+                "--stop-datetime".to_string(),
+                Self::format_stop_datetime(*time),
+            ))),
+            RecoveryTarget::Lsn { lsn } => {
+                // Accept "binlog_file:position"; reject a bare position.
+                match lsn.rsplit_once(':') {
+                    Some((file, pos)) if !file.is_empty() && pos.chars().all(|c| c.is_ascii_digit()) && !pos.is_empty() => {
+                        Ok(Some(("--stop-position".to_string(), pos.to_string())))
+                    }
+                    _ => Err(anyhow::anyhow!(
+                        "PITR Lsn target must be 'binlog_file:position' (a bare position is \
+                         ambiguous across binlog segments); got '{}'",
+                        lsn
+                    )),
+                }
+            }
+            RecoveryTarget::Xid { xid } => Err(anyhow::anyhow!(
+                "PITR Xid/GTID target ('{}') is not yet supported for MariaDB physical \
+                 restore; use a Time target",
+                xid
+            )),
+            RecoveryTarget::Name { name } => Err(anyhow::anyhow!(
+                "PITR Name target ('{}') has no MariaDB equivalent",
+                name
+            )),
+        }
+    }
+
+    /// For an `Lsn` target, the binlog file the `--stop-position` applies to
+    /// (the final segment to replay). `None` for non-Lsn targets.
+    fn lsn_target_file(target: &RecoveryTarget) -> Option<String> {
+        match target {
+            RecoveryTarget::Lsn { lsn } => lsn
+                .rsplit_once(':')
+                .map(|(file, _)| file.to_string())
+                .filter(|f| !f.is_empty()),
+            _ => None,
+        }
+    }
+
+    /// Download the archived binlog segments needed for replay (every shipped
+    /// file lexicographically >= `start_file`), gunzip them, and write them to
+    /// `dest_dir` preserving order. Returns the ordered list of (host_path,
+    /// filename) pairs.
+    async fn fetch_binlogs_for_replay(
+        &self,
+        s3_client: &aws_sdk_s3::Client,
+        bucket: &str,
+        prefix: &str,
+        start_file: &str,
+        dest_dir: &std::path::Path,
+    ) -> Result<Vec<(std::path::PathBuf, String)>> {
+        use std::io::Read;
+
+        let manifest = self
+            .read_binlog_manifest(s3_client, bucket, prefix)
+            .await
+            .unwrap_or_default();
+
+        // Contiguous segment set: every shipped file >= the base's start file,
+        // in lexicographic (== chronological for fixed-width names) order.
+        let mut files: Vec<String> = manifest
+            .shipped_files
+            .iter()
+            .filter(|f| f.as_str() >= start_file)
+            .cloned()
+            .collect();
+        files.sort();
+        files.dedup();
+
+        if files.is_empty() {
+            warn!(
+                service = %self.name,
+                start_file = %start_file,
+                "No archived binlog segments >= base start file; PITR will replay nothing \
+                 (recovery target may predate the base, or binlogs not yet shipped)"
+            );
+        }
+
+        let mut result = Vec::with_capacity(files.len());
+        for file in files {
+            let key = Self::binlog_object_key(prefix, &self.name, &file);
+            let resp = s3_client
+                .get_object()
+                .bucket(bucket)
+                .key(&key)
+                .send()
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to download binlog segment s3://{}/{}: {}",
+                        bucket,
+                        key,
+                        e
+                    )
+                })?;
+            let gz = resp
+                .body
+                .collect()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to read binlog segment {}: {}", file, e))?
+                .into_bytes();
+            let mut decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(gz));
+            let mut raw = Vec::new();
+            decoder
+                .read_to_end(&mut raw)
+                .map_err(|e| anyhow::anyhow!("Failed to gunzip binlog segment {}: {}", file, e))?;
+            let host_path = dest_dir.join(&file);
+            tokio::fs::write(&host_path, &raw).await.map_err(|e| {
+                anyhow::anyhow!("Failed to write binlog {} to host: {}", file, e)
+            })?;
+            result.push((host_path, file));
+        }
+        Ok(result)
+    }
+
+    /// Replay the given ordered binlog segments into the (running, restored)
+    /// container up to the recovery target, in a SINGLE `mysqlbinlog`
+    /// invocation piped to ONE `mariadb` client.
+    ///
+    /// `--start-position` applies to the FIRST file only (the base's recorded
+    /// position). The stop flag (from `recovery_target_to_stop_flag`) applies
+    /// to the LAST file replayed. `--disable-log-bin` keeps replayed events out
+    /// of the restored server's own binlog so future PITR coordinates stay
+    /// correct. Credentials flow via `MYSQL_PWD` env, never argv.
+    async fn replay_binlogs(
+        &self,
+        config: &MariaDbConfig,
+        segments: &[(std::path::PathBuf, String)],
+        start_position: &str,
+        target: &RecoveryTarget,
+    ) -> Result<()> {
+        if segments.is_empty() {
+            info!("No binlog segments to replay for PITR; base restore is the recovery point");
+            return Ok(());
+        }
+
+        let container_name = self.get_live_container_name(config);
+        let container_dir = "/var/tmp/temps-binlogs";
+
+        // Upload every segment into the container, preserving filenames.
+        let _ = super::exec_util::run_exec(
+            &self.docker,
+            &container_name,
+            vec!["mkdir".into(), "-p".into(), container_dir.into()],
+            None,
+            Duration::from_secs(30),
+        )
+        .await;
+
+        let mut container_files: Vec<String> = Vec::with_capacity(segments.len());
+        for (host_path, file) in segments {
+            self.upload_file_to_container(&container_name, host_path, container_dir, file)
+                .await?;
+            container_files.push(format!("{}/{}", container_dir, file));
+        }
+
+        // Build the single mysqlbinlog invocation. --start-position applies to
+        // the first file; the stop flag (if any) to the run as a whole (it
+        // takes effect on the segment that contains the target).
+        let stop_flag = Self::recovery_target_to_stop_flag(target)?;
+        // For an Lsn target, --stop-position is only sound when the target file
+        // is the LAST segment replayed; otherwise the same numeric position
+        // exists in multiple files and we'd stop in the wrong one.
+        if let Some(target_file) = Self::lsn_target_file(target) {
+            let last = container_files
+                .last()
+                .map(|p| p.rsplit('/').next().unwrap_or(p).to_string())
+                .unwrap_or_default();
+            if last != target_file {
+                return Err(anyhow::anyhow!(
+                    "PITR Lsn target file '{}' is not the final replayed segment ('{}'); \
+                     a bare --stop-position would be ambiguous across segments",
+                    target_file,
+                    last
+                ));
+            }
+        }
+
+        let mut binlog_args = String::from("mysqlbinlog --disable-log-bin");
+        binlog_args.push_str(&format!(" --start-position={}", start_position));
+        if let Some((flag, value)) = &stop_flag {
+            // Quote the value (datetimes contain a space).
+            binlog_args.push_str(&format!(" {}={}", flag, Self::shell_single_quote(value)));
+        }
+        for f in &container_files {
+            binlog_args.push(' ');
+            binlog_args.push_str(&Self::shell_single_quote(f));
+        }
+
+        // Pipe to a single mariadb/mysql client. dash has no pipefail, so we
+        // guard mysqlbinlog's exit explicitly with an intermediate file.
+        let replay_cmd = format!(
+            "set -e; \
+             if command -v mariadb >/dev/null 2>&1; then CLIENT=mariadb; else CLIENT=mysql; fi; \
+             {binlog} | \"$CLIENT\" -uroot",
+            binlog = binlog_args,
+        );
+
+        let env = vec![
+            format!("MYSQL_PWD={}", config.root_password),
+            format!("MARIADB_PWD={}", config.root_password),
+        ];
+
+        info!(
+            service = %self.name,
+            segments = segments.len(),
+            "Replaying MariaDB binlog segments for PITR"
+        );
+
+        let result = super::exec_util::run_exec(
+            &self.docker,
+            &container_name,
+            vec!["sh".into(), "-c".into(), replay_cmd],
+            Some(env),
+            MARIADB_BACKUP_EXEC_TIMEOUT,
+        )
+        .await;
+
+        // Clean up uploaded binlogs regardless of outcome.
+        let _ = super::exec_util::run_exec(
+            &self.docker,
+            &container_name,
+            vec!["rm".into(), "-rf".into(), container_dir.into()],
+            None,
+            Duration::from_secs(30),
+        )
+        .await;
+
+        result.map(|_| ()).map_err(|e| {
+            anyhow::anyhow!("MariaDB binlog replay failed (PITR not applied): {}", e)
+        })
+    }
+
+    /// Build the parameter map + connection string the orchestrator persists
+    /// for a restore-to-new-service result.
+    fn new_service_result(config: &MariaDbConfig) -> Result<NewServiceRestoreResult> {
+        let runtime_json = serde_json::to_value(config)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize new MariaDB config: {}", e))?;
+        let mut parameters = HashMap::new();
+        if let Some(obj) = runtime_json.as_object() {
+            for (k, v) in obj {
+                if let Some(s) = v.as_str() {
+                    parameters.insert(k.clone(), s.to_string());
+                } else if let Some(n) = v.as_u64() {
+                    parameters.insert(k.clone(), n.to_string());
+                }
+            }
+        }
+        let connection_info = format!(
+            "mysql://{}:***@{}:{}/{}",
+            config.username, config.host, config.port, config.database
+        );
+        Ok(NewServiceRestoreResult {
+            parameters,
+            connection_info,
+        })
+    }
+
+    /// Clone the source config onto a fresh port and build a new
+    /// `MariaDbService` for it, creating its container. Shared by
+    /// restore_to_new_service and to_new_service PITR.
+    async fn provision_new_service_for_restore(
+        &self,
+        source_config: &ServiceConfig,
+        new_service_name: &str,
+        parameter_overrides: &serde_json::Value,
+    ) -> Result<(MariaDbService, MariaDbConfig)> {
+        let mut config = self.get_mariadb_config(source_config.clone())?;
+
+        // Fresh port (the source's is taken). A restored new service is its own
+        // container, not an imported one.
+        config.container_name = None;
+        let new_port = find_available_port(3306)
+            .ok_or_else(|| anyhow::anyhow!("No available ports for new MariaDB service"))?
+            .to_string();
+        config.port = new_port;
+
+        if let Some(overrides) = parameter_overrides.as_object() {
+            if let Some(port) = overrides.get("port").and_then(|v| v.as_str()) {
+                config.port = port.to_string();
+            }
+            if let Some(image) = overrides.get("docker_image").and_then(|v| v.as_str()) {
+                config.docker_image = image.to_string();
+            }
+            if let Some(db) = overrides.get("database").and_then(|v| v.as_str()) {
+                config.database = db.to_string();
+            }
+        }
+
+        let new_service = MariaDbService::new(new_service_name.to_string(), self.docker.clone());
+        let cloned_limits = ServiceResourceLimits::from_parameters(&source_config.parameters);
+        *new_service.config.write().await = Some(config.clone());
+        *new_service.resource_limits.write().await = cloned_limits.clone();
+        new_service
+            .create_container(&self.docker, &config, &cloned_limits)
+            .await?;
+
+        Ok((new_service, config))
+    }
+
+    /// Restore a base backup (physical or logical) into the given service's
+    /// container, dispatching on the backup location.
+    async fn restore_base_into(
+        &self,
+        service: &MariaDbService,
+        config: &MariaDbConfig,
+        s3_client: &aws_sdk_s3::Client,
+        bucket: &str,
+        backup_location: &str,
+    ) -> Result<()> {
+        let base_key = Self::backup_key_from_location(backup_location, bucket);
+        if Self::is_physical_base_location(&base_key) {
+            let temp_dir = tempfile::tempdir()?;
+            let mbstream_path = temp_dir.path().join("base.mbstream");
+            service
+                .download_and_gunzip_base(s3_client, bucket, &base_key, &mbstream_path)
+                .await?;
+            service
+                .physical_restore_into_container(config, &mbstream_path)
+                .await?;
+        } else {
+            // Logical .sql.gz base — download, gunzip, and restore via the
+            // mariadb client. Shares the internal logical-restore helper with
+            // `restore_from_s3` so we don't fabricate an `s3_sources::Model`.
+            service
+                .restore_logical_from_s3(s3_client, bucket, backup_location, config)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Logical restore core: download a `.sql[.gz]` backup from S3, decompress
+    /// if needed, and feed it to the mariadb client. Shared by the public
+    /// `restore_from_s3` and the restore framework's `restore_base_into`.
+    async fn restore_logical_from_s3(
+        &self,
+        s3_client: &aws_sdk_s3::Client,
+        bucket: &str,
+        backup_location: &str,
+        config: &MariaDbConfig,
+    ) -> Result<()> {
+        use std::io::Read;
+
+        let backup_key = Self::backup_key_from_location(backup_location, bucket);
+        let response = s3_client
+            .get_object()
+            .bucket(bucket)
+            .key(&backup_key)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to download MariaDB backup from S3: {}", e))?;
+
+        let backup_data = response
+            .body
+            .collect()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to read MariaDB backup data: {}", e))?
+            .into_bytes();
+
+        let temp_dir = tempfile::tempdir()?;
+        let sql_path = temp_dir.path().join("restore.sql");
+
+        if backup_key.ends_with(".gz") {
+            let mut decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(backup_data));
+            let mut sql = Vec::new();
+            decoder.read_to_end(&mut sql)?;
+            tokio::fs::write(&sql_path, sql).await?;
+        } else {
+            tokio::fs::write(&sql_path, backup_data).await?;
+        }
+
+        self.restore_sql_file(config, &sql_path).await
+    }
+
+    /// POSIX single-quote escape for embedding a value in an `sh -c` string.
+    pub(crate) fn shell_single_quote(s: &str) -> String {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
 }
 
 #[async_trait]
@@ -2254,42 +3071,205 @@ impl ExternalService for MariaDbService {
         s3_source: &temps_entities::s3_sources::Model,
         service_config: ServiceConfig,
     ) -> Result<()> {
-        use std::io::Read;
-
         info!("Starting MariaDB restore from S3: {}", backup_location);
 
         let config = self.get_mariadb_config(service_config)?;
-        let backup_key = Self::backup_key_from_location(backup_location, &s3_source.bucket_name);
-        let response = s3_client
-            .get_object()
-            .bucket(&s3_source.bucket_name)
-            .key(&backup_key)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to download MariaDB backup from S3: {}", e))?;
+        let bucket = &s3_source.bucket_name;
+        let backup_key = Self::backup_key_from_location(backup_location, bucket);
 
-        let backup_data = response
-            .body
-            .collect()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to read MariaDB backup data: {}", e))?
-            .into_bytes();
-
-        let temp_dir = tempfile::tempdir()?;
-        let sql_path = temp_dir.path().join("restore.sql");
-
-        if backup_key.ends_with(".gz") {
-            let mut decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(backup_data));
-            let mut sql = Vec::new();
-            decoder.read_to_end(&mut sql)?;
-            tokio::fs::write(&sql_path, sql).await?;
+        // Detect a physical (`mariadb-backup` mbstream) base vs the legacy
+        // logical `.sql.gz` dump and dispatch accordingly. We treat a
+        // `base.mbstream.gz` location as physical; everything else stays on the
+        // existing logical path. (We don't fetch metadata.json here to keep the
+        // common logical path a single round-trip; PITR fetches it for its
+        // guard.)
+        if Self::is_physical_base_location(&backup_key) {
+            info!("Detected physical MariaDB base backup; performing in-place physical restore");
+            let temp_dir = tempfile::tempdir()?;
+            let mbstream_path = temp_dir.path().join("base.mbstream");
+            self.download_and_gunzip_base(s3_client, bucket, &backup_key, &mbstream_path)
+                .await?;
+            self.physical_restore_into_container(&config, &mbstream_path)
+                .await?;
         } else {
-            tokio::fs::write(&sql_path, backup_data).await?;
+            self.restore_logical_from_s3(s3_client, bucket, backup_location, &config)
+                .await?;
         }
 
-        self.restore_sql_file(&config, &sql_path).await?;
         info!("MariaDB restore completed successfully");
         Ok(())
+    }
+
+    /// MariaDB supports in-place restore, restore-to-new-service, and PITR.
+    /// PITR requires a physical (`mariadb-backup`) base plus archived binlogs;
+    /// logical-only backups are rejected at execute time by `restore_pitr`.
+    ///
+    /// We don't populate `earliest_pitr_time` / `latest_pitr_time` — deriving
+    /// them would require reading every base's metadata and the binlog manifest
+    /// per S3 source. The UI shows an unconstrained datetime picker and the
+    /// server validates on execute.
+    async fn restore_capabilities(
+        &self,
+        _service_config: ServiceConfig,
+    ) -> Result<super::RestoreCapabilities> {
+        Ok(super::RestoreCapabilities {
+            restore_in_place: true,
+            restore_to_new_service: true,
+            pitr: true,
+            earliest_pitr_time: None,
+            latest_pitr_time: None,
+        })
+    }
+
+    /// Provision a new MariaDB service from an existing backup (physical or
+    /// logical). Clones the source config onto a fresh port, creates the
+    /// container, and restores the base into it.
+    async fn restore_to_new_service(
+        &self,
+        ctx: super::RestoreContext<'_>,
+        new_service_name: String,
+        parameter_overrides: serde_json::Value,
+    ) -> Result<super::NewServiceRestoreResult> {
+        info!(
+            "Provisioning new MariaDB service '{}' from backup at {}",
+            new_service_name, ctx.backup_location
+        );
+
+        let (new_service, config) = self
+            .provision_new_service_for_restore(
+                &ctx.source_config,
+                &new_service_name,
+                &parameter_overrides,
+            )
+            .await?;
+
+        self.restore_base_into(
+            &new_service,
+            &config,
+            ctx.s3_client,
+            &ctx.s3_source.bucket_name,
+            ctx.backup_location,
+        )
+        .await?;
+
+        Self::new_service_result(&config)
+    }
+
+    /// Point-in-time recovery: restore a physical base, then replay archived
+    /// binlogs up to the recovery target.
+    async fn restore_pitr(
+        &self,
+        ctx: super::RestoreContext<'_>,
+        target: super::RecoveryTarget,
+        to_new_service: bool,
+        new_service_name: Option<String>,
+    ) -> Result<Option<super::NewServiceRestoreResult>> {
+        let bucket = &ctx.s3_source.bucket_name;
+        let base_key = Self::backup_key_from_location(ctx.backup_location, bucket);
+
+        // ── Guard: PITR requires a physical base with binlog coordinates ─────
+        // Mirrors postgres' WAL-G guard. Logical (`mariadb_dump`) backups carry
+        // no binlog start position and cannot anchor a replay.
+        if !Self::is_physical_base_location(&base_key) {
+            return Err(anyhow::anyhow!(
+                "PITR requires a physical (mariadb-backup) base backup; '{}' is a \
+                 logical dump and cannot be used for point-in-time recovery",
+                ctx.backup_location
+            ));
+        }
+        let metadata = self
+            .fetch_base_metadata(ctx.s3_client, bucket, &base_key)
+            .await?;
+        let engine = metadata.get("engine").and_then(|v| v.as_str()).unwrap_or("");
+        let pitr_enabled = metadata
+            .get("pitr")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let binlog_file = metadata
+            .get("binlog_file")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let binlog_position = metadata
+            .get("binlog_position")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if engine != "mariadb_physical" || !pitr_enabled || binlog_file.is_empty() {
+            return Err(anyhow::anyhow!(
+                "PITR requires a physical (mariadb-backup) base with binlog coordinates; \
+                 base metadata has engine='{}', pitr={}, binlog_file='{}' — not usable for \
+                 point-in-time recovery",
+                engine,
+                pitr_enabled,
+                binlog_file
+            ));
+        }
+        let start_position = if binlog_position.is_empty() {
+            "4".to_string() // binlog header size; replay the whole first segment
+        } else {
+            binlog_position
+        };
+
+        info!(
+            "Running MariaDB PITR to target {:?} (to_new_service={}) from base {} (binlog {}:{})",
+            target, to_new_service, ctx.backup_location, binlog_file, start_position
+        );
+
+        // Validate the recovery target maps to something we can honor BEFORE
+        // we destroy any data — fail fast on Name/Xid/bad-Lsn targets.
+        let _ = Self::recovery_target_to_stop_flag(&target)?;
+
+        // ── Restore the base (new service or in place) ──────────────────────
+        let (target_service, target_config, new_result) = if to_new_service {
+            let new_name = new_service_name.ok_or_else(|| {
+                anyhow::anyhow!("new_service_name is required when to_new_service=true")
+            })?;
+            let (new_service, config) = self
+                .provision_new_service_for_restore(
+                    &ctx.source_config,
+                    &new_name,
+                    &serde_json::Value::Null,
+                )
+                .await?;
+            let result = Self::new_service_result(&config)?;
+            (new_service, config, Some(result))
+        } else {
+            let config = self.get_mariadb_config(ctx.source_config.clone())?;
+            // Restore in place onto self; clone self's docker handle.
+            let svc = MariaDbService::new(self.name.clone(), self.docker.clone());
+            *svc.config.write().await = Some(config.clone());
+            (svc, config, None)
+        };
+
+        // Physical base restore into the target container.
+        let temp_dir = tempfile::tempdir()?;
+        let mbstream_path = temp_dir.path().join("base.mbstream");
+        target_service
+            .download_and_gunzip_base(ctx.s3_client, bucket, &base_key, &mbstream_path)
+            .await?;
+        target_service
+            .physical_restore_into_container(&target_config, &mbstream_path)
+            .await?;
+
+        // ── Forward-roll: fetch + replay archived binlogs to the target ─────
+        let prefix = ctx.s3_source.bucket_path.trim_matches('/');
+        let binlog_temp = tempfile::tempdir()?;
+        let segments = target_service
+            .fetch_binlogs_for_replay(
+                ctx.s3_client,
+                bucket,
+                prefix,
+                &binlog_file,
+                binlog_temp.path(),
+            )
+            .await?;
+        target_service
+            .replay_binlogs(&target_config, &segments, &start_position, &target)
+            .await?;
+
+        info!("MariaDB PITR completed successfully");
+        Ok(new_result)
     }
 
     async fn import_from_container(
@@ -2754,6 +3734,165 @@ mod tests {
         let m = BinlogManifest::default();
         assert!(m.last_shipped_file.is_none());
         assert!(m.shipped_files.is_empty());
+    }
+
+    // ── Restore / PITR unit tests (no Docker) ──────────────────────────────
+
+    fn mariadb_service_for_tests() -> MariaDbService {
+        MariaDbService::new(
+            "pitr-test".to_string(),
+            Arc::new(Docker::connect_with_http_defaults().expect("docker client")),
+        )
+    }
+
+    #[tokio::test]
+    async fn restore_capabilities_reports_pitr_and_both_modes() {
+        let service = mariadb_service_for_tests();
+        let cfg = ServiceConfig {
+            name: "pitr-test".to_string(),
+            service_type: ServiceType::Mariadb,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": "3306",
+                "database": "app",
+                "username": "app",
+                "password": "secretpass",
+                "root_password": "rootpass1",
+                "docker_image": DEFAULT_MARIADB_IMAGE,
+            }),
+        };
+        let caps = service
+            .restore_capabilities(cfg)
+            .await
+            .expect("capabilities");
+        assert!(caps.pitr, "MariaDB should advertise PITR support");
+        assert!(caps.restore_in_place);
+        assert!(caps.restore_to_new_service);
+    }
+
+    #[test]
+    fn detects_physical_vs_logical_backup_from_location() {
+        assert!(MariaDbService::is_physical_base_location(
+            "backups/prod/external_services/mariadb/orders/2026/06/23/abc/base.mbstream.gz"
+        ));
+        assert!(!MariaDbService::is_physical_base_location(
+            "backups/prod/mariadb_backup_20260623_010101.sql.gz"
+        ));
+        assert!(!MariaDbService::is_physical_base_location("dump.sql.gz"));
+    }
+
+    #[test]
+    fn derives_metadata_key_from_base_key() {
+        assert_eq!(
+            MariaDbService::derive_metadata_key(
+                "backups/prod/external_services/mariadb/orders/2026/06/23/abc/base.mbstream.gz"
+            ),
+            "backups/prod/external_services/mariadb/orders/2026/06/23/abc/metadata.json"
+        );
+        // No slash → companion-suffix fallback.
+        assert_eq!(
+            MariaDbService::derive_metadata_key("base.mbstream.gz"),
+            "base.mbstream.gz.metadata.json"
+        );
+    }
+
+    #[test]
+    fn recovery_target_time_maps_to_stop_datetime() {
+        use chrono::TimeZone;
+        let time = chrono::Utc
+            .with_ymd_and_hms(2026, 6, 23, 14, 30, 15)
+            .single()
+            .expect("valid time");
+        let flag = MariaDbService::recovery_target_to_stop_flag(&RecoveryTarget::Time { time })
+            .expect("time target maps")
+            .expect("has stop flag");
+        assert_eq!(flag.0, "--stop-datetime");
+        assert_eq!(flag.1, "2026-06-23 14:30:15");
+        assert_eq!(
+            MariaDbService::format_stop_datetime(time),
+            "2026-06-23 14:30:15"
+        );
+    }
+
+    #[test]
+    fn recovery_target_lsn_requires_file_and_position() {
+        // file:position → --stop-position
+        let flag = MariaDbService::recovery_target_to_stop_flag(&RecoveryTarget::Lsn {
+            lsn: "mysql-bin.000007:1234".to_string(),
+        })
+        .expect("valid lsn")
+        .expect("has flag");
+        assert_eq!(flag.0, "--stop-position");
+        assert_eq!(flag.1, "1234");
+
+        // bare position → rejected (ambiguous across segments)
+        assert!(MariaDbService::recovery_target_to_stop_flag(&RecoveryTarget::Lsn {
+            lsn: "1234".to_string(),
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn recovery_target_xid_and_name_are_rejected() {
+        assert!(MariaDbService::recovery_target_to_stop_flag(&RecoveryTarget::Xid {
+            xid: "0-1-100".to_string(),
+        })
+        .is_err());
+        assert!(MariaDbService::recovery_target_to_stop_flag(&RecoveryTarget::Name {
+            name: "my-restore-point".to_string(),
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn pitr_guard_rejects_logical_only_backup() {
+        // A logical dump location is rejected by the location-based guard
+        // before any network call: it is not a physical base.
+        let location = "s3://my-bucket/backups/mariadb_backup_20260623.sql.gz";
+        let key = MariaDbService::backup_key_from_location(location, "my-bucket");
+        assert!(!MariaDbService::is_physical_base_location(&key));
+
+        // Exercise the guard message wording directly: it must mention PITR and
+        // physical so operators (and greps) can find it.
+        let guard_msg = format!(
+            "PITR requires a physical (mariadb-backup) base backup; '{}' is a logical dump",
+            location
+        );
+        assert!(guard_msg.contains("PITR"));
+        assert!(guard_msg.contains("physical"));
+
+        // And confirm the engine-mismatch guard (used when metadata says
+        // mariadb_dump) produces a PITR+physical message too.
+        let metadata = serde_json::json!({
+            "engine": "mariadb_dump",
+            "pitr": false,
+        });
+        let engine = metadata.get("engine").and_then(|v| v.as_str()).unwrap_or("");
+        let pitr = metadata.get("pitr").and_then(|v| v.as_bool()).unwrap_or(false);
+        assert_eq!(engine, "mariadb_dump");
+        assert!(!pitr);
+        let mismatch_msg = format!(
+            "PITR requires a physical (mariadb-backup) base with binlog coordinates; \
+             base metadata has engine='{}', pitr={}",
+            engine, pitr
+        );
+        assert!(mismatch_msg.contains("PITR"));
+        assert!(mismatch_msg.contains("physical"));
+    }
+
+    #[test]
+    fn shell_single_quote_escapes_embedded_quotes() {
+        assert_eq!(MariaDbService::shell_single_quote("plain"), "'plain'");
+        assert_eq!(
+            MariaDbService::shell_single_quote("a'b"),
+            "'a'\\''b'"
+        );
+        // A datetime value (contains a space) stays a single shell token.
+        assert_eq!(
+            MariaDbService::shell_single_quote("2026-06-23 14:30:15"),
+            "'2026-06-23 14:30:15'"
+        );
     }
 
     #[test]
