@@ -7014,7 +7014,7 @@ echo "[restore] Pre-seed complete"
 
             if service_type_enum == ServiceType::Mariadb {
                 let parameters = self.get_service_parameters(service_id).await?;
-                if parameters.get("container_name").is_some() {
+                if parameters.contains_key("container_name") {
                     let service_config = ServiceConfig {
                         name: service.name.clone(),
                         service_type: service_type_enum,

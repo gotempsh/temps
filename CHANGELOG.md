@@ -25,34 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.0-beta.41] - 2026-07-02
 
 ### CI
-### Added
-- **Opt-in MariaDB external services**: Temps can now create standalone
-  MariaDB services for hosted projects without changing its internal Postgres
-  dependency. The new `mariadb` service type uses the official `mariadb:lts`
-  container image, generates separate application and root passwords, provisions
-  per-project/per-environment databases, and exposes both `MYSQL_*` and
-  `MARIADB_*` runtime environment variables plus `DATABASE_URL`. MariaDB is
-  supported in the query explorer, existing MariaDB/MySQL-compatible containers
-  can be imported as MariaDB services, and full logical backup/restore uses
-  `mariadb-dump` with `mysqldump` fallback for non-system databases.
 
 - **changelog:** Skip preview comment on fork PRs
-### Changed
-- **MariaDB services default to a small-host profile**: new managed MariaDB
-  services now materialize `size_profile=small` into a conservative `resources`
-  block (`512` MiB memory, `768` MiB memory+swap, `750000000` nano-cpus) and
-  start `mariadbd` with tuned connection/cache/buffer settings. The create
-  service UI now presents MariaDB as a shared database server whose linked
-  projects get separate databases, reducing accidental one-container-per-website
-  installs on 4 GiB and 8 GiB hosts.
 
 ### Fixed
-- **Laravel MariaDB docs use runtime service env vars**: the Laravel tutorial
-  now keeps `php artisan config:cache` out of the Docker build so Temps-injected
-  runtime variables are not baked incorrectly into the image, documents
-  `DATABASE_URL`/`MYSQL_*`/`MARIADB_*` fallbacks for MariaDB-backed Laravel
-  configs, and keeps `php artisan migrate --force` as a one-off release step
-  rather than a per-container start command.
 
 - **deployer:** Stop temps-dns-resolver being a container DNS SPOF
 

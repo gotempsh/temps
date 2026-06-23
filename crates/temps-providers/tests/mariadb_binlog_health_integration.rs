@@ -113,8 +113,12 @@ async fn probe_detects_binlog_disabled() {
 /// non-ROW-format warning either, since we asked for ROW).
 #[tokio::test]
 async fn probe_emits_no_disabled_warning_when_binlog_on() {
-    let Some((conn_str, _container)) =
-        boot_mariadb(&["--log-bin=mysql-bin", "--server-id=1", "--binlog-format=ROW"]).await
+    let Some((conn_str, _container)) = boot_mariadb(&[
+        "--log-bin=mysql-bin",
+        "--server-id=1",
+        "--binlog-format=ROW",
+    ])
+    .await
     else {
         return;
     };

@@ -141,9 +141,11 @@ impl MariadbBinlogHealth {
 /// but we also accept a JSON number so the function is robust to either shape.
 pub fn build_conn_str(parameters: &serde_json::Value) -> Option<String> {
     let host = parameters.get("host")?.as_str()?;
-    let port = parameters
-        .get("port")
-        .and_then(|v| v.as_str().map(|s| s.to_string()).or_else(|| v.as_u64().map(|n| n.to_string())))?;
+    let port = parameters.get("port").and_then(|v| {
+        v.as_str()
+            .map(|s| s.to_string())
+            .or_else(|| v.as_u64().map(|n| n.to_string()))
+    })?;
     let root_password = parameters.get("root_password")?.as_str()?;
 
     Some(format!(
@@ -173,7 +175,9 @@ async fn collect_snapshot(conn_str: &str) -> Option<MariadbBinlogHealth> {
         .await
         .ok()?;
 
-    let log_bin = fetch_on_off_variable(&pool, "log_bin").await.unwrap_or(false);
+    let log_bin = fetch_on_off_variable(&pool, "log_bin")
+        .await
+        .unwrap_or(false);
     let binlog_format = fetch_string_variable(&pool, "binlog_format")
         .await
         .unwrap_or_default();
@@ -187,8 +191,7 @@ async fn collect_snapshot(conn_str: &str) -> Option<MariadbBinlogHealth> {
     // `SHOW BINARY LOGS` errors when binary logging is disabled. Treat that —
     // and any other read failure — as an empty backlog rather than failing the
     // whole probe.
-    let (segment_count, total_binlog_bytes) =
-        fetch_binary_logs(&pool).await.unwrap_or((0, 0));
+    let (segment_count, total_binlog_bytes) = fetch_binary_logs(&pool).await.unwrap_or((0, 0));
 
     // Non-InnoDB user tables make PITR unreliable; surface a count.
     let non_innodb_table_count = fetch_non_innodb_table_count(&pool).await.unwrap_or(0);
@@ -229,7 +232,10 @@ async fn fetch_string_variable(pool: &sqlx::MySqlPool, name: &str) -> Option<Str
 /// `ON`/`OFF` too). Normalize to a bool.
 async fn fetch_on_off_variable(pool: &sqlx::MySqlPool, name: &str) -> Option<bool> {
     let raw = fetch_variable_value(pool, name).await?;
-    Some(matches!(raw.trim().to_ascii_uppercase().as_str(), "ON" | "1"))
+    Some(matches!(
+        raw.trim().to_ascii_uppercase().as_str(),
+        "ON" | "1"
+    ))
 }
 
 async fn fetch_numeric_variable(pool: &sqlx::MySqlPool, name: &str) -> Option<i64> {
@@ -348,10 +354,7 @@ mod tests {
         s.segment_count = 1000;
         let warnings = compute_warnings(&s);
         assert_eq!(warnings, vec![BinlogWarning::BinlogDisabled]);
-        assert_eq!(
-            warnings[0].severity(),
-            BinlogWarningSeverity::Critical
-        );
+        assert_eq!(warnings[0].severity(), BinlogWarningSeverity::Critical);
     }
 
     #[test]
@@ -428,10 +431,9 @@ mod tests {
         s.segment_count = 5; // under the count threshold
         s.total_binlog_bytes = BINLOG_BACKLOG_TOTAL_BYTES + 1;
         let warnings = compute_warnings(&s);
-        assert!(warnings.iter().any(|w| matches!(
-            w,
-            BinlogWarning::LargeBinlogBacklog { .. }
-        )));
+        assert!(warnings
+            .iter()
+            .any(|w| matches!(w, BinlogWarning::LargeBinlogBacklog { .. })));
     }
 
     #[test]
@@ -508,6 +510,8 @@ mod tests {
     fn build_conn_str_missing_fields_returns_none() {
         assert!(build_conn_str(&serde_json::json!({})).is_none());
         assert!(build_conn_str(&serde_json::json!({ "host": "h", "port": "3306" })).is_none());
-        assert!(build_conn_str(&serde_json::json!({ "host": "h", "root_password": "p" })).is_none());
+        assert!(
+            build_conn_str(&serde_json::json!({ "host": "h", "root_password": "p" })).is_none()
+        );
     }
 }

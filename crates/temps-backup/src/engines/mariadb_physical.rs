@@ -50,10 +50,14 @@ const BASE_FILE_SUFFIX: &str = "base.mbstream.gz";
 /// `--target-dir` is a scratch dir mariadb-backup needs even when streaming.
 /// Success is asserted via the `"completed OK!"` stderr marker, since the
 /// pipe-to-gzip masks mariadb-backup's own exit code under dash.
+///
+/// CRITICAL: the `| gzip` must bind to the `mariadb-backup` command, NOT a
+/// trailing statement. In `sh`, `a; b; c | gzip` pipes only `c` to gzip - so
+/// the scratch-dir cleanup runs *before* the backup (rm-then-mkdir) and the
+/// command ends with the gzip pipeline, making stdout the gzipped mbstream.
 const PHYSICAL_SHELL: &str = "if command -v mariadb-backup >/dev/null 2>&1; then BK=mariadb-backup; else BK=mariabackup; fi; \
-     mkdir -p /var/tmp/temps-mariadb-backup; \
-     \"$BK\" --backup --stream=mbstream --target-dir=/var/tmp/temps-mariadb-backup --user=root --host=localhost; \
-     rm -rf /var/tmp/temps-mariadb-backup";
+     rm -rf /var/tmp/temps-mariadb-backup; mkdir -p /var/tmp/temps-mariadb-backup; \
+     \"$BK\" --backup --stream=mbstream --target-dir=/var/tmp/temps-mariadb-backup --user=root --host=localhost | gzip";
 
 pub struct MariadbPhysicalDeps {
     pub db: Arc<DatabaseConnection>,
@@ -149,8 +153,8 @@ impl BackupEngine for MariadbPhysicalEngine {
         let exec = match exec_stream_stdout_to_file(
             &deps.docker,
             &container_name,
-            // Pipe the stream to gzip in-container.
-            &format!("{} | gzip", pipe_source()),
+            // PHYSICAL_SHELL already ends with `| gzip` on the backup command.
+            PHYSICAL_SHELL,
             &env,
             &host_path,
             &ctx.cancel,
@@ -269,12 +273,6 @@ impl BackupEngine for MariadbPhysicalEngine {
             compression: "gzip".to_string(),
         })
     }
-}
-
-/// The `mariadb-backup` invocation (without the `| gzip`), kept separate so a
-/// unit test can assert it carries no credentials on argv.
-fn pipe_source() -> &'static str {
-    PHYSICAL_SHELL
 }
 
 fn stderr_tail(stderr: &str) -> String {
