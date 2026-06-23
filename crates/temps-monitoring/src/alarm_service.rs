@@ -1164,6 +1164,7 @@ mod tests {
             consecutive_health_failures: 0,
             health_metadata: None,
             metrics_enabled: true,
+            default_backup_provisioned: false,
         }
     }
 

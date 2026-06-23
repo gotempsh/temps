@@ -365,6 +365,38 @@ impl TempsPlugin for BackupPlugin {
             });
             drop(schedule_cancel);
 
+            // Default-backup auto-provisioner. Every 5 minutes, ensure each
+            // MariaDB external service has a covering daily full-backup
+            // schedule (base backups -> point-in-time recovery out of the
+            // box). Gated by the per-service `default_backup_provisioned`
+            // latch so it provisions exactly once and never recreates a
+            // schedule the operator deletes. Errors are logged and swallowed
+            // so a reconcile failure never crashes the task; the next tick
+            // retries (handles "default S3 source configured later").
+            tokio::spawn({
+                let backup_service = Arc::clone(&backup_service);
+                async move {
+                    let mut tick =
+                        tokio::time::interval(std::time::Duration::from_secs(5 * 60));
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    // First tick fires immediately so newly-created MariaDB
+                    // services get a schedule shortly after startup.
+                    loop {
+                        tick.tick().await;
+                        if let Err(e) = backup_service
+                            .reconcile_default_external_service_schedules()
+                            .await
+                        {
+                            error!(
+                                error = %e,
+                                "default-backup auto-provision reconcile failed \
+                                 (will retry next tick)"
+                            );
+                        }
+                    }
+                }
+            });
+
             Ok(())
         })
     }
