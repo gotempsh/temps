@@ -9,10 +9,7 @@ import { init } from "./index";
  * Usage:
  *   <script
  *     defer
- *     src="https://unpkg.com/@temps-sdk/analytics-browser/dist/auto.js"
- *     data-domain="example.com"
- *     data-base-path="/api/_temps"
- *     data-session-recording="true">
+ *     src="https://cdn.jsdelivr.net/npm/@temps-sdk/analytics-browser@0.0.1/dist/temps.min.js">
  *   </script>
  */
 

@@ -50,70 +50,27 @@ impl ContainerLifecycle for ContainerLifecycleAdapter {
     ///
     /// A `Running` container whose process hasn't yet bound its port would, on a
     /// scale-to-zero wake, get a request proxied to it before it can serve,
-    /// producing a spurious upstream-connect 503 on the first request. So after
-    /// confirming `Running`, we TCP-probe a mapped host port (short timeout,
-    /// treated as "not ready yet" on failure so `do_wake`'s loop keeps polling).
+    /// producing a spurious upstream-connect 503 on the first request. The
+    /// underlying readiness probe (Docker `Running` + a TCP connect to the
+    /// lowest published host port) lives in `temps_deployer::readiness` so the
+    /// deployment-completion path shares exactly the same definition of "ready".
     ///
-    /// **Scope:** the probe targets `127.0.0.1:{host_port}` — the loopback
-    /// address the local node publishes container ports on. Containers running on
-    /// *remote* worker nodes are not reachable on this node's loopback; that
-    /// (along with the fact that the local deployer can't even
-    /// `get_container_info` a remote container) is handled by the multi-node wake
-    /// work tracked separately. For the local single-node case this is correct.
-    /// We probe the **lowest** published host port deterministically (Docker
-    /// reports ports as an unordered map, so `.first()` would be unstable for a
-    /// container that publishes more than one). Containers with no published port
-    /// fall back to the `Running` check — there's nothing to probe.
+    /// `do_wake` runs its own outer poll loop, so this is a single-shot check:
+    /// `Ok(false)` means "not ready yet, keep polling". A container in a
+    /// terminal state (`Exited`/`Dead`) is reported not-healthy here too — the
+    /// wake loop's own timeout then surfaces the failure.
     async fn is_container_healthy(&self, container_id: &str) -> Result<bool, OnDemandError> {
-        let info = self
-            .deployer
-            .get_container_info(container_id)
+        use temps_deployer::readiness::{check_accepting_requests, ReadinessCheck};
+
+        // 2s connect timeout matches the historical inline probe.
+        let check = check_accepting_requests(&self.deployer, container_id, Duration::from_secs(2))
             .await
             .map_err(|e| OnDemandError::ContainerOperation {
                 container_id: container_id.to_string(),
                 reason: e.to_string(),
             })?;
 
-        if info.status != temps_deployer::ContainerStatus::Running {
-            return Ok(false);
-        }
-
-        // No published port → nothing to probe; trust the Running status.
-        // Pick deterministically (lowest host port) — Docker's port map has no
-        // defined iteration order, so `.first()` could vary between polls.
-        let Some(port) = info.ports.iter().map(|p| p.host_port).min() else {
-            return Ok(true);
-        };
-
-        // Probe the mapped host port. A refused/timed-out connection means the
-        // app inside hasn't bound its port yet — report not-ready so the wake
-        // loop keeps polling rather than completing prematurely.
-        let addr = format!("127.0.0.1:{}", port);
-        match tokio::time::timeout(
-            Duration::from_secs(2),
-            tokio::net::TcpStream::connect(&addr),
-        )
-        .await
-        {
-            Ok(Ok(_stream)) => Ok(true),
-            Ok(Err(e)) => {
-                tracing::debug!(
-                    container_id = %container_id,
-                    addr = %addr,
-                    error = %e,
-                    "Readiness probe connect failed; container not ready yet"
-                );
-                Ok(false)
-            }
-            Err(_) => {
-                tracing::debug!(
-                    container_id = %container_id,
-                    addr = %addr,
-                    "Readiness probe timed out; container not ready yet"
-                );
-                Ok(false)
-            }
-        }
+        Ok(matches!(check, ReadinessCheck::Ready))
     }
 }
 

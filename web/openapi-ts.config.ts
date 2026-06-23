@@ -9,7 +9,7 @@ export default {
   client: '@hey-api/client-fetch',
   // input: 'https://app.localup.dev/api-docs/openapi.json',
   input: {
-    path: 'http://localhost:8081/api/api-docs/openapi.json',
+    path: 'http://localhost:8080/api/api-docs/openapi.json',
     fetch: {
       headers: env.TEMPS_API_KEY
         ? { Authorization: `Bearer ${env.TEMPS_API_KEY}` }

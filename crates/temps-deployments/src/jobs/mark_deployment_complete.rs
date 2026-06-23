@@ -47,6 +47,14 @@ const MAX_TEARDOWN_DEPLOYMENTS_PER_PASS: u64 = 25;
 /// log and move on — the container row is left for the next sweep to retry.
 const CONTAINER_TEARDOWN_TIMEOUT_SECS: u64 = 30;
 
+/// How long each new container has to start accepting connections before we
+/// flip the route table to this deployment. A container that never binds its
+/// port within this budget fails the deployment rather than letting the route
+/// flip onto a backend that can't serve. Applications that boot slowly (JIT
+/// warmup, migrations on start) need headroom, so this is generous; the gate
+/// returns the instant the port is reachable, so a fast app pays nothing.
+const CONTAINER_READY_TIMEOUT_SECS: u64 = 120;
+
 /// Output from MarkDeploymentCompleteJob
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarkCompleteOutput {
@@ -499,6 +507,20 @@ impl MarkDeploymentCompleteJob {
                     .unwrap_or("no reason")
             )));
         }
+
+        // ── Readiness gate: don't flip routes onto a container that can't
+        //    serve yet ──────────────────────────────────────────────────────
+        //
+        // The phases below flip `current_deployment_id` and wait only for the
+        // *route table* to acknowledge the new deployment — not for the app
+        // inside the container to actually accept connections. A container can
+        // be `Running` (and routable) before its process has bound its port, so
+        // the first request after the flip would race startup and 503. Wait for
+        // each (local) container to accept a TCP connection first; on timeout
+        // this returns an error and fails the deployment, leaving the previous
+        // deployment serving. This mirrors the scale-to-zero wake path, which
+        // already gates on the same probe.
+        self.wait_for_containers_ready(environment_id).await?;
 
         // ── Phase 0: Persist routing inputs before flipping the route table ──
         //
@@ -1418,6 +1440,87 @@ impl MarkDeploymentCompleteJob {
         ))
         .await
         .ok();
+    }
+
+    /// Wait until every container of *this* deployment is accepting connections,
+    /// before the caller flips the route table onto it.
+    ///
+    /// Without this gate, `current_deployment_id` flips as soon as the route
+    /// table confirms it knows about the deployment — which can be well before
+    /// the app inside the container has bound its port. The first real request
+    /// then races startup and gets a spurious upstream-connect 503. The wake
+    /// (scale-to-zero) path already gates on this same readiness probe; this
+    /// brings the deploy path to parity using the shared
+    /// `temps_deployer::readiness` definition of "ready".
+    ///
+    /// On timeout (or a container that exits during boot) the deployment fails:
+    /// we never route onto a backend that can't serve. The error is contextual
+    /// so the deployment log shows *which* container and *why*.
+    ///
+    /// **Local containers only.** The probe is a loopback TCP connect, valid
+    /// only for containers this node publishes ports for. Containers on remote
+    /// worker nodes (`node_id IS NOT NULL`) are skipped here — their readiness
+    /// is the remote agent's concern and is covered by the worker-propagation
+    /// gate. A container that publishes no host port is ready once `Running`
+    /// (nothing to probe), handled inside the shared helper.
+    async fn wait_for_containers_ready(&self, environment_id: i32) -> Result<(), WorkflowError> {
+        let containers = deployment_containers::Entity::find()
+            .filter(deployment_containers::Column::DeploymentId.eq(self.deployment_id))
+            .filter(deployment_containers::Column::DeletedAt.is_null())
+            .all(self.db.as_ref())
+            .await
+            .map_err(|e| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Failed to load containers for readiness gate (deployment {}): {}",
+                    self.deployment_id, e
+                ))
+            })?;
+
+        let probe = temps_deployer::readiness::ReadinessProbe::with_timeout(
+            std::time::Duration::from_secs(CONTAINER_READY_TIMEOUT_SECS),
+        );
+
+        for container in containers {
+            // Remote containers aren't reachable on this node's loopback; their
+            // readiness is handled by the worker-propagation gate, not here.
+            if container.node_id.is_some() {
+                debug!(
+                    container_id = %container.container_id,
+                    node_id = ?container.node_id,
+                    "Skipping readiness probe for remote container"
+                );
+                continue;
+            }
+
+            self.log(format!(
+                "Waiting for container {} to accept connections…",
+                container.container_name
+            ))
+            .await
+            .ok();
+
+            temps_deployer::readiness::wait_until_accepting_requests(
+                &self.container_deployer,
+                &container.container_id,
+                probe,
+            )
+            .await
+            .map_err(|e| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Container {} ({}) for environment {} never became ready: {}",
+                    container.container_name, container.container_id, environment_id, e
+                ))
+            })?;
+
+            self.log(format!(
+                "Container {} is accepting connections",
+                container.container_name
+            ))
+            .await
+            .ok();
+        }
+
+        Ok(())
     }
 
     /// Tear down a single container: capture its logs, stop it, remove it from

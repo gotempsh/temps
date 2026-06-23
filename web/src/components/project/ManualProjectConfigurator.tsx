@@ -821,16 +821,18 @@ export function ManualProjectConfigurator({
             <CardContent>{renderProjectConfig()}</CardContent>
           </Card>
 
-          {/* Services */}
-          <Card>
-            <CardHeader>
-              <CardTitle>Services</CardTitle>
-              <CardDescription>
-                Select storage and database services
-              </CardDescription>
-            </CardHeader>
-            <CardContent>{renderServices()}</CardContent>
-          </Card>
+          {/* Services — not applicable for static-only projects */}
+          {sourceType !== 'static_files' && (
+            <Card>
+              <CardHeader>
+                <CardTitle>Services</CardTitle>
+                <CardDescription>
+                  Select storage and database services
+                </CardDescription>
+              </CardHeader>
+              <CardContent>{renderServices()}</CardContent>
+            </Card>
+          )}
 
           {/* Environment Variables */}
           <Card>

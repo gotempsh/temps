@@ -773,6 +773,13 @@ export type AppSettings = {
      */
     build_limits?: BuildLimitsSettings;
     /**
+     * Nightly Docker/disk cleanup behaviour — retention windows for unused
+     * deployment images and BuildKit cache, plus the schedule. Operator-tunable
+     * at runtime; the cleanup scheduler re-reads this on every run, so changes
+     * take effect without a restart.
+     */
+    cleanup?: CleanupSettings;
+    /**
      * Binary version tag (e.g. "v0.1.0") of the *console* process
      * (`temps serve`, role=all or role=console) that last started. Written
      * on console startup; read by the standalone `temps proxy` to detect
@@ -814,6 +821,14 @@ export type AppSettings = {
      */
     monitoring?: MonitoringSettings;
     multi_node?: MultiNodeSettings;
+    on_demand_tls?: OnDemandTlsSettings;
+    /**
+     * OpenTelemetry ingest (OTLP/HTTP) settings. Instance-global kill-switch
+     * for the inbound metrics/traces/logs ingest endpoints under
+     * `/api/otel/v1*`. Distinct from `monitoring`, which governs the
+     * *outbound* Prometheus scraper (a different data source).
+     */
+    otel_ingest?: OtelIngestSettings;
     preview_domain?: string;
     preview_gateway?: PreviewGatewaySettings;
     rate_limiting?: RateLimitSettings;
@@ -834,6 +849,7 @@ export type AppSettings = {
 export type AppSettingsResponse = {
     agent_sandbox: AgentSandboxSettingsMasked;
     ai_config: AiConfigSettings;
+    cleanup: CleanupSettings;
     container_logs: ContainerLogSettings;
     disk_space_alert: DiskSpaceAlertSettings;
     dns_provider: DnsProviderSettingsMasked;
@@ -854,6 +870,14 @@ export type AppSettingsResponse = {
     letsencrypt: LetsEncryptSettings;
     monitoring: MonitoringSettingsMasked;
     multi_node: MultiNodeSettingsMasked;
+    /**
+     * Whether OTLP/HTTP ingestion is currently accepted. Mirrors
+     * `otel_ingest.enabled`. Flipped via the dedicated
+     * `PATCH /settings/otel-ingest` endpoint (guarded by `otel:write`), not
+     * the generic settings PUT — but surfaced here so the UI can render the
+     * current state without a second request.
+     */
+    otel_ingest_enabled: boolean;
     preview_domain: string;
     preview_gateway: PreviewGatewaySettingsMasked;
     rate_limiting: RateLimitSettings;
@@ -1380,6 +1404,26 @@ export type CancelBackupResponse = {
 };
 
 /**
+ * Current on-demand cert status for a single hostname (ADR-018 §5). Backs
+ * `GET /domains/by-host/{hostname}/cert-status`.
+ */
+export type CertStatusResponse = {
+    /**
+     * On-demand negative-cache deadline (epoch millis), when in backoff.
+     */
+    backoff_until?: number | null;
+    /**
+     * SNI hostname.
+     */
+    hostname: string;
+    last_attempt?: null | OnDemandCertAttemptResponse;
+    /**
+     * Current cert lifecycle status from the `domains` row, when one exists.
+     */
+    status?: string | null;
+};
+
+/**
  * Challenge configuration (future feature)
  * For CAPTCHA, JS challenges, proof-of-work, etc.
  */
@@ -1568,6 +1612,60 @@ export type ChildBackupListResponse = {
      * Zero or more child backup entries ordered by `external_service_backups.id` ASC.
      */
     children: Array<ChildBackupEntryResponse>;
+};
+
+/**
+ * Nightly Docker/disk cleanup settings.
+ *
+ * Governs the background `DockerCleanupService` that reclaims disk on each
+ * node: dangling images, superseded *tagged* deployment images, and BuildKit
+ * build cache. Defaults are conservative — safe for a multi-tenant control
+ * plane — and every value is operator-tunable at runtime (the scheduler
+ * re-reads settings on every run, so no restart is needed).
+ *
+ * Image removal is always DB-driven: an image is only ever removed if its tag
+ * belongs to a known deployment that is neither live nor inside the
+ * per-environment rollback window. Base images and in-flight builds are never
+ * touched, regardless of these values.
+ */
+export type CleanupSettings = {
+    /**
+     * Maximum *unused* age (days) for BuildKit build cache. Cache not touched
+     * by a build within this window is reclaimed on the next run. Lower =
+     * reclaims disk sooner but causes more cold (slow) builds. Default 7.
+     * Typical: 1 (daily-deploy/disk-tight), 3 (weekday-active), 7 (default).
+     */
+    build_cache_max_age_days?: number;
+    /**
+     * Hard cap on total BuildKit build-cache size, in megabytes. Enforced
+     * independently of the age window, so a burst of builds cannot fill the
+     * disk before the next nightly run. `0` (default) means "no size cap —
+     * age window only". When set, the least-recently-used cache beyond this
+     * size is reclaimed regardless of age.
+     */
+    build_cache_max_size_mb?: number;
+    /**
+     * Master switch for the nightly cleanup. When `false`, no images or build
+     * cache are pruned (the static-asset/chunk cleanup still runs, as it is
+     * unrelated to Docker). Defaults to `true`.
+     */
+    enabled?: boolean;
+    /**
+     * Minimum age (days) an unreferenced deployment image must reach before it
+     * is eligible for removal. Acts as a safety floor against racing a deploy
+     * whose DB row hasn't reached a live state yet. Default 7.
+     */
+    image_max_age_days?: number;
+    /**
+     * How many of the most-recent deployments *per environment* to keep images
+     * for, so a rollback is always possible even when those deployments are no
+     * longer live. Default 3. Set 0 to keep only currently-live images.
+     */
+    keep_deployments_per_env?: number;
+    /**
+     * Hour of day (UTC, 0–23) the nightly cleanup runs. Default 2 (02:00 UTC).
+     */
+    run_hour_utc?: number;
 };
 
 export type CliDeviceApproveRequest = {
@@ -3274,6 +3372,13 @@ export type DeployFromImageRequest = {
      */
     external_image_id?: number | null;
     /**
+     * Optional HTTP health-check path override (e.g. "/api/healthz").
+     * Image deploys can't read `.temps.yaml`, so this sets the path the deployer
+     * probes after the container starts and the path the environment's uptime
+     * monitor checks. Must start with '/'. When omitted, defaults to "/".
+     */
+    health_check_path?: string | null;
+    /**
      * Docker image reference (e.g., "ghcr.io/org/app:v1.0")
      * Required if external_image_id is not provided
      */
@@ -3289,6 +3394,11 @@ export type DeployFromImageRequest = {
  */
 export type DeployFromImageUploadQuery = {
     /**
+     * Optional HTTP health-check path override (e.g. "/api/healthz").
+     * Must start with '/'. When omitted, defaults to "/".
+     */
+    health_check_path?: string | null;
+    /**
      * Tag to apply to the imported image (e.g., "myapp:v1.0")
      * If not provided, a unique tag will be generated
      */
@@ -3296,6 +3406,13 @@ export type DeployFromImageUploadQuery = {
 };
 
 export type DeployFromStaticRequest = {
+    /**
+     * Optional HTTP health-check path override (e.g. "/api/healthz").
+     * Static deploys can't read `.temps.yaml`, so this sets the path the deployer
+     * probes after the container starts and the path the environment's uptime
+     * monitor checks. Must start with '/'. When omitted, defaults to "/".
+     */
+    health_check_path?: string | null;
     /**
      * Optional deployment metadata
      */
@@ -3326,9 +3443,11 @@ export type DeploymentConfig = {
      */
     antiAffinity?: boolean;
     /**
-     * Enable automatic deployments on git push
+     * Enable automatic deployments on git push.
+     * `None` = inherit from project config; `Some(true/false)` = explicit override.
+     * Stored as JSONB so absent key → `None` (inherit), never silently defaults to false.
      */
-    automaticDeploy?: boolean;
+    automaticDeploy?: boolean | null;
     /**
      * Enable container exec/shell access (disabled by default for security)
      */
@@ -3627,6 +3746,13 @@ export type DeploymentMetadata = {
      */
     fileCount?: number | null;
     gitPushEvent?: null | GitPushEvent;
+    /**
+     * Explicit deploy-time HTTP health-check path override.
+     * Image/static deploys can't read `.temps.yaml`, so this lets the deploy
+     * request set a custom path (e.g. "/api/healthz"). When present it takes
+     * priority over any `.temps.yaml` `health.path` value. Always starts with '/'.
+     */
+    healthCheckPath?: string | null;
     /**
      * Total size of the built image in bytes
      */
@@ -4377,6 +4503,12 @@ export type DomainResponse = {
     last_error?: string | null;
     last_error_type?: string | null;
     last_renewed?: number | null;
+    /**
+     * On-demand TLS negative-cache deadline (epoch millis), when this hostname's
+     * on-demand HTTP-01 issuance is in backoff after a failure (ADR-018 §4).
+     * `None` means no active backoff.
+     */
+    on_demand_backoff_until?: number | null;
     status: string;
     updated_at: number;
     verification_method: string;
@@ -7482,6 +7614,17 @@ export type ListMcpsResponse = {
     total: number;
 };
 
+/**
+ * Paginated list of on-demand cert attempts (ADR-018 §5 console "Certificates"
+ * surface). Joined with current `domains.status`, newest first.
+ */
+export type ListOnDemandCertsResponse = {
+    certs: Array<OnDemandCertRow>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
 export type ListOrdersResponse = {
     orders: Array<AcmeOrderResponse>;
 };
@@ -8477,6 +8620,136 @@ export type OidcTestConnectionResponse = {
     success: boolean;
 };
 
+/**
+ * A single on-demand HTTP-01 issuance attempt from the append-only
+ * `on_demand_cert_attempts` audit log. Carries the full forensic detail for one
+ * attempt; the current cert state lives on the enclosing row's domain fields.
+ *
+ * Contains no private-key or certificate material — only audit metadata — so it
+ * is safe to return without masking.
+ */
+export type OnDemandCertAttemptResponse = {
+    /**
+     * Did we reach the Let's Encrypt API?
+     */
+    acme_request_sent?: boolean | null;
+    /**
+     * HTTP status or ACME error type returned by Let's Encrypt, when known.
+     */
+    acme_response_status?: string | null;
+    /**
+     * Did the proxy serve the `/.well-known/acme-challenge/` request?
+     */
+    challenge_served?: boolean | null;
+    /**
+     * When the attempt was recorded (epoch millis).
+     */
+    created_at: number;
+    /**
+     * End-to-end issuance duration in milliseconds (0/None for skipped).
+     */
+    duration_ms?: number | null;
+    /**
+     * Coarse error category for UI labelling: `"rate_limited"`, `"dns_failure"`,
+     * `"acme_order_expired"`, `"challenge_mismatch"`, `"timeout"`, `"internal"`.
+     */
+    error_category?: string | null;
+    /**
+     * Full `Display` chain of the error (all `source()` levels), when failed.
+     */
+    error_chain?: string | null;
+    /**
+     * SNI hostname that triggered the attempt.
+     */
+    hostname: string;
+    id: number;
+    /**
+     * Final outcome: `"issued"`, `"failed"`, `"skipped_duplicate"`,
+     * `"skipped_gate"`, `"skipped_rate_limit"`, or `"skipped_no_route"`.
+     */
+    outcome: string;
+    /**
+     * What triggered the attempt (always `"tls_callback"` today).
+     */
+    trigger: string;
+};
+
+/**
+ * One row of the on-demand certificates list: the most-recent attempt for a
+ * hostname plus the current authoritative cert state from its `domains` row.
+ */
+export type OnDemandCertRow = {
+    /**
+     * The audit record for the attempt this row represents (newest first in
+     * the list).
+     */
+    attempt: OnDemandCertAttemptResponse;
+    /**
+     * On-demand negative-cache deadline (epoch millis), when in backoff.
+     */
+    backoff_until?: number | null;
+    /**
+     * Certificate expiration (epoch millis), when an active cert exists.
+     */
+    expiration_time?: number | null;
+    /**
+     * SNI hostname.
+     */
+    hostname: string;
+    /**
+     * Current cert lifecycle status from the `domains` row, when one exists:
+     * `on_demand_pending`, `on_demand_issuing`, `active`, `on_demand_failed`,
+     * etc. `None` when no `domains` row exists yet for this hostname.
+     */
+    status?: string | null;
+};
+
+/**
+ * On-demand (lazy) HTTP-01 TLS issuance settings (ADR-018).
+ *
+ * When `enabled`, the proxy's `certificate_callback` triggers ACME HTTP-01
+ * issuance for allowlisted, STABLE hostnames (per-environment aliases and the
+ * console host) that have no active cert, rather than silently failing the
+ * handshake. Ephemeral per-deployment hostnames are NEVER certed (ADR §2).
+ *
+ * Off by default — operators opt in explicitly, except QuickStart (`sslip.io`)
+ * installs where `temps setup` auto-enables it and derives `zone`.
+ */
+export type OnDemandTlsSettings = {
+    /**
+     * How ephemeral per-deployment hostnames behave when they have no cert
+     * (they are NEVER certed — see ADR §2). One of:
+     * - `"http"` (default): serve plain HTTP on :80.
+     * - `"redirect_to_env"`: 308-redirect to the stable per-environment URL,
+     * which IS certed.
+     */
+    deployment_url_mode?: string;
+    /**
+     * Master switch. When `false` (default) the proxy's on-demand cert gate
+     * rejects every SNI and no issuance is ever triggered.
+     */
+    enabled?: boolean;
+    /**
+     * Global cap on total on-demand issuances per hour across all hostnames
+     * (ADR §4 Layer 3). The operator's self-imposed safety net, separate from
+     * the Let's Encrypt rate limit.
+     */
+    hourly_cap?: number;
+    /**
+     * Maximum number of ACME issuance flows allowed to run simultaneously
+     * (the concurrent-issuance semaphore, ADR §4 Layer 1). Min 1.
+     */
+    max_concurrent?: number;
+    /**
+     * Zone suffix for the allowlist gate. A hostname passes the gate only if
+     * it is a direct subdomain of this zone (e.g. zone `1.2.3.4.sslip.io`
+     * admits `myapp.1.2.3.4.sslip.io` but not `deep.sub.1.2.3.4.sslip.io`).
+     * `None` (default) means "auto-derive from `external_url`"; if no zone can
+     * be derived the gate rejects all SNI, disabling the feature.
+     */
+    zone?: string | null;
+};
+
 export type OpenAiError = {
     code?: string | null;
     message: string;
@@ -8504,6 +8777,33 @@ export type OperationResultResponse = {
 export type OperationResultsResponse = {
     deployment_id: string;
     operations: Array<OperationResultResponse>;
+};
+
+/**
+ * OpenTelemetry ingest (OTLP/HTTP) settings.
+ *
+ * Controls the inbound OTLP receiver endpoints (`/api/otel/v1/metrics`,
+ * `/traces`, `/logs`, and their path-scoped variants). This is the
+ * data path where deployed applications and infrastructure services
+ * *push* telemetry into Temps — it is NOT temps self-instrumentation
+ * (temps does not emit its own OTLP) and NOT the Prometheus scraper
+ * (see [`MonitoringSettings`], a separate pull-based source).
+ */
+export type OtelIngestSettings = {
+    /**
+     * Master switch for OTLP ingest. When `false`, the ingest handlers
+     * short-circuit *before* auth/decompress/decode/store and return an
+     * empty OTLP success envelope (HTTP 200) so SDK exporters treat the
+     * batch as delivered and do not retry-storm. The background OTel
+     * analysis loops (anomaly detection, health compute) also pause while
+     * this is `false`.
+     *
+     * Defaults to `true`: OTLP ingest is a pre-existing always-on receiver,
+     * so a `settings` row written before this field existed deserializes to
+     * `enabled = true` (preserving current behaviour on upgrade — no silent
+     * telemetry loss).
+     */
+    enabled?: boolean;
 };
 
 /**
@@ -9685,7 +9985,7 @@ export type ProjectHealthSummary = {
      */
     status: string;
     /**
-     * Total errors (status >= 400) in the period
+     * Total server errors (status >= 500) in the period
      */
     total_errors: number;
     /**
@@ -12141,6 +12441,7 @@ export type ServicePlan = {
  * - `memory_swap_mb`→ `HostConfig.memory_swap`   (bytes; ≥ memory)
  * - `nano_cpus`     → `HostConfig.nano_cpus`     (1e9 = 1 full CPU)
  * - `cpu_shares`    → `HostConfig.cpu_shares`    (relative weight, default 1024)
+ * - `shm_size_mb`   → `HostConfig.shm_size`      (bytes; default 64 MiB)
  *
  * IMPORTANT: enabling hard memory limits causes the kernel OOM killer to
  * terminate the container when the working set exceeds the limit. The
@@ -12168,8 +12469,11 @@ export type ServiceResourceLimits = {
     nano_cpus?: number | null;
     /**
      * Shared memory (/dev/shm) size in MiB. None = Docker default (64 MiB).
-     * TODO(sdk-regen): added by hand ahead of `bun run openapi-ts` regen; the
-     * backend `ServiceResourceLimits` already carries this field.
+     * Maps to HostConfig.shm_size (bytes). PostgreSQL uses /dev/shm for parallel
+     * query workers and large work_mem; the 64 MiB default causes "could not
+     * resize shared memory segment ... No space left on device" under load.
+     * NOTE: shm_size is fixed at container-create time — Docker's live update
+     * API cannot change it, so changing this value recreates the container.
      */
     shm_size_mb?: number | null;
 };
@@ -14229,6 +14533,28 @@ export type UpdateOidcProviderRequest = {
     scopes?: string | null;
     template?: string | null;
     trust_idp_email?: boolean | null;
+};
+
+/**
+ * Request body for the OTLP ingest kill-switch.
+ */
+export type UpdateOtelIngestRequest = {
+    /**
+     * Whether OTLP/HTTP ingestion (`/api/otel/v1*`) is accepted. When
+     * `false`, the ingest endpoints accept-and-discard (HTTP 200) and the
+     * OTel analysis loops pause.
+     */
+    enabled: boolean;
+};
+
+/**
+ * Response for the OTLP ingest kill-switch update.
+ */
+export type UpdateOtelIngestResponse = {
+    /**
+     * The effective state after the update.
+     */
+    enabled: boolean;
 };
 
 export type UpdatePreferencesRequest = {
@@ -21136,6 +21462,82 @@ export type GetDomainByHostResponses = {
 };
 
 export type GetDomainByHostResponse = GetDomainByHostResponses[keyof GetDomainByHostResponses];
+
+export type GetOnDemandCertStatusData = {
+    body?: never;
+    path: {
+        /**
+         * Domain hostname
+         */
+        hostname: string;
+    };
+    query?: never;
+    url: '/domains/by-host/{hostname}/cert-status';
+};
+
+export type GetOnDemandCertStatusErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetOnDemandCertStatusResponses = {
+    /**
+     * On-demand cert status retrieved successfully
+     */
+    200: CertStatusResponse;
+};
+
+export type GetOnDemandCertStatusResponse = GetOnDemandCertStatusResponses[keyof GetOnDemandCertStatusResponses];
+
+export type ListOnDemandCertsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Page number (1-indexed)
+         */
+        page?: number | null;
+        /**
+         * Number of items per page (max 100)
+         */
+        page_size?: number | null;
+    };
+    url: '/domains/on-demand-certs';
+};
+
+export type ListOnDemandCertsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListOnDemandCertsResponses = {
+    /**
+     * On-demand cert attempts retrieved successfully
+     */
+    200: ListOnDemandCertsResponse;
+};
+
+export type ListOnDemandCertsResponse2 = ListOnDemandCertsResponses[keyof ListOnDemandCertsResponses];
 
 export type CancelDomainOrderData = {
     body?: never;
@@ -33577,6 +33979,11 @@ export type DeployFromImageUploadData = {
          * If not provided, a unique tag will be generated
          */
         tag?: string | null;
+        /**
+         * Optional HTTP health-check path override (e.g. "/api/healthz").
+         * Must start with '/'. When omitted, defaults to "/".
+         */
+        health_check_path?: string | null;
     };
     url: '/projects/{project_id}/environments/{environment_id}/deploy/image-upload';
 };
@@ -39370,6 +39777,37 @@ export type UpdateGlobalMcpResponses = {
 };
 
 export type UpdateGlobalMcpResponse = UpdateGlobalMcpResponses[keyof UpdateGlobalMcpResponses];
+
+export type UpdateOtelIngestData = {
+    body: UpdateOtelIngestRequest;
+    path?: never;
+    query?: never;
+    url: '/settings/otel-ingest';
+};
+
+export type UpdateOtelIngestErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions (requires otel:write)
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateOtelIngestResponses = {
+    /**
+     * OTLP ingest toggle updated
+     */
+    200: UpdateOtelIngestResponse;
+};
+
+export type UpdateOtelIngestResponse2 = UpdateOtelIngestResponses[keyof UpdateOtelIngestResponses];
 
 export type RefreshRouteTableData = {
     body?: never;

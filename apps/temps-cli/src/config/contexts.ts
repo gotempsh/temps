@@ -199,6 +199,21 @@ export async function removeContext(name: string): Promise<boolean> {
 }
 
 /**
+ * Rename a context. Returns false if `oldName` doesn't exist or `newName`
+ * is already taken. The renamed context keeps its active state.
+ */
+export async function renameContext(oldName: string, newName: string): Promise<boolean> {
+  const contexts = await loadContexts()
+  if (!contexts.some((c) => c.name === oldName)) return false
+  if (contexts.some((c) => c.name === newName)) return false
+  for (const c of contexts) {
+    if (c.name === oldName) c.name = newName
+  }
+  await saveContexts(contexts)
+  return true
+}
+
+/**
  * Make `name` the active context. Returns false if the context doesn't
  * exist.
  */
