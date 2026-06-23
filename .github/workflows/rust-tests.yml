@@ -248,9 +248,12 @@ jobs:
 
       - name: Run unit tests
         env:
+          CARGO_TERM_COLOR: never
           RUST_BACKTRACE: 1
           CARGO_INCREMENTAL: 0
         run: |
+          set -o pipefail
+
           # Run tests, capturing the names of any failures for targeted retry
           if cargo test --no-fail-fast --lib ${{ matrix.crates }} 2>&1 | tee /tmp/test-output.txt; then
             echo "All tests passed on first attempt"
@@ -258,7 +261,7 @@ jobs:
           fi
 
           # Extract failed test names from output
-          failed_tests=$(grep '^test .* FAILED$' /tmp/test-output.txt | sed 's/^test \(.*\) \.\.\..*FAILED$/\1/' | tr '\n' ' ')
+          failed_tests=$(grep '^test .* FAILED$' /tmp/test-output.txt | sed 's/^test \(.*\) \.\.\..*FAILED$/\1/' | tr '\n' ' ' || true)
           if [ -z "$failed_tests" ]; then
             echo "Could not parse failed test names, re-running all tests"
             cargo test --no-fail-fast --lib ${{ matrix.crates }}
@@ -428,10 +431,13 @@ jobs:
 
       - name: Run integration tests
         env:
+          CARGO_TERM_COLOR: never
           RUST_BACKTRACE: 1
           CARGO_INCREMENTAL: 0
           TEMPS_TEST_DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db
         run: |
+          set -o pipefail
+
           # Run tests, capturing the names of any failures for targeted retry.
           # `cargo_args` covers everything cargo cares about (crate, features,
           # filters); `test_args` is everything after `--` that libtest cares
@@ -444,7 +450,7 @@ jobs:
           fi
 
           # Extract failed test names from output
-          failed_tests=$(grep '^test .* FAILED$' /tmp/test-output.txt | sed 's/^test \(.*\) \.\.\..*FAILED$/\1/' | tr '\n' ' ')
+          failed_tests=$(grep '^test .* FAILED$' /tmp/test-output.txt | sed 's/^test \(.*\) \.\.\..*FAILED$/\1/' | tr '\n' ' ' || true)
           if [ -z "$failed_tests" ]; then
             echo "Could not parse failed test names, re-running all tests"
             cargo ${{ matrix.cargo_args }} -- ${{ matrix.test_args }}
@@ -478,3 +484,113 @@ jobs:
               sleep 10
             done
           done
+
+  # ---------------------------------------------------------------------------
+  # Phase 2b: MariaDB PITR full-chain E2E
+  # ---------------------------------------------------------------------------
+  # Keep this heavyweight single test out of the generic Docker matrix so it can
+  # start immediately, and so Actions shows each expensive phase (image pull,
+  # test build, test run, diagnostics) separately.
+  mariadb-pitr-e2e:
+    name: "MariaDB PITR E2E"
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    services:
+      timescaledb:
+        image: timescale/timescaledb-ha:pg18
+        env:
+          POSTGRES_DB: test_db
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U test_user -d test_db"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          sudo apt-get autoremove -y && sudo apt-get clean
+          df -h
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-build
+          save-if: false
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Verify TimescaleDB is ready
+        run: |
+          timeout 60 bash -c 'until nc -z localhost 5432; do sleep 1; done'
+          echo "TimescaleDB is ready"
+
+      - name: Show Docker environment
+        run: |
+          docker version
+          docker info
+          docker system df
+
+      - name: Pull E2E images
+        run: |
+          timeout 10m docker pull minio/minio:latest
+          timeout 10m docker pull mariadb:lts
+          docker image ls | grep -E '^(minio/minio|mariadb)\s' || true
+
+      - name: Build MariaDB PITR E2E binary
+        env:
+          CARGO_TERM_COLOR: never
+          CARGO_INCREMENTAL: 0
+        run: |
+          cargo test -p temps-backup --features docker-tests mariadb_pitr_full_chain_e2e --no-run
+
+      - name: Run MariaDB PITR E2E
+        env:
+          CARGO_TERM_COLOR: never
+          RUST_BACKTRACE: 1
+          CARGO_INCREMENTAL: 0
+          TEMPS_TEST_DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db
+        run: |
+          timeout --foreground 20m bash -lc 'set -o pipefail; cargo test -p temps-backup --features docker-tests mariadb_pitr_full_chain_e2e -- --nocapture --test-threads=1 2>&1 | tee /tmp/mariadb-pitr-e2e.log'
+
+      - name: Summarize MariaDB PITR E2E diagnostics
+        if: always()
+        run: |
+          if [ -f /tmp/mariadb-pitr-e2e.log ]; then
+            grep -E 'Restored row counts|test result|FAILED|Timed out|timed out|Fetched MariaDB PITR|Uploading MariaDB PITR|Uploaded MariaDB PITR|Replaying MariaDB|temps-mariadb-pitr-replay|docker exec timed out|DIAG|Booted MariaDB|Base backup|archive_binlogs|Restore produced' /tmp/mariadb-pitr-e2e.log | tail -n 240 || true
+          else
+            echo "No MariaDB PITR E2E log was written"
+          fi
+
+          echo ""
+          echo "Docker containers:"
+          docker ps -a || true
+          echo ""
+          echo "Docker images:"
+          docker image ls || true
+          echo ""
+          echo "Docker disk usage:"
+          docker system df || true
+
+      - name: Upload MariaDB PITR E2E log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mariadb-pitr-e2e-log
+          path: /tmp/mariadb-pitr-e2e.log
+          if-no-files-found: ignore

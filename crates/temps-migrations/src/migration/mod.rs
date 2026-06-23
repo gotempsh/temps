@@ -246,9 +246,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260618_000001_create_on_demand_cert_attempts::Migration),
             Box::new(m20260618_000002_add_domains_on_demand_backoff::Migration),
             Box::new(m20260619_000001_add_settings_change_trigger::Migration),
-            Box::new(
-                m20260623_000001_add_external_services_default_backup_provisioned::Migration,
-            ),
+            Box::new(m20260623_000001_add_external_services_default_backup_provisioned::Migration),
         ]
     }
 }

@@ -376,8 +376,7 @@ impl TempsPlugin for BackupPlugin {
             tokio::spawn({
                 let backup_service = Arc::clone(&backup_service);
                 async move {
-                    let mut tick =
-                        tokio::time::interval(std::time::Duration::from_secs(5 * 60));
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(5 * 60));
                     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                     // First tick fires immediately so newly-created MariaDB
                     // services get a schedule shortly after startup.

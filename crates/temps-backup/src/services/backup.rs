@@ -4140,9 +4140,7 @@ impl BackupService {
     ///   service can't block the others.
     ///
     /// Idempotent and safe to call on a periodic tick.
-    pub async fn reconcile_default_external_service_schedules(
-        &self,
-    ) -> Result<(), BackupError> {
+    pub async fn reconcile_default_external_service_schedules(&self) -> Result<(), BackupError> {
         use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
         // 1. Resolve the default S3 source. If none is configured yet, this is
@@ -4162,9 +4160,7 @@ impl BackupService {
         // 2. Load unprovisioned MariaDB services.
         let services = temps_entities::external_services::Entity::find()
             .filter(temps_entities::external_services::Column::ServiceType.eq("mariadb"))
-            .filter(
-                temps_entities::external_services::Column::DefaultBackupProvisioned.eq(false),
-            )
+            .filter(temps_entities::external_services::Column::DefaultBackupProvisioned.eq(false))
             .all(self.db.as_ref())
             .await?;
 
@@ -4182,10 +4178,7 @@ impl BackupService {
         // 3. For each, create a daily full-backup schedule targeting exactly
         //    that service, then flip the latch.
         for service in services {
-            if let Err(e) = self
-                .provision_default_schedule_for_service(&service)
-                .await
-            {
+            if let Err(e) = self.provision_default_schedule_for_service(&service).await {
                 // Leave default_backup_provisioned = false so the next tick
                 // retries. One failing service must not block the others.
                 warn!(
@@ -4248,8 +4241,7 @@ impl BackupService {
             .await?;
 
         // Flip the one-shot latch so we never provision this service again.
-        let mut active: temps_entities::external_services::ActiveModel =
-            service.clone().into();
+        let mut active: temps_entities::external_services::ActiveModel = service.clone().into();
         active.default_backup_provisioned = Set(true);
         active.update(self.db.as_ref()).await?;
 
@@ -9662,8 +9654,8 @@ mod tests {
         const DAILY_3AM: &str = "0 0 3 * * *";
 
         // Parses under the cron crate (6-field sec/min/hour/dom/mon/dow).
-        let schedule = Schedule::from_str(DAILY_3AM)
-            .expect("auto-provision cron expression must parse");
+        let schedule =
+            Schedule::from_str(DAILY_3AM).expect("auto-provision cron expression must parse");
 
         // Two adjacent runs are 24h apart -> passes the >= 1h rule in
         // validate_backup_schedule.

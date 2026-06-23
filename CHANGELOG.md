@@ -34,7 +34,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `DATABASE_URL`/`MYSQL_*`/`MARIADB_*` fallbacks for MariaDB-backed Laravel
   configs, and keeps `php artisan migrate --force` as a one-off release step
   rather than a per-container start command.
+- **MariaDB physical base backups are gzipped correctly**: `mariadb_physical`
+  now binds the `| gzip` pipeline directly to `mariadb-backup --stream=mbstream`
+  instead of the trailing scratch-directory cleanup command, so base backup
+  objects ending in `base.mbstream.gz` are valid gzip streams that PITR restore
+  can unpack.
+- **MariaDB PITR restore reads source binlogs for new services**:
+  restore-to-new-service now fetches the binlog manifest and archived binlog
+  objects from the source service name prefix instead of the newly restored
+  service name, allowing forward replay to find the source service's archived
+  segments.
+- **MariaDB physical restore helper waits are bounded**: PITR physical restore
+  now times out a stuck helper container wait with diagnostic logs instead of
+  hanging indefinitely, so failed restore attempts surface actionable errors.
+- **MariaDB physical restore diagnostics cannot hang**: restore-helper log
+  collection is now finite and includes phase markers, so a stuck PITR physical
+  restore reports the helper phase instead of masking the timeout.
+- **MariaDB restore-to-new-service avoids redundant image pulls**: MariaDB
+  container creation now reuses a locally present `docker_image` and bounds the
+  pull when the image is missing, preventing restore provisioning from hanging
+  on an unnecessary network pull.
+- **MariaDB PITR binlog replay is bounded and non-interactive**: PITR replay now
+  uses an explicit TCP root connection, a short dedicated replay timeout,
+  per-phase `timeout` guards, and replay phase markers so a stuck or
+  prompt-bound `mariadb-binlog`/client invocation fails with context instead of
+  hanging behind the generic backup timeout.
+- **MariaDB PITR binlog uploads are bounded**: archived binlog segments copied
+  into the restored container now use a dedicated upload timeout and phase logs,
+  so Docker archive-upload stalls fail before the E2E or job timeout.
+- **Docker exec API calls are bounded for provider operations**: shared
+  `externalsvc::exec_util::run_exec` now applies a short Docker API timeout to
+  exec creation, start, polling, and final log draining while preserving
+  captured command output on command timeouts. It also stops polling a drained
+  output stream, preventing restore workflows from hanging when Docker closes
+  stdout/stderr before `inspect_exec` reports completion.
 
+### Tests
+- **Full-chain MariaDB PITR Docker E2E coverage**: `crates/temps-backup/tests/mariadb_pitr_e2e.rs`
+  exercises the real physical backup engine, S3 binlog archiver, and
+  `restore_pitr(Time)` path against Dockerized MariaDB, MinIO, and Postgres,
+  asserting that rows before the recovery timestamp are restored while later
+  rows are excluded. The `docker-tests` feature and `docker-backup` GitHub
+  Actions matrix group keep the heavyweight test opt-in locally and enforced in
+  CI.
+- **GitHub Actions cargo test pipelines preserve failures**: the Rust test
+  workflow now enables `pipefail` before piping cargo test output through
+  `tee`, disables cargo color for parseable test result lines, and makes failed
+  test extraction non-fatal, so failed unit or integration tests cannot be
+  reported as successful before retry parsing runs.
+- **MariaDB PITR E2E does not retry after long failures**: the `docker-backup`
+  GitHub Actions group now fails immediately after a failed full-chain E2E
+  attempt, preserving the first diagnostic log instead of spending another
+  timeout window rerunning the same expensive scenario.
+- **MariaDB PITR E2E emits provider phase logs**: the Docker E2E initializes a
+  test-only tracing subscriber for `temps_providers::externalsvc::mariadb`, so
+  CI logs show where a full-chain restore is spending time.
+- **MariaDB PITR E2E runs as a dedicated CI job**: `.github/workflows/rust-tests.yml`
+  now runs the full-chain Docker E2E outside the generic integration matrix,
+  starts it immediately, and gives it explicit image-pull, binary-build,
+  test-run, and diagnostics steps, so GitHub Actions exposes progress and
+  hard-stops stuck runs faster.
 
 ## [0.1.0-beta.35] - 2026-06-19
 
