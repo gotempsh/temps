@@ -45,15 +45,17 @@ impl ContainerLifecycle for ContainerLifecycleAdapter {
             })
     }
 
-    /// Report a container ready only once its application is actually accepting
-    /// connections — not merely once Docker reports `Running`.
+    /// Report a container ready only once its application is actually answering
+    /// HTTP — not merely once Docker reports `Running`.
     ///
     /// A `Running` container whose process hasn't yet bound its port would, on a
     /// scale-to-zero wake, get a request proxied to it before it can serve,
     /// producing a spurious upstream-connect 503 on the first request. The
-    /// underlying readiness probe (Docker `Running` + a TCP connect to the
-    /// lowest published host port) lives in `temps_deployer::readiness` so the
-    /// deployment-completion path shares exactly the same definition of "ready".
+    /// readiness probe lives in `temps_deployer::readiness`; it issues an HTTP
+    /// GET (Docker `Running` + a real HTTP response) rather than a bare TCP
+    /// connect — a TCP connect is defeated by Docker's userland proxy, which
+    /// accepts the connection before the app inside has bound its port (so a
+    /// TCP handshake would falsely report "ready"). See that module for details.
     ///
     /// `do_wake` runs its own outer poll loop, so this is a single-shot check:
     /// `Ok(false)` means "not ready yet, keep polling". A container in a
@@ -62,7 +64,7 @@ impl ContainerLifecycle for ContainerLifecycleAdapter {
     async fn is_container_healthy(&self, container_id: &str) -> Result<bool, OnDemandError> {
         use temps_deployer::readiness::{check_accepting_requests, ReadinessCheck};
 
-        // 2s connect timeout matches the historical inline probe.
+        // 2s per-request timeout matches the historical inline probe.
         let check = check_accepting_requests(&self.deployer, container_id, Duration::from_secs(2))
             .await
             .map_err(|e| OnDemandError::ContainerOperation {
@@ -255,10 +257,17 @@ mod tests {
         info: ContainerInfo,
     }
 
+    /// Build a `ContainerInfo` pointed at a test listener. The readiness probe
+    /// resolves its URL via `DeploymentMode::build_container_url`, which yields
+    /// `(container_name, container_port)` in Docker mode and `("127.0.0.1",
+    /// host_port)` in baremetal mode. Using `container_name = "127.0.0.1"` and
+    /// `container_port == host_port` makes both modes resolve to
+    /// `http://127.0.0.1:{port}/`, so these tests don't depend on the ambient
+    /// `DEPLOYMENT_MODE`.
     fn container_info(status: ContainerStatus, ports: Vec<u16>) -> ContainerInfo {
         ContainerInfo {
             container_id: "c1".to_string(),
-            container_name: "app".to_string(),
+            container_name: "127.0.0.1".to_string(),
             image_name: "app:latest".to_string(),
             status,
             created_at: chrono::Utc::now(),
@@ -266,7 +275,7 @@ mod tests {
                 .into_iter()
                 .map(|host_port| PortMapping {
                     host_port,
-                    container_port: 3000,
+                    container_port: host_port,
                     protocol: Protocol::Tcp,
                 })
                 .collect(),
@@ -336,6 +345,35 @@ mod tests {
         ContainerLifecycleAdapter::new(Arc::new(MockDeployer { info }))
     }
 
+    /// Spawn a minimal HTTP/1.1 server on a loopback port that answers `200 OK`
+    /// to any request, returning the bound port. The readiness probe issues a
+    /// real HTTP GET (a bare TCP listener would be reported not-ready, which is
+    /// the whole point of the HTTP probe), so tests that need a "ready" port
+    /// must actually speak HTTP.
+    async fn spawn_http_ok() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        port
+    }
+
     #[tokio::test]
     async fn test_not_running_is_not_healthy() {
         let adapter = adapter_for(container_info(ContainerStatus::Created, vec![12345]));
@@ -350,15 +388,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_running_port_listening_is_healthy() {
-        // Bind a real listener so the readiness probe's TCP connect succeeds.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
+    async fn test_running_port_serving_http_is_healthy() {
+        // An HTTP server on the mapped port → the probe gets a 200 → healthy.
+        let port = spawn_http_ok().await;
         let adapter = adapter_for(container_info(ContainerStatus::Running, vec![port]));
         assert!(
             adapter.is_container_healthy("c1").await.unwrap(),
-            "Running container with a listening port must be healthy"
+            "Running container that answers HTTP must be healthy"
         );
     }
 
@@ -379,28 +415,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_running_tcp_open_but_no_http_is_not_healthy() {
+        // The docker-proxy false-positive: a raw TCP listener that never speaks
+        // HTTP. A TCP-only probe would call this "ready"; the HTTP probe must
+        // not (the connect succeeds but no HTTP response arrives within the
+        // per-request timeout).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Accept connections but never respond, holding the socket open.
+        tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    drop(sock);
+                });
+            }
+        });
+
+        let adapter = adapter_for(container_info(ContainerStatus::Running, vec![port]));
+        assert!(
+            !adapter.is_container_healthy("c1").await.unwrap(),
+            "TCP-open-but-silent container must NOT be reported healthy (docker-proxy false-positive)"
+        );
+    }
+
+    #[tokio::test]
     async fn test_probes_lowest_port_deterministically() {
-        // Bind two listeners, keep only the LOWER-numbered one alive (close the
-        // higher). The probe must target the lowest published port, so the
-        // container is healthy iff the lowest port is the listening one — proving
-        // selection is by value, not by the (unordered) report order.
-        let a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let pa = a.local_addr().unwrap().port();
-        let pb = b.local_addr().unwrap().port();
-        let (lo, hi, lo_listener, hi_listener) = if pa < pb {
-            (pa, pb, a, b)
-        } else {
-            (pb, pa, b, a)
+        // Serve HTTP only on the LOWER-numbered port; the higher is closed. The
+        // probe must target the lowest published port, so the container is
+        // healthy iff the lowest port is the serving one — proving selection is
+        // by value, not by the (unordered) report order.
+        let lo_port = spawn_http_ok().await;
+        let hi_port = {
+            // A bound-then-dropped higher port: pick something above lo_port and
+            // ensure it's closed. Bind to 0 until we get a port > lo_port.
+            let mut p;
+            loop {
+                let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                p = l.local_addr().unwrap().port();
+                if p > lo_port {
+                    break; // dropped here → closed
+                }
+            }
+            p
         };
-        drop(hi_listener); // higher port now closed; lower port still listening
-        let _keep = lo_listener; // keep the lower port bound for the probe
 
         // Report ports high-then-low to prove order-independence.
-        let adapter = adapter_for(container_info(ContainerStatus::Running, vec![hi, lo]));
+        let adapter = adapter_for(container_info(
+            ContainerStatus::Running,
+            vec![hi_port, lo_port],
+        ));
         assert!(
             adapter.is_container_healthy("c1").await.unwrap(),
-            "probe must target the lowest published port (the listening one)"
+            "probe must target the lowest published port (the HTTP-serving one)"
         );
     }
 }
