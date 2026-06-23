@@ -13,6 +13,8 @@
 //! - [`postgres_pgdump`]: Postgres via pg_dump sidecar (fallback).
 //! - [`postgres_walg`]: Postgres via WAL-G (preferred when available).
 //! - [`postgres_cluster`]: Postgres cluster (pg_auto_failover) via WAL-G.
+//! - [`mariadb_physical`]: MariaDB via `mariadb-backup` physical base (PITR).
+//! - [`mariadb_dump`]: MariaDB via `mariadb-dump` logical dump (fallback).
 //! - [`s3_mirror`]: S3-compatible object storage via `mc mirror`.
 //! - [`dispatch`]: Engine-key resolution helper (`resolve_engine_key`).
 //!
@@ -24,6 +26,9 @@
 pub mod control_plane;
 pub mod dispatch;
 pub mod image_pull;
+pub mod mariadb_dump;
+pub mod mariadb_exec;
+pub mod mariadb_physical;
 pub mod mongodb;
 pub mod oneshot;
 pub mod postgres_cluster;

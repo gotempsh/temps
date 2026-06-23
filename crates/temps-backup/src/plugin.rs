@@ -13,6 +13,8 @@ use utoipa::OpenApi as OpenApiTrait;
 use crate::{
     engines::{
         control_plane::{ControlPlaneDeps, ControlPlaneEngine},
+        mariadb_dump::{MariadbDumpDeps, MariadbDumpEngine},
+        mariadb_physical::{MariadbPhysicalDeps, MariadbPhysicalEngine},
         mongodb::{MongodbDeps, MongodbEngine},
         postgres_cluster::{PostgresClusterDeps, PostgresClusterEngine},
         postgres_pgdump::{PostgresPgDumpDeps, PostgresPgDumpEngine},
@@ -160,6 +162,16 @@ impl TempsPlugin for BackupPlugin {
                         encryption_service: encryption_service.clone(),
                         docker: docker.as_ref().clone(),
                     })))
+                    .register_engine(Arc::new(MariadbPhysicalEngine::new(MariadbPhysicalDeps {
+                        db: db.clone(),
+                        encryption_service: encryption_service.clone(),
+                        docker: docker.as_ref().clone(),
+                    })))
+                    .register_engine(Arc::new(MariadbDumpEngine::new(MariadbDumpDeps {
+                        db: db.clone(),
+                        encryption_service: encryption_service.clone(),
+                        docker: docker.as_ref().clone(),
+                    })))
                     .register_engine(Arc::new(S3MirrorEngine::new(S3MirrorDeps {
                         db: db.clone(),
                         encryption_service: encryption_service.clone(),
@@ -169,8 +181,9 @@ impl TempsPlugin for BackupPlugin {
             );
 
             info!(
-                "BackupExecutor: registered 7 engines: control_plane, redis, \
-                 postgres_pgdump, postgres_walg, postgres_cluster, mongodb, s3_mirror",
+                "BackupExecutor: registered 9 engines: control_plane, redis, \
+                 postgres_pgdump, postgres_walg, postgres_cluster, mongodb, \
+                 mariadb_physical, mariadb_dump, s3_mirror",
             );
 
             // Wire the JobQueue into BackupService so trigger paths can
