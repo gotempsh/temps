@@ -325,12 +325,16 @@ jobs:
             # temps-providers with Docker tests enabled.
             # NOTE: orchestrator_* tests run in a dedicated `postgres-upgrades`
             # group below (serial, long timeout, real pg17→pg18 containers).
-            # Skip them here so this group stays fast and parallel-safe.
+            # Skip them here so this group stays focused. The remaining
+            # provider Docker tests still create real containers and some
+            # use fixed service names, so run them serially to avoid port
+            # and container-name contention on the shared runner.
             cargo_args: >-
               test --no-fail-fast --lib
               -p temps-providers --features docker-tests
             test_args: >-
               --skip orchestrator_
+              --test-threads=1
           - group: postgres-upgrades
             # PostgreSQL major-version upgrade orchestrator integration tests.
             # Each test pulls pg17 + pg18 images and runs a real dump/restore,
@@ -343,29 +347,53 @@ jobs:
             test_args: >-
               --nocapture
               --test-threads=1
+          - group: docker-backup
+            # Backup service integration tests get their own runner because
+            # they exercise S3-compatible storage, schedules, and real DB
+            # fixtures. Keeping this separate makes MariaDB/PITR regressions
+            # visible without waiting for unrelated deployment/domain tests.
+            cargo_args: >-
+              test --no-fail-fast
+              -p temps-backup
+            test_args: >-
+              --test-threads=1
           - group: docker-deployments
-            # Crates that use TestDatabase and/or Docker
+            # Core deployment/database crates that use TestDatabase and/or
+            # Docker but do not need the provider Docker feature.
             cargo_args: >-
               test --no-fail-fast
               -p temps-deployments
-              -p temps-backup
               -p temps-vulnerability-scanner
               -p temps-import-docker
               -p temps-migrations
               -p temps-database
               -p temps-blob
-              -p temps-query-s3
-              -p temps-query-redis
-              -p temps-query-mongodb
-              -p temps-query-postgres
               -p temps-embeddings
               -p temps-config
               -p temps-notifications
               -p temps-deployer
               -p temps-logs
-              -p temps-domains
               -p temps-projects
             test_args: ""
+          - group: docker-query
+            # Query adapters use service/testcontainer fixtures; isolate them
+            # from the heavier deployment and backup suites.
+            cargo_args: >-
+              test --no-fail-fast
+              -p temps-query-s3
+              -p temps-query-redis
+              -p temps-query-mongodb
+              -p temps-query-postgres
+            test_args: ""
+          - group: docker-domains
+            # The Pebble/HTTP-01 tests create several containers and local
+            # listeners. Run them alone so ACME callbacks are not starved by
+            # unrelated Docker-heavy tests.
+            cargo_args: >-
+              test --no-fail-fast
+              -p temps-domains
+            test_args: >-
+              --test-threads=1
 
     services:
       timescaledb:

@@ -68,6 +68,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   captured command output on command timeouts. It also stops polling a drained
   output stream, preventing restore workflows from hanging when Docker closes
   stdout/stderr before `inspect_exec` reports completion.
+- **Postgres lifecycle waits for usable databases**: managed Postgres container
+  startup now waits for real `psql SELECT 1` connectivity, creates the
+  configured database if the cluster is alive but it is absent, and includes
+  container logs on readiness failures. This prevents major-upgrade restores
+  from treating `pg_isready` as sufficient before the target database exists.
+- **MariaDB default base-backup schedules attach correctly**: the PITR
+  auto-provisioner now uses an internal service-scoped schedule insert so it can
+  create the schedule, attach the MariaDB service, and then mark the one-shot
+  latch without being rejected by the public "empty target set" validation.
 
 ### Tests
 - **Full-chain MariaDB PITR Docker E2E coverage**: `crates/temps-backup/tests/mariadb_pitr_e2e.rs`
@@ -98,6 +107,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `postgres_upgrade` integration fixtures now insert a matching `backups` row
   for the fake pre-upgrade backup id, keeping the existing rollback/upgrade
   assertions valid after FK enforcement.
+- **Docker CI integration groups are narrower**: the Rust workflow now splits
+  backup, query, domains, provider Docker, postgres-upgrade, and MariaDB PITR
+  tests into separate GitHub Actions groups, with container-heavy provider,
+  backup, domains, and upgrade groups serialized where needed to avoid
+  container-name, port, and callback contention.
 
 ## [0.1.0-beta.38] - 2026-06-23
 

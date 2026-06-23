@@ -4208,37 +4208,58 @@ impl BackupService {
         // Daily at 03:00 UTC. 6-field cron (`sec min hour dom mon dow`) as
         // required by the `cron` crate / `validate_backup_schedule`; the two
         // adjacent occurrences are 24h apart, satisfying the validator's
-        // "at least 1 hour" rule. Reuse create_backup_schedule for validation
-        // and next-run computation — do NOT hand-roll a second insert.
-        let request = CreateBackupScheduleRequest {
-            name: format!("Auto base backup — {}", service.name),
+        // "at least 1 hour" rule.
+        let schedule_expression = "0 0 3 * * *".to_string();
+        self.validate_backup_schedule(&schedule_expression)?;
+        let cron_schedule = Schedule::from_str(&schedule_expression)
+            .map_err(|e| BackupError::Schedule(e.to_string()))?;
+        let next_run = cron_schedule.upcoming(Utc).next();
+        let s3_source_id = self.resolve_s3_source_id(None).await?;
+        temps_entities::s3_sources::Entity::find_by_id(s3_source_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| BackupError::NotFound {
+                resource: "S3Source".to_string(),
+                detail: format!("S3 source {} not found", s3_source_id),
+            })?;
+
+        // This internal auto-provisioning path is allowed to create a
+        // service-scoped schedule before membership rows exist, because the
+        // service is attached immediately below. The public create endpoint
+        // still rejects an empty target set.
+        let now = chrono::Utc::now();
+        let schedule = temps_entities::backup_schedules::ActiveModel {
+            id: sea_orm::NotSet,
+            name: Set(format!("Auto base backup — {}", service.name)),
             // `backup_type` is the schedule/job label ("full"); the actual
             // backup engine (`mariadb_physical`) is resolved from the service's
             // `service_type` at run time, not from this field.
-            backup_type: "full".to_string(),
-            // Days. 14 days of base backups is a sane default retention window.
-            retention_period: 14,
-            // Use the resolved default S3 source.
-            s3_source_id: None,
-            schedule_expression: "0 0 3 * * *".to_string(),
-            enabled: true,
-            description: Some(
+            backup_type: Set("full".to_string()),
+            retention_period: Set(14),
+            s3_source_id: Set(s3_source_id),
+            schedule_expression: Set(schedule_expression),
+            enabled: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+            description: Set(Some(
                 "Automatically created daily base backup so point-in-time recovery \
                  works out of the box. Safe to edit or delete."
                     .to_string(),
-            ),
-            tags: vec![],
-            max_runtime_secs: None,
-            // Target exactly this service (attached below), not every DB.
-            target_all_services: Some(false),
-            include_control_plane: Some(false),
-        };
-
-        let schedule = self.create_backup_schedule(request).await?;
+            )),
+            tags: Set("[]".to_string()),
+            next_run: Set(next_run),
+            max_runtime_secs: Set(None),
+            target_all_services: Set(false),
+            include_control_plane: Set(false),
+            ..Default::default()
+        }
+        .insert(self.db.as_ref())
+        .await?;
 
         // Attach exactly this service so the schedule's fan-out targets it.
         self.attach_services_to_schedule(schedule.id, &[service.id])
             .await?;
+        self.fire_lifecycle_reconcile(schedule.s3_source_id);
 
         // Flip the one-shot latch so we never provision this service again.
         let mut active: temps_entities::external_services::ActiveModel = service.clone().into();
