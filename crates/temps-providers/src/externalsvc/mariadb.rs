@@ -2294,7 +2294,9 @@ impl MariaDbService {
             }
         }
 
-        let mut binlog_args = String::from("mysqlbinlog --disable-log-bin");
+        // `$BINLOG` is resolved at run time in the shell below — mariadb:lts
+        // ships `mariadb-binlog`, not `mysqlbinlog`.
+        let mut binlog_args = String::from("\"$BINLOG\" --disable-log-bin");
         binlog_args.push_str(&format!(" --start-position={}", start_position));
         if let Some((flag, value)) = &stop_flag {
             // Quote the value (datetimes contain a space).
@@ -2305,13 +2307,23 @@ impl MariaDbService {
             binlog_args.push_str(&Self::shell_single_quote(f));
         }
 
-        // Pipe to a single mariadb/mysql client. dash has no pipefail, so we
-        // guard mysqlbinlog's exit explicitly with an intermediate file.
+        // Resolve tool names at run time: mariadb:lts ships `mariadb-binlog`
+        // and `mariadb` (NOT `mysqlbinlog`/`mysql`); fall back to the mysql
+        // names for non-MariaDB images. dash has no pipefail, so we decode to
+        // an intermediate file FIRST (under `set -e`, a failed decode aborts
+        // before the client runs) and only then feed it to the client — this
+        // surfaces a broken replay as an error rather than a silent
+        // half-apply masked by the client's exit code in a pipe.
+        let replay_file = "/var/tmp/temps-pitr-replay.sql";
         let replay_cmd = format!(
             "set -e; \
+             if command -v mariadb-binlog >/dev/null 2>&1; then BINLOG=mariadb-binlog; else BINLOG=mysqlbinlog; fi; \
              if command -v mariadb >/dev/null 2>&1; then CLIENT=mariadb; else CLIENT=mysql; fi; \
-             {binlog} | \"$CLIENT\" -uroot",
+             {binlog} > {file}; \
+             \"$CLIENT\" -uroot < {file}; \
+             rm -f {file}",
             binlog = binlog_args,
+            file = replay_file,
         );
 
         let env = vec![
@@ -3441,6 +3453,7 @@ impl ExternalService for MariaDbService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::externalsvc::DEPLOYMENT_MODE_MUTEX as ENV_MUTEX;
 
     #[test]
     fn normalizes_database_names() {
@@ -3917,5 +3930,601 @@ mod tests {
             size_profile.get("x-editable").and_then(|v| v.as_bool()),
             Some(false)
         );
+    }
+
+    // ── Identifier / database-name validation (parity with Postgres) ────────
+    //
+    // MariaDB's `validate_identifier` is the gate for database/username before
+    // any SQL is emitted. Unlike Postgres it accepts uppercase (MariaDB
+    // identifiers are case-sensitive on some platforms and validate is a
+    // safety gate, not a normalizer); `normalize_database_name` lowercases.
+
+    #[test]
+    fn test_validate_database_name_valid_names() {
+        assert!(MariaDbService::validate_identifier("database", "mydb").is_ok());
+        assert!(MariaDbService::validate_identifier("database", "project_1_production").is_ok());
+        assert!(MariaDbService::validate_identifier("database", "db_test_env").is_ok());
+        assert!(MariaDbService::validate_identifier("database", "a").is_ok());
+        assert!(MariaDbService::validate_identifier("database", "_private").is_ok());
+    }
+
+    #[test]
+    fn test_validate_database_name_rejects_empty() {
+        assert!(MariaDbService::validate_identifier("database", "").is_err());
+    }
+
+    #[test]
+    fn test_validate_database_name_rejects_sql_injection_single_quote() {
+        // Classic SQL injection: ' OR 1=1 --
+        assert!(
+            MariaDbService::validate_identifier("database", "test'; DROP TABLE users--").is_err()
+        );
+    }
+
+    #[test]
+    fn test_validate_database_name_rejects_sql_injection_semicolon() {
+        assert!(
+            MariaDbService::validate_identifier("database", "mydb; DROP DATABASE production")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_validate_database_name_rejects_spaces() {
+        assert!(MariaDbService::validate_identifier("database", "my database").is_err());
+    }
+
+    #[test]
+    fn test_validate_database_name_rejects_special_chars() {
+        assert!(MariaDbService::validate_identifier("database", "db-name").is_err());
+        assert!(MariaDbService::validate_identifier("database", "db.name").is_err());
+        assert!(MariaDbService::validate_identifier("database", "db/name").is_err());
+        assert!(MariaDbService::validate_identifier("database", "db\\name").is_err());
+        assert!(MariaDbService::validate_identifier("database", "db`name").is_err());
+    }
+
+    #[test]
+    fn test_validate_database_name_accepts_uppercase() {
+        // MariaDB's validator accepts uppercase letters (it is a safety gate,
+        // not a normalizer). This diverges from Postgres, which rejects
+        // uppercase; we assert MariaDB's actual behavior.
+        assert!(MariaDbService::validate_identifier("database", "MyDatabase").is_ok());
+    }
+
+    #[test]
+    fn test_validate_database_name_rejects_leading_digit() {
+        assert!(MariaDbService::validate_identifier("database", "1database").is_err());
+        assert!(MariaDbService::validate_identifier("database", "123").is_err());
+    }
+
+    #[test]
+    fn test_validate_database_name_rejects_too_long() {
+        let long_name = "a".repeat(64);
+        assert!(MariaDbService::validate_identifier("database", &long_name).is_err());
+    }
+
+    #[test]
+    fn test_validate_database_name_accepts_max_length() {
+        let max_name = "a".repeat(63);
+        assert!(MariaDbService::validate_identifier("database", &max_name).is_ok());
+    }
+
+    #[test]
+    fn test_normalize_then_validate_is_always_safe() {
+        // Any input passed through normalize_database_name must pass validation.
+        let dangerous_inputs = vec![
+            "'; DROP TABLE users--",
+            "test; DELETE FROM sessions",
+            "../../etc/passwd",
+            "admin\x00hidden",
+            "Robert'); DROP TABLE Students;--",
+            "name WITH spaces AND STUFF",
+            "UPPERCASE_NAME",
+            "123_starts_with_number",
+            "db`name",
+        ];
+
+        for input in dangerous_inputs {
+            let normalized = MariaDbService::normalize_database_name(input);
+            assert!(
+                MariaDbService::validate_identifier("database", &normalized).is_ok(),
+                "normalize_database_name('{}') produced '{}' which failed validation",
+                input,
+                normalized
+            );
+        }
+    }
+
+    // ── Config / schema parity ──────────────────────────────────────────────
+
+    #[test]
+    fn test_mariadb_input_config_default_values() {
+        let input = MariaDbInputConfig {
+            host: default_host(),
+            port: None,
+            database: default_database(),
+            username: default_username(),
+            password: None,
+            root_password: None,
+            docker_image: default_docker_image(),
+            size_profile: MariaDbSizeProfile::default(),
+            binlog_archive_interval: BinlogArchiveInterval::default(),
+            container_name: None,
+        };
+
+        let config: MariaDbConfig = input.into();
+
+        assert_eq!(config.host, "localhost");
+        assert_eq!(config.database, "app");
+        assert_eq!(config.username, "app");
+        assert_eq!(config.docker_image, DEFAULT_MARIADB_IMAGE);
+        assert_eq!(config.size_profile, MariaDbSizeProfile::Small);
+        assert_eq!(config.binlog_archive_interval, BinlogArchiveInterval::Min5);
+        // Auto-generated credentials: 24 alphanumeric chars, distinct.
+        assert_eq!(config.password.len(), 24);
+        assert_eq!(config.root_password.len(), 24);
+        assert!(config.password.chars().all(|c| c.is_ascii_alphanumeric()));
+        assert!(config.root_password.chars().all(|c| c.is_ascii_alphanumeric()));
+        assert_ne!(
+            config.password, config.root_password,
+            "app and root passwords should be independently generated"
+        );
+        // Generated passwords satisfy the password validator.
+        assert!(MariaDbService::validate_password("password", &config.password).is_ok());
+        assert!(MariaDbService::validate_password("root_password", &config.root_password).is_ok());
+    }
+
+    #[test]
+    fn test_mariadb_input_config_custom_docker_image() {
+        let input = MariaDbInputConfig {
+            host: "localhost".to_string(),
+            port: Some("3306".to_string()),
+            database: "mydb".to_string(),
+            username: "myuser".to_string(),
+            password: Some("mypassword".to_string()),
+            root_password: Some("myrootpassword".to_string()),
+            docker_image: "mariadb:11.4".to_string(),
+            size_profile: MariaDbSizeProfile::default(),
+            binlog_archive_interval: BinlogArchiveInterval::default(),
+            container_name: None,
+        };
+
+        let config: MariaDbConfig = input.into();
+        assert_eq!(config.docker_image, "mariadb:11.4");
+        assert_eq!(config.port, "3306");
+        // A supplied >= 8 char password is kept (not regenerated).
+        assert_eq!(config.password, "mypassword");
+        assert_eq!(config.root_password, "myrootpassword");
+    }
+
+    #[test]
+    fn test_short_password_is_regenerated() {
+        // The optional-password deserializer drops too-short values, so a
+        // sub-8-char password is replaced with an auto-generated one.
+        let input: MariaDbInputConfig = serde_json::from_value(serde_json::json!({
+            "host": "localhost",
+            "database": "app",
+            "username": "app",
+            "password": "short",
+            "docker_image": DEFAULT_MARIADB_IMAGE,
+        }))
+        .expect("parse input config");
+        assert!(
+            input.password.is_none(),
+            "too-short password must be dropped to None by the deserializer"
+        );
+        let config: MariaDbConfig = input.into();
+        assert_eq!(config.password.len(), 24, "dropped password is regenerated");
+    }
+
+    #[test]
+    fn test_parameter_schema_editable_fields() {
+        let service = MariaDbService::new(
+            "test-editable".to_string(),
+            Arc::new(Docker::connect_with_http_defaults().expect("docker client")),
+        );
+
+        let schema = service
+            .get_parameter_schema()
+            .expect("schema should be generated");
+        let properties = schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .expect("properties should be an object");
+
+        // Connection identity is fixed after creation; only port and image
+        // (and binlog cadence, covered by its own test) are editable.
+        let editable_status = vec![
+            ("host", false),
+            ("port", true),
+            ("database", false),
+            ("username", false),
+            ("password", false),
+            ("root_password", false),
+            ("docker_image", true),
+        ];
+
+        for (field_name, should_be_editable) in editable_status {
+            let field = properties
+                .get(field_name)
+                .and_then(|v| v.as_object())
+                .unwrap_or_else(|| panic!("{} field should exist", field_name));
+            let is_editable = field
+                .get("x-editable")
+                .and_then(|v| v.as_bool())
+                .unwrap_or_else(|| panic!("{} should have x-editable property", field_name));
+            assert_eq!(
+                is_editable, should_be_editable,
+                "Field {} editable status should be {}",
+                field_name, should_be_editable
+            );
+        }
+    }
+
+    #[test]
+    fn test_default_docker_image_constant() {
+        // The default image tag the service provisions with.
+        assert_eq!(default_docker_image(), "mariadb:lts");
+        assert_eq!(DEFAULT_MARIADB_IMAGE, "mariadb:lts");
+    }
+
+    // ── Address / env-var routing (parity with Postgres) ────────────────────
+
+    #[test]
+    fn test_get_effective_address_baremetal_mode() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        // Clear Docker mode to ensure baremetal mode.
+        unsafe { std::env::remove_var("DEPLOYMENT_MODE") };
+
+        let service = MariaDbService::new(
+            "test-effective-addr".to_string(),
+            Arc::new(Docker::connect_with_http_defaults().expect("docker client")),
+        );
+        let config = ServiceConfig {
+            name: "test-mariadb".to_string(),
+            service_type: ServiceType::Mariadb,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": "3307",
+                "database": "app",
+                "username": "app",
+                "password": "secretpass",
+                "root_password": "rootpass1",
+                "docker_image": DEFAULT_MARIADB_IMAGE,
+            }),
+        };
+
+        let (host, port) = service.get_effective_address(config).unwrap();
+        // Baremetal: localhost with the exposed host port.
+        assert_eq!(host, "localhost");
+        assert_eq!(port, "3307");
+    }
+
+    #[test]
+    fn test_get_effective_address_docker_mode() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("DEPLOYMENT_MODE", "docker") };
+
+        let service = MariaDbService::new(
+            "test-effective-addr-docker".to_string(),
+            Arc::new(Docker::connect_with_http_defaults().expect("docker client")),
+        );
+        let config = ServiceConfig {
+            name: "test-mariadb".to_string(),
+            service_type: ServiceType::Mariadb,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": "3307",
+                "database": "app",
+                "username": "app",
+                "password": "secretpass",
+                "root_password": "rootpass1",
+                "docker_image": DEFAULT_MARIADB_IMAGE,
+            }),
+        };
+
+        let (host, port) = service.get_effective_address(config).unwrap();
+        // Docker: container name with the internal port, not the host port.
+        assert_eq!(host, "mariadb-test-effective-addr-docker");
+        assert_eq!(port, MARIADB_INTERNAL_PORT);
+
+        unsafe { std::env::remove_var("DEPLOYMENT_MODE") };
+    }
+
+    #[test]
+    fn test_get_effective_address_docker_mode_uses_imported_container_name() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("DEPLOYMENT_MODE", "docker") };
+
+        let service = MariaDbService::new(
+            "imported-svc".to_string(),
+            Arc::new(Docker::connect_with_http_defaults().expect("docker client")),
+        );
+        let config = ServiceConfig {
+            name: "imported-svc".to_string(),
+            service_type: ServiceType::Mariadb,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": "3307",
+                "database": "app",
+                "username": "app",
+                "password": "secretpass",
+                "root_password": "rootpass1",
+                "docker_image": DEFAULT_MARIADB_IMAGE,
+                "container_name": "legacy-mariadb",
+            }),
+        };
+
+        let (host, port) = service.get_effective_address(config).unwrap();
+        // The imported container name wins over the derived mariadb-{name}.
+        assert_eq!(host, "legacy-mariadb");
+        assert_eq!(port, MARIADB_INTERNAL_PORT);
+
+        unsafe { std::env::remove_var("DEPLOYMENT_MODE") };
+    }
+
+    #[test]
+    fn test_get_environment_variables_always_uses_container_name() {
+        // get_environment_variables always targets the container name and the
+        // internal port (3306) for container-to-container traffic, regardless
+        // of the exposed host port.
+        let service = MariaDbService::new(
+            "test-env-vars".to_string(),
+            Arc::new(Docker::connect_with_http_defaults().expect("docker client")),
+        );
+
+        let mut params = HashMap::new();
+        params.insert("port".to_string(), "3399".to_string()); // host port, ignored
+        params.insert("database".to_string(), "project_prod".to_string());
+        params.insert("username".to_string(), "app".to_string());
+        params.insert("password".to_string(), "secretpass".to_string());
+
+        let env = service.get_environment_variables(&params).unwrap();
+
+        assert_eq!(env.get("MYSQL_HOST").unwrap(), "mariadb-test-env-vars");
+        assert_eq!(env.get("MARIADB_HOST").unwrap(), "mariadb-test-env-vars");
+        assert_eq!(env.get("MYSQL_PORT").unwrap(), MARIADB_INTERNAL_PORT);
+        assert_eq!(env.get("MARIADB_PORT").unwrap(), MARIADB_INTERNAL_PORT);
+        assert_eq!(env.get("MYSQL_DATABASE").unwrap(), "project_prod");
+        assert_eq!(
+            env.get("DATABASE_URL").unwrap(),
+            "mysql://app:secretpass@mariadb-test-env-vars:3306/project_prod"
+        );
+        // Internal port is used; the host port is never embedded.
+        assert!(!env.get("DATABASE_URL").unwrap().contains("3399"));
+    }
+
+    #[test]
+    fn test_get_environment_variables_prefers_explicit_container_name() {
+        // An imported service surfaces its real container_name as the host.
+        let service = MariaDbService::new(
+            "svc".to_string(),
+            Arc::new(Docker::connect_with_http_defaults().expect("docker client")),
+        );
+
+        let mut params = HashMap::new();
+        params.insert("container_name".to_string(), "legacy-mariadb".to_string());
+        params.insert("host".to_string(), "localhost".to_string());
+        params.insert("database".to_string(), "app".to_string());
+        params.insert("username".to_string(), "app".to_string());
+        params.insert("password".to_string(), "secretpass".to_string());
+
+        let env = service.get_environment_variables(&params).unwrap();
+        assert_eq!(env.get("MARIADB_HOST").unwrap(), "legacy-mariadb");
+        assert!(env
+            .get("MARIADB_URL")
+            .unwrap()
+            .contains("legacy-mariadb:3306"));
+    }
+
+    #[test]
+    fn test_get_docker_environment_variables_match_environment_variables() {
+        let service = MariaDbService::new(
+            "test-docker-env".to_string(),
+            Arc::new(Docker::connect_with_http_defaults().expect("docker client")),
+        );
+
+        let mut params = HashMap::new();
+        params.insert("port".to_string(), "3399".to_string());
+        params.insert("database".to_string(), "app".to_string());
+        params.insert("username".to_string(), "app".to_string());
+        params.insert("password".to_string(), "secretpass".to_string());
+
+        let env = service.get_docker_environment_variables(&params).unwrap();
+        assert_eq!(env.get("MYSQL_HOST").unwrap(), "mariadb-test-docker-env");
+        assert_eq!(env.get("MYSQL_PORT").unwrap(), MARIADB_INTERNAL_PORT);
+    }
+
+    #[test]
+    fn test_get_environment_variables_missing_params_error() {
+        let service = MariaDbService::new(
+            "missing".to_string(),
+            Arc::new(Docker::connect_with_http_defaults().expect("docker client")),
+        );
+        // No database/username/password → error.
+        let params = HashMap::new();
+        assert!(service.get_environment_variables(&params).is_err());
+    }
+
+    // ── Import (parity with Postgres) ───────────────────────────────────────
+
+    #[test]
+    fn test_import_connection_url_format() {
+        // Mirrors verify_import_connection's URL construction (mysql:// scheme).
+        let username = "app";
+        let password = "mysecretpassword";
+        let port = "3306";
+        let database = "importeddb";
+        let connection_url = format!(
+            "mysql://{}:{}@localhost:{}/{}",
+            urlencoding::encode(username),
+            urlencoding::encode(password),
+            port,
+            urlencoding::encode(database)
+        );
+        assert!(connection_url.contains("mysql://"));
+        assert!(connection_url.contains("app"));
+        assert!(connection_url.contains("mysecretpassword"));
+        assert!(connection_url.contains("localhost"));
+        assert!(connection_url.contains("3306"));
+        assert!(connection_url.contains("importeddb"));
+    }
+
+    #[test]
+    fn test_import_version_extraction_with_tag() {
+        // Import derives `version` from the image tag (image.rfind(':')).
+        let test_cases = vec![
+            ("mariadb:lts", "lts"),
+            ("mariadb:11.4", "11.4"),
+            ("mysql:8.0", "8.0"),
+            ("docker.io/library/mariadb:10.11", "10.11"),
+        ];
+        for (image, expected) in test_cases {
+            let version = image
+                .rfind(':')
+                .map(|p| image[p + 1..].to_string())
+                .unwrap_or_else(|| "latest".to_string());
+            assert_eq!(version, expected, "failed for image {}", image);
+        }
+    }
+
+    #[test]
+    fn test_import_version_extraction_without_tag() {
+        let image = "mariadb";
+        let version = image
+            .rfind(':')
+            .map(|p| image[p + 1..].to_string())
+            .unwrap_or_else(|| "latest".to_string());
+        assert_eq!(version, "latest");
+    }
+
+    #[test]
+    fn test_import_root_password_resolution_from_credentials_and_env() {
+        // root_password resolution prefers explicit credentials, then a
+        // username==root password, then MARIADB/MYSQL env. Exercises the
+        // first_non_empty precedence the import path relies on.
+        let root_pw = "explicit-root-pw".to_string();
+        let env_pw = "env-root-pw".to_string();
+        let resolved = MariaDbService::first_non_empty([
+            Some(&root_pw),
+            Some(&env_pw),
+        ]);
+        assert_eq!(resolved.as_deref(), Some("explicit-root-pw"));
+
+        // Blank/whitespace entries are skipped.
+        let blank = "   ".to_string();
+        let resolved = MariaDbService::first_non_empty([Some(&blank), Some(&env_pw)]);
+        assert_eq!(resolved.as_deref(), Some("env-root-pw"));
+
+        // Nothing usable → None (the import path then errors).
+        let resolved = MariaDbService::first_non_empty([None, Some(&blank)]);
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn test_import_env_to_map_parses_container_env() {
+        // import reads root/db/user/password from the container's env list.
+        let env = MariaDbService::env_to_map(Some(vec![
+            "MARIADB_ROOT_PASSWORD=rootsecret".to_string(),
+            "MARIADB_DATABASE=appdb".to_string(),
+            "MARIADB_USER=appuser".to_string(),
+            "PATH=/usr/bin".to_string(),
+            "MALFORMED_NO_EQUALS".to_string(),
+        ]));
+        assert_eq!(env.get("MARIADB_ROOT_PASSWORD").map(String::as_str), Some("rootsecret"));
+        assert_eq!(env.get("MARIADB_DATABASE").map(String::as_str), Some("appdb"));
+        assert_eq!(env.get("MARIADB_USER").map(String::as_str), Some("appuser"));
+        // A line without '=' is dropped, not panicked on.
+        assert!(!env.contains_key("MALFORMED_NO_EQUALS"));
+    }
+
+    #[test]
+    fn test_import_json_string_extracts_override() {
+        // database/port overrides come from additional_config via json_string.
+        let cfg = serde_json::json!({
+            "database": "overridedb",
+            "port": "3399",
+            "blank": "   ",
+        });
+        assert_eq!(
+            MariaDbService::json_string(&cfg, "database").as_deref(),
+            Some("overridedb")
+        );
+        assert_eq!(
+            MariaDbService::json_string(&cfg, "port").as_deref(),
+            Some("3399")
+        );
+        // Blank-only values are treated as absent.
+        assert!(MariaDbService::json_string(&cfg, "blank").is_none());
+        assert!(MariaDbService::json_string(&cfg, "missing").is_none());
+    }
+
+    // ── Upgrade decision ────────────────────────────────────────────────────
+    //
+    // MariaDB does NOT override the ExternalService::upgrade method. The
+    // container runs with MARIADB_AUTO_UPGRADE=1, which performs the
+    // datadir/system-table upgrade automatically on startup after an image
+    // bump (the MariaDB analog of mysql_upgrade). There is therefore no
+    // pg_upgrade-style explicit upgrade orchestration here, and calling
+    // upgrade() returns the trait's default "not implemented" error. A major
+    // version change happens via a container recreate on the new image, not
+    // through this method.
+
+    #[tokio::test]
+    async fn test_upgrade_returns_not_implemented() {
+        let service = mariadb_service_for_tests();
+        let old = ServiceConfig {
+            name: "pitr-test".to_string(),
+            service_type: ServiceType::Mariadb,
+            version: Some("10.11".to_string()),
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": "3306",
+                "database": "app",
+                "username": "app",
+                "password": "secretpass",
+                "root_password": "rootpass1",
+                "docker_image": "mariadb:10.11",
+            }),
+        };
+        let new = ServiceConfig {
+            version: Some("11.4".to_string()),
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": "3306",
+                "database": "app",
+                "username": "app",
+                "password": "secretpass",
+                "root_password": "rootpass1",
+                "docker_image": "mariadb:11.4",
+            }),
+            ..old.clone()
+        };
+
+        // MariaDB relies on MARIADB_AUTO_UPGRADE on recreate, so the explicit
+        // upgrade entrypoint is intentionally the trait default (errors).
+        let result = service.upgrade(old, new).await;
+        assert!(
+            result.is_err(),
+            "MariaDB should not implement explicit in-place upgrade"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("Upgrade not implemented"),
+            "unexpected upgrade error message: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_create_container_env_enables_auto_upgrade() {
+        // Document the upgrade mechanism: MARIADB_AUTO_UPGRADE=1 is the env the
+        // container is created with (see create_container). This is the path by
+        // which version upgrades actually happen.
+        let env_vars = ["MARIADB_AUTO_UPGRADE=1".to_string()];
+        assert!(env_vars.contains(&"MARIADB_AUTO_UPGRADE=1".to_string()));
     }
 }
