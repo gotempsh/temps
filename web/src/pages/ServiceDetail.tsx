@@ -56,6 +56,8 @@ import {
 } from '@/components/ui/popover'
 import { CopyButton } from '@/components/ui/copy-button'
 import { EnvVariablesDisplay } from '@/components/ui/env-variables-display'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
 import { ServiceLogo } from '@/components/ui/service-logo'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
@@ -159,6 +161,7 @@ export function ServiceDetail() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false)
+  const [deleteConfirmName, setDeleteConfirmName] = useState('')
   const [isUpgradeDialogOpen, setIsUpgradeDialogOpen] = useState(false)
   const [isMajorUpgradeDialogOpen, setIsMajorUpgradeDialogOpen] = useState(false)
   const [isEditDialogOpen, setIsEditDialogOpen] = useState(false)
@@ -517,6 +520,7 @@ export function ServiceDetail() {
   }
 
   const handleDelete = async () => {
+    if (deleteConfirmName.trim() !== service?.service?.name) return
     deleteService.mutate({ path: { id: parseInt(id!) } })
   }
 
@@ -1629,15 +1633,38 @@ export function ServiceDetail() {
         </DialogContent>
       </Dialog>
 
-      <Dialog open={isDeleteDialogOpen} onOpenChange={setIsDeleteDialogOpen}>
+      <Dialog
+        open={isDeleteDialogOpen}
+        onOpenChange={(open) => {
+          setIsDeleteDialogOpen(open)
+          if (!open) setDeleteConfirmName('')
+        }}
+      >
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Delete Service</DialogTitle>
             <DialogDescription>
-              Are you sure you want to delete this service? This action cannot
-              be undone.
+              This action cannot be undone and all data associated with this
+              service will be permanently removed.
             </DialogDescription>
           </DialogHeader>
+          <div className="space-y-2">
+            <Label htmlFor="confirm-delete-service-name">
+              Type{' '}
+              <span className="font-mono font-semibold text-foreground">
+                {service.service.name}
+              </span>{' '}
+              to confirm
+            </Label>
+            <Input
+              id="confirm-delete-service-name"
+              value={deleteConfirmName}
+              onChange={(e) => setDeleteConfirmName(e.target.value)}
+              placeholder={service.service.name}
+              autoComplete="off"
+              autoFocus
+            />
+          </div>
           <DialogFooter>
             <Button
               variant="outline"
@@ -1648,7 +1675,10 @@ export function ServiceDetail() {
             <Button
               variant="destructive"
               onClick={handleDelete}
-              disabled={deleteService.isPending}
+              disabled={
+                deleteService.isPending ||
+                deleteConfirmName.trim() !== service.service.name
+              }
             >
               {deleteService.isPending && (
                 <Loader2 className="h-4 w-4 mr-2 animate-spin" />

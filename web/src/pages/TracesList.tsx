@@ -789,10 +789,15 @@ export default function TracesList({ project }: TracesListProps) {
       ? 'No traces in the selected time range. Try widening the range.'
       : 'Traces will appear here once your application sends data via OpenTelemetry.'
 
-  // Extract unique service names for the filter dropdown
+  // Extract unique service names for the filter dropdown. Drop empty/missing
+  // names: a trace whose root span never set `service.name` arrives as "", and
+  // Radix's <SelectItem> throws ("must have a value prop that is not an empty
+  // string") if one reaches the dropdown — crashing the whole page.
   const serviceNames = useMemo(() => {
     if (!traces.length) return []
-    const names = new Set(traces.map((t) => t.service_name))
+    const names = new Set(
+      traces.map((t) => t.service_name).filter((name): name is string => !!name)
+    )
     return Array.from(names).sort()
   }, [traces])
 
@@ -1060,7 +1065,11 @@ export default function TracesList({ project }: TracesListProps) {
                     <TableCell>
                       <div className="flex flex-col gap-0.5">
                         <span className="font-medium truncate max-w-[200px] md:max-w-[280px]">
-                          {trace.root_span_name}
+                          {trace.root_span_name || (
+                            <span className="text-muted-foreground italic">
+                              (unnamed)
+                            </span>
+                          )}
                         </span>
                         <span className="text-xs text-muted-foreground font-mono truncate max-w-[200px] md:max-w-[280px]">
                           {trace.trace_id.slice(0, 16)}...
@@ -1069,7 +1078,11 @@ export default function TracesList({ project }: TracesListProps) {
                     </TableCell>
                     <TableCell>
                       <span className="text-sm">
-                        {trace.service_name}
+                        {trace.service_name || (
+                          <span className="text-muted-foreground italic">
+                            unknown
+                          </span>
+                        )}
                       </span>
                     </TableCell>
                     {environmentId === 'all' && (

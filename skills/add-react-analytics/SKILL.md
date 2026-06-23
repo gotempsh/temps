@@ -33,10 +33,10 @@ Peer deps: React 18 or 19 (`react`, `react-dom`).
 
 The SDK POSTs to `${basePath}/event`, `${basePath}/speed`, `${basePath}/heartbeat`, and session replay to `${basePath}/session-replay` (via `sendBeacon`, falling back to keepalive `fetch`).
 
-- **App deployed on Temps → use `basePath="/api/_temps"`.** The Temps proxy treats `/api/_temps/*` as a public ingest path: it bypasses the auth gate from any host and routes to the platform's analytics handlers. **No app-side route handler is needed.**
+- **App deployed on Temps → no `basePath` is required.** The SDK default is `/api/_temps`, and the Temps proxy treats `/api/_temps/*` as a public ingest path: it bypasses the auth gate from any host and routes to the platform's analytics handlers. **No app-side route handler is needed.**
 - **App NOT on Temps** → `${basePath}/...` hits your own origin. You must either run a route that forwards to Temps, or point `basePath` at an absolute Temps ingest URL, and set `domain="<project-domain>"` so events are attributed correctly.
 
-The package's built-in default basePath is `/_temps`. For Temps-hosted apps always set `/api/_temps` explicitly.
+The package's built-in default basePath is `/api/_temps`. Set `basePath` only when the app needs a custom same-origin proxy path.
 
 ## Framework Setup
 

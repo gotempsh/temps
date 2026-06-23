@@ -265,9 +265,11 @@ pub struct DeploymentConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exposed_port: Option<i32>,
 
-    /// Enable automatic deployments on git push
-    #[serde(default)]
-    pub automatic_deploy: bool,
+    /// Enable automatic deployments on git push.
+    /// `None` = inherit from project config; `Some(true/false)` = explicit override.
+    /// Stored as JSONB so absent key → `None` (inherit), never silently defaults to false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automatic_deploy: Option<bool>,
 
     /// Enable performance metrics collection (speed insights)
     #[serde(default)]
@@ -415,7 +417,7 @@ impl Default for DeploymentConfig {
             memory_request: None,
             memory_limit: None,
             exposed_port: None,
-            automatic_deploy: false,
+            automatic_deploy: None,
             performance_metrics_enabled: false,
             session_recording_enabled: false,
             container_exec_enabled: false,
@@ -466,7 +468,9 @@ impl DeploymentConfig {
             memory_request: other.memory_request.or(self.memory_request),
             memory_limit: other.memory_limit.or(self.memory_limit),
             exposed_port: other.exposed_port.or(self.exposed_port),
-            automatic_deploy: other.automatic_deploy || self.automatic_deploy,
+            // Env-wins semantics: if the environment has an explicit value use it,
+            // otherwise inherit the project-level setting.
+            automatic_deploy: other.automatic_deploy.or(self.automatic_deploy),
             performance_metrics_enabled: other.performance_metrics_enabled
                 || self.performance_metrics_enabled,
             session_recording_enabled: other.session_recording_enabled
@@ -574,7 +578,7 @@ impl DeploymentConfigSnapshot {
             memory_limit: config.memory_limit,
             exposed_port: config.exposed_port,
             environment_variables,
-            automatic_deploy: config.automatic_deploy,
+            automatic_deploy: config.automatic_deploy.unwrap_or(false),
             performance_metrics_enabled: config.performance_metrics_enabled,
             session_recording_enabled: config.session_recording_enabled,
             container_exec_enabled: config.container_exec_enabled,
@@ -618,7 +622,7 @@ mod tests {
         let config = DeploymentConfig::default();
         assert_eq!(config.cpu_request, None);
         assert_eq!(config.cpu_limit, None);
-        assert!(!config.automatic_deploy);
+        assert_eq!(config.automatic_deploy, None);
         assert!(!config.performance_metrics_enabled);
         assert!(!config.session_recording_enabled);
     }
@@ -631,7 +635,7 @@ mod tests {
             memory_request: Some(128),
             memory_limit: Some(512),
             exposed_port: Some(3000),
-            automatic_deploy: true,
+            automatic_deploy: Some(true),
             performance_metrics_enabled: true,
             session_recording_enabled: false,
             replicas: 2,
@@ -648,7 +652,8 @@ mod tests {
             memory_request: None,     // Use project default
             memory_limit: Some(1024), // Override
             exposed_port: Some(8080), // Override
-            automatic_deploy: false,
+            // Env explicitly opts out — env-wins semantics means this is respected
+            automatic_deploy: Some(false),
             performance_metrics_enabled: false,
             session_recording_enabled: true, // Override
             replicas: 5,                     // Override
@@ -666,7 +671,8 @@ mod tests {
         assert_eq!(merged.memory_request, Some(128));
         assert_eq!(merged.memory_limit, Some(1024));
         assert_eq!(merged.exposed_port, Some(8080));
-        assert!(merged.automatic_deploy); // true || false = true
+        // Env explicitly sets false → env wins, merged is false
+        assert_eq!(merged.automatic_deploy, Some(false));
         assert!(merged.performance_metrics_enabled); // true || false = true
         assert!(merged.session_recording_enabled);
         assert_eq!(merged.replicas, 5);
@@ -763,7 +769,7 @@ mod tests {
             memory_request: Some(128),
             memory_limit: Some(512),
             exposed_port: Some(3000),
-            automatic_deploy: true,
+            automatic_deploy: Some(true),
             performance_metrics_enabled: true,
             session_recording_enabled: false,
             replicas: 3,
@@ -788,7 +794,7 @@ mod tests {
             memory_request: Some(128),
             memory_limit: Some(512),
             exposed_port: Some(3000),
-            automatic_deploy: true,
+            automatic_deploy: Some(true),
             performance_metrics_enabled: true,
             session_recording_enabled: false,
             replicas: 2,

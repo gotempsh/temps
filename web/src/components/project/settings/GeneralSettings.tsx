@@ -33,6 +33,7 @@ import {
   FormLabel,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation } from '@tanstack/react-query'
@@ -258,6 +259,7 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
   }
 
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false)
+  const [deleteConfirmName, setDeleteConfirmName] = useState('')
   const deleteProjectMutationM = useMutation({
     ...deleteProjectMutation(),
     meta: {
@@ -266,6 +268,7 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
   })
 
   const handleDeleteProject = async () => {
+    if (deleteConfirmName.trim() !== project?.name) return
     setIsDeleteDialogOpen(false)
     try {
       await toast.promise(
@@ -698,7 +701,10 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
         </p>
         <AlertDialog
           open={isDeleteDialogOpen}
-          onOpenChange={setIsDeleteDialogOpen}
+          onOpenChange={(open) => {
+            setIsDeleteDialogOpen(open)
+            if (!open) setDeleteConfirmName('')
+          }}
         >
           <AlertDialogTrigger asChild>
             <Button variant="destructive">Delete project</Button>
@@ -707,18 +713,37 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
             <AlertDialogHeader>
               <AlertDialogTitle>Are you absolutely sure?</AlertDialogTitle>
               <AlertDialogDescription>
-                This action cannot be undone. This will permanently delete your
-                project &quot;{project?.name}&quot; and remove all associated
-                data from our servers.
+                This action cannot be undone. This will permanently delete this
+                project and remove all associated data from our servers.
               </AlertDialogDescription>
             </AlertDialogHeader>
+            <div className="space-y-2">
+              <Label htmlFor="confirm-delete-project-name">
+                Type{' '}
+                <span className="font-mono font-semibold text-foreground">
+                  {project?.name}
+                </span>{' '}
+                to confirm
+              </Label>
+              <Input
+                id="confirm-delete-project-name"
+                value={deleteConfirmName}
+                onChange={(e) => setDeleteConfirmName(e.target.value)}
+                placeholder={project?.name}
+                autoComplete="off"
+              />
+            </div>
             <AlertDialogFooter>
               <AlertDialogCancel>Cancel</AlertDialogCancel>
               <AlertDialogAction
                 onClick={handleDeleteProject}
+                disabled={
+                  deleteProjectMutationM.isPending ||
+                  deleteConfirmName.trim() !== project?.name
+                }
                 className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
               >
-                Delete
+                {deleteProjectMutationM.isPending ? 'Deleting...' : 'Delete'}
               </AlertDialogAction>
             </AlertDialogFooter>
           </AlertDialogContent>

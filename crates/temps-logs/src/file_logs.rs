@@ -16,6 +16,15 @@ use tracing::{debug, trace};
 
 use crate::structured_logs::{LogEntry, LogLevel, StructuredLogService};
 
+/// Default number of trailing lines replayed when a tail stream first attaches.
+///
+/// This is the initial backlog the client receives before it starts seeing
+/// live lines. It is intentionally large so that full deployment/build logs
+/// are visible in the UI on first load — the previous value (1000) silently
+/// truncated long build logs. Clients dedupe by absolute line number, so a
+/// generous backlog is safe across reconnects.
+pub const DEFAULT_TAIL_REPLAY_LINES: usize = 100_000;
+
 pub struct LogService {
     log_base_path: PathBuf,
     structured_service: StructuredLogService,
@@ -85,12 +94,32 @@ impl LogService {
         tokio::fs::read_to_string(log_path).await
     }
 
+    /// Tail a log file, replaying up to [`DEFAULT_TAIL_REPLAY_LINES`] trailing
+    /// lines before streaming new lines as they are appended.
     pub async fn tail_log(
         &self,
         log_id: &str,
     ) -> Result<impl Stream<Item = Result<String, std::io::Error>>, std::io::Error> {
+        self.tail_log_with_replay(log_id, DEFAULT_TAIL_REPLAY_LINES)
+            .await
+    }
+
+    /// Tail a log file, replaying up to `replay_lines` trailing lines before
+    /// streaming new lines as they are appended.
+    ///
+    /// Pass `usize::MAX` to replay the entire file. The replay backlog is the
+    /// last `replay_lines` lines of the file at the moment the stream attaches;
+    /// any line written afterwards is streamed live regardless of this cap.
+    pub async fn tail_log_with_replay(
+        &self,
+        log_id: &str,
+        replay_lines: usize,
+    ) -> Result<impl Stream<Item = Result<String, std::io::Error>>, std::io::Error> {
         let log_path = self.get_log_path(log_id);
-        debug!("Attempting to tail log at path: {:?}", log_path);
+        debug!(
+            "Attempting to tail log at path: {:?} (replay up to {} lines)",
+            log_path, replay_lines
+        );
 
         // Create file if it doesn't exist
         if !log_path.exists() {
@@ -103,15 +132,21 @@ impl LogService {
         let file_size = file.metadata().await?.len();
         let mut reader = BufReader::new(file);
 
-        // If file has content, seek to position to get last 1000 lines
+        // If file has content, seek to the start of the last `replay_lines` lines.
         if file_size > 0 {
             let mut buffer = Vec::new();
             reader.read_to_end(&mut buffer).await?;
 
-            let lines = buffer.split(|&b| b == b'\n').collect::<Vec<_>>();
-            let start_pos = if lines.len() > 1000 {
-                // Get position to start reading from for last 1000 lines
-                let skip_lines = lines.len() - 1000;
+            // Split on newlines. A file ending in '\n' yields a trailing empty
+            // segment that is not a real line — drop it so the replay backlog
+            // counts actual lines (otherwise we'd skip one real line too many).
+            let mut lines = buffer.split(|&b| b == b'\n').collect::<Vec<_>>();
+            if lines.last().is_some_and(|last| last.is_empty()) {
+                lines.pop();
+            }
+            let start_pos = if lines.len() > replay_lines {
+                // Skip everything before the last `replay_lines` lines.
+                let skip_lines = lines.len() - replay_lines;
                 lines
                     .iter()
                     .take(skip_lines)
@@ -432,6 +467,88 @@ mod tests {
         // Directory should exist
         let full_path = temp_dir.path().join(&log_path);
         assert!(full_path.parent().unwrap().exists());
+    }
+
+    #[tokio::test]
+    async fn test_tail_log_replays_more_than_1000_lines() {
+        use futures::StreamExt;
+        use tokio::io::AsyncWriteExt;
+
+        let temp_dir = TempDir::new().unwrap();
+        let log_service = LogService::new(temp_dir.path().to_path_buf());
+
+        // Write 5000 plain lines directly to the log file (bypassing the
+        // structured JSONL writer to keep the assertion about line counts simple).
+        let log_id = "test-large-tail";
+        let log_path = log_service.get_log_path(log_id);
+        let mut file = File::create(&log_path).await.unwrap();
+        for i in 0..5000 {
+            file.write_all(format!("line {}\n", i).as_bytes())
+                .await
+                .unwrap();
+        }
+        file.flush().await.unwrap();
+
+        // With the default replay cap (100k > 5000), the stream should replay
+        // ALL 5000 lines, not just the last 1000.
+        let stream = log_service.tail_log(log_id).await.unwrap();
+        tokio::pin!(stream);
+
+        let mut received = Vec::new();
+        // The tail stream is infinite (it waits at EOF), so bound the read with
+        // a short timeout once the backlog is drained.
+        loop {
+            match tokio::time::timeout(Duration::from_millis(300), stream.next()).await {
+                Ok(Some(Ok(line))) => received.push(line),
+                Ok(Some(Err(_))) | Ok(None) => break,
+                Err(_) => break, // timed out waiting for more — backlog drained
+            }
+        }
+
+        assert_eq!(
+            received.len(),
+            5000,
+            "expected all 5000 lines replayed, got {}",
+            received.len()
+        );
+        assert_eq!(received.first().unwrap(), "line 0");
+        assert_eq!(received.last().unwrap(), "line 4999");
+    }
+
+    #[tokio::test]
+    async fn test_tail_log_with_replay_caps_backlog() {
+        use futures::StreamExt;
+        use tokio::io::AsyncWriteExt;
+
+        let temp_dir = TempDir::new().unwrap();
+        let log_service = LogService::new(temp_dir.path().to_path_buf());
+
+        let log_id = "test-capped-tail";
+        let log_path = log_service.get_log_path(log_id);
+        let mut file = File::create(&log_path).await.unwrap();
+        for i in 0..100 {
+            file.write_all(format!("line {}\n", i).as_bytes())
+                .await
+                .unwrap();
+        }
+        file.flush().await.unwrap();
+
+        // Explicit small replay cap: only the last 10 lines should come back.
+        let stream = log_service.tail_log_with_replay(log_id, 10).await.unwrap();
+        tokio::pin!(stream);
+
+        let mut received = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_millis(300), stream.next()).await {
+                Ok(Some(Ok(line))) => received.push(line),
+                Ok(Some(Err(_))) | Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+
+        assert_eq!(received.len(), 10, "expected last 10 lines only");
+        assert_eq!(received.first().unwrap(), "line 90");
+        assert_eq!(received.last().unwrap(), "line 99");
     }
 
     #[tokio::test]

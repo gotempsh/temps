@@ -7,10 +7,12 @@
 //! - sends each event as a fire-and-forget timed HTTP POST so a dead endpoint
 //!   never affects the running server.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serde::Serialize;
 use temps_core::telemetry::{TelemetryEvent, TelemetryReporter};
 use thiserror::Error;
@@ -57,6 +59,16 @@ struct Inner {
     temps_version: String,
     endpoint: String,
     client: reqwest::Client,
+    /// Database connection used to persist once-per-instance milestone claims
+    /// (see [`TelemetryReporter::report_once`]). `None` until wired by the
+    /// plugin; when absent, `report_once` falls back to the in-process cache
+    /// only (still once-per-process, just not durable across restarts).
+    db: Mutex<Option<Arc<DatabaseConnection>>>,
+    /// In-process set of milestones already claimed this process. This is the
+    /// hot-path guard: after the first emit of a given milestone, `report_once`
+    /// returns on a cheap set lookup and NEVER touches the DB again — so a busy
+    /// instance pays no per-event cost on the analytics/AI/deploy hot paths.
+    claimed: Mutex<HashSet<&'static str>>,
 }
 
 impl TelemetryService {
@@ -106,8 +118,22 @@ impl TelemetryService {
                 temps_version: version,
                 endpoint,
                 client,
+                db: Mutex::new(None),
+                claimed: Mutex::new(HashSet::new()),
             }),
         })
+    }
+
+    /// Wire the database connection used to make [`TelemetryReporter::report_once`]
+    /// durable across restarts (and across the split proxy/console processes,
+    /// which share the same Postgres). Called by the telemetry plugin once the DB
+    /// service is available. Without it, once-guarding still works but only
+    /// per-process (an in-memory set), so a restart could re-emit a milestone
+    /// once — acceptable, but the DB makes it truly once-per-instance.
+    pub fn set_db(&self, db: Arc<DatabaseConnection>) {
+        if let Ok(mut guard) = self.inner.db.lock() {
+            *guard = Some(db);
+        }
     }
 
     /// Read the `TEMPS_TELEMETRY` opt-out flag. Enabled by default; treats
@@ -223,6 +249,86 @@ impl TelemetryReporter for TelemetryService {
         });
     }
 
+    fn report_once(&self, milestone: &'static str, event: TelemetryEvent) {
+        if !self.inner.enabled {
+            return;
+        }
+
+        // ── Hot-path guard ──
+        // After the first emit of this milestone in this process, this is a
+        // cheap set lookup and we return WITHOUT touching the DB or spawning a
+        // task. This is what keeps the analytics/AI/deploy ingestion paths free
+        // of any per-event telemetry cost.
+        {
+            let mut claimed = match self.inner.claimed.lock() {
+                Ok(g) => g,
+                // A poisoned lock should never happen (we hold it only for these
+                // tiny critical sections), but if it does, fail safe: don't emit.
+                Err(_) => return,
+            };
+            if claimed.contains(milestone) {
+                return;
+            }
+            // Optimistically mark claimed-in-process so concurrent callers also
+            // short-circuit. The DB (below) is the cross-process / cross-restart
+            // arbiter of whether we actually emit.
+            claimed.insert(milestone);
+        }
+
+        let inner = self.inner.clone();
+        let reporter = self.clone();
+        tokio::spawn(async move {
+            // Snapshot the DB handle (if wired) without holding the lock across
+            // the await.
+            let db = inner.db.lock().ok().and_then(|g| g.clone());
+
+            match db {
+                Some(db) => {
+                    // Durable claim: only the FIRST claimant across all processes
+                    // and restarts inserts a row; everyone else is a no-op. We
+                    // emit the event only when we won the claim — a single-row
+                    // INSERT ... ON CONFLICT DO NOTHING yields rows_affected 1
+                    // (won) or 0 (already claimed).
+                    let stmt = Statement::from_sql_and_values(
+                        db.get_database_backend(),
+                        "INSERT INTO telemetry_milestones (milestone) VALUES ($1) \
+                         ON CONFLICT (milestone) DO NOTHING",
+                        [milestone.into()],
+                    );
+                    match db.execute(stmt).await {
+                        Ok(res) if res.rows_affected() >= 1 => {
+                            // We won the claim — emit exactly once.
+                            reporter.report(event);
+                        }
+                        Ok(_) => {
+                            // Already claimed by a prior run/process — don't emit.
+                            tracing::trace!(
+                                milestone = %milestone,
+                                "telemetry milestone already claimed; skipping emit"
+                            );
+                        }
+                        Err(e) => {
+                            // DB error claiming the milestone. Best-effort: do NOT
+                            // emit (avoid re-introducing the firehose if the DB is
+                            // flaky); the in-process set still prevents retries
+                            // this process.
+                            tracing::debug!(
+                                milestone = %milestone,
+                                error = %e,
+                                "telemetry milestone claim failed; skipping emit"
+                            );
+                        }
+                    }
+                }
+                None => {
+                    // No DB wired (e.g. early startup): fall back to the
+                    // in-process guard we already set above — once per process.
+                    reporter.report(event);
+                }
+            }
+        });
+    }
+
     fn is_enabled(&self) -> bool {
         self.inner.enabled
     }
@@ -273,6 +379,76 @@ mod tests {
         assert!(!svc.is_enabled());
         // Must not panic and must not spawn a request.
         svc.report(TelemetryEvent::new(TelemetryEventKind::ProjectCreated));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn report_once_records_milestone_in_process_guard() {
+        let dir = temp_dir();
+        std::env::remove_var("TEMPS_TELEMETRY");
+        let svc = TelemetryService::new(&dir, "0.0.0-test").unwrap();
+        assert!(svc.is_enabled());
+
+        // Not claimed yet.
+        assert!(!svc
+            .inner
+            .claimed
+            .lock()
+            .unwrap()
+            .contains("analytics_first_event_received"));
+
+        // First call records the milestone in the in-process guard so subsequent
+        // calls short-circuit (no DB wired here, so this is the only guard).
+        svc.report_once(
+            "analytics_first_event_received",
+            TelemetryEvent::new(TelemetryEventKind::AnalyticsFirstEventReceived),
+        );
+        assert!(
+            svc.inner
+                .claimed
+                .lock()
+                .unwrap()
+                .contains("analytics_first_event_received"),
+            "first report_once should record the milestone"
+        );
+
+        // A second call is a cheap no-op (still exactly one entry).
+        svc.report_once(
+            "analytics_first_event_received",
+            TelemetryEvent::new(TelemetryEventKind::AnalyticsFirstEventReceived),
+        );
+        assert_eq!(
+            svc.inner
+                .claimed
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| **m == "analytics_first_event_received")
+                .count(),
+            1,
+            "milestone recorded exactly once"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn report_once_is_noop_when_disabled() {
+        let dir = temp_dir();
+        std::env::set_var("TEMPS_TELEMETRY", "0");
+        let svc = TelemetryService::new(&dir, "0.0.0-test").unwrap();
+        std::env::remove_var("TEMPS_TELEMETRY");
+
+        assert!(!svc.is_enabled());
+        // Disabled: must not record anything (returns before the guard).
+        svc.report_once(
+            "analytics_first_event_received",
+            TelemetryEvent::new(TelemetryEventKind::AnalyticsFirstEventReceived),
+        );
+        assert!(
+            svc.inner.claimed.lock().unwrap().is_empty(),
+            "disabled reporter must not claim milestones"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

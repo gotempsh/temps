@@ -70,8 +70,8 @@ pub enum OutputFormat {
 
 #[derive(Args)]
 pub struct SetupCommand {
-    /// Database connection URL
-    #[arg(long, env = "TEMPS_DATABASE_URL")]
+    /// Database connection URL (set via TEMPS_DATABASE_URL env var; not accepted as a flag to prevent credentials leaking into process listings)
+    #[arg(long, env = "TEMPS_DATABASE_URL", hide_env_values = true)]
     pub database_url: String,
 
     /// Data directory for storing configuration and runtime files
@@ -182,6 +182,14 @@ pub struct SetupCommand {
     /// Use Let's Encrypt staging environment (for testing, avoids rate limits)
     #[arg(long, default_value = "false", env = "LETSENCRYPT_STAGING")]
     pub letsencrypt_staging: bool,
+
+    /// Contact email for Let's Encrypt / ACME certificate issuance. Stored as
+    /// `letsencrypt.email` and used as the ACME account contact for all cert
+    /// provisioning (manual, HTTP-01, and on-demand). There is no fallback: if
+    /// this is unset, certificate issuance has no contact and will not proceed,
+    /// so installers that enable TLS must supply a real address.
+    #[arg(long, env = "LETSENCRYPT_EMAIL")]
+    pub letsencrypt_email: Option<String>,
 
     /// DNS propagation wait time in seconds (default: 60)
     #[arg(long, default_value = "60")]
@@ -1179,6 +1187,7 @@ async fn update_app_settings(
     db: &sea_orm::DatabaseConnection,
     preview_domain: &str,
     external_url: Option<&str>,
+    letsencrypt_email: Option<&str>,
 ) -> anyhow::Result<()> {
     use chrono::Utc;
 
@@ -1196,6 +1205,33 @@ async fn update_app_settings(
     // Update external_url if provided
     if let Some(url) = external_url {
         app_settings.external_url = Some(url.to_string());
+    }
+
+    // Set the Let's Encrypt / ACME contact email when provided. This is the
+    // single source of truth for the ACME account contact — `get_acme_email`
+    // returns exactly this value with no fallback, so a real address here is
+    // what makes certificate issuance work. An empty string is ignored so a
+    // re-run without the flag does not wipe a previously-configured address.
+    if let Some(email) = letsencrypt_email {
+        let email = email.trim();
+        if !email.is_empty() {
+            app_settings.letsencrypt.email = Some(email.to_string());
+        }
+    }
+
+    // ADR-018 §6: auto-enable on-demand HTTP-01 TLS for any publicly-reachable
+    // install. Every app/console host under the base domain
+    // (`<app>.<preview_domain>`) then gets HTTPS via per-host HTTP-01 issued
+    // lazily on first request, with the base domain as the allowlist zone. This
+    // is not specific to sslip.io — it applies equally to a real wildcard domain
+    // (e.g. `apps.example.com`). The only case we skip is loopback / local mode
+    // (`127.0.0.1.sslip.io`, `localhost`), where Let's Encrypt cannot reach the
+    // box for the challenge so issuance could never succeed. The proxy applies
+    // its own authoritative loopback guard at startup regardless; this just
+    // avoids advertising a feature that can never fire in local mode.
+    if !preview_domain.trim().is_empty() && !is_loopback_zone(preview_domain) {
+        app_settings.on_demand_tls.enabled = true;
+        app_settings.on_demand_tls.zone = Some(preview_domain.trim().to_ascii_lowercase());
     }
 
     // Mark setup as complete so the web onboarding wizard knows to skip
@@ -1230,6 +1266,19 @@ async fn update_app_settings(
 /// e.g., "*.davidviejo.kfs.es" -> "davidviejo.kfs.es"
 fn extract_preview_domain(wildcard_domain: &str) -> String {
     wildcard_domain.trim_start_matches("*.").to_string()
+}
+
+/// True if `zone` is a loopback zone (`127.0.0.1.sslip.io`, `localhost`, …) —
+/// local mode, where Let's Encrypt cannot reach the box for the HTTP-01
+/// challenge, so on-demand TLS would never fire. This is the only condition
+/// that gates ADR-018 §6 on-demand-TLS auto-enablement; any other (non-empty,
+/// non-loopback) base domain qualifies, regardless of whether it is sslip.io.
+fn is_loopback_zone(zone: &str) -> bool {
+    let z = zone.trim().trim_end_matches('.').to_ascii_lowercase();
+    z == "localhost"
+        || z.ends_with(".localhost")
+        || z.starts_with("127.0.0.1")
+        || z.contains("127-0-0-1")
 }
 
 impl SetupCommand {
@@ -1780,6 +1829,7 @@ impl SetupCommand {
                 db.as_ref(),
                 &preview_domain,
                 self.external_url.as_deref(),
+                self.letsencrypt_email.as_deref(),
             ))?;
             print_success(&format!(
                 "Preview domain set to: {}",
@@ -1905,6 +1955,7 @@ impl SetupCommand {
                 db.as_ref(),
                 &preview_domain,
                 self.external_url.as_deref(),
+                self.letsencrypt_email.as_deref(),
             ))?;
             print_success(&format!(
                 "Preview domain set to: {}",
@@ -2120,6 +2171,7 @@ impl SetupCommand {
                 db.as_ref(),
                 &preview_domain,
                 self.external_url.as_deref(),
+                self.letsencrypt_email.as_deref(),
             ))?;
             print_success(&format!(
                 "Preview domain set to: {}",
@@ -2161,6 +2213,7 @@ impl SetupCommand {
                 db.as_ref(),
                 &preview_domain,
                 self.external_url.as_deref(),
+                self.letsencrypt_email.as_deref(),
             ))?;
             print_success(&format!(
                 "Preview domain set to: {}",
@@ -2607,6 +2660,7 @@ impl SetupCommand {
             db.as_ref(),
             &preview_domain,
             self.external_url.as_deref(),
+            self.letsencrypt_email.as_deref(),
         ))?;
         print_success(&format!(
             "Preview domain set to: {}",
@@ -2744,7 +2798,7 @@ fn finish_setup(
     println!();
     println!("   {} Start the server:", "1.".bright_cyan());
     println!(
-        "      {} temps serve --database-url=<URL>",
+        "      {} TEMPS_DATABASE_URL=<URL> temps serve",
         "$".bright_cyan()
     );
     println!();
@@ -2766,6 +2820,30 @@ fn finish_setup(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_loopback_zone() {
+        assert!(is_loopback_zone("127.0.0.1.sslip.io"));
+        assert!(is_loopback_zone("localhost"));
+        assert!(is_loopback_zone("foo.localhost"));
+        assert!(is_loopback_zone("127-0-0-1.sslip.io"));
+        assert!(!is_loopback_zone("1.2.3.4.sslip.io"));
+        assert!(!is_loopback_zone("example.com"));
+    }
+
+    #[test]
+    fn test_on_demand_tls_auto_enable_decision() {
+        // The exact condition used in update_app_settings, decoupled from
+        // sslip.io: any non-empty, non-loopback base domain enables on-demand
+        // TLS — loopback (local mode) is the only thing that disables it.
+        let should_enable = |zone: &str| !zone.trim().is_empty() && !is_loopback_zone(zone);
+        assert!(should_enable("1.2.3.4.sslip.io")); // sslip.io quick install
+        assert!(should_enable("apps.mycompany.com")); // custom wildcard domain
+        assert!(!should_enable("127.0.0.1.sslip.io")); // local mode (loopback)
+        assert!(!should_enable("localhost")); // local mode
+        assert!(!should_enable("")); // no domain
+        assert!(!should_enable("   ")); // whitespace-only
+    }
 
     #[test]
     fn test_dns_provider_type_display() {

@@ -31,6 +31,7 @@ use std::collections::BTreeMap;
 pub enum TelemetryEventKind {
     // ---- Instance lifecycle ----
     InstanceStarted,
+    InstanceHeartbeat,
     InstanceSetupCompleted,
     UpgradeCompleted,
     WorkerNodeJoined,
@@ -91,6 +92,7 @@ impl TelemetryEventKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::InstanceStarted => "instance_started",
+            Self::InstanceHeartbeat => "instance_heartbeat",
             Self::InstanceSetupCompleted => "instance_setup_completed",
             Self::UpgradeCompleted => "upgrade_completed",
             Self::WorkerNodeJoined => "worker_node_joined",
@@ -142,6 +144,7 @@ impl TelemetryEventKind {
     pub fn all() -> &'static [TelemetryEventKind] {
         &[
             Self::InstanceStarted,
+            Self::InstanceHeartbeat,
             Self::InstanceSetupCompleted,
             Self::UpgradeCompleted,
             Self::WorkerNodeJoined,
@@ -237,6 +240,27 @@ pub trait TelemetryReporter: Send + Sync {
     /// Report an event. Never blocks on the network and never fails the caller.
     fn report(&self, event: TelemetryEvent);
 
+    /// Report a "first-touch" milestone event **at most once per instance, ever**.
+    ///
+    /// Use this for events whose name promises a single lifetime occurrence
+    /// (e.g. `analytics_first_event_received`, `ai_gateway_first_request`,
+    /// `first_deploy_succeeded`) but whose callsite fires per-action (every
+    /// pageview / request / deploy). Without this guard those events become a
+    /// firehose: telemetry volume scales with the self-hoster's production
+    /// traffic, which both skews the metric and leaks a coarse activity signal.
+    ///
+    /// `milestone` is a stable key (use the event's wire name) used to dedupe.
+    /// Implementations MUST be fire-and-forget like [`Self::report`] and MUST
+    /// guarantee the hot path stays cheap (an in-process check before any
+    /// durable lookup), so a busy instance pays no per-event cost after the
+    /// first emit.
+    ///
+    /// The default implementation simply forwards to [`Self::report`] every time
+    /// (no dedupe) — concrete reporters override it with the real once-guard.
+    fn report_once(&self, _milestone: &'static str, event: TelemetryEvent) {
+        self.report(event);
+    }
+
     /// Whether telemetry is currently enabled. Callsites can use this to skip
     /// building expensive property bags when reporting is off.
     fn is_enabled(&self) -> bool;
@@ -276,8 +300,8 @@ mod tests {
     fn all_covers_every_variant() {
         // If a variant is added but not added to all(), as_str() on it will be
         // missing from the list and this length check is a cheap tripwire.
-        // 34 events as of the initial product-telemetry design.
-        assert_eq!(TelemetryEventKind::all().len(), 34);
+        // 35 events (34 initial + instance_heartbeat).
+        assert_eq!(TelemetryEventKind::all().len(), 35);
     }
 
     #[test]

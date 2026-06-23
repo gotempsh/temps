@@ -178,7 +178,7 @@ impl ProjectService {
             memory_request: Some(DEFAULT_MEMORY_REQUEST),
             memory_limit: None,
             exposed_port: request.exposed_port,
-            automatic_deploy: request.automatic_deploy,
+            automatic_deploy: Some(request.automatic_deploy),
             ..Default::default()
         });
 
@@ -958,7 +958,7 @@ impl ProjectService {
 
         // Update deployment config with new automatic_deploy value
         let mut deployment_config = project.deployment_config.clone().unwrap_or_default();
-        deployment_config.automatic_deploy = automatic_deploy;
+        deployment_config.automatic_deploy = Some(automatic_deploy);
         active_project.deployment_config = Set(Some(deployment_config));
 
         let updated_project = active_project.update(self.db.as_ref()).await?;
@@ -1535,7 +1535,7 @@ impl ProjectService {
             deployment_config.exposed_port = Some(exposed_port);
         }
         if let Some(automatic_deploy) = config.automatic_deploy {
-            deployment_config.automatic_deploy = automatic_deploy;
+            deployment_config.automatic_deploy = Some(automatic_deploy);
         }
         if let Some(performance_metrics_enabled) = config.performance_metrics_enabled {
             deployment_config.performance_metrics_enabled = performance_metrics_enabled;
@@ -1676,7 +1676,7 @@ impl ProjectService {
             updated_at: db_project.updated_at,
             automatic_deploy: deployment_config
                 .clone()
-                .map(|c| c.automatic_deploy)
+                .and_then(|c| c.automatic_deploy)
                 .unwrap_or(false),
             cpu_request: deployment_config.clone().and_then(|c| c.cpu_request),
             cpu_limit: deployment_config.clone().and_then(|c| c.cpu_limit),

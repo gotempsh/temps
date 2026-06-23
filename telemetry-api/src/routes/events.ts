@@ -8,6 +8,7 @@ import { countryForRequest } from "../geo.js";
 export const KNOWN_EVENT_TYPES = new Set([
   // Instance lifecycle
   "instance_started",
+  "instance_heartbeat",
   "instance_setup_completed",
   "upgrade_completed",
   "worker_node_joined",

@@ -316,8 +316,8 @@ pub struct ImportCertificateCommand {
     #[arg(long, short = 'k')]
     pub private_key: PathBuf,
 
-    /// Database URL
-    #[arg(long, env = "TEMPS_DATABASE_URL")]
+    /// Database URL (set via TEMPS_DATABASE_URL env var; not accepted as a flag to prevent credentials leaking into process listings)
+    #[arg(long, env = "TEMPS_DATABASE_URL", hide_env_values = true)]
     pub database_url: String,
 
     /// Data directory containing the encryption key

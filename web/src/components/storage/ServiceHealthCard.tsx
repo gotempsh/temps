@@ -124,6 +124,12 @@ export function ServiceHealthCard({ serviceId }: { serviceId: number }) {
   const hasFailure =
     data.status === 'down' || (data.consecutive_failures ?? 0) > 0
 
+  // Degraded is not a "failure" (the probe succeeded, so consecutive_failures
+  // stays 0), but it still has a reason the user needs to see — e.g. "mongodb
+  // responded in 10007ms (>2000ms)". Surface it as an amber notice so the
+  // bare "Degraded" badge in the header is no longer unexplained.
+  const isDegraded = !hasFailure && data.status === 'degraded'
+
   return (
     <div className="space-y-3">
       {/*
@@ -194,6 +200,21 @@ export function ServiceHealthCard({ serviceId }: { serviceId: number }) {
             {data.last_error ? (
               <p className="break-words text-xs opacity-80">{data.last_error}</p>
             ) : null}
+          </AlertDescription>
+        </Alert>
+      ) : isDegraded ? (
+        <Alert variant="warning">
+          <AlertCircle className="h-4 w-4" />
+          <AlertDescription className="space-y-1">
+            <p className="font-medium">Service is degraded.</p>
+            {data.last_error ? (
+              <p className="break-words text-xs opacity-80">{data.last_error}</p>
+            ) : (
+              <p className="text-xs opacity-80">
+                The last health check succeeded but the service responded
+                slowly. Check load and network latency to this instance.
+              </p>
+            )}
           </AlertDescription>
         </Alert>
       ) : null}

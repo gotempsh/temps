@@ -266,49 +266,57 @@ impl JobProcessorService {
     }
 }
 
-/// Find the environment to deploy to for a given branch.
-/// When multiple environments track the same branch, the first non-preview
-/// environment is selected. The user can then promote to other environments
-/// manually (Vercel-like model).
-async fn find_or_create_environment_for_branch(
+/// Find all environments to deploy to for a given branch push.
+/// Returns every non-preview, non-protected environment tracking this branch
+/// so each can independently apply its own `automatic_deploy` policy.
+/// When no named environments match and preview environments are enabled,
+/// creates/finds a per-branch preview environment and returns it as the sole
+/// entry. Returns an empty Vec only when there are no matches and preview
+/// environments are disabled.
+async fn find_environments_for_branch(
     db: Arc<DbConnection>,
     project: &temps_entities::projects::Model,
     branch: Option<&str>,
-) -> Result<temps_entities::environments::Model, String> {
+) -> Result<Vec<temps_entities::environments::Model>, String> {
     use temps_entities::environments;
 
-    // If no branch specified, find first environment
+    // No branch → use the first environment (tag push, manual trigger without branch)
     let Some(branch_name) = branch else {
-        return environments::Entity::find()
+        let env = environments::Entity::find()
             .filter(environments::Column::ProjectId.eq(project.id))
             .filter(environments::Column::DeletedAt.is_null())
             .one(db.as_ref())
             .await
             .map_err(|e| format!("Database error finding environment: {}", e))?
-            .ok_or_else(|| "No environment found for project".to_string());
+            .ok_or_else(|| "No environment found for project".to_string())?;
+        return Ok(vec![env]);
     };
 
     info!(
-        "Looking for environment matching branch '{}' for project {}",
+        "Looking for environments matching branch '{}' for project {}",
         branch_name, project.id
     );
 
-    // Find the first non-protected environment with matching branch.
-    // Protected environments are skipped — they only receive promoted deployments.
-    if let Some(matched_env) = environments::Entity::find()
+    // Find ALL non-preview, non-protected environments tracking this branch.
+    // Protected environments receive only promoted deployments, never push events.
+    // Each returned environment then applies its own automatic_deploy policy.
+    let matched_envs = environments::Entity::find()
         .filter(environments::Column::ProjectId.eq(project.id))
         .filter(environments::Column::Branch.eq(branch_name))
+        .filter(environments::Column::IsPreview.eq(false))
         .filter(environments::Column::Protected.eq(false))
         .filter(environments::Column::DeletedAt.is_null())
-        .one(db.as_ref())
+        .all(db.as_ref())
         .await
-        .map_err(|e| format!("Database error finding branch environment: {}", e))?
-    {
+        .map_err(|e| format!("Database error finding branch environments: {}", e))?;
+
+    if !matched_envs.is_empty() {
         info!(
-            "Found environment '{}' matching branch '{}'",
-            matched_env.name, branch_name
+            "Found {} environment(s) matching branch '{}'",
+            matched_envs.len(),
+            branch_name
         );
-        return Ok(matched_env);
+        return Ok(matched_envs);
     }
 
     info!(
@@ -340,7 +348,7 @@ async fn find_or_create_environment_for_branch(
                 "Found existing preview environment '{}' for branch '{}'",
                 existing_preview.name, branch_name
             );
-            return Ok(existing_preview);
+            return Ok(vec![existing_preview]);
         }
 
         // Check if a soft-deleted preview environment exists for this branch — restore it
@@ -364,11 +372,13 @@ async fn find_or_create_environment_for_branch(
                 .update(db.as_ref())
                 .await
                 .map_err(|e| format!("Failed to restore preview environment: {}", e))?;
-            return Ok(restored);
+            return Ok(vec![restored]);
         }
 
         // Create new preview environment for this branch
-        return create_preview_environment(db, project, branch_name, &slugified_branch).await;
+        return create_preview_environment(db, project, branch_name, &slugified_branch)
+            .await
+            .map(|env| vec![env]);
     }
 
     // Preview environments not enabled, try to find generic preview environment (legacy behavior)
@@ -389,7 +399,7 @@ async fn find_or_create_environment_for_branch(
             "Using existing generic preview environment for branch '{}'",
             branch_name
         );
-        return Ok(preview_env);
+        return Ok(vec![preview_env]);
     }
 
     // No preview environment exists, create generic one (legacy behavior)
@@ -429,7 +439,7 @@ async fn find_or_create_environment_for_branch(
         created_env.name, project.id
     );
 
-    Ok(created_env)
+    Ok(vec![created_env])
 }
 
 /// Create a new preview environment for a specific branch
@@ -586,19 +596,22 @@ async fn copy_environment_variables_to_preview(
 }
 
 /// Returns true if a git push should auto-deploy given the project and
-/// environment deployment configs. The merge mirrors `DeploymentConfig::merge`
-/// (env overrides project; OR-semantics for booleans). When both configs are
-/// absent the answer is false — auto-deploy is opt-in, not opt-out.
+/// environment deployment configs. Environment config wins when present
+/// (env can explicitly opt out even if project has auto-deploy on).
+/// When both configs are absent the answer is false — auto-deploy is opt-in.
 fn is_automatic_deploy_enabled(
     project_config: Option<&temps_entities::deployment_config::DeploymentConfig>,
     environment_config: Option<&temps_entities::deployment_config::DeploymentConfig>,
 ) -> bool {
-    match (project_config, environment_config) {
-        (Some(project_cfg), Some(env_cfg)) => project_cfg.merge(env_cfg).automatic_deploy,
+    // Environment-level explicit value takes precedence; fall back to project then false.
+    let effective = match (project_config, environment_config) {
+        (_, Some(env_cfg)) => env_cfg
+            .automatic_deploy
+            .or_else(|| project_config.and_then(|p| p.automatic_deploy)),
         (Some(project_cfg), None) => project_cfg.automatic_deploy,
-        (None, Some(env_cfg)) => env_cfg.automatic_deploy,
-        (None, None) => false,
-    }
+        (None, None) => None,
+    };
+    effective.unwrap_or(false)
 }
 
 // Extracted free function for testing
@@ -639,138 +652,33 @@ async fn process_git_push_event(
         }
     };
 
-    // Find environment matching the branch, or fallback to preview environment.
-    // Multiple environments can track the same branch, but auto-deploy only
-    // targets the first match. Users promote to other environments via redeploy.
-    let environment =
-        match find_or_create_environment_for_branch(db.clone(), &project, job.branch.as_deref())
-            .await
-        {
-            Ok(env) => env,
+    // Find all environments matching this branch. Multiple environments can
+    // track the same branch; each is deployed independently according to its
+    // own automatic_deploy policy (env-wins semantics).
+    let environments =
+        match find_environments_for_branch(db.clone(), &project, job.branch.as_deref()).await {
+            Ok(envs) => envs,
             Err(e) => {
                 error!(
-                    "Failed to find or create environment for project {}: {}",
+                    "Failed to find environments for project {}: {}",
                     project.id, e
                 );
                 return;
             }
         };
 
-    // ── Auto-deploy gate ─────────────────────────────────────────────────
-    //
-    // Respect the user's "deploy on push" setting before doing any work.
-    // The effective value is computed by merging project + environment
-    // deployment configs (env overrides project). When both sides have
-    // automatic_deploy=false, webhook push events must NOT trigger a
-    // deployment — the user has explicitly opted out of auto-deploy.
-    //
-    // Manual triggers (the "Deploy" button, `trigger_pipeline` API,
-    // initial deployment on project creation) bypass this gate entirely:
-    // the user just clicked deploy, so they unambiguously want a deploy
-    // regardless of the auto-deploy setting. The flag exists for
-    // webhook-driven flows, not user-driven ones.
-    //
-    // Exception for the webhook path: the FIRST deployment for an
-    // environment always runs even when automatic_deploy=false. Without
-    // this, a freshly-created opt-out project would never get a baseline
-    // deployment from the first push.
-    use sea_orm::{EntityTrait, PaginatorTrait, QueryOrder};
-    let auto_deploy_enabled = is_automatic_deploy_enabled(
-        project.deployment_config.as_ref(),
-        environment.deployment_config.as_ref(),
-    );
-    if !auto_deploy_enabled && !job.manual_trigger {
-        let existing_count = match deployments::Entity::find()
-            .filter(deployments::Column::EnvironmentId.eq(environment.id))
-            .count(db.as_ref())
-            .await
-        {
-            Ok(n) => n,
-            Err(e) => {
-                error!(
-                    "Failed to count existing deployments for environment {}: {}",
-                    environment.id, e
-                );
-                return;
-            }
-        };
-
-        if existing_count > 0 {
-            info!(
-                "Skipping push event for project {} environment {} ({}): automatic_deploy is disabled",
-                project.id, environment.id, environment.name
-            );
-            return;
-        }
-
+    if environments.is_empty() {
         info!(
-            "Allowing initial deployment for project {} environment {} ({}) despite automatic_deploy=false (no prior deployments)",
-            project.id, environment.id, environment.name
-        );
-    } else if job.manual_trigger && !auto_deploy_enabled {
-        info!(
-            "Manual trigger for project {} environment {} ({}) — bypassing automatic_deploy=false",
-            project.id, environment.id, environment.name
-        );
-    }
-
-    // Check for duplicate deployment (same project, environment, and commit)
-    // This prevents duplicate deployments from being created if:
-    // - Multiple webhook URLs are configured in GitHub (both /webhook/git/github/events and /webhook/source/github/events)
-    // - GitHub sends duplicate webhooks
-    // - Race condition between concurrent push events
-    let existing_deployment = deployments::Entity::find()
-        .filter(deployments::Column::ProjectId.eq(project.id))
-        .filter(deployments::Column::EnvironmentId.eq(environment.id))
-        .filter(deployments::Column::CommitSha.eq(&job.commit))
-        .filter(deployments::Column::State.is_in(vec!["pending", "running", "deploying", "ready"]))
-        .order_by_desc(deployments::Column::CreatedAt)
-        .one(db.as_ref())
-        .await;
-
-    if let Ok(Some(existing)) = existing_deployment {
-        info!(
-            "Deployment already exists for project {} environment {} commit {} (deployment #{}, state: {}). Skipping duplicate.",
-            project.id, environment.id, job.commit, existing.id, existing.state
+            "No environments found for branch {:?} in project {}",
+            job.branch, project.id
         );
         return;
     }
 
-    // ── Cancel-on-supersede ──────────────────────────────────────────────
-    //
-    // Cancel any in-flight deployments for this environment before starting
-    // a new one. This is the standard PaaS behaviour (Vercel, Railway, etc.):
-    // the newest push always wins. Benefits:
-    //   - Prevents race conditions between concurrent mark_complete() calls
-    //   - Saves Docker build resources (no wasted builds)
-    //   - Avoids container name/port conflicts during deploy phase
-    //
-    // The cancelled deployments will stop at the next workflow checkpoint
-    // (between job batches) via the DatabaseCancellationProvider.
-    cancel_in_flight_deployments(&db, &queue, project.id, environment.id).await;
-
-    // Create deployment record directly (no more pipeline)
-    // Note: Previous deployment teardown happens AFTER this deployment succeeds (zero-downtime)
     use chrono::Utc;
+    use sea_orm::{EntityTrait, PaginatorTrait, QueryOrder};
 
-    // Get the next deployment number for this project
-    let paginator = deployments::Entity::find()
-        .filter(deployments::Column::ProjectId.eq(project.id))
-        .paginate(db.as_ref(), 1);
-
-    let deployment_count = match paginator.num_items().await {
-        Ok(count) => count,
-        Err(e) => {
-            error!(
-                "Failed to count deployments for project {}: {}",
-                project.id, e
-            );
-            return;
-        }
-    };
-    let deployment_number = deployment_count + 1;
-
-    // Fetch commit information from Git provider
+    // Fetch commit info once — it's the same for every environment receiving this push.
     let commit_info =
         match JobProcessorService::fetch_commit_info(&git_provider_manager, &project, &job).await {
             Ok(info) => {
@@ -783,117 +691,7 @@ async fn process_git_push_event(
             }
         };
 
-    // Generate URL/slug based on environment type
-    let env_slug = if environment.is_preview {
-        // For preview deployments, include branch name in slug for unique URLs
-        let sanitized_branch = job
-            .branch
-            .as_ref()
-            .map(|b| b.replace(['/', '_', '.'], "-").to_lowercase())
-            .unwrap_or_else(|| "unknown".to_string());
-        format!(
-            "{}-{}-{}",
-            project.slug, sanitized_branch, deployment_number
-        )
-    } else {
-        // For named environments (production, staging, etc.), use standard format
-        format!("{}-{}", project.slug, deployment_number)
-    };
-
-    // Get the effective deployment configuration by merging project and environment configs
-    let merged_config = if let Some(project_config) = &project.deployment_config {
-        if let Some(env_config) = &environment.deployment_config {
-            Some(project_config.merge(env_config))
-        } else {
-            Some(project_config.clone())
-        }
-    } else {
-        environment.deployment_config.clone()
-    };
-
-    // Create deployment config snapshot
-    // Note: Environment variables will be populated during workflow execution
-    // We store an empty map here and the workflow will update it with actual values
-    let deployment_config_snapshot =
-        merged_config.map(|config| DeploymentConfigSnapshot::from_config(&config, HashMap::new()));
-
-    // Create typed deployment metadata
-    let deployment_metadata = DeploymentMetadata {
-        git_push_event: Some(GitPushEvent {
-            owner: job.owner.clone(),
-            repo: job.repo.clone(),
-            branch: job.branch.clone().unwrap_or_default(),
-            commit: job.commit.clone(),
-        }),
-        ..Default::default()
-    };
-
-    let new_deployment = deployments::ActiveModel {
-        id: sea_orm::NotSet,
-        project_id: sea_orm::Set(project.id),
-        environment_id: sea_orm::Set(environment.id),
-        slug: sea_orm::Set(env_slug),
-        state: sea_orm::Set("pending".to_string()),
-        metadata: sea_orm::Set(Some(deployment_metadata)),
-        branch_ref: sea_orm::Set(job.branch.clone()),
-        tag_ref: sea_orm::Set(job.tag.clone()),
-        commit_sha: sea_orm::Set(Some(job.commit.clone())),
-        commit_message: sea_orm::Set(commit_info.as_ref().map(|c| c.message.clone())),
-        commit_author: sea_orm::Set(commit_info.as_ref().map(|c| c.author.clone())),
-        promoted_from_deployment_id: sea_orm::Set(None),
-        started_at: sea_orm::Set(None),
-        finished_at: sea_orm::Set(None),
-        context_vars: sea_orm::Set(Some(serde_json::json!({
-            "trigger": "git_push",
-            "source": "webhook"
-        }))),
-        deploying_at: sea_orm::Set(None),
-        ready_at: sea_orm::Set(None),
-        static_dir_location: sea_orm::Set(None),
-        screenshot_location: sea_orm::Set(None),
-        image_name: sea_orm::Set(None),
-        cancelled_reason: sea_orm::Set(None),
-        commit_json: sea_orm::Set(commit_info.as_ref().map(|c| c.commit_json.clone())),
-        deployment_config: sea_orm::Set(deployment_config_snapshot),
-        created_at: sea_orm::Set(Utc::now()),
-        updated_at: sea_orm::Set(Utc::now()),
-    };
-
-    let deployment = match new_deployment.insert(db.as_ref()).await {
-        Ok(deployment) => deployment,
-        Err(e) => {
-            error!(
-                "Failed to create deployment for project {}: {}",
-                project.id, e
-            );
-            return;
-        }
-    };
-
-    info!(
-        "Created deployment {} for project {} from GitPushEvent",
-        deployment.id, project.id
-    );
-
-    // Fire DeploymentCreated event to queue
-    let deployment_created_event = Job::DeploymentCreated(temps_core::DeploymentCreatedJob {
-        deployment_id: deployment.id,
-        project_id: project.id,
-        environment_id: environment.id,
-        environment_name: environment.name.clone(),
-        branch: job.branch.clone(),
-        commit_sha: Some(job.commit.clone()),
-    });
-    if let Err(e) = queue.send(deployment_created_event).await {
-        error!("Failed to send DeploymentCreated event: {}", e);
-    } else {
-        debug!(
-            "Sent DeploymentCreated event for deployment {}",
-            deployment.id
-        );
-    }
-
-    // Update project's last_deployment timestamp
+    // Update project's last_deployment timestamp once for this push event.
     let mut active_project: temps_entities::projects::ActiveModel = project.clone().into();
     active_project.last_deployment = sea_orm::Set(Some(Utc::now()));
     if let Err(e) = active_project.update(db.as_ref()).await {
@@ -901,103 +699,276 @@ async fn process_git_push_event(
             "Failed to update last_deployment for project {}: {}",
             project.id, e
         );
-    } else {
-        debug!(
-            "Updated last_deployment timestamp for project {}",
-            project.id
-        );
     }
 
-    // Create jobs for this deployment using the workflow planner
-    let create_jobs_result = workflow_planner.create_deployment_jobs(deployment.id).await;
-    let deployment_id = deployment.id; // Extract deployment_id before match
-
-    // Handle result immediately
-    match create_jobs_result {
-        Ok(created_jobs) => {
-            let job_count = created_jobs.len();
-            info!(
-                "Created {} jobs for deployment {} from GitPushEvent",
-                job_count, deployment_id
-            );
-
-            // Update deployment status to Running before executing workflow
-            match JobProcessorService::update_deployment_status(
-                &db,
-                deployment_id,
-                PipelineStatus::Running,
-            )
-            .await
-            {
-                Ok(_) => info!("Updated deployment {} status to Running", deployment_id),
-                Err(e) => {
-                    error!("Failed to update deployment status to Running: {}", e);
-                    return;
-                }
-            }
-
-            // Execute the workflow
-            info!("Executing workflow for deployment {}", deployment_id);
-            match workflow_executor
-                .execute_deployment_workflow(deployment_id)
+    // Deploy to each environment that opts in. Each environment applies its own
+    // automatic_deploy policy so the user can have one env auto-deploy on push
+    // and another deploy on demand — even when both track the same branch.
+    for environment in environments {
+        // ── Auto-deploy gate ───────────────────────────────────────────────
+        //
+        // Env-wins semantics: if the environment has an explicit automatic_deploy
+        // value it takes precedence over the project setting. When both are absent
+        // the answer is false (opt-in, not opt-out). Manual triggers bypass this
+        // gate entirely — the user clicked deploy, so they unambiguously want one.
+        //
+        // Exception: the FIRST deployment for an environment always runs even when
+        // automatic_deploy=false, so a freshly-created opt-out env still boots.
+        let auto_deploy_enabled = is_automatic_deploy_enabled(
+            project.deployment_config.as_ref(),
+            environment.deployment_config.as_ref(),
+        );
+        if !auto_deploy_enabled && !job.manual_trigger {
+            let existing_count = match deployments::Entity::find()
+                .filter(deployments::Column::EnvironmentId.eq(environment.id))
+                .count(db.as_ref())
                 .await
             {
-                Ok(_) => {
-                    info!(
-                        "Workflow execution completed for deployment {}",
-                        deployment_id
-                    );
-                }
+                Ok(n) => n,
                 Err(e) => {
-                    let error_message = format!("{}", e);
                     error!(
-                        "Workflow execution failed for deployment {}: {}",
-                        deployment_id, error_message
+                        "Failed to count existing deployments for environment {}: {}",
+                        environment.id, e
                     );
+                    continue;
+                }
+            };
 
-                    // Mark deployment as failed with error message
-                    if let Err(update_err) =
-                        JobProcessorService::update_deployment_status_with_message(
-                            &db,
-                            deployment_id,
-                            PipelineStatus::Failed,
-                            Some(error_message),
-                        )
-                        .await
-                    {
-                        error!("Failed to update deployment status: {}", update_err);
-                    } else {
-                        debug!("Updated deployment {} status to failed", deployment_id);
+            if existing_count > 0 {
+                info!(
+                    "Skipping push event for project {} environment {} ({}): automatic_deploy is disabled",
+                    project.id, environment.id, environment.name
+                );
+                continue;
+            }
+
+            info!(
+                "Allowing initial deployment for project {} environment {} ({}) despite automatic_deploy=false (no prior deployments)",
+                project.id, environment.id, environment.name
+            );
+        } else if job.manual_trigger && !auto_deploy_enabled {
+            info!(
+                "Manual trigger for project {} environment {} ({}) — bypassing automatic_deploy=false",
+                project.id, environment.id, environment.name
+            );
+        }
+
+        // Check for duplicate deployment (same project, environment, and commit).
+        let existing_deployment = deployments::Entity::find()
+            .filter(deployments::Column::ProjectId.eq(project.id))
+            .filter(deployments::Column::EnvironmentId.eq(environment.id))
+            .filter(deployments::Column::CommitSha.eq(&job.commit))
+            .filter(deployments::Column::State.is_in(vec![
+                "pending",
+                "running",
+                "deploying",
+                "ready",
+            ]))
+            .order_by_desc(deployments::Column::CreatedAt)
+            .one(db.as_ref())
+            .await;
+
+        if let Ok(Some(existing)) = existing_deployment {
+            info!(
+                "Deployment already exists for project {} environment {} commit {} (deployment #{}, state: {}). Skipping duplicate.",
+                project.id, environment.id, job.commit, existing.id, existing.state
+            );
+            continue;
+        }
+
+        // Cancel-on-supersede: newest push always wins.
+        cancel_in_flight_deployments(&db, &queue, project.id, environment.id).await;
+
+        // Get the next deployment number for this project.
+        let deployment_count = match deployments::Entity::find()
+            .filter(deployments::Column::ProjectId.eq(project.id))
+            .paginate(db.as_ref(), 1)
+            .num_items()
+            .await
+        {
+            Ok(count) => count,
+            Err(e) => {
+                error!(
+                    "Failed to count deployments for project {}: {}",
+                    project.id, e
+                );
+                continue;
+            }
+        };
+        let deployment_number = deployment_count + 1;
+
+        let env_slug = if environment.is_preview {
+            let sanitized_branch = job
+                .branch
+                .as_ref()
+                .map(|b| b.replace(['/', '_', '.'], "-").to_lowercase())
+                .unwrap_or_else(|| "unknown".to_string());
+            format!(
+                "{}-{}-{}",
+                project.slug, sanitized_branch, deployment_number
+            )
+        } else {
+            format!("{}-{}", project.slug, deployment_number)
+        };
+
+        let merged_config = if let Some(project_config) = &project.deployment_config {
+            if let Some(env_config) = &environment.deployment_config {
+                Some(project_config.merge(env_config))
+            } else {
+                Some(project_config.clone())
+            }
+        } else {
+            environment.deployment_config.clone()
+        };
+
+        let deployment_config_snapshot = merged_config
+            .map(|config| DeploymentConfigSnapshot::from_config(&config, HashMap::new()));
+
+        let deployment_metadata = DeploymentMetadata {
+            git_push_event: Some(GitPushEvent {
+                owner: job.owner.clone(),
+                repo: job.repo.clone(),
+                branch: job.branch.clone().unwrap_or_default(),
+                commit: job.commit.clone(),
+            }),
+            ..Default::default()
+        };
+
+        let new_deployment = deployments::ActiveModel {
+            id: sea_orm::NotSet,
+            project_id: sea_orm::Set(project.id),
+            environment_id: sea_orm::Set(environment.id),
+            slug: sea_orm::Set(env_slug),
+            state: sea_orm::Set("pending".to_string()),
+            metadata: sea_orm::Set(Some(deployment_metadata)),
+            branch_ref: sea_orm::Set(job.branch.clone()),
+            tag_ref: sea_orm::Set(job.tag.clone()),
+            commit_sha: sea_orm::Set(Some(job.commit.clone())),
+            commit_message: sea_orm::Set(commit_info.as_ref().map(|c| c.message.clone())),
+            commit_author: sea_orm::Set(commit_info.as_ref().map(|c| c.author.clone())),
+            promoted_from_deployment_id: sea_orm::Set(None),
+            started_at: sea_orm::Set(None),
+            finished_at: sea_orm::Set(None),
+            context_vars: sea_orm::Set(Some(serde_json::json!({
+                "trigger": "git_push",
+                "source": "webhook"
+            }))),
+            deploying_at: sea_orm::Set(None),
+            ready_at: sea_orm::Set(None),
+            static_dir_location: sea_orm::Set(None),
+            screenshot_location: sea_orm::Set(None),
+            image_name: sea_orm::Set(None),
+            cancelled_reason: sea_orm::Set(None),
+            commit_json: sea_orm::Set(commit_info.as_ref().map(|c| c.commit_json.clone())),
+            deployment_config: sea_orm::Set(deployment_config_snapshot),
+            created_at: sea_orm::Set(Utc::now()),
+            updated_at: sea_orm::Set(Utc::now()),
+        };
+
+        let deployment = match new_deployment.insert(db.as_ref()).await {
+            Ok(deployment) => deployment,
+            Err(e) => {
+                error!(
+                    "Failed to create deployment for project {} environment {}: {}",
+                    project.id, environment.id, e
+                );
+                continue;
+            }
+        };
+
+        info!(
+            "Created deployment {} for project {} environment {} from GitPushEvent",
+            deployment.id, project.id, environment.id
+        );
+
+        let deployment_created_event = Job::DeploymentCreated(temps_core::DeploymentCreatedJob {
+            deployment_id: deployment.id,
+            project_id: project.id,
+            environment_id: environment.id,
+            environment_name: environment.name.clone(),
+            branch: job.branch.clone(),
+            commit_sha: Some(job.commit.clone()),
+        });
+        if let Err(e) = queue.send(deployment_created_event).await {
+            error!("Failed to send DeploymentCreated event: {}", e);
+        }
+
+        let create_jobs_result = workflow_planner.create_deployment_jobs(deployment.id).await;
+        let deployment_id = deployment.id;
+
+        match create_jobs_result {
+            Ok(created_jobs) => {
+                info!(
+                    "Created {} jobs for deployment {} from GitPushEvent",
+                    created_jobs.len(),
+                    deployment_id
+                );
+
+                match JobProcessorService::update_deployment_status(
+                    &db,
+                    deployment_id,
+                    PipelineStatus::Running,
+                )
+                .await
+                {
+                    Ok(_) => info!("Updated deployment {} status to Running", deployment_id),
+                    Err(e) => {
+                        error!("Failed to update deployment status to Running: {}", e);
+                        continue;
+                    }
+                }
+
+                info!("Executing workflow for deployment {}", deployment_id);
+                match workflow_executor
+                    .execute_deployment_workflow(deployment_id)
+                    .await
+                {
+                    Ok(_) => {
+                        info!(
+                            "Workflow execution completed for deployment {}",
+                            deployment_id
+                        );
+                    }
+                    Err(e) => {
+                        let error_message = format!("{}", e);
+                        error!(
+                            "Workflow execution failed for deployment {}: {}",
+                            deployment_id, error_message
+                        );
+                        if let Err(update_err) =
+                            JobProcessorService::update_deployment_status_with_message(
+                                &db,
+                                deployment_id,
+                                PipelineStatus::Failed,
+                                Some(error_message),
+                            )
+                            .await
+                        {
+                            error!("Failed to update deployment status: {}", update_err);
+                        }
                     }
                 }
             }
-        }
-        Err(job_error) => {
-            // Convert error to string immediately to avoid Send issues
-            let error_message = format!("{}", job_error);
-            // Drop the error explicitly before any await
-            std::mem::drop(job_error);
-
-            error!(
-                "Failed to create jobs for deployment {}: {}",
-                deployment_id, error_message
-            );
-
-            // Mark deployment as failed with error message
-            if let Err(update_err) = JobProcessorService::update_deployment_status_with_message(
-                &db,
-                deployment_id,
-                PipelineStatus::Failed,
-                Some(error_message),
-            )
-            .await
-            {
-                error!("Failed to update deployment status: {}", update_err);
-            } else {
-                debug!("Updated deployment {} status to failed", deployment_id);
+            Err(job_error) => {
+                let error_message = format!("{}", job_error);
+                std::mem::drop(job_error);
+                error!(
+                    "Failed to create jobs for deployment {}: {}",
+                    deployment_id, error_message
+                );
+                if let Err(update_err) = JobProcessorService::update_deployment_status_with_message(
+                    &db,
+                    deployment_id,
+                    PipelineStatus::Failed,
+                    Some(error_message),
+                )
+                .await
+                {
+                    error!("Failed to update deployment status: {}", update_err);
+                }
             }
         }
-    }
+    } // end for environment in environments
 }
 
 /// Cancel all in-flight deployments for the given environment.
@@ -1616,9 +1587,10 @@ mod tests {
         let production_env = production_env.insert(db.as_ref()).await?;
 
         // Test finding environment for "main" branch
-        let found_env =
-            find_or_create_environment_for_branch(db.clone(), &project, Some("main")).await?;
+        let found_envs = find_environments_for_branch(db.clone(), &project, Some("main")).await?;
 
+        assert_eq!(found_envs.len(), 1, "exactly one env matches branch 'main'");
+        let found_env = &found_envs[0];
         assert_eq!(found_env.id, production_env.id);
         assert_eq!(found_env.name, "Production");
         assert_eq!(found_env.branch, Some("main".to_string()));
@@ -1684,10 +1656,11 @@ mod tests {
         let preview_env = preview_env.insert(db.as_ref()).await?;
 
         // Test finding environment for "feature-auth" branch (no exact match)
-        let found_env =
-            find_or_create_environment_for_branch(db.clone(), &project, Some("feature-auth"))
-                .await?;
+        let found_envs =
+            find_environments_for_branch(db.clone(), &project, Some("feature-auth")).await?;
 
+        assert_eq!(found_envs.len(), 1, "falls back to the single preview env");
+        let found_env = &found_envs[0];
         assert_eq!(found_env.id, preview_env.id);
         assert_eq!(found_env.name, "preview");
         assert_eq!(found_env.branch, None); // Preview has no specific branch
@@ -1746,11 +1719,12 @@ mod tests {
         assert!(preview_before.is_none(), "Preview should not exist yet");
 
         // Test finding environment for "feature-xyz" branch (should create preview)
-        let found_env =
-            find_or_create_environment_for_branch(db.clone(), &project, Some("feature-xyz"))
-                .await?;
+        let found_envs =
+            find_environments_for_branch(db.clone(), &project, Some("feature-xyz")).await?;
 
         // Verify preview environment was created
+        assert_eq!(found_envs.len(), 1, "creates one generic preview env");
+        let found_env = &found_envs[0];
         assert_eq!(found_env.name, "preview");
         assert_eq!(found_env.slug, "preview");
         assert_eq!(found_env.subdomain, "auto-create-preview-test-preview");
@@ -1812,19 +1786,22 @@ mod tests {
         let _production_env = _production_env.insert(db.as_ref()).await?;
 
         // Find environment for first feature branch (creates preview)
-        let env1 =
-            find_or_create_environment_for_branch(db.clone(), &project, Some("feature-auth"))
-                .await?;
+        let envs1 =
+            find_environments_for_branch(db.clone(), &project, Some("feature-auth")).await?;
 
         // Find environment for second feature branch (reuses preview)
-        let env2 =
-            find_or_create_environment_for_branch(db.clone(), &project, Some("feature-payments"))
-                .await?;
+        let envs2 =
+            find_environments_for_branch(db.clone(), &project, Some("feature-payments")).await?;
 
         // Find environment for third feature branch (reuses preview)
-        let env3 =
-            find_or_create_environment_for_branch(db.clone(), &project, Some("bugfix-login"))
-                .await?;
+        let envs3 =
+            find_environments_for_branch(db.clone(), &project, Some("bugfix-login")).await?;
+
+        // Each call returns exactly the one shared preview environment
+        assert_eq!(envs1.len(), 1);
+        assert_eq!(envs2.len(), 1);
+        assert_eq!(envs3.len(), 1);
+        let (env1, env2, env3) = (&envs1[0], &envs2[0], &envs3[0]);
 
         // All three should return the same preview environment
         assert_eq!(env1.id, env2.id);
@@ -1903,10 +1880,11 @@ mod tests {
         let _env2 = _env2.insert(db.as_ref()).await?;
 
         // Test finding environment with no branch specified
-        let found_env = find_or_create_environment_for_branch(db.clone(), &project, None).await?;
+        let found_envs = find_environments_for_branch(db.clone(), &project, None).await?;
 
-        // Should return first environment (by database order)
-        assert_eq!(found_env.id, env1.id);
+        // Should return the first environment (by database order)
+        assert_eq!(found_envs.len(), 1, "no branch → single first env");
+        assert_eq!(found_envs[0].id, env1.id);
 
         Ok(())
     }
@@ -1972,10 +1950,11 @@ mod tests {
 
         // Test finding environment for feature branch
         // Should create NEW preview (ignore deleted one)
-        let found_env =
-            find_or_create_environment_for_branch(db.clone(), &project, Some("feature-test"))
-                .await?;
+        let found_envs =
+            find_environments_for_branch(db.clone(), &project, Some("feature-test")).await?;
 
+        assert_eq!(found_envs.len(), 1, "creates one fresh preview env");
+        let found_env = &found_envs[0];
         assert_eq!(found_env.name, "preview");
         assert!(
             found_env.deleted_at.is_none(),
@@ -1999,7 +1978,7 @@ mod tests {
 
     fn cfg_with_auto_deploy(value: bool) -> temps_entities::deployment_config::DeploymentConfig {
         temps_entities::deployment_config::DeploymentConfig {
-            automatic_deploy: value,
+            automatic_deploy: Some(value),
             ..Default::default()
         }
     }
@@ -2045,5 +2024,30 @@ mod tests {
     fn auto_deploy_enabled_when_only_env_set_on() {
         let env_cfg = cfg_with_auto_deploy(true);
         assert!(is_automatic_deploy_enabled(None, Some(&env_cfg)));
+    }
+
+    #[test]
+    fn auto_deploy_env_false_overrides_project_true() {
+        // Env explicitly opts out even though project is on — env wins.
+        let project_cfg = cfg_with_auto_deploy(true);
+        let env_cfg = cfg_with_auto_deploy(false);
+        assert!(!is_automatic_deploy_enabled(
+            Some(&project_cfg),
+            Some(&env_cfg)
+        ));
+    }
+
+    #[test]
+    fn auto_deploy_env_none_inherits_project_true() {
+        // Env has no explicit setting — inherits project's true.
+        let project_cfg = cfg_with_auto_deploy(true);
+        let env_cfg = temps_entities::deployment_config::DeploymentConfig {
+            automatic_deploy: None,
+            ..Default::default()
+        };
+        assert!(is_automatic_deploy_enabled(
+            Some(&project_cfg),
+            Some(&env_cfg)
+        ));
     }
 }

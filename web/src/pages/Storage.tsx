@@ -17,7 +17,7 @@ import { ImportServiceButton } from '@/components/storage/ImportServiceButton'
 import { PlatformServices } from '@/components/storage/PlatformServices'
 import EmptyStateStorage from '@/components/storage/EmptyStateStorage'
 import { Button } from '@/components/ui/button'
-import { Card, CardContent, CardHeader } from '@/components/ui/card'
+import { Card } from '@/components/ui/card'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { ServiceLogo } from '@/components/ui/service-logo'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
@@ -25,7 +25,6 @@ import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useQuery } from '@tanstack/react-query'
 import {
-  ChevronRight,
   Cpu,
   Database,
   HardDrive,
@@ -95,21 +94,17 @@ export function Storage() {
           <div className="flex items-center justify-end">
             <div className="h-9 w-24 bg-muted rounded animate-pulse" />
           </div>
-          <div className="grid gap-4">
-            {[...Array(3)].map((_, i) => (
-              <Card key={i}>
-                <CardHeader>
-                  <div className="flex items-center justify-between">
-                    <div className="space-y-2">
-                      <div className="h-5 w-40 bg-muted rounded animate-pulse" />
-                      <div className="h-4 w-24 bg-muted rounded animate-pulse" />
-                    </div>
-                    <div className="h-8 w-20 bg-muted rounded animate-pulse" />
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+            {[...Array(6)].map((_, i) => (
+              <Card key={i} className="p-4">
+                <div className="flex items-start gap-3">
+                  <div className="size-11 shrink-0 rounded-md bg-muted animate-pulse" />
+                  <div className="flex-1 space-y-2 pt-0.5">
+                    <div className="h-4 w-32 bg-muted rounded animate-pulse" />
+                    <div className="h-3 w-20 bg-muted rounded animate-pulse" />
                   </div>
-                </CardHeader>
-                <CardContent>
-                  <div className="h-4 w-full bg-muted rounded animate-pulse" />
-                </CardContent>
+                </div>
+                <div className="mt-4 h-3 w-full bg-muted rounded animate-pulse" />
               </Card>
             ))}
           </div>
@@ -152,7 +147,7 @@ export function Storage() {
           </div>
         </div>
 
-        <ServicesDividerList
+        <ServicesCardGrid
           services={services}
           healthMap={healthMap}
           onOpen={(id) => navigate(`/storage/${id}`)}
@@ -310,9 +305,9 @@ function ServiceActions({
   )
 }
 
-// ── Variant: Divider list (Vercel-style) ──
+// ── Variant: Card grid (scan all services at a glance) ──
 
-function ServicesDividerList({
+function ServicesCardGrid({
   services,
   healthMap,
   onOpen,
@@ -320,72 +315,115 @@ function ServicesDividerList({
   onDeleteSuccess,
 }: ServicesVariantProps) {
   return (
-    <div className="overflow-hidden rounded-lg border">
-      <ul role="list" className="divide-y">
-        {services.map((service) => {
-          // Only show the health dot for services the backend is actually
-          // probing (status === 'running'). Others haven't been checked.
-          const health =
-            service.status === 'running'
-              ? healthMap?.get(service.id)?.status ?? null
-              : null
-          return (
-            <li
-              key={service.id}
-              onClick={() => onOpen(service.id)}
-              className="group flex cursor-pointer items-center gap-4 px-4 py-3 transition-colors hover:bg-muted/40"
-            >
-              {/*
-                Wrap the logo so we can anchor the health dot in its
-                bottom-right corner (Vercel deployment-status pattern).
-              */}
-              <div className="relative shrink-0">
-                <div className="flex size-9 items-center justify-center rounded-md border bg-background">
-                  <ServiceLogo service={service.service_type} />
-                </div>
-                {health ? (
-                  <HealthDot
-                    status={health}
-                    className="absolute -bottom-0.5 -right-0.5 ring-2 ring-background"
-                  />
-                ) : null}
-              </div>
-              <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-2">
-                  <p className="truncate text-sm font-medium">{service.name}</p>
-                  <span className="rounded border bg-muted/50 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
-                    {service.service_type}
-                  </span>
-                  {service.topology === 'cluster' && (
-                    <span className="rounded border px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-muted-foreground">
-                      Cluster
-                    </span>
-                  )}
-                </div>
-                <div className="mt-1 flex items-center gap-3 text-xs text-muted-foreground">
-                  <ServiceStatusDot status={service.status} />
-                  {service.version && (
-                    <span className="font-mono">v{service.version}</span>
-                  )}
-                  <span>
-                    Created <TimeAgo date={service.created_at} />
-                  </span>
-                </div>
-              </div>
-              {service.status === 'running' && (
-                <ServiceMetricsCell serviceId={service.id} />
-              )}
-              <ServiceActions
-                service={service}
-                onEdit={onEdit}
-                onDeleteSuccess={onDeleteSuccess}
-              />
-              <ChevronRight className="size-4 shrink-0 text-muted-foreground/40 transition-transform group-hover:translate-x-0.5 group-hover:text-muted-foreground" />
-            </li>
-          )
-        })}
-      </ul>
+    <div
+      role="list"
+      className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3"
+    >
+      {services.map((service) => {
+        // Only show the health dot for services the backend is actually
+        // probing (status === 'running'). Others haven't been checked.
+        const health =
+          service.status === 'running'
+            ? healthMap?.get(service.id)?.status ?? null
+            : null
+        return (
+          <ServiceCard
+            key={service.id}
+            service={service}
+            health={health}
+            onOpen={onOpen}
+            onEdit={onEdit}
+            onDeleteSuccess={onDeleteSuccess}
+          />
+        )
+      })}
     </div>
+  )
+}
+
+function ServiceCard({
+  service,
+  health,
+  onOpen,
+  onEdit,
+  onDeleteSuccess,
+}: {
+  service: ExternalServiceInfo
+  health: HealthStatus | null
+  onOpen: (id: number) => void
+  onEdit: (service: ExternalServiceInfo) => void
+  onDeleteSuccess: () => void
+}) {
+  return (
+    <Card
+      role="listitem"
+      onClick={() => onOpen(service.id)}
+      className="group relative flex cursor-pointer flex-col gap-4 p-4 hover:border-foreground/20 hover:shadow-md"
+    >
+      <div className="flex items-start gap-3">
+        {/*
+          Wrap the logo so we can anchor the health dot in its bottom-right
+          corner (Vercel deployment-status pattern).
+        */}
+        <div className="relative shrink-0">
+          <div className="flex size-11 items-center justify-center rounded-md border bg-background">
+            <ServiceLogo service={service.service_type} className="size-6" />
+          </div>
+          {health ? (
+            <HealthDot
+              status={health}
+              className="absolute -bottom-0.5 -right-0.5 ring-2 ring-card"
+            />
+          ) : null}
+        </div>
+
+        <div className="min-w-0 flex-1">
+          <p className="truncate text-base font-medium sm:text-sm">
+            {service.name}
+          </p>
+          <div className="mt-1 flex flex-wrap items-center gap-1.5">
+            <span className="rounded border bg-muted/50 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
+              {service.service_type}
+            </span>
+            {service.topology === 'cluster' && (
+              <span className="rounded border px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-muted-foreground">
+                Cluster
+              </span>
+            )}
+            {service.version && (
+              <span className="font-mono text-[10px] text-muted-foreground">
+                v{service.version}
+              </span>
+            )}
+          </div>
+        </div>
+
+        {/*
+          Touch devices have no hover, so keep actions visible there; on
+          pointer/larger screens they fade in on hover (or keyboard focus)
+          to keep the card header tidy.
+        */}
+        <div className="shrink-0 sm:opacity-0 sm:transition-opacity sm:group-hover:opacity-100 sm:group-focus-within:opacity-100">
+          <ServiceActions
+            service={service}
+            onEdit={onEdit}
+            onDeleteSuccess={onDeleteSuccess}
+          />
+        </div>
+      </div>
+
+      <div className="mt-auto flex items-center justify-between gap-3 border-t pt-3 text-xs text-muted-foreground">
+        <div className="flex min-w-0 items-center gap-3">
+          <ServiceStatusDot status={service.status} />
+          <span className="truncate">
+            Created <TimeAgo date={service.created_at} />
+          </span>
+        </div>
+        {service.status === 'running' && (
+          <ServiceMetricsCell serviceId={service.id} />
+        )}
+      </div>
+    </Card>
   )
 }
 
@@ -457,7 +495,7 @@ function ServiceMetricsCell({ serviceId }: { serviceId: number }) {
   if (!hasCpu && !hasMem) return null
 
   return (
-    <div className="hidden shrink-0 items-center gap-3 text-xs text-muted-foreground sm:flex">
+    <div className="flex shrink-0 items-center gap-3 text-xs text-muted-foreground">
       {hasCpu && (
         <span
           className="flex items-center gap-1 tabular-nums"

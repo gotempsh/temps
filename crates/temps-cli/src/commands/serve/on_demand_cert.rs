@@ -46,40 +46,27 @@ const STATE_SEED_LOOKBACK_HOURS: i64 = 24;
 /// `ContainerLifecycleAdapter` pattern for scale-to-zero).
 struct DomainServiceProvisioner {
     domain_service: Arc<DomainService>,
-    db: Arc<DbConnection>,
     /// ACME contact email resolved at startup from `letsencrypt.email` settings
     /// (the manager re-passes it per call; resolving once at boot avoids a
-    /// settings round-trip on every issuance). Empty falls back to the first
-    /// user's email inside [`Self::resolve_email`].
+    /// settings round-trip on every issuance). There is no fallback: if
+    /// `letsencrypt.email` is unset, [`Self::resolve_email`] returns empty and
+    /// issuance fails cleanly with "no ACME contact email configured" rather
+    /// than substituting a system/placeholder address.
     configured_email: Option<String>,
 }
 
 impl DomainServiceProvisioner {
-    /// Resolve the ACME account email: the configured `letsencrypt.email`, else
-    /// the first user's email, else a last-resort fallback. Mirrors
-    /// `TlsService::get_acme_email` so on-demand uses the same contact as manual
-    /// provisioning.
+    /// Resolve the ACME account email. The configured `letsencrypt.email` is the
+    /// single source of truth — there is NO fallback to the first user's email
+    /// or a placeholder, because those produced invalid contacts (e.g. the
+    /// `system@localhost` system user). Returns empty when unset; the caller
+    /// (`provision_on_demand`) treats empty as a clean, logged failure.
     async fn resolve_email(&self) -> String {
-        if let Some(email) = self
-            .configured_email
+        self.configured_email
             .as_ref()
-            .map(|e| e.trim())
+            .map(|e| e.trim().to_string())
             .filter(|e| !e.is_empty())
-        {
-            return email.to_string();
-        }
-
-        use sea_orm::QueryOrder;
-        use temps_entities::users;
-        if let Ok(Some(user)) = users::Entity::find()
-            .order_by_asc(users::Column::Id)
-            .one(self.db.as_ref())
-            .await
-        {
-            return user.email;
-        }
-
-        "system@temps.dev".to_string()
+            .unwrap_or_default()
     }
 }
 
@@ -212,6 +199,28 @@ struct OnDemandZoneInputs {
     external_url: Option<String>,
 }
 
+/// Derive the conventional console host (`console.<zone>`) for the gate's
+/// console exemption.
+///
+/// The installer's quick/sslip.io flow serves the console at `console.<zone>`
+/// (e.g. `console.1.2.3.4.sslip.io`) as a fall-through, so it has no
+/// `CachedPeerTable` route. The gate exempts exactly this host from the
+/// cert-eligible-route check (it is still subject to the in-zone check) so the
+/// console gets HTTPS on demand. Returns `None` for an empty zone.
+///
+/// Note: this only covers the `console.<zone>` convention. A custom-domain
+/// (advanced) install serves the console at the bare base domain and ships a
+/// wildcard cert that already covers it, so the console there is served from
+/// that cert and never reaches the on-demand path — the `console.<zone>`
+/// exemption is simply unused in that case (harmless).
+fn derive_console_host(zone: &str) -> Option<String> {
+    let zone = zone.trim().trim_end_matches('.').to_ascii_lowercase();
+    if zone.is_empty() {
+        return None;
+    }
+    Some(format!("console.{zone}"))
+}
+
 /// Build the [`OnDemandCertManager`] for a proxy process when on-demand TLS is
 /// enabled, or `None` when the feature is off / cannot be safely enabled.
 ///
@@ -267,6 +276,18 @@ pub async fn build_on_demand_cert_manager(
         .map(|e| e.trim().to_string())
         .filter(|e| !e.is_empty());
 
+    // Warn loudly at boot if on-demand TLS is enabled but has no ACME contact:
+    // every issuance will fail cleanly ("no ACME contact email configured"), so
+    // the console/app HTTPS will never come up. There is no fallback by design.
+    if email.is_none() {
+        warn!(
+            "on-demand TLS is enabled but no Let's Encrypt contact email is set \
+             (settings.letsencrypt.email is empty). Certificate issuance cannot \
+             proceed — set a contact email (e.g. re-run `temps setup \
+             --letsencrypt-email you@example.com`) to enable HTTPS."
+        );
+    }
+
     // Build the DomainService that drives the ACME flow. Reuses the same
     // repository + LetsEncryptProvider construction as the domains plugin so
     // on-demand issuance is byte-for-byte the same code path as manual
@@ -285,9 +306,17 @@ pub async fn build_on_demand_cert_manager(
 
     let provisioner: Arc<dyn OnDemandCertProvisioner> = Arc::new(DomainServiceProvisioner {
         domain_service,
-        db: db.clone(),
         configured_email: email.clone(),
     });
+
+    // Derive the console host so the gate exempts it from the cert-eligible
+    // route check. On a sslip.io install the console is served at
+    // `console.<zone>` (the deploy-script convention; the proxy itself serves
+    // the console as a fall-through for any unmatched host, so it has no route
+    // table entry). The console is in-zone, stable, and single — exactly the
+    // shape on-demand TLS should cover — so `quick` mode gets console HTTPS
+    // without the eager HTTP-01 step the old `testing` mode performed.
+    let console_host = derive_console_host(&zone);
 
     let manager = OnDemandCertManager::new(
         OnDemandCertConfig {
@@ -297,6 +326,7 @@ pub async fn build_on_demand_cert_manager(
             email: email.unwrap_or_default(),
             max_concurrent: cfg.max_concurrent.max(1),
             hourly_cap: cfg.hourly_cap.max(1),
+            console_host,
         },
         route_table,
         provisioner,
@@ -428,6 +458,28 @@ mod tests {
             external_url: Some("https://paas.example.com".to_string()),
         });
         assert_eq!(zone, None);
+    }
+
+    #[test]
+    fn console_host_derived_from_zone() {
+        assert_eq!(
+            derive_console_host("1.2.3.4.sslip.io").as_deref(),
+            Some("console.1.2.3.4.sslip.io")
+        );
+    }
+
+    #[test]
+    fn console_host_trims_and_lowercases_zone() {
+        assert_eq!(
+            derive_console_host("  5.6.7.8.SSLIP.IO. ").as_deref(),
+            Some("console.5.6.7.8.sslip.io")
+        );
+    }
+
+    #[test]
+    fn console_host_none_for_empty_zone() {
+        assert_eq!(derive_console_host("   "), None);
+        assert_eq!(derive_console_host(""), None);
     }
 
     #[test]

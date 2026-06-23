@@ -142,6 +142,14 @@ pub struct OnDemandCertConfig {
     pub max_concurrent: u32,
     /// Global per-hour issuance cap (ADR §4 Layer 3).
     pub hourly_cap: u32,
+    /// The instance's console host (`console.<zone>`), when on a sslip.io-style
+    /// install. The console is served as a fall-through, not a `CachedPeerTable`
+    /// route, so the gate's cert-eligible-route check (check 2) would otherwise
+    /// reject it. It is nonetheless a stable, low-cardinality host that should
+    /// get on-demand HTTPS — so the gate exempts exactly this one hostname from
+    /// the route check. `None` (custom-domain installs, or no derivable console
+    /// host) means no exemption: the console must get its cert another way.
+    pub console_host: Option<String>,
 }
 
 /// Max novel hostnames a single source IP may trigger per minute (ADR §4
@@ -255,11 +263,20 @@ impl OnDemandCertManager {
         // Check 2 — a cert-eligible route exists (stable, not ephemeral).
         // Resolve across all lookup strategies (TLS/SNI, HTTP-host, legacy) so
         // stable env hostnames stored in the legacy routes map are seen.
-        match self.route_table.resolve_route_for_sni(&hostname) {
-            Some(route) if route.cert_eligible => {}
-            _ => {
-                debug!(sni = %hostname, "on-demand cert gate: no cert-eligible route");
-                return EnqueueOutcome::SkippedNoRoute;
+        //
+        // Exemption: the console host (`console.<zone>`) is served as a
+        // fall-through, not a `CachedPeerTable` route, so it has no route entry
+        // to satisfy this check. It is nonetheless a stable, single host that
+        // should get on-demand HTTPS, so it bypasses the route check. Everything
+        // else still requires a cert-eligible route, which is what keeps a
+        // random-SNI flood from creating issuance jobs.
+        if !self.is_console_host(&hostname) {
+            match self.route_table.resolve_route_for_sni(&hostname) {
+                Some(route) if route.cert_eligible => {}
+                _ => {
+                    debug!(sni = %hostname, "on-demand cert gate: no cert-eligible route");
+                    return EnqueueOutcome::SkippedNoRoute;
+                }
             }
         }
 
@@ -366,6 +383,19 @@ impl OnDemandCertManager {
         };
         // Exactly one non-empty label before the zone (no nested subdomains).
         !label.is_empty() && !label.contains('.')
+    }
+
+    /// True iff `hostname` is the configured console host. Used to exempt the
+    /// console (a fall-through, not a route) from the cert-eligible-route check
+    /// while still requiring it to be in-zone (check 1 runs first). The compare
+    /// is case-insensitive against the already-lowercased gate input.
+    fn is_console_host(&self, hostname: &str) -> bool {
+        self.config
+            .console_host
+            .as_deref()
+            .map(|c| c.trim().trim_end_matches('.').to_ascii_lowercase())
+            .filter(|c| !c.is_empty())
+            .is_some_and(|c| c == hostname)
     }
 
     /// ADR §4 final layer: bound how many novel hostnames a single source IP
@@ -625,12 +655,22 @@ mod tests {
         route_table: Arc<CachedPeerTable>,
         provisioner: Arc<dyn OnDemandCertProvisioner>,
     ) -> Arc<OnDemandCertManager> {
+        manager_with_console(zone, None, route_table, provisioner)
+    }
+
+    fn manager_with_console(
+        zone: &str,
+        console_host: Option<&str>,
+        route_table: Arc<CachedPeerTable>,
+        provisioner: Arc<dyn OnDemandCertProvisioner>,
+    ) -> Arc<OnDemandCertManager> {
         OnDemandCertManager::new(
             OnDemandCertConfig {
                 zone: zone.to_string(),
                 email: "ops@example.com".to_string(),
                 max_concurrent: 3,
                 hourly_cap: 10,
+                console_host: console_host.map(|c| c.to_string()),
             },
             route_table,
             provisioner,
@@ -694,6 +734,56 @@ mod tests {
 
         let outcome = mgr.try_enqueue("ghost.1.2.3.4.sslip.io", ip());
         assert_eq!(outcome, EnqueueOutcome::SkippedNoRoute);
+    }
+
+    #[tokio::test]
+    async fn test_gate_accepts_console_host_without_route() {
+        let (p, calls) = fake(true);
+        // No route at all for the console host — it is served as a fall-through,
+        // not a CachedPeerTable route. The exemption must let it through anyway.
+        let rt = empty_route_table();
+        let mgr = manager_with_console(
+            "1.2.3.4.sslip.io",
+            Some("console.1.2.3.4.sslip.io"),
+            rt,
+            Arc::clone(&p),
+        );
+
+        let outcome = mgr.try_enqueue("console.1.2.3.4.sslip.io", ip());
+        assert_eq!(outcome, EnqueueOutcome::Enqueued);
+
+        // Give the background consumer a moment to drain the job.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &["console.1.2.3.4.sslip.io".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_console_exemption_is_exact_host_only() {
+        let (p, _) = fake(true);
+        let rt = empty_route_table();
+        // The console host is `console.<zone>`; a *different* routeless in-zone
+        // host must NOT inherit the exemption (it would defeat the route check).
+        let mgr = manager_with_console("1.2.3.4.sslip.io", Some("console.1.2.3.4.sslip.io"), rt, p);
+
+        let outcome = mgr.try_enqueue("ghost.1.2.3.4.sslip.io", ip());
+        assert_eq!(outcome, EnqueueOutcome::SkippedNoRoute);
+    }
+
+    #[tokio::test]
+    async fn test_console_exemption_still_requires_in_zone() {
+        let (p, _) = fake(true);
+        let rt = empty_route_table();
+        // A console host configured outside the zone still fails check 1 (which
+        // runs before the exemption), so it can never trigger issuance. This
+        // guards against a misconfigured console_host bypassing the zone gate.
+        let mgr =
+            manager_with_console("1.2.3.4.sslip.io", Some("console.other.example.com"), rt, p);
+
+        let outcome = mgr.try_enqueue("console.other.example.com", ip());
+        assert_eq!(outcome, EnqueueOutcome::SkippedGate);
     }
 
     #[tokio::test]

@@ -4,6 +4,7 @@ import {
   getActiveContext,
   setActiveContext,
   removeContext,
+  renameContext,
   contextsPath,
 } from '../../config/contexts.js'
 import { credentials } from '../../config/store.js'
@@ -165,6 +166,34 @@ async function removeAction(name: string): Promise<void> {
   }
 }
 
+async function renameAction(oldName: string, newName: string): Promise<void> {
+  if (oldName === newName) {
+    info('Nothing to do — old and new names are the same.')
+    return
+  }
+  const result = await renameContext(oldName, newName)
+  if (!result) {
+    const contexts = await listContexts()
+    if (!contexts.some((c) => c.name === oldName)) {
+      errorOutput(`Context "${oldName}" not found.`)
+      if (contexts.length > 0) {
+        info(`Available: ${contexts.map((c) => c.name).join(', ')}`)
+      }
+    } else {
+      errorOutput(`A context named "${newName}" already exists.`)
+    }
+    return
+  }
+  const envContext = process.env.TEMPS_CONTEXT?.trim() || null
+  success(`Renamed context "${oldName}" → "${newName}"`)
+  if (envContext === oldName) {
+    warning(
+      `${colors.bold('TEMPS_CONTEXT')}=${oldName} is set in your environment. ` +
+        `Update it to "${newName}" for the change to take effect in this shell.`,
+    )
+  }
+}
+
 async function currentAction(options: { json?: boolean }): Promise<void> {
   const active = await getActiveContext()
   if (!active) {
@@ -212,6 +241,11 @@ export function registerContextCommands(program: Command): void {
     .alias('rm')
     .description('Remove a context (does NOT revoke the key on the server)')
     .action(removeAction)
+
+  ctx
+    .command('rename <old-name> <new-name>')
+    .description('Rename a context')
+    .action(renameAction)
 
   ctx
     .command('current')

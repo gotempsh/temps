@@ -99,6 +99,16 @@ impl TlsService {
         domain: &str,
         email: &str,
     ) -> Result<Certificate, TlsError> {
+        // An ACME account requires a real contact email. There is no fallback
+        // (see `get_acme_email`): refuse to provision rather than register an
+        // account with an empty/placeholder contact that Let's Encrypt rejects.
+        if email.trim().is_empty() {
+            return Err(TlsError::Configuration(format!(
+                "no Let's Encrypt contact email configured; set letsencrypt.email before \
+                 provisioning a certificate for {domain}"
+            )));
+        }
+
         // Wildcard domains require DNS-01 challenge
         if domain.starts_with("*.") {
             info!(
@@ -390,13 +400,20 @@ impl TlsService {
         Ok(report)
     }
 
-    /// Get email for ACME certificate provisioning
-    /// Priority: 1) LetsEncrypt email from settings, 2) First user email, 3) Fallback
+    /// Get the ACME contact email from `letsencrypt.email` settings.
+    ///
+    /// `letsencrypt.email` is the single source of truth — there is NO fallback
+    /// to the first user's email or a placeholder address. Those fallbacks
+    /// produced invalid ACME contacts (e.g. the `system@localhost` system user),
+    /// which Let's Encrypt rejects, so issuance failed silently. Returns empty
+    /// when no email is configured; callers must treat empty as "no contact
+    /// configured" and skip/abort issuance rather than provision with a bogus
+    /// address.
     async fn get_acme_email(&self) -> String {
-        // Try to get from config service settings
         if let Some(config_service) = &self.config_service {
             if let Ok(settings) = config_service.get_settings().await {
                 if let Some(email) = settings.letsencrypt.email {
+                    let email = email.trim().to_string();
                     if !email.is_empty() {
                         return email;
                     }
@@ -404,22 +421,7 @@ impl TlsService {
             }
         }
 
-        // Fall back to first user's email if database is available
-        if let Some(db) = &self.db {
-            use sea_orm::{EntityTrait, QueryOrder};
-            use temps_entities::users;
-
-            if let Ok(Some(user)) = users::Entity::find()
-                .order_by_asc(users::Column::Id)
-                .one(db.as_ref())
-                .await
-            {
-                return user.email;
-            }
-        }
-
-        // Last resort fallback
-        "system@temps.dev".to_string()
+        String::new()
     }
 
     async fn handle_http01_renewal(&self, cert: &Certificate, report: &mut RenewalReport) {

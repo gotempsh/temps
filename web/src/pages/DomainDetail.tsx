@@ -858,6 +858,32 @@ export function DomainDetail() {
                 label="Wildcard"
                 value={domain.is_wildcard ? 'Yes' : 'No'}
               />
+              {domain.certificate && (
+                <KeyFact
+                  label="Certificate"
+                  value={
+                    <span className="text-emerald-600 dark:text-emerald-400 font-medium">
+                      Present
+                    </span>
+                  }
+                />
+              )}
+              {domain.expiration_time && (
+                <KeyFact
+                  label="Expires"
+                  value={
+                    <span className={isExpiringSoon(domain.expiration_time) ? 'text-amber-600 dark:text-amber-400 font-medium' : ''}>
+                      {formatLocalDateTime(domain.expiration_time)}
+                    </span>
+                  }
+                />
+              )}
+              {domain.last_renewed && (
+                <KeyFact
+                  label="Last issued"
+                  value={formatLocalDateTime(domain.last_renewed)}
+                />
+              )}
             </dl>
           </div>
         </Card>

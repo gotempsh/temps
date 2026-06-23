@@ -11,6 +11,8 @@ import {
   AlertDialogTrigger,
 } from '@/components/ui/alert-dialog'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { Trash2 } from 'lucide-react'
 import { useState } from 'react'
@@ -27,7 +29,10 @@ export function DeleteServiceButton({
   onSuccess,
 }: DeleteServiceButtonProps) {
   const [isOpen, setIsOpen] = useState(false)
+  const [confirmName, setConfirmName] = useState('')
   const queryClient = useQueryClient()
+
+  const isConfirmed = confirmName.trim() === serviceName
 
   const deleteMutation = useMutation({
     ...deleteServiceMutation(),
@@ -41,8 +46,16 @@ export function DeleteServiceButton({
     },
   })
 
+  const handleOpenChange = (open: boolean) => {
+    setIsOpen(open)
+    if (!open) {
+      setConfirmName('')
+    }
+  }
+
   const handleDelete = (e: React.MouseEvent) => {
     e.stopPropagation()
+    if (!isConfirmed) return
     deleteMutation.mutate({
       path: {
         id: serviceId,
@@ -57,7 +70,7 @@ export function DeleteServiceButton({
     : null
 
   return (
-    <AlertDialog open={isOpen} onOpenChange={setIsOpen}>
+    <AlertDialog open={isOpen} onOpenChange={handleOpenChange}>
       <AlertDialogTrigger asChild>
         <Button
           variant="ghost"
@@ -75,11 +88,28 @@ export function DeleteServiceButton({
         <AlertDialogHeader>
           <AlertDialogTitle>Delete storage service?</AlertDialogTitle>
           <AlertDialogDescription>
-            Are you sure you want to delete &quot;{serviceName}&quot;? This
-            action cannot be undone and all data associated with this service
-            will be permanently removed.
+            This action cannot be undone and all data associated with this
+            service will be permanently removed.
           </AlertDialogDescription>
         </AlertDialogHeader>
+        <div className="space-y-2">
+          <Label htmlFor="confirm-service-name">
+            Type{' '}
+            <span className="font-mono font-semibold text-foreground">
+              {serviceName}
+            </span>{' '}
+            to confirm
+          </Label>
+          <Input
+            id="confirm-service-name"
+            value={confirmName}
+            onChange={(e) => setConfirmName(e.target.value)}
+            onClick={(e) => e.stopPropagation()}
+            placeholder={serviceName}
+            autoComplete="off"
+            autoFocus
+          />
+        </div>
         {errorMessage && (
           <div className="rounded-md bg-destructive/10 p-3 text-sm text-destructive">
             {errorMessage}
@@ -92,7 +122,7 @@ export function DeleteServiceButton({
           <AlertDialogAction
             onClick={handleDelete}
             className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-            disabled={deleteMutation.isPending}
+            disabled={deleteMutation.isPending || !isConfirmed}
           >
             {deleteMutation.isPending ? 'Deleting...' : 'Delete'}
           </AlertDialogAction>

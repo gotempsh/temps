@@ -656,7 +656,7 @@ impl WorkloadImporter for DockerImporter {
                     .map(|ev| (ev.key.clone(), ev.value.clone()))
                     .collect(),
             ),
-            automatic_deploy: false,
+            automatic_deploy: true,
             storage_service_ids: vec![],
             is_public_repo: None,
             git_url: None,

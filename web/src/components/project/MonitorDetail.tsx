@@ -160,27 +160,39 @@ function BucketItem({ bucket, isOpen, onOpenChange }: BucketItemProps) {
   )
 }
 
-type QuickFilter =
-  | 'today'
-  | 'yesterday'
-  | '24hours'
-  | '7days'
-  | '30days'
-  | 'custom'
+type QuickFilter = '24hours' | '7days' | '30days' | '90days' | 'custom'
 
 const QUICK_FILTERS = [
-  { label: 'Today', value: 'today' as const },
-  { label: 'Yesterday', value: 'yesterday' as const },
   { label: 'Last 24 hours', value: '24hours' as const },
   { label: 'Last 7 Days', value: '7days' as const },
   { label: 'Last 30 Days', value: '30days' as const },
+  { label: 'Last 90 Days', value: '90days' as const },
 ]
+
+type BucketInterval = '1min' | '5min' | 'hourly' | 'daily'
+
+const INTERVAL_LABELS: Record<BucketInterval, string> = {
+  '1min': '1-minute',
+  '5min': '5-minute',
+  hourly: 'Hourly',
+  daily: 'Daily',
+}
+
+// Bucket granularity must scale with the time range, otherwise a long window
+// either renders thousands of unreadable segments or aggregates silently. Pick
+// the resolution from the span (in days) so every range yields a readable number
+// of buckets: ~24 for a day, hourly for a week, daily for months.
+function intervalForSpan(startDate?: Date, endDate?: Date): BucketInterval {
+  if (!startDate || !endDate) return 'hourly'
+  const spanMs = endDate.getTime() - startDate.getTime()
+  const spanDays = spanMs / (1000 * 60 * 60 * 24)
+  if (spanDays <= 2) return 'hourly' // up to 48 hourly buckets
+  if (spanDays <= 14) return 'hourly' // up to ~336 thin bars for a week/two
+  return 'daily' // 30d / 90d / long custom ranges → one bucket per day
+}
 
 export function MonitorDetail({ project }: MonitorDetailProps) {
   const { monitorId } = useParams()
-  const [interval, setInterval] = useState<'5min' | 'hourly' | 'daily'>(
-    'hourly'
-  )
   const [activeFilter, setActiveFilter] = useState<QuickFilter>('24hours')
   const [dateRange, setDateRange] = useState<DateRange | undefined>(undefined)
   const [hoveredBucket, setHoveredBucket] = useState<number | null>(null)
@@ -196,28 +208,6 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
     }
 
     switch (activeFilter) {
-      case 'today': {
-        const todayStart = new Date(now)
-        todayStart.setHours(0, 0, 0, 0)
-        const todayEnd = new Date(now)
-        todayEnd.setHours(23, 59, 59, 999)
-        return {
-          startDate: todayStart,
-          endDate: todayEnd,
-        }
-      }
-      case 'yesterday': {
-        const yesterdayStart = new Date(now)
-        yesterdayStart.setDate(yesterdayStart.getDate() - 1)
-        yesterdayStart.setHours(0, 0, 0, 0)
-        const yesterdayEnd = new Date(now)
-        yesterdayEnd.setDate(yesterdayEnd.getDate() - 1)
-        yesterdayEnd.setHours(23, 59, 59, 999)
-        return {
-          startDate: yesterdayStart,
-          endDate: yesterdayEnd,
-        }
-      }
       case '24hours': {
         const twentyFourHoursAgo = new Date(now)
         twentyFourHoursAgo.setHours(twentyFourHoursAgo.getHours() - 24)
@@ -238,6 +228,12 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
           endDate: now,
         }
       }
+      case '90days': {
+        return {
+          startDate: subDays(now, 90),
+          endDate: now,
+        }
+      }
       default: {
         return {
           startDate: subDays(now, 7),
@@ -246,6 +242,13 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
       }
     }
   }, [activeFilter, dateRange])
+
+  // Resolution is derived from the selected range — no standalone selector,
+  // so there are no invalid (range × granularity) combinations.
+  const interval = useMemo(
+    () => intervalForSpan(startDate, endDate),
+    [startDate, endDate]
+  )
 
   const {
     data: monitor,
@@ -566,22 +569,9 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
               Historical uptime and performance data
             </CardDescription>
           </div>
-          <Select
-            value={interval}
-            onValueChange={(value: '5min' | 'hourly' | 'daily') =>
-              setInterval(value)
-            }
-          >
-            <SelectTrigger className="w-32">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="minute">Minute</SelectItem>
-              <SelectItem value="5min">5 Minutes</SelectItem>
-              <SelectItem value="hourly">Hourly</SelectItem>
-              <SelectItem value="daily">Daily</SelectItem>
-            </SelectContent>
-          </Select>
+          <Badge variant="outline" className="font-normal">
+            {INTERVAL_LABELS[interval]} buckets
+          </Badge>
         </CardHeader>
         <CardContent>
           {statusError ? (

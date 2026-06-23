@@ -98,6 +98,7 @@ utoipa = { workspace = true }
 utoipa-swagger-ui = { workspace = true }
 async-trait = { workspace = true }
 sea-orm = { workspace = true }
+sysinfo = { workspace = true }
 include_dir = "0.7"
 ipnet = "2.10"
 mime_guess = "2.0"
@@ -118,6 +119,7 @@ glob = "0.3"
 uuid = { workspace = true }
 bytes = { workspace = true }
 http-body-util = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 # `tower`'s `util` feature provides `ServiceExt::oneshot`, used to drive the

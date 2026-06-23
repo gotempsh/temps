@@ -7,7 +7,8 @@
 
 use async_trait::async_trait;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder,
+    QuerySelect, Set,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -30,6 +31,21 @@ use tracing::{debug, info, warn};
 static ENVIRONMENT_LOCKS: std::sync::LazyLock<
     std::sync::Mutex<HashMap<i32, Arc<tokio::sync::Mutex<()>>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Safety bound on how many previous deployments a single teardown pass will
+/// process. Under normal operation there is at most one previous active
+/// deployment per environment (each is flipped to "stopped" once torn down),
+/// so this only ever bites on backlog from before the state-flip fix or after
+/// a crash mid-teardown. A bounded, newest-first sweep keeps the job from
+/// stalling for minutes on environments with a large unprocessed history;
+/// remaining stragglers are picked up by the next deployment's sweep.
+const MAX_TEARDOWN_DEPLOYMENTS_PER_PASS: u64 = 25;
+
+/// Per-container timeout for the stop+remove+mark-deleted teardown sequence.
+/// Docker's graceful stop alone can take ~10s; without a ceiling a single hung
+/// container would block the whole teardown loop indefinitely. On timeout we
+/// log and move on — the container row is left for the next sweep to retry.
+const CONTAINER_TEARDOWN_TIMEOUT_SECS: u64 = 30;
 
 /// Output from MarkDeploymentCompleteJob
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1404,9 +1420,94 @@ impl MarkDeploymentCompleteJob {
         .ok();
     }
 
-    /// Teardown all running/pending deployments for the same environment
-    /// This ensures only one active deployment per environment
-    /// Note: Deployment state is NOT changed - the is_current flag indicates which deployment is active
+    /// Tear down a single container: capture its logs, stop it, remove it from
+    /// Docker, and mark it deleted in the database. Each step is best-effort —
+    /// a failure is logged and the sequence continues so that a container which
+    /// e.g. can't be stopped is still marked removed and won't be retried
+    /// forever. Resolves the correct (local vs remote) deployer from node_id.
+    async fn teardown_container(
+        &self,
+        container: deployment_containers::Model,
+        project_id: i32,
+        environment_id: i32,
+    ) {
+        let container_id = container.container_id.clone();
+
+        // Determine which deployer to use based on node_id
+        let deployer: Arc<dyn temps_deployer::ContainerDeployer> = if let Some(node_id) =
+            container.node_id
+        {
+            match self.get_remote_deployer(node_id).await {
+                Ok(remote) => remote,
+                Err(e) => {
+                    self.log(format!(
+                        "Failed to create remote deployer for container {} on node {}: {} — falling back to local",
+                        container_id, node_id, e
+                    ))
+                    .await
+                    .ok();
+                    self.container_deployer.clone()
+                }
+            }
+        } else {
+            self.container_deployer.clone()
+        };
+
+        // Capture the container's logs to durable storage BEFORE we stop and
+        // remove it, so they survive teardown and can be viewed later.
+        self.capture_container_logs(&deployer, &container, project_id, environment_id)
+            .await;
+
+        // Stop container first
+        match deployer.stop_container(&container_id).await {
+            Ok(_) => {
+                self.log(format!("Stopped container {}", container_id))
+                    .await
+                    .ok();
+            }
+            Err(e) => {
+                self.log(format!("Failed to stop container {}: {}", container_id, e))
+                    .await
+                    .ok();
+            }
+        }
+
+        // Remove container from Docker
+        match deployer.remove_container(&container_id).await {
+            Ok(_) => {
+                self.log(format!("Removed container {}", container_id))
+                    .await
+                    .ok();
+            }
+            Err(e) => {
+                self.log(format!(
+                    "Failed to remove container {}: {}",
+                    container_id, e
+                ))
+                .await
+                .ok();
+            }
+        }
+
+        // Mark container as deleted in database
+        let mut active_container: deployment_containers::ActiveModel = container.into();
+        active_container.deleted_at = Set(Some(chrono::Utc::now()));
+        active_container.status = Set(Some("removed".to_string()));
+        if let Err(e) = active_container.update(self.db.as_ref()).await {
+            self.log(format!("Failed to update container status: {}", e))
+                .await
+                .ok();
+        }
+    }
+
+    /// Teardown all running/pending deployments for the same environment.
+    /// This ensures only one active deployment per environment.
+    ///
+    /// After a deployment's containers are torn down, the deployment's state is
+    /// flipped to "stopped" so it is no longer re-scanned by subsequent
+    /// teardown passes — bounding this work regardless of how much deployment
+    /// history accumulates. The route table already points at the new
+    /// deployment (via `environments.current_deployment_id`) before this runs.
     async fn cancel_previous_deployments(&self, environment_id: i32) {
         use sea_orm::Set;
 
@@ -1414,8 +1515,19 @@ impl MarkDeploymentCompleteJob {
             .await
             .ok();
 
-        // Find all running or pending deployments for this environment (excluding the new one)
-        // Note: "failed" deployments are intentionally excluded to preserve error history
+        // Find previous active deployments for this environment (excluding the new one).
+        //
+        // "failed" is intentionally excluded to preserve error history. Once a
+        // deployment is torn down here its state is flipped to "stopped" (see
+        // below), so it drops out of this filter and is never re-scanned — that
+        // is what keeps this query bounded as deployment history grows. We still
+        // include "completed" to catch a previously-current deployment that this
+        // new deploy is superseding (and any legacy rows left un-torn-down before
+        // the state-flip fix existed).
+        //
+        // The result is additionally capped (newest-first) so that even a large
+        // backlog of un-processed rows can't make a single pass run for minutes;
+        // anything beyond the cap is handled by the next deployment's sweep.
         let previous_deployments = match deployments::Entity::find()
             .filter(deployments::Column::EnvironmentId.eq(environment_id))
             .filter(deployments::Column::Id.ne(self.deployment_id))
@@ -1425,6 +1537,8 @@ impl MarkDeploymentCompleteJob {
                 "built",
                 "completed",
             ]))
+            .order_by_desc(deployments::Column::CreatedAt)
+            .limit(MAX_TEARDOWN_DEPLOYMENTS_PER_PASS)
             .all(self.db.as_ref())
             .await
         {
@@ -1503,79 +1617,51 @@ impl MarkDeploymentCompleteJob {
                 }
             }
 
-            for container in containers {
-                let container_id = container.container_id.clone();
-
-                // Determine which deployer to use based on node_id
-                let deployer: Arc<dyn temps_deployer::ContainerDeployer> = if let Some(node_id) =
-                    container.node_id
-                {
-                    match self.get_remote_deployer(node_id).await {
-                        Ok(remote) => remote,
-                        Err(e) => {
-                            self.log(format!(
-                                    "Failed to create remote deployer for container {} on node {}: {} — falling back to local",
-                                    container_id, node_id, e
-                                ))
-                                .await
-                                .ok();
-                            self.container_deployer.clone()
-                        }
-                    }
-                } else {
-                    self.container_deployer.clone()
-                };
-
-                // Capture the container's logs to durable storage BEFORE we stop
-                // and remove it, so they survive teardown and can be viewed later.
-                self.capture_container_logs(
-                    &deployer,
-                    &container,
-                    deployment.project_id,
-                    deployment.environment_id,
-                )
-                .await;
-
-                // Stop container first
-                match deployer.stop_container(&container_id).await {
-                    Ok(_) => {
-                        self.log(format!("Stopped container {}", container_id))
-                            .await
-                            .ok();
-                    }
-                    Err(e) => {
-                        self.log(format!("Failed to stop container {}: {}", container_id, e))
-                            .await
-                            .ok();
-                    }
-                }
-
-                // Remove container from Docker
-                match deployer.remove_container(&container_id).await {
-                    Ok(_) => {
-                        self.log(format!("Removed container {}", container_id))
-                            .await
-                            .ok();
-                    }
-                    Err(e) => {
+            // Tear down every container concurrently. Each container's
+            // stop+remove+mark-deleted sequence is wrapped in a timeout so a
+            // single hung Docker daemon or container can't stall the whole loop;
+            // running them concurrently keeps total teardown time bounded by the
+            // slowest container rather than their sum.
+            let teardowns = containers.into_iter().map(|container| {
+                let project_id = deployment.project_id;
+                let env_id = deployment.environment_id;
+                async move {
+                    let container_id = container.container_id.clone();
+                    let result = tokio::time::timeout(
+                        std::time::Duration::from_secs(CONTAINER_TEARDOWN_TIMEOUT_SECS),
+                        self.teardown_container(container, project_id, env_id),
+                    )
+                    .await;
+                    if result.is_err() {
                         self.log(format!(
-                            "Failed to remove container {}: {}",
-                            container_id, e
+                            "Timed out tearing down container {} after {}s — will retry on next sweep",
+                            container_id, CONTAINER_TEARDOWN_TIMEOUT_SECS
                         ))
                         .await
                         .ok();
                     }
                 }
+            });
+            futures::future::join_all(teardowns).await;
 
-                // Mark container as deleted in database
-                let mut active_container: deployment_containers::ActiveModel = container.into();
-                active_container.deleted_at = Set(Some(chrono::Utc::now()));
-                active_container.status = Set(Some("removed".to_string()));
-                if let Err(e) = active_container.update(self.db.as_ref()).await {
-                    self.log(format!("Failed to update container status: {}", e))
-                        .await
-                        .ok();
-                }
+            // Flip the deployment to a terminal "stopped" state so it is no
+            // longer matched by the scan above. This is what bounds the teardown
+            // query as deployment history grows — without it, every completed
+            // deployment would be re-scanned on every subsequent deploy forever.
+            // We do NOT touch "failed" deployments (excluded by the filter) and
+            // the rollback target finder (`find_last_successful_deployment`) only
+            // ever needs the most-recent completed deployment, which is the new
+            // current one — never a deployment we are stopping here.
+            let mut active_deployment: deployments::ActiveModel = deployment.into();
+            active_deployment.state = Set("stopped".to_string());
+            active_deployment.updated_at = Set(chrono::Utc::now());
+            if let Err(e) = active_deployment.update(self.db.as_ref()).await {
+                self.log(format!(
+                    "Failed to mark deployment {} as stopped: {}",
+                    deployment_id, e
+                ))
+                .await
+                .ok();
             }
 
             self.log(format!(
@@ -1780,5 +1866,288 @@ impl MarkDeploymentCompleteJobBuilder {
 impl Default for MarkDeploymentCompleteJobBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod teardown_tests {
+    use super::*;
+    use sea_orm::ActiveModelTrait;
+    use std::sync::Mutex as StdMutex;
+    use temps_core::QueueError;
+    use temps_database::test_utils::TestDatabase;
+    use temps_deployer::{
+        ContainerDeployer, ContainerInfo, ContainerStats, DeployRequest, DeployResult,
+        DeployerError,
+    };
+    use temps_entities::preset::Preset;
+    use temps_entities::upstream_config::UpstreamList;
+    use temps_entities::{deployment_containers, environments, projects};
+
+    /// Minimal ContainerDeployer that records stop/remove calls and otherwise
+    /// no-ops. Used to assert that teardown stopped the expected containers
+    /// without needing a real Docker daemon.
+    struct RecordingDeployer {
+        stopped: Arc<StdMutex<Vec<String>>>,
+        removed: Arc<StdMutex<Vec<String>>>,
+    }
+
+    impl RecordingDeployer {
+        fn new() -> Self {
+            Self {
+                stopped: Arc::new(StdMutex::new(Vec::new())),
+                removed: Arc::new(StdMutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ContainerDeployer for RecordingDeployer {
+        async fn deploy_container(
+            &self,
+            request: DeployRequest,
+        ) -> Result<DeployResult, DeployerError> {
+            Err(DeployerError::Other(format!(
+                "deploy_container not used in teardown test: {}",
+                request.container_name
+            )))
+        }
+        async fn start_container(&self, _id: &str) -> Result<(), DeployerError> {
+            Ok(())
+        }
+        async fn stop_container(&self, id: &str) -> Result<(), DeployerError> {
+            self.stopped.lock().unwrap().push(id.to_string());
+            Ok(())
+        }
+        async fn pause_container(&self, _id: &str) -> Result<(), DeployerError> {
+            Ok(())
+        }
+        async fn resume_container(&self, _id: &str) -> Result<(), DeployerError> {
+            Ok(())
+        }
+        async fn remove_container(&self, id: &str) -> Result<(), DeployerError> {
+            self.removed.lock().unwrap().push(id.to_string());
+            Ok(())
+        }
+        async fn get_container_info(&self, _id: &str) -> Result<ContainerInfo, DeployerError> {
+            Err(DeployerError::Other("not implemented".into()))
+        }
+        async fn get_container_stats(&self, _id: &str) -> Result<ContainerStats, DeployerError> {
+            Err(DeployerError::Other("not implemented".into()))
+        }
+        async fn list_containers(&self) -> Result<Vec<ContainerInfo>, DeployerError> {
+            Ok(vec![])
+        }
+        async fn get_container_logs(&self, _id: &str) -> Result<String, DeployerError> {
+            Ok(String::new())
+        }
+        async fn stream_container_logs(
+            &self,
+            _id: &str,
+        ) -> Result<Box<dyn futures::Stream<Item = String> + Unpin + Send>, DeployerError> {
+            Err(DeployerError::Other("not implemented".into()))
+        }
+    }
+
+    /// No-op JobQueue — teardown never enqueues anything.
+    struct NoopQueue;
+
+    #[async_trait]
+    impl JobQueue for NoopQueue {
+        async fn send(&self, _job: Job) -> Result<(), QueueError> {
+            Ok(())
+        }
+        fn subscribe(&self) -> Box<dyn JobReceiver> {
+            panic!("subscribe not used in teardown test")
+        }
+    }
+
+    async fn seed_project_env(db: &Arc<DbConnection>) -> (projects::Model, environments::Model) {
+        let project = projects::ActiveModel {
+            name: Set("Teardown Test".to_string()),
+            slug: Set("teardown-test".to_string()),
+            repo_owner: Set("owner".to_string()),
+            repo_name: Set("repo".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::NextJs),
+            directory: Set("/".to_string()),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            is_deleted: Set(false),
+            ..Default::default()
+        };
+        let project = project.insert(db.as_ref()).await.unwrap();
+
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("prod".to_string()),
+            slug: Set("prod".to_string()),
+            host: Set("app.example.com".to_string()),
+            subdomain: Set("app.example.com".to_string()),
+            upstreams: Set(UpstreamList::default()),
+            current_deployment_id: Set(None),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        };
+        let environment = environment.insert(db.as_ref()).await.unwrap();
+        (project, environment)
+    }
+
+    async fn insert_deployment(
+        db: &Arc<DbConnection>,
+        project_id: i32,
+        environment_id: i32,
+        slug: &str,
+        state: &str,
+    ) -> deployments::Model {
+        deployments::ActiveModel {
+            project_id: Set(project_id),
+            environment_id: Set(environment_id),
+            slug: Set(slug.to_string()),
+            state: Set(state.to_string()),
+            metadata: Set(Some(deployments::DeploymentMetadata::default())),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap()
+    }
+
+    async fn insert_container(
+        db: &Arc<DbConnection>,
+        deployment_id: i32,
+        container_id: &str,
+    ) -> deployment_containers::Model {
+        deployment_containers::ActiveModel {
+            deployment_id: Set(deployment_id),
+            container_id: Set(container_id.to_string()),
+            container_name: Set(container_id.to_string()),
+            container_port: Set(8080),
+            status: Set(Some("running".to_string())),
+            created_at: Set(chrono::Utc::now()),
+            deployed_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap()
+    }
+
+    fn make_job(
+        db: Arc<DbConnection>,
+        deployment_id: i32,
+        deployer: Arc<RecordingDeployer>,
+    ) -> MarkDeploymentCompleteJob {
+        MarkDeploymentCompleteJob::new(
+            "mark-complete".to_string(),
+            deployment_id,
+            db,
+            deployer,
+            Arc::new(NoopQueue),
+            Arc::new(temps_core::EncryptionService::new_from_password(
+                "test-password",
+            )),
+        )
+    }
+
+    /// The core scalability fix: a previous "completed" deployment is torn down
+    /// AND flipped to "stopped", so it no longer matches the teardown scan on
+    /// subsequent passes. Without the flip it would be re-scanned forever.
+    #[tokio::test]
+    async fn test_teardown_flips_previous_completed_to_stopped() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Postgres not available, skipping");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+
+        let (project, env) = seed_project_env(&db).await;
+
+        // Previous completed deployment + its container.
+        let prev = insert_deployment(&db, project.id, env.id, "prev-deploy", "completed").await;
+        insert_container(&db, prev.id, "prev-container").await;
+        let _ = project;
+
+        // The new (current) deployment — already marked completed by the time
+        // teardown runs.
+        let new = insert_deployment(&db, project.id, env.id, "new-deploy", "completed").await;
+
+        let deployer = Arc::new(RecordingDeployer::new());
+        let job = make_job(db.clone(), new.id, deployer.clone());
+
+        job.cancel_previous_deployments(env.id).await;
+
+        // The previous deployment is now "stopped" and won't be re-scanned.
+        let prev_after = deployments::Entity::find_by_id(prev.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(prev_after.state, "stopped");
+
+        // The new/current deployment is untouched (still completed).
+        let new_after = deployments::Entity::find_by_id(new.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(new_after.state, "completed");
+
+        // Its container was stopped and removed.
+        assert_eq!(
+            deployer.stopped.lock().unwrap().as_slice(),
+            ["prev-container"]
+        );
+        assert_eq!(
+            deployer.removed.lock().unwrap().as_slice(),
+            ["prev-container"]
+        );
+
+        // A second teardown pass finds nothing to do — proving the scan is
+        // bounded and "stopped" deployments are not re-processed.
+        job.cancel_previous_deployments(env.id).await;
+        assert_eq!(
+            deployer.stopped.lock().unwrap().len(),
+            1,
+            "stopped deployment must not be re-torn-down on the next pass"
+        );
+    }
+
+    /// "failed" deployments are never torn down — error history is preserved.
+    #[tokio::test]
+    async fn test_teardown_preserves_failed_deployments() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Postgres not available, skipping");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+
+        let (project, env) = seed_project_env(&db).await;
+        let failed = insert_deployment(&db, project.id, env.id, "failed-deploy", "failed").await;
+        let new = insert_deployment(&db, project.id, env.id, "new-deploy", "completed").await;
+
+        let deployer = Arc::new(RecordingDeployer::new());
+        let job = make_job(db.clone(), new.id, deployer.clone());
+        job.cancel_previous_deployments(env.id).await;
+
+        let failed_after = deployments::Entity::find_by_id(failed.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            failed_after.state, "failed",
+            "failed deployments must be left untouched"
+        );
+        assert!(deployer.stopped.lock().unwrap().is_empty());
     }
 }

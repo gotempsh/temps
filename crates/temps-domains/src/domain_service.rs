@@ -58,6 +58,12 @@ pub enum DomainServiceError {
         category: String,
         error_chain: String,
     },
+
+    /// `begin_on_demand_issuing` found that the domain already has an `active`
+    /// certificate with cert+key populated. The caller must treat this as a
+    /// no-op success — no ACME request should be sent.
+    #[error("Certificate already active for {0}: skipping on-demand re-issuance")]
+    CertificateAlreadyActive(String),
 }
 
 pub struct DomainService {
@@ -883,10 +889,18 @@ impl DomainService {
         // 1. Create or reuse the domains row, transitioning into the issuing state.
         //    HTTP-01 is the only supported on-demand challenge (wildcards/DNS-01
         //    are explicitly out of scope per ADR §2).
-        if let Err(e) = self.begin_on_demand_issuing(hostname).await {
-            self.record_on_demand_outcome(hostname, false, false, None, Some(&e), started)
-                .await;
-            return Err(e);
+        match self.begin_on_demand_issuing(hostname).await {
+            Err(DomainServiceError::CertificateAlreadyActive(_)) => {
+                // The domain already has a valid active cert — nothing to do.
+                // The cert loader serves it regardless of this function being called.
+                return Ok(());
+            }
+            Err(e) => {
+                self.record_on_demand_outcome(hostname, false, false, None, Some(&e), started)
+                    .await;
+                return Err(e);
+            }
+            Ok(_) => {}
         }
 
         // 2. Run the ACME order: request_challenge persists the order + serves the
@@ -971,6 +985,21 @@ impl DomainService {
             .await?
         {
             Some(existing) => {
+                // If the domain already has an active certificate, don't re-issue.
+                // This prevents burning LE rate limits when concurrent TLS handshakes
+                // all race to trigger on-demand issuance before the cert is in place.
+                if existing.status == "active"
+                    && !existing.certificate.as_deref().unwrap_or("").is_empty()
+                    && !existing.private_key.as_deref().unwrap_or("").is_empty()
+                {
+                    info!(
+                        hostname = %hostname,
+                        "on-demand TLS: certificate already active — skipping re-issuance"
+                    );
+                    return Err(DomainServiceError::CertificateAlreadyActive(
+                        hostname.to_string(),
+                    ));
+                }
                 let mut active: domains::ActiveModel = existing.into();
                 active.status = Set("on_demand_issuing".to_string());
                 active.verification_method = Set("http-01".to_string());

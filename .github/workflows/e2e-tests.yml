@@ -40,6 +40,12 @@ jobs:
       ADMIN_EMAIL: admin@localho.st
       ADMIN_PASSWORD: E2eTestPass123!
       API_BASE: http://localhost:8081/api
+      # Disable anonymous product telemetry for CI. Without this, every e2e run
+      # boots a fresh instance and emits instance_started + project_created +
+      # deploy_attempted for the example apps, polluting the real telemetry DB
+      # with phantom "tried N deploys, never shipped" instances. (Opt-out values:
+      # 0/false/off/no/disabled — see temps-telemetry/src/service.rs.)
+      TEMPS_TELEMETRY: "0"
 
     steps:
       - name: Free up disk space

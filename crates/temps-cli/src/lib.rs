@@ -228,12 +228,138 @@ pub fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+/// Scrub sensitive flag values from the process argv so they don't appear in
+/// `pgrep`, `ps`, or `/proc/self/cmdline`.
+///
+/// Clap has already parsed the arguments by the time this runs, so we can
+/// safely overwrite the raw argv strings with `x` characters in-place.
+/// The length of each argument is preserved — we never reallocate.
+///
+/// Best-effort: if the platform doesn't support argv scrubbing, the process
+/// continues normally. The flag is still accepted; it may remain visible in
+/// the process table, which is no worse than before this change.
+fn scrub_sensitive_argv() {
+    const SENSITIVE_FLAGS: &[&str] = &["--database-url"];
+
+    // macOS: use the stable _NSGetArgc/_NSGetArgv APIs from libSystem.
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            fn _NSGetArgc() -> *mut libc::c_int;
+            fn _NSGetArgv() -> *mut *mut *mut libc::c_char;
+        }
+        unsafe {
+            let argc_ptr = _NSGetArgc();
+            let argv_ptr = _NSGetArgv();
+            if !argc_ptr.is_null() && !argv_ptr.is_null() {
+                scrub_argv_raw(*argc_ptr as usize, *argv_ptr, SENSITIVE_FLAGS);
+            }
+        }
+    }
+
+    // Linux: recover argv base from environ. The kernel stack layout is:
+    //   argc | argv[0..argc] | NULL | envp[0..] | NULL
+    // environ points to envp[0], so argv[0] is at environ[-(argc+1)].
+    // We determine argc by counting NUL-terminated args in /proc/self/cmdline,
+    // then validate by checking that argv[0] matches the cmdline prefix.
+    #[cfg(target_os = "linux")]
+    {
+        use std::ffi::CStr;
+
+        let cmdline = match std::fs::read("/proc/self/cmdline") {
+            Ok(b) if !b.is_empty() => b,
+            _ => return,
+        };
+        let argc = cmdline.iter().filter(|&&b| b == 0).count();
+        if argc == 0 {
+            return;
+        }
+
+        unsafe {
+            extern "C" {
+                static environ: *const *const libc::c_char;
+            }
+            if environ.is_null() {
+                return;
+            }
+            // environ[-1] should be the NULL terminator of argv.
+            let argv_null = (environ as *mut *mut libc::c_char).sub(1);
+            if !(*argv_null).is_null() {
+                return;
+            }
+            // argv[0] is argc slots before the NULL.
+            let argv = argv_null.sub(argc);
+            // Sanity-check: argv[0] must match the first cmdline token.
+            let first = *argv;
+            if first.is_null() {
+                return;
+            }
+            let first_bytes = CStr::from_ptr(first).to_bytes();
+            let cmdline_first = cmdline.split(|&b| b == 0).next().unwrap_or(&[]);
+            if first_bytes != cmdline_first {
+                return;
+            }
+            scrub_argv_raw(argc, argv, SENSITIVE_FLAGS);
+        }
+    }
+}
+
+/// Overwrite sensitive flag values in a raw C argv array in-place.
+///
+/// # Safety
+/// `argv` must point to a valid array of `argc` writable C strings
+/// (i.e. the actual process argv, not a copy).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+unsafe fn scrub_argv_raw(argc: usize, argv: *mut *mut libc::c_char, sensitive_flags: &[&str]) {
+    use std::ffi::CStr;
+
+    let mut i = 0usize;
+    while i < argc {
+        let ptr = *argv.add(i);
+        if ptr.is_null() {
+            i += 1;
+            continue;
+        }
+        let arg = CStr::from_ptr(ptr).to_string_lossy();
+
+        // `--flag=value` form: overwrite only the value part after `=`.
+        for flag in sensitive_flags {
+            let prefix = format!("{}=", flag);
+            if arg.starts_with(prefix.as_str()) {
+                let value_offset = prefix.len();
+                let total_len = libc::strlen(ptr);
+                if value_offset < total_len {
+                    std::ptr::write_bytes(ptr.add(value_offset), b'x', total_len - value_offset);
+                }
+            }
+        }
+
+        // `--flag value` form: the next argv slot holds the value.
+        for flag in sensitive_flags {
+            if arg.as_ref() == *flag && i + 1 < argc {
+                let next = *argv.add(i + 1);
+                if !next.is_null() {
+                    let len = libc::strlen(next);
+                    if len > 0 {
+                        std::ptr::write_bytes(next, b'x', len);
+                    }
+                }
+            }
+        }
+
+        i += 1;
+    }
+}
+
 /// Convenience entrypoint that parses, installs tracing, and dispatches.
 /// Used by both the OSS `temps` binary (`extra_plugins = vec![]`) and any
 /// EE-bundled binary that wraps the same CLI surface.
 pub fn run(extra_plugins: Vec<Box<dyn temps_core::plugin::TempsPlugin>>) -> anyhow::Result<()> {
     install_crypto_provider();
     let cli = Cli::parse();
+    // Scrub sensitive flag values from argv *after* clap has parsed them so
+    // they no longer appear in `pgrep -af` or /proc/self/cmdline.
+    scrub_sensitive_argv();
     install_tracing(&cli.log_level, &cli.log_format);
     dispatch(cli, extra_plugins)
 }

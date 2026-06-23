@@ -754,11 +754,14 @@ pub async fn init_session_replay(
     {
         Ok(session_id) => {
             debug!("Successfully initialized session replay: {}", session_id);
-            state
-                .telemetry
-                .report(temps_core::telemetry::TelemetryEvent::new(
+            // Once-per-instance: "session replay is in use here", not "a session
+            // started". Guard so it fires once, not on every replay session.
+            state.telemetry.report_once(
+                "session_replay_first_session",
+                temps_core::telemetry::TelemetryEvent::new(
                     temps_core::telemetry::TelemetryEventKind::SessionReplayFirstSession,
-                ));
+                ),
+            );
             Ok((
                 StatusCode::CREATED,
                 Json(SessionReplayInitResponse {

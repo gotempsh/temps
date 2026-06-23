@@ -188,9 +188,21 @@ export function EnvironmentHeaderBar({
                   </DropdownMenuContent>
                 </DropdownMenu>
               ) : (
-                <h1 className="truncate text-2xl font-semibold tracking-tight text-neutral-950 dark:text-white">
-                  {environment.name}
-                </h1>
+                <>
+                  <h1 className="truncate text-2xl font-semibold tracking-tight text-neutral-950 dark:text-white">
+                    {environment.name}
+                  </h1>
+                  {onCreateEnvironment && (
+                    <button
+                      type="button"
+                      onClick={onCreateEnvironment}
+                      className="inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-sm text-neutral-500 hover:bg-neutral-100 hover:text-neutral-700 dark:text-neutral-400 dark:hover:bg-white/5 dark:hover:text-neutral-200"
+                    >
+                      <Plus className="size-3.5" aria-hidden="true" />
+                      New environment
+                    </button>
+                  )}
+                </>
               )}
               <span
                 className={`inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inset ${statusTone}`}

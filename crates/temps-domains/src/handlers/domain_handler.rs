@@ -219,6 +219,17 @@ impl From<DomainServiceError> for Problem {
                     "On-demand TLS issuance for {hostname} failed ({category}): {error_chain}"
                 ))
                 .build(),
+            DomainServiceError::CertificateAlreadyActive(hostname) => {
+                // This is a no-op success path, not an error that should reach
+                // HTTP handlers. Map to 200 OK conceptually, but if it somehow
+                // surfaces here, return 409 Conflict as a safe fallback.
+                ErrorBuilder::new(StatusCode::CONFLICT)
+                    .title("Certificate Already Active")
+                    .detail(format!(
+                        "Domain {hostname} already has an active certificate"
+                    ))
+                    .build()
+            }
         }
     }
 }

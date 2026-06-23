@@ -14,8 +14,13 @@
 		"./auto": {
 			"types": "./dist/auto.d.ts",
 			"import": "./dist/auto.js"
+		},
+		"./cdn": {
+			"default": "./dist/temps.min.js"
 		}
 	},
+	"unpkg": "./dist/temps.min.js",
+	"jsdelivr": "./dist/temps.min.js",
 	"files": [
 		"dist",
 		"README.md"
@@ -23,8 +28,12 @@
 	"scripts": {
 		"build:js": "tsc -p tsconfig.json",
 		"build:types": "tsc -p tsconfig.types.json",
-		"build": "bun run build:js && bun run build:types",
+		"build:cdn": "bun build src/auto.ts --target browser --format iife --outfile dist/temps.js && bun build src/auto.ts --target browser --format iife --outfile dist/temps.min.js --minify",
+		"build": "bun run build:js && bun run build:types && bun run build:cdn",
 		"clean": "rm -rf dist",
+		"test": "bun run test:run",
+		"test:cdn": "node scripts/verify-cdn-bundle.mjs",
+		"test:run": "bun run build && bun run test:cdn",
 		"prepublishOnly": "bun run clean && bun run build"
 	},
 	"publishConfig": {
@@ -37,6 +46,8 @@
 		"typescript": "^5.5.4"
 	},
 	"sideEffects": [
-		"./dist/auto.js"
+		"./dist/auto.js",
+		"./dist/temps.js",
+		"./dist/temps.min.js"
 	]
 }
