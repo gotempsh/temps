@@ -359,7 +359,9 @@ jobs:
               --test-threads=1
           - group: docker-deployments
             # Core deployment/database crates that use TestDatabase and/or
-            # Docker but do not need the provider Docker feature.
+            # Docker but do not need the provider Docker feature. These share
+            # one TimescaleDB service and some tests create/drop schemas, so
+            # run serially to avoid teardown deadlocks.
             cargo_args: >-
               test --no-fail-fast
               -p temps-deployments
@@ -374,7 +376,8 @@ jobs:
               -p temps-deployer
               -p temps-logs
               -p temps-projects
-            test_args: ""
+            test_args: >-
+              --test-threads=1
           - group: docker-query
             # Query adapters use service/testcontainer fixtures; isolate them
             # from the heavier deployment and backup suites.

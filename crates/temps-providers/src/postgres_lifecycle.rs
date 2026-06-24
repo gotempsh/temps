@@ -215,8 +215,15 @@ impl PostgresLifecycleAdapter {
             Self::sql_string_literal(&cfg.database)
         );
         let cmd = format!(
-            "set -e; psql -v ON_ERROR_STOP=1 -U {user} -d postgres -tAc {sql} | grep -q 1 \
-             || createdb -U {user} {db}",
+            "set -e; \
+             if psql -v ON_ERROR_STOP=1 -U {user} -d postgres -tAc {sql} | grep -q 1; then \
+               exit 0; \
+             fi; \
+             if createdb -U {user} {db} 2>/tmp/createdb.err; then \
+               exit 0; \
+             fi; \
+             psql -v ON_ERROR_STOP=1 -U {user} -d postgres -tAc {sql} | grep -q 1 \
+               || {{ cat /tmp/createdb.err >&2; exit 1; }}",
             user = Self::shell_escape(&cfg.username),
             sql = Self::shell_escape(&sql),
             db = Self::shell_escape(&cfg.database),

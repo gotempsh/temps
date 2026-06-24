@@ -662,8 +662,15 @@ impl PostgresUpgradeOrchestrator {
 
         self.copy_volume(row, &source_volume, &rollback_volume)
             .await?;
-        // Remove the original — new_container phase will recreate it empty.
-        self.remove_volume_best_effort(&source_volume).await;
+        // Remove the original. The new_container phase must start from an
+        // empty live volume; reusing old-version PGDATA breaks Postgres 18+.
+        self.remove_volume_or_fail(&source_volume)
+            .await
+            .map_err(|reason| PostgresUpgradeError::SnapshotFailed {
+                upgrade_id: row.id,
+                service_id: row.service_id,
+                reason: format!("remove old live volume '{}': {}", source_volume, reason),
+            })?;
 
         let expires_at = chrono::Utc::now() + chrono::Duration::days(ROLLBACK_RETENTION_DAYS);
         let current = self.load_upgrade(row.id).await?;
@@ -1593,6 +1600,26 @@ impl PostgresUpgradeOrchestrator {
             .await;
     }
 
+    async fn remove_volume_or_fail(&self, volume_name: &str) -> Result<(), String> {
+        self.docker
+            .remove_volume(
+                volume_name,
+                Some(bollard::query_parameters::RemoveVolumeOptions { force: true }),
+            )
+            .await
+            .map_err(|e| e.to_string())
+            .or_else(|reason| {
+                if reason.contains("No such volume")
+                    || reason.contains("not found")
+                    || reason.contains("404")
+                {
+                    Ok(())
+                } else {
+                    Err(reason)
+                }
+            })
+    }
+
     // ---- Rollback volume retention -------------------------------------
 
     /// Sweep rollback volumes whose 7-day retention has expired.
@@ -1770,8 +1797,15 @@ impl PostgresUpgradeOrchestrator {
 
         // 2. Remove the live volume so the copy produces a clean replica of
         //    the rollback volume (any lingering new-version WAL/catalog is
-        //    discarded). `remove_volume_best_effort` tolerates absence.
-        self.remove_volume_best_effort(&live_volume).await;
+        //    discarded). This is required; overlaying rollback data onto a
+        //    dirty live volume can leave incompatible catalog/WAL files.
+        self.remove_volume_or_fail(&live_volume)
+            .await
+            .map_err(|reason| PostgresUpgradeError::RollbackFailed {
+                upgrade_id,
+                service_id: row.service_id,
+                reason: format!("remove live volume '{}': {}", live_volume, reason),
+            })?;
         self.create_volume_if_missing(&row, &live_volume).await?;
         self.copy_volume(&row, &rollback_volume, &live_volume)
             .await
