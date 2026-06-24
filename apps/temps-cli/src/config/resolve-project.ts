@@ -1,7 +1,8 @@
 import { config } from './store.js'
 import { readProjectConfig } from './project-config.js'
+import { getActiveDefaultProjectSync, setActiveDefaultProject } from './contexts.js'
 
-export type ProjectSource = 'flag' | 'local-config' | 'env-var' | 'global-config'
+export type ProjectSource = 'flag' | 'local-config' | 'env-var' | 'context-default' | 'global-config'
 
 export interface ResolvedProject {
   slug: string
@@ -10,7 +11,8 @@ export interface ResolvedProject {
 
 /**
  * Resolve the project slug using priority chain:
- * CLI flag > .temps/config.json > TEMPS_PROJECT env var > global defaultProject
+ * CLI flag > .temps/config.json > TEMPS_PROJECT env var
+ *   > active context's defaultProject > legacy global defaultProject
  */
 export async function resolveProjectSlug(flagValue?: string): Promise<ResolvedProject | null> {
   // 1. CLI flag takes highest priority
@@ -30,13 +32,34 @@ export async function resolveProjectSlug(flagValue?: string): Promise<ResolvedPr
     return { slug: envProject, source: 'env-var' }
   }
 
-  // 4. Global default project
+  // 4. Active context's default project (scoped per Temps server).
+  const contextDefault = getActiveDefaultProjectSync()
+  if (contextDefault) {
+    return { slug: contextDefault, source: 'context-default' }
+  }
+
+  // 5. Legacy global default project. Kept for back-compat with configs
+  //    written before defaults were scoped per context. New writes go to the
+  //    active context, so this drains over time.
   const defaultProject = config.get('defaultProject')
   if (defaultProject) {
     return { slug: defaultProject, source: 'global-config' }
   }
 
   return null
+}
+
+/**
+ * Persist the default project slug. Writes to the active context so the
+ * default is scoped to the Temps server it belongs to. When there's no
+ * active context (e.g. env-var-only auth), falls back to the legacy global
+ * key so the behaviour still works. Pass `undefined` to clear it.
+ */
+export async function setDefaultProject(slug: string | undefined): Promise<void> {
+  const wroteToContext = await setActiveDefaultProject(slug)
+  if (!wroteToContext) {
+    config.set('defaultProject', slug)
+  }
 }
 
 /**

@@ -8,6 +8,7 @@ import {
   detectGitRemote,
   detectGitBranch,
   detectServiceHints,
+  detectStaticDir,
   suggestProjectName,
   refinePythonPreset,
   isGitRepo,
@@ -29,8 +30,8 @@ import {
 } from '../../lib/service-setup.js'
 import { writeProjectConfig } from '../../config/project-config.js'
 import { promptText, promptSelect, promptConfirm } from '../../ui/prompts.js'
-import { withSpinner, startSpinner, succeedSpinner, failSpinner } from '../../ui/spinner.js'
-import { success, error, info, warning, newline, icons, colors, header, keyValue, box } from '../../ui/output.js'
+import { withSpinner } from '../../ui/spinner.js'
+import { success, info, warning, newline, icons, colors, header, keyValue, box } from '../../ui/output.js'
 import {
   createProject,
   triggerProjectPipeline,
@@ -38,10 +39,11 @@ import {
   generatePresetDockerfile,
   listPresets,
 } from '../../api/sdk.gen.js'
-import type { ConnectionResponse, RepositoryResponse } from '../../api/types.gen.js'
+import type { RepositoryResponse } from '../../api/types.gen.js'
 import { config } from '../../config/store.js'
 import { watchDeployment } from '../../lib/deployment-watcher.jsx'
 import { deployLocalImage } from '../deploy/deploy-local-image.js'
+import { deployStatic } from '../deploy/deploy-static.js'
 import { existsSync, writeFileSync, mkdirSync } from 'node:fs'
 import { resolve, join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -51,6 +53,10 @@ interface SetupWizardOptions {
   preset?: string
   branch?: string
   manual?: boolean
+  /** Deploy as a pre-built static bundle (source_type: static_files). */
+  static?: boolean
+  /** Directory to upload as the static bundle (defaults to auto-detected). */
+  staticDir?: string
   noServices?: boolean
   yes?: boolean
 }
@@ -130,7 +136,8 @@ export async function runSetupWizard(options: SetupWizardOptions): Promise<Setup
       }))
 
   // ─── Step 3: Deployment Method ───────────────────────────────────────────
-  let isGitBased = !options.manual
+  let isGitBased = !options.manual && !options.static
+  let isStatic = !!options.static
   let connectionId: number | null = null
   let repository: RepositoryResponse | null = null
   let branch = gitBranch
@@ -140,7 +147,15 @@ export async function runSetupWizard(options: SetupWizardOptions): Promise<Setup
   let presetSlug = detectedPreset?.slug ?? 'dockerfile'
   let directory = './'
 
-  if (options.manual) {
+  // Auto-detect a built static-output directory (dist/build/out/…) up front so
+  // we can surface it in the deploy-method choice and pre-fill the prompt.
+  const detectedStaticDir = options.staticDir ?? detectStaticDir() ?? undefined
+
+  if (options.static) {
+    isStatic = true
+    isGitBased = false
+    info('Static deployment mode selected')
+  } else if (options.manual) {
     isGitBased = false
     info('Manual deployment mode selected')
   } else if (options.yes && gitRemote) {
@@ -157,6 +172,13 @@ export async function runSetupWizard(options: SetupWizardOptions): Promise<Setup
           description: gitRemote ? `Using ${gitRemote.owner}/${gitRemote.repo}` : 'Requires a git connection',
         },
         {
+          name: 'Static (upload a pre-built folder)',
+          value: 'static',
+          description: detectedStaticDir
+            ? `Detected ./${detectedStaticDir}`
+            : 'Upload HTML/CSS/JS — no Docker, no git',
+        },
+        {
           name: 'Manual (upload Docker images from CLI)',
           value: 'manual',
           description: 'Build locally, deploy with temps deploy:local-image',
@@ -166,6 +188,36 @@ export async function runSetupWizard(options: SetupWizardOptions): Promise<Setup
     })
 
     isGitBased = deployMethod === 'git'
+    isStatic = deployMethod === 'static'
+  }
+
+  // ─── Step 3-static: Pick the folder to upload ────────────────────────────
+  // Auto-detect, but always let the user override with a custom folder.
+  let staticDir = detectedStaticDir ?? './'
+  if (isStatic) {
+    // Static bundles aren't built, so there's no real framework preset. The
+    // API marks them via `project_type: 'static'`; `preset` must still be a
+    // valid slug, so use the safe `dockerfile` default (mirrors `projects
+    // create`). "static" is only a local detection label, not an API preset.
+    presetSlug = 'dockerfile'
+    if (options.staticDir) {
+      staticDir = options.staticDir
+    } else if (!options.yes) {
+      staticDir = await promptText({
+        message: 'Folder to upload (built static output)',
+        default: detectedStaticDir ?? 'dist',
+        required: true,
+      })
+    } else {
+      // Non-interactive: use the detection, falling back to a sensible default.
+      staticDir = detectedStaticDir ?? 'dist'
+    }
+
+    if (!existsSync(resolve(staticDir))) {
+      warning(`Folder not found: ${colors.bold(staticDir)}`)
+      info('Build your project first, then re-run, or pass --static-dir <path>.')
+      return null
+    }
   }
 
   // ─── Step 3a: Git Connection Setup ───────────────────────────────────────
@@ -213,8 +265,9 @@ export async function runSetupWizard(options: SetupWizardOptions): Promise<Setup
     }
   }
 
-  // If manual mode and no API preset detection happened, use local detection or prompt
-  if (!isGitBased && !options.preset) {
+  // If manual mode and no API preset detection happened, use local detection or prompt.
+  // Static deploys don't build an image, so they don't need a Dockerfile preset.
+  if (!isGitBased && !isStatic && !options.preset) {
     if (detectedPreset) {
       // Confirm the detected preset
       if (!options.yes) {
@@ -253,17 +306,27 @@ export async function runSetupWizard(options: SetupWizardOptions): Promise<Setup
 
   const serviceNames = serviceIds.length > 0 ? `${serviceIds.length} service(s) linked` : 'None'
 
+  const deployLabel = isGitBased
+    ? 'Automatic (on push)'
+    : isStatic
+      ? 'Static (folder upload)'
+      : 'Manual (CLI upload)'
+
   box(
     [
       `Project:    ${colors.bold(projectName)}`,
-      `Preset:     ${colors.bold(presetSlug)}`,
-      `Directory:  ${colors.bold(directory)}`,
+      // Static bundles have no real framework preset — don't show the
+      // internal `dockerfile` placeholder, it just confuses.
+      isStatic ? null : `Preset:     ${colors.bold(presetSlug)}`,
+      isStatic
+        ? `Folder:     ${colors.bold(staticDir)}`
+        : `Directory:  ${colors.bold(directory)}`,
       isGitBased && repoOwner && repoName
         ? `Repository: ${colors.bold(`${repoOwner}/${repoName}`)}`
         : null,
-      `Branch:     ${colors.bold(branch)}`,
+      isStatic ? null : `Branch:     ${colors.bold(branch)}`,
       `Services:   ${colors.bold(serviceNames)}`,
-      `Deploy:     ${colors.bold(isGitBased ? 'Automatic (on push)' : 'Manual (CLI upload)')}`,
+      `Deploy:     ${colors.bold(deployLabel)}`,
     ]
       .filter(Boolean)
       .join('\n'),
@@ -298,7 +361,10 @@ export async function runSetupWizard(options: SetupWizardOptions): Promise<Setup
         git_url: gitUrl,
         git_provider_connection_id: connectionId,
         automatic_deploy: isGitBased,
-        source_type: isGitBased ? 'git' : 'manual',
+        source_type: isGitBased ? 'git' : isStatic ? 'static_files' : 'manual',
+        // project_type mirrors the web configurator: 'static' for static_files,
+        // 'docker' otherwise. This is what actually marks the project static.
+        project_type: isStatic ? 'static' : 'docker',
         storage_service_ids: serviceIds,
       },
     })
@@ -329,7 +395,24 @@ export async function runSetupWizard(options: SetupWizardOptions): Promise<Setup
   newline()
 
   // ─── Step 8: First Deployment ────────────────────────────────────────────
-  if (isGitBased) {
+  if (isStatic) {
+    // Upload the built folder as a static bundle and deploy it. deployStatic
+    // archives the directory, uploads it, triggers the deploy, and watches it.
+    info(`Uploading ${colors.bold(staticDir)} and deploying...`)
+    newline()
+
+    try {
+      await deployStatic({
+        path: staticDir,
+        project: project.slug,
+        yes: true,
+      })
+    } catch {
+      newline()
+      warning('Static deploy failed. You can retry with:')
+      info(`  ${colors.muted(`temps deploy:static -p ${project.slug} --path ${staticDir}`)}`)
+    }
+  } else if (isGitBased) {
     info('Triggering first deployment...')
     newline()
 

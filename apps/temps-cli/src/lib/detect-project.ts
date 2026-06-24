@@ -180,6 +180,41 @@ export async function refinePythonPreset(dir?: string): Promise<DetectedPreset> 
   return { slug: 'python', label: 'Python', confidence: 'low' }
 }
 
+// ─── Static Output Detection ─────────────────────────────────────────────────
+
+/**
+ * Common build-output directory names, ordered by how strongly they imply a
+ * ready-to-serve static bundle. The first one that exists wins.
+ */
+const STATIC_DIR_CANDIDATES = ['dist', 'build', 'out', 'public', '_site', 'output'] as const
+
+/**
+ * Detect a likely static-output directory to deploy (e.g. `dist`, `build`,
+ * `out`). Returns the directory name (relative to `dir`) or null when none of
+ * the well-known candidates exist. The caller can fall back to prompting.
+ *
+ * A bare `index.html` in the project root counts too — that's a static site
+ * with no build step, deployable as `./`.
+ */
+export function detectStaticDir(dir?: string): string | null {
+  const projectDir = dir ?? process.cwd()
+  for (const candidate of STATIC_DIR_CANDIDATES) {
+    if (existsSync(join(projectDir, candidate, 'index.html'))) {
+      return candidate
+    }
+  }
+  // A built bundle directory without an index.html is still plausible output.
+  for (const candidate of STATIC_DIR_CANDIDATES) {
+    if (existsSync(join(projectDir, candidate))) {
+      return candidate
+    }
+  }
+  if (existsSync(join(projectDir, 'index.html'))) {
+    return '.'
+  }
+  return null
+}
+
 // ─── Git Remote Detection ────────────────────────────────────────────────────
 
 export interface DetectedGitRemote {
