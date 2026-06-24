@@ -1507,6 +1507,8 @@ impl PostgresUpgradeOrchestrator {
         dest: &str,
     ) -> Result<(), PostgresUpgradeError> {
         use futures::TryStreamExt;
+        use std::time::{Duration, Instant};
+
         let copy_container_name = format!(
             "temps_pg_upgrade_{}_copy_{}",
             row.id,
@@ -1598,11 +1600,55 @@ impl PostgresUpgradeOrchestrator {
             .await;
 
         if let Err(e) = remove_result {
-            return Err(PostgresUpgradeError::SnapshotFailed {
-                upgrade_id: row.id,
-                service_id: row.service_id,
-                reason: format!("remove copy container: {}", e),
-            });
+            let msg = e.to_string();
+            if !msg.contains("removal of container") || !msg.contains("is already in progress") {
+                return Err(PostgresUpgradeError::SnapshotFailed {
+                    upgrade_id: row.id,
+                    service_id: row.service_id,
+                    reason: format!("remove copy container: {}", msg),
+                });
+            }
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match self
+                .docker
+                .inspect_container(
+                    &created.id,
+                    None::<bollard::query_parameters::InspectContainerOptions>,
+                )
+                .await
+            {
+                Ok(_) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                Ok(_) => {
+                    return Err(PostgresUpgradeError::SnapshotFailed {
+                        upgrade_id: row.id,
+                        service_id: row.service_id,
+                        reason: format!(
+                            "copy container '{}' still exists after removal timeout",
+                            created.id
+                        ),
+                    });
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("No such container")
+                        || msg.contains("no such container")
+                        || msg.contains("not found")
+                        || msg.contains("404")
+                    {
+                        break;
+                    }
+                    return Err(PostgresUpgradeError::SnapshotFailed {
+                        upgrade_id: row.id,
+                        service_id: row.service_id,
+                        reason: format!("inspect copy container after removal: {}", msg),
+                    });
+                }
+            }
         }
 
         if let Some(nonzero) = wait_result
