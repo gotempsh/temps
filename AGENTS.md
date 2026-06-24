@@ -28,6 +28,22 @@ If you're touching code without writing a CHANGELOG entry, you're
 either doing the wrong thing or you forgot. Stop and add the entry
 before staging the commit.
 
+**This is CI-enforced on every PR to `main`.** The `changelog-check`
+workflow fails the PR unless the diff touches `CHANGELOG.md` (with a
+valid `## [Unreleased]` category) **or** the PR carries the
+`skip-changelog` label. So for every PR you open, do one of:
+
+- **Add a `CHANGELOG.md` entry** (the default — see above). This is
+  also required for changes to the `@temps-sdk/cli` npm package, even
+  though it versions separately; tag those bullets with `(\`@temps-sdk/cli\`, #PR)`.
+- **Apply the `skip-changelog` label** (`gh pr edit <n> --add-label
+  skip-changelog`) only when the change is genuinely changelog-exempt:
+  docs/typos, CI/build config, dependency bumps with no operator
+  impact, pure refactors, or test-only changes.
+
+Don't open a PR and leave the changelog check red — resolve it the
+same way you'd resolve a failing test.
+
 ## Use the generated OpenAPI SDK in `web/`
 
 The frontend has a generated TypeScript SDK at `web/src/api/client/`
