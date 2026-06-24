@@ -205,6 +205,65 @@ impl PostgresLifecycleAdapter {
         ))
     }
 
+    async fn wait_for_container_healthy(
+        &self,
+        container_name: &str,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        let mut last_state = String::new();
+        let mut last_health = String::new();
+
+        while Instant::now() < deadline {
+            let inspect = self
+                .docker
+                .inspect_container(
+                    container_name,
+                    None::<bollard::query_parameters::InspectContainerOptions>,
+                )
+                .await
+                .map_err(|e| format!("inspect_container({}) failed: {}", container_name, e))?;
+
+            if let Some(state) = inspect.state {
+                last_state = state
+                    .status
+                    .map(|status| status.to_string())
+                    .unwrap_or_default();
+                last_health = state
+                    .health
+                    .and_then(|health| health.status)
+                    .map(|status| status.to_string())
+                    .unwrap_or_default();
+
+                if state.running == Some(false) || state.dead == Some(true) {
+                    let logs = self.container_logs(container_name).await;
+                    return Err(format!(
+                        "container '{}' stopped before becoming healthy \
+                         (state='{}', health='{}', exit={:?}, error={:?}):\n{}",
+                        container_name, last_state, last_health, state.exit_code, state.error, logs
+                    ));
+                }
+
+                if last_health == "healthy" {
+                    return Ok(());
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        let logs = self.container_logs(container_name).await;
+        Err(format!(
+            "container '{}' did not become healthy within {}s \
+             (last state='{}', health='{}'):\n{}",
+            container_name,
+            timeout.as_secs(),
+            last_state,
+            last_health,
+            logs
+        ))
+    }
+
     async fn ensure_database_exists(
         &self,
         container_name: &str,
@@ -457,9 +516,11 @@ impl PostgresContainerLifecycle for PostgresLifecycleAdapter {
             .await
             .map_err(|e| format!("start_container({}) failed: {}", container_name, e))?;
 
-        // Block until Postgres accepts real SQL connections, then make sure
-        // the configured application database exists. `pg_isready` alone can
-        // report success while the target database is absent.
+        // Block until Docker's healthcheck sees the final post-entrypoint
+        // server, then make sure the configured application database exists.
+        // A transient init server can accept SQL briefly before shutdown.
+        self.wait_for_container_healthy(&container_name, Duration::from_secs(120))
+            .await?;
         self.wait_for_psql_database(&container_name, &cfg, "postgres", Duration::from_secs(120))
             .await?;
         self.ensure_database_exists(&container_name, &cfg).await?;

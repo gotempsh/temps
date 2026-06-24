@@ -1242,7 +1242,7 @@ impl PostgresUpgradeOrchestrator {
                     read_only: Some(true),
                     ..Default::default()
                 }]),
-                auto_remove: Some(true),
+                auto_remove: Some(false),
                 ..Default::default()
             }),
             ..Default::default()
@@ -1571,7 +1571,8 @@ impl PostgresUpgradeOrchestrator {
                 reason: format!("start copy container: {}", e),
             })?;
 
-        self.docker
+        let wait_result = self
+            .docker
             .wait_container(
                 &created.id,
                 None::<bollard::query_parameters::WaitContainerOptions>,
@@ -1583,6 +1584,38 @@ impl PostgresUpgradeOrchestrator {
                 service_id: row.service_id,
                 reason: format!("wait copy container: {}", e),
             })?;
+
+        let remove_result = self
+            .docker
+            .remove_container(
+                &created.id,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    v: true,
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+
+        if let Err(e) = remove_result {
+            return Err(PostgresUpgradeError::SnapshotFailed {
+                upgrade_id: row.id,
+                service_id: row.service_id,
+                reason: format!("remove copy container: {}", e),
+            });
+        }
+
+        if let Some(nonzero) = wait_result
+            .iter()
+            .map(|status| status.status_code)
+            .find(|status_code| *status_code != 0)
+        {
+            return Err(PostgresUpgradeError::SnapshotFailed {
+                upgrade_id: row.id,
+                service_id: row.service_id,
+                reason: format!("copy container exited with status {}", nonzero),
+            });
+        }
 
         Ok(())
     }

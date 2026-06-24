@@ -108,9 +108,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for the fake pre-upgrade backup id, keeping the existing rollback/upgrade
   assertions valid after FK enforcement.
 - **Postgres major upgrades require a clean live volume**: the upgrade
-  snapshot and rollback phases now fail if Docker cannot remove the old live
-  data volume before recreating it, preventing Postgres 18+ containers from
-  reopening stale 17-era PGDATA after a supposedly clean handoff.
+  snapshot and rollback phases now remove the temporary copy sidecar before
+  deleting the old live data volume, fail if Docker still cannot remove that
+  volume, and wait for the final healthy Postgres container before creating
+  the target database, preventing Postgres 18+ containers from reopening stale
+  17-era PGDATA after a supposedly clean handoff.
 - **Docker CI integration groups are narrower**: the Rust workflow now splits
   backup, query, domains, provider Docker, postgres-upgrade, and MariaDB PITR
   tests into separate GitHub Actions groups, with container-heavy provider,
