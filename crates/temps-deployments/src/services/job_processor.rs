@@ -824,6 +824,9 @@ async fn process_git_push_event(
         let deployment_config_snapshot = merged_config
             .map(|config| DeploymentConfigSnapshot::from_config(&config, HashMap::new()));
 
+        // A rebuild-from-source rollback rides the same git-push pipeline but
+        // must be recorded as a rollback so the UI/history reflect it.
+        let is_rollback = job.rollback_from_deployment_id.is_some();
         let deployment_metadata = DeploymentMetadata {
             git_push_event: Some(GitPushEvent {
                 owner: job.owner.clone(),
@@ -831,7 +834,21 @@ async fn process_git_push_event(
                 branch: job.branch.clone().unwrap_or_default(),
                 commit: job.commit.clone(),
             }),
+            is_rollback,
+            rolled_back_from_id: job.rollback_from_deployment_id,
             ..Default::default()
+        };
+        let trigger_context = if is_rollback {
+            serde_json::json!({
+                "trigger": "rollback",
+                "source": "rebuild_from_source",
+                "source_deployment_id": job.rollback_from_deployment_id,
+            })
+        } else {
+            serde_json::json!({
+                "trigger": "git_push",
+                "source": "webhook"
+            })
         };
 
         let new_deployment = deployments::ActiveModel {
@@ -849,10 +866,7 @@ async fn process_git_push_event(
             promoted_from_deployment_id: sea_orm::Set(None),
             started_at: sea_orm::Set(None),
             finished_at: sea_orm::Set(None),
-            context_vars: sea_orm::Set(Some(serde_json::json!({
-                "trigger": "git_push",
-                "source": "webhook"
-            }))),
+            context_vars: sea_orm::Set(Some(trigger_context)),
             deploying_at: sea_orm::Set(None),
             ready_at: sea_orm::Set(None),
             static_dir_location: sea_orm::Set(None),
@@ -1220,6 +1234,7 @@ mod tests {
             commit: "abc123".to_string(),
             project_id: 0,
             manual_trigger: false,
+            rollback_from_deployment_id: None,
         };
 
         // Try to find the project (should return None)

@@ -20,6 +20,15 @@ pub struct GitPushEventJob {
     /// pre-existing gate behaviour for them.
     #[serde(default)]
     pub manual_trigger: bool,
+    /// Set to the source deployment's id when this push is a rollback that
+    /// rebuilds from source (git projects). The deployment record created by
+    /// the pipeline is then marked `is_rollback` / `rolled_back_from_id` so the
+    /// UI and history show it as a rollback rather than a normal deploy.
+    ///
+    /// `None` for ordinary pushes. `#[serde(default)]` keeps older queued jobs
+    /// (no field) deserializing as non-rollback.
+    #[serde(default)]
+    pub rollback_from_deployment_id: Option<i32>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

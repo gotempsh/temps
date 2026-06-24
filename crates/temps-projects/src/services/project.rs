@@ -1822,6 +1822,7 @@ impl ProjectService {
             // Initial deployment is a user-initiated event (project creation),
             // not a git webhook — bypass automatic_deploy.
             manual_trigger: true,
+            rollback_from_deployment_id: None,
         };
 
         self.queue_service
@@ -1993,6 +1994,7 @@ impl ProjectService {
             // `trigger_pipeline` on the projects service is hit by the
             // "Deploy" button and the CLI — both are user-initiated.
             manual_trigger: true,
+            rollback_from_deployment_id: None,
         };
 
         // Send the job to the queue

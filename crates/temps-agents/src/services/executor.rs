@@ -2855,6 +2855,7 @@ impl AgentExecutor {
             // rules apply. The first-deploy exception covers a freshly
             // created preview env.
             manual_trigger: false,
+            rollback_from_deployment_id: None,
         });
 
         if let Err(e) = self.queue.send(push_job).await {

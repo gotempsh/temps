@@ -1002,6 +1002,22 @@ impl DeploymentService {
         tag: Option<String>,
         commit: Option<String>,
     ) -> Result<(), DeploymentError> {
+        self.trigger_pipeline_inner(project_id, environment_id, branch, tag, commit, None)
+            .await
+    }
+
+    /// Internal pipeline trigger that also carries an optional rollback marker.
+    /// `rollback_from_deployment_id` is `Some(id)` only for rebuild-from-source
+    /// rollbacks, which tags the resulting deployment as a rollback of `id`.
+    async fn trigger_pipeline_inner(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        branch: Option<String>,
+        tag: Option<String>,
+        commit: Option<String>,
+        rollback_from_deployment_id: Option<i32>,
+    ) -> Result<(), DeploymentError> {
         info!("Triggering pipeline for project_id: {}", project_id);
         let project = projects::Entity::find_by_id(project_id)
             .one(self.db.as_ref())
@@ -1041,6 +1057,7 @@ impl DeploymentService {
             project_id,
             // User-initiated trigger — bypasses environments.automatic_deploy.
             manual_trigger: true,
+            rollback_from_deployment_id,
         };
 
         tracing::debug!(
@@ -1125,19 +1142,98 @@ impl DeploymentService {
             )));
         }
 
-        // Ensure target deployment has an image to roll back to
-        let image_name = target_deployment.image_name.clone().ok_or_else(|| {
-            DeploymentError::Other(
-                "Target deployment has no image_name - cannot rollback".to_string(),
-            )
-        })?;
-
         let environment_id = target_deployment.environment_id;
 
         let project = projects::Entity::find_by_id(project_id)
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| DeploymentError::NotFound("Project not found".to_string()))?;
+
+        // --- Git projects: rebuild from source instead of reusing the image ---
+        //
+        // The image-reuse path below is fast but fragile: it redeploys the
+        // target deployment's stored Docker image, which the nightly cleanup
+        // prunes after ~7 days — so rolling back to anything older fails with
+        // "image no longer exists locally". It also skips the build + health
+        // pipeline and can't reconstruct static deployments.
+        //
+        // For git-sourced projects we instead re-run the full build pipeline at
+        // the target deployment's commit. This always works (no dependency on a
+        // surviving image), goes through the same health checks as a normal
+        // deploy, and rebuilds static bundles correctly. Non-git projects
+        // (docker_image / static_files / manual without a git ref) have no
+        // source to rebuild, so they fall through to image reuse.
+        let has_git_ref = target_deployment
+            .commit_sha
+            .as_ref()
+            .is_some_and(|c| !c.is_empty())
+            || target_deployment
+                .branch_ref
+                .as_ref()
+                .is_some_and(|b| !b.is_empty());
+
+        if project.source_type == temps_entities::source_type::SourceType::Git && has_git_ref {
+            info!(
+                "Rollback: project {} is git-sourced — rebuilding from source at commit {:?} (rolling back to #{})",
+                project_id, target_deployment.commit_sha, deployment_id
+            );
+
+            // Snapshot the latest deployment id BEFORE triggering, so we can
+            // identify the one the pipeline creates and return it.
+            let prev_max_id = deployments::Entity::find()
+                .filter(deployments::Column::ProjectId.eq(project_id))
+                .filter(deployments::Column::EnvironmentId.eq(environment_id))
+                .order_by_desc(deployments::Column::Id)
+                .one(self.db.as_ref())
+                .await?
+                .map(|d| d.id)
+                .unwrap_or(0);
+
+            self.trigger_pipeline_inner(
+                project_id,
+                environment_id,
+                target_deployment.branch_ref.clone(),
+                target_deployment.tag_ref.clone(),
+                target_deployment.commit_sha.clone(),
+                Some(deployment_id),
+            )
+            .await?;
+
+            // Anonymous telemetry: a rollback was initiated. No identifying props.
+            self.telemetry()
+                .report(temps_core::telemetry::TelemetryEvent::new(
+                    temps_core::telemetry::TelemetryEventKind::RollbackTriggered,
+                ));
+
+            // The pipeline created a new deployment row; return it so the API
+            // response carries the rollback deployment's id/status. It's the
+            // newest row for this environment above the prior max.
+            let created = deployments::Entity::find()
+                .filter(deployments::Column::ProjectId.eq(project_id))
+                .filter(deployments::Column::EnvironmentId.eq(environment_id))
+                .filter(deployments::Column::Id.gt(prev_max_id))
+                .order_by_desc(deployments::Column::Id)
+                .one(self.db.as_ref())
+                .await?;
+
+            let model = match created {
+                Some(dep) => dep,
+                // The job is queued; the row may not be visible yet. Surface the
+                // target as a stand-in rather than failing — the rollback is
+                // already in flight.
+                None => target_deployment,
+            };
+            return Ok(self
+                .map_db_deployment_to_deployment(model, false, None)
+                .await);
+        }
+
+        // Ensure target deployment has an image to roll back to
+        let image_name = target_deployment.image_name.clone().ok_or_else(|| {
+            DeploymentError::Other(
+                "Target deployment has no image_name - cannot rollback".to_string(),
+            )
+        })?;
 
         let environment = environments::Entity::find_by_id(environment_id)
             .one(self.db.as_ref())
@@ -3963,6 +4059,59 @@ mod tests {
             .await?
             .unwrap();
         assert_eq!(updated_environment.current_deployment_id, Some(result.id));
+
+        Ok(())
+    }
+
+    /// When the target deployment carries a git commit on a git-sourced
+    /// project, rollback should rebuild from source (enqueue a GitPushEvent)
+    /// rather than reuse the stored image. We assert it does NOT take the
+    /// image-reuse path: that path synchronously inserts a brand-new
+    /// deployment row (different id) and flips the environment pointer. The
+    /// rebuild path enqueues an async job, so within the test the only
+    /// deployments present are the originals — no extra image-reuse row.
+    #[tokio::test]
+    async fn test_rollback_rebuilds_from_source_for_git_projects(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        // setup_test_data creates a Git-source project (SourceType default).
+        let (_project, _environment, target_deployment) = setup_test_data(&db).await?;
+
+        // Give the target a real git commit so it's rebuildable from source.
+        let mut active: deployments::ActiveModel = target_deployment.clone().into();
+        active.commit_sha = Set(Some("abc1234deadbeef".to_string()));
+        active.branch_ref = Set(Some("main".to_string()));
+        let target_deployment = active.update(db.as_ref()).await?;
+
+        let count_before = deployments::Entity::find()
+            .filter(deployments::Column::ProjectId.eq(target_deployment.project_id))
+            .count(db.as_ref())
+            .await?;
+
+        let deployment_service = create_deployment_service_for_test(db.clone());
+
+        let result = deployment_service
+            .rollback_to_deployment(target_deployment.project_id, target_deployment.id)
+            .await?;
+
+        // The image-reuse path would have inserted a new deployment row and
+        // returned its (different) id. The rebuild path enqueues a job instead,
+        // so no synchronous row is added and we get the target back as a
+        // stand-in (the queued pipeline row isn't visible in-test).
+        let count_after = deployments::Entity::find()
+            .filter(deployments::Column::ProjectId.eq(target_deployment.project_id))
+            .count(db.as_ref())
+            .await?;
+        assert_eq!(
+            count_before, count_after,
+            "rebuild-from-source must not synchronously create an image-reuse deployment"
+        );
+        assert_eq!(
+            result.id, target_deployment.id,
+            "rebuild path returns the target as a stand-in while the job is queued"
+        );
 
         Ok(())
     }

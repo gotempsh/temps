@@ -585,6 +585,7 @@ mod tests {
             commit: "abc123def456".to_string(),
             project_id: 123,
             manual_trigger: false,
+            rollback_from_deployment_id: None,
         };
 
         // Publish job
@@ -740,6 +741,7 @@ mod tests {
             commit: "abc123".to_string(),
             project_id: 123,
             manual_trigger: false,
+            rollback_from_deployment_id: None,
         });
 
         let cert_job = Job::ProvisionCertificate(ProvisionCertificateJob {

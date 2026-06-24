@@ -4069,6 +4069,7 @@ impl GitProviderManager {
                 project_id: project.id,
                 // Real git provider webhook — honour automatic_deploy.
                 manual_trigger: false,
+                rollback_from_deployment_id: None,
             };
 
             if let Err(e) = self

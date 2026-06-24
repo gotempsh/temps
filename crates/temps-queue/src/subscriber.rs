@@ -25,6 +25,7 @@ mod tests {
             commit: "abc123".to_string(),
             project_id: 123,
             manual_trigger: false,
+            rollback_from_deployment_id: None,
         };
         queue.send(Job::GitPushEvent(git_push_job)).await.unwrap();
 
@@ -79,6 +80,7 @@ mod tests {
             commit: "def456".to_string(),
             project_id: 999,
             manual_trigger: false,
+            rollback_from_deployment_id: None,
         };
         queue.send(Job::GitPushEvent(git_push_job)).await.unwrap();
 
@@ -119,6 +121,7 @@ mod tests {
             commit: "xyz789".to_string(),
             project_id: 42,
             manual_trigger: false,
+            rollback_from_deployment_id: None,
         };
         queue.send(Job::GitPushEvent(git_push_job)).await.unwrap();
 
