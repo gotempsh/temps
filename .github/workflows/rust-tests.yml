@@ -365,7 +365,6 @@ jobs:
             cargo_args: >-
               test --no-fail-fast
               -p temps-deployments
-              -p temps-vulnerability-scanner
               -p temps-import-docker
               -p temps-migrations
               -p temps-database
@@ -376,6 +375,16 @@ jobs:
               -p temps-deployer
               -p temps-logs
               -p temps-projects
+            test_args: >-
+              --test-threads=1
+          - group: docker-scanner
+            # Trivy scanner integration tests use Docker but not the shared
+            # TimescaleDB fixture. Keep them out of the deployment/database
+            # group so scanner image/database behavior cannot mask deployment
+            # regressions or extend the serial DB test queue.
+            cargo_args: >-
+              test --no-fail-fast
+              -p temps-vulnerability-scanner
             test_args: >-
               --test-threads=1
           - group: docker-query

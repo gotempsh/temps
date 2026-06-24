@@ -114,10 +114,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the target database, preventing Postgres 18+ containers from reopening stale
   17-era PGDATA after a supposedly clean handoff.
 - **Docker CI integration groups are narrower**: the Rust workflow now splits
-  backup, query, domains, provider Docker, postgres-upgrade, and MariaDB PITR
-  tests into separate GitHub Actions groups, with container-heavy provider,
-  backup, deployments, domains, and upgrade groups serialized where needed to
-  avoid container-name, port, callback, and database-teardown contention.
+  backup, query, domains, provider Docker, vulnerability scanner,
+  postgres-upgrade, and MariaDB PITR tests into separate GitHub Actions groups,
+  with container-heavy provider, backup, scanner, deployments, domains, and
+  upgrade groups serialized where needed to avoid container-name, port,
+  callback, and database-teardown contention.
 
 ## [0.1.0-beta.38] - 2026-06-23
 

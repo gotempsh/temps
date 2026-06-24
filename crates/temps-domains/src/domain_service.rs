@@ -2286,10 +2286,6 @@ mod tests {
         let responder_listener =
             std::net::TcpListener::bind("0.0.0.0:0").expect("Cannot bind challenge responder");
         let responder_port = responder_listener.local_addr().unwrap().port();
-        // The host-gateway IP as seen from Docker containers on macOS Docker Desktop.
-        // Pebble's VA will connect to this IP:responder_port to validate the challenge.
-        let host_gateway_ip = "192.168.65.254";
-
         // ── 1b. Shared Docker network for Pebble ↔ challtestsrv DNS ───────────
         // Pebble's VA resolves the challenge hostname through challtestsrv's DNS
         // server. Talking to challtestsrv over a *host* port mapping is fragile
@@ -2339,6 +2335,26 @@ mod tests {
         println!(
             "challtestsrv mgmt port: {} (DNS reached via network '{}' alias '{}:8053')",
             challtestsrv_mgmt_port, network_name, challtestsrv_alias
+        );
+
+        let host_gateway_ip = docker
+            .inspect_network(
+                &network_name,
+                None::<bollard::query_parameters::InspectNetworkOptions>,
+            )
+            .await
+            .expect("inspect Pebble E2E docker network")
+            .ipam
+            .and_then(|ipam| ipam.config)
+            .and_then(|configs| {
+                configs
+                    .into_iter()
+                    .find_map(|config| config.gateway.filter(|gateway| !gateway.is_empty()))
+            })
+            .expect("Pebble E2E docker network must expose an IPAM gateway");
+        println!(
+            "Docker network '{}' gateway for HTTP-01 callback: {}",
+            network_name, host_gateway_ip
         );
 
         // ── 3. Register test hostname DNS A-record in challtestsrv ────────────
