@@ -11,7 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Changed
--
+- **Rollback rebuilds from source for git projects instead of reusing the
+  stored image.** Reusing the target deployment's Docker image failed once the
+  nightly cleanup pruned it (`image no longer exists locally` for anything older
+  than ~7 days), skipped readiness checks (`health_check_path` was `None`), and
+  couldn't reconstruct static deployments. Git-sourced rollbacks now re-run the
+  full build pipeline at the target deployment's commit — always available, with
+  the same build + health-check pipeline as a normal deploy. Non-git projects
+  (docker_image / static_files / manual without a git ref) keep the image-reuse
+  path unchanged (#155).
 
 ### Fixed
 - **`docker-providers` CI no longer hangs/flakes under load.** The heavyweight
