@@ -10,6 +10,7 @@ import {
   succeedSpinner,
   failSpinner,
   updateSpinner,
+  isQuietMode,
 } from '../../ui/spinner.js'
 import {
   success,
@@ -235,7 +236,15 @@ export async function deployLocalImage(options: DeployLocalImageOptions): Promis
     )
     newline()
 
-    startSpinner('Building Docker image...')
+    // Stream the full Docker build log instead of collapsing it into a single
+    // spinner line. A spinner can't coexist with multi-line streamed output —
+    // it would fight the build lines for the cursor — so we stop it and print
+    // each line dimmed, like subordinate log output. Quiet mode stays silent.
+    const quiet = isQuietMode()
+    if (!quiet) {
+      info('Building Docker image...')
+      newline()
+    }
 
     try {
       await dockerBuild({
@@ -244,16 +253,18 @@ export async function deployLocalImage(options: DeployLocalImageOptions): Promis
         tag: imageName,
         buildArgs: allBuildArgs,
         onOutput: (line) => {
-          const trimmed = line.trim()
-          if (trimmed) {
-            updateSpinner(`Building: ${trimmed.substring(0, 60)}${trimmed.length > 60 ? '...' : ''}`)
+          const trimmed = line.trimEnd()
+          if (trimmed && !quiet) {
+            console.log(colors.dim(`  ${trimmed}`))
           }
         },
       })
-      succeedSpinner(`Image built: ${imageName}`)
+      if (!quiet) newline()
+      success(`Image built: ${imageName}`)
       didBuild = true
     } catch (err) {
-      failSpinner('Docker build failed')
+      if (!quiet) newline()
+      warning('Docker build failed')
       if (err instanceof Error) {
         warning(err.message)
       }
@@ -459,6 +470,11 @@ async function dockerBuild(options: DockerBuildOptions): Promise<void> {
   return new Promise((resolve, reject) => {
     const args = [
       'build',
+      // Force the plain, line-oriented BuildKit renderer. The default `auto`
+      // renderer collapses into a single rewriting line when stdout isn't a
+      // TTY (which it isn't — we pipe it), so the per-step build log is lost.
+      // `plain` emits every step/line, which we stream through to the user.
+      '--progress=plain',
       '-f', options.dockerfile,
       '-t', options.tag,
     ]
@@ -471,6 +487,10 @@ async function dockerBuild(options: DockerBuildOptions): Promise<void> {
 
     const docker = spawn('docker', args, {
       stdio: ['ignore', 'pipe', 'pipe'],
+      // BuildKit's plain renderer keys off whether *its* stdout is a TTY;
+      // setting this env makes it deterministic regardless of how docker is
+      // invoked, and keeps colour codes out of the piped stream.
+      env: { ...process.env, BUILDKIT_PROGRESS: 'plain' },
     })
 
     let stderr = ''
