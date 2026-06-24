@@ -7,7 +7,6 @@ use schemars::JsonSchema;
 use sea_orm::{prelude::*, *};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::net::TcpListener;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -228,13 +227,7 @@ fn example_docker_image() -> &'static str {
     "gotempsh/postgres-walg:18-bookworm"
 }
 
-fn is_port_available(port: u16) -> bool {
-    TcpListener::bind(("0.0.0.0", port)).is_ok()
-}
-
-fn find_available_port(start_port: u16) -> Option<u16> {
-    (start_port..start_port + 100).find(|&port| is_port_available(port))
-}
+use super::port_util::find_available_port;
 
 pub struct PostgresService {
     name: String,

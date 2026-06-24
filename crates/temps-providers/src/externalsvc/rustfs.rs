@@ -18,7 +18,6 @@ use sea_orm::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{self};
 use std::collections::HashMap;
-use std::net::TcpListener;
 use std::sync::Arc;
 use std::time::Duration;
 use temps_core::EncryptionService;
@@ -292,80 +291,7 @@ fn example_image() -> &'static str {
     "rustfs/rustfs:latest"
 }
 
-fn is_port_available(port: u16) -> bool {
-    TcpListener::bind(("0.0.0.0", port)).is_ok()
-}
-
-fn find_available_port(start_port: u16) -> Option<u16> {
-    (start_port..start_port + 1000).find(|&port| is_port_available(port))
-}
-
-/// Check if a specific port is available (both OS and Docker)
-async fn is_port_available_async(docker: &Docker, port: u16) -> bool {
-    // Check OS-level availability first
-    if !is_port_available(port) {
-        return false;
-    }
-
-    // Check Docker containers
-    let containers = match docker
-        .list_containers(Some(bollard::query_parameters::ListContainersOptions {
-            all: true,
-            ..Default::default()
-        }))
-        .await
-    {
-        Ok(c) => c,
-        Err(_) => return true, // If we can't check Docker, assume available
-    };
-
-    for container in containers {
-        if let Some(port_mappings) = container.ports {
-            for port_mapping in port_mappings {
-                if let Some(public_port) = port_mapping.public_port {
-                    if public_port == port {
-                        return false;
-                    }
-                }
-            }
-        }
-    }
-
-    true
-}
-
-/// Async version that checks both OS and Docker port availability
-async fn find_available_port_async(docker: &Docker, start_port: u16) -> Option<u16> {
-    // Get all ports currently used by Docker containers
-    let docker_ports: std::collections::HashSet<u16> = {
-        let containers = match docker
-            .list_containers(Some(bollard::query_parameters::ListContainersOptions {
-                all: true,
-                ..Default::default()
-            }))
-            .await
-        {
-            Ok(c) => c,
-            Err(_) => return find_available_port(start_port), // Fallback to OS-only check
-        };
-
-        let mut ports = std::collections::HashSet::new();
-        for container in containers {
-            if let Some(port_mappings) = container.ports {
-                for port_mapping in port_mappings {
-                    if let Some(public_port) = port_mapping.public_port {
-                        ports.insert(public_port);
-                    }
-                }
-            }
-        }
-        ports
-    };
-
-    // Find a port that's available both at OS level and not used by Docker
-    (start_port..start_port + 1000)
-        .find(|&port| !docker_ports.contains(&port) && is_port_available(port))
-}
+use super::port_util::{find_available_port, find_available_port_async, is_port_available_async};
 
 pub struct RustfsService {
     name: String,

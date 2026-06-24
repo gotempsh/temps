@@ -966,12 +966,7 @@ fn is_empty_value(value: Option<&JsonValue>) -> bool {
     }
 }
 
-fn find_available_port(start_port: u16) -> Option<u16> {
-    use std::net::TcpListener;
-    // Simple OS-level port check - Docker port conflicts will be handled at container creation time
-    // with proper error handling and retry logic
-    (start_port..start_port + 1000).find(|&port| TcpListener::bind(("0.0.0.0", port)).is_ok())
-}
+use crate::externalsvc::port_util::find_available_port;
 
 fn generate_secure_password() -> String {
     use rand::Rng;

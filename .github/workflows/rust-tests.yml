@@ -321,13 +321,29 @@ jobs:
           - group: docker-providers
             # temps-providers with Docker tests enabled.
             # NOTE: orchestrator_* tests run in a dedicated `postgres-upgrades`
-            # group below (serial, long timeout, real pg17→pg18 containers).
+            # group, and *_backup_and_restore_to_s3 tests in a dedicated
+            # `docker-backups` group (both serial, long-running, container-heavy).
             # Skip them here so this group stays fast and parallel-safe.
             cargo_args: >-
               test --no-fail-fast --lib
               -p temps-providers --features docker-tests
             test_args: >-
               --skip orchestrator_
+              --skip backup_and_restore_to_s3
+          - group: docker-backups
+            # Heavyweight S3 backup/restore integration tests
+            # (test_{mongodb,postgres,redis,s3}_backup_and_restore_to_s3). Each
+            # spins up a MinIO container plus a service container and streams a
+            # real wal-g/mongodump backup, so running them in parallel saturates
+            # Docker and races for host ports (`port is already allocated`),
+            # causing 300s hangs. --test-threads=1 guarantees serial execution.
+            cargo_args: >-
+              test --no-fail-fast --lib
+              -p temps-providers --features docker-tests
+              backup_and_restore_to_s3
+            test_args: >-
+              --nocapture
+              --test-threads=1
           - group: postgres-upgrades
             # PostgreSQL major-version upgrade orchestrator integration tests.
             # Each test pulls pg17 + pg18 images and runs a real dump/restore,

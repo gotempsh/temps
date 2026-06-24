@@ -7,6 +7,7 @@ use utoipa::ToSchema;
 pub mod cluster_role;
 pub mod exec_util;
 pub mod mongodb;
+pub mod port_util;
 pub mod postgres;
 pub mod postgres_cluster;
 pub mod postgres_role_reconciler;

@@ -11,7 +11,6 @@ use sea_orm::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{self};
 use std::collections::HashMap;
-use std::net::TcpListener;
 use std::sync::Arc;
 use std::time::Duration;
 use temps_core::EncryptionService;
@@ -161,13 +160,7 @@ fn example_image() -> &'static str {
     "minio/minio:RELEASE.2025-09-07T16-13-09Z"
 }
 
-fn is_port_available(port: u16) -> bool {
-    TcpListener::bind(("0.0.0.0", port)).is_ok()
-}
-
-fn find_available_port(start_port: u16) -> Option<u16> {
-    (start_port..start_port + 100).find(|&port| is_port_available(port))
-}
+use super::port_util::find_available_port;
 
 pub struct S3Service {
     name: String,
