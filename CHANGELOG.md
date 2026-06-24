@@ -8,12 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
--
+- **CLI: static deploys in `temps up`.** The setup wizard now offers a "Static
+  (upload a pre-built folder)" option that creates a `static_files` project and
+  uploads a built folder — no Docker, no git. It auto-detects the output folder
+  (`dist`/`build`/`out`/`public`/`_site`/`output`, or a root `index.html`) and
+  lets you pick a custom one. New `--static` / `--static-dir` flags
+  (`@temps-sdk/cli`, #154).
 
 ### Changed
--
+- **CLI: the default project is scoped per instance.** `defaultProject` now
+  lives on the active CLI context instead of one global key, so a project
+  created on one Temps server no longer leaks as the default on another (which
+  printed `Using project … (from global-config)` and 404'd). `temps up` also
+  falls back to the setup wizard when a stale default no longer resolves, rather
+  than dead-ending on the 404 (`@temps-sdk/cli`, #154).
 
 ### Fixed
+- **CLI: `temps up` / `deploy:local-image` now stream the full Docker build
+  log.** Build output was collapsed into a single rewriting spinner line, so the
+  per-step BuildKit log was lost (you'd only see e.g. `#25 exporting layers`).
+  The build now runs with `--progress=plain` and streams each line
+  (`@temps-sdk/cli`, #154).
 - **`docker-providers` CI no longer hangs/flakes under load.** The heavyweight
   `test_{mongodb,postgres,redis,s3}_backup_and_restore_to_s3` tests each spin up
   a MinIO container plus a service container and stream a real wal-g/mongodump
