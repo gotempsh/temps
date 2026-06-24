@@ -14,7 +14,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **`docker-providers` CI no longer hangs/flakes under load.** The heavyweight
+  `test_{mongodb,postgres,redis,s3}_backup_and_restore_to_s3` tests each spin up
+  a MinIO container plus a service container and stream a real wal-g/mongodump
+  backup; running them in parallel saturated Docker and raced for host ports
+  (`Bind for 0.0.0.0:<port> failed: port is already allocated`), causing 300s
+  timeouts (most visibly the MongoDB backup step). They now run in a dedicated
+  serial `docker-backups` CI group (`--test-threads=1`), mirroring the existing
+  `postgres-upgrades` group, and are skipped from the parallel `docker-providers`
+  group.
+- **Host-port selection is less collision-prone.** The per-service
+  `find_available_port` helpers (mongodb/postgres/redis/s3/rustfs and
+  `parameter_strategies`) are consolidated into `externalsvc::port_util`, which
+  advances a process-wide offset so concurrent allocations diverge instead of all
+  landing on the same base port, and exposes a Docker-aware variant that skips
+  ports already published by running containers.
 
 
 ## [0.1.0-beta.38] - 2026-06-23
