@@ -1,5 +1,7 @@
 import type { Command } from 'commander'
 import { config, credentials, type TempsConfig } from '../config/store.js'
+import { setDefaultProject } from '../config/resolve-project.js'
+import { getActiveDefaultProjectSync } from '../config/contexts.js'
 import { promptUrl, promptSelect, promptConfirm, promptPassword } from '../ui/prompts.js'
 import { success, info, colors, newline, header, keyValue, icons, box } from '../ui/output.js'
 import { shouldBeInteractive } from '../utils/tty.js'
@@ -253,11 +255,18 @@ function getConfigValue(key: string): void {
     process.exit(1)
   }
 
+  // defaultProject is scoped per context — read the active context's value,
+  // falling back to the legacy global key for older configs.
+  if (key === 'defaultProject') {
+    console.log(getActiveDefaultProjectSync() ?? config.get('defaultProject') ?? '')
+    return
+  }
+
   const value = config.get(key as keyof TempsConfig)
   console.log(value ?? '')
 }
 
-function setConfigValue(key: string, value: string): void {
+async function setConfigValue(key: string, value: string): Promise<void> {
   const validKeys: (keyof TempsConfig)[] = [
     'apiUrl',
     'defaultProject',
@@ -270,6 +279,14 @@ function setConfigValue(key: string, value: string): void {
     console.error(colors.error(`Unknown configuration key: ${key}`))
     console.error(colors.muted(`Valid keys: ${validKeys.join(', ')}`))
     process.exit(1)
+  }
+
+  // defaultProject is scoped per context — write it to the active context
+  // (falls back to the legacy global key when no context is active).
+  if (key === 'defaultProject') {
+    await setDefaultProject(value)
+    success(`Set ${key} = ${value}`)
+    return
   }
 
   // Type conversion

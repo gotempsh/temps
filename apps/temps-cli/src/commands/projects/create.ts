@@ -1,4 +1,5 @@
-import { requireAuth, config } from '../../config/store.js'
+import { requireAuth } from '../../config/store.js'
+import { setDefaultProject } from '../../config/resolve-project.js'
 import {
   promptText,
   promptConfirm,
@@ -284,7 +285,7 @@ export async function create(options: CreateOptions): Promise<void> {
 
     // Ask if user wants to set as default (auto-set with --yes)
     if (skipPrompts) {
-      config.set('defaultProject', project.slug)
+      await setDefaultProject(project.slug)
       success(`Default project set to "${project.slug}"`)
     } else {
       const setDefault = await promptConfirm({
@@ -293,7 +294,7 @@ export async function create(options: CreateOptions): Promise<void> {
       })
 
       if (setDefault) {
-        config.set('defaultProject', project.slug)
+        await setDefaultProject(project.slug)
         success(`Default project set to "${project.slug}"`)
       }
     }
@@ -430,7 +431,7 @@ async function createManualProject(
 
     // Ask if user wants to set as default (auto-set with --yes)
     if (skipPrompts) {
-      config.set('defaultProject', project.slug)
+      await setDefaultProject(project.slug)
       success(`Default project set to "${project.slug}"`)
     } else {
       const setDefault = await promptConfirm({
@@ -439,7 +440,7 @@ async function createManualProject(
       })
 
       if (setDefault) {
-        config.set('defaultProject', project.slug)
+        await setDefaultProject(project.slug)
         success(`Default project set to "${project.slug}"`)
       }
     }

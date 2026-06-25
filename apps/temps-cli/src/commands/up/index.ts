@@ -25,6 +25,8 @@ interface UpOptions {
   name?: string
   preset?: string
   manual?: boolean
+  static?: boolean
+  staticDir?: string
   noServices?: boolean
   wait?: boolean
   yes?: boolean
@@ -44,6 +46,8 @@ async function up(projectArg: string | undefined, options: UpOptions): Promise<v
       preset: options.preset,
       branch: options.branch,
       manual: options.manual,
+      static: options.static,
+      staticDir: options.staticDir,
       noServices: options.noServices,
       yes: options.yes,
     })
@@ -78,13 +82,39 @@ async function up(projectArg: string | undefined, options: UpOptions): Promise<v
     })
 
     if (error || !data) {
-      const rawApiUrl = config.get('apiUrl')
-      const baseUrl = client.getConfig().baseUrl ?? rawApiUrl
-      failSpinner(`Project "${resolved.slug}" not found`)
-      info(`API: ${colors.muted(`${baseUrl}/projects/by-slug/${resolved.slug}`)}`)
-      if (error) {
-        info(`Error: ${getErrorMessage(error)}`)
+      // The project didn't resolve to a real project on this server. When the
+      // slug came from an explicit --project flag, that's a genuine error —
+      // the user named something that doesn't exist. But when it came from a
+      // saved default (context-default / global-config / local-config), it's
+      // almost always a stale default left over from another instance, so
+      // fall through to the setup wizard and offer to create one instead of
+      // dead-ending on a 404.
+      if (resolved.source === 'flag') {
+        const rawApiUrl = config.get('apiUrl')
+        const baseUrl = client.getConfig().baseUrl ?? rawApiUrl
+        failSpinner(`Project "${resolved.slug}" not found`)
+        info(`API: ${colors.muted(`${baseUrl}/projects/by-slug/${resolved.slug}`)}`)
+        if (error) {
+          info(`Error: ${getErrorMessage(error)}`)
+        }
+        return
       }
+
+      failSpinner(`No project "${resolved.slug}" on this server (from ${resolved.source})`)
+      info('Setting up a new project instead...')
+      newline()
+
+      const result = await runSetupWizard({
+        name: options.name,
+        preset: options.preset,
+        branch: options.branch,
+        manual: options.manual,
+        noServices: options.noServices,
+        yes: options.yes,
+      })
+
+      // Wizard (when not cancelled) already triggered the deploy and saved config.
+      void result
       return
     }
 
@@ -325,6 +355,8 @@ export function registerUpCommand(program: Command): void {
     .option('-n, --name <name>', 'Project name (for new projects)')
     .option('--preset <preset>', 'Framework preset slug (skip auto-detection)')
     .option('--manual', 'Use manual deployment mode (no git)')
+    .option('--static', 'Deploy a pre-built static folder (no Docker, no git)')
+    .option('--static-dir <dir>', 'Folder to upload for static deploys (auto-detected by default)')
     .option('--no-services', 'Skip external service setup')
     .option('--no-wait', 'Do not wait for deployment to complete')
     .option('-y, --yes', 'Skip confirmation prompts')

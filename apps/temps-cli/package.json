@@ -1,6 +1,6 @@
 {
   "name": "@temps-sdk/cli",
-  "version": "0.1.26",
+  "version": "0.1.28",
   "description": "CLI for Temps deployment platform",
   "type": "module",
   "bin": {

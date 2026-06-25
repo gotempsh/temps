@@ -21,6 +21,11 @@
  *                    the key in the web UI without revealing the secret
  *   - expiresAt      ISO 8601 timestamp when the API key expires
  *   - isActive       only one context is the active one at a time
+ *   - defaultProject slug of the project commands target when none is given
+ *                    on the CLI / in .temps/config.json. Scoped per context
+ *                    because a project only exists on the server it was
+ *                    created against — a global default would leak across
+ *                    instances and 404.
  */
 
 import { readFile, writeFile, mkdir, unlink } from 'node:fs/promises'
@@ -35,6 +40,7 @@ export interface CliContext {
   keyPrefix?: string
   expiresAt?: string
   isActive?: boolean
+  defaultProject?: string
 }
 
 function getContextsPath(): string {
@@ -70,6 +76,7 @@ async function saveContexts(contexts: CliContext[]): Promise<void> {
     if (c.keyPrefix !== undefined) out.keyPrefix = c.keyPrefix
     if (c.expiresAt !== undefined) out.expiresAt = c.expiresAt
     if (c.isActive !== undefined) out.isActive = c.isActive
+    if (c.defaultProject !== undefined) out.defaultProject = c.defaultProject
     return out
   })
   await writeFile(path, JSON.stringify(normalized, null, 2) + '\n', { mode: 0o600 })
@@ -243,6 +250,35 @@ export function defaultContextName(url: string): string {
 /** Path to the contexts file (for display in UI / errors). */
 export function contextsPath(): string {
   return getContextsPath()
+}
+
+/**
+ * Read the active context's default project slug, honoring `TEMPS_CONTEXT`.
+ * Returns undefined when there's no active context or it has no default —
+ * callers then fall back to the legacy global key in `config/store.ts`.
+ */
+export function getActiveDefaultProjectSync(): string | undefined {
+  return getActiveContextSync()?.defaultProject
+}
+
+/**
+ * Set (or clear, with `undefined`) the default project on the active context.
+ * No-op returning false when there's no active context to attach it to.
+ * Does not change which context is active.
+ */
+export async function setActiveDefaultProject(slug: string | undefined): Promise<boolean> {
+  const contexts = await loadContexts()
+  const active = pickActiveContext(contexts)
+  if (!active) return false
+  const target = contexts.find((c) => c.name === active.name)
+  if (!target) return false
+  if (slug) {
+    target.defaultProject = slug
+  } else {
+    delete target.defaultProject
+  }
+  await saveContexts(contexts)
+  return true
 }
 
 /**

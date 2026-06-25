@@ -1,5 +1,6 @@
 import { requireAuth, config } from '../../config/store.js'
-import { requireProjectSlug } from '../../config/resolve-project.js'
+import { requireProjectSlug, setDefaultProject } from '../../config/resolve-project.js'
+import { getActiveDefaultProjectSync } from '../../config/contexts.js'
 import { promptConfirm } from '../../ui/prompts.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { success, warning, newline, colors, info } from '../../ui/output.js'
@@ -65,7 +66,12 @@ export async function remove(options: DeleteOptions): Promise<void> {
 
   success(`Project "${projectIdOrName}" deleted`)
 
-  // Clear default if this was the default project
+  // Clear the default if this was it — check both the active context's
+  // default (the per-server location new writes go to) and the legacy
+  // global key (for configs written before defaults were scoped).
+  if (getActiveDefaultProjectSync() === projectIdOrName) {
+    await setDefaultProject(undefined)
+  }
   if (config.get('defaultProject') === projectIdOrName) {
     config.set('defaultProject', undefined)
   }
