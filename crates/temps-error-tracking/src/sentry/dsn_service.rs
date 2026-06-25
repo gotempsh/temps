@@ -6,6 +6,27 @@ use temps_entities::{project_dsns, projects};
 
 use super::types::{ParsedDSN, ProjectDSN, SentryIngesterError};
 
+/// Build a Sentry-compatible DSN string from the instance base URL.
+///
+/// Sentry SDKs derive the ingest URL (host, **port**, and scheme) from the DSN
+/// itself, so the DSN must preserve all three from `base_url`. Earlier code
+/// force-`https`'d and stripped `:8080`, which sent events to the wrong
+/// scheme/port (e.g. a local instance at `http://host.docker.internal:8080`
+/// produced `https://…@host.docker.internal/4` → unreachable). This keeps
+/// `{scheme}://{public_key}@{host[:port]}/{project_id}` intact.
+fn build_dsn(base_url: &str, public_key: &str, project_id: i32) -> String {
+    let (scheme, rest) = if let Some(r) = base_url.strip_prefix("https://") {
+        ("https", r)
+    } else if let Some(r) = base_url.strip_prefix("http://") {
+        ("http", r)
+    } else {
+        ("https", base_url)
+    };
+    // Keep host[:port]; drop any path / trailing slash.
+    let host = rest.split('/').next().unwrap_or(rest);
+    format!("{}://{}@{}/{}", scheme, public_key, host, project_id)
+}
+
 /// Service for managing Data Source Names (DSNs) for error tracking
 pub struct DSNService {
     db: Arc<DatabaseConnection>,
@@ -55,14 +76,8 @@ impl DSNService {
 
         let dsn_model = new_dsn.insert(self.db.as_ref()).await?;
 
-        // Build DSN in Sentry-compatible format
-        // Format: https://PUBLIC_KEY@HOST/PROJECT_ID
-        let host = base_url
-            .replace("https://", "")
-            .replace("http://", "")
-            .replace(":8080", ""); // Remove common dev port
-
-        let dsn = format!("https://{}@{}/{}", dsn_model.public_key, host, project_id);
+        // Build DSN preserving scheme + host + port (see build_dsn).
+        let dsn = build_dsn(base_url, &dsn_model.public_key, project_id);
 
         Ok(ProjectDSN {
             id: dsn_model.id,
@@ -105,19 +120,8 @@ impl DSNService {
         }
 
         if let Some(existing_dsn) = query.one(self.db.as_ref()).await? {
-            // Return existing DSN
-            let (protocol, host_with_port) = if base_url.starts_with("https://") {
-                ("https", base_url.strip_prefix("https://").unwrap())
-            } else if base_url.starts_with("http://") {
-                ("http", base_url.strip_prefix("http://").unwrap())
-            } else {
-                ("https", base_url)
-            };
-
-            let dsn = format!(
-                "{}://{}@{}/{}",
-                protocol, existing_dsn.public_key, host_with_port, project_id
-            );
+            // Return existing DSN (scheme + host + port preserved, see build_dsn).
+            let dsn = build_dsn(base_url, &existing_dsn.public_key, project_id);
 
             return Ok(ProjectDSN {
                 id: existing_dsn.id,
@@ -314,13 +318,8 @@ impl DSNService {
 
         let updated_dsn = dsn_update.update(self.db.as_ref()).await?;
 
-        // Build new DSN string
-        let host = base_url
-            .replace("https://", "")
-            .replace("http://", "")
-            .replace(":8080", "");
-
-        let dsn = format!("https://{}@{}/{}", updated_dsn.public_key, host, project_id);
+        // Build new DSN string preserving scheme + host + port (see build_dsn).
+        let dsn = build_dsn(base_url, &updated_dsn.public_key, project_id);
 
         Ok(ProjectDSN {
             id: updated_dsn.id,
@@ -416,6 +415,28 @@ mod tests {
         TestDatabase::with_migrations()
             .await
             .expect("Failed to create test database")
+    }
+
+    #[test]
+    fn build_dsn_preserves_scheme_host_and_port() {
+        // Local dev: http + explicit port must survive (Sentry SDK derives the
+        // ingest host/port/scheme from the DSN).
+        assert_eq!(
+            build_dsn("http://host.docker.internal:8080", "pk", 4),
+            "http://pk@host.docker.internal:8080/4"
+        );
+        // Production: https + default port → no port, https preserved.
+        assert_eq!(
+            build_dsn("https://temps.sh", "pk", 7),
+            "https://pk@temps.sh/7"
+        );
+        // Trailing slash / path is dropped, port kept.
+        assert_eq!(
+            build_dsn("http://localho.st:8443/", "pk", 1),
+            "http://pk@localho.st:8443/1"
+        );
+        // Scheme-less base falls back to https.
+        assert_eq!(build_dsn("example.com:9000", "pk", 2), "https://pk@example.com:9000/2");
     }
 
     async fn create_test_project(db: &Arc<DatabaseConnection>) -> i32 {
