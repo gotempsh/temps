@@ -1,6 +1,7 @@
 import { EnvironmentResponse, ProjectResponse } from '@/api/client'
 import {
   cancelDeploymentMutation,
+  deployFromImageMutation,
   getEnvironmentsOptions,
   getProjectDeploymentsOptions,
   promoteDeploymentMutation,
@@ -160,6 +161,20 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
     },
   })
 
+  // Redeploy path for docker_image projects: re-pull the prebuilt image
+  // instead of running the git pipeline (which has no commit/repo to build).
+  const redeployImage = useMutation({
+    ...deployFromImageMutation(),
+    meta: {
+      errorTitle: 'Failed to redeploy image',
+    },
+    onSuccess: () => {
+      toast.success('Deployment triggered successfully')
+      setIsRedeployModalOpen(false)
+      refetch()
+    },
+  })
+
   const cancelDeployment = useMutation({
     ...cancelDeploymentMutation(),
     meta: {
@@ -210,6 +225,22 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
     },
   })
 
+  // Resolve the prebuilt image ref for a docker_image project: prefer the
+  // selected deployment's image, else the most recent deployment that has one.
+  const resolveImageRef = useCallback((): string | undefined => {
+    const deployments = deploymentsData?.deployments ?? []
+    if (selectedDeployment != null) {
+      const sel = deployments.find((d) => d.id === selectedDeployment)
+      if (sel?.metadata?.externalImageRef) return sel.metadata.externalImageRef
+    }
+    return (
+      deployments.find((d) => d.metadata?.externalImageRef)?.metadata
+        ?.externalImageRef ?? undefined
+    )
+  }, [deploymentsData?.deployments, selectedDeployment])
+
+  const imageRef = resolveImageRef()
+
   const handleRedeploy = async ({
     branch,
     commit,
@@ -221,6 +252,20 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
     tag?: string
     environmentId: number
   }) => {
+    // docker_image projects re-pull the prebuilt image; git projects run the pipeline.
+    if (project.source_type === 'docker_image') {
+      const ref = resolveImageRef()
+      if (!ref) {
+        toast.error('No image reference found for this project')
+        return
+      }
+      await redeployImage.mutateAsync({
+        path: { project_id: project.id, environment_id: environmentId },
+        body: { image_ref: ref },
+      })
+      return
+    }
+
     await createDeployment.mutateAsync({
       path: { id: project.id },
       body: {
@@ -414,7 +459,8 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
               (d) => d.id === selectedDeployment
             )?.environment_id ?? undefined
           }
-          isLoading={createDeployment.isPending}
+          isLoading={createDeployment.isPending || redeployImage.isPending}
+          imageRef={imageRef}
         />
       </>
     )

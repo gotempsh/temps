@@ -45,6 +45,13 @@ interface RedeploymentModalProps {
   defaultTag?: string
   isLoading?: boolean
   mode?: 'new' | 'redeploy' // 'new' = full form, 'redeploy' = simple confirmation
+  /**
+   * Prebuilt image reference for docker_image projects. When the project's
+   * source_type is `docker_image`, the modal shows an image-deploy view
+   * (image + environment, no branch/commit/tag) and the parent re-pulls this
+   * image via deploy_from_image instead of the git pipeline.
+   */
+  imageRef?: string | null
 }
 
 export function RedeploymentModal({
@@ -59,7 +66,11 @@ export function RedeploymentModal({
   defaultType,
   isLoading,
   mode = 'new',
+  imageRef,
 }: RedeploymentModalProps) {
+  // Image-based (docker_image) projects deploy a prebuilt image, not a git
+  // ref — the parent routes confirmation through deploy_from_image.
+  const isImageDeploy = project?.source_type === 'docker_image'
   // Fetch project details to get repo info and main branch
   const projectQuery = useQuery({
     ...getProjectBySlugOptions({
@@ -153,6 +164,19 @@ export function RedeploymentModal({
   }
 
   const handleConfirm = async () => {
+    // Image-based projects: only the environment matters; the parent re-pulls
+    // the prebuilt image. In redeploy mode the environment is fixed; in new
+    // mode the user picks it.
+    if (isImageDeploy) {
+      const envId = mode === 'redeploy' ? defaultEnvironment : effectiveEnvironment
+      if (!envId) {
+        toast.error('No environment specified for deployment')
+        return
+      }
+      await onConfirm({ environmentId: envId })
+      return
+    }
+
     // In redeploy mode, use the default values directly
     if (mode === 'redeploy') {
       if (!defaultEnvironment) {
@@ -210,8 +234,81 @@ export function RedeploymentModal({
           </DialogTitle>
         </DialogHeader>
 
-        {/* Simplified view for redeploy mode */}
-        {mode === 'redeploy' ? (
+        {/* Image-deploy view (docker_image projects): re-pull the prebuilt
+            image; no branch/commit/tag. */}
+        {isImageDeploy ? (
+          <div className="space-y-4">
+            <p className="text-sm text-muted-foreground">
+              {mode === 'redeploy'
+                ? 'This will re-pull and run the prebuilt image:'
+                : 'Deploy the prebuilt image:'}
+            </p>
+            <div className="space-y-3 rounded-md border bg-muted/50 p-4">
+              <div className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-2">
+                <div className="text-sm font-medium">Image:</div>
+                <div className="truncate text-sm font-mono" title={imageRef || ''}>
+                  {imageRef || 'N/A'}
+                </div>
+                {mode === 'redeploy' ? (
+                  <>
+                    <div className="text-sm font-medium">Environment:</div>
+                    <div className="text-sm">{environmentName || 'Loading...'}</div>
+                  </>
+                ) : null}
+              </div>
+            </div>
+            {mode !== 'redeploy' && (
+              <div className="space-y-2">
+                <Label htmlFor="image-environment">Environment</Label>
+                <Select
+                  value={effectiveEnvironment?.toString() || ''}
+                  onValueChange={(value) =>
+                    setSelectedEnvironment(value ? parseInt(value) : null)
+                  }
+                  disabled={environmentsQuery.isLoading}
+                >
+                  <SelectTrigger>
+                    <SelectValue
+                      placeholder={
+                        environmentsQuery.isLoading
+                          ? 'Loading...'
+                          : 'Select environment'
+                      }
+                    />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {environmentsQuery.data?.map((env: EnvironmentResponse) => (
+                      <SelectItem key={env.id} value={env.id.toString()}>
+                        {env.name || env.slug}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            )}
+            <DialogFooter>
+              <Button variant="outline" onClick={onClose} disabled={isLoading}>
+                Cancel
+              </Button>
+              <Button
+                onClick={handleConfirm}
+                disabled={
+                  isLoading ||
+                  !imageRef ||
+                  (mode === 'redeploy' ? !defaultEnvironment : !effectiveEnvironment)
+                }
+              >
+                {isLoading
+                  ? mode === 'redeploy'
+                    ? 'Redeploying...'
+                    : 'Deploying...'
+                  : mode === 'redeploy'
+                    ? 'Redeploy'
+                    : 'Deploy'}
+              </Button>
+            </DialogFooter>
+          </div>
+        ) : mode === 'redeploy' ? (
           <div className="space-y-4">
             <p className="text-sm text-muted-foreground">
               This will redeploy using the following configuration:

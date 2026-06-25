@@ -1,6 +1,7 @@
 import { ProjectResponse } from '@/api/client'
 import {
   cancelDeploymentMutation,
+  deployFromImageMutation,
   getDeploymentOptions,
   getSettingsOptions,
   pauseDeploymentMutation,
@@ -107,6 +108,18 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
     },
   })
 
+  // docker_image projects re-pull the prebuilt image instead of the git pipeline.
+  const redeployImage = useMutation({
+    ...deployFromImageMutation(),
+    meta: {
+      errorTitle: 'Failed to redeploy image',
+    },
+    onSuccess: () => {
+      toast.success('Deployment created successfully')
+      setIsRedeployModalOpen(false)
+    },
+  })
+
   const pauseDeployment = useMutation({
     ...pauseDeploymentMutation(),
     meta: {
@@ -162,6 +175,20 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
     tag?: string
     environmentId: number
   }) => {
+    if (project.source_type === 'docker_image') {
+      const ref = deployment?.metadata?.externalImageRef
+      if (!ref) {
+        toast.error('No image reference found for this deployment')
+        return
+      }
+      await redeployImage.mutateAsync({
+        path: { project_id: project.id, environment_id: environmentId },
+        body: { image_ref: ref },
+      })
+      navigate(`/projects/${project.slug}/deployments?autoRefresh=true`)
+      return
+    }
+
     await createDeployment.mutateAsync({
       path: {
         id: project.id,
@@ -683,7 +710,8 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
                 : 'commit'
           }
           defaultEnvironment={deployment?.environment_id || 0}
-          isLoading={createDeployment.isPending}
+          isLoading={createDeployment.isPending || redeployImage.isPending}
+          imageRef={deployment?.metadata?.externalImageRef}
         />
       </div>
     </div>
