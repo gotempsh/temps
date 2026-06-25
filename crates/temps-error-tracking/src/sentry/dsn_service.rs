@@ -436,7 +436,10 @@ mod tests {
             "http://pk@localho.st:8443/1"
         );
         // Scheme-less base falls back to https.
-        assert_eq!(build_dsn("example.com:9000", "pk", 2), "https://pk@example.com:9000/2");
+        assert_eq!(
+            build_dsn("example.com:9000", "pk", 2),
+            "https://pk@example.com:9000/2"
+        );
     }
 
     async fn create_test_project(db: &Arc<DatabaseConnection>) -> i32 {
