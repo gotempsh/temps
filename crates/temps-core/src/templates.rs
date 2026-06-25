@@ -704,6 +704,40 @@ templates:
     }
 
     #[test]
+    fn test_bundled_templates_parse_and_validate() {
+        // The bundled templates.yaml is embedded at compile time and loaded on
+        // every startup. Guard against YAML breakage and invalid template
+        // definitions (bad git URLs, unknown services, etc.).
+        let config = TemplatesConfig::from_yaml(BUNDLED_TEMPLATES)
+            .expect("bundled templates.yaml must parse");
+        assert!(
+            !config.templates.is_empty(),
+            "bundled templates should not be empty"
+        );
+
+        let errors = TemplateService::validate_config(&config);
+        assert!(
+            errors.is_empty(),
+            "bundled templates have validation errors: {:?}",
+            errors
+        );
+
+        // The Observability Starter is the one-click activation demo surfaced in
+        // the empty projects state — it must stay featured and bring a database.
+        let starter = config
+            .get_by_slug("observability-starter")
+            .expect("observability-starter template must exist");
+        assert!(
+            starter.is_featured,
+            "observability-starter must be featured"
+        );
+        assert!(
+            starter.services.iter().any(|s| s == "postgres"),
+            "observability-starter must depend on postgres"
+        );
+    }
+
+    #[test]
     fn test_various_git_providers() {
         let yaml = r#"
 templates:

@@ -45,6 +45,10 @@ pub enum TelemetryEventKind {
 
     // ---- Project & environment ----
     ProjectCreated,
+    /// A project was created from a curated template. Carries the (public,
+    /// non-identifying) `template_slug` so we can measure which templates drive
+    /// activation. Emitted in addition to `ProjectCreated`.
+    ProjectCreatedFromTemplate,
     EnvironmentCreated,
     ScaleToZeroConfigured,
     AutoDeployEnabled,
@@ -104,6 +108,7 @@ impl TelemetryEventKind {
             Self::FirstDeploySucceeded => "first_deploy_succeeded",
 
             Self::ProjectCreated => "project_created",
+            Self::ProjectCreatedFromTemplate => "project_created_from_template",
             Self::EnvironmentCreated => "environment_created",
             Self::ScaleToZeroConfigured => "scale_to_zero_configured",
             Self::AutoDeployEnabled => "auto_deploy_enabled",
@@ -154,6 +159,7 @@ impl TelemetryEventKind {
             Self::RollbackTriggered,
             Self::FirstDeploySucceeded,
             Self::ProjectCreated,
+            Self::ProjectCreatedFromTemplate,
             Self::EnvironmentCreated,
             Self::ScaleToZeroConfigured,
             Self::AutoDeployEnabled,
@@ -300,8 +306,8 @@ mod tests {
     fn all_covers_every_variant() {
         // If a variant is added but not added to all(), as_str() on it will be
         // missing from the list and this length check is a cheap tripwire.
-        // 35 events (34 initial + instance_heartbeat).
-        assert_eq!(TelemetryEventKind::all().len(), 35);
+        // 36 events (34 initial + instance_heartbeat + project_created_from_template).
+        assert_eq!(TelemetryEventKind::all().len(), 36);
     }
 
     #[test]

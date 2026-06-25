@@ -145,16 +145,32 @@ pub struct ListTagsResponse {
 }
 
 /// Request to create a project from a template
+///
+/// Supports two deploy modes:
+///   * **Fork mode** — when `git_provider_connection_id` is set, the template
+///     repo is cloned into a new repository under the user's Git account and the
+///     project tracks that fork (git-push deploys, automatic deploy on push).
+///   * **One-click public-repo mode** — when `git_provider_connection_id` is
+///     omitted, the project deploys directly from the template's public source
+///     repository (no fork, no Git account required). This is the activation
+///     path: a brand-new user with no Git provider connected can still deploy a
+///     demo in one click. `repository_name` / `repository_owner` are ignored in
+///     this mode, and automatic-deploy-on-push is unavailable (there is no fork
+///     to receive webhooks).
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateProjectFromTemplateRequest {
     /// Template slug to use as the base
     pub template_slug: String,
     /// Name for the new project
     pub project_name: String,
-    /// Git provider connection ID (required to create the repository)
-    pub git_provider_connection_id: i32,
-    /// Name for the new repository to create
-    pub repository_name: String,
+    /// Git provider connection ID. When omitted, the project deploys directly
+    /// from the template's public source repository instead of forking it.
+    #[serde(default)]
+    pub git_provider_connection_id: Option<i32>,
+    /// Name for the new repository to create. Required in fork mode; ignored in
+    /// one-click public-repo mode.
+    #[serde(default)]
+    pub repository_name: Option<String>,
     /// Owner/organization for the new repository (defaults to authenticated user)
     pub repository_owner: Option<String>,
     /// Whether to make the repository private (defaults to true)
@@ -166,7 +182,8 @@ pub struct CreateProjectFromTemplateRequest {
     /// External storage service IDs to attach to the project
     #[serde(default)]
     pub storage_service_ids: Vec<i32>,
-    /// Enable automatic deployment on push (defaults to true)
+    /// Enable automatic deployment on push (defaults to true). Only honoured in
+    /// fork mode; public-repo deploys cannot receive push webhooks.
     #[serde(default = "default_true")]
     pub automatic_deploy: bool,
 }

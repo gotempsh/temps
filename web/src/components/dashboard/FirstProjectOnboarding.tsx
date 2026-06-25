@@ -1,11 +1,14 @@
 import { Link } from 'react-router-dom'
 import {
   ArrowRight,
+  BarChart3,
   BookOpen,
   Boxes,
+  Bug,
   Database,
   GitBranch,
   HardDrive,
+  Sparkles,
   Terminal,
   Upload,
 } from 'lucide-react'
@@ -23,6 +26,26 @@ interface FirstProjectOnboardingProps {
    */
   gitConnected: boolean
 }
+
+// Deep-link into the project creation flow with the Observability Starter
+// template pre-selected. The configurator reads `?source=templates&template=`
+// (see GitImportClone), so this is a true one-click deploy: pick the template,
+// Temps provisions the attached Postgres service, and the app deploys with
+// analytics, error tracking, and tracing already wired. The slug must match the
+// template registered in `temps-core/templates.yaml`.
+const DEMO_TEMPLATE_SLUG = 'observability-starter'
+const DEMO_TEMPLATE_HREF = `/projects/new?source=templates&template=${DEMO_TEMPLATE_SLUG}`
+
+// What the demo app lights up, shown as inline pills so the value is legible at
+// a glance without reading prose.
+const DEMO_HIGHLIGHTS: ReadonlyArray<{
+  label: string
+  icon: React.ComponentType<{ className?: string }>
+}> = [
+  { label: 'Analytics', icon: BarChart3 },
+  { label: 'Error tracking', icon: Bug },
+  { label: 'Database', icon: Database },
+] as const
 
 // The two copy-paste commands for the local/CLI deploy path. `login` is the
 // browser device-auth flow (no API key to mint or manage); `up` runs the setup
@@ -111,6 +134,15 @@ export function FirstProjectOnboarding({
 
   return (
     <div className="col-span-full min-w-0 rounded-lg border bg-card p-4 sm:p-8 lg:p-10 animate-in fade-in-50">
+      {/* One-click "try Temps" path. This whole component only renders on an
+          empty instance (the project list owns that branch), so the banner is
+          guaranteed to show only when there are no deployed projects. It
+          deploys a demo app that comes pre-wired with analytics, error
+          tracking, tracing, and a Postgres database — so a new user reaches the
+          activation moment (live URL + real telemetry) without first building a
+          project of their own. */}
+      <DemoAppBanner />
+
       <div className="mx-auto max-w-2xl text-center">
         <div className="mx-auto flex h-11 w-11 items-center justify-center rounded-xl bg-primary/10 sm:h-12 sm:w-12">
           <Upload className="h-5 w-5 text-primary sm:h-6 sm:w-6" />
@@ -257,6 +289,58 @@ export function FirstProjectOnboarding({
         </Button>
       </div>
     </div>
+  )
+}
+
+function DemoAppBanner() {
+  return (
+    <Link
+      to={DEMO_TEMPLATE_HREF}
+      className={cn(
+        'group mb-6 flex flex-col gap-4 rounded-xl border border-primary/30 bg-primary/5 p-5 text-left transition-colors sm:mb-8 sm:flex-row sm:items-center sm:justify-between sm:p-6',
+        'hover:border-primary/50 hover:bg-primary/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring'
+      )}
+    >
+      <div className="flex items-start gap-3 sm:items-center">
+        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-primary/15">
+          <Sparkles className="h-5 w-5 text-primary" />
+        </div>
+        <div className="min-w-0">
+          <div className="flex items-center gap-2">
+            <h3 className="text-base font-semibold">Try the demo app</h3>
+            <span className="rounded-full bg-primary/15 px-2 py-0.5 text-[11px] font-medium uppercase tracking-wide text-primary">
+              No setup
+            </span>
+          </div>
+          <p className="mt-0.5 text-sm text-muted-foreground">
+            Deploy a sample app with a database in one click — see analytics,
+            error tracking, and tracing light up live.
+          </p>
+          <div className="mt-2 flex flex-wrap gap-1.5">
+            {DEMO_HIGHLIGHTS.map(({ label, icon: Icon }) => (
+              <span
+                key={label}
+                className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-0.5 text-xs text-muted-foreground"
+              >
+                <Icon className="h-3 w-3" />
+                {label}
+              </span>
+            ))}
+          </div>
+        </div>
+      </div>
+      <Button
+        asChild
+        className="w-full shrink-0 sm:w-auto"
+        // The whole banner is a link; render the CTA as a non-interactive span
+        // so it doesn't nest an anchor inside an anchor.
+      >
+        <span>
+          Deploy demo
+          <ArrowRight className="ml-1.5 h-4 w-4 transition-transform group-hover:translate-x-0.5" />
+        </span>
+      </Button>
+    </Link>
   )
 }
 

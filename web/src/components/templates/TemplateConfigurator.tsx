@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useCallback } from 'react'
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useForm, useWatch } from 'react-hook-form'
@@ -74,6 +74,7 @@ import {
   Loader2,
   Lock,
   Plus,
+  Rocket,
   Settings,
   Sparkles,
   Star,
@@ -115,7 +116,10 @@ const formSchema = z.object({
   projectName: z.string().min(1, 'Project name is required'),
   repositoryName: z.string().min(1, 'Repository name is required'),
   repositoryOwner: z.string().optional(),
-  gitProviderConnectionId: z.number({ message: 'Git provider connection is required' }),
+  // Optional: when omitted the project deploys directly from the template's
+  // public source repository (one-click, no Git account required) instead of
+  // forking it into the user's Git provider.
+  gitProviderConnectionId: z.number().optional(),
   private: z.boolean(),
   automaticDeploy: z.boolean(),
   storageServices: z.array(z.number()),
@@ -283,6 +287,35 @@ export function TemplateConfigurator({
     }
   }, [connectionsData, form])
 
+  // Auto-select an existing service that satisfies a template requirement, so a
+  // returning user who already has (say) a Postgres service gets it attached
+  // with zero extra clicks — true "almost one-click" deploy. We only pre-select
+  // when nothing is selected yet, and never override the user's choices. New
+  // users with no matching service create one via the "Add Service" button.
+  const autoSelectedServicesRef = useRef(false)
+  useEffect(() => {
+    if (autoSelectedServicesRef.current) return
+    if (!existingServices || existingServices.length === 0) return
+    if (template.services.length === 0) return
+    if ((form.getValues('storageServices') || []).length > 0) return
+
+    const wanted = new Set(template.services.map((s) => s.toLowerCase()))
+    const matchIds: number[] = []
+    for (const required of wanted) {
+      // First existing service whose type matches the required engine.
+      const match = existingServices.find(
+        (svc: ExternalServiceInfo) =>
+          svc.service_type.toLowerCase() === required && !matchIds.includes(svc.id)
+      )
+      if (match) matchIds.push(match.id)
+    }
+
+    if (matchIds.length > 0) {
+      autoSelectedServicesRef.current = true
+      form.setValue('storageServices', matchIds, { shouldValidate: false })
+    }
+  }, [existingServices, template.services, form])
+
   // Watch project name to update repo name
   const projectName = useWatch({ control: form.control, name: 'projectName' })
   useEffect(() => {
@@ -379,15 +412,24 @@ export function TemplateConfigurator({
       new Set([...(data.storageServices || []), ...newlyCreatedServiceIds])
     )
 
+    // No connection selected → one-click public-repo deploy. The backend forks
+    // the template when a connection is present, and deploys straight from the
+    // template's public source repo when it isn't. Repository name/owner only
+    // matter in fork mode, so they're omitted otherwise.
+    const usePublicRepo = data.gitProviderConnectionId == null
+
     await createFromTemplateMutation.mutateAsync({
       body: {
         template_slug: template.slug,
         project_name: data.projectName,
-        git_provider_connection_id: data.gitProviderConnectionId,
-        repository_name: data.repositoryName,
-        repository_owner: data.repositoryOwner || undefined,
+        git_provider_connection_id: data.gitProviderConnectionId ?? undefined,
+        repository_name: usePublicRepo ? undefined : data.repositoryName,
+        repository_owner: usePublicRepo
+          ? undefined
+          : data.repositoryOwner || undefined,
         private: data.private,
-        automatic_deploy: data.automaticDeploy,
+        // Auto-deploy on push is only possible against a fork we own.
+        automatic_deploy: usePublicRepo ? false : data.automaticDeploy,
         storage_service_ids: allServiceIds,
         environment_variables: data.environmentVariables
           .filter((env) => env.name && env.value)
@@ -415,6 +457,11 @@ export function TemplateConfigurator({
 
   const watchedServices = form.watch('storageServices') || []
   const watchedEnvVars = form.watch('environmentVariables') || []
+  const watchedConnectionId = form.watch('gitProviderConnectionId')
+
+  // Public-repo (one-click) mode when no Git connection is selected. The
+  // fork-only fields (repository name/owner/visibility) are hidden in this mode.
+  const usePublicRepo = watchedConnectionId == null
 
   // Check if required env vars are filled
   const requiredEnvVars = template.env_vars.filter((e) => e.required)
@@ -433,20 +480,10 @@ export function TemplateConfigurator({
     )
   }
 
-  if (!connectionsData?.connections?.length) {
-    return (
-      <Card className={className}>
-        <CardContent className="py-12 text-center">
-          <Github className="h-12 w-12 mx-auto text-muted-foreground mb-4" />
-          <h3 className="font-semibold mb-2">No Git Provider Connected</h3>
-          <p className="text-sm text-muted-foreground mb-4">
-            You need to connect a Git provider to create projects from templates.
-          </p>
-          <Button onClick={() => navigate('/git-providers')}>Connect Git Provider</Button>
-        </CardContent>
-      </Card>
-    )
-  }
+  // No early dead-end when there's no Git connection. A brand-new user with no
+  // provider linked can still deploy the demo directly from the template's
+  // public source repo (one-click activation). The connection picker below
+  // becomes optional and the form deploys in public-repo mode.
 
   return (
     <div className={cn('space-y-6', className)}>
@@ -526,6 +563,40 @@ export function TemplateConfigurator({
                 render={({ field }) => {
                   const conns = connectionsData?.connections ?? []
                   const setValue = (id: number) => field.onChange(id)
+
+                  // No connection: deploy straight from the template's public
+                  // source repo. This is the one-click activation path — no Git
+                  // account required. We surface a "connect to fork instead"
+                  // affordance for users who want their own copy.
+                  if (conns.length === 0) {
+                    return (
+                      <FormItem>
+                        <FormLabel>Source</FormLabel>
+                        <div className="flex items-start gap-3 rounded-md border bg-muted/50 px-3 py-3">
+                          <Rocket className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
+                          <div className="space-y-1">
+                            <p className="text-sm font-medium">
+                              Deploy from the template&apos;s public source
+                            </p>
+                            <p className="text-xs text-muted-foreground">
+                              No Git account needed — Temps deploys directly from
+                              the template repository. Want your own copy to push
+                              to?{' '}
+                              <button
+                                type="button"
+                                onClick={() => navigate('/git-providers')}
+                                className="underline underline-offset-2 hover:text-foreground"
+                              >
+                                Connect a Git provider
+                              </button>{' '}
+                              to fork it instead.
+                            </p>
+                          </div>
+                        </div>
+                        <FormMessage />
+                      </FormItem>
+                    )
+                  }
 
                   // Single connection: render as a read-only chip. The form
                   // value is auto-set in the existing useEffect that picks
@@ -635,6 +706,10 @@ export function TemplateConfigurator({
                 }}
               />
 
+              {/* Repository name/owner/visibility only apply when forking into
+                  a Git account. In public-repo (one-click) mode there's no fork,
+                  so these are hidden to keep the path frictionless. */}
+              {!usePublicRepo && (
               <FormField
                 control={form.control}
                 name="repositoryName"
@@ -651,7 +726,9 @@ export function TemplateConfigurator({
                   </FormItem>
                 )}
               />
+              )}
 
+              {!usePublicRepo && (
               <FormField
                 control={form.control}
                 name="repositoryOwner"
@@ -702,8 +779,10 @@ export function TemplateConfigurator({
                   )
                 }}
               />
+              )}
 
-              {/* Repository URL Preview */}
+              {/* Repository URL Preview (fork mode only) */}
+              {!usePublicRepo && (
               <RepositoryPreview
                 repositoryName={form.watch('repositoryName')}
                 repositoryOwner={form.watch('repositoryOwner')}
@@ -711,7 +790,9 @@ export function TemplateConfigurator({
                   (c: ConnectionResponse) => c.id === form.watch('gitProviderConnectionId')
                 )}
               />
+              )}
 
+              {!usePublicRepo && (
               <div className="flex flex-col gap-4 sm:flex-row">
                 <FormField
                   control={form.control}
@@ -755,6 +836,7 @@ export function TemplateConfigurator({
                   )}
                 />
               </div>
+              )}
             </CardContent>
           </Card>
 

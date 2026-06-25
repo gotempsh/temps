@@ -2866,9 +2866,10 @@ export type CreateProjectFromTemplateRequest = {
      */
     environment_variables?: Array<EnvVarInput>;
     /**
-     * Git provider connection ID (required to create the repository)
+     * Git provider connection ID. When omitted, the project deploys directly
+     * from the template's public source repository instead of forking it.
      */
-    git_provider_connection_id: number;
+    git_provider_connection_id?: number | null;
     /**
      * Whether to make the repository private (defaults to true)
      */
@@ -2878,9 +2879,10 @@ export type CreateProjectFromTemplateRequest = {
      */
     project_name: string;
     /**
-     * Name for the new repository to create
+     * Name for the new repository to create. Required in fork mode; ignored in
+     * one-click public-repo mode.
      */
-    repository_name: string;
+    repository_name?: string | null;
     /**
      * Owner/organization for the new repository (defaults to authenticated user)
      */

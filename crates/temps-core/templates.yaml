@@ -7,6 +7,55 @@
 version: "1"
 
 templates:
+  # Observability Starter — the one-click "try Temps" demo app.
+  # Showcases all four built-in observability pillars (analytics, error
+  # tracking, distributed tracing) plus a Postgres database in a single deploy,
+  # so a new user can activate without building a project of their own first.
+  - slug: observability-starter
+    name: Observability Starter
+    description: A Next.js demo app pre-wired with analytics, error tracking, distributed tracing, and a Postgres database — see Temps in action in one deploy
+    git:
+      url: https://github.com/gotempsh/temps-examples.git
+      ref: main
+      subfolder: examples/observability-starter
+    preset: nextjs
+    tags:
+      - demo
+      - nextjs
+      - observability
+      - analytics
+      - getting-started
+    features:
+      - Product analytics with @temps-sdk/react-analytics
+      - Error tracking via Sentry-compatible DSN
+      - Distributed tracing with OpenTelemetry
+      - Postgres-backed guestbook
+      - Session recording on errors
+    services:
+      - postgres
+    env_vars:
+      # All of these are sourced from the Temps project itself (Error Tracking /
+      # Monitoring settings), not user secrets, so they're optional — the app
+      # builds and runs without them and lights each pillar up as you fill them in.
+      - name: SENTRY_DSN
+        description: Server-side error tracking DSN. Copy from Project → Error Tracking → DSN & Setup.
+        example: https://<key>@<host>/<project>
+        required: false
+      - name: NEXT_PUBLIC_SENTRY_DSN
+        description: Browser error tracking DSN (safe to expose). Same value as SENTRY_DSN.
+        example: https://<key>@<host>/<project>
+        required: false
+      - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        description: OpenTelemetry traces ingestion endpoint. Copy from Project → Monitoring.
+        example: https://your-app.temps.sh/api/otel/v1/traces
+        required: false
+      - name: OTEL_EXPORTER_OTLP_TOKEN
+        description: Bearer token for the OTLP endpoint. Copy from Project → Monitoring.
+        required: false
+    is_public: true
+    is_featured: true
+    sort_order: 0
+
   # Next.js SaaS Starter
   - slug: nextjs-saas-starter
     name: Next.js SaaS Starter
