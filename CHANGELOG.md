@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **One-click demo deploy from templates (no Git account).** A brand-new user
+  can deploy a fully-instrumented demo app — analytics, error tracking,
+  distributed tracing, and a Postgres database — in one click without first
+  connecting a Git provider. `POST /projects/from-template` now accepts an
+  *optional* `git_provider_connection_id`: with a connection it forks into your
+  Git account as before; without one it deploys directly from the template's
+  public source repo (the template subfolder as the build directory) and
+  auto-queues the first deploy. The `TemplateConfigurator` and first-project
+  empty state surface a "Try the demo app" path, auto-attaching an existing
+  matching service (e.g. Postgres) when present. Public-repo deploys can't
+  receive push webhooks, so auto-deploy-on-push is disabled in that mode (#157).
 - **CLI: static deploys in `temps up`.** The setup wizard now offers a "Static
   (upload a pre-built folder)" option that creates a `static_files` project and
   uploads a built folder — no Docker, no git. It auto-detects the output folder
