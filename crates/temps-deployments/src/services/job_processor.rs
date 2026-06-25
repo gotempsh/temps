@@ -133,12 +133,14 @@ impl JobProcessorService {
                                 image_job.project_id, image_job.image_ref
                             );
                             let workflow_planner = Arc::clone(&self.workflow_planner);
+                            let workflow_executor = Arc::clone(&self.workflow_executor);
                             let db = Arc::clone(&self.db);
                             let queue = Arc::clone(&self.queue);
 
                             tokio::spawn(async move {
                                 Self::process_deploy_image_requested_job(
                                     workflow_planner,
+                                    workflow_executor,
                                     db,
                                     queue,
                                     image_job,
@@ -175,6 +177,7 @@ impl JobProcessorService {
     /// download_repo / build_image).
     async fn process_deploy_image_requested_job(
         workflow_planner: Arc<WorkflowPlanner>,
+        workflow_executor: Arc<WorkflowExecutionService>,
         db: Arc<DbConnection>,
         queue: Arc<dyn JobQueue>,
         job: temps_core::DeployImageRequestedJob,
@@ -321,6 +324,40 @@ impl JobProcessorService {
                         error!(
                             "Failed to update deployment {} status to Running: {}",
                             deployment.id, e
+                        );
+                        continue;
+                    }
+
+                    // Kick off the workflow (pull image → deploy container). Jobs
+                    // sit pending until the executor runs them, same as the
+                    // git-push path.
+                    info!("Executing workflow for image deployment {}", deployment.id);
+                    if let Err(e) = workflow_executor
+                        .execute_deployment_workflow(deployment.id)
+                        .await
+                    {
+                        let msg = format!("{}", e);
+                        error!(
+                            "Workflow execution failed for image deployment {}: {}",
+                            deployment.id, msg
+                        );
+                        if let Err(e2) = JobProcessorService::update_deployment_status_with_message(
+                            &db,
+                            deployment.id,
+                            PipelineStatus::Failed,
+                            Some(msg),
+                        )
+                        .await
+                        {
+                            error!(
+                                "Failed to mark image deployment {} failed: {}",
+                                deployment.id, e2
+                            );
+                        }
+                    } else {
+                        info!(
+                            "Workflow execution completed for image deployment {}",
+                            deployment.id
                         );
                     }
                 }
