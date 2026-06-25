@@ -1381,119 +1381,165 @@ pub async fn create_project_from_template(
         )
     };
 
-    // 3. Resolve the deploy mode. With a Git connection we fork the template
-    //    into the user's account; without one we deploy straight from the
-    //    template's public source repo (the one-click activation path).
-    let (create_request, repository_url) = match request.git_provider_connection_id {
-        Some(connection_id) => {
-            // Fork mode requires a repository name to create under the account.
-            let repository_name = request.repository_name.as_deref().filter(|s| !s.is_empty());
-            let Some(repository_name) = repository_name else {
-                return Err(temps_core::error_builder::bad_request()
+    // 3. Resolve the deploy mode, producing the project-create request, a
+    //    source URL for the response, a non-identifying `deploy_mode` label for
+    //    telemetry, and (image mode only) the image to deploy after creation.
+    //
+    //    Priority:
+    //      * "image"       — the template carries a prebuilt image: create a
+    //        docker_image project and pull/run the image (instant, no build).
+    //        Wins over any Git connection — fastest activation path.
+    //      * "fork"        — a Git connection is supplied: fork the template
+    //        into the user's account and build from the fork.
+    //      * "public_repo" — no connection: build straight from the template's
+    //        public source repository.
+    let (create_request, repository_url, deploy_mode, image_to_deploy): (
+        crate::services::types::CreateProjectRequest,
+        String,
+        &'static str,
+        Option<String>,
+    ) = if let Some(image_ref) = template.image.clone().filter(|s| !s.is_empty()) {
+        info!(
+            "Deploying template {} from prebuilt image {} (image mode)",
+            request.template_slug, image_ref
+        );
+        let req = crate::services::types::CreateProjectRequest {
+            name: request.project_name.clone(),
+            // No Git source — the image is pulled from its registry.
+            repo_name: None,
+            repo_owner: None,
+            directory: ".".to_string(),
+            main_branch: template.git.r#ref.clone(),
+            preset: template.preset.clone(),
+            preset_config: template.preset_config.clone(),
+            environment_variables: env_vars,
+            automatic_deploy: false,
+            storage_service_ids: request.storage_service_ids.clone(),
+            is_public_repo: None,
+            git_url: None,
+            git_provider_connection_id: None,
+            exposed_port: template.exposed_port,
+            // docker_image source skips the build pipeline entirely; the deploy
+            // is triggered explicitly below via Job::DeployImageRequested.
+            source_type: SourceType::DockerImage,
+        };
+        // Surface the template's source repo as the response URL (the image ref
+        // isn't a browsable URL); the message clarifies it deployed from an image.
+        (req, template.git.url.clone(), "image", Some(image_ref))
+    } else {
+        let (create_request, repository_url, deploy_mode) = match request.git_provider_connection_id
+        {
+            Some(connection_id) => {
+                // Fork mode requires a repository name to create under the account.
+                let repository_name = request.repository_name.as_deref().filter(|s| !s.is_empty());
+                let Some(repository_name) = repository_name else {
+                    return Err(temps_core::error_builder::bad_request()
                     .title("Repository Name Required")
                     .detail(
                         "repository_name is required when a Git provider connection is supplied",
                     )
                     .build());
-            };
+                };
 
-            info!(
-                "Creating repository {} from template {} (fork mode)",
-                repository_name, request.template_slug
-            );
+                info!(
+                    "Creating repository {} from template {} (fork mode)",
+                    repository_name, request.template_slug
+                );
 
-            let new_repo = state
-                .project_service
-                .git_provider_manager
-                .create_repository_and_push_template(
-                    connection_id,
-                    repository_name,
-                    request.repository_owner.as_deref(),
-                    Some(&format!("Created from template: {}", template.name)),
-                    request.private,
-                    &template.git.url,
-                    &template.git.r#ref,
-                    template.git.path.as_deref(),
-                )
-                .await
-                .map_err(|e| {
-                    error!("Failed to create repository from template: {:?}", e);
-                    // Forward the typed Problem (e.g. 409 for "name already exists",
-                    // 401 for auth failures) instead of flattening everything to 500.
-                    Problem::from(e)
-                })?;
+                let new_repo = state
+                    .project_service
+                    .git_provider_manager
+                    .create_repository_and_push_template(
+                        connection_id,
+                        repository_name,
+                        request.repository_owner.as_deref(),
+                        Some(&format!("Created from template: {}", template.name)),
+                        request.private,
+                        &template.git.url,
+                        &template.git.r#ref,
+                        template.git.path.as_deref(),
+                    )
+                    .await
+                    .map_err(|e| {
+                        error!("Failed to create repository from template: {:?}", e);
+                        // Forward the typed Problem (e.g. 409 for "name already exists",
+                        // 401 for auth failures) instead of flattening everything to 500.
+                        Problem::from(e)
+                    })?;
 
-            info!(
-                "Successfully created repository {} from template",
-                new_repo.full_name
-            );
+                info!(
+                    "Successfully created repository {} from template",
+                    new_repo.full_name
+                );
 
-            // Point the project at the new fork. The template subfolder has been
-            // flattened into the fork root by create_repository_and_push_template.
-            let req = crate::services::types::CreateProjectRequest {
-                name: request.project_name.clone(),
-                repo_name: Some(new_repo.name.clone()),
-                repo_owner: Some(new_repo.owner.clone()),
-                directory: ".".to_string(),
-                main_branch: new_repo.default_branch.clone(),
-                preset: template.preset.clone(),
-                preset_config: template.preset_config.clone(),
-                environment_variables: env_vars,
-                automatic_deploy: request.automatic_deploy,
-                storage_service_ids: request.storage_service_ids.clone(),
-                is_public_repo: Some(!new_repo.private),
-                git_url: Some(new_repo.clone_url.clone()),
-                git_provider_connection_id: Some(connection_id),
-                exposed_port: None,
-                source_type: SourceType::Git,
-            };
-            (req, new_repo.clone_url)
-        }
-        None => {
-            // One-click public-repo mode: no fork, no Git account. Deploy
-            // directly from the template's public source repository. We clone
-            // the whole public repo, so the project's build directory is the
-            // template's subfolder (not flattened).
-            info!(
-                "Deploying template {} directly from public repo {} (one-click mode)",
-                request.template_slug, template.git.url
-            );
+                // Point the project at the new fork. The template subfolder has been
+                // flattened into the fork root by create_repository_and_push_template.
+                let req = crate::services::types::CreateProjectRequest {
+                    name: request.project_name.clone(),
+                    repo_name: Some(new_repo.name.clone()),
+                    repo_owner: Some(new_repo.owner.clone()),
+                    directory: ".".to_string(),
+                    main_branch: new_repo.default_branch.clone(),
+                    preset: template.preset.clone(),
+                    preset_config: template.preset_config.clone(),
+                    environment_variables: env_vars,
+                    automatic_deploy: request.automatic_deploy,
+                    storage_service_ids: request.storage_service_ids.clone(),
+                    is_public_repo: Some(!new_repo.private),
+                    git_url: Some(new_repo.clone_url.clone()),
+                    git_provider_connection_id: Some(connection_id),
+                    exposed_port: None,
+                    source_type: SourceType::Git,
+                };
+                (req, new_repo.clone_url, "fork")
+            }
+            None => {
+                // One-click public-repo mode: no fork, no Git account. Deploy
+                // directly from the template's public source repository. We clone
+                // the whole public repo, so the project's build directory is the
+                // template's subfolder (not flattened).
+                info!(
+                    "Deploying template {} directly from public repo {} (one-click mode)",
+                    request.template_slug, template.git.url
+                );
 
-            let directory = template
-                .git
-                .path
-                .clone()
-                .filter(|p| !p.is_empty())
-                .unwrap_or_else(|| ".".to_string());
+                let directory = template
+                    .git
+                    .path
+                    .clone()
+                    .filter(|p| !p.is_empty())
+                    .unwrap_or_else(|| ".".to_string());
 
-            // The deploy pipeline uses repo_owner/repo_name as labels and gates
-            // the clone+initial-deploy on them being non-empty (they're NOT
-            // validated against a Git connection — the actual clone uses
-            // git_url). Derive them from the public URL so the public-repo
-            // download job is planned and the first deploy fires automatically.
-            let (repo_owner, repo_name) = parse_owner_repo_from_git_url(&template.git.url);
+                // The deploy pipeline uses repo_owner/repo_name as labels and gates
+                // the clone+initial-deploy on them being non-empty (they're NOT
+                // validated against a Git connection — the actual clone uses
+                // git_url). Derive them from the public URL so the public-repo
+                // download job is planned and the first deploy fires automatically.
+                let (repo_owner, repo_name) = parse_owner_repo_from_git_url(&template.git.url);
 
-            let req = crate::services::types::CreateProjectRequest {
-                name: request.project_name.clone(),
-                repo_name: Some(repo_name),
-                repo_owner: Some(repo_owner),
-                directory,
-                main_branch: template.git.r#ref.clone(),
-                preset: template.preset.clone(),
-                preset_config: template.preset_config.clone(),
-                environment_variables: env_vars,
-                // Push webhooks can't reach a public upstream we don't own, so
-                // auto-deploy-on-push is meaningless here regardless of request.
-                automatic_deploy: false,
-                storage_service_ids: request.storage_service_ids.clone(),
-                is_public_repo: Some(true),
-                git_url: Some(template.git.url.clone()),
-                git_provider_connection_id: None,
-                exposed_port: None,
-                source_type: SourceType::Git,
-            };
-            (req, template.git.url.clone())
-        }
+                let req = crate::services::types::CreateProjectRequest {
+                    name: request.project_name.clone(),
+                    repo_name: Some(repo_name),
+                    repo_owner: Some(repo_owner),
+                    directory,
+                    main_branch: template.git.r#ref.clone(),
+                    preset: template.preset.clone(),
+                    preset_config: template.preset_config.clone(),
+                    environment_variables: env_vars,
+                    // Push webhooks can't reach a public upstream we don't own, so
+                    // auto-deploy-on-push is meaningless here regardless of request.
+                    automatic_deploy: false,
+                    storage_service_ids: request.storage_service_ids.clone(),
+                    is_public_repo: Some(true),
+                    git_url: Some(template.git.url.clone()),
+                    git_provider_connection_id: None,
+                    exposed_port: None,
+                    source_type: SourceType::Git,
+                };
+                (req, template.git.url.clone(), "public_repo")
+            }
+        };
+        (create_request, repository_url, deploy_mode, None)
     };
 
     let project = state
@@ -1501,6 +1547,31 @@ pub async fn create_project_from_template(
         .create_project(create_request)
         .await
         .map_err(Problem::from)?;
+
+    // 4. Image mode: docker_image projects don't auto-deploy on create (no Git
+    //    push), so explicitly queue the image deploy. The deployments side
+    //    resolves the target environment, pulls the image, and runs it — no
+    //    build. Failure to enqueue is logged but doesn't fail project creation
+    //    (the user can redeploy from the UI).
+    if let Some(image_ref) = image_to_deploy {
+        let deploy_job =
+            temps_core::Job::DeployImageRequested(temps_core::DeployImageRequestedJob {
+                project_id: project.id,
+                image_ref: image_ref.clone(),
+                health_check_path: template.health_check_path.clone(),
+            });
+        if let Err(e) = state.project_service.queue_service.send(deploy_job).await {
+            error!(
+                "Failed to queue image deploy for project {} (image {}): {}",
+                project.id, image_ref, e
+            );
+        } else {
+            info!(
+                "Queued image deploy for project {} from image {}",
+                project.id, image_ref
+            );
+        }
+    }
 
     // 5. Create audit event
     let audit_context = AuditContext {
@@ -1529,9 +1600,7 @@ pub async fn create_project_from_template(
     // 6. Anonymous telemetry. Emit both the generic project-created event (so the
     //    template path counts the same as any other project creation) and a
     //    template-specific one carrying the public, non-identifying template slug
-    //    so we can measure which templates drive activation. `forked` is the
-    //    deploy mode without leaking the user's Git account.
-    let forked = request.git_provider_connection_id.is_some();
+    //    + deploy mode so we can measure which templates drive activation.
     state.telemetry.report(
         temps_core::telemetry::TelemetryEvent::new(
             temps_core::telemetry::TelemetryEventKind::ProjectCreated,
@@ -1544,11 +1613,16 @@ pub async fn create_project_from_template(
             temps_core::telemetry::TelemetryEventKind::ProjectCreatedFromTemplate,
         )
         .with("template_slug", request.template_slug.clone())
-        .with("forked", forked)
+        .with("deploy_mode", deploy_mode)
         .with("service_count", request.storage_service_ids.len() as i64),
     );
 
     // 7. Return the response with the source/repository URL.
+    let deploy_note = match deploy_mode {
+        "image" => "Deployed from the template's prebuilt image (no build).",
+        "fork" => "Repository created and initialized with template code.",
+        _ => "Deployed directly from the template's public source repository.",
+    };
     let response = super::templates::CreateProjectFromTemplateResponse {
         project_id: project.id,
         project_slug: project.slug,
@@ -1557,13 +1631,7 @@ pub async fn create_project_from_template(
         template_slug: request.template_slug,
         message: format!(
             "Project created successfully from template '{}'. {} Services required: {:?}",
-            template.name,
-            if forked {
-                "Repository created and initialized with template code."
-            } else {
-                "Deployed directly from the template's public source repository."
-            },
-            template.services
+            template.name, deploy_note, template.services
         ),
     };
 

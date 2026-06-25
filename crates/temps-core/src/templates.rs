@@ -69,13 +69,28 @@ pub struct ProjectTemplate {
     /// URL to template image/icon
     #[serde(default)]
     pub image_url: Option<String>,
-    /// Git repository reference (supports any git provider)
+    /// Git repository reference (supports any git provider). Always present as
+    /// the source-of-truth / build fallback, even for image-based templates.
     pub git: GitRef,
     /// Framework/preset to use (e.g., "nextjs", "fastapi", "dockerfile")
     pub preset: String,
     /// Preset-specific configuration
     #[serde(default)]
     pub preset_config: Option<serde_json::Value>,
+    /// Prebuilt Docker image reference (e.g. "ghcr.io/org/app:latest"). When set,
+    /// the one-click deploy pulls and runs this image directly (source_type
+    /// docker_image) instead of building from `git` — instant, no BuildKit. When
+    /// absent, the template builds from source.
+    #[serde(default)]
+    pub image: Option<String>,
+    /// Container port the prebuilt image listens on (used for routing when
+    /// deploying from `image`). Falls back to the image's EXPOSE / 3000 default.
+    #[serde(default)]
+    pub exposed_port: Option<i32>,
+    /// HTTP health-check path probed after the container starts (image deploys
+    /// can't read `.temps.yaml`). Must start with '/'. Defaults to "/".
+    #[serde(default)]
+    pub health_check_path: Option<String>,
     /// Tags/categories for filtering
     #[serde(default)]
     pub tags: Vec<String>,
@@ -652,6 +667,9 @@ templates:
                 },
                 preset: "nextjs".to_string(),
                 preset_config: None,
+                image: None,
+                exposed_port: None,
+                health_check_path: None,
                 tags: vec!["test".to_string()],
                 features: vec!["Feature 1".to_string()],
                 services: vec!["postgres".to_string()],

@@ -278,14 +278,16 @@ export function TemplateConfigurator({
     return seeded
   })
 
-  // Auto-select first connection when available
+  // Auto-select first connection when available. Skipped for image-based
+  // templates, which deploy a prebuilt image and never touch Git.
   useEffect(() => {
+    if (template.image) return
     if (connectionsData?.connections?.length && !form.getValues('gitProviderConnectionId')) {
       form.setValue('gitProviderConnectionId', connectionsData.connections[0].id, {
         shouldValidate: true,
       })
     }
-  }, [connectionsData, form])
+  }, [connectionsData, form, template.image])
 
   // Auto-select an existing service that satisfies a template requirement, so a
   // returning user who already has (say) a Postgres service gets it attached
@@ -463,6 +465,11 @@ export function TemplateConfigurator({
   // fork-only fields (repository name/owner/visibility) are hidden in this mode.
   const usePublicRepo = watchedConnectionId == null
 
+  // Image-based template: deploys a prebuilt image directly (no build, no Git).
+  // The backend decides image-vs-build from `template.image`; when it's set we
+  // hide the entire Git/source section and show an "instant deploy" note.
+  const isImageTemplate = Boolean(template.image)
+
   // Check if required env vars are filled
   const requiredEnvVars = template.env_vars.filter((e) => e.required)
   const missingRequiredVars = useMemo(() => {
@@ -557,6 +564,28 @@ export function TemplateConfigurator({
                 )}
               />
 
+              {/* Image-based template: deploys a prebuilt image directly. No
+                  Git source/connection needed, so the whole source picker is
+                  replaced by an "instant deploy" note. */}
+              {isImageTemplate && (
+                <div className="flex items-start gap-3 rounded-md border border-primary/30 bg-primary/5 px-3 py-3">
+                  <Rocket className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
+                  <div className="space-y-1">
+                    <p className="text-sm font-medium">
+                      Deploys instantly from a prebuilt image
+                    </p>
+                    <p className="text-xs text-muted-foreground">
+                      No build step and no Git account — Temps pulls{' '}
+                      <code className="rounded bg-muted px-1 py-0.5 text-[11px]">
+                        {template.image}
+                      </code>{' '}
+                      and runs it in seconds.
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {!isImageTemplate && (
               <FormField
                 control={form.control}
                 name="gitProviderConnectionId"
@@ -705,11 +734,12 @@ export function TemplateConfigurator({
                   )
                 }}
               />
+              )}
 
               {/* Repository name/owner/visibility only apply when forking into
                   a Git account. In public-repo (one-click) mode there's no fork,
                   so these are hidden to keep the path frictionless. */}
-              {!usePublicRepo && (
+              {!isImageTemplate && !usePublicRepo && (
               <FormField
                 control={form.control}
                 name="repositoryName"

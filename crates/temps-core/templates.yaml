@@ -19,6 +19,12 @@ templates:
       ref: main
       subfolder: examples/observability-starter
     preset: nextjs
+    # Prebuilt image published by CI in gotempsh/temps-examples. When set, the
+    # one-click deploy pulls and runs this image directly (instant, no BuildKit);
+    # the `git` block above remains the build-from-source fallback.
+    image: ghcr.io/gotempsh/observability-starter:latest
+    exposed_port: 3000
+    health_check_path: /
     tags:
       - demo
       - nextjs

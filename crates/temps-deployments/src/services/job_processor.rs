@@ -127,6 +127,25 @@ impl JobProcessorService {
                                 debug!("Completed async processing for GitPushEvent job");
                             });
                         }
+                        Job::DeployImageRequested(image_job) => {
+                            debug!(
+                                "🔥 Handling DeployImageRequested job - project: {}, image: {}",
+                                image_job.project_id, image_job.image_ref
+                            );
+                            let workflow_planner = Arc::clone(&self.workflow_planner);
+                            let db = Arc::clone(&self.db);
+                            let queue = Arc::clone(&self.queue);
+
+                            tokio::spawn(async move {
+                                Self::process_deploy_image_requested_job(
+                                    workflow_planner,
+                                    db,
+                                    queue,
+                                    image_job,
+                                )
+                                .await;
+                            });
+                        }
                         _ => {
                             // Ignore jobs that aren't handled by this processor
                             info!("Ignoring unhandled job: {}", job);
@@ -142,6 +161,187 @@ impl JobProcessorService {
                     debug!("Queue error details: {:?}", e);
                     debug!("Stopping job processor due to queue error");
                     return Err(JobProcessorError::QueueError(e.to_string()));
+                }
+            }
+        }
+    }
+
+    /// Process a `DeployImageRequested` job: deploy a prebuilt Docker image to
+    /// the project's production environment(s) with **no build step**. Mirrors
+    /// the `deploy_from_image` HTTP handler but is project-scoped and
+    /// queue-driven — fired by the template one-click flow when a template
+    /// carries a prebuilt image. The workflow planner sees `external_image_ref`
+    /// in the deployment metadata and plans a pull+run pipeline (no
+    /// download_repo / build_image).
+    async fn process_deploy_image_requested_job(
+        workflow_planner: Arc<WorkflowPlanner>,
+        db: Arc<DbConnection>,
+        queue: Arc<dyn JobQueue>,
+        job: temps_core::DeployImageRequestedJob,
+    ) {
+        use chrono::Utc;
+        use sea_orm::PaginatorTrait;
+
+        // Resolve the project.
+        let project = match temps_entities::projects::Entity::find_by_id(job.project_id)
+            .one(db.as_ref())
+            .await
+        {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                error!("DeployImageRequested: project {} not found", job.project_id);
+                return;
+            }
+            Err(e) => {
+                error!(
+                    "DeployImageRequested: db error loading project {}: {}",
+                    job.project_id, e
+                );
+                return;
+            }
+        };
+
+        // Target the project's non-preview (production) environment(s). A fresh
+        // template project has exactly one.
+        let environments = match temps_entities::environments::Entity::find()
+            .filter(temps_entities::environments::Column::ProjectId.eq(job.project_id))
+            .filter(temps_entities::environments::Column::DeletedAt.is_null())
+            .filter(temps_entities::environments::Column::IsPreview.eq(false))
+            .all(db.as_ref())
+            .await
+        {
+            Ok(envs) => envs,
+            Err(e) => {
+                error!(
+                    "DeployImageRequested: db error loading environments for project {}: {}",
+                    job.project_id, e
+                );
+                return;
+            }
+        };
+
+        if environments.is_empty() {
+            error!(
+                "DeployImageRequested: project {} has no deployable (non-preview) environment",
+                job.project_id
+            );
+            return;
+        }
+
+        for environment in environments {
+            let deployment_number = deployments::Entity::find()
+                .filter(deployments::Column::ProjectId.eq(project.id))
+                .count(db.as_ref())
+                .await
+                .unwrap_or(0)
+                + 1;
+            let deployment_slug = format!("{}-{}", project.slug, deployment_number);
+
+            let metadata = DeploymentMetadata {
+                external_image_ref: Some(job.image_ref.clone()),
+                deployment_source_type: Some(temps_entities::source_type::SourceType::DockerImage),
+                health_check_path: job.health_check_path.clone(),
+                ..Default::default()
+            };
+
+            // Snapshot the merged project+env deployment config (port, resources)
+            // so the planner/deployer resolve the routed container port.
+            let merged_config = if let Some(project_config) = &project.deployment_config {
+                if let Some(env_config) = &environment.deployment_config {
+                    Some(project_config.merge(env_config))
+                } else {
+                    Some(project_config.clone())
+                }
+            } else {
+                environment.deployment_config.clone()
+            };
+            let deployment_config_snapshot = merged_config
+                .map(|config| DeploymentConfigSnapshot::from_config(&config, HashMap::new()));
+
+            let new_deployment = deployments::ActiveModel {
+                project_id: Set(project.id),
+                environment_id: Set(environment.id),
+                slug: Set(deployment_slug),
+                state: Set("pending".to_string()),
+                metadata: Set(Some(metadata)),
+                context_vars: Set(Some(serde_json::json!({
+                    "trigger": "template_image",
+                    "source": "docker_image"
+                }))),
+                image_name: Set(Some(job.image_ref.clone())),
+                deployment_config: Set(deployment_config_snapshot),
+                created_at: Set(Utc::now()),
+                updated_at: Set(Utc::now()),
+                ..Default::default()
+            };
+
+            let deployment = match new_deployment.insert(db.as_ref()).await {
+                Ok(d) => d,
+                Err(e) => {
+                    error!(
+                        "DeployImageRequested: failed to create deployment for project {} env {}: {}",
+                        project.id, environment.id, e
+                    );
+                    continue;
+                }
+            };
+
+            info!(
+                "Created deployment {} for project {} env {} from DeployImageRequested (image {})",
+                deployment.id, project.id, environment.id, job.image_ref
+            );
+
+            let deployment_created_event =
+                Job::DeploymentCreated(temps_core::DeploymentCreatedJob {
+                    deployment_id: deployment.id,
+                    project_id: project.id,
+                    environment_id: environment.id,
+                    environment_name: environment.name.clone(),
+                    branch: None,
+                    commit_sha: None,
+                });
+            if let Err(e) = queue.send(deployment_created_event).await {
+                error!("Failed to send DeploymentCreated event: {}", e);
+            }
+
+            match workflow_planner.create_deployment_jobs(deployment.id).await {
+                Ok(created_jobs) => {
+                    info!(
+                        "Created {} jobs for deployment {} from DeployImageRequested",
+                        created_jobs.len(),
+                        deployment.id
+                    );
+                    if let Err(e) = JobProcessorService::update_deployment_status(
+                        &db,
+                        deployment.id,
+                        PipelineStatus::Running,
+                    )
+                    .await
+                    {
+                        error!(
+                            "Failed to update deployment {} status to Running: {}",
+                            deployment.id, e
+                        );
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to plan jobs for image deployment {}: {}",
+                        deployment.id, e
+                    );
+                    if let Err(e2) = JobProcessorService::update_deployment_status_with_message(
+                        &db,
+                        deployment.id,
+                        PipelineStatus::Failed,
+                        Some(format!("Failed to plan image deployment: {}", e)),
+                    )
+                    .await
+                    {
+                        error!(
+                            "Failed to mark image deployment {} failed: {}",
+                            deployment.id, e2
+                        );
+                    }
                 }
             }
         }

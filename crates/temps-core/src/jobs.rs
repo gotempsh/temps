@@ -31,6 +31,23 @@ pub struct GitPushEventJob {
     pub rollback_from_deployment_id: Option<i32>,
 }
 
+/// Request to deploy a prebuilt Docker image to a project (no build step).
+///
+/// Project-scoped like `GitPushEventJob` — the consumer resolves the target
+/// environment(s) and creates a `source_type: docker_image` deployment that
+/// pulls and runs `image_ref`. Fired by the template one-click flow when a
+/// template carries a prebuilt `image`.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct DeployImageRequestedJob {
+    pub project_id: i32,
+    /// Docker image reference to pull and run (e.g. "ghcr.io/org/app:latest").
+    pub image_ref: String,
+    /// Optional HTTP health-check path probed after the container starts.
+    /// Must start with '/'. Defaults to "/" when absent.
+    #[serde(default)]
+    pub health_check_path: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct UpdateRepoFrameworkJob {
     pub repo_id: i32,
@@ -351,6 +368,9 @@ pub enum Job {
     ProvisionCertificate(ProvisionCertificateJob),
     CalculateRepositoryPreset(CalculateRepositoryPresetJob),
     GitPushEvent(GitPushEventJob),
+    /// Deploy a prebuilt Docker image to a project (no build) — fired by the
+    /// template one-click flow when a template carries a prebuilt image.
+    DeployImageRequested(DeployImageRequestedJob),
     CronInvocationError(CronInvocationErrorData),
     ProjectCreated(ProjectCreatedJob),
     ProjectUpdated(ProjectUpdatedJob),
@@ -416,6 +436,7 @@ impl fmt::Display for Job {
             Job::ProvisionCertificate(job) => write!(f, "ProvisionCertificate({})", job.domain),
             Job::CalculateRepositoryPreset(job) => write!(f, "CalculateRepositoryPreset(repository_id: {})", job.repository_id),
             Job::GitPushEvent(job) => write!(f, "GitPushEvent(project_id: {}, owner: {}, repo: {}, branch: {:?}, tag: {:?}, commit: {})", job.project_id, job.owner, job.repo, job.branch, job.tag, job.commit),
+            Job::DeployImageRequested(job) => write!(f, "DeployImageRequested(project_id: {}, image_ref: {})", job.project_id, job.image_ref),
             Job::CronInvocationError(job) => write!(f, "CronInvocationError(cron_id: {}, env: {}, error: {})", job.cron_job_id, job.environment_id, job.error_message),
             Job::ProjectCreated(job) => write!(f, "ProjectCreated(id: {}, name: {})", job.project_id, job.project_name),
             Job::ProjectUpdated(job) => write!(f, "ProjectUpdated(id: {}, name: {})", job.project_id, job.project_name),

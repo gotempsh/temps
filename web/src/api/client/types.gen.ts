@@ -13629,6 +13629,19 @@ export type TemplateResponse = {
      */
     is_featured: boolean;
     /**
+     * Prebuilt Docker image reference. When set, the one-click deploy pulls and
+     * runs this image directly (no build); when absent it builds from `git`.
+     */
+    image?: string | null;
+    /**
+     * Container port the prebuilt image listens on (image deploys only).
+     */
+    exposed_port?: number | null;
+    /**
+     * HTTP health-check path probed after the container starts (image deploys).
+     */
+    health_check_path?: string | null;
+    /**
      * Display name
      */
     name: string;
