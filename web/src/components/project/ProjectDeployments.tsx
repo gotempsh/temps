@@ -582,7 +582,8 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
           deploymentsData?.deployments.find((d) => d.id === selectedDeployment)
             ?.environment_id ?? undefined
         }
-        isLoading={createDeployment.isPending}
+        isLoading={createDeployment.isPending || redeployImage.isPending}
+        imageRef={imageRef}
       />
 
       {/* Promote deployment dialog */}
