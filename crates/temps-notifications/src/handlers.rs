@@ -309,8 +309,9 @@ pub struct CloudflareConfig {
     /// Cloudflare account id that owns the Email Sending configuration.
     #[schema(example = "023e105f4ecef8ad9ca31a8372d0c353")]
     pub account_id: String,
-    /// Cloudflare API token with the Email Sending permission. Stored encrypted
-    /// and masked in responses.
+    /// Cloudflare API token with the Email Sending permission. Encrypted at
+    /// rest; like the other notification providers, it is returned decrypted to
+    /// authorized callers so the edit form can prefill (not masked).
     pub api_token: String,
     /// Verified sender address (must belong to a domain enabled for Cloudflare
     /// Email Sending).
