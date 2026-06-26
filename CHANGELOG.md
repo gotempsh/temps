@@ -11,7 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Changed
--
+- **Documentation: local build prerequisites.** The installation guide and
+  `CONTRIBUTING.md` now document the system prerequisites required to build
+  Temps from source locally (toolchain and dependencies), so new contributors
+  can get a local build working without trial and error.
 
 ### Fixed
 -
