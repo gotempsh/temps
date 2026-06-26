@@ -4230,14 +4230,42 @@ impl BackupService {
             tags: vec![],
             max_runtime_secs: None,
             // Target exactly this service (attached below), not every DB.
+            //
+            // `create_backup_schedule` refuses to create a schedule that has
+            // nothing to back up (target_all=false AND include_control_plane=
+            // false) because no services can be attached until the schedule
+            // row exists. So we create it with the control plane temporarily
+            // included, attach the service, then flip include_control_plane
+            // off via `update_backup_schedule` — which permits the otherwise-
+            // empty combination precisely because a service is now attached.
             target_all_services: Some(false),
-            include_control_plane: Some(false),
+            include_control_plane: Some(true),
         };
 
         let schedule = self.create_backup_schedule(request).await?;
 
         // Attach exactly this service so the schedule's fan-out targets it.
         self.attach_services_to_schedule(schedule.id, &[service.id])
+            .await?;
+
+        // Now that the service is attached, narrow the schedule down to exactly
+        // that service: drop the control-plane backup so the schedule only
+        // produces base backups for this MariaDB service.
+        let schedule = self
+            .update_backup_schedule(
+                schedule.id,
+                UpdateBackupScheduleRequest {
+                    name: None,
+                    description: None,
+                    schedule_expression: None,
+                    retention_period: None,
+                    max_runtime_secs: None,
+                    enabled: None,
+                    tags: None,
+                    target_all_services: None,
+                    include_control_plane: Some(false),
+                },
+            )
             .await?;
 
         // Flip the one-shot latch so we never provision this service again.
