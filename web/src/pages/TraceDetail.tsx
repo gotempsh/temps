@@ -496,7 +496,7 @@ export default function TraceDetail({ project }: TraceDetailProps) {
                       </Badge>
                     </div>
                     {selectedSpan.status_message && (
-                      <p className="text-xs text-destructive bg-destructive/10 rounded p-2">
+                      <p className="text-xs text-destructive bg-destructive/10 rounded p-2 break-words">
                         {selectedSpan.status_message}
                       </p>
                     )}
@@ -539,20 +539,20 @@ export default function TraceDetail({ project }: TraceDetailProps) {
                         <span className="text-muted-foreground shrink-0">
                           span:
                         </span>
-                        <span className="truncate">{selectedSpan.span_id}</span>
+                        <span className="break-all">{selectedSpan.span_id}</span>
                       </div>
                       <div className="flex gap-2">
                         <span className="text-muted-foreground shrink-0">
                           trace:
                         </span>
-                        <span className="truncate">{selectedSpan.trace_id}</span>
+                        <span className="break-all">{selectedSpan.trace_id}</span>
                       </div>
                       {selectedSpan.parent_span_id && (
                         <div className="flex gap-2">
                           <span className="text-muted-foreground shrink-0">
                             parent:
                           </span>
-                          <span className="truncate">
+                          <span className="break-all">
                             {selectedSpan.parent_span_id}
                           </span>
                         </div>
@@ -569,18 +569,22 @@ export default function TraceDetail({ project }: TraceDetailProps) {
                       <div className="space-y-1 text-xs">
                         {selectedSpan.resource.service_name && (
                           <div className="flex gap-2">
-                            <span className="text-muted-foreground">
+                            <span className="text-muted-foreground shrink-0">
                               service.name:
                             </span>
-                            <span>{selectedSpan.resource.service_name}</span>
+                            <span className="break-all">
+                              {selectedSpan.resource.service_name}
+                            </span>
                           </div>
                         )}
                         {selectedSpan.resource.service_version && (
                           <div className="flex gap-2">
-                            <span className="text-muted-foreground">
+                            <span className="text-muted-foreground shrink-0">
                               service.version:
                             </span>
-                            <span>{selectedSpan.resource.service_version}</span>
+                            <span className="break-all">
+                              {selectedSpan.resource.service_version}
+                            </span>
                           </div>
                         )}
                       </div>
@@ -606,7 +610,7 @@ export default function TraceDetail({ project }: TraceDetailProps) {
                                   <span className="text-muted-foreground shrink-0">
                                     {key}:
                                   </span>
-                                  <span className="truncate">
+                                  <span className="break-all">
                                     {typeof value === 'object'
                                       ? JSON.stringify(value)
                                       : String(value)}
@@ -651,10 +655,10 @@ export default function TraceDetail({ project }: TraceDetailProps) {
                                           key={k}
                                           className="flex gap-2 font-mono"
                                         >
-                                          <span className="text-muted-foreground">
+                                          <span className="text-muted-foreground shrink-0">
                                             {k}:
                                           </span>
-                                          <span className="truncate">
+                                          <span className="break-all">
                                             {typeof v === 'object'
                                               ? JSON.stringify(v)
                                               : String(v)}
