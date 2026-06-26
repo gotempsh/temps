@@ -166,12 +166,19 @@ impl CloudflareProvider {
         )
     }
 
-    /// Build the `from` field. Cloudflare accepts a bare address or an RFC 5322
-    /// `Name <address>` form — mirror what an inbox would display.
-    fn sender_field(&self) -> String {
+    /// Build the `from` field for the Cloudflare payload.
+    ///
+    /// Cloudflare Email Sending accepts either a bare address string or a
+    /// structured `{ "email", "name" }` object for a display name (the RFC 5322
+    /// `Name <address>` *string* form is NOT parsed — it would be treated as a
+    /// literal address). We emit the object form only when a name is set.
+    fn sender_value(&self) -> serde_json::Value {
         match &self.from_name {
-            Some(name) if !name.trim().is_empty() => format!("{} <{}>", name, self.from_address),
-            _ => self.from_address.clone(),
+            Some(name) if !name.trim().is_empty() => serde_json::json!({
+                "email": self.from_address,
+                "name": name,
+            }),
+            _ => serde_json::json!(self.from_address),
         }
     }
 
@@ -200,7 +207,7 @@ impl CloudflareProvider {
     ) -> Result<()> {
         let payload = serde_json::json!({
             "to": to,
-            "from": self.sender_field(),
+            "from": self.sender_value(),
             "subject": subject,
             "html": html,
             "text": text,
@@ -312,18 +319,15 @@ impl NotificationProvider for CloudflareProvider {
     }
 
     async fn health_check(&self) -> Result<bool> {
-        // Verify the token/account by listing the account's Email Sending
-        // domains. This is a cheap, side-effect-free GET that fails fast on bad
-        // credentials without sending a real email.
+        // Validate the API token via Cloudflare's documented token-verify
+        // endpoint (`GET /user/tokens/verify`). This is a cheap, side-effect-free
+        // check that fails fast on bad/expired credentials without sending a real
+        // email. It is account-independent by design.
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
             .build()?;
 
-        let url = format!(
-            "{}/accounts/{}/email/sending/addresses",
-            self.api_base(),
-            self.account_id
-        );
+        let url = format!("{}/user/tokens/verify", self.api_base());
 
         match client.get(url).bearer_auth(&self.api_token).send().await {
             Ok(response) => Ok(response.status().is_success()),
@@ -2199,21 +2203,33 @@ mod tests {
     }
 
     #[test]
-    fn test_cloudflare_from_field() {
+    fn test_cloudflare_sender_value() {
+        // With a display name → structured { email, name } object (Cloudflare's
+        // documented format; the RFC `Name <addr>` string is NOT used).
         let with_name = cloudflare_provider(vec!["a@example.com"]);
         assert_eq!(
-            with_name.sender_field(),
-            "Temps <welcome@infracf.example.com>"
+            with_name.sender_value(),
+            serde_json::json!({
+                "email": "welcome@infracf.example.com",
+                "name": "Temps",
+            })
         );
 
+        // Without a name → bare address string.
         let mut without_name = cloudflare_provider(vec!["a@example.com"]);
         without_name.from_name = None;
-        assert_eq!(without_name.sender_field(), "welcome@infracf.example.com");
+        assert_eq!(
+            without_name.sender_value(),
+            serde_json::json!("welcome@infracf.example.com")
+        );
 
         // Whitespace-only name is treated as absent.
         let mut blank_name = cloudflare_provider(vec!["a@example.com"]);
         blank_name.from_name = Some("   ".to_string());
-        assert_eq!(blank_name.sender_field(), "welcome@infracf.example.com");
+        assert_eq!(
+            blank_name.sender_value(),
+            serde_json::json!("welcome@infracf.example.com")
+        );
     }
 
     #[test]
@@ -2278,7 +2294,7 @@ mod tests {
             .and(path("/accounts/acct123/email/sending/send"))
             .and(header("authorization", "Bearer cf-token"))
             .and(body_partial_json(serde_json::json!({
-                "from": "Temps <welcome@infracf.example.com>",
+                "from": { "email": "welcome@infracf.example.com", "name": "Temps" },
                 "subject": "Deploy failed",
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2334,11 +2350,11 @@ mod tests {
         let server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/accounts/acct123/email/sending/addresses"))
+            .and(path("/user/tokens/verify"))
             .and(header("authorization", "Bearer cf-token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "success": true,
-                "result": [],
+                "result": { "id": "tok123", "status": "active" },
             })))
             .mount(&server)
             .await;
@@ -2357,7 +2373,7 @@ mod tests {
         let server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/accounts/acct123/email/sending/addresses"))
+            .and(path("/user/tokens/verify"))
             .respond_with(ResponseTemplate::new(401))
             .mount(&server)
             .await;
