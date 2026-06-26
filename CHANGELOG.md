@@ -8,7 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
--
+- **Cloudflare Email Sending notification provider.** A new notification
+  provider delivers alert emails through Cloudflare's transactional Email
+  Sending API instead of a self-managed SMTP relay. Operators configure only an
+  account id, an API token with the Email Sending permission, the verified
+  sender (from name/address), and the recipients — the subject and HTML/text
+  bodies are derived from each notification (HTML reuses the shared notification
+  email template). Adds dedicated `POST`/`PUT /notification-providers/cloudflare`
+  endpoints plus a "Cloudflare Email" option in the notification provider UI
+  (#160).
 
 ### Changed
 -
