@@ -141,6 +141,11 @@ pub struct CloudflareProvider {
     pub from_name: Option<String>,
     /// Recipients that should receive the notification.
     pub to_addresses: Vec<String>,
+    /// Override for the Cloudflare API base URL. Never serialized into stored
+    /// config — it exists only so integration tests can point the provider at a
+    /// local mock server. Production always uses [`Self::API_BASE`].
+    #[serde(skip)]
+    pub api_base: Option<String>,
 }
 
 impl CloudflareProvider {
@@ -148,10 +153,15 @@ impl CloudflareProvider {
     /// build the same URL.
     const API_BASE: &'static str = "https://api.cloudflare.com/client/v4";
 
+    /// Effective API base — the test override if set, otherwise the real one.
+    fn api_base(&self) -> &str {
+        self.api_base.as_deref().unwrap_or(Self::API_BASE)
+    }
+
     fn send_endpoint(&self) -> String {
         format!(
             "{}/accounts/{}/email/sending/send",
-            Self::API_BASE,
+            self.api_base(),
             self.account_id
         )
     }
@@ -311,7 +321,7 @@ impl NotificationProvider for CloudflareProvider {
 
         let url = format!(
             "{}/accounts/{}/email/sending/addresses",
-            Self::API_BASE,
+            self.api_base(),
             self.account_id
         );
 
@@ -2175,6 +2185,7 @@ mod tests {
             from_address: "welcome@infracf.example.com".to_string(),
             from_name: Some("Temps".to_string()),
             to_addresses: to.into_iter().map(String::from).collect(),
+            api_base: None,
         }
     }
 
@@ -2243,10 +2254,118 @@ mod tests {
     fn test_cloudflare_config_serialization_roundtrip() {
         let provider = cloudflare_provider(vec!["a@example.com", "b@example.com"]);
         let json = serde_json::to_string(&provider).unwrap();
+        // The api_base test override must never leak into stored config.
+        assert!(!json.contains("api_base"));
         let parsed: CloudflareProvider = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.account_id, "acct123");
         assert_eq!(parsed.to_addresses.len(), 2);
         assert_eq!(parsed.from_name.as_deref(), Some("Temps"));
+        assert_eq!(parsed.api_base, None);
+    }
+
+    // ---- Integration tests against a local mock HTTP server (wiremock) ----
+    // These exercise the real `send` / `health_check` HTTP paths: request
+    // method, path, bearer auth, JSON payload shape and response handling.
+
+    #[tokio::test]
+    async fn test_cloudflare_send_posts_to_each_recipient_with_auth_and_payload() {
+        use wiremock::matchers::{body_partial_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/accounts/acct123/email/sending/send"))
+            .and(header("authorization", "Bearer cf-token"))
+            .and(body_partial_json(serde_json::json!({
+                "from": "Temps <welcome@infracf.example.com>",
+                "subject": "Deploy failed",
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+            })))
+            .expect(2) // one POST per recipient
+            .mount(&server)
+            .await;
+
+        let mut provider = cloudflare_provider(vec!["a@example.com", "b@example.com"]);
+        provider.api_base = Some(server.uri());
+
+        let notification = Notification::new("Deploy failed", "The build crashed");
+        let result = provider.send(&notification).await;
+
+        assert!(result.is_ok(), "send should succeed: {:?}", result.err());
+        // `expect(2)` is verified on drop of the server.
+    }
+
+    #[tokio::test]
+    async fn test_cloudflare_send_errors_when_all_recipients_fail() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/accounts/acct123/email/sending/send"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "success": false,
+                "errors": [{ "message": "Authentication error" }],
+            })))
+            .mount(&server)
+            .await;
+
+        let mut provider = cloudflare_provider(vec!["a@example.com"]);
+        provider.api_base = Some(server.uri());
+
+        let notification = Notification::new("Alert", "Something broke");
+        let err = provider.send(&notification).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("403") && msg.contains("a@example.com"),
+            "error should carry status and recipient: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cloudflare_health_check_true_on_success() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/accounts/acct123/email/sending/addresses"))
+            .and(header("authorization", "Bearer cf-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "result": [],
+            })))
+            .mount(&server)
+            .await;
+
+        let mut provider = cloudflare_provider(vec!["a@example.com"]);
+        provider.api_base = Some(server.uri());
+
+        assert!(provider.health_check().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_cloudflare_health_check_false_on_bad_credentials() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/accounts/acct123/email/sending/addresses"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let mut provider = cloudflare_provider(vec!["a@example.com"]);
+        provider.api_base = Some(server.uri());
+
+        assert!(!provider.health_check().await.unwrap());
     }
 
     #[test]

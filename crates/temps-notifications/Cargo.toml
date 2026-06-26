@@ -34,3 +34,4 @@ thiserror = { workspace = true }
 tokio-test = "0.4"
 testcontainers = { workspace = true }
 tower = { version = "0.4", features = ["util"] }
+wiremock = "0.6"
