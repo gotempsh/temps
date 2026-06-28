@@ -116,7 +116,7 @@ fn make_audit_context(auth: &temps_auth::AuthContext, metadata: &RequestMetadata
         create_notification_email_provider,
         create_webhook_provider,
         update_slack_provider,
-        update_email_provider,
+        update_notification_email_provider,
         update_webhook_provider,
         get_preferences,
         update_preferences,
@@ -942,7 +942,7 @@ async fn update_slack_provider(
         ("bearer_auth" = [])
     )
 )]
-async fn update_email_provider(
+async fn update_notification_email_provider(
     State(app_state): State<Arc<NotificationState>>,
     Path(id): Path<i32>,
     RequireAuth(auth): RequireAuth,
@@ -1561,7 +1561,7 @@ pub fn configure_routes() -> Router<Arc<NotificationState>> {
         )
         .route(
             "/notification-providers/email/{id}",
-            put(update_email_provider),
+            put(update_notification_email_provider),
         )
         .route(
             "/notification-providers/webhook/{id}",
@@ -1894,7 +1894,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_email_provider() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_update_notification_email_provider() -> Result<(), Box<dyn std::error::Error>> {
         let setup = TestSetup::new().await?;
 
         let request_body = UpdateNotificationEmailProviderRequest {

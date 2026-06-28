@@ -4,7 +4,7 @@ import {
   deleteNotificationProviderMutation as deleteProviderSafelyMutation,
   listNotificationProvidersOptions,
   testNotificationProviderMutation as testProviderMutation,
-  updateEmailProviderMutation,
+  updateNotificationEmailProviderMutation,
   updateNotificationProviderMutation,
   updateSlackProviderMutation,
   updateWebhookProviderMutation,
@@ -78,7 +78,7 @@ export function ProvidersManagement() {
   })
 
   const updateEmailMutation = useMutation({
-    ...updateEmailProviderMutation(),
+    ...updateNotificationEmailProviderMutation(),
     meta: {
       errorTitle: 'Failed to update email provider',
     },

@@ -28457,7 +28457,7 @@ export type CreateNotificationEmailProviderResponses = {
 
 export type CreateNotificationEmailProviderResponse = CreateNotificationEmailProviderResponses[keyof CreateNotificationEmailProviderResponses];
 
-export type UpdateEmailProvider2Data = {
+export type UpdateNotificationEmailProviderData = {
     body: UpdateNotificationEmailProviderRequest;
     path: {
         /**
@@ -28469,7 +28469,7 @@ export type UpdateEmailProvider2Data = {
     url: '/notification-providers/email/{id}';
 };
 
-export type UpdateEmailProvider2Errors = {
+export type UpdateNotificationEmailProviderErrors = {
     /**
      * Provider not found
      */
@@ -28480,14 +28480,14 @@ export type UpdateEmailProvider2Errors = {
     500: unknown;
 };
 
-export type UpdateEmailProvider2Responses = {
+export type UpdateNotificationEmailProviderResponses = {
     /**
      * Successfully updated Email provider
      */
     200: NotificationProviderResponse;
 };
 
-export type UpdateEmailProvider2Response = UpdateEmailProvider2Responses[keyof UpdateEmailProvider2Responses];
+export type UpdateNotificationEmailProviderResponse = UpdateNotificationEmailProviderResponses[keyof UpdateNotificationEmailProviderResponses];
 
 export type CreateSlackProviderData = {
     body: CreateSlackProviderRequest;
