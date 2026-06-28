@@ -11,8 +11,8 @@ use clap::{Parser, Subcommand};
 use commands::{
     AgentCommand, ApiKeyCommand, BackfillCommand, BackupCommand, BuildCommand, DeployCommand,
     DoctorCommand, DomainCommand, EdgeCommand, JoinCommand, MigrateCommand, NetworkCommand,
-    NodeCommand, ProxyCommand, ResetPasswordCommand, SandboxCommand, ServeCommand, ServicesCommand,
-    SetupCommand, UpgradeCommand,
+    NodeCommand, ProxyCommand, ResetPasswordCommand, RouteCommand, SandboxCommand, ServeCommand,
+    ServicesCommand, SetupCommand, UpgradeCommand,
 };
 use tracing_subscriber::{layer::SubscriberExt, Layer};
 
@@ -65,6 +65,8 @@ pub enum Commands {
     Services(ServicesCommand),
     /// Domain and certificate management
     Domain(DomainCommand),
+    /// Reverse-proxy route management (map a hostname to an upstream host:port)
+    Route(RouteCommand),
     /// Build a Docker image locally
     Build(BuildCommand),
     /// Deploy pre-built images or static files to environments
@@ -245,6 +247,7 @@ pub fn dispatch(
         Commands::Backfill(backfill_cmd) => backfill_cmd.execute(),
         Commands::Services(services_cmd) => services_cmd.execute(),
         Commands::Domain(domain_cmd) => domain_cmd.execute(),
+        Commands::Route(route_cmd) => route_cmd.execute(),
         Commands::Build(build_cmd) => build_cmd.execute(),
         Commands::Deploy(deploy_cmd) => deploy_cmd.execute(),
         Commands::Upgrade(upgrade_cmd) => upgrade_cmd.execute(),
