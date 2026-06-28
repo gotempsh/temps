@@ -18,13 +18,77 @@ use bytes::Bytes;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{permission_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, error, info, warn};
 use utoipa::ToSchema;
 
 use super::types::AppState;
+
+async fn verify_container_exec_access(
+    state: &AppState,
+    auth: &temps_auth::AuthContext,
+    project_id: i32,
+    environment_id: i32,
+    container_id: String,
+) -> Result<temps_entities::deployment_containers::Model, Problem> {
+    project_scope_guard!(auth, project_id);
+
+    // Verify the container belongs to this project/environment before using
+    // the caller-supplied Docker ID against any Docker daemon.
+    let (container_record, _env) = state
+        .deployment_service
+        .get_container_detail(project_id, environment_id, container_id.clone())
+        .await
+        .map_err(|_| {
+            problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Container Not Found")
+                .with_detail(format!(
+                    "Container {} not found in project {} environment {}",
+                    container_id, project_id, environment_id
+                ))
+        })?;
+
+    if let Some(token) = auth.deployment_token_info() {
+        if token
+            .environment_id
+            .is_some_and(|token_environment_id| token_environment_id != environment_id)
+            || token.deployment_id.is_some_and(|token_deployment_id| {
+                token_deployment_id != container_record.deployment_id
+            })
+        {
+            return Err(problemdetails::new(StatusCode::FORBIDDEN)
+                .with_title("Deployment Token Scope Denied")
+                .with_detail(
+                    "This deployment token is not scoped to the requested container's environment or deployment",
+                ));
+        }
+    }
+
+    let exec_enabled = state
+        .deployment_service
+        .is_container_exec_enabled(project_id, environment_id)
+        .await
+        .map_err(|_| {
+            problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Environment Not Found")
+                .with_detail(format!(
+                    "Environment {} was not found in project {}",
+                    environment_id, project_id
+                ))
+        })?;
+
+    if !exec_enabled {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Container Exec Disabled")
+            .with_detail(
+                "Container exec and terminal access must be enabled for this environment before use",
+            ));
+    }
+
+    Ok(container_record)
+}
 
 #[derive(Deserialize, ToSchema)]
 pub struct ExecRequest {
@@ -76,19 +140,14 @@ pub async fn exec_command(
             .with_detail("Command cannot be empty"));
     }
 
-    // Verify the container belongs to this project/environment
-    let (container_record, _env) = state
-        .deployment_service
-        .get_container_detail(project_id, environment_id, container_id.clone())
-        .await
-        .map_err(|_| {
-            problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Container Not Found")
-                .with_detail(format!(
-                    "Container {} not found in project {} environment {}",
-                    container_id, project_id, environment_id
-                ))
-        })?;
+    let container_record = verify_container_exec_access(
+        &state,
+        &auth,
+        project_id,
+        environment_id,
+        container_id.clone(),
+    )
+    .await?;
 
     // Use the verified container ID from the database record
     let verified_container_id = &container_record.container_id;
@@ -237,19 +296,14 @@ pub async fn container_terminal(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ContainersExec);
 
-    // Verify the container belongs to this project/environment
-    let (container_record, _env) = state
-        .deployment_service
-        .get_container_detail(project_id, environment_id, container_id.clone())
-        .await
-        .map_err(|_| {
-            problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Container Not Found")
-                .with_detail(format!(
-                    "Container {} not found in project {} environment {}",
-                    container_id, project_id, environment_id
-                ))
-        })?;
+    let container_record = verify_container_exec_access(
+        &state,
+        &auth,
+        project_id,
+        environment_id,
+        container_id.clone(),
+    )
+    .await?;
 
     // Use the verified container ID from the database record
     let verified_container_id = container_record.container_id;

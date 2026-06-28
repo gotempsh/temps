@@ -3209,6 +3209,42 @@ impl DeploymentService {
         Ok((container, env_info))
     }
 
+    /// Check whether container exec/terminal access is enabled for an
+    /// environment after applying project-level defaults and environment-level
+    /// overrides.
+    pub async fn is_container_exec_enabled(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+    ) -> Result<bool, DeploymentError> {
+        let project = projects::Entity::find_by_id(project_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| DeploymentError::NotFound("Project not found".to_string()))?;
+
+        let environment = environments::Entity::find_by_id(environment_id)
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| DeploymentError::NotFound("Environment not found".to_string()))?;
+
+        let enabled = match (
+            project.deployment_config.as_ref(),
+            environment.deployment_config.as_ref(),
+        ) {
+            (Some(project_config), Some(environment_config)) => {
+                project_config
+                    .merge(environment_config)
+                    .container_exec_enabled
+            }
+            (Some(project_config), None) => project_config.container_exec_enabled,
+            (None, Some(environment_config)) => environment_config.container_exec_enabled,
+            (None, None) => false,
+        };
+
+        Ok(enabled)
+    }
+
     /// Stop a specific container
     pub async fn stop_container(
         &self,
