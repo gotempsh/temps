@@ -25,7 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   can get a local build working without trial and error.
 
 ### Fixed
--
+- **Edge cache-miss token isolation**: cacheable static asset misses in `temps edge` no longer attach the edge control-plane bearer token when fetching tenant-routed origin paths. This preserves pull-through caching while preventing deployed applications from observing node/join credentials in the `Authorization` header.
+
+### Security
+- **Edge origin fetch credential leak**: removed the privileged bearer credential from cache-miss origin requests that use the public `Host` header for routing, because those requests can be handled by untrusted deployed application code.
 
 
 ## [0.1.0-beta.39] - 2026-06-25
