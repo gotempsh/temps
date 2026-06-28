@@ -25,7 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   can get a local build working without trial and error.
 
 ### Fixed
--
+- **Compose deploy container conflict handling**: Removed pre-deploy Docker container deletion based on user-controlled `container_name` values so a Compose name collision fails safely instead of allowing one deployment to stop or remove unrelated host containers.
+
 
 
 ## [0.1.0-beta.39] - 2026-06-25
