@@ -11169,6 +11169,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "serde_yaml",
  "serial_test",
  "sysinfo 0.29.11",
  "tar",
