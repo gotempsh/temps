@@ -60,6 +60,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   firing kept a frozen `firing` state (the evaluator only scans enabled rules);
   the status model now treats a disabled monitor as not-firing everywhere, so
   dashboards and the alerts list don't flash a false red alarm (#158).
+- **Flaky provider lifecycle tests isolated.** `test_create_redis_service`,
+  `test_delete_service`, and `test_update_service_parameters` used fixed
+  container names and default host ports, causing intermittent CI failures
+  (`port is already allocated`, `No such container`) under runner contention.
+  They now allocate an unused port and a unique service name, matching the
+  existing `test_create_postgres_service` idiom (#171).
 
 
 ## [0.1.0-beta.39] - 2026-06-25
