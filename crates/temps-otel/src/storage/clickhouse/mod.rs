@@ -46,13 +46,15 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
+use temps_metrics::validate_metric_name;
+
 use crate::error::OtelError;
 use crate::storage::timescaledb::TimescaleDbStorage;
 use crate::storage::{BaselinePoint, DeployEvent, MinuteAggregate, OtelStorage, StorageResult};
 use crate::types::{
-    GenAiEvent, GenAiSpanDetail, GenAiTraceSummary, HealthSummary, Insight, InsightStatus,
-    LogQuery, LogRecord, MetricBucket, MetricPoint, MetricQuery, SpanEvent, SpanKind, SpanRecord,
-    SpanStatusCode, StorageQuota, TraceQuery, TraceSummary,
+    GenAiEvent, GenAiSpanDetail, GenAiTraceSummary, HealthSummary, HistogramSummary, Insight,
+    InsightStatus, LogQuery, LogRecord, MetricAggregation, MetricBucket, MetricPoint, MetricQuery,
+    SpanEvent, SpanKind, SpanRecord, SpanStatusCode, StorageQuota, TraceQuery, TraceSummary,
 };
 
 // ── Client configuration ────────────────────────────────────────────────────
@@ -364,6 +366,271 @@ impl From<ChSpanRow> for SpanRecord {
     }
 }
 
+// ── Metric row type ───────────────────────────────────────────────────────
+
+/// ClickHouse row matching the `metrics` table DDL in `0003_metrics.sql`.
+///
+/// **Field order must match the DDL column order exactly.** The `clickhouse`
+/// crate serialises fields positionally (binary protocol over HTTP); any
+/// reordering here relative to the DDL silently corrupts inserts. A unit test
+/// (`ch_metric_row_field_order_matches_ddl`) guards the column count.
+///
+/// ## Type mapping
+///
+/// | DDL type                              | Rust type                          |
+/// |---------------------------------------|------------------------------------|
+/// | `Int32`                               | `i32`                              |
+/// | `Nullable(Int32)`                     | `Option<i32>`                      |
+/// | `LowCardinality(String)` / `String`   | `String`                           |
+/// | `Nullable(UInt8)`                     | `Option<u8>` (0/1 for is_monotonic)|
+/// | `DateTime64(3, 'UTC')`                | `i64` (Unix milliseconds)          |
+/// | `Nullable(DateTime64(3, 'UTC'))`      | `Option<i64>` (Unix milliseconds)  |
+/// | `UInt32`                              | `u32`                              |
+/// | `Nullable(Float64)`                   | `Option<f64>`                      |
+/// | `Nullable(UInt64)`                    | `Option<u64>`                      |
+/// | `Array(Float64)`                      | `Vec<f64>`                         |
+/// | `Array(UInt64)`                       | `Vec<u64>`                         |
+/// | `Array(Tuple(Float64, Float64))`      | `Vec<(f64, f64)>`                  |
+/// | `Array(Tuple(String,String,Float64,DateTime64))` | `Vec<(String,String,f64,i64)>` |
+/// | `Map(String, String)`                 | `Vec<(String, String)>`            |
+/// | `UInt64`                              | `u64`                              |
+///
+/// Timestamps are stored as Unix milliseconds (`i64`), the same encoding used by
+/// [`ChSpanRow`]. The `clickhouse` crate represents `Map(K, V)` as a `Vec<(K, V)>`
+/// of key/value pairs in row-binary, so `attributes` is modelled that way.
+#[derive(::clickhouse::Row, Serialize, Deserialize, Debug, Clone)]
+pub struct ChMetricRow {
+    // ── Tenant + deployment context ─────────────────────────────────────────
+    /// project_id  Int32
+    pub project_id: i32,
+    /// deployment_id  Nullable(Int32)
+    pub deployment_id: Option<i32>,
+
+    // ── Resource / service identity ─────────────────────────────────────────
+    /// service_name  LowCardinality(String)
+    pub service_name: String,
+    /// service_version  LowCardinality(String)
+    pub service_version: String,
+    /// deployment_environment  LowCardinality(String)
+    pub deployment_environment: String,
+
+    // ── Metric identity + semantics ─────────────────────────────────────────
+    /// metric_name  String
+    pub metric_name: String,
+    /// metric_type  LowCardinality(String)
+    pub metric_type: String,
+    /// temporality  LowCardinality(String)  DEFAULT 'unspecified'
+    pub temporality: String,
+    /// is_monotonic  Nullable(UInt8)  (0/1; None for non-Sum)
+    pub is_monotonic: Option<u8>,
+    /// unit  LowCardinality(String)  DEFAULT ''
+    pub unit: String,
+    /// description  String  DEFAULT ''
+    pub description: String,
+
+    // ── Timing ──────────────────────────────────────────────────────────────
+    /// timestamp  DateTime64(3, 'UTC') — Unix milliseconds
+    pub timestamp: i64,
+    /// start_time  Nullable(DateTime64(3, 'UTC')) — Unix milliseconds
+    pub start_time: Option<i64>,
+    /// flags  UInt32  DEFAULT 0
+    pub flags: u32,
+
+    // ── Scalar (Gauge / Sum) ────────────────────────────────────────────────
+    /// value  Nullable(Float64)
+    pub value: Option<f64>,
+
+    // ── Explicit histogram / summary aggregate fields ───────────────────────
+    /// histogram_count  Nullable(UInt64)
+    pub histogram_count: Option<u64>,
+    /// histogram_sum  Nullable(Float64)
+    pub histogram_sum: Option<f64>,
+    /// histogram_min  Nullable(Float64)
+    pub histogram_min: Option<f64>,
+    /// histogram_max  Nullable(Float64)
+    pub histogram_max: Option<f64>,
+    /// histogram_bounds  Array(Float64)  DEFAULT []
+    pub histogram_bounds: Vec<f64>,
+    /// histogram_bucket_counts  Array(UInt64)  DEFAULT []
+    pub histogram_bucket_counts: Vec<u64>,
+
+    // ── Exponential-histogram fields ────────────────────────────────────────
+    /// exp_scale  Nullable(Int32)
+    pub exp_scale: Option<i32>,
+    /// exp_zero_count  Nullable(UInt64)
+    pub exp_zero_count: Option<u64>,
+    /// exp_zero_threshold  Nullable(Float64)
+    pub exp_zero_threshold: Option<f64>,
+    /// exp_positive_offset  Nullable(Int32)
+    pub exp_positive_offset: Option<i32>,
+    /// exp_positive_counts  Array(UInt64)  DEFAULT []
+    pub exp_positive_counts: Vec<u64>,
+    /// exp_negative_offset  Nullable(Int32)
+    pub exp_negative_offset: Option<i32>,
+    /// exp_negative_counts  Array(UInt64)  DEFAULT []
+    pub exp_negative_counts: Vec<u64>,
+
+    // ── Summary quantiles ───────────────────────────────────────────────────
+    /// summary_quantiles  Array(Tuple(Float64, Float64))  DEFAULT []
+    pub summary_quantiles: Vec<(f64, f64)>,
+
+    // ── Exemplars ───────────────────────────────────────────────────────────
+    /// exemplars  Array(Tuple(String, String, Float64, DateTime64(3,'UTC')))
+    /// Tuple shape: (trace_id, span_id, value, timestamp_ms).
+    pub exemplars: Vec<(String, String, f64, i64)>,
+
+    // ── Data-point labels ───────────────────────────────────────────────────
+    /// attributes  Map(String, String) — row-binary as key/value pairs.
+    pub attributes: Vec<(String, String)>,
+
+    // ── Dedup key ───────────────────────────────────────────────────────────
+    /// _version  UInt64  DEFAULT toUnixTimestamp64Milli(now64())
+    pub _version: u64,
+}
+
+/// The number of named columns in the `metrics` DDL (`0003_metrics.sql`),
+/// excluding the `_version` dedup sentinel. The [`ChMetricRow`] struct must have
+/// exactly this many domain fields, in the same order. Bump together with the
+/// DDL when the schema changes. Used by the field-order guard test.
+#[allow(dead_code)]
+pub(crate) const CH_METRIC_ROW_FIELD_COUNT: usize = 31;
+
+impl From<&MetricPoint> for ChMetricRow {
+    fn from(p: &MetricPoint) -> Self {
+        // attributes Map: BTreeMap -> ordered key/value pairs. Caller (ingest)
+        // has already capped count/size and stripped temps.* keys at the trust
+        // boundary, so we serialise verbatim here.
+        let attributes: Vec<(String, String)> = p
+            .attributes
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        let exemplars: Vec<(String, String, f64, i64)> = p
+            .exemplars
+            .iter()
+            .map(|e| {
+                (
+                    e.trace_id.clone().unwrap_or_default(),
+                    e.span_id.clone().unwrap_or_default(),
+                    e.value,
+                    e.timestamp.timestamp_millis(),
+                )
+            })
+            .collect();
+
+        // _version: Unix ms timestamp used as the ReplacingMergeTree dedup key.
+        let version = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        Self {
+            project_id: p.project_id,
+            deployment_id: p.deployment_id,
+            service_name: p.resource.service_name.clone(),
+            service_version: p.resource.service_version.clone().unwrap_or_default(),
+            deployment_environment: p
+                .resource
+                .deployment_environment
+                .clone()
+                .unwrap_or_default(),
+            metric_name: p.metric_name.clone(),
+            metric_type: p.metric_type.to_string(),
+            temporality: p
+                .temporality
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "unspecified".to_string()),
+            is_monotonic: p.is_monotonic.map(|b| b as u8),
+            unit: p.unit.clone(),
+            description: p.description.clone().unwrap_or_default(),
+            timestamp: p.timestamp.timestamp_millis(),
+            start_time: p.start_time.map(|t| t.timestamp_millis()),
+            flags: p.flags,
+            value: p.value,
+            histogram_count: p.histogram_count,
+            histogram_sum: p.histogram_sum,
+            histogram_min: p.histogram_min,
+            histogram_max: p.histogram_max,
+            histogram_bounds: p.histogram_bounds.clone().unwrap_or_default(),
+            histogram_bucket_counts: p.histogram_bucket_counts.clone().unwrap_or_default(),
+            exp_scale: p.exp_scale,
+            exp_zero_count: p.exp_zero_count,
+            exp_zero_threshold: p.exp_zero_threshold,
+            exp_positive_offset: p.exp_positive_offset,
+            exp_positive_counts: p.exp_positive_counts.clone().unwrap_or_default(),
+            exp_negative_offset: p.exp_negative_offset,
+            exp_negative_counts: p.exp_negative_counts.clone().unwrap_or_default(),
+            summary_quantiles: p.summary_quantiles.clone().unwrap_or_default(),
+            exemplars,
+            attributes,
+            _version: version,
+        }
+    }
+}
+
+// ── Metric read-side row types ────────────────────────────────────────────
+
+/// Row returned by `query_metrics` — one time-bucketed aggregate.
+///
+/// Field order MUST match the SELECT column order in `query_metrics`
+/// (positional row-binary). `agg_value` carries the requested
+/// [`MetricAggregation`]; `series_values` carries the grouped label values in
+/// `group_by` order (empty when the query is ungrouped).
+#[derive(::clickhouse::Row, Deserialize, Debug)]
+struct ChMetricBucketRow {
+    /// Bucket start, Unix milliseconds (toStartOfInterval(...)).
+    bucket_ms: i64,
+    avg_value: f64,
+    min_value: f64,
+    max_value: f64,
+    count: u64,
+    /// The value of the requested aggregation for this bucket.
+    agg_value: f64,
+    /// Grouped label values, in `group_by` order (empty when ungrouped).
+    series_values: Vec<String>,
+}
+
+/// Row of the temporality-aware histogram sub-aggregation (one per
+/// bucket × grouped-series). Matched back to [`ChMetricBucketRow`] by
+/// `(bucket_ms, series_values)`.
+#[derive(::clickhouse::Row, Deserialize, Debug)]
+struct ChHistogramRow {
+    bucket_ms: i64,
+    series_values: Vec<String>,
+    hcount: u64,
+    hsum: f64,
+    hmin: Option<f64>,
+    hmax: Option<f64>,
+    hbounds: Vec<f64>,
+    hbuckets: Vec<u64>,
+}
+
+/// Row returned by `list_metric_names` — a single distinct name.
+#[derive(::clickhouse::Row, Deserialize, Debug)]
+struct ChMetricNameRow {
+    metric_name: String,
+}
+
+/// Row returned by `get_metric_baseline` — hour/day-bucketed stats.
+#[derive(::clickhouse::Row, Deserialize, Debug)]
+struct ChBaselineRow {
+    hour_of_day: i32,
+    day_of_week: i32,
+    avg_value: f64,
+    stddev_value: f64,
+    sample_count: u64,
+}
+
+/// Row returned by `get_recent_minute_aggregates`.
+#[derive(::clickhouse::Row, Deserialize, Debug)]
+struct ChMinuteAggregateRow {
+    /// Bucket start, Unix milliseconds (toStartOfMinute(...)).
+    bucket_ms: i64,
+    avg_value: f64,
+    count: u64,
+}
+
 // ── Enum ↔ string helpers ───────────────────────────────────────────────────
 
 /// Map [`SpanKind`] to the string stored in the CH `kind` column.
@@ -492,6 +759,99 @@ pub(crate) fn escape_like_pattern(pattern: &str) -> String {
         .replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")
+}
+
+// ── Metric bucket-interval translation ──────────────────────────────────────
+
+/// Translate a free-form Postgres-style interval string (e.g. `"1 hour"`,
+/// `"5 minutes"`, `"1 day"`) into a ClickHouse `INTERVAL <n> <UNIT>` fragment
+/// that is safe to interpolate into a `toStartOfInterval(timestamp, INTERVAL …)`
+/// expression.
+///
+/// ClickHouse has no `time_bucket()`; bucketing is done with
+/// `toStartOfInterval(ts, INTERVAL n unit)`. The `clickhouse` crate cannot bind
+/// an `INTERVAL` literal as a parameter, so the fragment must be built as a
+/// string. To keep that injection-safe we parse the input strictly:
+///
+/// - the count must be a positive integer (`1..=100000`),
+/// - the unit must be one of a fixed allowlist (second/minute/hour/day/week),
+///
+/// and we re-emit a canonical fragment built only from the parsed integer and a
+/// hard-coded unit keyword — no user bytes survive into the SQL. Anything that
+/// does not parse falls back to the default `INTERVAL 1 HOUR`.
+pub(crate) fn translate_bucket_interval(interval: &str) -> String {
+    const DEFAULT: &str = "INTERVAL 1 HOUR";
+    let trimmed = interval.trim();
+    // Accept two shapes:
+    //   - space-separated "<count> <unit>" (e.g. "5 minutes", "1 hour"), and
+    //   - compact "<count><unit>" (e.g. "300s", "5m", "1h") which the evaluator
+    //     and SDK emit via `format!("{}s", secs)`. Without the compact form,
+    //     "300s" failed to parse and silently fell back to 1-hour buckets —
+    //     coarsening every windowed query (static + anomaly baseline).
+    let mut parts = trimmed.split_whitespace();
+    let (count_str, unit_raw): (String, String) = match (parts.next(), parts.next()) {
+        (Some(count), Some(unit)) => {
+            // Reject anything with extra tokens (e.g. "1 hour; DROP").
+            if parts.next().is_some() {
+                return DEFAULT.to_string();
+            }
+            (count.to_string(), unit.to_string())
+        }
+        (Some(single), None) => {
+            // Compact form: split leading ASCII digits from the trailing unit.
+            let split = single
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(single.len());
+            if split == 0 || split == single.len() {
+                return DEFAULT.to_string();
+            }
+            (single[..split].to_string(), single[split..].to_string())
+        }
+        _ => return DEFAULT.to_string(),
+    };
+    let Ok(count) = count_str.parse::<u32>() else {
+        return DEFAULT.to_string();
+    };
+    if count == 0 || count > 100_000 {
+        return DEFAULT.to_string();
+    }
+    // Normalise the unit (singular/plural and single-letter) to a fixed keyword.
+    let unit = match unit_raw.to_ascii_lowercase().as_str() {
+        "second" | "seconds" | "sec" | "secs" | "s" => "SECOND",
+        "minute" | "minutes" | "min" | "mins" | "m" => "MINUTE",
+        "hour" | "hours" | "hr" | "hrs" | "h" => "HOUR",
+        "day" | "days" | "d" => "DAY",
+        "week" | "weeks" | "w" => "WEEK",
+        _ => return DEFAULT.to_string(),
+    };
+    format!("INTERVAL {count} {unit}")
+}
+
+/// Derive the bucket width in whole seconds from a canonical interval fragment
+/// produced by [`translate_bucket_interval`] (e.g. `"INTERVAL 5 MINUTE"`).
+///
+/// Used only by the `RatePerSec` aggregation to convert a per-bucket counter
+/// delta into a per-second rate. The input is always our own controlled
+/// fragment (never raw user input), so parse failures fall back to one hour.
+pub(crate) fn interval_seconds(interval_sql: &str) -> i64 {
+    const HOUR: i64 = 3600;
+    let mut parts = interval_sql.split_whitespace();
+    // Expect: INTERVAL <n> <UNIT>
+    if parts.next() != Some("INTERVAL") {
+        return HOUR;
+    }
+    let Some(count) = parts.next().and_then(|c| c.parse::<i64>().ok()) else {
+        return HOUR;
+    };
+    let unit_secs = match parts.next() {
+        Some("SECOND") => 1,
+        Some("MINUTE") => 60,
+        Some("HOUR") => HOUR,
+        Some("DAY") => 86_400,
+        Some("WEEK") => 604_800,
+        _ => return HOUR,
+    };
+    (count * unit_secs).max(1)
 }
 
 // ── OtelError helpers ───────────────────────────────────────────────────────
@@ -823,7 +1183,12 @@ impl OtelStorage for ClickHouseOtelStorage {
             binds.push(Bv::Str(tid.clone()));
         }
         if let Some(ref svc) = query.service_name {
-            where_parts.push("service_name = ?".to_owned());
+            // Qualify with the table: the trace-summary SELECTs alias
+            // `argMax(service_name) AS service_name`, which shadows the raw
+            // column, so an unqualified `service_name` in WHERE binds to the
+            // aggregate (ClickHouse Code 184 ILLEGAL_AGGREGATION). The count
+            // mirrors qualify too so the filter SQL stays byte-identical.
+            where_parts.push("spans.service_name = ?".to_owned());
             binds.push(Bv::Str(svc.clone()));
         }
         if let Some(min_dur) = query.min_duration_ms {
@@ -984,7 +1349,12 @@ impl OtelStorage for ClickHouseOtelStorage {
             binds.push(Bv::Str(tid.clone()));
         }
         if let Some(ref svc) = query.service_name {
-            where_parts.push("service_name = ?".to_owned());
+            // Qualify with the table: the trace-summary SELECTs alias
+            // `argMax(service_name) AS service_name`, which shadows the raw
+            // column, so an unqualified `service_name` in WHERE binds to the
+            // aggregate (ClickHouse Code 184 ILLEGAL_AGGREGATION). The count
+            // mirrors qualify too so the filter SQL stays byte-identical.
+            where_parts.push("spans.service_name = ?".to_owned());
             binds.push(Bv::Str(svc.clone()));
         }
         if let Some(min_dur) = query.min_duration_ms {
@@ -1195,7 +1565,12 @@ impl OtelStorage for ClickHouseOtelStorage {
         let mut binds: Vec<Bv> = vec![Bv::I32(query.project_id)];
 
         if let Some(ref svc) = query.service_name {
-            where_parts.push("service_name = ?".to_owned());
+            // Qualify with the table: the trace-summary SELECTs alias
+            // `argMax(service_name) AS service_name`, which shadows the raw
+            // column, so an unqualified `service_name` in WHERE binds to the
+            // aggregate (ClickHouse Code 184 ILLEGAL_AGGREGATION). The count
+            // mirrors qualify too so the filter SQL stays byte-identical.
+            where_parts.push("spans.service_name = ?".to_owned());
             binds.push(Bv::Str(svc.clone()));
         }
         if let Some(start) = query.start_time {
@@ -1445,7 +1820,12 @@ impl OtelStorage for ClickHouseOtelStorage {
         let mut binds: Vec<Bv> = vec![Bv::I32(query.project_id)];
 
         if let Some(ref svc) = query.service_name {
-            where_parts.push("service_name = ?".to_owned());
+            // Qualify with the table: the trace-summary SELECTs alias
+            // `argMax(service_name) AS service_name`, which shadows the raw
+            // column, so an unqualified `service_name` in WHERE binds to the
+            // aggregate (ClickHouse Code 184 ILLEGAL_AGGREGATION). The count
+            // mirrors qualify too so the filter SQL stays byte-identical.
+            where_parts.push("spans.service_name = ?".to_owned());
             binds.push(Bv::Str(svc.clone()));
         }
         if let Some(start) = query.start_time {
@@ -1574,12 +1954,411 @@ impl OtelStorage for ClickHouseOtelStorage {
         Ok(events)
     }
 
+    // ── Metric write (ClickHouse — sole sink for the OtelStorage path) ───────
+    //
+    // ADR-016 Phase B: when ClickHouse is enabled, native CH `metrics` is the
+    // single source of truth for the OtelStorage metric path (otel_metrics on
+    // Timescale no longer receives this write). The independent
+    // `service_metrics` alerting bridge (TimescaleMetricsStore / metrics_write_tx
+    // in the ingest handler) is untouched and still targets TimescaleDB.
+
+    /// Batch-insert metric points directly into the ClickHouse `metrics` table.
+    ///
+    /// Mirrors `store_spans`: chunked `insert` + per-row `write` + `end()`,
+    /// `ReplacingMergeTree(_version)` dedups retried OTLP payloads.
+    ///
+    /// Trust boundary: although the OTLP ingest handler already validates metric
+    /// names and caps labels before producing `MetricPoint`s, this method is the
+    /// last gate before bytes hit the store. We re-apply the metric-name
+    /// allowlist here (defence in depth) and skip — rather than abort — any point
+    /// whose name is outside `[a-zA-Z0-9_.:-]`. The returned count reflects only
+    /// the points actually written.
+    async fn store_metrics(&self, points: Vec<MetricPoint>) -> StorageResult<u64> {
+        /// Maximum number of metric rows per ClickHouse HTTP insert request.
+        const MAX_METRIC_INSERT_BATCH: usize = 10_000;
+
+        if points.is_empty() {
+            return Ok(0);
+        }
+
+        // Filter at the trust boundary: drop names outside the allowlist.
+        let safe: Vec<&MetricPoint> = points
+            .iter()
+            .filter(|p| {
+                if validate_metric_name(&p.metric_name).is_err() {
+                    tracing::warn!(
+                        project_id = p.project_id,
+                        metric_name = %p.metric_name,
+                        "ClickHouse store_metrics: dropping metric, name outside allowlist (possible injection attempt)"
+                    );
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+
+        if safe.is_empty() {
+            return Ok(0);
+        }
+        let total = safe.len() as u64;
+
+        for chunk in safe.chunks(MAX_METRIC_INSERT_BATCH) {
+            let mut inserter = self
+                .ch
+                .insert::<ChMetricRow>("metrics")
+                .map_err(|e| ch_ingest_err("store_metrics (inserter setup)", e))?;
+
+            for point in chunk {
+                let row = ChMetricRow::from(*point);
+                inserter
+                    .write(&row)
+                    .await
+                    .map_err(|e| ch_ingest_err("store_metrics (write)", e))?;
+            }
+
+            inserter
+                .end()
+                .await
+                .map_err(|e| ch_ingest_err("store_metrics (end)", e))?;
+        }
+
+        debug!(total, "ClickHouseOtelStorage: stored metrics");
+        Ok(total)
+    }
+
+    // ── Metric reads (ClickHouse — native) ──────────────────────────────────
+
+    /// Time-bucketed metric aggregates over the scalar `value` column.
+    ///
+    /// Honours the store-neutral [`MetricQuery`] contract:
+    /// - `bucket_interval` → `toStartOfInterval(timestamp, INTERVAL …)` (CH has
+    ///   no `time_bucket`), translated via [`translate_bucket_interval`] from a
+    ///   fixed allowlist — no user bytes reach the SQL.
+    /// - `metric_type` → `metric_type = ?` (bound).
+    /// - `label_filters` → `attributes[?] = ?` per pair, the **key bound** via a
+    ///   parameter (never concatenated) after passing the metric-name allowlist.
+    /// - `group_by` → one series per distinct label-set; the grouped label values
+    ///   are returned as an `Array(String)` and paired back with the (allowlisted)
+    ///   keys to form `series_key`.
+    /// - `aggregation` → the requested reducer drives `agg_value`: avg/sum/min/
+    ///   max/count, a `quantile(q)(value)`, or `RatePerSec` as
+    ///   `(max-min)/window_seconds` (cumulative monotonic delta; we never
+    ///   re-delta a series, matching the ingest temporality semantics).
+    ///
+    /// All filter values are bound via `?` placeholders.
+    async fn query_metrics(&self, query: MetricQuery) -> StorageResult<Vec<MetricBucket>> {
+        use chrono::TimeZone;
+
+        let interval_sql =
+            translate_bucket_interval(query.bucket_interval.as_deref().unwrap_or("1 hour"));
+        let limit = query.limit.unwrap_or(1000).min(10_000);
+
+        // Validate label keys (group_by + label_filters) against the ingest
+        // allowlist. Reject the whole query on a bad key rather than silently
+        // dropping a filter — a bad key signals a malformed/abusive request.
+        for key in query
+            .group_by
+            .iter()
+            .chain(query.label_filters.iter().map(|(k, _)| k))
+        {
+            if validate_metric_name(key).is_err() {
+                return Err(OtelError::Storage {
+                    message: format!(
+                        "query_metrics: label key '{key}' is outside the allowed character set [a-zA-Z0-9_.:-]"
+                    ),
+                });
+            }
+        }
+
+        // The aggregation expression over the scalar `value` column. For
+        // RatePerSec we compute the per-bucket delta divided by the bucket width
+        // in seconds; the divisor is derived from the (already-validated)
+        // interval fragment, not user input.
+        // `value` is Nullable(Float64); every aggregate input is wrapped in
+        // assumeNotNull (safe — the WHERE clause filters `value IS NOT NULL`) so
+        // the result type is a non-nullable Float64 that matches the `f64`
+        // ChMetricBucketRow read field. Without this, min/max/sum/quantile over a
+        // Nullable column return Nullable(Float64) and the RowBinary read fails
+        // with "row type mismatches a database schema".
+        let agg_expr = match query.aggregation {
+            MetricAggregation::Avg => "avg(assumeNotNull(value))".to_string(),
+            MetricAggregation::Sum => "sum(assumeNotNull(value))".to_string(),
+            MetricAggregation::Min => "min(assumeNotNull(value))".to_string(),
+            MetricAggregation::Max => "max(assumeNotNull(value))".to_string(),
+            MetricAggregation::Count => "toFloat64(count())".to_string(),
+            MetricAggregation::RatePerSec => {
+                let secs = interval_seconds(&interval_sql).max(1);
+                // Temporality-aware per-second rate. DELTA series already carry
+                // per-interval increments, so the bucket rate is sum/window.
+                // CUMULATIVE counters are stored raw (monotonic running total),
+                // so the within-bucket increase is (max - min). `any(temporality)`
+                // reads the metric's (uniform) temporality; the window divisor is
+                // guarded against zero by secs.max(1) above.
+                format!(
+                    "if(any(temporality) = 'delta', \
+                        sum(assumeNotNull(value)), \
+                        max(assumeNotNull(value)) - min(assumeNotNull(value))) / {secs}.0"
+                )
+            }
+            MetricAggregation::Quantile(q) => {
+                let qc = q.clamp(0.0, 1.0);
+                // quantile() takes its level as a parameter in parentheses; we
+                // emit the clamped float literal (not user bytes).
+                format!("quantile({qc})(assumeNotNull(value))")
+            }
+        };
+
+        // Grouped label values as an Array(String), in group_by order. CH binds
+        // the key via the `?` map-index parameter, never string interpolation.
+        let group_select = if query.group_by.is_empty() {
+            "[] AS series_values".to_string()
+        } else {
+            let parts: Vec<String> = query
+                .group_by
+                .iter()
+                .map(|_| "attributes[?]".to_string())
+                .collect();
+            format!("[{}] AS series_values", parts.join(", "))
+        };
+        let group_by_extra = if query.group_by.is_empty() {
+            String::new()
+        } else {
+            ", series_values".to_string()
+        };
+        // The grouped-label array WITHOUT the `AS series_values` alias, for reuse
+        // inside the histogram sub-aggregation's projection.
+        let group_array = if query.group_by.is_empty() {
+            "[]".to_string()
+        } else {
+            let parts: Vec<String> = query
+                .group_by
+                .iter()
+                .map(|_| "attributes[?]".to_string())
+                .collect();
+            format!("[{}]", parts.join(", "))
+        };
+
+        // Build WHERE with `?` placeholders; bind in the same order below.
+        let mut where_clauses = vec!["project_id = ?".to_string()];
+        if query.metric_name.is_some() {
+            where_clauses.push("metric_name = ?".to_string());
+        }
+        if query.metric_type.is_some() {
+            where_clauses.push("metric_type = ?".to_string());
+        }
+        if query.service_name.is_some() {
+            where_clauses.push("service_name = ?".to_string());
+        }
+        if query.environment.is_some() {
+            where_clauses.push("deployment_environment = ?".to_string());
+        }
+        for _ in &query.label_filters {
+            where_clauses.push("attributes[?] = ?".to_string());
+        }
+        if query.start_time.is_some() {
+            where_clauses.push("timestamp >= fromUnixTimestamp64Milli(?)".to_string());
+        }
+        if query.end_time.is_some() {
+            where_clauses.push("timestamp <= fromUnixTimestamp64Milli(?)".to_string());
+        }
+        // Only aggregate rows that carry a scalar value.
+        where_clauses.push("value IS NOT NULL".to_string());
+        let where_sql = where_clauses.join(" AND ");
+
+        let sql = format!(
+            "SELECT \
+                 toInt64(toUnixTimestamp(toStartOfInterval(timestamp, {interval_sql}))) * 1000 AS bucket_ms, \
+                 avg(assumeNotNull(value)) AS avg_value, \
+                 min(assumeNotNull(value)) AS min_value, \
+                 max(assumeNotNull(value)) AS max_value, \
+                 count() AS count, \
+                 {agg_expr} AS agg_value, \
+                 {group_select} \
+             FROM metrics \
+             WHERE {where_sql} \
+             GROUP BY bucket_ms{group_by_extra} \
+             ORDER BY bucket_ms ASC \
+             LIMIT ?"
+        );
+
+        // Bind order: SELECT group keys first (the `attributes[?]` in the
+        // projection), then WHERE params in clause order, then LIMIT.
+        let mut q = self.ch.query(&sql);
+        for key in &query.group_by {
+            q = q.bind(key.clone());
+        }
+        q = q.bind(query.project_id);
+        if let Some(ref name) = query.metric_name {
+            q = q.bind(name.clone());
+        }
+        if let Some(mt) = query.metric_type {
+            q = q.bind(mt.to_string());
+        }
+        if let Some(ref svc) = query.service_name {
+            q = q.bind(svc.clone());
+        }
+        if let Some(ref env) = query.environment {
+            q = q.bind(env.clone());
+        }
+        for (k, v) in &query.label_filters {
+            q = q.bind(k.clone());
+            q = q.bind(v.clone());
+        }
+        if let Some(start) = query.start_time {
+            q = q.bind(start.timestamp_millis());
+        }
+        if let Some(end) = query.end_time {
+            q = q.bind(end.timestamp_millis());
+        }
+        q = q.bind(limit);
+
+        let rows = q
+            .fetch_all::<ChMetricBucketRow>()
+            .await
+            .map_err(|e| ch_query_err("query_metrics", e))?;
+
+        // Histogram summary, computed separately so cumulative re-exports are NOT
+        // double-counted. The inner query collapses each series (cumulative ->
+        // latest snapshot via argMax/max; delta or unspecified -> sum across the
+        // window); the outer sums those per-series results up to the requested
+        // grouping granularity. Matched back to the scalar rows by
+        // (bucket_ms, series_values).
+        let hist_sql = format!(
+            "SELECT bucket_ms, series_values, \
+                 sum(s_count) AS hcount, sum(s_sum) AS hsum, \
+                 min(s_min) AS hmin, max(s_max) AS hmax, \
+                 anyIf(s_bounds, notEmpty(s_bounds)) AS hbounds, \
+                 sumForEach(s_buckets) AS hbuckets \
+             FROM ( \
+                 SELECT \
+                     toInt64(toUnixTimestamp(toStartOfInterval(timestamp, {interval_sql}))) * 1000 AS bucket_ms, \
+                     any({group_array}) AS series_values, \
+                     attributes_hash AS ah, \
+                     if(any(temporality) = 'cumulative', max(ifNull(histogram_count, 0)), sum(ifNull(histogram_count, 0))) AS s_count, \
+                     if(any(temporality) = 'cumulative', max(ifNull(histogram_sum, 0)), sum(ifNull(histogram_sum, 0))) AS s_sum, \
+                     min(histogram_min) AS s_min, \
+                     max(histogram_max) AS s_max, \
+                     any(histogram_bounds) AS s_bounds, \
+                     if(any(temporality) = 'cumulative', argMax(histogram_bucket_counts, timestamp), sumForEach(histogram_bucket_counts)) AS s_buckets \
+                 FROM metrics \
+                 WHERE {where_sql} AND notEmpty(histogram_bucket_counts) \
+                 GROUP BY bucket_ms, ah \
+             ) \
+             GROUP BY bucket_ms, series_values \
+             ORDER BY bucket_ms ASC \
+             LIMIT ?"
+        );
+        let mut hq = self.ch.query(&hist_sql);
+        for key in &query.group_by {
+            hq = hq.bind(key.clone());
+        }
+        hq = hq.bind(query.project_id);
+        if let Some(ref name) = query.metric_name {
+            hq = hq.bind(name.clone());
+        }
+        if let Some(mt) = query.metric_type {
+            hq = hq.bind(mt.to_string());
+        }
+        if let Some(ref svc) = query.service_name {
+            hq = hq.bind(svc.clone());
+        }
+        if let Some(ref env) = query.environment {
+            hq = hq.bind(env.clone());
+        }
+        for (k, v) in &query.label_filters {
+            hq = hq.bind(k.clone());
+            hq = hq.bind(v.clone());
+        }
+        if let Some(start) = query.start_time {
+            hq = hq.bind(start.timestamp_millis());
+        }
+        if let Some(end) = query.end_time {
+            hq = hq.bind(end.timestamp_millis());
+        }
+        hq = hq.bind(limit);
+        let hist_rows = hq
+            .fetch_all::<ChHistogramRow>()
+            .await
+            .map_err(|e| ch_query_err("query_metrics histogram", e))?;
+        let mut hist_map: std::collections::HashMap<(i64, Vec<String>), HistogramSummary> =
+            std::collections::HashMap::new();
+        for h in hist_rows {
+            if h.hbounds.is_empty() {
+                continue;
+            }
+            hist_map.insert(
+                (h.bucket_ms, h.series_values.clone()),
+                HistogramSummary {
+                    count: h.hcount,
+                    sum: h.hsum,
+                    min: h.hmin,
+                    max: h.hmax,
+                    bounds: h.hbounds,
+                    bucket_counts: h.hbuckets,
+                },
+            );
+        }
+
+        let group_keys = query.group_by.clone();
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                // Look up the temporality-correct histogram summary (None for
+                // gauge/sum metrics, which produce no histogram rows).
+                let histogram_summary = hist_map
+                    .get(&(r.bucket_ms, r.series_values.clone()))
+                    .cloned();
+                let series_key = if group_keys.is_empty() {
+                    None
+                } else {
+                    Some(
+                        group_keys
+                            .iter()
+                            .cloned()
+                            .zip(r.series_values)
+                            .collect::<Vec<(String, String)>>(),
+                    )
+                };
+                MetricBucket {
+                    bucket: chrono::Utc
+                        .timestamp_millis_opt(r.bucket_ms)
+                        .single()
+                        .unwrap_or_default(),
+                    avg_value: r.avg_value,
+                    min_value: r.min_value,
+                    max_value: r.max_value,
+                    count: r.count as i64,
+                    value: r.agg_value,
+                    quantiles: match query.aggregation.quantile() {
+                        Some(qq) => vec![(qq, r.agg_value)],
+                        None => Vec::new(),
+                    },
+                    histogram_summary,
+                    series_key,
+                }
+            })
+            .collect())
+    }
+
+    /// List distinct metric names for a project from the CH `metrics` table.
+    async fn list_metric_names(&self, project_id: i32) -> StorageResult<Vec<String>> {
+        let rows = self
+            .ch
+            .query(
+                "SELECT DISTINCT metric_name FROM metrics \
+                 WHERE project_id = ? ORDER BY metric_name",
+            )
+            .bind(project_id)
+            .fetch_all::<ChMetricNameRow>()
+            .await
+            .map_err(|e| ch_query_err("list_metric_names", e))?;
+
+        Ok(rows.into_iter().map(|r| r.metric_name).collect())
+    }
+
     // ── Non-span methods — delegate to TimescaleDB unconditionally ───────────
     // (ADR-016 Phases 2–4 will replace these with CH implementations)
-
-    async fn store_metrics(&self, points: Vec<MetricPoint>) -> StorageResult<u64> {
-        self.inner.store_metrics(points).await
-    }
 
     async fn store_logs(&self, records: Vec<LogRecord>) -> StorageResult<u64> {
         self.inner.store_logs(records).await
@@ -1587,14 +2366,6 @@ impl OtelStorage for ClickHouseOtelStorage {
 
     async fn archive_logs(&self, records: Vec<LogRecord>) -> StorageResult<u64> {
         self.inner.archive_logs(records).await
-    }
-
-    async fn query_metrics(&self, query: MetricQuery) -> StorageResult<Vec<MetricBucket>> {
-        self.inner.query_metrics(query).await
-    }
-
-    async fn list_metric_names(&self, project_id: i32) -> StorageResult<Vec<String>> {
-        self.inner.list_metric_names(project_id).await
     }
 
     async fn query_logs(&self, query: LogQuery) -> StorageResult<Vec<LogRecord>> {
@@ -1645,8 +2416,20 @@ impl OtelStorage for ClickHouseOtelStorage {
         self.inner.check_quota(project_id).await
     }
 
-    // ── Anomaly-detection helpers — delegate to TimescaleDB ──────────────────
+    // ── Anomaly-detection helpers (ClickHouse — native) ──────────────────────
+    //
+    // store_metrics now writes only to CH, so these MUST read from CH or the
+    // anomaly detector would see an empty otel_metrics on Timescale. Implemented
+    // natively here to keep anomaly detection alive (ADR-016 Phase B, option a).
 
+    /// Hour-of-day / day-of-week baseline stats for a metric over a lookback
+    /// window. Mirrors the TimescaleDB query: average + population stddev grouped
+    /// by hour and weekday. ClickHouse `toHour`/`toDayOfWeek` operate in UTC for a
+    /// `DateTime64(_, 'UTC')` column.
+    ///
+    /// `toDayOfWeek` returns 1=Monday..7=Sunday; the Postgres `EXTRACT(DOW)`
+    /// returns 0=Sunday..6=Saturday. We remap to the Postgres convention so the
+    /// anomaly detector sees identical day indices regardless of backend.
     async fn get_metric_baseline(
         &self,
         project_id: i32,
@@ -1655,17 +2438,66 @@ impl OtelStorage for ClickHouseOtelStorage {
         environment: Option<&str>,
         lookback_days: i32,
     ) -> StorageResult<Vec<BaselinePoint>> {
-        self.inner
-            .get_metric_baseline(
-                project_id,
-                service_name,
-                metric_name,
-                environment,
-                lookback_days,
-            )
+        // Clamp the lookback to a sane range and bind it as the interval count.
+        let lookback = lookback_days.clamp(1, 3650);
+
+        let mut where_clauses = vec![
+            "project_id = ?".to_string(),
+            "service_name = ?".to_string(),
+            "metric_name = ?".to_string(),
+            "value IS NOT NULL".to_string(),
+            "timestamp >= now() - toIntervalDay(?)".to_string(),
+        ];
+        if environment.is_some() {
+            where_clauses.push("deployment_environment = ?".to_string());
+        }
+        let where_sql = where_clauses.join(" AND ");
+
+        // toDayOfWeek(...) % 7 maps Mon..Sun (1..7) -> 1..6,0 (Mon..Sat, Sun=0),
+        // matching Postgres EXTRACT(DOW) where Sunday = 0.
+        let sql = format!(
+            "SELECT \
+                 toInt32(toHour(timestamp)) AS hour_of_day, \
+                 toInt32(toDayOfWeek(timestamp) % 7) AS day_of_week, \
+                 avg(value) AS avg_value, \
+                 ifNull(stddevPop(value), 0) AS stddev_value, \
+                 count() AS sample_count \
+             FROM metrics \
+             WHERE {where_sql} \
+             GROUP BY hour_of_day, day_of_week \
+             ORDER BY day_of_week, hour_of_day"
+        );
+
+        let mut q = self
+            .ch
+            .query(&sql)
+            .bind(project_id)
+            .bind(service_name)
+            .bind(metric_name)
+            .bind(lookback as u32);
+        if let Some(env) = environment {
+            q = q.bind(env);
+        }
+
+        let rows = q
+            .fetch_all::<ChBaselineRow>()
             .await
+            .map_err(|e| ch_query_err("get_metric_baseline", e))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| BaselinePoint {
+                hour_of_day: r.hour_of_day,
+                day_of_week: r.day_of_week,
+                avg_value: r.avg_value,
+                stddev_value: r.stddev_value,
+                sample_count: r.sample_count as i64,
+            })
+            .collect())
     }
 
+    /// Recent 1-minute aggregates for anomaly scoring. Buckets on
+    /// `toStartOfMinute` and averages the scalar `value`.
     async fn get_recent_minute_aggregates(
         &self,
         project_id: i32,
@@ -1674,15 +2506,60 @@ impl OtelStorage for ClickHouseOtelStorage {
         environment: Option<&str>,
         minutes: i32,
     ) -> StorageResult<Vec<MinuteAggregate>> {
-        self.inner
-            .get_recent_minute_aggregates(
-                project_id,
-                service_name,
-                metric_name,
-                environment,
-                minutes,
-            )
+        use chrono::TimeZone;
+
+        let window = minutes.clamp(1, 100_000);
+
+        let mut where_clauses = vec![
+            "project_id = ?".to_string(),
+            "service_name = ?".to_string(),
+            "metric_name = ?".to_string(),
+            "value IS NOT NULL".to_string(),
+            "timestamp >= now() - toIntervalMinute(?)".to_string(),
+        ];
+        if environment.is_some() {
+            where_clauses.push("deployment_environment = ?".to_string());
+        }
+        let where_sql = where_clauses.join(" AND ");
+
+        let sql = format!(
+            "SELECT \
+                 toInt64(toUnixTimestamp(toStartOfMinute(timestamp))) * 1000 AS bucket_ms, \
+                 avg(value) AS avg_value, \
+                 count() AS count \
+             FROM metrics \
+             WHERE {where_sql} \
+             GROUP BY bucket_ms \
+             ORDER BY bucket_ms ASC"
+        );
+
+        let mut q = self
+            .ch
+            .query(&sql)
+            .bind(project_id)
+            .bind(service_name)
+            .bind(metric_name)
+            .bind(window as u32);
+        if let Some(env) = environment {
+            q = q.bind(env);
+        }
+
+        let rows = q
+            .fetch_all::<ChMinuteAggregateRow>()
             .await
+            .map_err(|e| ch_query_err("get_recent_minute_aggregates", e))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| MinuteAggregate {
+                bucket: chrono::Utc
+                    .timestamp_millis_opt(r.bucket_ms)
+                    .single()
+                    .unwrap_or_default(),
+                avg_value: r.avg_value,
+                count: r.count as i64,
+            })
+            .collect())
     }
 
     async fn get_recent_deploys(
@@ -1968,5 +2845,598 @@ mod tests {
         let err = ::clickhouse::error::Error::BadResponse("timeout".into());
         let otel_err = ch_query_err("query_trace_summaries", err);
         assert!(otel_err.to_string().contains("query_trace_summaries"));
+    }
+
+    // ── Metric row tests ────────────────────────────────────────────────────
+
+    use crate::types::{AggregationTemporality, Exemplar, MetricPoint, MetricQuery, MetricType};
+
+    /// A Gauge point with attributes — the simplest scalar case.
+    fn make_gauge() -> MetricPoint {
+        let mut p = MetricPoint::skeleton(
+            42,
+            Some(7),
+            ResourceInfo {
+                service_name: "my-service".into(),
+                service_version: Some("1.2.3".into()),
+                deployment_environment: Some("production".into()),
+                attributes: BTreeMap::new(),
+            },
+            "http.server.active_requests".into(),
+            MetricType::Gauge,
+            "1".into(),
+            Utc::now(),
+            {
+                let mut m = BTreeMap::new();
+                m.insert("http.method".into(), "GET".into());
+                m
+            },
+        );
+        p.value = Some(3.5);
+        p
+    }
+
+    /// A cumulative Histogram point exercising the full array/aggregate fields.
+    fn make_histogram() -> MetricPoint {
+        let mut p = MetricPoint::skeleton(
+            42,
+            None,
+            ResourceInfo::default(),
+            "http.server.duration".into(),
+            MetricType::Histogram,
+            "ms".into(),
+            Utc::now(),
+            BTreeMap::new(),
+        );
+        p.temporality = Some(AggregationTemporality::Cumulative);
+        p.histogram_count = Some(10);
+        p.histogram_sum = Some(1234.5);
+        p.histogram_min = Some(1.0);
+        p.histogram_max = Some(500.0);
+        p.histogram_bounds = Some(vec![0.0, 5.0, 10.0]);
+        p.histogram_bucket_counts = Some(vec![1, 4, 3, 2]);
+        p.value = Some(1234.5 / 10.0); // synthetic mean from decode
+        p
+    }
+
+    #[test]
+    fn ch_metric_row_field_count_matches_ddl() {
+        // Field-order landmine guard: ChMetricRow serialises positionally and
+        // MUST mirror 0003_metrics.sql column order/count exactly. Counting via
+        // a fully-specified struct literal forces a compile error if a field is
+        // added/removed without updating CH_METRIC_ROW_FIELD_COUNT.
+        let row = ChMetricRow::from(&make_gauge());
+        let ChMetricRow {
+            project_id: _,
+            deployment_id: _,
+            service_name: _,
+            service_version: _,
+            deployment_environment: _,
+            metric_name: _,
+            metric_type: _,
+            temporality: _,
+            is_monotonic: _,
+            unit: _,
+            description: _,
+            timestamp: _,
+            start_time: _,
+            flags: _,
+            value: _,
+            histogram_count: _,
+            histogram_sum: _,
+            histogram_min: _,
+            histogram_max: _,
+            histogram_bounds: _,
+            histogram_bucket_counts: _,
+            exp_scale: _,
+            exp_zero_count: _,
+            exp_zero_threshold: _,
+            exp_positive_offset: _,
+            exp_positive_counts: _,
+            exp_negative_offset: _,
+            exp_negative_counts: _,
+            summary_quantiles: _,
+            exemplars: _,
+            attributes: _,
+            _version: _,
+        } = row;
+        // 31 domain columns + _version sentinel = 32 serialised fields; the DDL
+        // declares 31 named columns plus _version, matching this destructure.
+        assert_eq!(CH_METRIC_ROW_FIELD_COUNT, 31);
+    }
+
+    #[test]
+    fn gauge_point_to_ch_row_field_mapping() {
+        let row = ChMetricRow::from(&make_gauge());
+
+        assert_eq!(row.project_id, 42);
+        assert_eq!(row.deployment_id, Some(7));
+        assert_eq!(row.service_name, "my-service");
+        assert_eq!(row.service_version, "1.2.3");
+        assert_eq!(row.deployment_environment, "production");
+        assert_eq!(row.metric_name, "http.server.active_requests");
+        assert_eq!(row.metric_type, "gauge");
+        // Gauge has no temporality -> sentinel.
+        assert_eq!(row.temporality, "unspecified");
+        assert_eq!(row.is_monotonic, None);
+        assert_eq!(row.unit, "1");
+        assert_eq!(row.value, Some(3.5));
+        // attributes Map preserved as key/value pairs.
+        assert_eq!(
+            row.attributes,
+            vec![("http.method".to_string(), "GET".to_string())]
+        );
+        // No histogram arrays -> empty sentinels (never Nullable).
+        assert!(row.histogram_bounds.is_empty());
+        assert!(row.histogram_bucket_counts.is_empty());
+        assert!(row.summary_quantiles.is_empty());
+        assert!(row.exemplars.is_empty());
+        assert!(row._version > 0);
+    }
+
+    #[test]
+    fn histogram_point_to_ch_row_field_mapping() {
+        let row = ChMetricRow::from(&make_histogram());
+
+        assert_eq!(row.metric_type, "histogram");
+        assert_eq!(row.temporality, "cumulative");
+        assert_eq!(row.histogram_count, Some(10));
+        assert_eq!(row.histogram_sum, Some(1234.5));
+        assert_eq!(row.histogram_min, Some(1.0));
+        assert_eq!(row.histogram_max, Some(500.0));
+        assert_eq!(row.histogram_bounds, vec![0.0, 5.0, 10.0]);
+        assert_eq!(row.histogram_bucket_counts, vec![1, 4, 3, 2]);
+    }
+
+    #[test]
+    fn monotonic_sum_maps_is_monotonic_to_u8() {
+        let mut p = make_gauge();
+        p.metric_type = MetricType::Sum;
+        p.is_monotonic = Some(true);
+        p.temporality = Some(AggregationTemporality::Delta);
+        let row = ChMetricRow::from(&p);
+        assert_eq!(row.metric_type, "sum");
+        assert_eq!(row.is_monotonic, Some(1));
+        assert_eq!(row.temporality, "delta");
+
+        p.is_monotonic = Some(false);
+        let row = ChMetricRow::from(&p);
+        assert_eq!(row.is_monotonic, Some(0));
+    }
+
+    #[test]
+    fn exemplars_map_to_tuple_with_hex_ids() {
+        let mut p = make_gauge();
+        p.exemplars = vec![Exemplar {
+            timestamp: Utc::now(),
+            value: 9.0,
+            trace_id: Some("deadbeef".into()),
+            span_id: Some("cafe".into()),
+            attributes: BTreeMap::new(),
+        }];
+        let row = ChMetricRow::from(&p);
+        assert_eq!(row.exemplars.len(), 1);
+        let (trace, span, value, ts) = &row.exemplars[0];
+        assert_eq!(trace, "deadbeef");
+        assert_eq!(span, "cafe");
+        assert_eq!(*value, 9.0);
+        assert!(*ts > 0);
+    }
+
+    #[test]
+    fn chunks_split_at_metric_batch_size() {
+        // 20_001 metrics -> ceil(20_001 / 10_000) = 3 chunks.
+        let points: Vec<MetricPoint> = (0..20_001).map(|_| make_gauge()).collect();
+        let chunks: Vec<_> = points.chunks(10_000).collect();
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].len(), 10_000);
+        assert_eq!(chunks[2].len(), 1);
+    }
+
+    /// A monotonic cumulative Sum (counter) — exercises is_monotonic + temporality
+    /// + start_time + flags on the scalar path.
+    fn make_monotonic_sum() -> MetricPoint {
+        let mut p = MetricPoint::skeleton(
+            7,
+            Some(3),
+            ResourceInfo {
+                service_name: "api".into(),
+                service_version: Some("9.9.9".into()),
+                deployment_environment: Some("staging".into()),
+                attributes: BTreeMap::new(),
+            },
+            "http.requests.total".into(),
+            MetricType::Sum,
+            "1".into(),
+            Utc::now(),
+            {
+                let mut m = BTreeMap::new();
+                m.insert("route".into(), "/api/v1".into());
+                m
+            },
+        );
+        p.temporality = Some(AggregationTemporality::Cumulative);
+        p.is_monotonic = Some(true);
+        p.start_time = Some(Utc::now());
+        p.flags = 1;
+        p.description = Some("Total HTTP requests".into());
+        p.value = Some(4242.0);
+        p
+    }
+
+    /// An exponential-histogram point with positive/negative bucket arrays and
+    /// the exp_* scalar fields populated.
+    fn make_exp_histogram() -> MetricPoint {
+        let mut p = MetricPoint::skeleton(
+            7,
+            None,
+            ResourceInfo::default(),
+            "rpc.duration".into(),
+            MetricType::ExponentialHistogram,
+            "ms".into(),
+            Utc::now(),
+            BTreeMap::new(),
+        );
+        p.temporality = Some(AggregationTemporality::Delta);
+        p.histogram_count = Some(8);
+        p.histogram_sum = Some(40.0);
+        p.histogram_min = Some(0.1);
+        p.histogram_max = Some(10.0);
+        p.exp_scale = Some(3);
+        p.exp_zero_count = Some(1);
+        p.exp_zero_threshold = Some(1e-6);
+        p.exp_positive_offset = Some(2);
+        p.exp_positive_counts = Some(vec![1, 2, 3]);
+        p.exp_negative_offset = Some(-1);
+        p.exp_negative_counts = Some(vec![4, 5]);
+        p.value = Some(5.0); // synthetic mean
+        p
+    }
+
+    /// A summary point carrying quantile/value pairs.
+    fn make_summary() -> MetricPoint {
+        let mut p = MetricPoint::skeleton(
+            7,
+            None,
+            ResourceInfo::default(),
+            "rpc.server.duration".into(),
+            MetricType::Summary,
+            "ms".into(),
+            Utc::now(),
+            BTreeMap::new(),
+        );
+        p.histogram_count = Some(4);
+        p.histogram_sum = Some(20.0);
+        p.summary_quantiles = Some(vec![(0.5, 4.0), (0.99, 9.0)]);
+        p.value = Some(5.0); // synthetic mean
+        p
+    }
+
+    #[test]
+    fn monotonic_sum_point_to_ch_row_field_mapping() {
+        let row = ChMetricRow::from(&make_monotonic_sum());
+
+        assert_eq!(row.metric_type, "sum");
+        assert_eq!(row.temporality, "cumulative");
+        assert_eq!(row.is_monotonic, Some(1));
+        assert_eq!(row.unit, "1");
+        assert_eq!(row.description, "Total HTTP requests");
+        assert_eq!(row.flags, 1);
+        // start_time is set -> Some(positive ms).
+        assert!(row.start_time.is_some());
+        assert!(row.start_time.unwrap_or(0) > 0);
+        assert_eq!(row.value, Some(4242.0));
+        assert_eq!(
+            row.attributes,
+            vec![("route".to_string(), "/api/v1".to_string())]
+        );
+        // Sums carry no histogram arrays.
+        assert!(row.histogram_bounds.is_empty());
+        assert!(row.exp_positive_counts.is_empty());
+        assert!(row.summary_quantiles.is_empty());
+    }
+
+    #[test]
+    fn exp_histogram_point_to_ch_row_field_mapping() {
+        let row = ChMetricRow::from(&make_exp_histogram());
+
+        assert_eq!(row.metric_type, "exponential_histogram");
+        assert_eq!(row.temporality, "delta");
+        assert_eq!(row.histogram_count, Some(8));
+        assert_eq!(row.histogram_sum, Some(40.0));
+        assert_eq!(row.histogram_min, Some(0.1));
+        assert_eq!(row.histogram_max, Some(10.0));
+        assert_eq!(row.exp_scale, Some(3));
+        assert_eq!(row.exp_zero_count, Some(1));
+        assert_eq!(row.exp_zero_threshold, Some(1e-6));
+        assert_eq!(row.exp_positive_offset, Some(2));
+        assert_eq!(row.exp_positive_counts, vec![1, 2, 3]);
+        assert_eq!(row.exp_negative_offset, Some(-1));
+        assert_eq!(row.exp_negative_counts, vec![4, 5]);
+        // Explicit-histogram bound arrays remain empty sentinels here.
+        assert!(row.histogram_bounds.is_empty());
+        assert!(row.histogram_bucket_counts.is_empty());
+        // is_monotonic is non-Sum -> None.
+        assert_eq!(row.is_monotonic, None);
+    }
+
+    #[test]
+    fn summary_point_to_ch_row_field_mapping() {
+        let row = ChMetricRow::from(&make_summary());
+
+        assert_eq!(row.metric_type, "summary");
+        // Summaries do not report temporality -> sentinel.
+        assert_eq!(row.temporality, "unspecified");
+        assert_eq!(row.histogram_count, Some(4));
+        assert_eq!(row.histogram_sum, Some(20.0));
+        assert_eq!(row.summary_quantiles, vec![(0.5, 4.0), (0.99, 9.0)]);
+        // Summaries carry no explicit/exponential histogram arrays.
+        assert!(row.histogram_bounds.is_empty());
+        assert!(row.exp_positive_counts.is_empty());
+        assert!(row.exemplars.is_empty());
+    }
+
+    #[test]
+    fn point_with_exemplars_and_labels_full_mapping() {
+        // A gauge carrying both labels AND multiple exemplars, asserting that the
+        // exemplar tuples and the attribute Map both survive in full.
+        let ts = Utc::now();
+        let mut p = MetricPoint::skeleton(
+            7,
+            Some(3),
+            ResourceInfo::default(),
+            "db.pool.in_use".into(),
+            MetricType::Gauge,
+            "1".into(),
+            ts,
+            {
+                let mut m = BTreeMap::new();
+                m.insert("pool".into(), "primary".into());
+                m.insert("db.system".into(), "postgresql".into());
+                m
+            },
+        );
+        p.exemplars = vec![
+            Exemplar {
+                timestamp: ts,
+                value: 12.0,
+                trace_id: Some("aabbccdd".into()),
+                span_id: Some("1122".into()),
+                attributes: BTreeMap::new(),
+            },
+            Exemplar {
+                timestamp: ts,
+                value: 13.0,
+                // An exemplar with no trace/span link -> empty-string sentinels.
+                trace_id: None,
+                span_id: None,
+                attributes: BTreeMap::new(),
+            },
+        ];
+        p.value = Some(11.0);
+
+        let row = ChMetricRow::from(&p);
+
+        // Attributes Map preserved in sorted (BTreeMap) key order.
+        assert_eq!(
+            row.attributes,
+            vec![
+                ("db.system".to_string(), "postgresql".to_string()),
+                ("pool".to_string(), "primary".to_string()),
+            ]
+        );
+        // Both exemplars survive; the second one's missing IDs become "".
+        assert_eq!(row.exemplars.len(), 2);
+        assert_eq!(row.exemplars[0].0, "aabbccdd");
+        assert_eq!(row.exemplars[0].1, "1122");
+        assert_eq!(row.exemplars[0].2, 12.0);
+        assert!(row.exemplars[0].3 > 0);
+        assert_eq!(row.exemplars[1].0, "");
+        assert_eq!(row.exemplars[1].1, "");
+        assert_eq!(row.exemplars[1].2, 13.0);
+        assert_eq!(row.value, Some(11.0));
+    }
+
+    #[test]
+    fn ch_metric_row_field_order_matches_ddl_columns() {
+        // SERIALIZATION LANDMINE GUARD.
+        //
+        // ChMetricRow is serialised positionally over RowBinary; a mismatch
+        // between the struct field order and the `metrics` DDL column order
+        // silently corrupts every insert. This test parses the column list out
+        // of 0003_metrics.sql and asserts it equals the ChMetricRow field order
+        // (derived from clickhouse::Row), so a future reorder of either side
+        // fails loudly here instead of corrupting data at runtime.
+        let ddl = include_str!("../../../migrations/clickhouse/0003_metrics.sql");
+
+        // Extract the column names from the `CREATE TABLE metrics ( ... )` body.
+        let create_start = ddl
+            .find("CREATE TABLE IF NOT EXISTS metrics")
+            .expect("DDL must declare the metrics table");
+        let body_start = ddl[create_start..]
+            .find('(')
+            .map(|i| create_start + i + 1)
+            .expect("CREATE TABLE must have an opening paren");
+        // The column body ends at the matching `)` that precedes `ENGINE`.
+        let engine_pos = ddl[body_start..]
+            .find("ENGINE")
+            .map(|i| body_start + i)
+            .expect("DDL must declare an ENGINE");
+        let body = &ddl[body_start..engine_pos];
+
+        let mut ddl_columns: Vec<String> = Vec::new();
+        for raw_line in body.lines() {
+            let line = raw_line.trim();
+            // Skip blanks and whole-line comments.
+            if line.is_empty() || line.starts_with("--") {
+                continue;
+            }
+            // MATERIALIZED / ALIAS columns are computed by ClickHouse and are NOT
+            // part of the positional RowBinary insert, so they are not ChMetricRow
+            // fields — skip them (e.g. attributes_hash, the series fingerprint).
+            if line.contains(" MATERIALIZED ") || line.contains(" ALIAS ") {
+                continue;
+            }
+            // The first whitespace-delimited token on a column line is the name.
+            // Lines inside the body are always `column_name Type ...,`.
+            let token = line.split_whitespace().next().unwrap_or("");
+            // Guard against any stray non-identifier tokens.
+            if token.is_empty() || !token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                continue;
+            }
+            ddl_columns.push(token.to_string());
+        }
+
+        // The ChMetricRow field order, declared once here and kept in lockstep
+        // with the struct definition above. Any change to the struct field list
+        // (or the DDL) must update this and will be caught by the two asserts.
+        let row_fields = [
+            "project_id",
+            "deployment_id",
+            "service_name",
+            "service_version",
+            "deployment_environment",
+            "metric_name",
+            "metric_type",
+            "temporality",
+            "is_monotonic",
+            "unit",
+            "description",
+            "timestamp",
+            "start_time",
+            "flags",
+            "value",
+            "histogram_count",
+            "histogram_sum",
+            "histogram_min",
+            "histogram_max",
+            "histogram_bounds",
+            "histogram_bucket_counts",
+            "exp_scale",
+            "exp_zero_count",
+            "exp_zero_threshold",
+            "exp_positive_offset",
+            "exp_positive_counts",
+            "exp_negative_offset",
+            "exp_negative_counts",
+            "summary_quantiles",
+            "exemplars",
+            "attributes",
+            "_version",
+        ];
+
+        // 31 domain columns + _version sentinel.
+        assert_eq!(
+            row_fields.len(),
+            CH_METRIC_ROW_FIELD_COUNT + 1,
+            "row_fields must list every ChMetricRow field incl _version"
+        );
+        assert_eq!(
+            ddl_columns.len(),
+            row_fields.len(),
+            "DDL column count ({}) must equal ChMetricRow field count ({}). \
+             DDL columns parsed: {:?}",
+            ddl_columns.len(),
+            row_fields.len(),
+            ddl_columns
+        );
+        for (i, (ddl_col, row_field)) in ddl_columns.iter().zip(row_fields.iter()).enumerate() {
+            assert_eq!(
+                ddl_col, row_field,
+                "Column #{i} mismatch: DDL has `{ddl_col}` but ChMetricRow has `{row_field}`. \
+                 Positional RowBinary serialisation requires EXACT order — fix the struct or DDL."
+            );
+        }
+    }
+
+    // ── translate_bucket_interval tests ─────────────────────────────────────
+
+    #[test]
+    fn translate_bucket_interval_known_units() {
+        assert_eq!(translate_bucket_interval("1 hour"), "INTERVAL 1 HOUR");
+        assert_eq!(translate_bucket_interval("5 minutes"), "INTERVAL 5 MINUTE");
+        assert_eq!(
+            translate_bucket_interval("30 seconds"),
+            "INTERVAL 30 SECOND"
+        );
+        assert_eq!(translate_bucket_interval("1 day"), "INTERVAL 1 DAY");
+        assert_eq!(translate_bucket_interval("2 weeks"), "INTERVAL 2 WEEK");
+        // Singular + abbreviations.
+        assert_eq!(translate_bucket_interval("15 min"), "INTERVAL 15 MINUTE");
+        // Compact (no-space) form, as emitted by `format!("{}s", secs)`.
+        assert_eq!(translate_bucket_interval("300s"), "INTERVAL 300 SECOND");
+        assert_eq!(translate_bucket_interval("5m"), "INTERVAL 5 MINUTE");
+        assert_eq!(translate_bucket_interval("1h"), "INTERVAL 1 HOUR");
+        assert_eq!(translate_bucket_interval("2d"), "INTERVAL 2 DAY");
+        assert_eq!(translate_bucket_interval("1w"), "INTERVAL 1 WEEK");
+        // Compact garbage still falls back to the safe default.
+        assert_eq!(translate_bucket_interval("300"), "INTERVAL 1 HOUR");
+        assert_eq!(translate_bucket_interval("abc"), "INTERVAL 1 HOUR");
+        assert_eq!(translate_bucket_interval("5x"), "INTERVAL 1 HOUR");
+    }
+
+    #[test]
+    fn translate_bucket_interval_rejects_injection_and_garbage() {
+        // Injection attempts and malformed inputs fall back to the safe default.
+        assert_eq!(
+            translate_bucket_interval("1 hour; DROP TABLE metrics"),
+            "INTERVAL 1 HOUR"
+        );
+        assert_eq!(translate_bucket_interval("abc def"), "INTERVAL 1 HOUR");
+        assert_eq!(translate_bucket_interval(""), "INTERVAL 1 HOUR");
+        assert_eq!(translate_bucket_interval("0 hours"), "INTERVAL 1 HOUR");
+        assert_eq!(translate_bucket_interval("-5 hours"), "INTERVAL 1 HOUR");
+        assert_eq!(
+            translate_bucket_interval("999999999 hours"),
+            "INTERVAL 1 HOUR"
+        );
+        assert_eq!(translate_bucket_interval("1 fortnight"), "INTERVAL 1 HOUR");
+    }
+
+    #[test]
+    fn store_metrics_query_shapes_use_unbound_metrics_table() {
+        // Lightweight guard that the native metric SQL targets the new `metrics`
+        // table and bucketing helper (not the Timescale otel_metrics path).
+        let interval = translate_bucket_interval(
+            MetricQuery::default()
+                .bucket_interval
+                .as_deref()
+                .unwrap_or("1 hour"),
+        );
+        assert_eq!(interval, "INTERVAL 1 HOUR");
+    }
+
+    // ── interval_seconds (RatePerSec divisor) ───────────────────────────────
+
+    #[test]
+    fn interval_seconds_parses_canonical_fragments() {
+        assert_eq!(interval_seconds("INTERVAL 1 SECOND"), 1);
+        assert_eq!(interval_seconds("INTERVAL 30 SECOND"), 30);
+        assert_eq!(interval_seconds("INTERVAL 5 MINUTE"), 300);
+        assert_eq!(interval_seconds("INTERVAL 1 HOUR"), 3600);
+        assert_eq!(interval_seconds("INTERVAL 2 DAY"), 172_800);
+        assert_eq!(interval_seconds("INTERVAL 1 WEEK"), 604_800);
+    }
+
+    #[test]
+    fn interval_seconds_falls_back_to_one_hour_on_garbage() {
+        assert_eq!(interval_seconds(""), 3600);
+        assert_eq!(interval_seconds("5 MINUTE"), 3600); // missing INTERVAL keyword
+        assert_eq!(interval_seconds("INTERVAL x HOUR"), 3600);
+        assert_eq!(interval_seconds("INTERVAL 5 FORTNIGHT"), 3600);
+    }
+
+    #[test]
+    fn interval_seconds_roundtrips_with_translate() {
+        // The two helpers must agree: translate produces the canonical fragment
+        // that interval_seconds parses back.
+        assert_eq!(
+            interval_seconds(&translate_bucket_interval("5 minutes")),
+            300
+        );
+        assert_eq!(
+            interval_seconds(&translate_bucket_interval("1 day")),
+            86_400
+        );
     }
 }

@@ -27,6 +27,8 @@ import { DiskSpaceAlert } from './components/alerts/DiskSpaceAlert'
 import { ProtectedLayout } from './components/layout/ProtectedLayout'
 import { SettingsLayout } from './components/settings/SettingsLayout'
 import { SidebarInset, SidebarProvider } from './components/ui/sidebar'
+import { AiAssistantProvider } from './components/ai/AiAssistantContext'
+import { AiAssistantDock } from './components/ai/AiAssistantDock'
 import { AuthProvider } from './contexts/AuthContext'
 import { BreadcrumbProvider } from './contexts/BreadcrumbContext'
 import { PlatformAccessProvider } from './contexts/PlatformAccessContext'
@@ -203,6 +205,11 @@ const ResetPassword = lazy(() =>
 const NotFound = lazy(() => import('./components/global/NotFound'))
 
 // Settings sub-pages
+const AiProvidersPage = lazy(() =>
+  import('./pages/settings/AiProvidersPage').then((m) => ({
+    default: m.AiProvidersPage,
+  }))
+)
 const DockerRegistryPage = lazy(() =>
   import('./pages/settings/DockerRegistryPage').then((m) => ({
     default: m.DockerRegistryPage,
@@ -336,6 +343,7 @@ const FullAppRoutes = () => {
   const { routes: extraRoutes } = useConsoleExtensions()
   return (
     <BreadcrumbProvider>
+      <AiAssistantProvider>
       <SidebarProvider>
         {/* Wrap sidebar with independent error boundary */}
         <ErrorBoundary
@@ -424,6 +432,7 @@ const FullAppRoutes = () => {
                     settings sidebar swap. */}
                 <Route path="/settings" element={<SettingsLayout />}>
                   <Route index element={<Settings />} />
+                  <Route path="ai-providers" element={<AiProvidersPage />} />
                   <Route path="notifications" element={<Notifications />} />
                   <Route path="users" element={<Users />} />
                   <Route path="users/:userId" element={<UserDetail />} />
@@ -521,8 +530,13 @@ const FullAppRoutes = () => {
             </div>
           </ErrorBoundary>
         </SidebarInset>
+        {/* Persistent AI assistant dock (ADR-023): a flex sibling so it pushes
+            the layout rather than covering it — stays open and streaming while
+            the user navigates the console. */}
+        <AiAssistantDock />
         <CommandPalette />
       </SidebarProvider>
+      </AiAssistantProvider>
     </BreadcrumbProvider>
   )
 }

@@ -73,23 +73,18 @@ fn sample_span(
 
 /// Build a sample MetricPoint.
 fn sample_metric(project_id: i32, name: &str, value: f64) -> MetricPoint {
-    MetricPoint {
+    let mut p = MetricPoint::skeleton(
         project_id,
-        deployment_id: None,
-        resource: test_resource(),
-        metric_name: name.into(),
-        metric_type: MetricType::Gauge,
-        unit: "ms".into(),
-        timestamp: Utc::now(),
-        value: Some(value),
-        histogram_count: None,
-        histogram_sum: None,
-        histogram_min: None,
-        histogram_max: None,
-        histogram_bounds: None,
-        histogram_bucket_counts: None,
-        attributes: BTreeMap::new(),
-    }
+        None,
+        test_resource(),
+        name.into(),
+        MetricType::Gauge,
+        "ms".into(),
+        Utc::now(),
+        BTreeMap::new(),
+    );
+    p.value = Some(value);
+    p
 }
 
 /// Build a sample LogRecord.

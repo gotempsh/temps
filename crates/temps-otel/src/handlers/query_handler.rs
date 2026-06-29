@@ -29,6 +29,19 @@ pub struct MetricQueryParams {
     pub end_time: Option<String>,
     pub bucket_interval: Option<String>,
     pub limit: Option<u64>,
+    /// Restrict to a single metric type: gauge | sum | histogram |
+    /// exponential_histogram | summary. Unknown values are ignored (no filter).
+    pub metric_type: Option<String>,
+    /// Aggregation applied per bucket: avg (default) | sum | min | max | count |
+    /// rate | p50/p95/p99 | quantile:0.95. Unknown values fall back to avg.
+    pub aggregation: Option<String>,
+    /// Exact-match data-point label filters as comma-separated `key=value`
+    /// pairs, e.g. `http.method=GET,http.status_code=200`. Keys must match the
+    /// metric-name allowlist `[a-zA-Z0-9_.:-]`.
+    pub label_filters: Option<String>,
+    /// Comma-separated label keys to group the series by, e.g.
+    /// `http.method,http.route`. Each key must match the allowlist.
+    pub group_by: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,13 +97,13 @@ pub struct HealthQueryParams {
 // ── Response DTOs ───────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, ToSchema)]
-pub struct MetricsResponse {
+pub struct OtelMetricsResponse {
     pub data: Vec<MetricBucket>,
     pub count: usize,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
-pub struct MetricNamesResponse {
+pub struct OtelMetricNamesResponse {
     pub names: Vec<String>,
 }
 
@@ -186,6 +199,32 @@ fn parse_attributes(s: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// Parse a metric type query token into the typed enum. Unknown → `None`.
+fn parse_metric_type(s: &str) -> Option<MetricType> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "gauge" => Some(MetricType::Gauge),
+        "sum" | "counter" => Some(MetricType::Sum),
+        "histogram" => Some(MetricType::Histogram),
+        "exponential_histogram" | "exp_histogram" => Some(MetricType::ExponentialHistogram),
+        "summary" => Some(MetricType::Summary),
+        _ => None,
+    }
+}
+
+/// Parse a comma-separated list of label keys, trimming and dropping empties.
+fn parse_label_keys(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(|k| k.trim())
+        .filter(|k| !k.is_empty())
+        .map(|k| k.to_string())
+        .collect()
+}
+
+/// Parse comma-separated `key=value` label filters into ordered pairs.
+fn parse_label_filters(s: &str) -> Vec<(String, String)> {
+    parse_attributes(s).into_iter().collect()
+}
+
 /// Query metrics with time bucketing.
 #[utoipa::path(
     tag = "OTel",
@@ -200,9 +239,14 @@ fn parse_attributes(s: &str) -> BTreeMap<String, String> {
         ("end_time" = Option<String>, Query, description = "End time (RFC 3339)"),
         ("bucket_interval" = Option<String>, Query, description = "Bucket interval (e.g. '1 hour', '5 minutes')"),
         ("limit" = Option<u64>, Query, description = "Max buckets to return (default: 1000)"),
+        ("metric_type" = Option<String>, Query, description = "Filter by metric type (gauge, sum, histogram, exponential_histogram, summary)"),
+        ("aggregation" = Option<String>, Query, description = "Per-bucket aggregation: avg (default), sum, min, max, count, rate, p50/p95/p99, quantile:0.95"),
+        ("label_filters" = Option<String>, Query, description = "Comma-separated key=value data-point label filters (keys must match [a-zA-Z0-9_.:-])"),
+        ("group_by" = Option<String>, Query, description = "Comma-separated label keys to group series by"),
     ),
     responses(
-        (status = 200, description = "Metrics data", body = MetricsResponse),
+        (status = 200, description = "Metrics data", body = OtelMetricsResponse),
+        (status = 400, description = "Invalid label key", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails),
@@ -225,12 +269,28 @@ pub async fn query_metrics(
         end_time: params.end_time.as_deref().and_then(parse_datetime),
         bucket_interval: params.bucket_interval,
         limit: params.limit,
+        metric_type: params.metric_type.as_deref().and_then(parse_metric_type),
+        label_filters: params
+            .label_filters
+            .as_deref()
+            .map(parse_label_filters)
+            .unwrap_or_default(),
+        group_by: params
+            .group_by
+            .as_deref()
+            .map(parse_label_keys)
+            .unwrap_or_default(),
+        aggregation: params
+            .aggregation
+            .as_deref()
+            .map(MetricAggregation::parse)
+            .unwrap_or_default(),
     };
 
     let data = state.otel_service.query_metrics(query).await?;
     let count = data.len();
 
-    Ok(Json(MetricsResponse { data, count }))
+    Ok(Json(OtelMetricsResponse { data, count }))
 }
 
 /// List distinct metric names for a project.
@@ -242,7 +302,7 @@ pub async fn query_metrics(
         ("project_id" = i32, Path, description = "Project ID"),
     ),
     responses(
-        (status = 200, description = "List of metric names", body = MetricNamesResponse),
+        (status = 200, description = "List of metric names", body = OtelMetricNamesResponse),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails),
@@ -257,7 +317,7 @@ pub async fn list_metric_names(
     permission_guard!(auth, OtelRead);
 
     let names = state.otel_service.list_metric_names(project_id).await?;
-    Ok(Json(MetricNamesResponse { names }))
+    Ok(Json(OtelMetricNamesResponse { names }))
 }
 
 /// Query trace spans with optional filters.
@@ -792,5 +852,46 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result.get("valid").unwrap(), "ok");
         assert_eq!(result.get("good").unwrap(), "yes");
+    }
+
+    // ── Metric query param parsing ──────────────────────────────────
+
+    #[test]
+    fn test_parse_metric_type() {
+        assert_eq!(parse_metric_type("gauge"), Some(MetricType::Gauge));
+        assert_eq!(parse_metric_type("Sum"), Some(MetricType::Sum));
+        assert_eq!(parse_metric_type("counter"), Some(MetricType::Sum));
+        assert_eq!(parse_metric_type("histogram"), Some(MetricType::Histogram));
+        assert_eq!(
+            parse_metric_type("exponential_histogram"),
+            Some(MetricType::ExponentialHistogram)
+        );
+        assert_eq!(parse_metric_type("summary"), Some(MetricType::Summary));
+        assert_eq!(parse_metric_type("nonsense"), None);
+    }
+
+    #[test]
+    fn test_parse_label_keys() {
+        let keys = parse_label_keys("http.method, http.route ,,");
+        assert_eq!(
+            keys,
+            vec!["http.method".to_string(), "http.route".to_string()]
+        );
+        assert!(parse_label_keys("").is_empty());
+        assert!(parse_label_keys("  ,  , ").is_empty());
+    }
+
+    #[test]
+    fn test_parse_label_filters() {
+        let filters = parse_label_filters("http.method=GET,http.status_code=200");
+        // parse_attributes returns a BTreeMap (sorted), so order is deterministic.
+        assert_eq!(
+            filters,
+            vec![
+                ("http.method".to_string(), "GET".to_string()),
+                ("http.status_code".to_string(), "200".to_string()),
+            ]
+        );
+        assert!(parse_label_filters("").is_empty());
     }
 }

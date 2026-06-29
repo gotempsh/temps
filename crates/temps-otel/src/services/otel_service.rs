@@ -260,6 +260,24 @@ impl OtelService {
     // ── Query operations ────────────────────────────────────────────
 
     pub async fn query_metrics(&self, query: MetricQuery) -> Result<Vec<MetricBucket>, OtelError> {
+        // Validate every label key used for filtering or grouping against the
+        // same allowlist the ingest path enforces on metric/attribute names.
+        // Keys flow into the store's SQL (as bound map indices); rejecting bad
+        // keys here is a defence-in-depth trust boundary on top of the store's
+        // own check. Values are always bound, never validated for content.
+        for key in query
+            .group_by
+            .iter()
+            .chain(query.label_filters.iter().map(|(k, _)| k))
+        {
+            if temps_metrics::validate_metric_name(key).is_err() {
+                return Err(OtelError::Validation {
+                    message: format!(
+                        "metric query label key '{key}' contains characters outside the allowed set [a-zA-Z0-9_.:-]"
+                    ),
+                });
+            }
+        }
         self.storage.query_metrics(query).await
     }
 
@@ -614,23 +632,17 @@ mod tests {
         let mock = MockOtelStorage::new();
         let (svc, storage) = make_service(mock);
 
-        let point = MetricPoint {
-            project_id: 1,
-            deployment_id: None,
-            resource: ResourceInfo::default(),
-            metric_name: "http.duration".into(),
-            metric_type: MetricType::Gauge,
-            unit: "ms".into(),
-            timestamp: chrono::Utc::now(),
-            value: Some(42.5),
-            histogram_count: None,
-            histogram_sum: None,
-            histogram_min: None,
-            histogram_max: None,
-            histogram_bounds: None,
-            histogram_bucket_counts: None,
-            attributes: Default::default(),
-        };
+        let mut point = MetricPoint::skeleton(
+            1,
+            None,
+            ResourceInfo::default(),
+            "http.duration".into(),
+            MetricType::Gauge,
+            "ms".into(),
+            chrono::Utc::now(),
+            Default::default(),
+        );
+        point.value = Some(42.5);
 
         let stored = svc.ingest_metrics(vec![point]).await.unwrap();
         assert_eq!(stored, 1);

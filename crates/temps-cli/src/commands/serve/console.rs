@@ -1304,6 +1304,12 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let ai_gateway_plugin = Box::new(temps_ai_gateway::AiGatewayPlugin::new());
     plugin_manager.register_plugin(ai_gateway_plugin);
 
+    // AI Chat Plugin - persistent AI debugging conversations (ADR-023). After the
+    // AI gateway so the AiService it provides is registered.
+    debug!("Registering AiChatPlugin");
+    let ai_chat_plugin = Box::new(temps_ai_chat::AiChatPlugin::new());
+    plugin_manager.register_plugin(ai_chat_plugin);
+
     // 12. ApiKeyPlugin - provides API key management (depends on auth services)
     debug!("Registering ApiKeyPlugin");
     let apikey_plugin = Box::new(ApiKeyPlugin::new());

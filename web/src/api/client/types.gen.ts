@@ -534,6 +534,15 @@ export type AggregatedBucketsResponse = {
 export type AggregationLevel = 'events' | 'sessions' | 'visitors';
 
 /**
+ * The aggregation temporality of a Sum/Histogram/ExponentialHistogram metric.
+ *
+ * Mirrors OTel's `AggregationTemporality` proto enum: whether reported values
+ * are cumulative since the start of the series (Cumulative) or only the delta
+ * since the previous report (Delta).
+ */
+export type AggregationTemporality = 'unspecified' | 'delta' | 'cumulative';
+
+/**
  * Response wrapping the AI agent breakdown rows.
  */
 export type AiAgentBreakdownResponse = {
@@ -741,6 +750,95 @@ export type AnalyticsSessionEventsResponse = {
     total_events: number;
 };
 
+/**
+ * Anomaly baseline algorithm. Adding one (e.g. a new robust variant) is a
+ * code-only enum addition — no migration, since it lives inside the blob.
+ */
+export type AnomalyAlgorithm = 'robust' | 'basic' | 'agile' | 'ewma';
+
+/**
+ * Seasonal anomaly-band detector parameters (stub — not yet evaluated).
+ */
+export type AnomalyParams = {
+    /**
+     * Baseline model. `robust` is the default (seasonal, stable, flags level
+     * shifts); `ewma`/`agile` adopt level shifts; `basic` is non-seasonal.
+     */
+    algorithm?: AnomalyAlgorithm;
+    /**
+     * How far back to build the baseline. `None` = an evaluator default.
+     */
+    baseline_lookback_days?: number | null;
+    /**
+     * Band width in robust standard deviations (Datadog's `bounds`).
+     */
+    deviations?: number;
+    /**
+     * Which side(s) of the band a deviation must be on to count.
+     */
+    direction?: Direction;
+    /**
+     * Fraction (0..=1) of points in the window that must be anomalous to fire.
+     */
+    pct_anomalous?: number;
+    /**
+     * Seasonality model for the baseline.
+     */
+    seasonality?: Seasonality;
+};
+
+export type AnomalyPreviewPointResponse = {
+    breaching: boolean;
+    bucket: string;
+    /**
+     * Lower edge of the expected band at this point.
+     */
+    lower: number;
+    /**
+     * Upper edge of the expected band at this point.
+     */
+    upper: number;
+    value: number;
+};
+
+export type AnomalyPreviewRequest = {
+    /**
+     * One of `avg|sum|min|max|count|rate|p50|p90|p95|p99`.
+     */
+    aggregation: string;
+    /**
+     * Must be an `anomaly` detector — the band to backtest.
+     */
+    detection_config: DetectionConfig;
+    /**
+     * RFC 3339; defaults to now.
+     */
+    end_time?: string | null;
+    metric_name: string;
+    project_id: number;
+    /**
+     * RFC 3339; defaults to 7 days before `end_time`.
+     */
+    start_time?: string | null;
+    window_secs: number;
+};
+
+export type AnomalyPreviewResponse = {
+    /**
+     * Baseline sample count (drives the `sufficient` flag).
+     */
+    baseline_samples: number;
+    /**
+     * How many points in the range would have fired.
+     */
+    breach_count: number;
+    points: Array<AnomalyPreviewPointResponse>;
+    /**
+     * Whether the baseline had enough history for a trustworthy band.
+     */
+    sufficient: boolean;
+};
+
 export type ApiKeyListResponse = {
     api_keys: Array<ApiKeyResponse>;
     total: number;
@@ -772,13 +870,6 @@ export type AppSettings = {
      * hardware that already has its own per-host headroom).
      */
     build_limits?: BuildLimitsSettings;
-    /**
-     * Nightly Docker/disk cleanup behaviour — retention windows for unused
-     * deployment images and BuildKit cache, plus the schedule. Operator-tunable
-     * at runtime; the cleanup scheduler re-reads this on every run, so changes
-     * take effect without a restart.
-     */
-    cleanup?: CleanupSettings;
     /**
      * Binary version tag (e.g. "v0.1.0") of the *console* process
      * (`temps serve`, role=all or role=console) that last started. Written
@@ -822,13 +913,6 @@ export type AppSettings = {
     monitoring?: MonitoringSettings;
     multi_node?: MultiNodeSettings;
     on_demand_tls?: OnDemandTlsSettings;
-    /**
-     * OpenTelemetry ingest (OTLP/HTTP) settings. Instance-global kill-switch
-     * for the inbound metrics/traces/logs ingest endpoints under
-     * `/api/otel/v1*`. Distinct from `monitoring`, which governs the
-     * *outbound* Prometheus scraper (a different data source).
-     */
-    otel_ingest?: OtelIngestSettings;
     preview_domain?: string;
     preview_gateway?: PreviewGatewaySettings;
     rate_limiting?: RateLimitSettings;
@@ -849,7 +933,6 @@ export type AppSettings = {
 export type AppSettingsResponse = {
     agent_sandbox: AgentSandboxSettingsMasked;
     ai_config: AiConfigSettings;
-    cleanup: CleanupSettings;
     container_logs: ContainerLogSettings;
     disk_space_alert: DiskSpaceAlertSettings;
     dns_provider: DnsProviderSettingsMasked;
@@ -870,14 +953,6 @@ export type AppSettingsResponse = {
     letsencrypt: LetsEncryptSettings;
     monitoring: MonitoringSettingsMasked;
     multi_node: MultiNodeSettingsMasked;
-    /**
-     * Whether OTLP/HTTP ingestion is currently accepted. Mirrors
-     * `otel_ingest.enabled`. Flipped via the dedicated
-     * `PATCH /settings/otel-ingest` endpoint (guarded by `otel:write`), not
-     * the generic settings PUT — but surfaced here so the UI can render the
-     * current state without a second request.
-     */
-    otel_ingest_enabled: boolean;
     preview_domain: string;
     preview_gateway: PreviewGatewaySettingsMasked;
     rate_limiting: RateLimitSettings;
@@ -1033,6 +1108,16 @@ export type AuthTokenResponse = {
     access_token: string;
     expires_at: number;
     refresh_token: string;
+};
+
+/**
+ * Auto-watch (Watchdog-style) detector parameters (stub — not evaluated).
+ */
+export type AutoWatchParams = {
+    /**
+     * The engine self-tunes the band; the user supplies only the direction.
+     */
+    direction?: Direction;
 };
 
 export type AutofixerRunResponse = {
@@ -1614,60 +1699,6 @@ export type ChildBackupListResponse = {
     children: Array<ChildBackupEntryResponse>;
 };
 
-/**
- * Nightly Docker/disk cleanup settings.
- *
- * Governs the background `DockerCleanupService` that reclaims disk on each
- * node: dangling images, superseded *tagged* deployment images, and BuildKit
- * build cache. Defaults are conservative — safe for a multi-tenant control
- * plane — and every value is operator-tunable at runtime (the scheduler
- * re-reads settings on every run, so no restart is needed).
- *
- * Image removal is always DB-driven: an image is only ever removed if its tag
- * belongs to a known deployment that is neither live nor inside the
- * per-environment rollback window. Base images and in-flight builds are never
- * touched, regardless of these values.
- */
-export type CleanupSettings = {
-    /**
-     * Maximum *unused* age (days) for BuildKit build cache. Cache not touched
-     * by a build within this window is reclaimed on the next run. Lower =
-     * reclaims disk sooner but causes more cold (slow) builds. Default 7.
-     * Typical: 1 (daily-deploy/disk-tight), 3 (weekday-active), 7 (default).
-     */
-    build_cache_max_age_days?: number;
-    /**
-     * Hard cap on total BuildKit build-cache size, in megabytes. Enforced
-     * independently of the age window, so a burst of builds cannot fill the
-     * disk before the next nightly run. `0` (default) means "no size cap —
-     * age window only". When set, the least-recently-used cache beyond this
-     * size is reclaimed regardless of age.
-     */
-    build_cache_max_size_mb?: number;
-    /**
-     * Master switch for the nightly cleanup. When `false`, no images or build
-     * cache are pruned (the static-asset/chunk cleanup still runs, as it is
-     * unrelated to Docker). Defaults to `true`.
-     */
-    enabled?: boolean;
-    /**
-     * Minimum age (days) an unreferenced deployment image must reach before it
-     * is eligible for removal. Acts as a safety floor against racing a deploy
-     * whose DB row hasn't reached a live state yet. Default 7.
-     */
-    image_max_age_days?: number;
-    /**
-     * How many of the most-recent deployments *per environment* to keep images
-     * for, so a rollback is always possible even when those deployments are no
-     * longer live. Default 3. Set 0 to keep only currently-live images.
-     */
-    keep_deployments_per_env?: number;
-    /**
-     * Hour of day (UTC, 0–23) the nightly cleanup runs. Default 2 (02:00 UTC).
-     */
-    run_hour_utc?: number;
-};
-
 export type CliDeviceApproveRequest = {
     user_code: string;
 };
@@ -1749,6 +1780,39 @@ export type CliDeviceStartResponse = {
 export type CliLoginRequest = {
     password: string;
     username: string;
+};
+
+/**
+ * Configuration for a Cloudflare Email Sending notification provider.
+ *
+ * Notifications are delivered through Cloudflare's transactional Email Sending
+ * API. Only the account, token, sender and recipients are configured here —
+ * subject and body are derived from each notification.
+ */
+export type CloudflareConfig = {
+    /**
+     * Cloudflare account id that owns the Email Sending configuration.
+     */
+    account_id: string;
+    /**
+     * Cloudflare API token with the Email Sending permission. Encrypted at
+     * rest; like the other notification providers, it is returned decrypted to
+     * authorized callers so the edit form can prefill (not masked).
+     */
+    api_token: string;
+    /**
+     * Verified sender address (must belong to a domain enabled for Cloudflare
+     * Email Sending).
+     */
+    from_address: string;
+    /**
+     * Optional human-friendly sender name shown in the recipient's inbox.
+     */
+    from_name?: string | null;
+    /**
+     * Recipients that should receive the notification.
+     */
+    to_addresses: Array<string>;
 };
 
 /**
@@ -1919,6 +1983,13 @@ export type CommitInfo = {
 export type CommitListResponse = {
     commits: Array<CommitInfo>;
 };
+
+/**
+ * Comparator for static/forecast threshold detectors. Serializes to the
+ * keyword forms `gt|gte|lt|lte` (NOT the SQL operators used by
+ * `temps-monitoring::compare`).
+ */
+export type Comparator = 'gt' | 'gte' | 'lt' | 'lte';
 
 export type ConnectionListQuery = {
     direction?: string | null;
@@ -2422,6 +2493,23 @@ export type ContextLogsResponse = {
     target_index: number;
 };
 
+export type ConversationDetailResponse = ConversationResponse & {
+    /**
+     * Turns oldest-first. The `system` seed message is omitted (internal).
+     */
+    messages: Array<MessageResponse>;
+};
+
+export type ConversationResponse = {
+    context_id: string;
+    context_type: string;
+    created_at: string;
+    last_activity_at: string;
+    public_id: string;
+    status: string;
+    title?: string | null;
+};
+
 /**
  * A conversation summary grouping related AI invocations.
  */
@@ -2565,11 +2653,34 @@ export type CreateBackupScheduleRequest = {
     target_all_services?: boolean | null;
 };
 
+export type CreateCloudflareProviderRequest = {
+    config: CloudflareConfig;
+    enabled?: boolean | null;
+    name: string;
+};
+
+export type CreateConversationRequest = {
+    /**
+     * The entity id (ints stringified).
+     */
+    context_id: string;
+    /**
+     * e.g. `"deployment"`.
+     */
+    context_type: string;
+};
+
 export type CreateDsnRequest = {
     base_url?: string | null;
     deployment_id?: number | null;
     environment_id?: number | null;
     name?: string | null;
+};
+
+export type CreateDashboardRequest = {
+    layout: DashboardLayout;
+    name: string;
+    project_id: number;
 };
 
 /**
@@ -2759,6 +2870,28 @@ export type CreateMcpRequest = {
     slug: string;
 };
 
+export type CreateMetricAlertRequest = {
+    /**
+     * One of `avg|sum|min|max|count|rate|p50|p90|p95|p99`.
+     */
+    aggregation: string;
+    /**
+     * The detector: a discriminated union keyed by `kind`. Today only
+     * `{ "kind": "static", "comparator": "gt", "threshold": 500 }` is evaluable.
+     */
+    detection_config: DetectionConfig;
+    enabled: boolean;
+    for_duration_secs: number;
+    metric_name: string;
+    name: string;
+    project_id: number;
+    /**
+     * One of `info|warning|critical`.
+     */
+    severity: string;
+    window_secs: number;
+};
+
 export type CreateMonitorRequest = {
     check_interval_seconds?: number | null;
     check_path?: string | null;
@@ -2855,10 +2988,23 @@ export type CreatePrResponse = {
 
 /**
  * Request to create a project from a template
+ *
+ * Supports two deploy modes:
+ * * **Fork mode** — when `git_provider_connection_id` is set, the template
+ * repo is cloned into a new repository under the user's Git account and the
+ * project tracks that fork (git-push deploys, automatic deploy on push).
+ * * **One-click public-repo mode** — when `git_provider_connection_id` is
+ * omitted, the project deploys directly from the template's public source
+ * repository (no fork, no Git account required). This is the activation
+ * path: a brand-new user with no Git provider connected can still deploy a
+ * demo in one click. `repository_name` / `repository_owner` are ignored in
+ * this mode, and automatic-deploy-on-push is unavailable (there is no fork
+ * to receive webhooks).
  */
 export type CreateProjectFromTemplateRequest = {
     /**
-     * Enable automatic deployment on push (defaults to true)
+     * Enable automatic deployment on push (defaults to true). Only honoured in
+     * fork mode; public-repo deploys cannot receive push webhooks.
      */
     automatic_deploy?: boolean;
     /**
@@ -3230,6 +3376,16 @@ export type CustomerMovementResponse = {
 };
 
 /**
+ * The typed layout persisted (as JSONB) in `metric_dashboards.layout`.
+ */
+export type DashboardLayout = {
+    /**
+     * Ordered sections that make up the dashboard.
+     */
+    sections: Array<DashboardSection>;
+};
+
+/**
  * Query parameters for batch dashboard analytics
  */
 export type DashboardProjectsAnalyticsQuery = {
@@ -3257,6 +3413,47 @@ export type DashboardProjectsAnalyticsResponse = {
     projects: {
         [key: string]: ProjectDashboardAnalytics;
     };
+};
+
+/**
+ * A titled group of tiles within a dashboard.
+ */
+export type DashboardSection = {
+    /**
+     * Stable client-generated section id.
+     */
+    id: string;
+    /**
+     * Tiles rendered within this section.
+     */
+    tiles: Array<DashboardTile>;
+    /**
+     * Section heading.
+     */
+    title: string;
+};
+
+/**
+ * A single metric tile within a dashboard section.
+ */
+export type DashboardTile = {
+    /**
+     * Aggregation applied per bucket: one of
+     * `avg|sum|min|max|count|rate|p50|p90|p95|p99`.
+     */
+    aggregation: string;
+    /**
+     * Stable client-generated tile id (used as a React key / for reordering).
+     */
+    id: string;
+    /**
+     * The metric name to chart (e.g. `http.server.duration`).
+     */
+    metric_name: string;
+    /**
+     * Optional display title; falls back to the metric name in the UI.
+     */
+    title?: string | null;
 };
 
 /**
@@ -3829,6 +4026,27 @@ export type DeploymentStateResponse = {
  */
 export type DeploymentStrategy = 'replace' | 'blue-green' | 'rolling';
 
+/**
+ * The typed detector definition stored (as jsonb) in
+ * `metric_alert_rules.detection_config`.
+ *
+ * Today only [`DetectionConfig::Static`] is evaluable; the other variants are
+ * schema-present (so the SDK/UI and storage are already future-shaped) but
+ * rejected by [`DetectionConfig::validate`] until their evaluator lands. Each is
+ * then enabled code-only, with no schema migration.
+ */
+export type DetectionConfig = (StaticParams & {
+    kind: 'static';
+}) | (AnomalyParams & {
+    kind: 'anomaly';
+}) | (ForecastParams & {
+    kind: 'forecast';
+}) | (OutlierParams & {
+    kind: 'outlier';
+}) | (AutoWatchParams & {
+    kind: 'auto_watch';
+});
+
 export type DeviceCount = {
     count: number;
     device_type: string;
@@ -3847,6 +4065,11 @@ export type DigestSections = {
     performance?: boolean;
     projects?: boolean;
 };
+
+/**
+ * Which side(s) of an anomaly band count as a deviation.
+ */
+export type Direction = 'both' | 'above' | 'below';
 
 /**
  * Response after disabling Blob service
@@ -5830,6 +6053,28 @@ export type FieldResponse = {
     nullable: boolean;
 };
 
+/**
+ * Forecast model family.
+ */
+export type ForecastAlgorithm = 'linear' | 'seasonal';
+
+/**
+ * Forecast detector parameters (stub — not yet evaluated).
+ */
+export type ForecastParams = {
+    algorithm?: ForecastAlgorithm;
+    /**
+     * Comparator + threshold the *forecast* is checked against.
+     */
+    comparator: Comparator;
+    deviations?: number;
+    /**
+     * How far ahead to project before checking the breach condition.
+     */
+    forecast_horizon_secs: number;
+    threshold: number;
+};
+
 export type FullError = {
     /**
      * Full JSONB blob from `error_events.data` — stack trace, breadcrumbs,
@@ -6534,6 +6779,24 @@ export type GitRefResponse = {
     url: string;
 };
 
+/**
+ * A conversation in the unified cross-project switcher: carries the project it
+ * belongs to (name/slug) so the UI can show where the chat was started and
+ * link back to the source.
+ */
+export type GlobalConversationResponse = {
+    context_id: string;
+    context_type: string;
+    created_at: string;
+    last_activity_at: string;
+    project_id: number;
+    project_name?: string | null;
+    project_slug?: string | null;
+    public_id: string;
+    status: string;
+    title?: string | null;
+};
+
 export type GlobalEventStatsResponse = {
     bounce_rate?: number | null;
     bounced: number;
@@ -6750,6 +7013,43 @@ export type HierarchyLevel = {
      * Human-readable name for this level
      */
     name: string;
+};
+
+/**
+ * An explicit-bucket histogram aggregated over a time bucket.
+ *
+ * Carries the reduced scalars (count/sum/min/max) plus the explicit bucket
+ * layout — `bounds` (the upper bounds) and `bucket_counts` (observation counts,
+ * summed element-wise across the window; length is `bounds.len() + 1`, the last
+ * entry being the +Inf overflow bucket). With these, a caller can reconstruct
+ * any quantile (e.g. p95) via cumulative-count interpolation.
+ */
+export type HistogramSummary = {
+    /**
+     * Explicit bucket upper bounds (OTLP `explicit_bounds`), ascending.
+     */
+    bounds: Array<number>;
+    /**
+     * Per-bucket observation counts summed element-wise across the window.
+     * Length is `bounds.len() + 1` (the trailing element is the +Inf bucket).
+     */
+    bucket_counts: Array<number>;
+    /**
+     * Total observation count summed across the bucket window.
+     */
+    count: number;
+    /**
+     * Maximum observed value, when reported by the producer.
+     */
+    max?: number | null;
+    /**
+     * Minimum observed value, when reported by the producer.
+     */
+    min?: number | null;
+    /**
+     * Sum of observed values across the bucket window.
+     */
+    sum: number;
 };
 
 export type HourlyPageSessions = {
@@ -7900,6 +8200,17 @@ export type McpDefinitionResponse = {
 
 export type MessageContent = string | Array<ContentPart>;
 
+export type MessageResponse = {
+    content: string;
+    created_at: string;
+    role: string;
+    /**
+     * Tools the assistant ran on this turn (persisted in message metadata), so
+     * the chat replays its tool work after a reload. Absent for plain turns.
+     */
+    tools?: Array<ToolInfo> | null;
+};
+
 /**
  * How to treat metered-billing subscriptions when computing MRR.
  *
@@ -7914,14 +8225,60 @@ export type MessageContent = string | Array<ContentPart>;
 export type MeteredMode = 'derive_from_invoices' | 'use_subscription' | 'ignore';
 
 /**
+ * The aggregation applied when reducing raw metric points into a time bucket.
+ *
+ * Store-neutral: every storage backend (ClickHouse today, TimescaleDB later)
+ * must be able to satisfy this contract. `Quantile(q)` carries the requested
+ * quantile in `[0.0, 1.0]` (e.g. `0.95` for p95).
+ */
+export type MetricAggregation = 'avg' | 'sum' | 'min' | 'max' | 'count' | 'rate_per_sec' | {
+    /**
+     * A quantile of the scalar value in each bucket. The carried `f64` is the
+     * requested quantile in `[0.0, 1.0]`.
+     */
+    quantile: number;
+};
+
+/**
  * A time-bucketed metric aggregate for chart display.
+ *
+ * Store-neutral response contract. The legacy scalar fields
+ * (`avg_value`/`min_value`/`max_value`/`count`) are always populated for chart
+ * back-compat. The richer fields describe the explicitly-requested
+ * [`MetricAggregation`] (`value`), optional `quantiles`, an optional
+ * `histogram_summary`, and a `series_key` identifying the label-set when the
+ * query used `group_by`.
  */
 export type MetricBucket = {
     avg_value: number;
     bucket: string;
     count: number;
+    histogram_summary?: null | HistogramSummary;
     max_value: number;
     min_value: number;
+    /**
+     * Computed quantile/value pairs `(quantile, value)` when the query asked for
+     * quantile aggregation; otherwise empty.
+     */
+    quantiles?: Array<[
+        number,
+        number
+    ]>;
+    /**
+     * The label-set this bucket belongs to, as ordered `(key, value)` pairs,
+     * when the query grouped by labels. Empty/`None` = the single ungrouped
+     * aggregate stream.
+     */
+    series_key?: Array<[
+        string,
+        string
+    ]> | null;
+    /**
+     * The value of the requested [`MetricAggregation`] for this bucket. For the
+     * default `Avg` aggregation this equals `avg_value`. `#[serde(default)]` so
+     * pre-existing payloads (which only carried avg/min/max/count) still parse.
+     */
+    value?: number;
 };
 
 /**
@@ -7938,14 +8295,10 @@ export type MetricDataPoint = {
     value: number;
 };
 
-export type MetricNamesResponse = {
-    names: Array<string>;
-};
-
 /**
  * The type of an OTel metric.
  */
-export type MetricType = 'gauge' | 'sum' | 'histogram';
+export type MetricType = 'gauge' | 'sum' | 'histogram' | 'exponential_histogram' | 'summary';
 
 export type MetricsOverTimeResponse = {
     cls: Array<number | null>;
@@ -8006,11 +8359,6 @@ export type MetricsRangeQuery = {
      * Time window: `"1h"` | `"6h"` | `"24h"` | `"7d"`.
      */
     range?: string;
-};
-
-export type MetricsResponse = {
-    count: number;
-    data: Array<MetricBucket>;
 };
 
 /**
@@ -8781,31 +9129,80 @@ export type OperationResultsResponse = {
     operations: Array<OperationResultResponse>;
 };
 
-/**
- * OpenTelemetry ingest (OTLP/HTTP) settings.
- *
- * Controls the inbound OTLP receiver endpoints (`/api/otel/v1/metrics`,
- * `/traces`, `/logs`, and their path-scoped variants). This is the
- * data path where deployed applications and infrastructure services
- * *push* telemetry into Temps — it is NOT temps self-instrumentation
- * (temps does not emit its own OTLP) and NOT the Prometheus scraper
- * (see [`MonitoringSettings`], a separate pull-based source).
- */
-export type OtelIngestSettings = {
+export type OtelDashboardResponse = {
+    created_at: string;
+    id: number;
+    layout: DashboardLayout;
+    name: string;
+    project_id: number;
+    updated_at: string;
+};
+
+export type OtelDashboardsResponse = {
+    data: Array<OtelDashboardResponse>;
+    total: number;
+};
+
+export type OtelMetricAlertRuleResponse = {
+    aggregation: string;
+    created_at: string;
     /**
-     * Master switch for OTLP ingest. When `false`, the ingest handlers
-     * short-circuit *before* auth/decompress/decode/store and return an
-     * empty OTLP success envelope (HTTP 200) so SDK exporters treat the
-     * batch as delivered and do not retry-storm. The background OTel
-     * analysis loops (anomaly detection, health compute) also pause while
-     * this is `false`.
-     *
-     * Defaults to `true`: OTLP ingest is a pre-existing always-on receiver,
-     * so a `settings` row written before this field existed deserializes to
-     * `enabled = true` (preserving current behaviour on upgrade — no silent
-     * telemetry loss).
+     * The typed detector definition (discriminated union keyed by `kind`).
      */
-    enabled?: boolean;
+    detection_config: DetectionConfig;
+    /**
+     * Coarse detector discriminator: `static|anomaly|forecast|outlier|auto_watch`.
+     */
+    detection_kind: string;
+    enabled: boolean;
+    for_duration_secs: number;
+    id: number;
+    last_evaluated_at?: string | null;
+    /**
+     * One of `ok|firing|unknown`.
+     */
+    last_state: string;
+    last_value?: number | null;
+    metric_name: string;
+    name: string;
+    project_id: number;
+    severity: string;
+    updated_at: string;
+    window_secs: number;
+};
+
+export type OtelMetricAlertsResponse = {
+    data: Array<OtelMetricAlertRuleResponse>;
+    total: number;
+};
+
+export type OtelMetricNamesResponse = {
+    names: Array<string>;
+};
+
+export type OtelMetricsResponse = {
+    count: number;
+    data: Array<MetricBucket>;
+};
+
+/**
+ * Outlier detection algorithm.
+ */
+export type OutlierAlgorithm = 'dbscan' | 'scaled_dbscan' | 'mad' | 'scaled_mad';
+
+/**
+ * Outlier (cross-series population) detector parameters (stub — not evaluated).
+ */
+export type OutlierParams = {
+    algorithm?: OutlierAlgorithm;
+    /**
+     * Label key defining the peer population compared across series (e.g. `host`).
+     */
+    peer_group_key: string;
+    /**
+     * Sensitivity; higher tolerates larger spread before flagging.
+     */
+    tolerance?: number;
 };
 
 /**
@@ -10041,6 +10438,14 @@ export type ProjectQuery = {
 };
 
 export type ProjectResponse = {
+    /**
+     * Opt-in to AI summarization of metric alert notifications (NULL/false = off).
+     */
+    ai_alert_summaries_enabled?: boolean | null;
+    /**
+     * Opt-in to AI debugging chat, e.g. on deployment failures (NULL/false = off).
+     */
+    ai_debug_chat_enabled?: boolean | null;
     /**
      * Attack mode - when enabled, requires CAPTCHA verification for all project environments
      */
@@ -11915,6 +12320,11 @@ export type SearchLogsResponse = {
  */
 export type SearchMode = 'index' | 'archive';
 
+/**
+ * Seasonality model for an anomaly baseline.
+ */
+export type Seasonality = 'none' | 'hourly' | 'daily' | 'weekly';
+
 export type SecretResponse = {
     created_at: string;
     description?: string | null;
@@ -12065,6 +12475,10 @@ export type SendEmailResponseBody = {
      * Email status
      */
     status: string;
+};
+
+export type SendMessageRequest = {
+    content: string;
 };
 
 export type SentryChunkUploadResponse = {
@@ -13365,6 +13779,20 @@ export type StaticBundleResponse = {
 };
 
 /**
+ * Static threshold detector: compare the aggregated `value` against `threshold`.
+ */
+export type StaticParams = {
+    /**
+     * How `value` is compared against `threshold`.
+     */
+    comparator: Comparator;
+    /**
+     * The threshold the aggregated value is compared against.
+     */
+    threshold: number;
+};
+
+/**
  * Configuration for static site presets (Vite, Next.js, Docusaurus, etc.)
  * These presets build static sites that are served via a web server
  */
@@ -13613,6 +14041,10 @@ export type TemplateResponse = {
      */
     env_vars: Array<EnvVarTemplateResponse>;
     /**
+     * Container port the prebuilt image listens on (image deploys only).
+     */
+    exposed_port?: number | null;
+    /**
      * Feature highlights
      */
     features: Array<string>;
@@ -13621,6 +14053,15 @@ export type TemplateResponse = {
      */
     git: GitRefResponse;
     /**
+     * HTTP health-check path probed after the container starts (image deploys).
+     */
+    health_check_path?: string | null;
+    /**
+     * Prebuilt Docker image reference. When set, the one-click deploy pulls and
+     * runs this image directly (no build); when absent it builds from `git`.
+     */
+    image?: string | null;
+    /**
      * URL to template image/icon
      */
     image_url?: string | null;
@@ -13628,19 +14069,6 @@ export type TemplateResponse = {
      * Whether the template is featured/promoted
      */
     is_featured: boolean;
-    /**
-     * Prebuilt Docker image reference. When set, the one-click deploy pulls and
-     * runs this image directly (no build); when absent it builds from `git`.
-     */
-    image?: string | null;
-    /**
-     * Container port the prebuilt image listens on (image deploys only).
-     */
-    exposed_port?: number | null;
-    /**
-     * HTTP health-check path probed after the container starts (image deploys).
-     */
-    health_check_path?: string | null;
     /**
      * Display name
      */
@@ -13864,6 +14292,40 @@ export type ToggleServiceMetricsRequest = {
 
 export type TokenRenewalRequest = {
     refresh_token: string;
+};
+
+/**
+ * Payload for the `tool_call` SSE event: the model is about to run a tool.
+ * Serialized as compact single-line JSON onto one `data:` line.
+ */
+export type ToolCallEvent = {
+    /**
+     * The raw JSON-args string the model emitted.
+     */
+    arguments: string;
+    id: string;
+    name: string;
+};
+
+/**
+ * One persisted tool invocation + its result, attached to an assistant message.
+ */
+export type ToolInfo = {
+    arguments: string;
+    id: string;
+    name: string;
+    result?: string | null;
+};
+
+/**
+ * Payload for the `tool_result` SSE event: a tool finished running. Serialized
+ * as compact single-line JSON; `content` is JSON-string-escaped so it stays on
+ * one `data:` line even when long.
+ */
+export type ToolResultEvent = {
+    content: string;
+    id: string;
+    name: string;
 };
 
 export type TopModelsQueryParams = {
@@ -14238,6 +14700,12 @@ export type UpdateBlobResponse = {
     success: boolean;
 };
 
+export type UpdateCloudflareProviderRequest = {
+    config: CloudflareConfig;
+    enabled?: boolean | null;
+    name?: string | null;
+};
+
 export type UpdateConfigBody = {
     config?: null | ProviderConfig;
 };
@@ -14252,6 +14720,11 @@ export type UpdateCustomDomainRequest = {
      */
     service_name?: string | null;
     status_code?: number | null;
+};
+
+export type UpdateDashboardRequest = {
+    layout?: null | DashboardLayout;
+    name?: string | null;
 };
 
 export type UpdateDeploymentConfigRequest = {
@@ -14529,6 +15002,17 @@ export type UpdateMcpRequest = {
     name?: string | null;
 };
 
+export type UpdateMetricAlertRequest = {
+    aggregation?: string | null;
+    detection_config?: null | DetectionConfig;
+    enabled?: boolean | null;
+    for_duration_secs?: number | null;
+    metric_name?: string | null;
+    name?: string | null;
+    severity?: string | null;
+    window_secs?: number | null;
+};
+
 export type UpdateNotificationEmailProviderRequest = {
     config: EmailConfig;
     enabled?: boolean | null;
@@ -14550,28 +15034,6 @@ export type UpdateOidcProviderRequest = {
     trust_idp_email?: boolean | null;
 };
 
-/**
- * Request body for the OTLP ingest kill-switch.
- */
-export type UpdateOtelIngestRequest = {
-    /**
-     * Whether OTLP/HTTP ingestion (`/api/otel/v1*`) is accepted. When
-     * `false`, the ingest endpoints accept-and-discard (HTTP 200) and the
-     * OTel analysis loops pause.
-     */
-    enabled: boolean;
-};
-
-/**
- * Response for the OTLP ingest kill-switch update.
- */
-export type UpdateOtelIngestResponse = {
-    /**
-     * The effective state after the update.
-     */
-    enabled: boolean;
-};
-
 export type UpdatePreferencesRequest = {
     preferences: NotificationPreferencesResponse;
 };
@@ -14591,6 +15053,14 @@ export type UpdateProjectSecretRequest = {
 };
 
 export type UpdateProjectSettingsRequest = {
+    /**
+     * Opt in to AI summarization of metric alert notifications (ADR-021).
+     */
+    ai_alert_summaries_enabled?: boolean | null;
+    /**
+     * Opt in to AI debugging chat, e.g. on deployment failures (ADR-023).
+     */
+    ai_debug_chat_enabled?: boolean | null;
     /**
      * Enable/disable attack mode (CAPTCHA protection) for all project environments
      */
@@ -16450,6 +16920,24 @@ export type WebhookTriggerResponses = {
 };
 
 export type WebhookTriggerResponse2 = WebhookTriggerResponses[keyof WebhookTriggerResponses];
+
+export type ListAllConversationsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/ai/conversations';
+};
+
+export type ListAllConversationsErrors = {
+    401: unknown;
+    403: unknown;
+};
+
+export type ListAllConversationsResponses = {
+    200: Array<GlobalConversationResponse>;
+};
+
+export type ListAllConversationsResponse = ListAllConversationsResponses[keyof ListAllConversationsResponses];
 
 export type GetPricingData = {
     body?: never;
@@ -28430,6 +28918,65 @@ export type CreateNotificationProviderResponses = {
 
 export type CreateNotificationProviderResponse = CreateNotificationProviderResponses[keyof CreateNotificationProviderResponses];
 
+export type CreateCloudflareProviderData = {
+    body: CreateCloudflareProviderRequest;
+    path?: never;
+    query?: never;
+    url: '/notification-providers/cloudflare';
+};
+
+export type CreateCloudflareProviderErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateCloudflareProviderResponses = {
+    /**
+     * Successfully created Cloudflare provider
+     */
+    201: NotificationProviderResponse;
+};
+
+export type CreateCloudflareProviderResponse = CreateCloudflareProviderResponses[keyof CreateCloudflareProviderResponses];
+
+export type UpdateCloudflareProviderData = {
+    body: UpdateCloudflareProviderRequest;
+    path: {
+        /**
+         * Provider ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/notification-providers/cloudflare/{id}';
+};
+
+export type UpdateCloudflareProviderErrors = {
+    /**
+     * Provider not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateCloudflareProviderResponses = {
+    /**
+     * Successfully updated Cloudflare provider
+     */
+    200: NotificationProviderResponse;
+};
+
+export type UpdateCloudflareProviderResponse = UpdateCloudflareProviderResponses[keyof UpdateCloudflareProviderResponses];
+
 export type CreateNotificationEmailProviderData = {
     body: CreateNotificationEmailProviderRequest;
     path?: never;
@@ -28773,6 +29320,499 @@ export type ListOrdersResponses = {
 
 export type ListOrdersResponse2 = ListOrdersResponses[keyof ListOrdersResponses];
 
+export type ListAlertsData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Page number (default: 1)
+         */
+        page?: number;
+        /**
+         * Page size (default: 20, max: 100)
+         */
+        page_size?: number;
+    };
+    url: '/otel/alerts';
+};
+
+export type ListAlertsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListAlertsError = ListAlertsErrors[keyof ListAlertsErrors];
+
+export type ListAlertsResponses = {
+    /**
+     * Alert rules for the project
+     */
+    200: OtelMetricAlertsResponse;
+};
+
+export type ListAlertsResponse = ListAlertsResponses[keyof ListAlertsResponses];
+
+export type CreateAlertData = {
+    body: CreateMetricAlertRequest;
+    path?: never;
+    query?: never;
+    url: '/otel/alerts';
+};
+
+export type CreateAlertErrors = {
+    /**
+     * Validation error
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type CreateAlertError = CreateAlertErrors[keyof CreateAlertErrors];
+
+export type CreateAlertResponses = {
+    /**
+     * Alert rule created
+     */
+    201: OtelMetricAlertRuleResponse;
+};
+
+export type CreateAlertResponse = CreateAlertResponses[keyof CreateAlertResponses];
+
+export type PreviewAlertData = {
+    body: AnomalyPreviewRequest;
+    path?: never;
+    query?: never;
+    url: '/otel/alerts/preview';
+};
+
+export type PreviewAlertErrors = {
+    /**
+     * Not an anomaly detector / bad input
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type PreviewAlertError = PreviewAlertErrors[keyof PreviewAlertErrors];
+
+export type PreviewAlertResponses = {
+    /**
+     * Per-bucket band + breach points
+     */
+    200: AnomalyPreviewResponse;
+};
+
+export type PreviewAlertResponse = PreviewAlertResponses[keyof PreviewAlertResponses];
+
+export type DeleteAlertData = {
+    body?: never;
+    path: {
+        /**
+         * Alert rule ID
+         */
+        id: number;
+    };
+    query: {
+        /**
+         * Owning project ID (scopes the delete)
+         */
+        project_id: number;
+    };
+    url: '/otel/alerts/{id}';
+};
+
+export type DeleteAlertErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Alert rule not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type DeleteAlertError = DeleteAlertErrors[keyof DeleteAlertErrors];
+
+export type DeleteAlertResponses = {
+    /**
+     * Alert rule deleted
+     */
+    204: void;
+};
+
+export type DeleteAlertResponse = DeleteAlertResponses[keyof DeleteAlertResponses];
+
+export type GetAlertData = {
+    body?: never;
+    path: {
+        /**
+         * Alert rule ID
+         */
+        id: number;
+    };
+    query: {
+        /**
+         * Owning project ID (scopes the lookup)
+         */
+        project_id: number;
+    };
+    url: '/otel/alerts/{id}';
+};
+
+export type GetAlertErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Alert rule not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetAlertError = GetAlertErrors[keyof GetAlertErrors];
+
+export type GetAlertResponses = {
+    /**
+     * Alert rule
+     */
+    200: OtelMetricAlertRuleResponse;
+};
+
+export type GetAlertResponse = GetAlertResponses[keyof GetAlertResponses];
+
+export type UpdateAlertData = {
+    body: UpdateMetricAlertRequest;
+    path: {
+        /**
+         * Alert rule ID
+         */
+        id: number;
+    };
+    query: {
+        /**
+         * Owning project ID (scopes the update)
+         */
+        project_id: number;
+    };
+    url: '/otel/alerts/{id}';
+};
+
+export type UpdateAlertErrors = {
+    /**
+     * Validation error
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Alert rule not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type UpdateAlertError = UpdateAlertErrors[keyof UpdateAlertErrors];
+
+export type UpdateAlertResponses = {
+    /**
+     * Alert rule updated
+     */
+    200: OtelMetricAlertRuleResponse;
+};
+
+export type UpdateAlertResponse = UpdateAlertResponses[keyof UpdateAlertResponses];
+
+export type ListDashboardsData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Page number (default: 1)
+         */
+        page?: number;
+        /**
+         * Page size (default: 20, max: 100)
+         */
+        page_size?: number;
+    };
+    url: '/otel/dashboards';
+};
+
+export type ListDashboardsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListDashboardsError = ListDashboardsErrors[keyof ListDashboardsErrors];
+
+export type ListDashboardsResponses = {
+    /**
+     * Dashboards for the project
+     */
+    200: OtelDashboardsResponse;
+};
+
+export type ListDashboardsResponse = ListDashboardsResponses[keyof ListDashboardsResponses];
+
+export type CreateDashboardData = {
+    body: CreateDashboardRequest;
+    path?: never;
+    query?: never;
+    url: '/otel/dashboards';
+};
+
+export type CreateDashboardErrors = {
+    /**
+     * Validation error
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type CreateDashboardError = CreateDashboardErrors[keyof CreateDashboardErrors];
+
+export type CreateDashboardResponses = {
+    /**
+     * Dashboard created
+     */
+    201: OtelDashboardResponse;
+};
+
+export type CreateDashboardResponse = CreateDashboardResponses[keyof CreateDashboardResponses];
+
+export type DeleteDashboardData = {
+    body?: never;
+    path: {
+        /**
+         * Dashboard ID
+         */
+        id: number;
+    };
+    query: {
+        /**
+         * Owning project ID (scopes the delete)
+         */
+        project_id: number;
+    };
+    url: '/otel/dashboards/{id}';
+};
+
+export type DeleteDashboardErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Dashboard not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type DeleteDashboardError = DeleteDashboardErrors[keyof DeleteDashboardErrors];
+
+export type DeleteDashboardResponses = {
+    /**
+     * Dashboard deleted
+     */
+    204: void;
+};
+
+export type DeleteDashboardResponse = DeleteDashboardResponses[keyof DeleteDashboardResponses];
+
+export type GetDashboardData = {
+    body?: never;
+    path: {
+        /**
+         * Dashboard ID
+         */
+        id: number;
+    };
+    query: {
+        /**
+         * Owning project ID (scopes the lookup)
+         */
+        project_id: number;
+    };
+    url: '/otel/dashboards/{id}';
+};
+
+export type GetDashboardErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Dashboard not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetDashboardError = GetDashboardErrors[keyof GetDashboardErrors];
+
+export type GetDashboardResponses = {
+    /**
+     * Dashboard
+     */
+    200: OtelDashboardResponse;
+};
+
+export type GetDashboardResponse = GetDashboardResponses[keyof GetDashboardResponses];
+
+export type UpdateDashboardData = {
+    body: UpdateDashboardRequest;
+    path: {
+        /**
+         * Dashboard ID
+         */
+        id: number;
+    };
+    query: {
+        /**
+         * Owning project ID (scopes the update)
+         */
+        project_id: number;
+    };
+    url: '/otel/dashboards/{id}';
+};
+
+export type UpdateDashboardErrors = {
+    /**
+     * Validation error
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Dashboard not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type UpdateDashboardError = UpdateDashboardErrors[keyof UpdateDashboardErrors];
+
+export type UpdateDashboardResponses = {
+    /**
+     * Dashboard updated
+     */
+    200: OtelDashboardResponse;
+};
+
+export type UpdateDashboardResponse = UpdateDashboardResponses[keyof UpdateDashboardResponses];
+
 export type QueryGenaiTracesData = {
     body?: never;
     path?: never;
@@ -29078,7 +30118,7 @@ export type ListMetricNamesResponses = {
     /**
      * List of metric names
      */
-    200: MetricNamesResponse;
+    200: OtelMetricNamesResponse;
 };
 
 export type ListMetricNamesResponse = ListMetricNamesResponses[keyof ListMetricNamesResponses];
@@ -29119,11 +30159,31 @@ export type QueryMetricsData = {
          * Max buckets to return (default: 1000)
          */
         limit?: number;
+        /**
+         * Filter by metric type (gauge, sum, histogram, exponential_histogram, summary)
+         */
+        metric_type?: string;
+        /**
+         * Per-bucket aggregation: avg (default), sum, min, max, count, rate, p50/p95/p99, quantile:0.95
+         */
+        aggregation?: string;
+        /**
+         * Comma-separated key=value data-point label filters (keys must match [a-zA-Z0-9_.:-])
+         */
+        label_filters?: string;
+        /**
+         * Comma-separated label keys to group series by
+         */
+        group_by?: string;
     };
     url: '/otel/metrics';
 };
 
 export type QueryMetricsErrors = {
+    /**
+     * Invalid label key
+     */
+    400: ProblemDetails;
     /**
      * Unauthorized
      */
@@ -29144,7 +30204,7 @@ export type QueryMetricsResponses = {
     /**
      * Metrics data
      */
-    200: MetricsResponse;
+    200: OtelMetricsResponse;
 };
 
 export type QueryMetricsResponse = QueryMetricsResponses[keyof QueryMetricsResponses];
@@ -31306,6 +32366,137 @@ export type GetAggregatedBucketsResponses = {
 };
 
 export type GetAggregatedBucketsResponse = GetAggregatedBucketsResponses[keyof GetAggregatedBucketsResponses];
+
+export type FindConversationData = {
+    body?: never;
+    path: {
+        project_id: number;
+    };
+    query: {
+        context_type: string;
+        context_id: string;
+    };
+    url: '/projects/{project_id}/ai/conversations';
+};
+
+export type FindConversationErrors = {
+    401: unknown;
+    403: unknown;
+};
+
+export type FindConversationResponses = {
+    200: null | ConversationResponse;
+};
+
+export type FindConversationResponse = FindConversationResponses[keyof FindConversationResponses];
+
+export type CreateConversationData = {
+    body: CreateConversationRequest;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/ai/conversations';
+};
+
+export type CreateConversationErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type CreateConversationResponses = {
+    200: ConversationResponse;
+};
+
+export type CreateConversationResponse = CreateConversationResponses[keyof CreateConversationResponses];
+
+export type ListConversationsData = {
+    body?: never;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/ai/conversations/list';
+};
+
+export type ListConversationsErrors = {
+    401: unknown;
+    403: unknown;
+};
+
+export type ListConversationsResponses = {
+    200: Array<ConversationResponse>;
+};
+
+export type ListConversationsResponse = ListConversationsResponses[keyof ListConversationsResponses];
+
+export type GetConversationData = {
+    body?: never;
+    path: {
+        project_id: number;
+        public_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/ai/conversations/{public_id}';
+};
+
+export type GetConversationErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type GetConversationResponses = {
+    200: ConversationDetailResponse;
+};
+
+export type GetConversationResponse = GetConversationResponses[keyof GetConversationResponses];
+
+export type ArchiveConversationData = {
+    body?: never;
+    path: {
+        project_id: number;
+        public_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/ai/conversations/{public_id}/archive';
+};
+
+export type ArchiveConversationErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type ArchiveConversationResponses = {
+    204: void;
+};
+
+export type ArchiveConversationResponse = ArchiveConversationResponses[keyof ArchiveConversationResponses];
+
+export type SendMessageData = {
+    body: SendMessageRequest;
+    path: {
+        project_id: number;
+        public_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/ai/conversations/{public_id}/messages';
+};
+
+export type SendMessageErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type SendMessageResponses = {
+    /**
+     * SSE stream of assistant text deltas
+     */
+    200: unknown;
+};
 
 export type StartAnalysisData = {
     body: StartAnalysisRequest;
@@ -39792,37 +40983,6 @@ export type UpdateGlobalMcpResponses = {
 };
 
 export type UpdateGlobalMcpResponse = UpdateGlobalMcpResponses[keyof UpdateGlobalMcpResponses];
-
-export type UpdateOtelIngestData = {
-    body: UpdateOtelIngestRequest;
-    path?: never;
-    query?: never;
-    url: '/settings/otel-ingest';
-};
-
-export type UpdateOtelIngestErrors = {
-    /**
-     * Unauthorized
-     */
-    401: unknown;
-    /**
-     * Insufficient permissions (requires otel:write)
-     */
-    403: unknown;
-    /**
-     * Internal server error
-     */
-    500: unknown;
-};
-
-export type UpdateOtelIngestResponses = {
-    /**
-     * OTLP ingest toggle updated
-     */
-    200: UpdateOtelIngestResponse;
-};
-
-export type UpdateOtelIngestResponse2 = UpdateOtelIngestResponses[keyof UpdateOtelIngestResponses];
 
 export type RefreshRouteTableData = {
     body?: never;

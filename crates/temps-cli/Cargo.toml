@@ -23,6 +23,7 @@ path = "src/lib.rs"
 temps-agent = { path = "../temps-agent" }
 temps-edge = { path = "../temps-edge" }
 temps-ai-gateway = { path = "../temps-ai-gateway" }
+temps-ai-chat = { path = "../temps-ai-chat" }
 temps-analytics = { path = "../temps-analytics" }
 temps-analytics-events = { path = "../temps-analytics-events" }
 temps-blob = { path = "../temps-blob" }

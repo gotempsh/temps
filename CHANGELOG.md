@@ -8,13 +8,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
--
+- **OpenTelemetry metrics.** A full OTLP metrics pipeline backed by ClickHouse,
+  with a Metrics explorer, saved dashboards, and first-class metric alert rules.
+  Alerts support **anomaly detection** (a robust, seasonal median/MAD baseline)
+  alongside static thresholds, with sensitivity presets and a **backtest
+  preview** ("would have fired N times") while you author the rule. Charts
+  overlay **deploy markers** ("did a deploy cause this?") and a firing metric
+  links straight across to its traces and errors in the same window
+  ("what changed"). Datadog-style firing status — triaged dots, severity sort,
+  and a needs-attention header — surfaces on the metrics overview, the
+  dashboards list, and the dashboard view (#158).
+- **AI-assisted debugging & assistant (bring-your-own-key).** Configure an AI
+  provider (OpenAI, Anthropic, xAI, or Google Gemini) under **Settings → AI
+  Providers** to power a persistent, cross-project AI assistant dock with
+  resumable conversations. It diagnoses **failed deployments** (grounded in the
+  pipeline's failed stages and build-log tails) and **firing alerts**, can
+  agentically **read repository files at the deployed commit via the configured
+  Git provider** (no clone), and humanizes alert notifications. Keys are verified
+  before being stored encrypted, and the first active key serves every AI feature
+  (#158).
+- **Cloudflare Email Sending notification provider.** A new notification
+  provider delivers alert emails through Cloudflare's transactional Email
+  Sending API instead of a self-managed SMTP relay. Operators configure only an
+  account id, an API token with the Email Sending permission, the verified
+  sender (from name/address), and the recipients — the subject and HTML/text
+  bodies are derived from each notification (HTML reuses the shared notification
+  email template). Adds dedicated `POST`/`PUT /notification-providers/cloudflare`
+  endpoints plus a "Cloudflare Email" option in the notification provider UI
+  (#160).
 
 ### Changed
--
+- **Project navigation grouped into OpenTelemetry + Monitoring.** The OTel
+  signals (Observe, Traces, AI Traces, Metrics, Error Tracking) are now grouped
+  under an **OpenTelemetry** section; operational tools (Uptime, Request Logs,
+  AI Crawlers) under **Monitoring** (#158).
+- **Project header stays on one line.** A long project name in the breadcrumb
+  switcher (and long crumbs on deep paths) now truncates with an ellipsis
+  instead of wrapping the header onto two lines (#158).
+- **Documentation: local build prerequisites.** The installation guide and
+  `CONTRIBUTING.md` now document the system prerequisites required to build
+  Temps from source locally (toolchain and dependencies), so new contributors
+  can get a local build working without trial and error.
+
+### Removed
+- **Legacy project "Metrics" (resource monitoring) page.** Superseded by the
+  OpenTelemetry Metrics surface; its sidebar entry, route, and page component
+  were removed (#158).
 
 ### Fixed
--
+- **Disabled alert rules no longer report as "firing".** A rule disabled while
+  firing kept a frozen `firing` state (the evaluator only scans enabled rules);
+  the status model now treats a disabled monitor as not-firing everywhere, so
+  dashboards and the alerts list don't flash a false red alarm (#158).
 
 
 ## [0.1.0-beta.39] - 2026-06-25

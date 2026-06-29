@@ -20,7 +20,6 @@ import { GitSettings, ChangeRepositoryPage } from '@/components/project/settings
 import { ProjectSpeedInsights } from '@/components/project/ProjectSpeedInsights'
 import { ProjectStorage } from '@/components/project/ProjectStorage'
 import { ProjectMonitors } from '@/components/project/ProjectMonitors'
-import { ProjectMonitoring } from '@/components/project/ProjectMonitoring'
 import { MonitorDetail } from '@/components/project/MonitorDetail'
 import { ErrorTracking } from '@/components/projects/ErrorTracking'
 import { ErrorTrackingSetup } from '@/components/project/setup/ErrorTrackingSetup'
@@ -43,6 +42,7 @@ import Observe from './Observe'
 import RequestLogs from './RequestLogs'
 import ProjectAiCrawlers from './ProjectAiCrawlers'
 import Traces from './Traces'
+import Metrics from './Metrics'
 import { ProjectAgentActivity } from './AiGateway'
 import { AutofixerPage } from '@/components/autofixer/AutofixerPage'
 import { AutofixRedirect } from '@/components/autofixer/AutofixRedirect'
@@ -410,12 +410,18 @@ export function ProjectDetail() {
                 element={<MonitorDetail project={project} />}
               />
               <Route
-                path="monitoring"
-                element={<ProjectMonitoring project={project} />}
-              />
-              <Route
                 path="traces/*"
                 element={<Traces project={project} />}
+              />
+              <Route
+                path="metrics/*"
+                element={<Metrics project={project} />}
+              />
+              {/* Dashboards moved under the unified Metrics surface; redirect
+                  any lingering /dashboards links. */}
+              <Route
+                path="dashboards/*"
+                element={<Navigate to="../metrics/dashboards" replace />}
               />
               <Route
                 path="ai-gateway"

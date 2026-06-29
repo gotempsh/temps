@@ -1,6 +1,8 @@
 pub mod acme_accounts;
 pub mod acme_orders;
+pub mod ai_conversations;
 pub mod ai_gateway_config;
+pub mod ai_messages;
 pub mod ai_provider_keys;
 pub mod ai_usage_logs;
 pub mod alarms;
@@ -121,6 +123,12 @@ pub mod status_monitors;
 
 // Metrics alert rules
 pub mod monitoring_alert_rules;
+
+// Metric dashboards (saved per-project dashboard layouts)
+pub mod metric_dashboards;
+
+// Metric alert rules (first-class metric-centric alerting)
+pub mod metric_alert_rules;
 
 // Webhook entities
 pub mod webhook_deliveries;

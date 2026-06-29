@@ -18,27 +18,46 @@ Thank you for your interest in contributing to Temps. Whether you are reporting 
 - **PostgreSQL** with TimescaleDB extension
 - **Bun** (for frontend development)
 - **Node.js** 18+
+- **C/C++ build toolchain**, **CMake**, and **pkg-config** -- required by native Rust dependencies
+- **OpenSSL development headers** -- required by Pingora/OpenSSL and Git dependencies
 - **protobuf compiler** (`protoc`) -- required by the `temps-otel` crate to compile OpenTelemetry `.proto` files
+- **rustfmt** -- required by generated-code build scripts
 - **wasm-pack** -- required to build the `temps-captcha-wasm` crate
+- **wasm32-unknown-unknown Rust target** -- required by the `temps-captcha-wasm` crate
 
-#### Installing protoc
+#### Amazon Linux 2023 build prerequisites
 
 ```bash
-# macOS
-brew install protobuf
+sudo dnf groupinstall -y "Development Tools"
+sudo dnf install -y \
+  rust cargo rustfmt rust-std-static-wasm32-unknown-unknown \
+  cmake pkgconf-pkg-config openssl-devel protobuf-compiler \
+  perl-FindBin perl-IPC-Cmd perl-File-Compare perl-File-Copy perl-Time-Piece
 
-# Debian/Ubuntu
-sudo apt-get install -y protobuf-compiler
-
-# Fedora
-sudo dnf install -y protobuf-compiler
-
-# Or download from https://github.com/protocolbuffers/protobuf/releases
+cargo install wasm-pack
 ```
 
-#### Installing wasm-pack
+If `cargo install` places `wasm-pack` in `~/.cargo/bin`, make sure that directory is on your `PATH`.
+
+#### Debian/Ubuntu build prerequisites
 
 ```bash
+sudo apt-get update
+sudo apt-get install -y \
+  build-essential cmake pkg-config libssl-dev protobuf-compiler
+
+rustup component add rustfmt
+rustup target add wasm32-unknown-unknown
+cargo install wasm-pack
+```
+
+#### macOS build prerequisites
+
+```bash
+brew install cmake openssl pkg-config protobuf
+
+rustup component add rustfmt
+rustup target add wasm32-unknown-unknown
 cargo install wasm-pack
 ```
 

@@ -1162,9 +1162,17 @@ impl GitProviderService for GitHubProvider {
         let client = self.get_client();
         let headers = self.get_headers(access_token);
 
+        // Percent-encode the path so model/user-supplied paths can't break out
+        // of the Contents API URL (e.g. injecting `?`/`#`/`..%2f`). Encode each
+        // segment individually so the `/` separators are preserved.
+        let encoded_path = path
+            .split('/')
+            .map(|segment| urlencoding::encode(segment).into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
         let mut url = format!(
             "{}/repos/{}/{}/contents/{}",
-            self.api_url, owner, repo, path
+            self.api_url, owner, repo, encoded_path
         );
         if let Some(ref_name) = branch {
             url.push_str(&format!("?ref={}", ref_name));

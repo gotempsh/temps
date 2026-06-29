@@ -693,13 +693,7 @@ impl OtelStorage for TimescaleDbStorage {
 
         Ok(rows
             .into_iter()
-            .map(|r| MetricBucket {
-                bucket: r.bucket,
-                avg_value: r.avg_value,
-                min_value: r.min_value,
-                max_value: r.max_value,
-                count: r.count,
-            })
+            .map(|r| MetricBucket::scalar(r.bucket, r.avg_value, r.min_value, r.max_value, r.count))
             .collect())
     }
 

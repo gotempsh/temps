@@ -5,6 +5,8 @@ members = [
     "crates/temps-cli",
     # Library crates
     "crates/temps-core",
+    "crates/temps-ai",
+    "crates/temps-ai-chat",
     "crates/temps-entities",
     "crates/temps-migrations",
     "crates/temps-database",
