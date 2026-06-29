@@ -352,6 +352,9 @@ pub struct ProjectResponse {
     /// OSS global-observability model where any OtelRead holder can query any
     /// project's telemetry).
     pub cross_project_trace_sharing: bool,
+    /// Hours to retain built Docker images before nightly cleanup. Null = system default (48 h).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_retention_hours: Option<i32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -393,6 +396,7 @@ impl ProjectResponse {
             source_type: project.source_type,
             gitlab_webhook_id: project.gitlab_webhook_id,
             cross_project_trace_sharing: project.cross_project_trace_sharing,
+            image_retention_hours: project.image_retention_hours,
             deployment_config: DeploymentConfig {
                 cpu_request: project
                     .deployment_config
@@ -681,6 +685,9 @@ pub struct UpdateProjectSettingsRequest {
     pub preview_envs_idle_timeout_seconds: Option<i32>,
     /// Wake timeout (seconds, 5..=120) for on-demand preview environments.
     pub preview_envs_wake_timeout_seconds: Option<i32>,
+    /// How long (hours) to retain built Docker images before nightly cleanup removes them.
+    /// Set to null to use the system default (48 hours). Valid range: 1–8760.
+    pub image_retention_hours: Option<i32>,
     /// Preset-specific configuration (e.g., Dockerfile path for Docker preset)
     ///
     /// Example for Dockerfile preset:

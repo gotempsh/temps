@@ -1287,6 +1287,7 @@ impl ProjectService {
         error_source_context_enabled: Option<bool>,
         error_source_root: Option<String>,
         ai_api_traffic_summary_enabled: Option<bool>,
+        image_retention_hours: Option<i32>,
     ) -> Result<Project, ProjectError> {
         // Validate preview env on-demand timeouts before touching the DB.
         // Mirrors DeploymentConfig::validate so the project-level defaults are
@@ -1304,6 +1305,14 @@ impl ProjectService {
                 return Err(ProjectError::InvalidInput(format!(
                     "preview_envs_wake_timeout_seconds {} is not in valid range (5-120)",
                     wake
+                )));
+            }
+        }
+        if let Some(hours) = image_retention_hours {
+            if !(1..=8760).contains(&hours) {
+                return Err(ProjectError::InvalidInput(format!(
+                    "image_retention_hours {} is not in valid range (1-8760)",
+                    hours
                 )));
             }
         }
@@ -1550,11 +1559,12 @@ impl ProjectService {
             active_project.update(self.db.as_ref()).await?;
         }
 
-        // Update preview environment settings if any are provided
+        // Update preview environment settings and image retention if any are provided
         let needs_preview_update = enable_preview_environments.is_some()
             || preview_envs_on_demand.is_some()
             || preview_envs_idle_timeout_seconds.is_some()
-            || preview_envs_wake_timeout_seconds.is_some();
+            || preview_envs_wake_timeout_seconds.is_some()
+            || image_retention_hours.is_some();
 
         if needs_preview_update {
             // Reload project to ensure we have the latest state
@@ -1579,6 +1589,9 @@ impl ProjectService {
             }
             if let Some(wake) = preview_envs_wake_timeout_seconds {
                 active_project.preview_envs_wake_timeout_seconds = Set(wake);
+            }
+            if let Some(hours) = image_retention_hours {
+                active_project.image_retention_hours = Set(Some(hours));
             }
 
             active_project.update(self.db.as_ref()).await?;
@@ -3160,6 +3173,7 @@ impl ProjectService {
             source_type: db_project.source_type,
             gitlab_webhook_id: db_project.gitlab_webhook_id,
             cross_project_trace_sharing: db_project.cross_project_trace_sharing,
+            image_retention_hours: db_project.image_retention_hours,
         }
     }
 
@@ -4096,6 +4110,7 @@ mod tests {
                 None, // error_source_context_enabled
                 None, // error_source_root
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await;
 

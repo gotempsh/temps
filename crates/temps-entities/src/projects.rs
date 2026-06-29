@@ -129,6 +129,9 @@ pub struct Model {
     /// and the project calls `GET /projects/{id}/api-analytics/summary`.
     /// Falls back to `null` summary gracefully when no AI provider is configured.
     pub ai_api_traffic_summary_enabled: Option<bool>,
+    /// How long (in hours) to retain built Docker images before the nightly
+    /// cleanup removes them. NULL means use the system default (48 hours).
+    pub image_retention_hours: Option<i32>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

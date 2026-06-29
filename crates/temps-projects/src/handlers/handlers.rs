@@ -1092,6 +1092,7 @@ pub async fn update_project_settings(
             settings.error_source_context_enabled,
             settings.error_source_root.clone(),
             settings.ai_api_traffic_summary_enabled,
+            settings.image_retention_hours,
         )
         .await
         .map_err(Problem::from)?;
