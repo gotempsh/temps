@@ -56,6 +56,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   were removed (#158).
 
 ### Fixed
+- **Notification email provider update hit the wrong endpoint in the SDK.** Both
+  `temps-email` and `temps-notifications` exposed an `update_email_provider`
+  handler, producing a duplicate `updateEmailProvider` operationId; the generated
+  TypeScript SDK silently shadowed one with the other, so the notification
+  provider UI could call the transactional-email endpoint instead. The
+  notifications handler is renamed to `update_notification_email_provider`
+  (`updateNotificationEmailProvider`), keeping the route unchanged
+  (`PUT /notification-providers/email/{id}`) (#163).
 - **Disabled alert rules no longer report as "firing".** A rule disabled while
   firing kept a frozen `firing` state (the evaluator only scans enabled rules);
   the status model now treats a disabled monitor as not-firing everywhere, so
