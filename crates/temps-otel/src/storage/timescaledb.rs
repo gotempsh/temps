@@ -1269,7 +1269,7 @@ impl OtelStorage for TimescaleDbStorage {
 
         // Stable order by bucket time (scalar rows already arrived ordered; the
         // histogram-only additions are merged in).
-        buckets.sort_by(|a, b| a.bucket.cmp(&b.bucket));
+        buckets.sort_by_key(|b| b.bucket);
 
         Ok(buckets)
     }
