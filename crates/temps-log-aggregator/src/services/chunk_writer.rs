@@ -272,6 +272,11 @@ impl ChunkWriterService {
         let service = first_line.service.clone();
         let env = first_line.env.clone();
         let deploy_id = first_line.deploy_id;
+        // A buffer is keyed by container_id, and one container runs on exactly
+        // one node, so the node tags are uniform across the buffer — taking
+        // them from the first line is correct.
+        let node_id = first_line.node_id;
+        let node_name = first_line.node_name.clone();
         let line_count = data.lines.len() as i32;
 
         // Build NDJSON
@@ -343,6 +348,8 @@ impl ChunkWriterService {
                 service,
                 container_id: container_id.to_string(),
                 deploy_id,
+                node_id,
+                node_name,
                 started_at: data.started_at,
                 ended_at: data.ended_at,
                 storage_key,
@@ -382,6 +389,8 @@ mod tests {
             env: "1".to_string(),
             project_id: 1,
             deploy_id: None,
+            node_id: None,
+            node_name: None,
         }
     }
 

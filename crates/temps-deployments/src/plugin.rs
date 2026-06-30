@@ -75,6 +75,18 @@ impl TempsPlugin for DeploymentsPlugin {
                 deployment_service.clone() as Arc<dyn temps_core::DeploymentCanceller>;
             context.register_service(deployment_canceller);
 
+            // Remote container log source — lets the log-aggregator collect logs
+            // from containers on remote worker nodes into searchable history. The
+            // aggregator picks this up via get_service and runs its reconcile
+            // loop; single-node setups simply have nothing to collect.
+            let remote_log_source = Arc::new(crate::services::RemoteLogSourceImpl::new(
+                db.clone(),
+                config_service.clone(),
+                encryption_service.clone(),
+            ))
+                as Arc<dyn temps_log_aggregator::RemoteContainerLogSource>;
+            context.register_service(remote_log_source);
+
             // Cancel any running deployments from previous server instance
             let cancel_service = deployment_service.clone();
             tokio::spawn(async move {
@@ -335,6 +347,7 @@ impl TempsPlugin for DeploymentsPlugin {
             audit_service,
             node_service,
             encryption_service,
+            config_service: config_service.clone(),
             docker: docker_for_exec,
         });
 

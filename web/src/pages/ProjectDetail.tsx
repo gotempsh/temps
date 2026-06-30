@@ -35,6 +35,7 @@ import { AlertRuleForm } from '@/pages/AlertRuleForm'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { useAssistantProject } from '@/components/ai/AiAssistantContext'
 import { DeploymentDetails } from '@/pages/DeploymentDetails'
 import { ErrorEventDetail } from './ErrorEventDetail'
 import { ErrorGroupDetail } from './ErrorGroupDetail'
@@ -42,6 +43,7 @@ import Observe from './Observe'
 import RequestLogs from './RequestLogs'
 import ProjectAiCrawlers from './ProjectAiCrawlers'
 import Traces from './Traces'
+import LogsList from './LogsList'
 import Metrics from './Metrics'
 import { ProjectAgentActivity } from './AiGateway'
 import { AutofixerPage } from '@/components/autofixer/AutofixerPage'
@@ -156,6 +158,11 @@ export function ProjectDetail() {
       )
     },
   })
+
+  // Register the current project so the assistant's "new chat" defaults to it.
+  useAssistantProject(
+    project ? { id: project.id, slug: project.slug, name: project.name } : null
+  )
 
   const handleDisableAttackMode = () => {
     if (!project) return
@@ -412,6 +419,10 @@ export function ProjectDetail() {
               <Route
                 path="traces/*"
                 element={<Traces project={project} />}
+              />
+              <Route
+                path="telemetry-logs"
+                element={<LogsList project={project} />}
               />
               <Route
                 path="metrics/*"

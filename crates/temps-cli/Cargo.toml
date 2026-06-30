@@ -21,6 +21,7 @@ path = "src/lib.rs"
 [dependencies]
 # All library crates
 temps-agent = { path = "../temps-agent" }
+temps-ai-api-tools = { path = "../temps-ai-api-tools" }
 temps-edge = { path = "../temps-edge" }
 temps-ai-gateway = { path = "../temps-ai-gateway" }
 temps-ai-chat = { path = "../temps-ai-chat" }

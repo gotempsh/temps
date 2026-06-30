@@ -134,6 +134,7 @@ function ProviderConfigCard({
   const [editing, setEditing] = useState(false)
   const [apiKey, setApiKey] = useState('')
   const [baseUrl, setBaseUrl] = useState('')
+  const [model, setModel] = useState('')
   const [showAdvanced, setShowAdvanced] = useState(false)
   const [testResult, setTestResult] = useState<{
     ok: boolean
@@ -147,6 +148,7 @@ function ProviderConfigCard({
   const resetForm = () => {
     setApiKey('')
     setBaseUrl('')
+    setModel('')
     setShowAdvanced(false)
     setTestResult(null)
     setEditing(false)
@@ -155,10 +157,20 @@ function ProviderConfigCard({
   const saveMutation = useMutation({
     mutationFn: async () => {
       const trimmedBase = baseUrl.trim() || undefined
+      const trimmedModel = model.trim() || undefined
+      const trimmedKey = apiKey.trim()
       if (existing) {
         return updateProviderKey({
           path: { id: existing.id },
-          body: { api_key: apiKey.trim(), base_url: trimmedBase ?? null },
+          body: {
+            // Only send the key when the user actually retyped one — omitting
+            // it leaves the stored credential untouched, so model/base-URL-only
+            // edits don't require re-entering the key.
+            ...(trimmedKey ? { api_key: trimmedKey } : {}),
+            base_url: trimmedBase ?? null,
+            // null clears the pinned model (revert to provider default).
+            default_model: trimmedModel ?? null,
+          },
           throwOnError: true,
         })
       }
@@ -168,6 +180,7 @@ function ProviderConfigCard({
           display_name: meta.name,
           api_key: apiKey.trim(),
           base_url: trimmedBase,
+          default_model: trimmedModel,
         },
         throwOnError: true,
       })
@@ -266,7 +279,10 @@ function ProviderConfigCard({
   }
 
   const showForm = editing || !existing
-  const canSave = apiKey.trim().length > 0 && !saveMutation.isPending
+  // New keys require an API key; editing an existing key can save settings
+  // (model / base URL) without re-entering the credential.
+  const canSave =
+    (existing ? true : apiKey.trim().length > 0) && !saveMutation.isPending
 
   return (
     <Card>
@@ -289,6 +305,7 @@ function ProviderConfigCard({
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div className="font-mono text-sm text-muted-foreground">
                 ••••••••••••{existing.base_url ? ` · ${existing.base_url}` : ''}
+                {existing.default_model ? ` · ${existing.default_model}` : ''}
               </div>
               <div className="flex items-center gap-2">
                 <Label
@@ -325,9 +342,16 @@ function ProviderConfigCard({
                 onClick={() => {
                   setEditing(true)
                   setTestResult(null)
+                  // Prefill the editable fields from the stored key (the API
+                  // key itself is masked and must be re-entered).
+                  setBaseUrl(existing.base_url ?? '')
+                  setModel(existing.default_model ?? '')
+                  if (existing.base_url || existing.default_model) {
+                    setShowAdvanced(true)
+                  }
                 }}
               >
-                Replace key
+                Edit
               </Button>
               <Button
                 variant="ghost"
@@ -351,7 +375,14 @@ function ProviderConfigCard({
           <div className="space-y-3">
             <div className="space-y-1.5">
               <div className="flex items-center justify-between">
-                <Label htmlFor={`key-${meta.id}`}>API key</Label>
+                <Label htmlFor={`key-${meta.id}`}>
+                  API key
+                  {existing && (
+                    <span className="ml-1 font-normal text-muted-foreground">
+                      — leave blank to keep current
+                    </span>
+                  )}
+                </Label>
                 <a
                   href={meta.keyDocsUrl}
                   target="_blank"
@@ -398,6 +429,23 @@ function ProviderConfigCard({
                 <p className="text-xs text-muted-foreground">
                   Leave blank to use {meta.name}'s default endpoint.
                 </p>
+
+                <div className="space-y-1.5 pt-1">
+                  <Label htmlFor={`model-${meta.id}`}>Default model</Label>
+                  <Input
+                    id={`model-${meta.id}`}
+                    type="text"
+                    autoComplete="off"
+                    placeholder="Optional — e.g. gpt-4o-mini, llama3.1, qwen3"
+                    value={model}
+                    onChange={(e) => setModel(e.target.value)}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    Pin which model this provider serves. Leave blank to use the
+                    per-provider default. A model passed explicitly in a request
+                    always takes precedence.
+                  </p>
+                </div>
               </div>
             )}
 

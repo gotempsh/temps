@@ -104,6 +104,8 @@ export function MetricTile({
                   hs.bounds,
                   hs.bucket_counts,
                   percentileFromAgg(aggregation),
+                  hs.min,
+                  hs.max,
                 )
               : (b.value ?? b.avg_value)
           return { bucket: b.bucket, label: formatBucketLabel(b.bucket), value }

@@ -21,6 +21,7 @@ import {
 import { CodeBlock } from '@/components/ui/code-block'
 import { EmptyState } from '@/components/ui/empty-state'
 import { Input } from '@/components/ui/input'
+import { useDebounce } from '@/hooks/useDebounce'
 import {
   Select,
   SelectContent,
@@ -625,6 +626,12 @@ export default function TracesList({ project }: TracesListProps) {
   const [search, setSearch] = useState(
     () => searchParams.get('q') || ''
   )
+  const [namePattern, setNamePattern] = useState(
+    () => searchParams.get('name') || ''
+  )
+  // Debounce the free-text filters so we don't fire a query on every keystroke.
+  const debouncedSearch = useDebounce(search, 300)
+  const debouncedNamePattern = useDebounce(namePattern, 300)
   const [environmentId, setEnvironmentId] = useState(
     () => searchParams.get('env') || 'all'
   )
@@ -697,14 +704,15 @@ export default function TracesList({ project }: TracesListProps) {
     if (timeRange !== '24h') params.set('range', timeRange)
     if (serviceName) params.set('service', serviceName)
     if (status !== 'all') params.set('status', status)
-    if (search) params.set('q', search)
+    if (debouncedSearch) params.set('q', debouncedSearch)
+    if (debouncedNamePattern) params.set('name', debouncedNamePattern)
     if (environmentId !== 'all') params.set('env', environmentId)
     if (deploymentId !== 'all') params.set('deploy', deploymentId)
     if (page > 1) params.set('page', page.toString())
     if (sortBy !== 'start_time') params.set('sort', sortBy)
     if (sortOrder !== 'desc') params.set('dir', sortOrder)
     setSearchParams(params, { replace: true })
-  }, [timeRange, serviceName, status, search, environmentId, deploymentId, page, sortBy, sortOrder, setSearchParams])
+  }, [timeRange, serviceName, status, debouncedSearch, debouncedNamePattern, environmentId, deploymentId, page, sortBy, sortOrder, setSearchParams])
 
   // Toggle sort on a column header. Clicking the active column flips direction;
   // clicking a new column selects it (duration starts desc = slowest first,
@@ -740,7 +748,8 @@ export default function TracesList({ project }: TracesListProps) {
         end_time: endTime,
         service_name: serviceName || undefined,
         status: status !== 'all' ? status : undefined,
-        trace_id: search || undefined,
+        trace_id: debouncedSearch || undefined,
+        name_pattern: debouncedNamePattern || undefined,
         environment_id:
           environmentId !== 'all' ? Number(environmentId) : undefined,
         deployment_id:
@@ -987,6 +996,18 @@ export default function TracesList({ project }: TracesListProps) {
                   setPage(1)
                 }}
                 className="pl-8 h-9"
+              />
+            </div>
+
+            <div className="relative flex-1 min-w-0 sm:min-w-[200px]">
+              <Input
+                placeholder="Filter by span name…"
+                value={namePattern}
+                onChange={(e) => {
+                  setNamePattern(e.target.value)
+                  setPage(1)
+                }}
+                className="h-9"
               />
             </div>
           </div>

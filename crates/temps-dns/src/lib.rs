@@ -37,6 +37,7 @@
 //! }
 //! ```
 
+pub mod cp_resolver;
 pub mod errors;
 pub mod handlers;
 pub mod plugin;
@@ -44,6 +45,7 @@ pub mod providers;
 pub mod services;
 
 // Re-export main types
+pub use cp_resolver::{start_control_plane_resolver, OverlayDnsSlot};
 pub use errors::DnsError;
 pub use plugin::DnsPlugin;
 pub use providers::{

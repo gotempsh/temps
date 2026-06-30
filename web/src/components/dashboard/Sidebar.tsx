@@ -829,6 +829,7 @@ const projectBaseNav: ProjectNavItem[] = [
       { title: 'Traces', url: 'traces', icon: Network },
       { title: 'AI Traces', url: 'ai-gateway?tab=activity', icon: Bot },
       { title: 'Metrics', url: 'metrics', icon: LineChart },
+      { title: 'Logs', url: 'telemetry-logs', icon: ScrollText },
       { title: 'Error Tracking', url: 'errors', icon: ShieldAlert },
     ],
   },

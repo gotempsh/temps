@@ -215,29 +215,26 @@ impl OtelService {
         let count = records.len() as u64;
         self.stats.logs_received.fetch_add(count, Ordering::Relaxed);
 
-        // Partition: ERROR/WARN go to DB, all go to S3
-        let db_records: Vec<LogRecord> = records
-            .iter()
-            .filter(|r| r.severity >= LogSeverity::Warn)
-            .cloned()
-            .collect();
-
-        // Store high-severity records in DB
-        let db_count = db_records.len() as u64;
-        if !db_records.is_empty() {
-            match self.storage.store_logs(db_records).await {
-                Ok(stored) => {
-                    self.stats
-                        .logs_stored_db
-                        .fetch_add(stored, Ordering::Relaxed);
-                }
-                Err(e) => {
-                    self.stats
-                        .logs_dropped
-                        .fetch_add(db_count, Ordering::Relaxed);
-                    self.stats.ingest_errors.fetch_add(1, Ordering::Relaxed);
-                    error!(db_count, error = %e, "Failed to store log records in DB");
-                }
+        // Store EVERY record in the queryable DB (all severities), so the Logs
+        // explorer and trace↔log correlation surface INFO/DEBUG too — not just
+        // WARN+. Apps log overwhelmingly at INFO, so a WARN+-only DB (the prior
+        // behaviour) made the explorer show almost nothing and a trace show one
+        // stray warning. All records are also archived to S3 for retention.
+        // (If hot-storage cost becomes a concern, reintroduce a *configurable*
+        // per-project minimum severity rather than a hard-coded WARN floor.)
+        let db_count = count;
+        match self.storage.store_logs(records.clone()).await {
+            Ok(stored) => {
+                self.stats
+                    .logs_stored_db
+                    .fetch_add(stored, Ordering::Relaxed);
+            }
+            Err(e) => {
+                self.stats
+                    .logs_dropped
+                    .fetch_add(db_count, Ordering::Relaxed);
+                self.stats.ingest_errors.fetch_add(1, Ordering::Relaxed);
+                error!(db_count, error = %e, "Failed to store log records in DB");
             }
         }
 
@@ -283,6 +280,40 @@ impl OtelService {
 
     pub async fn list_metric_names(&self, project_id: i32) -> Result<Vec<String>, OtelError> {
         self.storage.list_metric_names(project_id).await
+    }
+
+    pub async fn list_metric_label_keys(
+        &self,
+        project_id: i32,
+        metric_name: &str,
+        start_time: chrono::DateTime<chrono::Utc>,
+        end_time: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<String>, OtelError> {
+        self.storage
+            .list_metric_label_keys(project_id, metric_name, start_time, end_time)
+            .await
+    }
+
+    pub async fn list_metric_label_values(
+        &self,
+        project_id: i32,
+        metric_name: &str,
+        label_key: &str,
+        start_time: chrono::DateTime<chrono::Utc>,
+        end_time: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<String>, OtelError> {
+        // Defence-in-depth: the key flows into the store's SQL (bound, but mirror
+        // the `query_metrics` trust boundary) — reject anything off the allowlist.
+        if temps_metrics::validate_metric_name(label_key).is_err() {
+            return Err(OtelError::Validation {
+                message: format!(
+                    "label key '{label_key}' contains characters outside the allowed set [a-zA-Z0-9_.:-]"
+                ),
+            });
+        }
+        self.storage
+            .list_metric_label_values(project_id, metric_name, label_key, start_time, end_time)
+            .await
     }
 
     pub async fn query_spans(&self, query: TraceQuery) -> Result<Vec<SpanRecord>, OtelError> {
@@ -583,7 +614,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ingest_logs_severity_routing() {
+    async fn test_ingest_logs_stores_all_severities() {
         let mock = MockOtelStorage::new();
         let (svc, storage) = make_service(mock);
 
@@ -612,18 +643,19 @@ mod tests {
 
         svc.ingest_logs(logs).await.unwrap();
 
-        // DB should only have WARN, ERROR, FATAL
+        // DB should now hold ALL severities (queryable), not just WARN+.
         let db_logs = storage.stored_logs();
-        assert_eq!(db_logs.len(), 3, "Only WARN+ should go to DB");
-        assert!(db_logs.iter().all(|l| l.severity >= LogSeverity::Warn));
+        assert_eq!(db_logs.len(), 5, "All severities should go to the DB");
+        assert!(db_logs.iter().any(|l| l.severity == LogSeverity::Info));
+        assert!(db_logs.iter().any(|l| l.severity == LogSeverity::Debug));
 
-        // S3 archive should have all 5
+        // S3 archive should still have all 5.
         let archived = storage.stored_archived_logs();
         assert_eq!(archived.len(), 5, "All logs should be archived to S3");
 
         let stats = svc.pipeline_stats();
         assert_eq!(stats.logs_received, 5);
-        assert_eq!(stats.logs_stored_db, 3);
+        assert_eq!(stats.logs_stored_db, 5);
         assert_eq!(stats.logs_stored_s3, 5);
     }
 
@@ -967,5 +999,62 @@ mod tests {
             .unwrap();
 
         assert_eq!(count, 2);
+    }
+
+    #[tokio::test]
+    async fn test_list_metric_label_keys_and_values_in_window() {
+        let mock = MockOtelStorage::new();
+        let now = chrono::Utc::now();
+        {
+            let mut m = mock.metrics.lock().unwrap();
+            m.push(test_support::metric_point(
+                1,
+                "http.server.duration",
+                now,
+                &[("http.method", "GET"), ("http.route", "/a")],
+            ));
+            m.push(test_support::metric_point(
+                1,
+                "http.server.duration",
+                now,
+                &[("http.method", "POST"), ("http.route", "/b")],
+            ));
+            // Different metric — must not leak into the results.
+            m.push(test_support::metric_point(
+                1,
+                "other.metric",
+                now,
+                &[("region", "eu")],
+            ));
+        }
+        let (svc, _storage) = make_service(mock);
+        let start = now - chrono::Duration::hours(1);
+        let end = now + chrono::Duration::hours(1);
+
+        let keys = svc
+            .list_metric_label_keys(1, "http.server.duration", start, end)
+            .await
+            .unwrap();
+        assert_eq!(
+            keys,
+            vec!["http.method".to_string(), "http.route".to_string()]
+        );
+
+        let values = svc
+            .list_metric_label_values(1, "http.server.duration", "http.method", start, end)
+            .await
+            .unwrap();
+        assert_eq!(values, vec!["GET".to_string(), "POST".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_list_metric_label_values_rejects_invalid_key() {
+        let (svc, _storage) = make_service(MockOtelStorage::new());
+        let now = chrono::Utc::now();
+        let err = svc
+            .list_metric_label_values(1, "m", "bad key!", now - chrono::Duration::hours(1), now)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OtelError::Validation { .. }));
     }
 }

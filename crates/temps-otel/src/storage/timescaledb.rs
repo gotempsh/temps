@@ -14,6 +14,98 @@ use super::{BaselinePoint, DeployEvent, MinuteAggregate, OtelStorage, StorageRes
 use crate::error::OtelError;
 use crate::types::*;
 
+// ── Interval / aggregation helpers ─────────────────────────────────────────
+//
+// These are ported verbatim from the ClickHouse backend so both paths share
+// the same SQL-injection-safe interval-to-canonical-string logic.
+
+/// Translate a human interval string into a canonical Postgres/TimescaleDB
+/// interval token that is safe to interpolate into SQL (it is never user
+/// bytes — only our own controlled keyword strings survive).
+///
+/// Returns `"1 hour"` for any unrecognised input.
+fn translate_bucket_interval_pg(interval: &str) -> String {
+    const DEFAULT: &str = "1 hour";
+    let trimmed = interval.trim();
+
+    let mut parts = trimmed.split_whitespace();
+    let (count_str, unit_raw): (String, String) = match (parts.next(), parts.next()) {
+        (Some(count), Some(unit)) => {
+            if parts.next().is_some() {
+                return DEFAULT.to_string();
+            }
+            (count.to_string(), unit.to_string())
+        }
+        (Some(single), None) => {
+            let split = single
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(single.len());
+            if split == 0 || split == single.len() {
+                return DEFAULT.to_string();
+            }
+            (single[..split].to_string(), single[split..].to_string())
+        }
+        _ => return DEFAULT.to_string(),
+    };
+
+    let Ok(count) = count_str.parse::<u32>() else {
+        return DEFAULT.to_string();
+    };
+    if count == 0 || count > 100_000 {
+        return DEFAULT.to_string();
+    }
+
+    let unit = match unit_raw.to_ascii_lowercase().as_str() {
+        "second" | "seconds" | "sec" | "secs" | "s" => "second",
+        "minute" | "minutes" | "min" | "mins" | "m" => "minute",
+        "hour" | "hours" | "hr" | "hrs" | "h" => "hour",
+        "day" | "days" | "d" => "day",
+        "week" | "weeks" | "w" => "week",
+        _ => return DEFAULT.to_string(),
+    };
+    format!("{count} {unit}")
+}
+
+/// Derive the bucket width in whole seconds from a canonical interval string
+/// produced by [`translate_bucket_interval_pg`].
+fn interval_seconds_pg(interval: &str) -> i64 {
+    const HOUR: i64 = 3600;
+    let mut parts = interval.split_whitespace();
+    let Some(count) = parts.next().and_then(|c| c.parse::<i64>().ok()) else {
+        return HOUR;
+    };
+    let unit_secs = match parts.next() {
+        Some("second") => 1,
+        Some("minute") => 60,
+        Some("hour") => HOUR,
+        Some("day") => 86_400,
+        Some("week") => 604_800,
+        _ => return HOUR,
+    };
+    (count * unit_secs).max(1)
+}
+
+/// Validate that a metric label key contains only safe characters.
+/// Mirrors the allowlist in `temps-metrics::validate_metric_name`. A bad key is
+/// a client error (`Validation` → HTTP 400), not a server error.
+fn validate_label_key(key: &str) -> Result<(), OtelError> {
+    if key.is_empty() {
+        return Err(OtelError::Validation {
+            message: "label key is empty (only [a-zA-Z0-9_.:-] allowed)".to_string(),
+        });
+    }
+    for ch in key.chars() {
+        if !matches!(ch, 'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '.' | '-' | ':') {
+            return Err(OtelError::Validation {
+                message: format!(
+                    "label key '{key}' is outside the allowed character set [a-zA-Z0-9_.:-]"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// TimescaleDB-backed OTel storage.
 pub struct TimescaleDbStorage {
     db: Arc<DatabaseConnection>,
@@ -163,19 +255,32 @@ impl TimescaleDbStorage {
     }
 
     /// Execute a batch insert using raw SQL with parameter binding.
+    ///
+    /// Writes all 31 columns (17 legacy + 14 full-fidelity added by
+    /// m20260629_000001_otel_metrics_full_fidelity).  The 14 new columns are
+    /// all nullable so the INSERT is safe on instances that have not yet run
+    /// the migration — Postgres will error with "column does not exist" but
+    /// the migration is always applied before ingest in production.
     async fn batch_insert_metrics(&self, points: &[MetricPoint]) -> StorageResult<u64> {
         if points.is_empty() {
             return Ok(0);
         }
 
-        // Build batch INSERT with VALUES list
+        // 31 columns total (17 legacy + 14 new full-fidelity columns).
+        const COLS_PER_ROW: u32 = 31;
+
         let mut sql = String::from(
             "INSERT INTO otel_metrics (
                 project_id, deployment_id, service_name, service_version,
                 deployment_environment, metric_name, metric_type, unit,
                 timestamp, value, histogram_count, histogram_sum,
                 histogram_min, histogram_max, histogram_bounds,
-                histogram_bucket_counts, attributes
+                histogram_bucket_counts, attributes,
+                start_time, temporality, is_monotonic, flags, description,
+                exp_scale, exp_zero_count, exp_zero_threshold,
+                exp_positive_offset, exp_positive_counts,
+                exp_negative_offset, exp_negative_counts,
+                summary_quantiles, exemplars
             ) VALUES ",
         );
 
@@ -186,27 +291,61 @@ impl TimescaleDbStorage {
             if i > 0 {
                 sql.push_str(", ");
             }
-            sql.push_str(&format!(
-                "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
-                param_idx, param_idx + 1, param_idx + 2, param_idx + 3,
-                param_idx + 4, param_idx + 5, param_idx + 6, param_idx + 7,
-                param_idx + 8, param_idx + 9, param_idx + 10, param_idx + 11,
-                param_idx + 12, param_idx + 13, param_idx + 14, param_idx + 15,
-                param_idx + 16
-            ));
-            param_idx += 17;
+            // Generate $1, $2, … $31 placeholders for this row.
+            let placeholders: Vec<String> = (param_idx..param_idx + COLS_PER_ROW)
+                .map(|n| format!("${n}"))
+                .collect();
+            sql.push('(');
+            sql.push_str(&placeholders.join(", "));
+            sql.push(')');
+            param_idx += COLS_PER_ROW;
+
+            // ── Serialise JSONB fields (never .unwrap() — fall back to null) ──
 
             let attrs_json = serde_json::to_value(&p.attributes).unwrap_or_default();
+
             let bounds_json = p
                 .histogram_bounds
                 .as_ref()
-                .map(|b| serde_json::to_value(b).unwrap_or_default());
+                .and_then(|b| serde_json::to_value(b).ok());
             let bucket_counts_json = p
                 .histogram_bucket_counts
                 .as_ref()
-                .map(|c| serde_json::to_value(c).unwrap_or_default());
+                .and_then(|c| serde_json::to_value(c).ok());
+
+            // Exponential histogram bucket-count arrays (Vec<u64> → JSON).
+            let exp_positive_counts_json = p
+                .exp_positive_counts
+                .as_ref()
+                .and_then(|v| serde_json::to_value(v).ok());
+            let exp_negative_counts_json = p
+                .exp_negative_counts
+                .as_ref()
+                .and_then(|v| serde_json::to_value(v).ok());
+
+            // Summary quantiles: Vec<(f64, f64)> → [[q, v], …].
+            let summary_quantiles_json = p.summary_quantiles.as_ref().and_then(|pairs| {
+                let arr: Vec<serde_json::Value> = pairs
+                    .iter()
+                    .map(|(q, v)| serde_json::json!([q, v]))
+                    .collect();
+                serde_json::to_value(arr).ok()
+            });
+
+            // Exemplars: serialise as array of objects.
+            let exemplars_json = if p.exemplars.is_empty() {
+                None
+            } else {
+                serde_json::to_value(&p.exemplars).ok()
+            };
+
+            // flags: stored as i32 (Postgres INTEGER).
+            let flags_i32 = p.flags as i32;
+            // exp_zero_count: u64 → i64 (Postgres BIGINT).
+            let exp_zero_count_i64 = p.exp_zero_count.map(|v| v as i64);
 
             values.extend_from_slice(&[
+                // Legacy 17 columns
                 p.project_id.into(),
                 p.deployment_id.into(),
                 p.resource.service_name.clone().into(),
@@ -224,6 +363,21 @@ impl TimescaleDbStorage {
                 bounds_json.into(),
                 bucket_counts_json.into(),
                 attrs_json.into(),
+                // New 14 full-fidelity columns
+                p.start_time.into(),
+                p.temporality.map(|t| t.to_string()).into(),
+                p.is_monotonic.into(),
+                flags_i32.into(),
+                p.description.clone().into(),
+                p.exp_scale.into(),
+                exp_zero_count_i64.into(),
+                p.exp_zero_threshold.into(),
+                p.exp_positive_offset.into(),
+                exp_positive_counts_json.into(),
+                p.exp_negative_offset.into(),
+                exp_negative_counts_json.into(),
+                summary_quantiles_json.into(),
+                exemplars_json.into(),
             ]);
         }
 
@@ -503,6 +657,7 @@ impl TimescaleDbStorage {
 
 // ── Query result structs ────────────────────────────────────────────
 
+/// Row returned by the scalar metric aggregation query.
 #[derive(Debug, FromQueryResult)]
 struct MetricBucketRow {
     bucket: DateTime<Utc>,
@@ -510,11 +665,37 @@ struct MetricBucketRow {
     min_value: f64,
     max_value: f64,
     count: i64,
+    agg_value: f64,
+    // Serialised group-by label values as a JSON array (["v1","v2",…]).
+    series_values_json: Option<serde_json::Value>,
+}
+
+/// Row returned by the histogram aggregation sub-query.
+#[derive(Debug)]
+struct HistogramBucketRow {
+    bucket: DateTime<Utc>,
+    series_values_json: Option<serde_json::Value>,
+    hcount: i64,
+    hsum: f64,
+    hmin: Option<f64>,
+    hmax: Option<f64>,
+    hbounds: Option<serde_json::Value>,
+    hbuckets: Option<serde_json::Value>,
 }
 
 #[derive(Debug, FromQueryResult)]
 struct MetricNameRow {
     metric_name: String,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct LabelKeyRow {
+    label_key: String,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct LabelValueRow {
+    label_value: String,
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -618,83 +799,479 @@ impl OtelStorage for TimescaleDbStorage {
         }
     }
 
+    /// Query bucketed metric aggregates — full-fidelity port of the ClickHouse
+    /// implementation.
+    ///
+    /// Two separate SQL queries are issued:
+    ///
+    /// 1. **Scalar query** — aggregates the `value` column into avg/min/max/count
+    ///    plus the requested [`MetricAggregation`], grouped by time bucket and
+    ///    optional label keys.  `value IS NOT NULL` filters out histogram rows.
+    ///
+    /// 2. **Histogram query** — issued only when the metric carries histogram
+    ///    data.  Uses TimescaleDB's `last(col, timestamp)` for cumulative series
+    ///    (snapshot semantics) and `sum` for delta/unspecified.  Element-wise
+    ///    summation of `histogram_bucket_counts` across series is done via a CTE
+    ///    that unnests the JSONB array, sums by ordinal position, and re-aggregates
+    ///    into a JSONB array.
+    ///
+    /// Results are matched by `(bucket, series_values_json)` and merged into the
+    /// returned [`MetricBucket`] slice.
     async fn query_metrics(&self, query: MetricQuery) -> StorageResult<Vec<MetricBucket>> {
-        let interval = query
-            .bucket_interval
-            .as_deref()
-            .unwrap_or("1 hour")
-            .to_string();
-        let limit = query.limit.unwrap_or(1000).min(10000);
-
-        let mut where_clauses = vec!["project_id = $1".to_string()];
-        let mut values: Vec<sea_orm::Value> = vec![query.project_id.into()];
-        let mut param_idx = 2u32;
-
-        if let Some(ref name) = query.metric_name {
-            where_clauses.push(format!("metric_name = ${}", param_idx));
-            values.push(name.clone().into());
-            param_idx += 1;
-        }
-        if let Some(ref svc) = query.service_name {
-            where_clauses.push(format!("service_name = ${}", param_idx));
-            values.push(svc.clone().into());
-            param_idx += 1;
-        }
-        if let Some(ref env) = query.environment {
-            where_clauses.push(format!("deployment_environment = ${}", param_idx));
-            values.push(env.clone().into());
-            param_idx += 1;
-        }
-        if let Some(start) = query.start_time {
-            where_clauses.push(format!("timestamp >= ${}", param_idx));
-            values.push(start.into());
-            param_idx += 1;
-        }
-        if let Some(end) = query.end_time {
-            where_clauses.push(format!("timestamp <= ${}", param_idx));
-            values.push(end.into());
-            param_idx += 1;
+        // ── Validate label keys (group_by + label_filters) ──────────
+        for key in query
+            .group_by
+            .iter()
+            .chain(query.label_filters.iter().map(|(k, _)| k))
+        {
+            validate_label_key(key)?;
         }
 
-        let where_sql = where_clauses.join(" AND ");
+        let interval =
+            translate_bucket_interval_pg(query.bucket_interval.as_deref().unwrap_or("1 hour"));
+        let secs = interval_seconds_pg(&interval);
+        let limit = query.limit.unwrap_or(1000).min(10_000);
 
-        // Pass interval as parameterized value to prevent SQL injection
-        let interval_param_idx = param_idx;
-        values.push(interval.into());
-        param_idx += 1;
+        // ── Build shared WHERE clause ────────────────────────────────
+        //
+        // We build two WHERE clauses from the same filters (scalar + histogram
+        // queries share project/name/svc/env/time filters, but differ in the
+        // scalar query adding `value IS NOT NULL` and the histogram query adding
+        // `histogram_bucket_counts IS NOT NULL`).
 
-        let sql = format!(
-            r#"
-            SELECT bucket::timestamptz as bucket, avg_value, min_value, max_value, count
-            FROM (
-                SELECT
-                    time_bucket(${interval_param_idx}::interval, timestamp) as bucket,
-                    AVG(value) as avg_value,
-                    MIN(value) as min_value,
-                    MAX(value) as max_value,
-                    COUNT(*) as count
-                FROM otel_metrics
-                WHERE {where_sql}
-                GROUP BY bucket
-            ) sub
-            ORDER BY bucket ASC
-            LIMIT ${param_idx}
-            "#
+        let (base_where_sql, base_values, base_param_next) = build_metrics_where(&query);
+
+        // ── Scalar aggregation expression ────────────────────────────
+        let agg_expr = match query.aggregation {
+            MetricAggregation::Avg => "avg(value)".to_string(),
+            MetricAggregation::Sum => "sum(value)".to_string(),
+            MetricAggregation::Min => "min(value)".to_string(),
+            MetricAggregation::Max => "max(value)".to_string(),
+            MetricAggregation::Count => "count(*)::float8".to_string(),
+            MetricAggregation::RatePerSec => {
+                // Temporality-aware: delta → sum/window, cumulative → (max-min)/window.
+                format!(
+                    "CASE WHEN bool_or(temporality = 'delta') \
+                         THEN sum(value) \
+                         ELSE max(value) - min(value) \
+                     END / {secs}.0"
+                )
+            }
+            MetricAggregation::Quantile(q) => {
+                let qc = q.clamp(0.0, 1.0);
+                format!("percentile_cont({qc}) WITHIN GROUP (ORDER BY value)")
+            }
+        };
+
+        // ── Param layout (positional $N must match the values vector) ──
+        //
+        // base_values occupy $1..=$(base_param_next-1) (from build_metrics_where,
+        // used inside the inner WHERE). Then: interval, then one $N per group_by
+        // key (for the `attributes->>$N` projection), then LIMIT.
+        let interval_param = base_param_next;
+        let first_group_key_param = base_param_next + 1;
+        let limit_param = first_group_key_param + query.group_by.len() as u32;
+
+        let group_by_cols: Vec<String> = (0..query.group_by.len())
+            .map(|i| format!("gb_{i}"))
+            .collect();
+        let group_by_extra = if group_by_cols.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", group_by_cols.join(", "))
+        };
+        // Series key as a JSON array of the grouped label values (outer level,
+        // where gb_N are GROUP BY columns).
+        let series_json_expr = if group_by_cols.is_empty() {
+            "NULL::jsonb AS series_values_json".to_string()
+        } else {
+            format!(
+                "jsonb_build_array({}) AS series_values_json",
+                group_by_cols.join(", ")
+            )
+        };
+
+        // ── Scalar query ─────────────────────────────────────────────
+        //
+        // Compute `time_bucket()` + project the raw columns in an INNER subquery
+        // (no aggregation), then aggregate in the OUTER query — per the codebase
+        // rule "never cast time_bucket() in the same level as GROUP BY". The
+        // inner projects `value`/`temporality` (consumed by the aggregate exprs)
+        // plus one `gb_N` column per group_by key.
+        //
+        // NOTE: we deliberately do NOT route this read to the `otel_metrics_1min`/
+        // `1hr` continuous aggregates. Those rollups are refreshed on a lag and
+        // (in this setup) do not return un-materialized recent data, so reading
+        // them would silently DROP the most recent buckets from charts. The raw
+        // hypertable + the `(project_id, metric_name, service_name, timestamp)`
+        // index + chunk pruning keep this correct AND fast.
+        let mut inner_parts = vec![
+            format!("time_bucket(${interval_param}::interval, timestamp) AS bucket"),
+            "value".to_string(),
+            "temporality".to_string(),
+        ];
+        for (i, _) in query.group_by.iter().enumerate() {
+            inner_parts.push(format!(
+                "attributes->>${} AS gb_{i}",
+                first_group_key_param + i as u32
+            ));
+        }
+
+        let scalar_where = format!("{base_where_sql} AND value IS NOT NULL");
+        let inner_select = format!(
+            "SELECT {} FROM otel_metrics WHERE {scalar_where}",
+            inner_parts.join(", ")
         );
-        values.push((limit as i64).into());
 
-        let rows = MetricBucketRow::find_by_statement(Statement::from_sql_and_values(
-            DatabaseBackend::Postgres,
-            &sql,
-            values,
-        ))
-        .all(self.db.as_ref())
-        .await?;
+        let scalar_sql = format!(
+            "SELECT bucket, avg(value) AS avg_value, min(value) AS min_value, \
+                    max(value) AS max_value, count(*) AS count, {agg_expr} AS agg_value, \
+                    {series_json_expr} \
+             FROM ({inner_select}) _inner \
+             GROUP BY bucket{group_by_extra} \
+             ORDER BY bucket ASC \
+             LIMIT ${limit_param}"
+        );
 
-        Ok(rows
-            .into_iter()
-            .map(|r| MetricBucket::scalar(r.bucket, r.avg_value, r.min_value, r.max_value, r.count))
-            .collect())
+        // Bind in $ order: base_values, interval, group keys, LIMIT.
+        let mut scalar_values: Vec<sea_orm::Value> = base_values.clone();
+        scalar_values.push(interval.clone().into());
+        for k in &query.group_by {
+            scalar_values.push(k.clone().into());
+        }
+        scalar_values.push((limit as i64).into());
+
+        let scalar_results = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                &scalar_sql,
+                scalar_values,
+            ))
+            .await?;
+
+        // Parse scalar rows.
+        let scalar_rows: Vec<MetricBucketRow> = scalar_results
+            .iter()
+            .filter_map(|row| {
+                Some(MetricBucketRow {
+                    bucket: row.try_get("", "bucket").ok()?,
+                    avg_value: row.try_get("", "avg_value").ok()?,
+                    min_value: row.try_get("", "min_value").ok()?,
+                    max_value: row.try_get("", "max_value").ok()?,
+                    count: row.try_get("", "count").ok()?,
+                    agg_value: row.try_get("", "agg_value").ok()?,
+                    series_values_json: row.try_get("", "series_values_json").ok().flatten(),
+                })
+            })
+            .collect();
+
+        // NOTE: do NOT early-return when scalar_rows is empty — histogram-only
+        // metrics (data points with no scalar `value`) produce no scalar rows but
+        // DO have histogram buckets, so the histogram query below must still run.
+
+        // ── Histogram query ──────────────────────────────────────────
+        //
+        // Mirrors the CH inner/outer structure:
+        // - Inner: collapse each (bucket, series) by temporality
+        // - Outer: sum across series, element-wise sum bucket counts
+        //
+        // Element-wise JSONB array summation is done via a CTE that unnests
+        // both arrays together, sums values by ordinal, and re-aggregates.
+
+        let hist_where = format!("{base_where_sql} AND histogram_bucket_counts IS NOT NULL");
+
+        // Group-by label projections for the histogram CTE: one `attributes->>$N`
+        // per key, carried through as gb_0, gb_1, …. Same param positions as the
+        // scalar query (base_values, then interval, then group keys, then LIMIT).
+        let hist_gb_select_csv = if query.group_by.is_empty() {
+            String::new()
+        } else {
+            let parts: Vec<String> = query
+                .group_by
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    format!(
+                        "attributes->>${} AS gb_{i}",
+                        first_group_key_param + i as u32
+                    )
+                })
+                .collect();
+            format!("{}, ", parts.join(", "))
+        };
+        // `, gb_0, gb_1` suffix reused in every GROUP BY / USING / SELECT.
+        let hist_gb_csv = if group_by_cols.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", group_by_cols.join(", "))
+        };
+        // Qualify with `s.` — the final join keeps both `s.gb_N` and `c.gb_N`
+        // in scope (an `ON` join doesn't merge the columns the way `USING`
+        // does), so a bare `gb_N` here would be ambiguous.
+        let hist_series_json_expr = if group_by_cols.is_empty() {
+            "NULL::jsonb".to_string()
+        } else {
+            let qualified: Vec<String> = group_by_cols.iter().map(|c| format!("s.{c}")).collect();
+            format!("jsonb_build_array({})", qualified.join(", "))
+        };
+        // NULL-safe join between the `scalars` and `counts_arr` CTEs. A group
+        // label that is absent on some series is NULL on BOTH sides; a plain
+        // `USING`/`=` equi-join would drop those rows (`NULL = NULL` is not true),
+        // so compare the group columns with `IS NOT DISTINCT FROM`. (`bucket` is
+        // never NULL, so it stays an equi-join.)
+        let hist_join = if group_by_cols.is_empty() {
+            "USING (bucket)".to_string()
+        } else {
+            let mut conds = vec!["s.bucket = c.bucket".to_string()];
+            for col in &group_by_cols {
+                conds.push(format!("s.{col} IS NOT DISTINCT FROM c.{col}"));
+            }
+            format!("ON {}", conds.join(" AND "))
+        };
+
+        // Temporality-aware histogram reconstruction (vanilla Postgres, no
+        // TimescaleDB-specific aggregates other than time_bucket):
+        //  1. `contributing` — per data point: its bucket + the recency rank
+        //     (latest first) within (bucket, attribute-set).
+        //  2. `picked` — keep ALL delta/unspecified rows but only the LATEST
+        //     snapshot of each cumulative series (a cumulative bucket-count is a
+        //     running total; only the newest snapshot should contribute).
+        //  3. `counts` — element-wise sum the bucket-count arrays across picked
+        //     rows, per bucket index, via WITH ORDINALITY so `idx` is the position
+        //     WITHIN each array (a global row_number would break alignment).
+        //  4. `scalars` — sum count/sum, min/max, and pick one bounds array.
+        // Joined back per (bucket, group keys).
+        let hist_sql = format!(
+            "WITH contributing AS ( \
+                 SELECT \
+                     time_bucket(${interval_param}::interval, timestamp) AS bucket, \
+                     {hist_gb_select_csv}\
+                     histogram_bucket_counts, histogram_count, histogram_sum, \
+                     histogram_min, histogram_max, histogram_bounds, timestamp, \
+                     (COALESCE(temporality, '') = 'cumulative') AS is_cum, \
+                     row_number() OVER ( \
+                         PARTITION BY time_bucket(${interval_param}::interval, timestamp), md5(attributes::text) \
+                         ORDER BY timestamp DESC \
+                     ) AS rn \
+                 FROM otel_metrics WHERE {hist_where} \
+             ), \
+             picked AS (SELECT * FROM contributing WHERE NOT is_cum OR rn = 1), \
+             counts AS ( \
+                 SELECT bucket{hist_gb_csv}, idx, sum(v::numeric)::bigint AS cnt \
+                 FROM picked, LATERAL jsonb_array_elements_text(histogram_bucket_counts) \
+                     WITH ORDINALITY AS e(v, idx) \
+                 GROUP BY bucket{hist_gb_csv}, idx \
+             ), \
+             counts_arr AS ( \
+                 SELECT bucket{hist_gb_csv}, jsonb_agg(cnt ORDER BY idx) AS hbuckets \
+                 FROM counts GROUP BY bucket{hist_gb_csv} \
+             ), \
+             scalars AS ( \
+                 SELECT bucket{hist_gb_csv}, \
+                     sum(histogram_count)::bigint AS hcount, sum(histogram_sum) AS hsum, \
+                     min(histogram_min) AS hmin, max(histogram_max) AS hmax, \
+                     (array_agg(histogram_bounds ORDER BY timestamp DESC))[1] AS hbounds \
+                 FROM picked GROUP BY bucket{hist_gb_csv} \
+             ) \
+             SELECT s.bucket AS bucket, {hist_series_json_expr} AS series_values_json, \
+                    s.hcount AS hcount, s.hsum AS hsum, s.hmin AS hmin, s.hmax AS hmax, \
+                    s.hbounds AS hbounds, c.hbuckets AS hbuckets \
+             FROM scalars s JOIN counts_arr c {hist_join} \
+             WHERE s.hbounds IS NOT NULL \
+             ORDER BY s.bucket ASC \
+             LIMIT ${limit_param}"
+        );
+
+        // Same bind order as the scalar query: base_values, interval, group keys, LIMIT.
+        let mut hist_values: Vec<sea_orm::Value> = base_values.clone();
+        hist_values.push(interval.clone().into());
+        for k in &query.group_by {
+            hist_values.push(k.clone().into());
+        }
+        hist_values.push((limit as i64).into());
+
+        let hist_results = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                &hist_sql,
+                hist_values,
+            ))
+            .await
+            .unwrap_or_else(|e| {
+                // Histogram reconstruction is best-effort: on any failure (e.g. a
+                // pre-migration schema missing the new columns) degrade to
+                // scalar-only results rather than failing the whole query.
+                debug!(
+                    error = %e,
+                    "query_metrics: histogram sub-query failed, returning scalar-only"
+                );
+                Vec::new()
+            });
+
+        // Parse histogram rows.
+        let hist_rows: Vec<HistogramBucketRow> = hist_results
+            .iter()
+            .filter_map(|row| {
+                Some(HistogramBucketRow {
+                    bucket: row.try_get("", "bucket").ok()?,
+                    series_values_json: row.try_get("", "series_values_json").ok().flatten(),
+                    hcount: row.try_get("", "hcount").ok()?,
+                    hsum: row.try_get("", "hsum").ok()?,
+                    hmin: row.try_get("", "hmin").ok().flatten(),
+                    hmax: row.try_get("", "hmax").ok().flatten(),
+                    hbounds: row.try_get("", "hbounds").ok().flatten(),
+                    hbuckets: row.try_get("", "hbuckets").ok().flatten(),
+                })
+            })
+            .collect();
+
+        // Map keyed by (bucket_ms, series_json_string) → (bucket, series_json,
+        // summary). The bucket time + series_json are retained so histogram-only
+        // metrics (whose data points carry no scalar `value`, so the scalar query
+        // yields no rows for them) can still produce result buckets driven by the
+        // histogram query alone.
+        type HistEntry = (
+            chrono::DateTime<chrono::Utc>,
+            Option<serde_json::Value>,
+            HistogramSummary,
+        );
+        let mut hist_map: std::collections::HashMap<(i64, String), HistEntry> =
+            std::collections::HashMap::new();
+        for h in hist_rows {
+            let bounds = match parse_jsonb_f64_array(h.hbounds.as_ref()) {
+                Some(b) if !b.is_empty() => b,
+                _ => continue,
+            };
+            let bucket_counts = match parse_jsonb_u64_array(h.hbuckets.as_ref()) {
+                Some(c) => c,
+                None => continue,
+            };
+            let series_key = series_json_key(&h.series_values_json);
+            hist_map.insert(
+                (h.bucket.timestamp_millis(), series_key),
+                (
+                    h.bucket,
+                    h.series_values_json.clone(),
+                    HistogramSummary {
+                        count: h.hcount as u64,
+                        sum: h.hsum,
+                        min: h.hmin,
+                        max: h.hmax,
+                        bounds,
+                        bucket_counts,
+                    },
+                ),
+            );
+        }
+
+        // ── Assemble MetricBucket results ────────────────────────────
+        let group_keys = query.group_by.clone();
+        let agg = query.aggregation;
+
+        // Reconstruct the (key, value) series pairs from the stored JSON array.
+        let derive_series_key =
+            |series_json: &Option<serde_json::Value>| -> Option<Vec<(String, String)>> {
+                if group_keys.is_empty() {
+                    return None;
+                }
+                let values = series_json
+                    .as_ref()
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .map(|v| {
+                                v.as_str()
+                                    .map(|s| s.to_string())
+                                    .unwrap_or_else(|| v.to_string())
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                Some(group_keys.iter().cloned().zip(values).collect())
+            };
+
+        let mut buckets: Vec<MetricBucket> = Vec::new();
+        let mut covered: std::collections::HashSet<(i64, String)> =
+            std::collections::HashSet::new();
+
+        for r in scalar_rows {
+            let key = (
+                r.bucket.timestamp_millis(),
+                series_json_key(&r.series_values_json),
+            );
+            covered.insert(key.clone());
+            let histogram_summary = hist_map.get(&key).map(|(_, _, s)| s.clone());
+            let agg_value = r.agg_value;
+            let quantiles = match agg.quantile() {
+                Some(qq) => vec![(qq, agg_value)],
+                None => Vec::new(),
+            };
+            buckets.push(MetricBucket {
+                bucket: r.bucket,
+                avg_value: r.avg_value,
+                min_value: r.min_value,
+                max_value: r.max_value,
+                count: r.count,
+                value: agg_value,
+                quantiles,
+                histogram_summary,
+                series_key: derive_series_key(&r.series_values_json),
+            });
+        }
+
+        // Histogram-only metrics: a histogram data point carries no scalar
+        // `value`, so the scalar query produced no row for it. Emit those buckets
+        // from the histogram summary, deriving the scalar fields from it.
+        for (key, (bucket, series_json, summary)) in &hist_map {
+            if covered.contains(key) {
+                continue;
+            }
+            let count = summary.count as i64;
+            let avg_value = if summary.count > 0 {
+                summary.sum / summary.count as f64
+            } else {
+                0.0
+            };
+            let min_value = summary.min.unwrap_or(0.0);
+            let max_value = summary.max.unwrap_or(0.0);
+            let value = match agg {
+                MetricAggregation::Sum => summary.sum,
+                MetricAggregation::Count => summary.count as f64,
+                MetricAggregation::Min => min_value,
+                MetricAggregation::Max => max_value,
+                // p50/p95/p99 over a histogram: interpolate from the bucket
+                // counts rather than returning the mean. Falls back to the mean
+                // only if the histogram is empty/malformed.
+                MetricAggregation::Quantile(qq) => {
+                    histogram_quantile(qq, &summary.bounds, &summary.bucket_counts)
+                        .unwrap_or(avg_value)
+                }
+                MetricAggregation::Avg | MetricAggregation::RatePerSec => avg_value,
+            };
+            let quantiles = match agg {
+                MetricAggregation::Quantile(qq) => vec![(qq, value)],
+                _ => Vec::new(),
+            };
+            buckets.push(MetricBucket {
+                bucket: *bucket,
+                avg_value,
+                min_value,
+                max_value,
+                count,
+                value,
+                quantiles,
+                histogram_summary: Some(summary.clone()),
+                series_key: derive_series_key(series_json),
+            });
+        }
+
+        // Stable order by bucket time (scalar rows already arrived ordered; the
+        // histogram-only additions are merged in).
+        buckets.sort_by(|a, b| a.bucket.cmp(&b.bucket));
+
+        Ok(buckets)
     }
 
     async fn list_metric_names(&self, project_id: i32) -> StorageResult<Vec<String>> {
@@ -707,6 +1284,77 @@ impl OtelStorage for TimescaleDbStorage {
         .all(self.db.as_ref())
         .await?;
         Ok(rows.into_iter().map(|r| r.metric_name).collect())
+    }
+
+    async fn list_metric_label_keys(
+        &self,
+        project_id: i32,
+        metric_name: &str,
+        start_time: DateTime<Utc>,
+        end_time: DateTime<Utc>,
+    ) -> StorageResult<Vec<String>> {
+        // Sample the most-recent matching rows (subquery LIMIT) so the
+        // distinct-keys scan is bounded no matter how much history the metric
+        // has — TimescaleDB chunk exclusion + a per-chunk index make
+        // `ORDER BY timestamp DESC LIMIT N` over (project_id, metric_name) cheap.
+        // LATERAL jsonb_object_keys unnests each sampled row's attribute keys.
+        let sql = "SELECT DISTINCT key AS label_key FROM ( \
+                     SELECT attributes FROM otel_metrics \
+                     WHERE project_id = $1 AND metric_name = $2 \
+                       AND timestamp >= $3 AND timestamp <= $4 \
+                       AND attributes IS NOT NULL AND attributes <> '{}'::jsonb \
+                     ORDER BY timestamp DESC LIMIT 2000 \
+                   ) sub, LATERAL jsonb_object_keys(sub.attributes) AS key \
+                   ORDER BY label_key";
+        let rows = LabelKeyRow::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            sql,
+            vec![
+                project_id.into(),
+                metric_name.into(),
+                start_time.into(),
+                end_time.into(),
+            ],
+        ))
+        .all(self.db.as_ref())
+        .await?;
+        Ok(rows.into_iter().map(|r| r.label_key).collect())
+    }
+
+    async fn list_metric_label_values(
+        &self,
+        project_id: i32,
+        metric_name: &str,
+        label_key: &str,
+        start_time: DateTime<Utc>,
+        end_time: DateTime<Utc>,
+    ) -> StorageResult<Vec<String>> {
+        // `attributes ->> $3` extracts the value for the chosen key (NULL when
+        // absent). Same bounded recent-sample strategy, then dedup and cap the
+        // value list so a high-cardinality label can't return unbounded rows.
+        let sql = "SELECT DISTINCT label_value FROM ( \
+                     SELECT attributes ->> $3 AS label_value, timestamp \
+                     FROM otel_metrics \
+                     WHERE project_id = $1 AND metric_name = $2 \
+                       AND timestamp >= $4 AND timestamp <= $5 \
+                       AND attributes ->> $3 IS NOT NULL \
+                     ORDER BY timestamp DESC LIMIT 5000 \
+                   ) sub \
+                   ORDER BY label_value LIMIT 500";
+        let rows = LabelValueRow::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            sql,
+            vec![
+                project_id.into(),
+                metric_name.into(),
+                label_key.into(),
+                start_time.into(),
+                end_time.into(),
+            ],
+        ))
+        .all(self.db.as_ref())
+        .await?;
+        Ok(rows.into_iter().map(|r| r.label_value).collect())
     }
 
     async fn query_spans(&self, query: TraceQuery) -> StorageResult<Vec<SpanRecord>> {
@@ -2391,11 +3039,167 @@ impl TimescaleDbStorage {
 
 // ── LIKE pattern helpers ─────────────────────────────────────────────
 
+// ── Metric query helpers ────────────────────────────────────────────────────
+
+/// Build the shared WHERE clause + bound values for the metric queries.
+///
+/// Returns `(where_sql, values, next_param_idx)` where `next_param_idx` is
+/// the first `$N` index NOT yet consumed.  The caller then appends its own
+/// parameters (group_by keys, interval, limit) starting at that index.
+///
+/// Parameter binding order:
+///   $1  = project_id
+///   $2… = metric_name (optional), service_name (optional), metric_type
+///          (optional), deployment_environment (optional), label_filter values
+///          (optional), start_time (optional), end_time (optional)
+fn build_metrics_where(query: &MetricQuery) -> (String, Vec<sea_orm::Value>, u32) {
+    let mut where_clauses = vec!["project_id = $1".to_string()];
+    let mut values: Vec<sea_orm::Value> = vec![query.project_id.into()];
+    let mut param_idx = 2u32;
+
+    if let Some(ref name) = query.metric_name {
+        where_clauses.push(format!("metric_name = ${param_idx}"));
+        values.push(name.clone().into());
+        param_idx += 1;
+    }
+    if let Some(ref svc) = query.service_name {
+        where_clauses.push(format!("service_name = ${param_idx}"));
+        values.push(svc.clone().into());
+        param_idx += 1;
+    }
+    if let Some(mt) = query.metric_type {
+        where_clauses.push(format!("metric_type = ${param_idx}"));
+        values.push(mt.to_string().into());
+        param_idx += 1;
+    }
+    if let Some(ref env) = query.environment {
+        where_clauses.push(format!("deployment_environment = ${param_idx}"));
+        values.push(env.clone().into());
+        param_idx += 1;
+    }
+    // label_filters: use JSONB containment @> so the GIN index applies.
+    // Build one JSONB object from all (key, value) pairs.
+    if !query.label_filters.is_empty() {
+        // Construct the JSONB literal via jsonb_build_object($k1,$v1,$k2,$v2,…).
+        let mut kv_params: Vec<String> = Vec::with_capacity(query.label_filters.len() * 2);
+        for (k, v) in &query.label_filters {
+            kv_params.push(format!("${param_idx}"));
+            values.push(k.clone().into());
+            param_idx += 1;
+            kv_params.push(format!("${param_idx}"));
+            values.push(v.clone().into());
+            param_idx += 1;
+        }
+        where_clauses.push(format!(
+            "attributes @> jsonb_build_object({})",
+            kv_params.join(", ")
+        ));
+    }
+    if let Some(start) = query.start_time {
+        where_clauses.push(format!("timestamp >= ${param_idx}"));
+        values.push(start.into());
+        param_idx += 1;
+    }
+    if let Some(end) = query.end_time {
+        where_clauses.push(format!("timestamp <= ${param_idx}"));
+        values.push(end.into());
+        param_idx += 1;
+    }
+
+    (where_clauses.join(" AND "), values, param_idx)
+}
+
+/// Canonical string key for the series-values JSON (used as a HashMap key).
+/// `None` / `Null` → empty string (ungrouped series).
+fn series_json_key(val: &Option<serde_json::Value>) -> String {
+    match val {
+        Some(v) if !v.is_null() => v.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Decode a nullable JSONB column containing `[1.0, 2.0, …]` into `Vec<f64>`.
+fn parse_jsonb_f64_array(val: Option<&serde_json::Value>) -> Option<Vec<f64>> {
+    let arr = val?.as_array()?;
+    let result: Option<Vec<f64>> = arr
+        .iter()
+        .map(|v| {
+            v.as_f64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
+        .collect();
+    result
+}
+
+/// Decode a nullable JSONB column containing `[1, 2, …]` into `Vec<u64>`.
+fn parse_jsonb_u64_array(val: Option<&serde_json::Value>) -> Option<Vec<u64>> {
+    let arr = val?.as_array()?;
+    let result: Option<Vec<u64>> = arr
+        .iter()
+        .map(|v| {
+            v.as_u64()
+                .or_else(|| v.as_i64().map(|i| i as u64))
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
+        .collect();
+    result
+}
+
+/// Estimate the `q`-th quantile (`0.0..=1.0`) from an explicit-bucket histogram
+/// via linear interpolation within the bucket containing the q-th observation —
+/// the Prometheus `histogram_quantile` model.
+///
+/// `bounds` are the inclusive upper bounds of the first N buckets (OTLP
+/// `explicit_bounds`); `bucket_counts` has N+1 entries (one per bucket plus the
+/// final `+Inf` overflow bucket), though a missing overflow bucket is tolerated.
+/// Returns `None` for an empty/malformed histogram so the caller can fall back
+/// to the arithmetic mean.
+fn histogram_quantile(q: f64, bounds: &[f64], bucket_counts: &[u64]) -> Option<f64> {
+    if bounds.is_empty() || bucket_counts.is_empty() {
+        return None;
+    }
+    let total: u64 = bucket_counts.iter().sum();
+    if total == 0 {
+        return None;
+    }
+    let q = q.clamp(0.0, 1.0);
+    let rank = q * total as f64;
+
+    let mut cum_before = 0.0_f64;
+    for (i, &count) in bucket_counts.iter().enumerate() {
+        let cum_after = cum_before + count as f64;
+        if cum_after < rank {
+            cum_before = cum_after;
+            continue;
+        }
+        // The q-th observation falls in bucket `i` = (lower, upper].
+        let upper = match bounds.get(i) {
+            Some(&u) => u,
+            // Overflow (+Inf) bucket: no finite upper bound to interpolate to —
+            // report the largest finite bound.
+            None => return bounds.last().copied(),
+        };
+        // First bucket with a non-positive upper bound: no sensible lower bound
+        // to interpolate from (Prometheus convention) — report the upper bound.
+        if i == 0 && upper <= 0.0 {
+            return Some(upper);
+        }
+        let lower = if i == 0 { 0.0 } else { *bounds.get(i - 1)? };
+        if count == 0 {
+            return Some(upper);
+        }
+        let frac = (rank - cum_before) / count as f64;
+        return Some(lower + (upper - lower) * frac);
+    }
+    // rank == total (e.g. q == 1.0) → top of the distribution.
+    bounds.last().copied()
+}
+
+// ── Like-pattern helpers ────────────────────────────────────────────────────
+
 /// Escape LIKE/ILIKE metacharacters in a user-supplied substring pattern.
 ///
-/// PostgreSQL ILIKE uses backslash as the default escape character. We
-/// escape:
-///
+/// PostgreSQL ILIKE uses backslash as the default escape character. We escape:
 /// - `\` → `\\`   (backslash itself, first)
 /// - `%` → `\%`   (wildcard: any sequence of chars)
 /// - `_` → `\_`   (wildcard: exactly one char)
@@ -2934,5 +3738,208 @@ mod tests {
         // The OLD buggy capitalized form must now resolve to Internal (it's not
         // a stored value), proving we no longer accidentally match it.
         assert!(matches!(parse_span_kind("Server"), SpanKind::Internal));
+    }
+
+    // ── translate_bucket_interval_pg ────────────────────────────────────────
+
+    #[test]
+    fn translate_interval_known_units() {
+        assert_eq!(translate_bucket_interval_pg("1 hour"), "1 hour");
+        assert_eq!(translate_bucket_interval_pg("5 minutes"), "5 minute");
+        assert_eq!(translate_bucket_interval_pg("30 seconds"), "30 second");
+        assert_eq!(translate_bucket_interval_pg("1 day"), "1 day");
+        assert_eq!(translate_bucket_interval_pg("2 weeks"), "2 week");
+    }
+
+    #[test]
+    fn translate_interval_compact_form() {
+        assert_eq!(translate_bucket_interval_pg("300s"), "300 second");
+        assert_eq!(translate_bucket_interval_pg("5m"), "5 minute");
+        assert_eq!(translate_bucket_interval_pg("1h"), "1 hour");
+        assert_eq!(translate_bucket_interval_pg("2d"), "2 day");
+    }
+
+    #[test]
+    fn translate_interval_unknown_falls_back_to_1hour() {
+        assert_eq!(translate_bucket_interval_pg(""), "1 hour");
+        assert_eq!(translate_bucket_interval_pg("bogus"), "1 hour");
+        assert_eq!(translate_bucket_interval_pg("1 year"), "1 hour");
+        // Extra tokens — injection attempt guard.
+        assert_eq!(translate_bucket_interval_pg("1 hour; DROP TABLE"), "1 hour");
+        // Count=0 is rejected.
+        assert_eq!(translate_bucket_interval_pg("0 hours"), "1 hour");
+    }
+
+    // ── interval_seconds_pg ─────────────────────────────────────────────────
+
+    #[test]
+    fn interval_seconds_known_values() {
+        assert_eq!(interval_seconds_pg("1 second"), 1);
+        assert_eq!(interval_seconds_pg("1 minute"), 60);
+        assert_eq!(interval_seconds_pg("1 hour"), 3600);
+        assert_eq!(interval_seconds_pg("1 day"), 86_400);
+        assert_eq!(interval_seconds_pg("1 week"), 604_800);
+        assert_eq!(interval_seconds_pg("5 minute"), 300);
+    }
+
+    #[test]
+    fn interval_seconds_unknown_falls_back_to_hour() {
+        assert_eq!(interval_seconds_pg("bogus"), 3600);
+        assert_eq!(interval_seconds_pg(""), 3600);
+    }
+
+    // ── validate_label_key ──────────────────────────────────────────────────
+
+    #[test]
+    fn validate_label_key_accepts_valid_keys() {
+        assert!(validate_label_key("http.status_code").is_ok());
+        assert!(validate_label_key("gen_ai.system").is_ok());
+        assert!(validate_label_key("env").is_ok());
+        assert!(validate_label_key("k8s:node").is_ok());
+        assert!(validate_label_key("A-Za-z0-9_.:-").is_ok());
+    }
+
+    #[test]
+    fn validate_label_key_rejects_bad_keys() {
+        assert!(validate_label_key("").is_err());
+        // Space is not allowed.
+        assert!(validate_label_key("my key").is_err());
+        // SQL injection attempt.
+        assert!(validate_label_key("'; DROP TABLE otel_metrics; --").is_err());
+        // Unicode not in the allowlist.
+        assert!(validate_label_key("http.stätus").is_err());
+    }
+
+    // ── parse_jsonb arrays ──────────────────────────────────────────────────
+
+    #[test]
+    fn parse_jsonb_f64_array_basic() {
+        let v = serde_json::json!([1.0, 2.5, 10.0]);
+        let result = parse_jsonb_f64_array(Some(&v)).unwrap();
+        assert_eq!(result, vec![1.0, 2.5, 10.0]);
+    }
+
+    #[test]
+    fn parse_jsonb_f64_array_none_input() {
+        assert!(parse_jsonb_f64_array(None).is_none());
+    }
+
+    #[test]
+    fn parse_jsonb_u64_array_basic() {
+        let v = serde_json::json!([0, 3, 7, 100]);
+        let result = parse_jsonb_u64_array(Some(&v)).unwrap();
+        assert_eq!(result, vec![0u64, 3, 7, 100]);
+    }
+
+    #[test]
+    fn parse_jsonb_u64_array_none_input() {
+        assert!(parse_jsonb_u64_array(None).is_none());
+    }
+
+    // ── histogram_quantile ──────────────────────────────────────────────────
+
+    #[test]
+    fn histogram_quantile_empty_or_zero_is_none() {
+        assert!(histogram_quantile(0.95, &[], &[]).is_none());
+        assert!(histogram_quantile(0.95, &[1.0, 2.0], &[]).is_none());
+        // All-zero counts → no observations → None (caller falls back to mean).
+        assert!(histogram_quantile(0.95, &[1.0, 2.0], &[0, 0, 0]).is_none());
+    }
+
+    #[test]
+    fn histogram_quantile_interpolates_within_bucket() {
+        // bounds (0,1],(1,2],(2,5],(5,+Inf); counts 10/10/10/0 → 30 obs.
+        let bounds = [1.0, 2.0, 5.0];
+        let counts = [10u64, 10, 10, 0];
+        // p50 → rank 15 → falls in bucket (1,2], 5 into its 10 → 1 + 1*0.5 = 1.5
+        let p50 = histogram_quantile(0.5, &bounds, &counts).unwrap();
+        assert!((p50 - 1.5).abs() < 1e-9, "p50 = {p50}");
+        // p90 → rank 27 → bucket (2,5], 7 into its 10 → 2 + 3*0.7 = 4.1
+        let p90 = histogram_quantile(0.9, &bounds, &counts).unwrap();
+        assert!((p90 - 4.1).abs() < 1e-9, "p90 = {p90}");
+    }
+
+    #[test]
+    fn histogram_quantile_overflow_bucket_clamps_to_last_bound() {
+        // Most mass in the +Inf overflow bucket: p99 can't interpolate past the
+        // last finite bound, so it clamps there.
+        let bounds = [1.0, 2.0];
+        let counts = [1u64, 1, 100]; // (.,1],(1,2],(2,+Inf]
+        let p99 = histogram_quantile(0.99, &bounds, &counts).unwrap();
+        assert!((p99 - 2.0).abs() < 1e-9, "p99 = {p99}");
+    }
+
+    #[test]
+    fn histogram_quantile_q1_is_top_bound() {
+        let bounds = [1.0, 2.0, 5.0];
+        let counts = [10u64, 10, 10]; // no overflow bucket stored
+        let p100 = histogram_quantile(1.0, &bounds, &counts).unwrap();
+        assert!((p100 - 5.0).abs() < 1e-9, "p100 = {p100}");
+    }
+
+    // ── series_json_key ─────────────────────────────────────────────────────
+
+    #[test]
+    fn series_json_key_none_yields_empty() {
+        assert_eq!(series_json_key(&None), "");
+    }
+
+    #[test]
+    fn series_json_key_null_yields_empty() {
+        assert_eq!(series_json_key(&Some(serde_json::Value::Null)), "");
+    }
+
+    #[test]
+    fn series_json_key_array_yields_json_string() {
+        let v = serde_json::json!(["production", "api"]);
+        let key = series_json_key(&Some(v));
+        assert_eq!(key, r#"["production","api"]"#);
+    }
+
+    // ── build_metrics_where ─────────────────────────────────────────────────
+
+    #[test]
+    fn build_metrics_where_base_case() {
+        let query = crate::types::MetricQuery {
+            project_id: 42,
+            ..Default::default()
+        };
+        let (sql, values, next) = build_metrics_where(&query);
+        assert!(sql.contains("project_id = $1"));
+        assert_eq!(values.len(), 1);
+        assert_eq!(next, 2);
+    }
+
+    #[test]
+    fn build_metrics_where_label_filters_use_containment() {
+        let query = crate::types::MetricQuery {
+            project_id: 1,
+            label_filters: vec![("env".to_string(), "prod".to_string())],
+            ..Default::default()
+        };
+        let (sql, _values, _next) = build_metrics_where(&query);
+        // Must use JSONB containment, not key-value string comparison.
+        assert!(sql.contains("attributes @>"), "expected @> in: {sql}");
+        assert!(
+            sql.contains("jsonb_build_object"),
+            "expected jsonb_build_object in: {sql}"
+        );
+    }
+
+    #[test]
+    fn build_metrics_where_label_filters_param_count() {
+        // 2 label filters → 4 extra params (k1, v1, k2, v2).
+        let query = crate::types::MetricQuery {
+            project_id: 1,
+            label_filters: vec![
+                ("env".to_string(), "prod".to_string()),
+                ("svc".to_string(), "api".to_string()),
+            ],
+            ..Default::default()
+        };
+        let (_sql, values, next) = build_metrics_where(&query);
+        // project_id(1) + k1(1) + v1(1) + k2(1) + v2(1) = 5 values
+        assert_eq!(values.len(), 5);
+        assert_eq!(next, 6);
     }
 }

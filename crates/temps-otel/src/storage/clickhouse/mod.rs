@@ -612,6 +612,13 @@ struct ChMetricNameRow {
     metric_name: String,
 }
 
+/// Single distinct string — reused by the label key/value discovery queries
+/// (both alias their projected column to `label_key`).
+#[derive(::clickhouse::Row, Deserialize, Debug)]
+struct ChLabelRow {
+    label_key: String,
+}
+
 /// Row returned by `get_metric_baseline` — hour/day-bucketed stats.
 #[derive(::clickhouse::Row, Deserialize, Debug)]
 struct ChBaselineRow {
@@ -2355,6 +2362,73 @@ impl OtelStorage for ClickHouseOtelStorage {
             .map_err(|e| ch_query_err("list_metric_names", e))?;
 
         Ok(rows.into_iter().map(|r| r.metric_name).collect())
+    }
+
+    async fn list_metric_label_keys(
+        &self,
+        project_id: i32,
+        metric_name: &str,
+        start_time: chrono::DateTime<chrono::Utc>,
+        end_time: chrono::DateTime<chrono::Utc>,
+    ) -> StorageResult<Vec<String>> {
+        // Sample recent rows first (subquery LIMIT), then ARRAY JOIN the sampled
+        // attribute-key arrays — keeps the unnest bounded on high-volume metrics.
+        let rows = self
+            .ch
+            .query(
+                "SELECT DISTINCT label_key FROM ( \
+                   SELECT mapKeys(attributes) AS ks FROM metrics \
+                   WHERE project_id = ? AND metric_name = ? \
+                     AND timestamp >= fromUnixTimestamp64Milli(?) \
+                     AND timestamp <= fromUnixTimestamp64Milli(?) \
+                   ORDER BY timestamp DESC LIMIT 2000 \
+                 ) ARRAY JOIN ks AS label_key \
+                 WHERE label_key != '' ORDER BY label_key",
+            )
+            .bind(project_id)
+            .bind(metric_name)
+            .bind(start_time.timestamp_millis())
+            .bind(end_time.timestamp_millis())
+            .fetch_all::<ChLabelRow>()
+            .await
+            .map_err(|e| ch_query_err("list_metric_label_keys", e))?;
+
+        Ok(rows.into_iter().map(|r| r.label_key).collect())
+    }
+
+    async fn list_metric_label_values(
+        &self,
+        project_id: i32,
+        metric_name: &str,
+        label_key: &str,
+        start_time: chrono::DateTime<chrono::Utc>,
+        end_time: chrono::DateTime<chrono::Utc>,
+    ) -> StorageResult<Vec<String>> {
+        // `attributes[?]` reads the value for the chosen key; `mapContains` keeps
+        // only rows that actually carry it. Sampled and capped like the keys query.
+        let rows = self
+            .ch
+            .query(
+                "SELECT DISTINCT label_key FROM ( \
+                   SELECT attributes[?] AS label_key FROM metrics \
+                   WHERE project_id = ? AND metric_name = ? \
+                     AND mapContains(attributes, ?) \
+                     AND timestamp >= fromUnixTimestamp64Milli(?) \
+                     AND timestamp <= fromUnixTimestamp64Milli(?) \
+                   ORDER BY timestamp DESC LIMIT 5000 \
+                 ) WHERE label_key != '' ORDER BY label_key LIMIT 500",
+            )
+            .bind(label_key)
+            .bind(project_id)
+            .bind(metric_name)
+            .bind(label_key)
+            .bind(start_time.timestamp_millis())
+            .bind(end_time.timestamp_millis())
+            .fetch_all::<ChLabelRow>()
+            .await
+            .map_err(|e| ch_query_err("list_metric_label_values", e))?;
+
+        Ok(rows.into_iter().map(|r| r.label_key).collect())
     }
 
     // ── Non-span methods — delegate to TimescaleDB unconditionally ───────────

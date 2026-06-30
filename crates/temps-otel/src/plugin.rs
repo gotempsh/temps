@@ -153,6 +153,8 @@ impl OtelConfig {
         ingest_handler::ingest_logs_by_path,
         query_handler::query_metrics,
         query_handler::list_metric_names,
+        query_handler::list_metric_label_keys,
+        query_handler::list_metric_label_values,
         query_handler::query_traces,
         query_handler::query_trace_summaries,
         query_handler::get_trace,
@@ -179,6 +181,8 @@ impl OtelConfig {
         schemas(
             query_handler::OtelMetricsResponse,
             query_handler::OtelMetricNamesResponse,
+            query_handler::OtelMetricLabelKeysResponse,
+            query_handler::OtelMetricLabelValuesResponse,
             query_handler::TracesResponse,
             query_handler::TraceSummariesResponse,
             crate::types::TraceSummary,

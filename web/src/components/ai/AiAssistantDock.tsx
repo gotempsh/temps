@@ -23,6 +23,7 @@ import { TimeAgo } from '@/components/utils/TimeAgo'
 import { cn } from '@/lib/utils'
 import {
   Bell,
+  ChevronDown,
   ChevronLeft,
   ExternalLink,
   FolderGit2,
@@ -66,6 +67,48 @@ function metaFor(contextType: string) {
   )
 }
 
+/**
+ * Project favicon with a small context-type badge (deployment/alert/project)
+ * overlaid in the corner. Shared by the conversation list and the open-chat
+ * header so a chat looks the same in both places.
+ */
+function ContextAvatar({
+  projectId,
+  projectName,
+  contextType,
+  className,
+  badgeClassName,
+}: {
+  projectId: number
+  projectName?: string
+  contextType: string
+  className?: string
+  badgeClassName?: string
+}) {
+  const { label, Icon } = metaFor(contextType)
+  return (
+    <div className="relative shrink-0">
+      <Avatar className={cn('size-8 rounded-md', className)}>
+        <AvatarImage
+          src={`/api/projects/${projectId}/favicon`}
+          alt={projectName ?? 'Project'}
+        />
+        <AvatarFallback className="rounded-md bg-primary/10 text-xs font-medium text-primary">
+          {(projectName ?? label).slice(0, 1).toUpperCase()}
+        </AvatarFallback>
+      </Avatar>
+      <span
+        className={cn(
+          'absolute -bottom-1 -right-1 flex h-4 w-4 items-center justify-center rounded-full border border-background bg-muted text-muted-foreground',
+          badgeClassName
+        )}
+      >
+        <Icon className="h-2.5 w-2.5" />
+      </span>
+    </div>
+  )
+}
+
 /** Route to the entity a chat was started from, when we know its project. */
 function sourceHref(a: {
   contextType: string
@@ -84,6 +127,37 @@ function sourceHref(a: {
     return `/projects/${a.projectSlug}`
   }
   return null
+}
+
+// Remember the last open chat across close/reopen and page reloads, so the dock
+// returns to where the user was instead of the conversation list.
+const ACTIVE_CHAT_KEY = 'temps.ai.activeChat'
+
+function loadActiveChat(): ActiveChat | null {
+  try {
+    const raw = localStorage.getItem(ACTIVE_CHAT_KEY)
+    if (!raw) return null
+    const a = JSON.parse(raw) as ActiveChat
+    if (a && typeof a.projectId === 'number' && a.contextType && a.contextId != null) {
+      return { ...a, autoStart: false }
+    }
+  } catch {
+    /* storage unavailable or malformed — fall through */
+  }
+  return null
+}
+
+function saveActiveChat(a: ActiveChat | null) {
+  try {
+    if (a) {
+      // Never re-trigger the one-shot auto-diagnosis when restoring.
+      localStorage.setItem(ACTIVE_CHAT_KEY, JSON.stringify({ ...a, autoStart: false }))
+    } else {
+      localStorage.removeItem(ACTIVE_CHAT_KEY)
+    }
+  } catch {
+    /* non-fatal */
+  }
 }
 
 /**
@@ -107,8 +181,10 @@ export function AiAssistantDock() {
       )}
     >
       {/* Pinned full-height column; page content scrolls independently to the
-          left, so the dock stays put ("sticky") while navigating. */}
-      <div className="sticky top-0 h-svh w-full">
+          left, so the dock stays put ("sticky") while navigating. `dvh` tracks
+          the visible viewport so the composer pins to the bottom of the screen
+          on mobile instead of leaving an empty band below it. */}
+      <div className="sticky top-0 h-dvh w-full">
         {isOpen && (
           <DockBody
             key={openSeq}
@@ -129,7 +205,7 @@ function DockBody({
   onClose: () => void
 }) {
   const navigate = useNavigate()
-  const { projectId: openedProjectId } = useAiAssistant()
+  const { projectId: openedProjectId, currentProject } = useAiAssistant()
 
   // Navigate to a chat's source. On narrow screens the dock covers the whole
   // viewport, so close it after navigating — otherwise it looks like nothing
@@ -139,7 +215,7 @@ function DockBody({
     if (typeof window !== 'undefined' && window.innerWidth < 1024) onClose()
   }
 
-  const [active, setActive] = useState<ActiveChat | null>(
+  const [active, setActive] = useState<ActiveChat | null>(() =>
     initialContext && openedProjectId != null
       ? {
           projectId: openedProjectId,
@@ -152,8 +228,15 @@ function DockBody({
           startPrompt: initialContext.startPrompt,
           autoStart: true,
         }
-      : null
+      : // No explicit target → resume the last chat the user was in (across
+        // close/reopen and reloads), falling back to the conversation list.
+        loadActiveChat()
   )
+
+  // Persist the open chat so reopening the dock returns to it.
+  useEffect(() => {
+    saveActiveChat(active)
+  }, [active])
   const [conversations, setConversations] = useState<
     GlobalConversationResponse[]
   >([])
@@ -208,7 +291,11 @@ function DockBody({
   // Start a brand-new project-scoped chat (a fresh thread). The context_id is a
   // client-generated uuid so a project can have many independent chats; the
   // conversation row is created lazily on the first message (DebugChatPanel).
-  const startProjectChat = (p: ProjectResponse) => {
+  const startProjectChat = (p: {
+    id: number
+    slug?: string | null
+    name: string
+  }) => {
     setPicking(false)
     setActivePublicId(null)
     const contextId =
@@ -289,6 +376,14 @@ function DockBody({
             ) : (
               <Sparkles className="h-5 w-5 text-primary" />
             )}
+            {inConversation && active && (
+              <ContextAvatar
+                projectId={active.projectId}
+                projectName={active.projectName}
+                contextType={active.contextType}
+                className="size-7"
+              />
+            )}
             <h2 className="min-w-0 truncate text-lg font-semibold">
               {inConversation
                 ? (active?.title ?? 'AI chat')
@@ -323,17 +418,44 @@ function DockBody({
           )}
         </div>
         <div className="flex shrink-0 items-center gap-0.5">
-          {!inConversation && !picking && (
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => setPicking(true)}
-              className="mr-1 h-8 gap-1"
-            >
-              <Plus className="h-4 w-4" />
-              New chat
-            </Button>
-          )}
+          {!inConversation &&
+            !picking &&
+            (currentProject ? (
+              // On a project page: start a chat for it in one click, with a
+              // caret to pick a different project instead.
+              <div className="mr-1 flex items-center">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => startProjectChat(currentProject)}
+                  className="h-8 gap-1 rounded-r-none border-r-0"
+                  title={`New chat in ${currentProject.name}`}
+                >
+                  <Plus className="h-4 w-4" />
+                  New chat
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => setPicking(true)}
+                  className="h-8 rounded-l-none px-1.5"
+                  title="New chat in another project"
+                  aria-label="New chat in another project"
+                >
+                  <ChevronDown className="h-4 w-4" />
+                </Button>
+              </div>
+            ) : (
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => setPicking(true)}
+                className="mr-1 h-8 gap-1"
+              >
+                <Plus className="h-4 w-4" />
+                New chat
+              </Button>
+            ))}
           {inConversation && (
             <button
               type="button"
@@ -485,7 +607,7 @@ function ConversationList({
   return (
     <div className="h-full space-y-1 overflow-y-auto pr-1">
       {conversations.map((c) => {
-        const { label, Icon } = metaFor(c.context_type)
+        const { label } = metaFor(c.context_type)
         const hasSource = !!sourceHref({
           contextType: c.context_type,
           contextId: c.context_id,
@@ -501,22 +623,11 @@ function ConversationList({
               onClick={() => onOpen(c)}
               className="flex min-w-0 flex-1 items-center gap-3 px-2 py-2.5 text-left"
             >
-              <div className="relative shrink-0">
-                <Avatar className="size-8 rounded-md">
-                  <AvatarImage
-                    src={`/api/projects/${c.project_id}/favicon`}
-                    alt={c.project_name ?? 'Project'}
-                  />
-                  <AvatarFallback className="rounded-md bg-primary/10 text-xs font-medium text-primary">
-                    {(c.project_name ?? label).slice(0, 1).toUpperCase()}
-                  </AvatarFallback>
-                </Avatar>
-                {/* Context-type badge so the chat's source (deployment/alert)
-                    stays visible over the project favicon. */}
-                <span className="absolute -bottom-1 -right-1 flex h-4 w-4 items-center justify-center rounded-full border border-background bg-muted text-muted-foreground">
-                  <Icon className="h-2.5 w-2.5" />
-                </span>
-              </div>
+              <ContextAvatar
+                projectId={c.project_id}
+                projectName={c.project_name ?? undefined}
+                contextType={c.context_type}
+              />
               <div className="min-w-0 flex-1">
                 <div className="truncate text-sm font-medium">
                   {c.title ?? `${label} ${c.context_id}`}

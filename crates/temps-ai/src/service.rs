@@ -3,7 +3,9 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::streaming::{ChatTurnRequest, ChatTurnResponse, TokenStream};
+use crate::streaming::{
+    ChatStreamDelta, ChatTurnRequest, ChatTurnResponse, ChatTurnStream, TokenStream,
+};
 
 /// A single AI completion request. Construct with `..Default::default()` and set
 /// only what you need:
@@ -90,5 +92,20 @@ pub trait AiService: Send + Sync {
     /// overrides it. Best-effort like [`Self::complete`].
     async fn chat(&self, _request: ChatTurnRequest) -> Result<ChatTurnResponse, AiError> {
         Err(AiError::NotAvailable)
+    }
+
+    /// Streaming agentic turn: streams assistant text deltas **and** tool calls
+    /// from a single provider pass (see [`ChatStreamDelta`]). This is the seam an
+    /// agentic chat loop should use — it gives token-by-token prose *and* live
+    /// tool activity without a separate non-streaming gather call.
+    ///
+    /// The default implementation adapts the text-only [`Self::chat_stream`]: it
+    /// streams prose but never surfaces tool calls (so a model would just answer
+    /// in text). Providers that can stream tool-call deltas — like the gateway —
+    /// override this to honour `request.tools`. Best-effort like [`Self::complete`].
+    async fn chat_stream_turn(&self, request: ChatTurnRequest) -> Result<ChatTurnStream, AiError> {
+        use futures::StreamExt;
+        let stream = self.chat_stream(request).await?;
+        Ok(Box::pin(stream.map(|item| item.map(ChatStreamDelta::Text))))
     }
 }

@@ -26,6 +26,8 @@ pub struct SettingsState {
     pub config_service: Arc<ConfigService>,
     pub audit_service: Arc<dyn AuditLogger>,
     pub route_table_refresher: Option<Arc<dyn temps_core::route_table::RouteTableRefresher>>,
+    /// Node enrollment token minting/listing/revocation (ADR-020 WS-1.1).
+    pub enrollment_token_service: Arc<crate::enrollment_tokens::EnrollmentTokenService>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -213,6 +215,17 @@ pub struct PreviewGatewaySettingsMasked {
 pub struct MultiNodeSettingsMasked {
     pub has_join_token: bool,
     pub private_address: Option<String>,
+    /// Whether control-plane↔agent mutual TLS is enforced.
+    pub require_mtls: bool,
+    /// Whether the deprecated shared join token is still accepted.
+    pub legacy_shared_token_enabled: bool,
+    /// SHA-256 fingerprint of the cluster CA certificate (public — operators can
+    /// verify it out of band; the CA private key is never exposed).
+    pub cluster_ca_fingerprint: Option<String>,
+    /// Node resource-alert thresholds (percent); `None` = that alert disabled.
+    pub node_cpu_alert_percent: Option<f64>,
+    pub node_memory_alert_percent: Option<f64>,
+    pub node_disk_alert_percent: Option<f64>,
 }
 
 /// DNS provider settings with masked sensitive fields
@@ -301,6 +314,16 @@ impl From<AppSettings> for AppSettingsResponse {
             },
             multi_node: MultiNodeSettingsMasked {
                 has_join_token: settings.multi_node.join_token_hash.is_some(),
+                require_mtls: settings.multi_node.require_mtls,
+                legacy_shared_token_enabled: settings.multi_node.legacy_shared_token_enabled,
+                cluster_ca_fingerprint: settings
+                    .multi_node
+                    .cluster_ca_cert_pem
+                    .as_deref()
+                    .and_then(|pem| temps_core::node_pki::ca_fingerprint_sha256(pem).ok()),
+                node_cpu_alert_percent: settings.multi_node.node_cpu_alert_percent,
+                node_memory_alert_percent: settings.multi_node.node_memory_alert_percent,
+                node_disk_alert_percent: settings.multi_node.node_disk_alert_percent,
                 private_address: settings.multi_node.private_address,
             },
             // `effective_metrics_store` defaults to the configured store here;
@@ -341,6 +364,9 @@ impl AppSettingsResponse {
         generate_join_token,
         revoke_join_token,
         get_join_token_status,
+        mint_enrollment_token,
+        list_enrollment_tokens,
+        revoke_enrollment_token,
         refresh_route_table,
     ),
     components(schemas(
@@ -361,6 +387,10 @@ impl AppSettingsResponse {
         SettingsUpdateResponse,
         GenerateJoinTokenResponse,
         JoinTokenStatusResponse,
+        MintEnrollmentTokenRequest,
+        MintEnrollmentTokenResponse,
+        EnrollmentTokenInfo,
+        EnrollmentTokenListResponse,
         RouteRefreshResponse,
     )),
     info(
@@ -380,7 +410,233 @@ pub fn configure_routes() -> Router<Arc<SettingsState>> {
         .route("/settings/join-token/generate", post(generate_join_token))
         .route("/settings/join-token", delete(revoke_join_token))
         .route("/settings/join-token/status", get(get_join_token_status))
+        .route(
+            "/settings/enrollment-tokens",
+            post(mint_enrollment_token).get(list_enrollment_tokens),
+        )
+        .route(
+            "/settings/enrollment-tokens/{id}",
+            delete(revoke_enrollment_token),
+        )
         .route("/settings/routes/refresh", post(refresh_route_table))
+}
+
+// ── Node enrollment tokens (ADR-020 WS-1.1) ──────────────────────────────────
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct MintEnrollmentTokenRequest {
+    /// Maximum registrations this token may authorize (default 1).
+    pub max_uses: Option<i32>,
+    /// Time-to-live in seconds (default 3600 = 1h).
+    pub ttl_secs: Option<i64>,
+    /// Optional: restrict the token to register one specific node name.
+    pub bound_node_name: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MintEnrollmentTokenResponse {
+    pub id: i32,
+    /// The plaintext enrollment token — shown only once, save it now.
+    pub token: String,
+    pub expires_at: String,
+    pub max_uses: i32,
+    /// SHA-256 fingerprint of the cluster CA (if mTLS is set up). Pass it to the
+    /// worker as `temps join --ca-fingerprint <fp>` to verify the CA on join.
+    pub ca_fingerprint: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct EnrollmentTokenInfo {
+    pub id: i32,
+    pub expires_at: String,
+    pub used_count: i32,
+    pub max_uses: i32,
+    pub bound_node_name: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct EnrollmentTokenListResponse {
+    pub tokens: Vec<EnrollmentTokenInfo>,
+}
+
+fn enrollment_error_to_problem(e: crate::enrollment_tokens::EnrollmentError) -> Problem {
+    use crate::enrollment_tokens::EnrollmentError;
+    match e {
+        EnrollmentError::Validation { message } => ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Validation Error")
+            .detail(message)
+            .build(),
+        EnrollmentError::NotFound { id } => ErrorBuilder::new(StatusCode::NOT_FOUND)
+            .title("Enrollment Token Not Found")
+            .detail(format!("Enrollment token {} not found", id))
+            .build(),
+        EnrollmentError::InvalidToken
+        | EnrollmentError::Expired
+        | EnrollmentError::Revoked
+        | EnrollmentError::Exhausted => ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Invalid Enrollment Token")
+            .detail(e.to_string())
+            .build(),
+        EnrollmentError::Database(err) => {
+            error!("Enrollment token DB error: {}", err);
+            ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title("Internal Server Error")
+                .detail("Database error")
+                .build()
+        }
+    }
+}
+
+/// Mint a short-lived, single-use node enrollment token.
+#[utoipa::path(
+    tag = "Settings",
+    post,
+    path = "/settings/enrollment-tokens",
+    request_body = MintEnrollmentTokenRequest,
+    responses(
+        (status = 200, description = "Enrollment token minted", body = MintEnrollmentTokenResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn mint_enrollment_token(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<SettingsState>>,
+    Json(req): Json<MintEnrollmentTokenRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsWrite);
+
+    // If a cluster CA already exists, embed its SHA-256 fingerprint so a joining
+    // node can verify the control plane's CA out of band (ADR-020 WS-2.2). The
+    // CA is minted lazily on the first mTLS enrollment, so the very first token
+    // may carry no fingerprint; subsequent tokens do.
+    let settings = app_state.config_service.get_settings().await.map_err(|e| {
+        ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .title("Settings Error")
+            .detail(format!("Failed to read settings: {e}"))
+            .build()
+    })?;
+    let ca_fingerprint = settings
+        .multi_node
+        .cluster_ca_cert_pem
+        .as_deref()
+        .and_then(|pem| temps_core::node_pki::ca_fingerprint_sha256(pem).ok());
+
+    let params = crate::enrollment_tokens::MintParams {
+        max_uses: req.max_uses.unwrap_or(1),
+        ttl_secs: req.ttl_secs.unwrap_or(3600),
+        bound_node_name: req
+            .bound_node_name
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        bound_labels: None,
+        created_by_user_id: Some(auth.user_id()),
+        ca_fingerprint: ca_fingerprint.clone(),
+    };
+
+    let (plaintext, model) = app_state
+        .enrollment_token_service
+        .mint(params)
+        .await
+        .map_err(enrollment_error_to_problem)?;
+
+    info!(
+        user_id = auth.user_id(),
+        token_id = model.id,
+        "Node enrollment token minted"
+    );
+
+    Ok(Json(MintEnrollmentTokenResponse {
+        id: model.id,
+        token: plaintext,
+        expires_at: model.expires_at.to_rfc3339(),
+        max_uses: model.max_uses,
+        ca_fingerprint,
+        message: "Enrollment token minted. Save it now — it will not be shown again.".to_string(),
+    }))
+}
+
+/// List currently-valid node enrollment tokens (hashes elided).
+#[utoipa::path(
+    tag = "Settings",
+    get,
+    path = "/settings/enrollment-tokens",
+    responses(
+        (status = 200, description = "Active enrollment tokens", body = EnrollmentTokenListResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn list_enrollment_tokens(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<SettingsState>>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsRead);
+
+    let tokens = app_state
+        .enrollment_token_service
+        .list_active()
+        .await
+        .map_err(enrollment_error_to_problem)?;
+
+    let tokens = tokens
+        .into_iter()
+        .map(|t| EnrollmentTokenInfo {
+            id: t.id,
+            expires_at: t.expires_at.to_rfc3339(),
+            used_count: t.used_count,
+            max_uses: t.max_uses,
+            bound_node_name: t.bound_node_name,
+            created_at: t.created_at.to_rfc3339(),
+        })
+        .collect();
+
+    Ok(Json(EnrollmentTokenListResponse { tokens }))
+}
+
+/// Revoke a node enrollment token by id.
+#[utoipa::path(
+    tag = "Settings",
+    delete,
+    path = "/settings/enrollment-tokens/{id}",
+    params(("id" = i32, Path, description = "Enrollment token id")),
+    responses(
+        (status = 200, description = "Enrollment token revoked", body = SettingsUpdateResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Enrollment token not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn revoke_enrollment_token(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<SettingsState>>,
+    axum::extract::Path(id): axum::extract::Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsWrite);
+
+    app_state
+        .enrollment_token_service
+        .revoke(id)
+        .await
+        .map_err(enrollment_error_to_problem)?;
+
+    info!(
+        user_id = auth.user_id(),
+        token_id = id,
+        "Node enrollment token revoked"
+    );
+
+    Ok(Json(SettingsUpdateResponse {
+        message: format!("Enrollment token {} revoked", id),
+    }))
 }
 
 /// Get application settings

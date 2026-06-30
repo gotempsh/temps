@@ -247,6 +247,17 @@ async fn proxy_upgrade(entry: &RouteEntry, req: Request) -> Response {
         ) {
             continue;
         }
+        // Strip client-supplied forwarding/identity headers (ADR-020 WS-3 /
+        // netiso-5). The proxy sets `x-forwarded-*` and `x-temps-deployment-id`
+        // authoritatively below; passing inbound copies through would let any
+        // overlay client spoof its source host/proto or impersonate another
+        // deployment to the backend.
+        if name_str == "forwarded"
+            || name_str.starts_with("x-forwarded-")
+            || name_str.starts_with("x-temps-")
+        {
+            continue;
+        }
         if name_str == "host" {
             sent_host = true;
         }

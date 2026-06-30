@@ -193,7 +193,7 @@ fn parse_rfc3339(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 
 /// List alert rules for a project (newest first, paginated).
 #[utoipa::path(
-    tag = "OTel",
+    tag = "Alerts",
     get,
     path = "/otel/alerts",
     params(
@@ -230,7 +230,7 @@ pub async fn list_alerts(
 
 /// Create a new alert rule for a project.
 #[utoipa::path(
-    tag = "OTel",
+    tag = "Alerts",
     post,
     path = "/otel/alerts",
     request_body = CreateMetricAlertRequest,
@@ -288,7 +288,7 @@ pub async fn create_alert(
 
 /// Fetch a single alert rule by id.
 #[utoipa::path(
-    tag = "OTel",
+    tag = "Alerts",
     get,
     path = "/otel/alerts/{id}",
     params(
@@ -318,7 +318,7 @@ pub async fn get_alert(
 
 /// Update an alert rule's fields.
 #[utoipa::path(
-    tag = "OTel",
+    tag = "Alerts",
     patch,
     path = "/otel/alerts/{id}",
     params(
@@ -380,7 +380,7 @@ pub async fn update_alert(
 
 /// Delete an alert rule.
 #[utoipa::path(
-    tag = "OTel",
+    tag = "Alerts",
     delete,
     path = "/otel/alerts/{id}",
     params(
@@ -432,7 +432,7 @@ pub async fn delete_alert(
 /// the per-bucket band + which points would have fired. Powers the form's
 /// "would this have fired?" preview and the explorer band overlay. Read-only.
 #[utoipa::path(
-    tag = "OTel",
+    tag = "Alerts",
     post,
     path = "/otel/alerts/preview",
     request_body = AnomalyPreviewRequest,

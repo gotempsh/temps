@@ -1,7 +1,13 @@
-import { EnvironmentResponse, HistogramSummary, ProjectResponse } from '@/api/client'
+import {
+  EnvironmentResponse,
+  HistogramSummary,
+  ProjectResponse,
+} from '@/api/client'
 import {
   getEnvironmentsOptions,
   listMetricNamesOptions,
+  listMetricLabelKeysOptions,
+  listMetricLabelValuesOptions,
   queryMetricsOptions,
   listAlertsOptions,
   // Backtests an anomaly rule's band over the visible range to shade it.
@@ -17,6 +23,18 @@ import type {
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import {
+  Command,
+  CommandEmpty,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from '@/components/ui/command'
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from '@/components/ui/popover'
 import {
   Select,
   SelectContent,
@@ -42,14 +60,23 @@ import { format } from 'date-fns'
 import {
   ArrowLeft,
   BarChart3,
+  Check,
+  ChevronDown,
+  ChevronsUpDown,
   Gauge,
   LineChart as LineChartIcon,
   Plus,
   RefreshCw,
   Search,
+  SlidersHorizontal,
   Tag,
   X,
 } from 'lucide-react'
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible'
 import { useEffect, useMemo, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 
@@ -218,7 +245,7 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
   })()
   const labelFilters = useMemo(
     () => parseLabelFilters(searchParams.get('labels')),
-    [searchParams],
+    [searchParams]
   )
   // Custom absolute date range — overrides the relative preset when both bounds
   // are present and valid (`?start`/`?end`, ISO). The backend metric query takes
@@ -233,6 +260,9 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
   })()
 
   const [nameSearch, setNameSearch] = useState('')
+  // The filter controls collapse by default so the metric grid / chart sits high
+  // on the page; the collapsed header still summarizes the active selection.
+  const [filtersOpen, setFiltersOpen] = useState(false)
 
   const patchParams = (mutate: (p: URLSearchParams) => void) => {
     const params = new URLSearchParams(searchParams)
@@ -262,7 +292,9 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
     })
   const setEnvironmentId = (v: number | null) =>
     patchParams((p) =>
-      v == null ? p.delete('environment_id') : p.set('environment_id', String(v)),
+      v == null
+        ? p.delete('environment_id')
+        : p.set('environment_id', String(v))
     )
   const setAggregation = (v: AggKind) =>
     patchParams((p) => (v === 'avg' ? p.delete('agg') : p.set('agg', v)))
@@ -298,12 +330,12 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
   const fromDate = useMemo(
     () => (isCustom ? new Date(customStartStr!) : timeRangeToFrom(timeRange)),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [isCustom, customStartStr, timeRange],
+    [isCustom, customStartStr, timeRange]
   )
   const toDate = useMemo(
     () => (isCustom ? new Date(customEndStr!) : new Date()),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [isCustom, customEndStr, timeRange],
+    [isCustom, customEndStr, timeRange]
   )
   const fromIso = fromDate.toISOString()
   const toIso = toDate.toISOString()
@@ -368,9 +400,9 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
         (r) =>
           r.enabled &&
           r.metric_name === metricName &&
-          r.detection_config.kind === 'anomaly',
+          r.detection_config.kind === 'anomaly'
       ) ?? null,
-    [alertsQuery.data, metricName],
+    [alertsQuery.data, metricName]
   )
   const bandPreview = useMutation({ ...previewAlertMutation() })
   const { mutate: previewBand, reset: resetBand } = bandPreview
@@ -438,6 +470,8 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
                 hs.bounds,
                 hs.bucket_counts,
                 percentileFromAgg(aggregation),
+                hs.min,
+                hs.max
               )
             : (b.value ?? b.avg_value)
         return {
@@ -449,7 +483,7 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
           count: b.count,
         }
       }),
-    [buckets, isPercentile, aggregation],
+    [buckets, isPercentile, aggregation]
   )
 
   // Merge the anomaly band onto each chart bucket. The backtest buckets by the
@@ -539,6 +573,14 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
 
   const aggLabel =
     AGGREGATIONS.find((a) => a.value === aggregation)?.label ?? 'Average'
+  // Collapsed-header summary: what's currently narrowing the view.
+  const rangeLabel = isCustom
+    ? 'Custom range'
+    : (TIME_RANGES.find((r) => r.value === timeRange)?.label ?? 'Last 24 hours')
+  const envLabel = selectedEnv?.name ?? 'All environments'
+  const activeFilterCount =
+    (serviceName.trim() ? 1 : 0) +
+    labelFilters.filter((f) => f.key.trim().length > 0).length
 
   return (
     <div className="flex w-full flex-col gap-4">
@@ -573,154 +615,198 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
         </Button>
       </div>
 
-      {/* Filter bar */}
-      <div className="flex flex-col gap-3 rounded-lg border border-border bg-card p-3">
-        <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-end">
-          {/* Metric-name selector with inline search */}
-          <div className="flex min-w-0 flex-1 flex-col gap-1">
-            <label className="text-xs font-medium text-muted-foreground">
-              Metric
-            </label>
-            <Select value={metricName} onValueChange={setMetricName}>
-              <SelectTrigger className="w-full font-mono sm:w-[280px]">
-                <SelectValue placeholder="Select a metric…" />
-              </SelectTrigger>
-              <SelectContent>
-                <div className="sticky top-0 z-10 bg-popover p-1.5">
-                  <div className="relative">
-                    <Search className="pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2 text-muted-foreground" />
-                    <Input
-                      value={nameSearch}
-                      onChange={(e) => setNameSearch(e.target.value)}
-                      onKeyDown={(e) => e.stopPropagation()}
-                      placeholder="Filter metrics…"
-                      className="h-8 pl-7 font-mono text-xs"
+      {/* Filter bar — collapsed by default; the header summarizes the active
+          aggregation, environment, range, and any service/label filters. */}
+      <Collapsible
+        open={filtersOpen}
+        onOpenChange={setFiltersOpen}
+        className="rounded-lg border border-border bg-card"
+      >
+        <CollapsibleTrigger className="flex w-full items-center justify-between gap-2 px-3 py-2.5 text-left text-sm transition-colors hover:bg-muted/40">
+          <span className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+            <SlidersHorizontal className="size-4 shrink-0 text-muted-foreground" />
+            <span className="font-medium">Filters</span>
+            <span className="text-muted-foreground">·</span>
+            <span className="text-muted-foreground">{aggLabel}</span>
+            <span className="text-muted-foreground">·</span>
+            <span className="text-muted-foreground">{envLabel}</span>
+            <span className="text-muted-foreground">·</span>
+            <span className="text-muted-foreground">{rangeLabel}</span>
+            {activeFilterCount > 0 && (
+              <Badge variant="secondary" className="ml-1 shrink-0">
+                {activeFilterCount} filter{activeFilterCount === 1 ? '' : 's'}
+              </Badge>
+            )}
+          </span>
+          <ChevronDown
+            className={[
+              'size-4 shrink-0 text-muted-foreground transition-transform',
+              filtersOpen ? 'rotate-180' : '',
+            ].join(' ')}
+          />
+        </CollapsibleTrigger>
+        <CollapsibleContent>
+          <div className="flex flex-col gap-3 border-t border-border p-3">
+            <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-end">
+              {/* Metric-name selector with inline search */}
+              <div className="flex min-w-0 flex-1 flex-col gap-1">
+                <label className="text-xs font-medium text-muted-foreground">
+                  Metric
+                </label>
+                <Select value={metricName} onValueChange={setMetricName}>
+                  <SelectTrigger className="w-full font-mono sm:w-[280px]">
+                    <SelectValue placeholder="Select a metric…" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <div className="sticky top-0 z-10 bg-popover p-1.5">
+                      <div className="relative">
+                        <Search className="pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+                        <Input
+                          value={nameSearch}
+                          onChange={(e) => setNameSearch(e.target.value)}
+                          onKeyDown={(e) => e.stopPropagation()}
+                          placeholder="Filter metrics…"
+                          className="h-8 pl-7 font-mono text-xs"
+                        />
+                      </div>
+                    </div>
+                    {namesQuery.isPending ? (
+                      <div className="p-2">
+                        <Skeleton className="h-5 w-full" />
+                      </div>
+                    ) : filteredNames.length === 0 ? (
+                      <div className="p-3 text-center text-xs text-muted-foreground">
+                        {allNames.length === 0
+                          ? 'No metrics ingested yet.'
+                          : 'No metrics match your search.'}
+                      </div>
+                    ) : (
+                      filteredNames.map((n) => (
+                        <SelectItem
+                          key={n}
+                          value={n}
+                          className="font-mono text-xs"
+                        >
+                          {n}
+                        </SelectItem>
+                      ))
+                    )}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              {/* Aggregation */}
+              <div className="flex flex-col gap-1">
+                <label className="text-xs font-medium text-muted-foreground">
+                  Aggregation
+                </label>
+                <Select
+                  value={aggregation}
+                  onValueChange={(v) => setAggregation(v as AggKind)}
+                >
+                  <SelectTrigger className="w-full font-mono sm:w-[140px]">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {AGGREGATIONS.map((a) => (
+                      <SelectItem key={a.value} value={a.value}>
+                        {a.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              {/* Environment */}
+              <div className="flex flex-col gap-1">
+                <label className="text-xs font-medium text-muted-foreground">
+                  Environment
+                </label>
+                <Select
+                  value={environmentId != null ? String(environmentId) : 'all'}
+                  onValueChange={(v) =>
+                    setEnvironmentId(v === 'all' ? null : Number(v))
+                  }
+                >
+                  <SelectTrigger className="w-full sm:w-[160px]">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">All environments</SelectItem>
+                    {(environments ?? []).map((env: EnvironmentResponse) => (
+                      <SelectItem key={env.id} value={String(env.id)}>
+                        {env.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              {/* Time range */}
+              <div className="flex flex-col gap-1">
+                <label className="text-xs font-medium text-muted-foreground">
+                  Range
+                </label>
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                  <Select
+                    value={isCustom ? 'custom' : timeRange}
+                    onValueChange={(v) => {
+                      // "custom" seeds the picker with the window currently on screen.
+                      if (v === 'custom') setCustomRange(fromDate, toDate)
+                      else setTimeRange(v as TimeRange)
+                    }}
+                  >
+                    <SelectTrigger className="w-full sm:w-[160px]">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {TIME_RANGES.map((r) => (
+                        <SelectItem key={r.value} value={r.value}>
+                          {r.label}
+                        </SelectItem>
+                      ))}
+                      <SelectItem value="custom">Custom range…</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  {isCustom && (
+                    <DateRangePicker
+                      date={{ from: fromDate, to: toDate }}
+                      onDateChange={(range) => {
+                        if (range?.from && range?.to)
+                          setCustomRange(range.from, range.to)
+                      }}
                     />
-                  </div>
+                  )}
                 </div>
-                {namesQuery.isPending ? (
-                  <div className="p-2">
-                    <Skeleton className="h-5 w-full" />
-                  </div>
-                ) : filteredNames.length === 0 ? (
-                  <div className="p-3 text-center text-xs text-muted-foreground">
-                    {allNames.length === 0
-                      ? 'No metrics ingested yet.'
-                      : 'No metrics match your search.'}
-                  </div>
-                ) : (
-                  filteredNames.map((n) => (
-                    <SelectItem key={n} value={n} className="font-mono text-xs">
-                      {n}
-                    </SelectItem>
-                  ))
-                )}
-              </SelectContent>
-            </Select>
-          </div>
-
-          {/* Aggregation */}
-          <div className="flex flex-col gap-1">
-            <label className="text-xs font-medium text-muted-foreground">
-              Aggregation
-            </label>
-            <Select
-              value={aggregation}
-              onValueChange={(v) => setAggregation(v as AggKind)}
-            >
-              <SelectTrigger className="w-full font-mono sm:w-[140px]">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {AGGREGATIONS.map((a) => (
-                  <SelectItem key={a.value} value={a.value}>
-                    {a.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-
-          {/* Environment */}
-          <div className="flex flex-col gap-1">
-            <label className="text-xs font-medium text-muted-foreground">
-              Environment
-            </label>
-            <Select
-              value={environmentId != null ? String(environmentId) : 'all'}
-              onValueChange={(v) =>
-                setEnvironmentId(v === 'all' ? null : Number(v))
-              }
-            >
-              <SelectTrigger className="w-full sm:w-[160px]">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">All environments</SelectItem>
-                {(environments ?? []).map((env: EnvironmentResponse) => (
-                  <SelectItem key={env.id} value={String(env.id)}>
-                    {env.name}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-
-          {/* Time range */}
-          <div className="flex flex-col gap-1">
-            <label className="text-xs font-medium text-muted-foreground">
-              Range
-            </label>
-            <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-              <Select
-                value={isCustom ? 'custom' : timeRange}
-                onValueChange={(v) => {
-                  // "custom" seeds the picker with the window currently on screen.
-                  if (v === 'custom') setCustomRange(fromDate, toDate)
-                  else setTimeRange(v as TimeRange)
-                }}
-              >
-                <SelectTrigger className="w-full sm:w-[160px]">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {TIME_RANGES.map((r) => (
-                    <SelectItem key={r.value} value={r.value}>
-                      {r.label}
-                    </SelectItem>
-                  ))}
-                  <SelectItem value="custom">Custom range…</SelectItem>
-                </SelectContent>
-              </Select>
-              {isCustom && (
-                <DateRangePicker
-                  date={{ from: fromDate, to: toDate }}
-                  onDateChange={(range) => {
-                    if (range?.from && range?.to)
-                      setCustomRange(range.from, range.to)
-                  }}
-                />
-              )}
+              </div>
             </div>
-          </div>
-        </div>
 
-        {/* Service-name filter + label-filter builder */}
-        <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
-          <div className="relative flex-1">
-            <Search className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-muted-foreground" />
-            <Input
-              value={serviceName}
-              onChange={(e) => setServiceName(e.target.value)}
-              placeholder="Filter by service name…"
-              className="pl-8 font-mono text-xs"
+            {/* Service-name filter + label-filter builder */}
+            <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
+              <div className="relative flex-1">
+                <Search className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  value={serviceName}
+                  onChange={(e) => setServiceName(e.target.value)}
+                  placeholder="Filter by service name…"
+                  className="pl-8 font-mono text-xs"
+                />
+              </div>
+            </div>
+
+            {/* Label filters — keys/values autocomplete from the metric's
+                observed attributes (free text still allowed). */}
+            <LabelFilterBuilder
+              value={labelFilters}
+              onChange={setLabelFilters}
+              projectId={project.id}
+              metricName={metricName}
+              fromIso={fromIso}
+              toIso={toIso}
             />
           </div>
-        </div>
-
-        {/* Label filters (regen-ready, sent once SDK exposes label_filters) */}
-        <LabelFilterBuilder value={labelFilters} onChange={setLabelFilters} />
-      </div>
+        </CollapsibleContent>
+      </Collapsible>
 
       {metricName ? (
         <>
@@ -836,7 +922,9 @@ function MetricsOverview({
       <div className="rounded-lg border border-border bg-card p-4">
         <EmptyState
           icon={LineChartIcon}
-          title={totalCount === 0 ? 'No metrics ingested yet' : 'No metrics match'}
+          title={
+            totalCount === 0 ? 'No metrics ingested yet' : 'No metrics match'
+          }
           description={
             totalCount === 0
               ? 'Point an OpenTelemetry exporter at this project to start seeing metrics here.'
@@ -867,8 +955,8 @@ function MetricsOverview({
       </div>
       {names.length > shown.length && (
         <p className="text-center text-xs text-muted-foreground">
-          Showing {shown.length} of {names.length} metrics — use the search in the
-          Metric selector to find the rest.
+          Showing {shown.length} of {names.length} metrics — use the search in
+          the Metric selector to find the rest.
         </p>
       )}
     </div>
@@ -919,7 +1007,13 @@ function MetricCard({
     const hs = b.histogram_summary
     const value =
       isPercentile && hs && hs.bounds.length > 0
-        ? histogramQuantile(hs.bounds, hs.bucket_counts, percentileFromAgg(aggregation))
+        ? histogramQuantile(
+            hs.bounds,
+            hs.bucket_counts,
+            percentileFromAgg(aggregation),
+            hs.min,
+            hs.max
+          )
         : (b.value ?? b.avg_value)
     return { label: formatBucketLabel(b.bucket), value }
   })
@@ -984,14 +1078,58 @@ function MetricCard({
 function LabelFilterBuilder({
   value,
   onChange,
+  projectId,
+  metricName,
+  fromIso,
+  toIso,
 }: {
   value: LabelFilter[]
   onChange: (next: LabelFilter[]) => void
+  projectId: number
+  /** The selected metric whose attributes drive autocomplete; '' in overview. */
+  metricName: string
+  fromIso: string
+  toIso: string
 }) {
-  const add = () => onChange([...value, { key: '', value: '' }])
+  // Draft rows live in LOCAL state so an incomplete/empty row can exist while
+  // you type. The URL (via onChange → serializeLabelFilters) only ever keeps the
+  // COMPLETE pairs, so a freshly-added blank row would otherwise round-trip back
+  // out of existence and the "Add" button would appear to do nothing.
+  const [rows, setRows] = useState<LabelFilter[]>(value)
+
+  // Re-seed only on an EXTERNAL change (back/forward, shared link) — i.e. when
+  // the URL's complete set diverges from ours. Our own edits echo back equal, so
+  // the in-progress drafts survive instead of being clobbered.
+  const valueKey = serializeLabelFilters(value)
+  useEffect(() => {
+    if (valueKey !== serializeLabelFilters(rows)) setRows(value)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [valueKey])
+
+  const commit = (next: LabelFilter[]) => {
+    setRows(next)
+    onChange(next)
+  }
+  const add = () => commit([...rows, { key: '', value: '' }])
   const update = (i: number, patch: Partial<LabelFilter>) =>
-    onChange(value.map((f, idx) => (idx === i ? { ...f, ...patch } : f)))
-  const remove = (i: number) => onChange(value.filter((_, idx) => idx !== i))
+    commit(rows.map((f, idx) => (idx === i ? { ...f, ...patch } : f)))
+  const remove = (i: number) => commit(rows.filter((_, idx) => idx !== i))
+
+  // Discover the attribute keys present on the selected metric. Disabled in the
+  // all-metrics overview (no single metric to inspect) — rows fall back to free
+  // text there.
+  const keysQuery = useQuery({
+    ...listMetricLabelKeysOptions({
+      query: {
+        project_id: projectId,
+        metric_name: metricName,
+        start_time: fromIso,
+        end_time: toIso,
+      },
+    }),
+    enabled: !!projectId && metricName.length > 0,
+  })
+  const allKeys = keysQuery.data?.keys ?? []
 
   return (
     <div className="flex flex-col gap-2">
@@ -1011,48 +1149,222 @@ function LabelFilterBuilder({
           Add
         </Button>
       </div>
-      {value.length === 0 ? (
+      {rows.length === 0 ? (
         <p className="text-xs text-muted-foreground">
           No label filters. Add key/value pairs to narrow the series by
           attribute (e.g. <span className="font-mono">http.method = GET</span>).
         </p>
       ) : (
         <div className="flex flex-col gap-1.5">
-          {value.map((f, i) => (
-            <div key={i} className="flex items-center gap-1.5">
-              <Input
-                value={f.key}
-                onChange={(e) => update(i, { key: e.target.value })}
-                placeholder="label.key"
-                className="h-8 font-mono text-xs sm:w-[200px]"
-              />
-              <span className="text-muted-foreground">=</span>
-              <Input
-                value={f.value}
-                onChange={(e) => update(i, { value: e.target.value })}
-                placeholder="value"
-                className="h-8 flex-1 font-mono text-xs"
-              />
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                onClick={() => remove(i)}
-                className="h-8 w-8 shrink-0"
-                aria-label="Remove label filter"
-              >
-                <X className="size-3.5" />
-              </Button>
-            </div>
+          {rows.map((f, i) => (
+            <LabelFilterRow
+              // Index key is stable here — rows are only appended/removed, never
+              // reordered — so the per-row value query keeps its identity.
+              key={i}
+              row={f}
+              // Suggest only keys not already used by another row.
+              availableKeys={allKeys.filter(
+                (k) => k === f.key || !rows.some((r) => r.key === k)
+              )}
+              keysLoading={keysQuery.isFetching}
+              projectId={projectId}
+              metricName={metricName}
+              fromIso={fromIso}
+              toIso={toIso}
+              onUpdate={(patch) => update(i, patch)}
+              onRemove={() => remove(i)}
+            />
           ))}
           <p className="text-[11px] text-muted-foreground">
-            Label filters narrow the series to data points carrying the given
-            attribute values, server-side. They are URL-persisted so the view
-            stays shareable.
+            Keys and values autocomplete from the metric&apos;s observed
+            attributes (last 24h). Free text is still accepted for values not in
+            the recent sample. Filters are URL-persisted so the view stays
+            shareable.
           </p>
         </div>
       )}
     </div>
+  )
+}
+
+/** One key=value row with autocomplete on both sides. */
+function LabelFilterRow({
+  row,
+  availableKeys,
+  keysLoading,
+  projectId,
+  metricName,
+  fromIso,
+  toIso,
+  onUpdate,
+  onRemove,
+}: {
+  row: LabelFilter
+  availableKeys: string[]
+  keysLoading: boolean
+  projectId: number
+  metricName: string
+  fromIso: string
+  toIso: string
+  onUpdate: (patch: Partial<LabelFilter>) => void
+  onRemove: () => void
+}) {
+  // Values for THIS row's key — fetched only once a key is chosen on a metric.
+  const valuesQuery = useQuery({
+    ...listMetricLabelValuesOptions({
+      query: {
+        project_id: projectId,
+        metric_name: metricName,
+        label_key: row.key,
+        start_time: fromIso,
+        end_time: toIso,
+      },
+    }),
+    enabled: !!projectId && metricName.length > 0 && row.key.trim().length > 0,
+  })
+
+  return (
+    <div className="flex items-center gap-1.5">
+      <SuggestCombobox
+        value={row.key}
+        options={availableKeys}
+        loading={keysLoading}
+        placeholder="label.key"
+        searchPlaceholder="Search keys…"
+        ariaLabel="Label key"
+        widthClass="w-full sm:w-[200px]"
+        // Changing the key invalidates the previously chosen value.
+        onChange={(next) => onUpdate({ key: next, value: '' })}
+      />
+      <span className="text-muted-foreground">=</span>
+      <SuggestCombobox
+        value={row.value}
+        options={valuesQuery.data?.values ?? []}
+        loading={valuesQuery.isFetching}
+        placeholder="value"
+        searchPlaceholder="Search values…"
+        ariaLabel="Label value"
+        widthClass="flex-1"
+        disabled={row.key.trim().length === 0}
+        onChange={(next) => onUpdate({ value: next })}
+      />
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon"
+        onClick={onRemove}
+        className="h-8 w-8 shrink-0"
+        aria-label="Remove label filter"
+      >
+        <X className="size-3.5" />
+      </Button>
+    </div>
+  )
+}
+
+/**
+ * A combobox that suggests discovered options but still accepts free text — the
+ * sampled discovery may miss a rare key/value, so typing anything commits it via
+ * the "Use …" affordance (or Enter).
+ */
+function SuggestCombobox({
+  value,
+  options,
+  loading,
+  placeholder,
+  searchPlaceholder,
+  ariaLabel,
+  widthClass,
+  disabled,
+  onChange,
+}: {
+  value: string
+  options: string[]
+  loading?: boolean
+  placeholder: string
+  searchPlaceholder: string
+  ariaLabel: string
+  widthClass?: string
+  disabled?: boolean
+  onChange: (next: string) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const [query, setQuery] = useState('')
+  const typed = query.trim()
+  const hasExactOption = options.includes(typed)
+
+  const choose = (next: string) => {
+    onChange(next)
+    setQuery('')
+    setOpen(false)
+  }
+
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <Button
+          type="button"
+          variant="outline"
+          role="combobox"
+          aria-expanded={open}
+          aria-label={ariaLabel}
+          disabled={disabled}
+          className={[
+            'h-8 justify-between gap-1.5 px-2.5 font-mono text-xs font-normal',
+            widthClass ?? '',
+            value ? '' : 'text-muted-foreground',
+          ].join(' ')}
+        >
+          <span className="truncate">{value || placeholder}</span>
+          <ChevronsUpDown className="size-3.5 shrink-0 opacity-50" />
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent align="start" className="w-[240px] p-0">
+        <Command>
+          <CommandInput
+            value={query}
+            onValueChange={setQuery}
+            placeholder={searchPlaceholder}
+            className="text-xs"
+          />
+          <CommandList className="max-h-[240px]">
+            {loading ? (
+              <div className="py-4 text-center text-xs text-muted-foreground">
+                Loading…
+              </div>
+            ) : (
+              <>
+                {typed && !hasExactOption && (
+                  <CommandItem value={typed} onSelect={() => choose(typed)}>
+                    <Check className="size-3.5 shrink-0 opacity-0" />
+                    <span className="truncate font-mono text-xs">
+                      Use “{typed}”
+                    </span>
+                  </CommandItem>
+                )}
+                <CommandEmpty>No matches.</CommandEmpty>
+                {options.map((o) => (
+                  <CommandItem
+                    key={o}
+                    value={o}
+                    onSelect={() => choose(o)}
+                    className="gap-2"
+                  >
+                    <Check
+                      className={[
+                        'size-3.5 shrink-0',
+                        o === value ? 'opacity-100' : 'opacity-0',
+                      ].join(' ')}
+                    />
+                    <span className="truncate font-mono text-xs">{o}</span>
+                  </CommandItem>
+                ))}
+              </>
+            )}
+          </CommandList>
+        </Command>
+      </PopoverContent>
+    </Popover>
   )
 }
 
@@ -1195,23 +1507,43 @@ function histogramQuantile(
   bounds: number[],
   counts: number[],
   q: number,
+  min?: number | null,
+  max?: number | null
 ): number {
   const total = counts.reduce((a, c) => a + c, 0)
   if (total === 0) return 0
   const target = q * total
+  // Bound the first/last populated buckets to the recorded [min, max] so a
+  // single over-wide bucket (e.g. sub-ms samples in a 0–5ms bucket) doesn't
+  // spread quantiles across the whole bucket width (p99≈5 vs a true max ≈0.5).
+  let firstPop = -1
+  let lastPop = -1
+  for (let i = 0; i < counts.length; i++) {
+    if (counts[i] > 0) {
+      if (firstPop < 0) firstPop = i
+      lastPop = i
+    }
+  }
   let cumulative = 0
   for (let i = 0; i < counts.length; i++) {
     const next = cumulative + counts[i]
     if (next >= target && counts[i] > 0) {
-      const lower = i === 0 ? 0 : bounds[i - 1]
-      const upper =
+      let lower = i === 0 ? 0 : bounds[i - 1]
+      let upper =
         i < bounds.length ? bounds[i] : (bounds[bounds.length - 1] ?? lower)
+      if (i === firstPop && min != null) lower = Math.max(lower, min)
+      if (i === lastPop && max != null) upper = Math.min(upper, max)
+      if (upper < lower) upper = lower
       const within = (target - cumulative) / counts[i]
-      return lower + (upper - lower) * within
+      const value = lower + (upper - lower) * within
+      if (min != null && max != null) {
+        return Math.min(Math.max(value, min), max)
+      }
+      return value
     }
     cumulative = next
   }
-  return bounds[bounds.length - 1] ?? 0
+  return max ?? bounds[bounds.length - 1] ?? 0
 }
 
 // ── Histogram distribution panel ──────────────────────────────────────────────
@@ -1223,10 +1555,46 @@ function HistogramDistribution({ hist }: { hist: HistogramSummary }) {
   const stats: { label: string; value: number }[] = [
     { label: 'Count', value: total },
     { label: 'Mean', value: mean },
-    { label: 'p50', value: histogramQuantile(hist.bounds, hist.bucket_counts, 0.5) },
-    { label: 'p90', value: histogramQuantile(hist.bounds, hist.bucket_counts, 0.9) },
-    { label: 'p95', value: histogramQuantile(hist.bounds, hist.bucket_counts, 0.95) },
-    { label: 'p99', value: histogramQuantile(hist.bounds, hist.bucket_counts, 0.99) },
+    {
+      label: 'p50',
+      value: histogramQuantile(
+        hist.bounds,
+        hist.bucket_counts,
+        0.5,
+        hist.min,
+        hist.max
+      ),
+    },
+    {
+      label: 'p90',
+      value: histogramQuantile(
+        hist.bounds,
+        hist.bucket_counts,
+        0.9,
+        hist.min,
+        hist.max
+      ),
+    },
+    {
+      label: 'p95',
+      value: histogramQuantile(
+        hist.bounds,
+        hist.bucket_counts,
+        0.95,
+        hist.min,
+        hist.max
+      ),
+    },
+    {
+      label: 'p99',
+      value: histogramQuantile(
+        hist.bounds,
+        hist.bucket_counts,
+        0.99,
+        hist.min,
+        hist.max
+      ),
+    },
   ]
   // One row per bucket: label is the [lower, upper) range; the last is +Inf.
   const rows = hist.bucket_counts.map((c, i) => {

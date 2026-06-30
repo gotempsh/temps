@@ -47,6 +47,7 @@ fn make_resolver_config(
         // No upstream forwarder in tests — the integration suite only
         // exercises in-zone (`*.temps.local`) lookups.
         upstream_resolvers: vec![],
+        disable_sync: false,
     };
     (cfg, listen)
 }

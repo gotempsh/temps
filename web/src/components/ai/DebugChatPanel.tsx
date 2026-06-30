@@ -11,13 +11,57 @@ import {
   ChevronDown,
   ChevronRight,
   Loader2,
+  Paperclip,
   Send,
   Sparkles,
+  Square,
   Wrench,
 } from 'lucide-react'
+import { cn } from '@/lib/utils'
 import { useCallback, useEffect, useRef, useState } from 'react'
-import ReactMarkdown from 'react-markdown'
+import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import rehypeHighlight from 'rehype-highlight'
+import { useAiAssistant } from './AiAssistantContext'
+// highlight.js token theme for fenced code blocks. github-dark reads well on the
+// dark code surface used in both light and dark app themes.
+import 'highlight.js/styles/github-dark.css'
+
+/** A minimal mdast node (only the fields this file touches). */
+interface MdNode {
+  type: string
+  value?: string
+  children?: MdNode[]
+}
+
+/**
+ * Render a single newline as a `<br>` (a hard break) instead of collapsing it to
+ * a space. Standard Markdown treats a lone `\n` as a *soft* break (whitespace),
+ * so model output like `1\n2\n3` would otherwise render as `1 2 3`. This mirrors
+ * `remark-breaks` (and how ChatGPT/Claude render chat prose) without the extra
+ * dependency. Only `text` nodes are split, so fenced/inline code — which are
+ * `code`/`inlineCode` nodes, not `text` — keep their newlines untouched.
+ */
+function remarkSoftBreaks() {
+  const walk = (node: MdNode) => {
+    if (!node.children) return
+    const out: MdNode[] = []
+    for (const child of node.children) {
+      if (child.type === 'text' && child.value && child.value.includes('\n')) {
+        const segments = child.value.split('\n')
+        segments.forEach((seg, i) => {
+          if (i > 0) out.push({ type: 'break' })
+          if (seg) out.push({ type: 'text', value: seg })
+        })
+      } else {
+        walk(child)
+        out.push(child)
+      }
+    }
+    node.children = out
+  }
+  return (tree: MdNode) => walk(tree)
+}
 
 /** A tool invocation surfaced over the stream / persisted on the message. */
 interface ToolCall {
@@ -29,29 +73,93 @@ interface ToolCall {
 }
 
 /**
- * Local chat message shape. Mirrors the SDK's MessageResponse but with the tool
- * invocations attached to an assistant turn typed as the local ToolCall (the API
- * sends them as `tools` on persisted assistant messages; the live stream fills
- * them in as events arrive).
+ * One ordered segment of an assistant turn — a chunk of prose or a tool
+ * invocation — so tools render inline where they occurred instead of all
+ * hoisted above the text. Built in arrival order from the live event stream, and
+ * replayed from `metadata.parts` on reload (so live and reload look identical).
+ */
+type ChatPart =
+  | { type: 'text'; text: string }
+  | { type: 'tool'; tool: ToolCall }
+
+/**
+ * Local chat message shape. Mirrors the SDK's MessageResponse. Assistant turns
+ * carry ordered `parts` (text/tool segments); `tools` is kept for backward
+ * compatibility with turns persisted before parts were tracked.
  */
 interface ChatMessage {
   role: string
   content: string
   created_at?: string
   tools?: ToolCall[]
+  parts?: ChatPart[]
 }
 
-/** Pretty-print a JSON-args string when it parses; otherwise return it raw. */
-function prettyJson(raw: string): string {
-  try {
-    return JSON.stringify(JSON.parse(raw), null, 2)
-  } catch {
-    return raw
+/** Render segments for an assistant message, falling back for legacy turns that
+ *  predate ordered `parts` (tools first, then the prose). */
+function assistantParts(m: ChatMessage): ChatPart[] {
+  if (m.parts && m.parts.length > 0) return m.parts
+  const parts: ChatPart[] = []
+  for (const tool of m.tools ?? []) parts.push({ type: 'tool', tool })
+  if (m.content) parts.push({ type: 'text', text: m.content })
+  return parts
+}
+
+/**
+ * Human label for a tool card — what the tool actually did. For the `temps`
+ * virtual CLI that's the command it ran (e.g. `traces get_trace --trace_id …`),
+ * which is far more useful than four identical "temps" rows. Falls back to the
+ * tool name for other tools or unparsable args.
+ */
+function toolLabel(tool: ToolCall): string {
+  if (tool.name === 'temps') {
+    try {
+      const args = JSON.parse(tool.arguments) as { command?: unknown }
+      if (typeof args.command === 'string' && args.command.trim()) {
+        return args.command.trim()
+      }
+    } catch {
+      /* fall through to the tool name */
+    }
   }
+  return tool.name
 }
 
 const toolBlockClasses =
   'max-h-48 overflow-auto whitespace-pre-wrap break-words rounded bg-background p-2 font-mono text-[11px]'
+
+/**
+ * Render a tool's arguments/result. JSON is syntax-highlighted via the same
+ * `rehype-highlight` pipeline the assistant's code blocks use (so it matches the
+ * rest of the chat); non-JSON text (CLI `--help` output, errors) falls back to a
+ * plain preformatted block. Height-capped with its own scroll.
+ */
+function ToolBlock({ value }: { value: string }) {
+  let json: string | null = null
+  try {
+    json = JSON.stringify(JSON.parse(value), null, 2)
+  } catch {
+    json = null
+  }
+  if (json === null) {
+    return <pre className={toolBlockClasses}>{value}</pre>
+  }
+  return (
+    <div
+      className={cn(
+        proseClasses,
+        'scrollbar-thin max-h-48 overflow-auto [&_pre]:my-0 [&_pre]:text-[11px]'
+      )}
+    >
+      <ReactMarkdown
+        rehypePlugins={[[rehypeHighlight, { detect: true, ignoreMissing: true }]]}
+        components={markdownComponents}
+      >
+        {`\`\`\`json\n${json}\n\`\`\``}
+      </ReactMarkdown>
+    </div>
+  )
+}
 
 /** A collapsible card for one tool invocation + its result. */
 function ToolCard({ tool }: { tool: ToolCall }) {
@@ -66,7 +174,9 @@ function ToolCard({ tool }: { tool: ToolCall }) {
         aria-expanded={open}
       >
         <Wrench className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-        <span className="min-w-0 flex-1 truncate font-medium">{tool.name}</span>
+        <span className="min-w-0 flex-1 truncate font-mono text-[11px] font-medium">
+          {toolLabel(tool)}
+        </span>
         {running && (
           <Loader2
             className="h-3.5 w-3.5 shrink-0 animate-spin text-muted-foreground"
@@ -83,12 +193,12 @@ function ToolCard({ tool }: { tool: ToolCall }) {
         <div className="min-w-0 space-y-2 border-t px-2.5 py-2">
           <div className="min-w-0 space-y-1">
             <div className="font-medium text-muted-foreground">Arguments</div>
-            <pre className={toolBlockClasses}>{prettyJson(tool.arguments)}</pre>
+            <ToolBlock value={tool.arguments} />
           </div>
           {!running && (
             <div className="min-w-0 space-y-1">
               <div className="font-medium text-muted-foreground">Result</div>
-              <pre className={toolBlockClasses}>{tool.result}</pre>
+              <ToolBlock value={tool.result ?? ''} />
             </div>
           )}
         </div>
@@ -122,7 +232,7 @@ interface DebugChatPanelProps {
 }
 
 const proseClasses =
-  'prose prose-sm dark:prose-invert max-w-none prose-pre:bg-black/30 prose-pre:text-muted-foreground prose-pre:text-xs prose-pre:border-0 prose-code:before:content-none prose-code:after:content-none prose-p:my-1.5 prose-headings:my-2 prose-ul:my-1.5 prose-ul:list-disc prose-ul:pl-5 prose-ol:my-1.5 prose-ol:list-decimal prose-ol:pl-5 prose-li:my-0.5 prose-li:marker:text-foreground/60 prose-hr:my-3 prose-hr:border-border prose-table:text-xs prose-th:px-2 prose-th:py-1 prose-td:px-2 prose-td:py-1'
+  'prose prose-sm dark:prose-invert max-w-none prose-pre:bg-[#0d1117] prose-pre:text-xs prose-pre:border-0 prose-pre:overflow-x-auto prose-pre:rounded-lg prose-code:before:content-none prose-code:after:content-none prose-p:my-1.5 prose-headings:my-2 prose-ul:my-1.5 prose-ul:list-disc prose-ul:pl-5 prose-ol:my-1.5 prose-ol:list-decimal prose-ol:pl-5 prose-li:my-0.5 prose-li:marker:text-foreground/60 prose-hr:my-3 prose-hr:border-border prose-table:text-xs prose-th:px-2 prose-th:py-1 prose-td:px-2 prose-td:py-1'
 
 /** Three-dot "assistant is thinking" indicator. */
 function TypingDots() {
@@ -140,6 +250,76 @@ function AssistantAvatar() {
     <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-primary/10">
       <Sparkles className="h-4 w-4 text-primary" />
     </div>
+  )
+}
+
+/** Open links (including `remark-gfm` autolinked bare URLs) in a new tab, styled
+ *  as links. `rel="noopener noreferrer"` so the opened page can't access us. */
+const markdownComponents: Components = {
+  a({ node: _node, className, ...props }) {
+    return (
+      <a
+        {...props}
+        target="_blank"
+        rel="noopener noreferrer"
+        className={cn(
+          'font-medium text-primary underline underline-offset-2 hover:text-primary/80 break-all',
+          className
+        )}
+      />
+    )
+  },
+  // Give horizontally-scrolling code blocks a thin, subtle scrollbar instead of
+  // the chunky default OS bar over the dark code surface.
+  pre({ node: _node, className, ...props }) {
+    return <pre {...props} className={cn('scrollbar-thin', className)} />
+  },
+}
+
+/** Render one chunk of assistant prose as Markdown. */
+function MarkdownText({ text }: { text: string }) {
+  return (
+    <div className={proseClasses}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm, remarkSoftBreaks]}
+        // `detect` so unlabeled ``` fences (common in LLM output) still get
+        // highlighted; `ignoreMissing` avoids throwing on an unknown language hint.
+        rehypePlugins={[[rehypeHighlight, { detect: true, ignoreMissing: true }]]}
+        components={markdownComponents}
+      >
+        {text}
+      </ReactMarkdown>
+    </div>
+  )
+}
+
+/**
+ * The body of an assistant turn: its ordered text/tool segments, so a tool card
+ * shows exactly where the model invoked it rather than hoisted above the prose.
+ * Shows the typing indicator only while a trailing turn is streaming with nothing
+ * rendered yet (no tools, no text) — never an empty turn left by a failed send.
+ */
+function AssistantBody({
+  message,
+  streaming,
+}: {
+  message: ChatMessage
+  streaming: boolean
+}) {
+  const parts = assistantParts(message)
+  if (parts.length === 0) {
+    return streaming ? <TypingDots /> : null
+  }
+  return (
+    <>
+      {parts.map((part, idx) =>
+        part.type === 'tool' ? (
+          <ToolCard key={part.tool.id} tool={part.tool} />
+        ) : (
+          <MarkdownText key={`text-${idx}`} text={part.text} />
+        )
+      )}
+    </>
   )
 }
 
@@ -163,9 +343,22 @@ export function DebugChatPanel({
 }: DebugChatPanelProps) {
   const base = `/api/projects/${projectId}/ai/conversations`
   const ctxId = String(contextId)
+  // Per-chat draft key: a half-typed message survives closing the dock,
+  // switching chats, and reloads.
+  const draftKey = `temps.ai.draft.${projectId}:${contextType}:${ctxId}`
+  // Current page context (what the user is viewing). Shown as a chip by the
+  // input; the user can toggle whether it's attached.
+  const { pageContext } = useAiAssistant()
+  const [includeContext, setIncludeContext] = useState(true)
   const [publicId, setPublicId] = useState<string | null>(null)
   const [messages, setMessages] = useState<ChatMessage[]>([])
-  const [input, setInput] = useState('')
+  const [input, setInput] = useState(() => {
+    try {
+      return localStorage.getItem(draftKey) ?? ''
+    } catch {
+      return ''
+    }
+  })
   const [streaming, setStreaming] = useState(false)
   const [starting, setStarting] = useState(false)
   // True until the run-once init fetch resolves. Lets us show a skeleton instead
@@ -174,6 +367,27 @@ export function DebugChatPanel({
   const [initializing, setInitializing] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
+  // Aborts the in-flight streaming request when the user hits Stop (or the panel
+  // unmounts). Dropping the SSE connection also tells the server to stop
+  // generating, so a stopped turn doesn't keep costing tokens.
+  const abortRef = useRef<AbortController | null>(null)
+
+  const stop = useCallback(() => {
+    abortRef.current?.abort()
+  }, [])
+
+  // Abort any in-flight stream if the panel unmounts mid-generation.
+  useEffect(() => () => abortRef.current?.abort(), [])
+
+  // Persist the draft as the user types; clear it once sent (input → '').
+  useEffect(() => {
+    try {
+      if (input) localStorage.setItem(draftKey, input)
+      else localStorage.removeItem(draftKey)
+    } catch {
+      /* storage unavailable — non-fatal */
+    }
+  }, [input, draftKey])
 
   const send = useCallback(
     async (text: string, conversationId?: string) => {
@@ -221,14 +435,24 @@ export function DebugChatPanel({
           id = conv.public_id
           setPublicId(conv.public_id)
         }
+        const controller = new AbortController()
+        abortRef.current = controller
         const res = await fetch(`${base}/${id}/messages`, {
           method: 'POST',
           credentials: 'include',
+          signal: controller.signal,
           headers: {
             'Content-Type': 'application/json',
             Accept: 'text/event-stream',
           },
-          body: JSON.stringify({ content }),
+          body: JSON.stringify({
+            content,
+            // Ephemeral framing about the page the user is on — not stored or
+            // shown; the backend attaches it to this turn only. Honours the
+            // user's include toggle.
+            page_context:
+              includeContext && pageContext ? pageContext.value : undefined,
+          }),
         })
         if (!res.ok || !res.body) {
           const problem = await res.json().catch(() => ({}))
@@ -273,17 +497,16 @@ export function DebugChatPanel({
                   const copy = [...m]
                   const last = copy[copy.length - 1]
                   if (last?.role === 'assistant') {
+                    const tool: ToolCall = {
+                      id: t.id,
+                      name: t.name,
+                      arguments: t.arguments,
+                      result: undefined,
+                    }
                     copy[copy.length - 1] = {
                       ...last,
-                      tools: [
-                        ...(last.tools ?? []),
-                        {
-                          id: t.id,
-                          name: t.name,
-                          arguments: t.arguments,
-                          result: undefined,
-                        },
-                      ],
+                      tools: [...(last.tools ?? []), tool],
+                      parts: [...(last.parts ?? []), { type: 'tool', tool }],
                     }
                   }
                   return copy
@@ -303,11 +526,16 @@ export function DebugChatPanel({
                 setMessages((m) => {
                   const copy = [...m]
                   const last = copy[copy.length - 1]
-                  if (last?.role === 'assistant' && last.tools) {
+                  if (last?.role === 'assistant') {
                     copy[copy.length - 1] = {
                       ...last,
-                      tools: last.tools.map((tool) =>
+                      tools: (last.tools ?? []).map((tool) =>
                         tool.id === t.id ? { ...tool, result: t.content } : tool
+                      ),
+                      parts: (last.parts ?? []).map((part) =>
+                        part.type === 'tool' && part.tool.id === t.id
+                          ? { type: 'tool', tool: { ...part.tool, result: t.content } }
+                          : part
                       ),
                     }
                   }
@@ -322,10 +550,22 @@ export function DebugChatPanel({
               setMessages((m) => {
                 const copy = [...m]
                 const last = copy[copy.length - 1]
+                // Append to the trailing text part, or open a new one (so prose
+                // that follows a tool call becomes its own segment).
+                const prevParts = last?.parts ?? []
+                const lastPart = prevParts[prevParts.length - 1]
+                const parts: ChatPart[] =
+                  lastPart?.type === 'text'
+                    ? [
+                        ...prevParts.slice(0, -1),
+                        { type: 'text', text: lastPart.text + chunk },
+                      ]
+                    : [...prevParts, { type: 'text', text: chunk }]
                 copy[copy.length - 1] = {
                   ...last,
                   role: 'assistant',
                   content: (last?.content ?? '') + chunk,
+                  parts,
                   created_at: last?.created_at ?? new Date().toISOString(),
                 }
                 return copy
@@ -333,14 +573,30 @@ export function DebugChatPanel({
             }
           }
         }
-      } catch {
-        setError('Connection error while talking to the AI.')
-        dropEmptyAssistantTurn()
+      } catch (e) {
+        // A user-initiated Stop (AbortController) is not an error — just keep
+        // whatever streamed so far and drop the turn only if nothing arrived.
+        if (e instanceof DOMException && e.name === 'AbortError') {
+          dropEmptyAssistantTurn()
+        } else {
+          setError('Connection error while talking to the AI.')
+          dropEmptyAssistantTurn()
+        }
       } finally {
+        abortRef.current = null
         setStreaming(false)
       }
     },
-    [base, publicId, lazyCreate, projectId, contextType, ctxId]
+    [
+      base,
+      publicId,
+      lazyCreate,
+      projectId,
+      contextType,
+      ctxId,
+      pageContext,
+      includeContext,
+    ]
   )
 
   const start = useCallback(async () => {
@@ -402,12 +658,19 @@ export function DebugChatPanel({
         }).catch(() => ({ data: null }))
         if (!ignore && detail) {
           setMessages(
-            (detail.messages ?? []).map((m) => ({
-              role: m.role,
-              content: m.content,
-              created_at: m.created_at,
-              tools: m.tools ?? undefined,
-            }))
+            (detail.messages ?? []).map((m) => {
+              // `parts` is newer than the current generated SDK type; read it
+              // defensively until the client is regenerated.
+              const rawParts = (m as { parts?: ChatPart[] }).parts
+              return {
+                role: m.role,
+                content: m.content,
+                created_at: m.created_at,
+                tools: m.tools ?? undefined,
+                parts:
+                  rawParts && rawParts.length > 0 ? rawParts : undefined,
+              }
+            })
           )
         }
       } catch {
@@ -514,36 +777,17 @@ export function DebugChatPanel({
               <AssistantAvatar />
               <div className="min-w-0 flex-1 space-y-1">
                 <div className="min-w-0 space-y-2 rounded-2xl rounded-tl-sm bg-muted/60 px-3.5 py-2.5">
-                  {m.tools && m.tools.length > 0 && (
-                    <div className="min-w-0 space-y-1.5">
-                      {m.tools.map((tool) => (
-                        <ToolCard key={tool.id} tool={tool} />
-                      ))}
-                    </div>
-                  )}
-                  {m.content ? (
-                    <div className={proseClasses}>
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                        {m.content}
-                      </ReactMarkdown>
-                    </div>
-                  ) : (
-                    // Only the trailing turn that is actively streaming, and which
-                    // has neither content nor tools yet, gets dots — never an empty
-                    // turn left behind by a failed send, and never once tool cards
-                    // are already showing the work in progress.
-                    streaming &&
-                    i === visible.length - 1 &&
-                    !(m.tools && m.tools.length > 0) && <TypingDots />
-                  )}
+                  <AssistantBody
+                    message={m}
+                    streaming={streaming && i === visible.length - 1}
+                  />
                 </div>
-                {m.created_at &&
-                  (m.content || (m.tools && m.tools.length > 0)) && (
-                    <TimeAgo
-                      date={m.created_at}
-                      className="px-1 text-[10px] text-muted-foreground"
-                    />
-                  )}
+                {m.created_at && assistantParts(m).length > 0 && (
+                  <TimeAgo
+                    date={m.created_at}
+                    className="px-1 text-[10px] text-muted-foreground"
+                  />
+                )}
               </div>
             </div>
           )
@@ -551,6 +795,33 @@ export function DebugChatPanel({
       </div>
 
       {error && <p className="text-sm text-destructive">{error}</p>}
+
+      {/* Page-context chip: tells the user what page context is attached, and
+          lets them toggle whether it's sent with the next message. */}
+      {pageContext && (
+        <button
+          type="button"
+          onClick={() => setIncludeContext((v) => !v)}
+          className={cn(
+            'flex items-center gap-1.5 self-start rounded-full border px-2.5 py-1 text-xs transition-colors',
+            includeContext
+              ? 'border-primary/30 bg-primary/10 text-primary hover:bg-primary/15'
+              : 'border-border bg-muted/40 text-muted-foreground hover:bg-muted'
+          )}
+          title={
+            includeContext
+              ? `Context about ${pageContext.label} is shared with the assistant. Click to exclude it.`
+              : `Context about ${pageContext.label} is not shared. Click to include it.`
+          }
+        >
+          <Paperclip
+            className={cn('h-3 w-3', !includeContext && 'opacity-50')}
+          />
+          {includeContext
+            ? `Sharing context: ${pageContext.label}`
+            : `Share context: ${pageContext.label}`}
+        </button>
+      )}
 
       <div className="flex items-end gap-2 border-t pt-3">
         <Textarea
@@ -567,17 +838,27 @@ export function DebugChatPanel({
             }
           }}
         />
-        <Button
-          onClick={() => void send(input)}
-          disabled={streaming || !input.trim() || (!publicId && !lazyCreate)}
-          size="icon"
-        >
-          {streaming ? (
-            <Loader2 className="h-4 w-4 animate-spin" />
-          ) : (
+        {streaming ? (
+          <Button
+            type="button"
+            onClick={stop}
+            size="icon"
+            variant="secondary"
+            title="Stop generating"
+            aria-label="Stop generating"
+          >
+            <Square className="h-3.5 w-3.5 fill-current" />
+          </Button>
+        ) : (
+          <Button
+            onClick={() => void send(input)}
+            disabled={!input.trim() || (!publicId && !lazyCreate)}
+            size="icon"
+            aria-label="Send message"
+          >
             <Send className="h-4 w-4" />
-          )}
-        </Button>
+          </Button>
+        )}
       </div>
     </div>
   )

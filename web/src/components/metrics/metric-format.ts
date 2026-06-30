@@ -72,26 +72,49 @@ export function percentileFromAgg(agg: string): number {
  * bucket that crosses the target rank. `bounds` are ascending upper bounds;
  * `counts` has length `bounds.length + 1` (the trailing entry is the +Inf
  * bucket). Returns 0 for an empty histogram.
+ *
+ * When the recorded `min`/`max` are passed, the first and last *populated*
+ * buckets are bounded to the observed range. Without this, a single over-wide
+ * bucket (e.g. all sub-millisecond samples in a `0–5ms` bucket) spreads the
+ * quantiles across the full bucket width — so p99 reads ~5 while the true max
+ * is ~0.5. Bounding to [min, max] keeps quantiles inside the observed values.
  */
 export function histogramQuantile(
   bounds: number[],
   counts: number[],
   q: number,
+  min?: number | null,
+  max?: number | null,
 ): number {
   const total = counts.reduce((a, c) => a + c, 0)
   if (total === 0) return 0
   const target = q * total
+  let firstPop = -1
+  let lastPop = -1
+  for (let i = 0; i < counts.length; i++) {
+    if (counts[i] > 0) {
+      if (firstPop < 0) firstPop = i
+      lastPop = i
+    }
+  }
   let cumulative = 0
   for (let i = 0; i < counts.length; i++) {
     const next = cumulative + counts[i]
     if (next >= target && counts[i] > 0) {
-      const lower = i === 0 ? 0 : bounds[i - 1]
-      const upper =
+      let lower = i === 0 ? 0 : bounds[i - 1]
+      let upper =
         i < bounds.length ? bounds[i] : (bounds[bounds.length - 1] ?? lower)
+      if (i === firstPop && min != null) lower = Math.max(lower, min)
+      if (i === lastPop && max != null) upper = Math.min(upper, max)
+      if (upper < lower) upper = lower
       const within = (target - cumulative) / counts[i]
-      return lower + (upper - lower) * within
+      const value = lower + (upper - lower) * within
+      if (min != null && max != null) {
+        return Math.min(Math.max(value, min), max)
+      }
+      return value
     }
     cumulative = next
   }
-  return bounds[bounds.length - 1] ?? 0
+  return max ?? bounds[bounds.length - 1] ?? 0
 }

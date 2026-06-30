@@ -28,7 +28,6 @@
     "format:check": "prettier --check \"src/**/*.{ts,tsx,js,jsx,json,css,md}\""
   },
   "dependencies": {
-    "@temps-sdk/console-kit": "file:./packages/console-kit",
     "@hookform/resolvers": "^5.2.2",
     "@monaco-editor/react": "^4.7.0",
     "@nivo/line": "^0.99.0",
@@ -56,6 +55,7 @@
     "@tailwindcss/postcss": "^4.1.12",
     "@tanstack/react-query": "^5.85.5",
     "@tanstack/react-virtual": "^3.13.12",
+    "@temps-sdk/console-kit": "file:./packages/console-kit",
     "@temps-sdk/react-analytics": "^0.0.1-beta.15",
     "@types/three": "^0.182.0",
     "ansi-to-html": "^0.7.2",
@@ -68,6 +68,7 @@
     "framer-motion": "^12.23.16",
     "fuse.js": "^7.1.0",
     "ghostty-web": "^0.4.0",
+    "highlight.js": "^11.11.1",
     "lucide-react": "^0.544.0",
     "monaco-editor": "^0.53.0",
     "nanoid": "^5.1.5",
@@ -82,6 +83,7 @@
     "react-router-dom": "^7.9.1",
     "react-simple-maps": "^3.0.0",
     "recharts": "2.15.4",
+    "rehype-highlight": "^7.0.2",
     "remark-gfm": "^4.0.1",
     "rrweb-player": "^1.0.0-alpha.4",
     "slugify": "^1.6.6",

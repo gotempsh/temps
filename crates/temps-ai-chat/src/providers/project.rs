@@ -21,9 +21,8 @@ use crate::provider::{ConversationContextProvider, ConversationSeed};
 
 const SYSTEM_PREAMBLE: &str = "You are an expert SRE/DevOps assistant embedded in the Temps platform, helping a developer with \
 their project. Answer questions and help debug issues across the project's deployments, build/runtime logs, distributed \
-traces, metrics, and errors. Use the available tools to ground your answers in real data — for example, inspect recent \
-traces to find failing or slow requests, then drill into a specific trace. Be concise and practical; ask a brief \
-clarifying question only when essential, and never invent facts you cannot verify with a tool.";
+traces, metrics, and errors. For example, inspect recent traces to find failing or slow requests, then drill into a \
+specific trace.";
 
 /// Seeds general, project-scoped assistant chats.
 pub struct ProjectChatProvider {
@@ -52,6 +51,8 @@ impl ConversationContextProvider for ProjectChatProvider {
 
         let mut ctx = String::new();
         ctx.push_str(SYSTEM_PREAMBLE);
+        ctx.push_str("\n\n");
+        ctx.push_str(crate::provider::TOOL_USAGE_GUIDANCE);
         ctx.push_str("\n\n--- Project ---\n");
         ctx.push_str(&format!("Name: {}\n", project.name));
         ctx.push_str(&format!(

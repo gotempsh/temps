@@ -58,6 +58,14 @@ pub fn configure_routes() -> Router<OtelAppState> {
             "/otel/metric-names/{project_id}",
             get(query_handler::list_metric_names),
         )
+        .route(
+            "/otel/metric-label-keys",
+            get(query_handler::list_metric_label_keys),
+        )
+        .route(
+            "/otel/metric-label-values",
+            get(query_handler::list_metric_label_values),
+        )
         .route("/otel/traces", get(query_handler::query_traces))
         .route(
             "/otel/trace-summaries",

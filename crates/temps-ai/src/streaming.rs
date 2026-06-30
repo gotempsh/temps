@@ -121,3 +121,21 @@ pub struct ChatTurnResponse {
 /// A stream of assistant text deltas. Each `Ok(String)` is an incremental chunk
 /// to append; the stream ends when the reply is complete. Errors are terminal.
 pub type TokenStream = Pin<Box<dyn Stream<Item = Result<String, AiError>> + Send>>;
+
+/// One delta from a streaming *agentic* turn ([`crate::AiService::chat_stream_turn`]).
+/// A single provider pass can interleave assistant text and tool calls: the
+/// OpenAI/Anthropic streaming APIs emit tool-call argument fragments inline, so
+/// the provider accumulates them and surfaces each as a fully-assembled
+/// [`ToolCall`] once complete. This is what lets the UI show tool activity *and*
+/// streamed prose from a single model call (the same thing the Vercel AI SDK
+/// does), instead of a separate non-streaming gather pass.
+#[derive(Debug, Clone)]
+pub enum ChatStreamDelta {
+    /// An incremental chunk of assistant prose to append to the message.
+    Text(String),
+    /// A fully-assembled tool call the model decided to make this turn.
+    ToolCall(ToolCall),
+}
+
+/// A stream of [`ChatStreamDelta`]s for one agentic turn. Errors are terminal.
+pub type ChatTurnStream = Pin<Box<dyn Stream<Item = Result<ChatStreamDelta, AiError>> + Send>>;

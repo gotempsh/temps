@@ -1,0 +1,11 @@
+{
+  "name": "temps-echo-server",
+  "version": "1.0.0",
+  "description": "Minimal echo server for Temps multi-node deployment demos — reflects request headers and environment, including Temps node-identity variables.",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "license": "Apache-2.0"
+}

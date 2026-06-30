@@ -12,6 +12,7 @@ categories = ["development-tools"]
 
 [dependencies]
 temps-ai = { path = "../temps-ai" }
+temps-ai-api-tools = { path = "../temps-ai-api-tools" }
 temps-entities = { path = "../temps-entities" }
 temps-core = { path = "../temps-core" }
 temps-auth = { path = "../temps-auth" }

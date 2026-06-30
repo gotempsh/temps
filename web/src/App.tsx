@@ -16,7 +16,7 @@ import {
 } from '@temps-sdk/console-kit'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Loader2 } from 'lucide-react'
-import { lazy, Suspense } from 'react'
+import { lazy, Suspense, useEffect } from 'react'
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
 import { toast, Toaster } from 'sonner'
 import { ProblemDetails } from './api/client'
@@ -44,6 +44,9 @@ const Account = lazy(() =>
 )
 const Projects = lazy(() =>
   import('./pages/Projects').then((m) => ({ default: m.Projects }))
+)
+const Alarms = lazy(() =>
+  import('./pages/Alarms').then((m) => ({ default: m.Alarms }))
 )
 const Revenue = lazy(() =>
   import('./pages/Revenue').then((m) => ({ default: m.Revenue }))
@@ -341,6 +344,31 @@ const PageLoader = () => (
 // Full app routes with sidebar
 const FullAppRoutes = () => {
   const { routes: extraRoutes } = useConsoleExtensions()
+
+  // Lock the document to the viewport while the app shell is mounted. The shell
+  // is a fixed-height (`dvh`) layout whose content scrolls in inner containers,
+  // so the document itself must not scroll — otherwise dragging on the header
+  // (outside any inner scroller) rubber-bands / scrolls the whole page on
+  // mobile. Scoped to the shell so standalone pages (login, errors) keep normal
+  // full-page scrolling; restored on unmount.
+  useEffect(() => {
+    const body = document.body.style
+    const html = document.documentElement.style
+    const prev = {
+      bodyOverflow: body.overflow,
+      bodyOverscroll: body.overscrollBehavior,
+      htmlOverscroll: html.overscrollBehavior,
+    }
+    body.overflow = 'hidden'
+    body.overscrollBehavior = 'none'
+    html.overscrollBehavior = 'none'
+    return () => {
+      body.overflow = prev.bodyOverflow
+      body.overscrollBehavior = prev.bodyOverscroll
+      html.overscrollBehavior = prev.htmlOverscroll
+    }
+  }, [])
+
   return (
     <BreadcrumbProvider>
       <AiAssistantProvider>
@@ -411,6 +439,7 @@ const FullAppRoutes = () => {
                 <Route path="/sandboxes/:sandboxId" element={<SandboxDetail />} />
                 <Route path="/monitoring" element={<Monitoring />}>
                   <Route index element={<Navigate to="resources" replace />} />
+                  <Route path="alarms" element={<Alarms />} />
                   <Route path="providers/add" element={<AddNotificationProvider />} />
                   <Route path="providers/edit/:id" element={<EditNotificationProvider />} />
                   <Route path=":section" element={<MonitoringSettings />} />

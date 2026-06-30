@@ -38,14 +38,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
     tag = "Audit Logs",
     get,
     path = "audit/logs",
-    params(
-        ("operation_type", Query, description = "Filter logs by operation type"),
-        ("user_id", Query, description = "Filter logs by user ID"),
-        ("from", Query, description = "Start timestamp (milliseconds since epoch)"),
-        ("to", Query, description = "End timestamp (milliseconds since epoch)"),
-        ("limit", Query, description = "Maximum number of logs to return"),
-        ("offset", Query, description = "Number of logs to skip")
-    ),
+    params(ListAuditLogsQuery),
     responses(
         (status = 200, description = "List of audit logs", body = Vec<AuditLogResponse>),
         (status = 401, description = "Unauthorized"),

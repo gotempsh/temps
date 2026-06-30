@@ -14,8 +14,8 @@ use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use tracing::debug;
 
 use temps_ai::{
-    AiError, AiRequest, AiResponse, AiService, ChatMessage, ChatTool, ChatTurnRequest,
-    ChatTurnResponse, TokenStream, ToolCall,
+    AiError, AiRequest, AiResponse, AiService, ChatMessage, ChatStreamDelta, ChatTool,
+    ChatTurnRequest, ChatTurnResponse, ChatTurnStream, TokenStream, ToolCall,
 };
 
 use crate::services::{ByokOverride, GatewayService};
@@ -66,14 +66,23 @@ impl GatewayAiService {
             }
         }
 
-        // Fallback: no allow-list configured (the common case — there is no UI for
-        // it). Use a sensible default model for the first active provider key, so
-        // AI works as soon as a key is added, with no separate allow-list step.
+        // No allow-list configured (the common case). Use the first active
+        // provider key: prefer the model the operator pinned on it in the AI
+        // Providers UI (`default_model`), else a sensible per-provider default —
+        // so AI works as soon as a key is added, with no separate step.
         let key = temps_entities::ai_provider_keys::Entity::find()
             .filter(temps_entities::ai_provider_keys::Column::IsActive.eq(true))
             .one(self.db.as_ref())
             .await
             .ok()??;
+        if let Some(m) = key
+            .default_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Some(m.to_string());
+        }
         default_model_for_provider(&key.provider)
     }
 }
@@ -165,6 +174,56 @@ fn tool_to_json(t: &ChatTool) -> serde_json::Value {
             "parameters": t.parameters,
         },
     })
+}
+
+/// Merge one SSE chunk's `delta.tool_calls` fragments into the per-`index`
+/// accumulator. The first fragment for an index carries `id` + `function.name`;
+/// later fragments append `function.arguments` text. Each entry is
+/// `(id, name, arguments-so-far)`.
+fn accumulate_tool_call_deltas(
+    pending: &mut Vec<(String, String, String)>,
+    deltas: &[serde_json::Value],
+) {
+    for tc in deltas {
+        let idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+        while pending.len() <= idx {
+            pending.push((String::new(), String::new(), String::new()));
+        }
+        let slot = &mut pending[idx];
+        if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+            if !id.is_empty() {
+                slot.0 = id.to_string();
+            }
+        }
+        if let Some(func) = tc.get("function") {
+            if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+                if !name.is_empty() {
+                    slot.1 = name.to_string();
+                }
+            }
+            if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
+                slot.2.push_str(args);
+            }
+        }
+    }
+}
+
+/// Drain the per-index accumulator into fully-assembled [`ToolCall`]s, skipping
+/// empty slots and defaulting empty arguments to `{}`.
+fn assemble_tool_calls(pending: &mut Vec<(String, String, String)>) -> Vec<ToolCall> {
+    pending
+        .drain(..)
+        .filter(|(id, name, _)| !id.is_empty() || !name.is_empty())
+        .map(|(id, name, arguments)| ToolCall {
+            id,
+            name,
+            arguments: if arguments.is_empty() {
+                "{}".to_string()
+            } else {
+                arguments
+            },
+        })
+        .collect()
 }
 
 /// Parse one OpenAI tool-call value (`{id, function:{name, arguments}}`).
@@ -393,6 +452,130 @@ impl AiService for GatewayAiService {
         };
         Ok(Box::pin(token_stream))
     }
+
+    async fn chat_stream_turn(&self, request: ChatTurnRequest) -> Result<ChatTurnStream, AiError> {
+        let model = self
+            .resolve_model(request.project_id, request.model.as_deref())
+            .await
+            .ok_or_else(|| AiError::NoModel {
+                purpose: request.purpose.clone(),
+            })?;
+
+        // Full message serialization (tool-call / tool-result shape preserved) +
+        // the tool schemas, so the model can stream tool calls inline — unlike the
+        // text-only `chat_stream`, which drops both.
+        let messages: Vec<serde_json::Value> =
+            request.messages.iter().map(message_to_json).collect();
+        let mut body = serde_json::json!({ "model": model, "messages": messages, "stream": true });
+        if !request.tools.is_empty() {
+            body["tools"] =
+                serde_json::Value::Array(request.tools.iter().map(tool_to_json).collect());
+        }
+        if let Some(mt) = request.max_tokens {
+            body["max_tokens"] = serde_json::json!(mt);
+        }
+        if let Some(t) = request.temperature {
+            body["temperature"] = serde_json::json!(t);
+        }
+        let chat_req: ChatCompletionRequest =
+            serde_json::from_value(body).map_err(|e| AiError::Provider {
+                purpose: request.purpose.clone(),
+                reason: format!("malformed request: {e}"),
+            })?;
+
+        let purpose = request.purpose.clone();
+        tracing::debug!(
+            "chat_stream_turn: model={model} tools={} purpose={purpose}",
+            chat_req.tools.as_ref().map(|t| t.len()).unwrap_or(0)
+        );
+        let (byte_stream, _cred) = self
+            .gateway
+            .chat_completion_stream(&chat_req, &ByokOverride::default())
+            .await
+            .map_err(|e| AiError::Provider {
+                purpose: purpose.clone(),
+                reason: e.to_string(),
+            })?;
+
+        // Parse the OpenAI-format SSE byte stream into interleaved text + tool-call
+        // deltas. Tool calls arrive incrementally: the first delta for a given
+        // `index` carries `id` + `function.name`, and later deltas append
+        // `function.arguments` fragments. We accumulate per-index and emit a
+        // fully-assembled `ToolCall` once the stream finishes (`finish_reason:
+        // tool_calls`, or `[DONE]`/end). `data:` lines can split across byte
+        // chunks, so buffer to line boundaries.
+        let delta_stream = async_stream::stream! {
+            let mut byte_stream = byte_stream;
+            let mut buf = String::new();
+            // (id, name, arguments-so-far) accumulated per tool-call `index`.
+            let mut pending: Vec<(String, String, String)> = Vec::new();
+
+            while let Some(item) = byte_stream.next().await {
+                match item {
+                    Ok(bytes) => {
+                        buf.push_str(&String::from_utf8_lossy(&bytes));
+                        while let Some(nl) = buf.find('\n') {
+                            let line: String = buf.drain(..=nl).collect();
+                            let line = line.trim();
+                            let Some(data) = line.strip_prefix("data:") else { continue };
+                            let data = data.trim();
+                            if data == "[DONE]" {
+                                // Flush any accumulated tool calls and finish.
+                                for tc in assemble_tool_calls(&mut pending) {
+                                    yield Ok(ChatStreamDelta::ToolCall(tc));
+                                }
+                                return;
+                            }
+                            let chunk = match serde_json::from_str::<ChatCompletionChunk>(data) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "chat_stream_turn: unparsed SSE data ({e}): {}",
+                                        data.chars().take(300).collect::<String>()
+                                    );
+                                    continue;
+                                }
+                            };
+                            let Some(choice) = chunk.choices.first() else { continue };
+                            // Text delta -> stream immediately.
+                            if let Some(content) = choice.delta.content.as_ref() {
+                                if !content.is_empty() {
+                                    yield Ok(ChatStreamDelta::Text(content.clone()));
+                                }
+                            }
+                            // Tool-call deltas -> accumulate by index.
+                            if let Some(tcs) = choice.delta.tool_calls.as_ref() {
+                                accumulate_tool_call_deltas(&mut pending, tcs);
+                            }
+                            // Some providers signal completion via finish_reason
+                            // without a trailing [DONE]; flush there too.
+                            if choice
+                                .finish_reason
+                                .as_deref()
+                                .is_some_and(|r| r == "tool_calls")
+                            {
+                                for tc in assemble_tool_calls(&mut pending) {
+                                    yield Ok(ChatStreamDelta::ToolCall(tc));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        yield Err(AiError::Provider {
+                            purpose: purpose.clone(),
+                            reason: e.to_string(),
+                        });
+                        return;
+                    }
+                }
+            }
+            // Stream ended without an explicit terminator — flush any remainder.
+            for tc in assemble_tool_calls(&mut pending) {
+                yield Ok(ChatStreamDelta::ToolCall(tc));
+            }
+        };
+        Ok(Box::pin(delta_stream))
+    }
 }
 
 #[cfg(test)]
@@ -437,6 +620,7 @@ mod tests {
             display_name: format!("{provider} key"),
             api_key_encrypted: "enc".to_string(),
             base_url: None,
+            default_model: None,
             is_active: true,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -522,6 +706,39 @@ mod tests {
             let model = svc.resolve_model(None, None).await;
             assert_eq!(model, Some(expected.to_string()), "provider {provider}");
         }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_model_prefers_key_default_model() {
+        // An operator-pinned `default_model` on the active key beats the
+        // hardcoded per-provider default.
+        let mut key = active_key("openai");
+        key.default_model = Some("gpt-qwen3".to_string());
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<temps_entities::ai_gateway_config::Model>::new()])
+            .append_query_results(vec![vec![key]])
+            .into_connection();
+        let svc = service_over(db);
+        assert_eq!(
+            svc.resolve_model(None, None).await,
+            Some("gpt-qwen3".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_model_blank_key_default_falls_through() {
+        // A whitespace-only pinned model is ignored -> per-provider default.
+        let mut key = active_key("openai");
+        key.default_model = Some("   ".to_string());
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<temps_entities::ai_gateway_config::Model>::new()])
+            .append_query_results(vec![vec![key]])
+            .into_connection();
+        let svc = service_over(db);
+        assert_eq!(
+            svc.resolve_model(None, None).await,
+            Some("gpt-4o-mini".to_string())
+        );
     }
 
     #[tokio::test]

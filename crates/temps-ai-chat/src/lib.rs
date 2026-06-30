@@ -13,15 +13,14 @@ pub mod plugin;
 pub mod provider;
 pub mod providers;
 pub mod service;
-pub mod trace_tools;
 
 pub use plugin::AiChatPlugin;
 pub use provider::{ConversationContextProvider, ConversationSeed};
 pub use providers::alert::AlertChatProvider;
+pub use providers::api_tools::ApiToolsProvider;
 pub use providers::deployment::DeploymentChatProvider;
 pub use providers::project::ProjectChatProvider;
 pub use service::{ChatStreamEvent, ConversationService};
-pub use trace_tools::TraceTools;
 
 /// Errors from the conversation layer. All map cleanly to HTTP at the handler.
 #[derive(Debug, thiserror::Error)]

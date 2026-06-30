@@ -14,9 +14,12 @@ use temps_core::plugin::{
 use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
+use temps_ai_api_tools::ApiToolsHandle;
+
 use crate::handlers::{self, AiChatApiDoc, AppState};
 use crate::provider::ConversationContextProvider;
 use crate::providers::alert::AlertChatProvider;
+use crate::providers::api_tools::ApiToolsProvider;
 use crate::providers::deployment::DeploymentChatProvider;
 use crate::providers::project::ProjectChatProvider;
 use crate::ConversationService;
@@ -54,11 +57,22 @@ impl TempsPlugin for AiChatPlugin {
             // Optional: read-only repo access for the deployment debugger's
             // `read_repo_file` tool. Absent → the tool simply isn't offered.
             let git = context.get_service::<temps_git::GitProviderManager>();
-            // Optional: read-only trace access (OpenTelemetry) behind the
-            // storage-agnostic `temps_core::TraceReader` trait — registered by
-            // the OTel plugin (which loads before this one). Absent (OTel
-            // disabled) → no trace tools are offered in any chat.
-            let trace_reader = context.get_service::<dyn temps_core::TraceReader>();
+
+            // ADR-024: Register the shared ApiToolsHandle.
+            //
+            // 1. console.rs retrieves it via get_service::<ApiToolsHandle>() after
+            //    build_split_application() and calls handle.set(InternalApiCaller::new(...)).
+            // 2. The ApiToolsProvider (below) holds a clone and calls handle.get() at
+            //    tool-execution time to run the actual search/describe/call.
+            // 3. temps-ee-sre can also retrieve it via get_service::<ApiToolsHandle>()
+            //    and hold a clone for its rig Tool impls.
+            //
+            // The handle is empty here; it is populated in console.rs once the Axum
+            // router is assembled — InternalApiCaller requires the live router.
+            // ApiToolsHandle itself is a thin Arc<OnceLock<...>> so all clones share
+            // the same cell.
+            let api_tools_handle = Arc::new(ApiToolsHandle::new());
+            context.register_service(api_tools_handle.clone());
 
             // Built-in providers (one per context_type). Future context types add
             // their provider here (or via a registry once there are many).
@@ -66,14 +80,14 @@ impl TempsPlugin for AiChatPlugin {
                 Arc::new(DeploymentChatProvider::new(db.clone(), log_service, git)),
                 Arc::new(AlertChatProvider::new(db.clone())),
                 Arc::new(ProjectChatProvider::new(db.clone())),
+                // ADR-024: generic API meta-tools (search_api, describe_api, call_api).
+                // Uses the sentinel context_type "__api_tools__" — never selected as a
+                // primary provider, but its tools() output is merged into every context
+                // by the ConversationService tool-gathering loop.
+                Arc::new(ApiToolsProvider::new(api_tools_handle)),
             ];
 
-            let service = Arc::new(ConversationService::new(
-                db.clone(),
-                ai,
-                providers,
-                trace_reader,
-            ));
+            let service = Arc::new(ConversationService::new(db.clone(), ai, providers));
             context.register_service(service.clone());
 
             let app_state = Arc::new(AppState {

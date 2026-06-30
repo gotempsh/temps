@@ -49,6 +49,8 @@ impl ConversationContextProvider for AlertChatProvider {
 
         let mut ctx = String::new();
         ctx.push_str(SYSTEM_PREAMBLE);
+        ctx.push_str("\n\n");
+        ctx.push_str(crate::provider::TOOL_USAGE_GUIDANCE);
         ctx.push_str("\n\n--- Alert context ---\n");
         ctx.push_str(&format!("Alert: {}\n", rule.name));
         ctx.push_str(&format!(

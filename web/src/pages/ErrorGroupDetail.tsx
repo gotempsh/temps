@@ -23,6 +23,7 @@ import { ScrollArea } from '@/components/ui/scroll-area'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { TimeAgo } from '@/components/utils/TimeAgo'
+import { useAssistantPageContext } from '@/components/ai/AiAssistantContext'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { cn } from '@/lib/utils'
@@ -93,6 +94,18 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
       ])
     }
   }, [setBreadcrumbs, errorGroup, projectSlug])
+
+  // Tell the assistant which error the user is looking at.
+  const assistantContext = errorGroup
+    ? [
+        'The user is viewing an error group (error tracking) in the Temps console.',
+        `Project: "${project.name}" (slug: ${project.slug}, id: ${project.id}).`,
+        `Error group #${errorGroupId}: "${errorGroup.title}" (type: ${errorGroup.error_type ?? 'unknown'}).`,
+        `Seen ${errorGroup.total_count} time(s); first ${errorGroup.first_seen}, last ${errorGroup.last_seen}.`,
+        'Fetch details via the temps CLI: `error-tracking get_error_group --group_id` and `list_error_events --group_id`.',
+      ].join('\n')
+    : null
+  useAssistantPageContext(assistantContext, 'this error')
 
   const getSeverityColor = (level: string) => {
     switch (level?.toLowerCase()) {

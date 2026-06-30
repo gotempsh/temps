@@ -9,6 +9,7 @@ pub mod error;
 pub mod error_builder;
 pub mod external_plugin;
 pub mod jobs;
+pub mod node_pki;
 pub mod notifications;
 pub mod on_demand;
 pub mod openapi;

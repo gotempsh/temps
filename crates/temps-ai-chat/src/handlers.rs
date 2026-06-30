@@ -101,6 +101,12 @@ pub struct MessageResponse {
     /// the chat replays its tool work after a reload. Absent for plain turns.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ToolInfo>>,
+    /// Ordered render segments (text / tool, in the order they occurred) so a
+    /// reloaded chat shows the same interleaving as the live stream. Absent for
+    /// older messages persisted before parts were tracked; the client then falls
+    /// back to `tools` (rendered first) + `content`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parts: Option<Vec<MessagePart>>,
 }
 
 /// One persisted tool invocation + its result, attached to an assistant message.
@@ -112,6 +118,15 @@ pub struct ToolInfo {
     pub result: Option<String>,
 }
 
+/// One ordered segment of an assistant turn: a chunk of prose, or a tool
+/// invocation. Mirrors the `metadata.parts` persisted by the chat service.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum MessagePart {
+    Text { text: String },
+    Tool { tool: ToolInfo },
+}
+
 impl From<ai_messages::Model> for MessageResponse {
     fn from(m: ai_messages::Model) -> Self {
         let tools = m
@@ -120,11 +135,18 @@ impl From<ai_messages::Model> for MessageResponse {
             .and_then(|v| v.get("tools"))
             .and_then(|t| serde_json::from_value::<Vec<ToolInfo>>(t.clone()).ok())
             .filter(|t| !t.is_empty());
+        let parts = m
+            .metadata
+            .as_ref()
+            .and_then(|v| v.get("parts"))
+            .and_then(|p| serde_json::from_value::<Vec<MessagePart>>(p.clone()).ok())
+            .filter(|p| !p.is_empty());
         Self {
             role: m.role,
             content: m.content,
             created_at: m.created_at.to_rfc3339(),
             tools,
+            parts,
         }
     }
 }
@@ -154,6 +176,12 @@ pub struct FindConversationQuery {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SendMessageRequest {
     pub content: String,
+    /// Optional, client-supplied description of the page/entity the user is
+    /// currently viewing (e.g. a trace in a project). Injected into the model's
+    /// view of this turn only — never stored or shown in history. Capped server
+    /// side; oversized values are ignored rather than rejected.
+    #[serde(default)]
+    pub page_context: Option<String>,
 }
 
 /// Payload for the `tool_call` SSE event: the model is about to run a tool.
@@ -241,6 +269,8 @@ async fn ensure_enabled(state: &AppState, project_id: i32) -> Result<(), Problem
 const MAX_CONTEXT_TYPE_LEN: usize = 64;
 const MAX_CONTEXT_ID_LEN: usize = 128;
 const MAX_MESSAGE_CONTENT_LEN: usize = 32_000;
+/// Cap on the advisory `page_context` (well under a message; it's framing).
+const MAX_PAGE_CONTEXT_LEN: usize = 4_000;
 
 /// 400 for an over-length input field.
 fn too_long(field: &str, max: usize) -> Problem {
@@ -467,9 +497,19 @@ pub async fn send_message(
         .service
         .get_by_public_id(project_id, &public_id)
         .await?;
+    // Page context is advisory framing, not user content: cap it and silently
+    // drop an oversized value rather than failing the message.
+    let page_context = req
+        .page_context
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && s.len() <= MAX_PAGE_CONTEXT_LEN);
     // `send_message` persists the user turn before returning the stream, so the
     // turn is durable by the time we audit it.
-    let token_stream = state.service.send_message(&conv, &req.content).await?;
+    let token_stream = state
+        .service
+        .send_message(&conv, &req.content, page_context, &auth)
+        .await?;
     state
         .audit(&ChatMessageSentAudit {
             context: AuditContext {
@@ -601,6 +641,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         GlobalConversationResponse,
         MessageResponse,
         ToolInfo,
+        MessagePart,
         ConversationDetailResponse,
         CreateConversationRequest,
         SendMessageRequest,

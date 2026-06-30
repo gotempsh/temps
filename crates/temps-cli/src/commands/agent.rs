@@ -276,6 +276,12 @@ impl AgentCommand {
                 .unwrap_or(serde_json::json!({}))
         };
 
+        // mTLS cert paths written by `temps join` (ADR-020 WS-2.1). Carried
+        // through from the saved config; absent for legacy/HTTP-only nodes.
+        let tls_cert_path = saved.as_ref().and_then(|c| c.tls_cert_path.clone());
+        let tls_key_path = saved.as_ref().and_then(|c| c.tls_key_path.clone());
+        let cluster_ca_path = saved.as_ref().and_then(|c| c.cluster_ca_path.clone());
+
         Ok(temps_agent::AgentConfig {
             listen_address,
             token,
@@ -287,6 +293,9 @@ impl AgentCommand {
             // (`~/.temps` by default, overridable by TEMPS_DATA_DIR), so
             // the resolver snapshot lives next to other agent state.
             dns_data_dir: agent_data_dir().join("dns"),
+            tls_cert_path,
+            tls_key_path,
+            cluster_ca_path,
         })
     }
 

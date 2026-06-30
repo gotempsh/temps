@@ -13,7 +13,7 @@ use utoipa::ToSchema;
 
 use crate::types::*;
 use crate::OtelAppState;
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{permission_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::Problem;
 use temps_core::ProblemDetails;
 
@@ -42,6 +42,27 @@ pub struct MetricQueryParams {
     /// Comma-separated label keys to group the series by, e.g.
     /// `http.method,http.route`. Each key must match the allowlist.
     pub group_by: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MetricLabelKeysParams {
+    pub project_id: i32,
+    pub metric_name: String,
+    /// Window start (RFC 3339). Defaults to 24h before `end_time`.
+    pub start_time: Option<String>,
+    /// Window end (RFC 3339). Defaults to now.
+    pub end_time: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MetricLabelValuesParams {
+    pub project_id: i32,
+    pub metric_name: String,
+    pub label_key: String,
+    /// Window start (RFC 3339). Defaults to 24h before `end_time`.
+    pub start_time: Option<String>,
+    /// Window end (RFC 3339). Defaults to now.
+    pub end_time: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -105,6 +126,16 @@ pub struct OtelMetricsResponse {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct OtelMetricNamesResponse {
     pub names: Vec<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct OtelMetricLabelKeysResponse {
+    pub keys: Vec<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct OtelMetricLabelValuesResponse {
+    pub values: Vec<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -185,6 +216,22 @@ fn parse_datetime(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
         .map(|dt| dt.with_timezone(&chrono::Utc))
 }
 
+/// Resolve an optional RFC-3339 (start, end) pair into a concrete window for the
+/// label-discovery queries. Missing `end` → now; missing `start` → 24h before
+/// `end`. Keeping the window bounded is what keeps the sampled scans cheap.
+fn discovery_window(
+    start: Option<&str>,
+    end: Option<&str>,
+) -> (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) {
+    let end = end
+        .and_then(parse_datetime)
+        .unwrap_or_else(chrono::Utc::now);
+    let start = start
+        .and_then(parse_datetime)
+        .unwrap_or_else(|| end - chrono::Duration::hours(24));
+    (start, end)
+}
+
 fn parse_attributes(s: &str) -> BTreeMap<String, String> {
     s.split(',')
         .filter_map(|pair| {
@@ -227,7 +274,7 @@ fn parse_label_filters(s: &str) -> Vec<(String, String)> {
 
 /// Query metrics with time bucketing.
 #[utoipa::path(
-    tag = "OTel",
+    tag = "Telemetry Metrics",
     get,
     path = "/otel/metrics",
     params(
@@ -295,7 +342,7 @@ pub async fn query_metrics(
 
 /// List distinct metric names for a project.
 #[utoipa::path(
-    tag = "OTel",
+    tag = "Telemetry Metrics",
     get,
     path = "/otel/metric-names/{project_id}",
     params(
@@ -320,9 +367,93 @@ pub async fn list_metric_names(
     Ok(Json(OtelMetricNamesResponse { names }))
 }
 
+/// List the attribute (label) keys observed on a metric — powers the
+/// label-filter key autocomplete.
+#[utoipa::path(
+    tag = "Telemetry Metrics",
+    get,
+    path = "/otel/metric-label-keys",
+    params(
+        ("project_id" = i32, Query, description = "Project ID"),
+        ("metric_name" = String, Query, description = "Metric to inspect"),
+        ("start_time" = Option<String>, Query, description = "Window start (RFC 3339); defaults to 24h before end"),
+        ("end_time" = Option<String>, Query, description = "Window end (RFC 3339); defaults to now"),
+    ),
+    responses(
+        (status = 200, description = "Distinct label keys", body = OtelMetricLabelKeysResponse),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_metric_label_keys(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<OtelAppState>,
+    Query(params): Query<MetricLabelKeysParams>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, OtelRead);
+    // Confine a project-scoped deployment token to its own project's telemetry
+    // (no-op for user/API-key/session auth).
+    project_scope_guard!(auth, params.project_id);
+
+    let (start, end) = discovery_window(params.start_time.as_deref(), params.end_time.as_deref());
+    let keys = state
+        .otel_service
+        .list_metric_label_keys(params.project_id, &params.metric_name, start, end)
+        .await?;
+    Ok(Json(OtelMetricLabelKeysResponse { keys }))
+}
+
+/// List the distinct values seen for a label key on a metric — powers value
+/// autocomplete once a key is chosen.
+#[utoipa::path(
+    tag = "Telemetry Metrics",
+    get,
+    path = "/otel/metric-label-values",
+    params(
+        ("project_id" = i32, Query, description = "Project ID"),
+        ("metric_name" = String, Query, description = "Metric to inspect"),
+        ("label_key" = String, Query, description = "Label key whose values to list (must match [a-zA-Z0-9_.:-])"),
+        ("start_time" = Option<String>, Query, description = "Window start (RFC 3339); defaults to 24h before end"),
+        ("end_time" = Option<String>, Query, description = "Window end (RFC 3339); defaults to now"),
+    ),
+    responses(
+        (status = 200, description = "Distinct label values", body = OtelMetricLabelValuesResponse),
+        (status = 400, description = "Invalid label key", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_metric_label_values(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<OtelAppState>,
+    Query(params): Query<MetricLabelValuesParams>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, OtelRead);
+    // Confine a project-scoped deployment token to its own project's telemetry
+    // (no-op for user/API-key/session auth).
+    project_scope_guard!(auth, params.project_id);
+
+    let (start, end) = discovery_window(params.start_time.as_deref(), params.end_time.as_deref());
+    let values = state
+        .otel_service
+        .list_metric_label_values(
+            params.project_id,
+            &params.metric_name,
+            &params.label_key,
+            start,
+            end,
+        )
+        .await?;
+    Ok(Json(OtelMetricLabelValuesResponse { values }))
+}
+
 /// Query trace spans with optional filters.
 #[utoipa::path(
-    tag = "OTel",
+    tag = "Traces",
     get,
     path = "/otel/traces",
     params(
@@ -391,7 +522,7 @@ pub async fn query_traces(
 /// Query trace summaries — one row per trace with span count, error count,
 /// root span info, and proper trace-level pagination.
 #[utoipa::path(
-    tag = "OTel",
+    tag = "Traces",
     get,
     path = "/otel/trace-summaries",
     params(
@@ -475,7 +606,7 @@ pub async fn query_trace_summaries(
 
 /// Get all spans for a specific trace.
 #[utoipa::path(
-    tag = "OTel",
+    tag = "Traces",
     get,
     path = "/otel/traces/{project_id}/{trace_id}",
     params(
@@ -505,7 +636,7 @@ pub async fn get_trace(
 
 /// Query log records with optional filters.
 #[utoipa::path(
-    tag = "OTel",
+    tag = "Telemetry Logs",
     get,
     path = "/otel/logs",
     params(
@@ -564,7 +695,7 @@ pub async fn query_logs(
 
 /// List anomaly insights for a project.
 #[utoipa::path(
-    tag = "OTel",
+    tag = "Insights",
     get,
     path = "/otel/insights/{project_id}",
     params(
@@ -893,5 +1024,29 @@ mod tests {
             ]
         );
         assert!(parse_label_filters("").is_empty());
+    }
+
+    #[test]
+    fn test_discovery_window_defaults_to_last_24h() {
+        // No bounds → [now-24h, now], so the span is ~24h.
+        let (start, end) = discovery_window(None, None);
+        let span = end - start;
+        assert_eq!(span.num_hours(), 24);
+    }
+
+    #[test]
+    fn test_discovery_window_start_defaults_relative_to_end() {
+        // Explicit end, missing start → start is 24h before that end (not now).
+        let (start, end) = discovery_window(None, Some("2026-01-10T12:00:00Z"));
+        assert_eq!(end.to_rfc3339(), "2026-01-10T12:00:00+00:00");
+        assert_eq!(start.to_rfc3339(), "2026-01-09T12:00:00+00:00");
+    }
+
+    #[test]
+    fn test_discovery_window_honors_both_bounds() {
+        let (start, end) =
+            discovery_window(Some("2026-01-01T00:00:00Z"), Some("2026-01-02T00:00:00Z"));
+        assert_eq!(start.to_rfc3339(), "2026-01-01T00:00:00+00:00");
+        assert_eq!(end.to_rfc3339(), "2026-01-02T00:00:00+00:00");
     }
 }

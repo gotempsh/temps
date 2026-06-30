@@ -26,6 +26,7 @@ pub mod typed;
 
 pub use service::{AiError, AiRequest, AiResponse, AiService};
 pub use streaming::{
-    ChatMessage, ChatTool, ChatTurnRequest, ChatTurnResponse, TokenStream, ToolCall,
+    ChatMessage, ChatStreamDelta, ChatTool, ChatTurnRequest, ChatTurnResponse, ChatTurnStream,
+    TokenStream, ToolCall,
 };
 pub use typed::{complete_text, complete_typed, extract_json_block};

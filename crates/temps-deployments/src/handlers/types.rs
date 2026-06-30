@@ -33,6 +33,9 @@ pub struct AppState {
     pub node_service: Arc<NodeService>,
     /// Encryption service for decrypting node tokens (used by drain to stop remote containers)
     pub encryption_service: Arc<temps_core::EncryptionService>,
+    /// Config service — gives drain/exit-facing handlers access to the cluster
+    /// CA so CP→agent calls to `https://` nodes use mutual TLS (ADR-020 WS-2.1)
+    pub config_service: Arc<temps_config::ConfigService>,
     /// Docker client for container exec/terminal
     pub docker: Arc<bollard::Docker>,
 }

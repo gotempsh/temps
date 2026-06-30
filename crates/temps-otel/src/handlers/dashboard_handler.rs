@@ -106,7 +106,7 @@ pub struct OtelDashboardsResponse {
 
 /// List dashboards for a project (newest first, paginated).
 #[utoipa::path(
-    tag = "OTel",
+    tag = "Dashboards",
     get,
     path = "/otel/dashboards",
     params(
@@ -140,7 +140,7 @@ pub async fn list_dashboards(
 
 /// Create a new dashboard for a project.
 #[utoipa::path(
-    tag = "OTel",
+    tag = "Dashboards",
     post,
     path = "/otel/dashboards",
     request_body = CreateDashboardRequest,
@@ -188,7 +188,7 @@ pub async fn create_dashboard(
 
 /// Fetch a single dashboard by id.
 #[utoipa::path(
-    tag = "OTel",
+    tag = "Dashboards",
     get,
     path = "/otel/dashboards/{id}",
     params(
@@ -218,7 +218,7 @@ pub async fn get_dashboard(
 
 /// Update a dashboard's name and/or layout.
 #[utoipa::path(
-    tag = "OTel",
+    tag = "Dashboards",
     patch,
     path = "/otel/dashboards/{id}",
     params(
@@ -269,7 +269,7 @@ pub async fn update_dashboard(
 
 /// Delete a dashboard.
 #[utoipa::path(
-    tag = "OTel",
+    tag = "Dashboards",
     delete,
     path = "/otel/dashboards/{id}",
     params(
