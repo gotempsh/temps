@@ -1,12 +1,21 @@
 use crate::geoip_service::GeoIpService;
 use chrono::Utc;
+use moka::future::Cache;
 use sea_orm::{prelude::*, QueryFilter, QueryOrder, QuerySelect, Set};
 use std::sync::Arc;
+use std::time::Duration;
 use temps_core::UtcDateTime;
 use temps_entities::ip_geolocations;
 use tracing::{error, info};
 
-#[derive(Debug)]
+/// Max number of distinct IPs held in the geolocation cache. Bounds memory while
+/// covering the working set of a busy proxy (bots + real visitors).
+const GEO_CACHE_MAX_ENTRIES: u64 = 100_000;
+/// How long a cached IP -> geolocation mapping stays valid. Geolocation is stable,
+/// so a long TTL collapses repeated lookups for the same IP into a single DB hit.
+const GEO_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+
+#[derive(Debug, Clone)]
 pub struct IpAddressInfo {
     pub id: i32,
     pub ip: String,
@@ -38,14 +47,31 @@ impl From<ip_geolocations::Model> for IpAddressInfo {
 pub struct IpAddressService {
     db: Arc<DatabaseConnection>,
     geoip_service: Arc<GeoIpService>,
+    /// In-memory cache keyed by IP string. Lets the proxy hot path (batch log
+    /// enrichment, visitor tracking) resolve repeat IPs without a Postgres query,
+    /// which is the dominant per-request DB load at high request rates.
+    cache: Cache<String, IpAddressInfo>,
 }
 
 impl IpAddressService {
     pub fn new(db: Arc<DatabaseConnection>, geoip_service: Arc<GeoIpService>) -> Self {
-        Self { db, geoip_service }
+        let cache = Cache::builder()
+            .max_capacity(GEO_CACHE_MAX_ENTRIES)
+            .time_to_live(GEO_CACHE_TTL)
+            .build();
+        Self {
+            db,
+            geoip_service,
+            cache,
+        }
     }
 
     pub async fn get_or_create_ip(&self, ip_address_str: &str) -> anyhow::Result<IpAddressInfo> {
+        // Fast path: serve repeat IPs straight from memory, no DB connection used.
+        if let Some(cached) = self.cache.get(ip_address_str).await {
+            return Ok(cached);
+        }
+
         let now = Utc::now();
 
         if let Some(existing_ip) = ip_geolocations::Entity::find()
@@ -53,7 +79,11 @@ impl IpAddressService {
             .one(self.db.as_ref())
             .await?
         {
-            return Ok(existing_ip.into());
+            let info: IpAddressInfo = existing_ip.into();
+            self.cache
+                .insert(ip_address_str.to_string(), info.clone())
+                .await;
+            return Ok(info);
         }
 
         let geo_data =
@@ -102,7 +132,11 @@ impl IpAddressService {
         })?;
 
         info!("Created new IP address record for {}", ip_address_str);
-        Ok(result.into())
+        let info: IpAddressInfo = result.into();
+        self.cache
+            .insert(ip_address_str.to_string(), info.clone())
+            .await;
+        Ok(info)
     }
 
     pub async fn update_geolocation(&self, ip_id: i32) -> anyhow::Result<IpAddressInfo> {

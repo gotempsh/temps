@@ -56,6 +56,8 @@ sqlx = { version = "0.8", features = ["postgres", "runtime-tokio"] }
 dashmap = "6"
 futures = { workspace = true }
 parking_lot = "0.12"
+arc-swap = "1"
+ipnetwork = "0.21"
 regex = { workspace = true }
 once_cell = { workspace = true }
 woothee = "0.13"
