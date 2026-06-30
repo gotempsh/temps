@@ -117,6 +117,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolved fine. The forwarder now returns the correct `NOERROR`/NODATA while
   still passing genuine `NXDOMAIN` through. Affects both worker and
   control-plane resolvers.
+- **Proxy no longer queries Postgres on every request.** Under load the proxy
+  opened a database connection per request for the IP block-list check and the
+  IP-geolocation lookup, saturating the connection pool (~114 busy connections
+  at ~1k req/s) and capping throughput. Both are now served from memory — block
+  rules from an in-process snapshot refreshed every 30s (and immediately on
+  change), and geolocation from a bounded TTL cache — so steady-state request
+  handling makes no per-request database queries (#174).
 
 ### Security
 - **Mutual TLS between the control plane and worker agents (ADR-020).** Optional
