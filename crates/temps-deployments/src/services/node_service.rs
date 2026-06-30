@@ -23,6 +23,9 @@ pub enum NodeError {
     #[error("Invalid node configuration: {message}")]
     Validation { message: String },
 
+    #[error("Node '{name}' is currently active; re-registering a different identity (token/address/WireGuard key) requires proof of the current token, or the node must be drained/removed first")]
+    IdentityConflict { name: String },
+
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
 }
@@ -42,6 +45,11 @@ pub struct RegisterNodeRequest {
     pub labels: serde_json::Value,
     /// X25519 public key for ECIES certificate encryption (edge nodes only)
     pub edge_public_key: Option<String>,
+    /// SHA-256 hash of the node's *current* token, supplied to prove possession
+    /// when re-registering (changing identity) a node that already exists.
+    /// `None` for first-time registration or when no proof is offered.
+    /// (ADR-020 WS-1.2 / enroll-1.)
+    pub prior_token_hash: Option<String>,
 }
 
 /// Request to update a node's heartbeat.
@@ -50,6 +58,24 @@ pub struct HeartbeatRequest {
     pub capacity: serde_json::Value,
     /// Updated labels from the agent (allows runtime label changes without re-registration).
     pub labels: Option<serde_json::Value>,
+}
+
+/// A node whose last heartbeat is within this window (and still marked
+/// "active") is considered live, and its identity may not be silently rebound
+/// by a re-registration. Mirrors the health-check stale threshold.
+const NODE_LIVE_THRESHOLD_SECS: i64 = 90;
+
+/// Constant-time comparison of two equal-purpose byte slices (SHA-256 hex
+/// token hashes) to avoid leaking a match via timing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 pub struct NodeService {
@@ -68,6 +94,19 @@ impl NodeService {
                 message: "Node name cannot be empty".into(),
             });
         }
+        // Restrict to a DNS-label-style charset. The name is surfaced in logs
+        // and injected into every container's `TEMPS_NODE_NAME` env var, so
+        // reject shell metacharacters / newlines / control chars defensively.
+        if request.name.len() > 63
+            || !request
+                .name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_')
+        {
+            return Err(NodeError::Validation {
+                message: "Node name must be <=63 chars of letters, digits, '-', '.', or '_'".into(),
+            });
+        }
 
         if request.address.is_empty() {
             return Err(NodeError::Validation {
@@ -82,6 +121,56 @@ impl NodeService {
             .await?;
 
         if let Some(existing_node) = existing {
+            // Identity-change guard (ADR-020 WS-1.2 / enroll-1).
+            //
+            // Registration resolves an existing node purely by name. Without
+            // this guard, anyone holding the shared cluster join token could
+            // POST a register for an existing node's name with their own token,
+            // address, and WireGuard key and silently rebind that node — the
+            // control plane would then dial the attacker's address to deploy,
+            // exec, and hand out secrets. We refuse to overwrite an existing
+            // node's identity UNLESS either (a) the caller proves possession of
+            // the node's current token, or (b) the node is not currently live
+            // (an operator legitimately re-provisioning a dead node). A
+            // genuinely live, healthy node is never simultaneously re-joining.
+            let identity_change = existing_node.token_hash != request.token_hash
+                || existing_node.address != request.address
+                || existing_node.private_address != request.private_address
+                || existing_node.wg_public_key != request.wg_public_key;
+
+            if identity_change {
+                let proven = match &request.prior_token_hash {
+                    Some(h) => constant_time_eq(h.as_bytes(), existing_node.token_hash.as_bytes()),
+                    None => false,
+                };
+                let is_live = existing_node.status == "active"
+                    && existing_node
+                        .last_heartbeat
+                        .map(|h| (chrono::Utc::now() - h).num_seconds() < NODE_LIVE_THRESHOLD_SECS)
+                        .unwrap_or(false);
+
+                if is_live && !proven {
+                    tracing::warn!(
+                        node_id = existing_node.id,
+                        node_name = %existing_node.name,
+                        old_address = %existing_node.address,
+                        new_address = %request.address,
+                        "Rejected node re-registration: identity change on a live node with no proof of the current token (possible takeover via shared join token)"
+                    );
+                    return Err(NodeError::IdentityConflict { name: request.name });
+                }
+
+                tracing::warn!(
+                    node_id = existing_node.id,
+                    node_name = %existing_node.name,
+                    proven,
+                    is_live,
+                    old_address = %existing_node.address,
+                    new_address = %request.address,
+                    "Node identity re-bound (token/address/WireGuard key changed)"
+                );
+            }
+
             // Reconnection: update the existing node and set it back to active
             let mut active: nodes::ActiveModel = existing_node.into();
             active.token_hash = Set(request.token_hash);
@@ -170,6 +259,45 @@ impl NodeService {
             .one(self.db.as_ref())
             .await?
             .ok_or(NodeError::NotFoundById { node_id })
+    }
+
+    /// Authorization check for `get_s3_credentials` (ADR-020 WS-4.1 / analyst-1).
+    ///
+    /// A worker node may only receive the plaintext credentials for an S3 source
+    /// it legitimately needs — i.e. a source used by a backup of a managed
+    /// service that is actually hosted on this node (standalone placement via
+    /// `external_services.node_id`, or a cluster member via
+    /// `service_members.node_id`). Without this gate any single node token could
+    /// enumerate `s3_source_id = 1..N` and exfiltrate every tenant's object-store
+    /// access+secret keys.
+    pub async fn is_authorized_for_s3_source(
+        &self,
+        node_id: i32,
+        s3_source_id: i32,
+    ) -> Result<bool, NodeError> {
+        use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+        // EXISTS: a backup whose destination is `s3_source_id`, linked (via the
+        // external_service_backups join) to a service placed on `node_id`.
+        let sql = r#"
+            SELECT 1
+            FROM backups b
+            JOIN external_service_backups esb ON esb.backup_id = b.id
+            JOIN external_services es ON es.id = esb.service_id
+            LEFT JOIN service_members sm ON sm.service_id = es.id
+            WHERE b.s3_source_id = $1
+              AND (es.node_id = $2 OR sm.node_id = $2)
+            LIMIT 1
+        "#;
+
+        let stmt = Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            sql,
+            [s3_source_id.into(), node_id.into()],
+        );
+
+        let row = self.db.query_one(stmt).await?;
+        Ok(row.is_some())
     }
 
     /// Get a node by its name.
@@ -594,24 +722,30 @@ mod tests {
         }
     }
 
+    /// Build a register request with sensible defaults for tests.
+    fn register_req(name: &str, token_hash: &str, address: &str) -> RegisterNodeRequest {
+        RegisterNodeRequest {
+            name: name.to_string(),
+            token_hash: token_hash.to_string(),
+            token_encrypted: None,
+            address: address.to_string(),
+            private_address: "10.100.0.2".to_string(),
+            public_endpoint: None,
+            wg_public_key: None,
+            role: "worker".to_string(),
+            labels: serde_json::json!({}),
+            edge_public_key: None,
+            prior_token_hash: None,
+        }
+    }
+
     #[tokio::test]
     async fn test_register_validates_empty_name() {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let service = NodeService::new(Arc::new(db));
 
         let result = service
-            .register(RegisterNodeRequest {
-                name: "".to_string(),
-                token_hash: "hash".to_string(),
-                token_encrypted: None,
-                address: "https://10.100.0.2:3100".to_string(),
-                private_address: "10.100.0.2".to_string(),
-                public_endpoint: None,
-                wg_public_key: None,
-                role: "worker".to_string(),
-                labels: serde_json::json!({}),
-                edge_public_key: None,
-            })
+            .register(register_req("", "hash", "https://10.100.0.2:3100"))
             .await;
 
         assert!(matches!(result.unwrap_err(), NodeError::Validation { .. }));
@@ -622,52 +756,91 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let service = NodeService::new(Arc::new(db));
 
-        let result = service
-            .register(RegisterNodeRequest {
-                name: "worker-1".to_string(),
-                token_hash: "hash".to_string(),
-                token_encrypted: None,
-                address: "".to_string(),
-                private_address: "10.100.0.2".to_string(),
-                public_endpoint: None,
-                wg_public_key: None,
-                role: "worker".to_string(),
-                labels: serde_json::json!({}),
-                edge_public_key: None,
-            })
-            .await;
+        let result = service.register(register_req("worker-1", "hash", "")).await;
 
         assert!(matches!(result.unwrap_err(), NodeError::Validation { .. }));
     }
 
     #[tokio::test]
-    async fn test_register_reconnects_existing_node() {
+    async fn test_register_reconnect_offline_node_rebinds() {
+        // An OFFLINE node being re-provisioned with new credentials is the
+        // legitimate re-registration case — it must succeed. (ADR-020 WS-1.2.)
+        let mut offline = sample_node();
+        offline.status = "offline".to_string();
+
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            // First query: find existing node by name
-            .append_query_results(vec![vec![sample_node()]])
-            // Second query: update returns the updated node
-            .append_query_results(vec![vec![sample_node()]])
+            .append_query_results(vec![vec![offline]]) // find by name
+            .append_query_results(vec![vec![sample_node()]]) // update
             .into_connection();
         let service = NodeService::new(Arc::new(db));
 
         let result = service
-            .register(RegisterNodeRequest {
-                name: "worker-1".to_string(),
-                token_hash: "new-hash".to_string(),
-                token_encrypted: None,
-                address: "https://10.100.0.3:3100".to_string(),
-                private_address: "10.100.0.3".to_string(),
-                public_endpoint: None,
-                wg_public_key: None,
-                role: "worker".to_string(),
-                labels: serde_json::json!({}),
-                edge_public_key: None,
-            })
+            .register(register_req(
+                "worker-1",
+                "new-hash",
+                "https://10.100.0.3:3100",
+            ))
             .await;
 
         assert!(result.is_ok());
-        let node = result.unwrap();
-        assert_eq!(node.name, "worker-1");
+        assert_eq!(result.unwrap().name, "worker-1");
+    }
+
+    #[tokio::test]
+    async fn test_register_idempotent_same_identity_reconnect() {
+        // Re-registering with the SAME identity (no token/address/key change)
+        // is not an identity change and is always allowed, even while live.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![sample_node()]]) // find by name (live)
+            .append_query_results(vec![vec![sample_node()]]) // update
+            .into_connection();
+        let service = NodeService::new(Arc::new(db));
+
+        let mut req = register_req("worker-1", "hash123", "https://10.100.0.2:3100");
+        req.wg_public_key = Some("pubkey123".to_string()); // match sample_node
+
+        let result = service.register(req).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_register_rejects_identity_change_on_live_node() {
+        // A live node (active + recent heartbeat) cannot have its identity
+        // silently rebound by a join-token holder with no proof. (enroll-1.)
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![sample_node()]]) // find by name (live)
+            .into_connection();
+        let service = NodeService::new(Arc::new(db));
+
+        let result = service
+            .register(register_req(
+                "worker-1",
+                "attacker-hash",
+                "https://10.0.0.66:3100",
+            ))
+            .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            NodeError::IdentityConflict { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_register_identity_change_with_proof_succeeds() {
+        // The same identity change IS allowed when the caller proves possession
+        // of the node's current token.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![sample_node()]]) // find by name (live)
+            .append_query_results(vec![vec![sample_node()]]) // update
+            .into_connection();
+        let service = NodeService::new(Arc::new(db));
+
+        let mut req = register_req("worker-1", "new-hash", "https://10.100.0.3:3100");
+        req.prior_token_hash = Some("hash123".to_string()); // matches sample_node.token_hash
+
+        let result = service.register(req).await;
+        assert!(result.is_ok());
     }
 
     #[tokio::test]

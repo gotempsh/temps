@@ -6,6 +6,9 @@ vertexes = "vertexes"
 # `UNIONNs`, which is itself a misspelling. Pin both casings.
 UNIONs = "UNIONs"
 unions = "unions"
+# AIMD = Additive Increase / Multiplicative Decrease (congestion-control term,
+# ADR-021). typos mis-corrects it to "AIMED".
+AIMD = "AIMD"
 
 [default.extend-identifiers]
 # W3C traceparent spec example span-id used in test fixtures

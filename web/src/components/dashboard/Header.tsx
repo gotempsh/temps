@@ -2,6 +2,7 @@ import {
   getLastDeploymentOptions,
   getProjectsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
+import { AiAssistantButton } from '@/components/ai/AiAssistantButton'
 import { BackupAlertsButton } from '@/components/dashboard/BackupAlertsButton'
 import { ThemeToggle } from '@/components/theme/ThemeToggle'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
@@ -114,10 +115,12 @@ function ProjectSwitcher({
         <button
           type="button"
           aria-label="Switch project"
-          className="inline-flex items-center gap-1.5 rounded-md px-1.5 py-0.5 text-sm font-normal text-foreground transition-colors hover:bg-accent"
+          className="inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-md px-1.5 py-0.5 text-sm font-normal text-foreground transition-colors hover:bg-accent"
         >
-          <span className="truncate">{label}</span>
-          <ChevronsUpDown className="size-3.5 text-muted-foreground" />
+          <span className="max-w-[120px] truncate sm:max-w-[200px] lg:max-w-[280px]">
+            {label}
+          </span>
+          <ChevronsUpDown className="size-3.5 shrink-0 text-muted-foreground" />
         </button>
       </PopoverTrigger>
       <PopoverContent
@@ -205,12 +208,12 @@ export function Header() {
 
   return (
     <header className="flex h-16 shrink-0 items-center gap-2 border-b px-4">
-      <div className="flex justify-between w-full">
-        <div className="flex items-center">
-          <SidebarTrigger className="-ml-1" />
-          <Separator orientation="vertical" className="mr-2 h-4" />
-          <Breadcrumb>
-            <BreadcrumbList>
+      <div className="flex w-full min-w-0 items-center justify-between gap-2">
+        <div className="flex min-w-0 items-center overflow-hidden">
+          <SidebarTrigger className="-ml-1 shrink-0" />
+          <Separator orientation="vertical" className="mr-2 h-4 shrink-0" />
+          <Breadcrumb className="min-w-0">
+            <BreadcrumbList className="flex-nowrap min-w-0">
               {breadcrumbs.map((item, index) => {
                 const isLast = index === breadcrumbs.length - 1
                 const isProjectCrumb =
@@ -219,7 +222,7 @@ export function Header() {
                     item.href === `/projects/${projectSlug}`)
                 return (
                   <React.Fragment key={index}>
-                    <BreadcrumbItem>
+                    <BreadcrumbItem className="min-w-0">
                       {isProjectCrumb ? (
                         <ProjectSwitcher
                           currentSlug={projectSlug}
@@ -227,10 +230,17 @@ export function Header() {
                         />
                       ) : !isLast ? (
                         <BreadcrumbLink asChild href={item.href ?? '#'}>
-                          <Link to={item.href ?? '#'}>{item.label}</Link>
+                          <Link
+                            to={item.href ?? '#'}
+                            className="block max-w-[120px] truncate sm:max-w-[200px] lg:max-w-[260px]"
+                          >
+                            {item.label}
+                          </Link>
                         </BreadcrumbLink>
                       ) : (
-                        <BreadcrumbPage>{item.label}</BreadcrumbPage>
+                        <BreadcrumbPage className="block max-w-[160px] truncate sm:max-w-[280px] lg:max-w-[360px]">
+                          {item.label}
+                        </BreadcrumbPage>
                       )}
                     </BreadcrumbItem>
                     {!isLast && <BreadcrumbSeparator />}
@@ -240,7 +250,7 @@ export function Header() {
             </BreadcrumbList>
           </Breadcrumb>
         </div>
-        <div className="ml-auto flex items-center space-x-2">
+        <div className="ml-auto flex shrink-0 items-center space-x-2">
           {headerActions?.map((action) => (
             <React.Fragment key={action.id}>{action.element}</React.Fragment>
           ))}
@@ -272,6 +282,7 @@ export function Header() {
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
+          <AiAssistantButton />
           <BackupAlertsButton />
           <ThemeToggle />
         </div>

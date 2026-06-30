@@ -13,7 +13,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::error::LogAggregatorError;
-use crate::types::{ChunkMeta, LogLevel, LogLine};
+use crate::types::{ChunkMeta, LogLevel, LogLine, LogSource};
 
 /// Parameters for querying log events from the TimescaleDB hypertable.
 pub struct LogEventsQuery {
@@ -50,6 +50,8 @@ impl LogMetadataService {
             service: Set(meta.service.clone()),
             container_id: Set(meta.container_id.clone()),
             deploy_id: Set(meta.deploy_id),
+            node_id: Set(meta.node_id),
+            node_name: Set(meta.node_name.clone()),
             started_at: Set(meta.started_at),
             ended_at: Set(meta.ended_at),
             storage_key: Set(meta.storage_key.clone()),
@@ -146,6 +148,7 @@ impl LogMetadataService {
     /// When `deploy_id` is provided, only chunks tagged with that deployment ID
     /// are returned. This is a SQL-level prefilter that skips entire chunks
     /// before they are fetched and decompressed during archive search.
+    #[allow(clippy::too_many_arguments)]
     pub async fn find_chunks(
         &self,
         project_id: i32,
@@ -153,6 +156,8 @@ impl LogMetadataService {
         start_time: DateTime<Utc>,
         end_time: DateTime<Utc>,
         deploy_id: Option<i32>,
+        container_ids: &[String],
+        node_ids: &[i32],
     ) -> Result<Vec<ChunkMeta>, LogAggregatorError> {
         let mut condition = Condition::all()
             .add(temps_entities::log_chunks::Column::ProjectId.eq(project_id))
@@ -166,6 +171,19 @@ impl LogMetadataService {
 
         if let Some(deploy) = deploy_id {
             condition = condition.add(temps_entities::log_chunks::Column::DeployId.eq(deploy));
+        }
+
+        // Container prefilter — each chunk belongs to exactly one container, so
+        // this skips entire chunks before any file is fetched/decompressed.
+        if !container_ids.is_empty() {
+            condition = condition
+                .add(temps_entities::log_chunks::Column::ContainerId.is_in(container_ids.to_vec()));
+        }
+
+        // Node prefilter on node_id.
+        if !node_ids.is_empty() {
+            condition =
+                condition.add(temps_entities::log_chunks::Column::NodeId.is_in(node_ids.to_vec()));
         }
 
         let chunks = temps_entities::log_chunks::Entity::find()
@@ -183,6 +201,8 @@ impl LogMetadataService {
                 service: m.service,
                 container_id: m.container_id,
                 deploy_id: m.deploy_id,
+                node_id: m.node_id,
+                node_name: m.node_name,
                 started_at: m.started_at,
                 ended_at: m.ended_at,
                 storage_key: m.storage_key,
@@ -190,6 +210,64 @@ impl LogMetadataService {
                 compressed_size_bytes: m.compressed_size_bytes,
                 has_errors: m.has_errors,
                 line_offsets: m.line_offsets,
+            })
+            .collect())
+    }
+
+    /// List the distinct log sources (container + node + service) present in a
+    /// project's chunks for a scope. Powers the history filter dropdowns with
+    /// the *full* set of containers/nodes/services, independent of the active
+    /// container/node/service filter — so they don't collapse to the current
+    /// selection. Filters by project + time, and optionally env + deployment.
+    pub async fn list_sources(
+        &self,
+        project_id: i32,
+        env: Option<&str>,
+        deploy_id: Option<i32>,
+        start_time: DateTime<Utc>,
+        end_time: DateTime<Utc>,
+    ) -> Result<Vec<LogSource>, LogAggregatorError> {
+        use sea_orm::FromQueryResult;
+
+        #[derive(FromQueryResult)]
+        struct SourceRow {
+            container_id: String,
+            service: String,
+            node_id: Option<i32>,
+            node_name: Option<String>,
+        }
+
+        let mut condition = Condition::all()
+            .add(temps_entities::log_chunks::Column::ProjectId.eq(project_id))
+            .add(temps_entities::log_chunks::Column::StartedAt.lte(end_time))
+            .add(temps_entities::log_chunks::Column::EndedAt.gte(start_time));
+
+        if let Some(e) = env {
+            condition = condition.add(temps_entities::log_chunks::Column::Env.eq(e.to_string()));
+        }
+        if let Some(d) = deploy_id {
+            condition = condition.add(temps_entities::log_chunks::Column::DeployId.eq(d));
+        }
+
+        let rows = temps_entities::log_chunks::Entity::find()
+            .filter(condition)
+            .select_only()
+            .column(temps_entities::log_chunks::Column::ContainerId)
+            .column(temps_entities::log_chunks::Column::Service)
+            .column(temps_entities::log_chunks::Column::NodeId)
+            .column(temps_entities::log_chunks::Column::NodeName)
+            .distinct()
+            .into_model::<SourceRow>()
+            .all(self.db.as_ref())
+            .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| LogSource {
+                container_id: r.container_id,
+                service: r.service,
+                node_id: r.node_id,
+                node_name: r.node_name,
             })
             .collect())
     }
@@ -253,6 +331,8 @@ impl LogMetadataService {
                 service: m.service,
                 container_id: m.container_id,
                 deploy_id: m.deploy_id,
+                node_id: m.node_id,
+                node_name: m.node_name,
                 started_at: m.started_at,
                 ended_at: m.ended_at,
                 storage_key: m.storage_key,
@@ -327,6 +407,8 @@ impl LogMetadataService {
             service: m.service,
             container_id: m.container_id,
             deploy_id: m.deploy_id,
+            node_id: m.node_id,
+            node_name: m.node_name,
             started_at: m.started_at,
             ended_at: m.ended_at,
             storage_key: m.storage_key,
@@ -358,6 +440,8 @@ mod tests {
             service: svc.to_string(),
             container_id: "test-container".to_string(),
             deploy_id: None,
+            node_id: None,
+            node_name: None,
             started_at: Utc::now() - Duration::minutes(5),
             ended_at: Utc::now(),
             storage_key: format!("test/{}/{}", project_id, Uuid::new_v4()),
@@ -422,6 +506,86 @@ mod tests {
         assert!(
             projects.is_empty(),
             "Should return empty list when no chunks exist"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_list_sources_distinct() {
+        let db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Docker/DB not available, skipping test");
+                return;
+            }
+        };
+        let service = LogMetadataService::new(db.connection_arc());
+        let project = 90010;
+        let now = Utc::now();
+        let mk = |cid: &str, node: Option<i32>, nname: Option<&str>| ChunkMeta {
+            id: Uuid::new_v4(),
+            project_id: project,
+            env: "1".to_string(),
+            service: "web".to_string(),
+            container_id: cid.to_string(),
+            deploy_id: Some(1),
+            node_id: node,
+            node_name: nname.map(|s| s.to_string()),
+            started_at: now - Duration::minutes(5),
+            ended_at: now,
+            storage_key: format!("k/{}", Uuid::new_v4()),
+            line_count: 1,
+            compressed_size_bytes: 10,
+            has_errors: false,
+            line_offsets: vec![0],
+        };
+        // Two chunks for the same remote container (must dedup to one source),
+        // plus a second remote node and a control-plane-local container.
+        service
+            .insert_chunk_meta(&mk("cnt-a", Some(1), Some("worker-1")))
+            .await
+            .unwrap();
+        service
+            .insert_chunk_meta(&mk("cnt-a", Some(1), Some("worker-1")))
+            .await
+            .unwrap();
+        service
+            .insert_chunk_meta(&mk("cnt-b", Some(2), Some("worker-2")))
+            .await
+            .unwrap();
+        service
+            .insert_chunk_meta(&mk("cnt-local", None, None))
+            .await
+            .unwrap();
+
+        let sources = service
+            .list_sources(
+                project,
+                Some("1"),
+                None,
+                now - Duration::hours(1),
+                now + Duration::hours(1),
+            )
+            .await
+            .unwrap();
+
+        // 3 distinct containers (cnt-a's two chunks collapse to one source).
+        assert_eq!(
+            sources.len(),
+            3,
+            "expected 3 distinct sources, got {sources:?}"
+        );
+        let nodes: std::collections::HashSet<_> =
+            sources.iter().filter_map(|s| s.node_id).collect();
+        assert!(
+            nodes.contains(&1) && nodes.contains(&2),
+            "both remote nodes present"
+        );
+        assert!(
+            sources
+                .iter()
+                .any(|s| s.container_id == "cnt-local" && s.node_id.is_none()),
+            "control-plane-local container present with no node_id"
         );
     }
 }

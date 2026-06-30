@@ -69,9 +69,18 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [searchParams, setSearchParams] = useSearchParams()
+  // Honour a `?range=` deep-link (e.g. from a firing metric's "what changed"
+  // strip) so arriving here lands on the same window the operator was looking
+  // at. The metrics surface also offers `6h`, which error tracking doesn't
+  // bucket — widen it to 24h rather than silently ignore the intent.
   const [selectedTimeRange, setSelectedTimeRange] = useState<
     '1h' | '24h' | '7d' | '30d'
-  >('24h')
+  >(() => {
+    const r = searchParams.get('range')
+    if (r === '1h' || r === '24h' || r === '7d' || r === '30d') return r
+    if (r === '6h') return '24h'
+    return '24h'
+  })
   const [isDsnConfigOpen, setIsDsnConfigOpen] = useState(false)
   const [statusFilter, setStatusFilter] = useState<
     'unresolved' | 'resolved' | 'all'

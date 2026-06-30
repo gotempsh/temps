@@ -27,6 +27,7 @@ use hickory_proto::op::{Header, HeaderCounts, Metadata, ResponseCode};
 use hickory_proto::rr::{Name, Record};
 use hickory_resolver::config::{NameServerConfig, ResolverConfig, ResolverOpts};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::net::{DnsError, NetError};
 use hickory_resolver::Resolver;
 use hickory_server::server::{Request, ResponseHandler, ResponseInfo};
 use hickory_server::zone_handler::MessageResponseBuilder;
@@ -107,23 +108,26 @@ impl UpstreamResolver {
                 (recs, ResponseCode::NoError)
             }
             Err(e) => {
-                // hickory-resolver flattens NXDOMAIN, NODATA, and
-                // network errors into a single error type. We want to
-                // pass NXDOMAIN through cleanly (clients rely on it for
-                // negative caching) but treat real transport failures
-                // as SERVFAIL so the client can retry against another
-                // server.
-                let s = e.to_string();
-                let is_negative = s.contains("NXDomain")
-                    || s.contains("no records found")
-                    || s.contains("NoRecordsFound");
-                if is_negative {
-                    trace!(qname = %qname, qtype = ?qtype, "upstream NXDOMAIN");
-                    (Vec::new(), ResponseCode::NXDomain)
-                } else {
+                // hickory-resolver reports both NODATA (the name exists but
+                // has no record of *this* type) and NXDOMAIN (the name does
+                // not exist at all) as the same `NoRecordsFound` error. The
+                // true distinction lives in `NoRecords.response_code`, and it
+                // is load-bearing: glibc and busybox `getaddrinfo` treat an
+                // NXDOMAIN on *either* the A or the AAAA query as "host does
+                // not exist" and abandon the whole lookup. So an AAAA query
+                // for an IPv4-only host (e.g. `api.github.com`) that we answer
+                // with NXDOMAIN instead of NODATA silently breaks every
+                // outbound connection to that host — the good A answer is
+                // thrown away. We therefore forward the real response code and
+                // reserve SERVFAIL for genuine transport failures (timeout,
+                // refused, malformed) so the client retries another server.
+                let code = upstream_error_response_code(&e);
+                if code == ResponseCode::ServFail {
                     warn!(qname = %qname, qtype = ?qtype, error = %e, "upstream lookup failed");
-                    (Vec::new(), ResponseCode::ServFail)
+                } else {
+                    trace!(qname = %qname, qtype = ?qtype, ?code, "upstream negative answer");
                 }
+                (Vec::new(), code)
             }
         };
 
@@ -171,6 +175,24 @@ fn error_info(request: &Request, code: ResponseCode) -> ResponseInfo {
     .into()
 }
 
+/// Map an upstream lookup error to the DNS `ResponseCode` we return to the
+/// client.
+///
+/// `hickory-resolver` collapses NODATA and NXDOMAIN into a single
+/// [`DnsError::NoRecordsFound`] error; the real status is carried in
+/// `NoRecords.response_code` (`NoError` for NODATA, `NXDomain` for a genuine
+/// non-existent name). Returning NXDOMAIN for a NODATA makes `getaddrinfo`
+/// abandon the entire hostname — including a valid A answer it would
+/// otherwise have used — so we forward the true code. Anything that is not a
+/// negative DNS answer (transport failure, malformed response) becomes
+/// SERVFAIL so the stub resolver retries against another server.
+fn upstream_error_response_code(error: &NetError) -> ResponseCode {
+    match error {
+        NetError::Dns(DnsError::NoRecordsFound(no_records)) => no_records.response_code,
+        _ => ResponseCode::ServFail,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,5 +206,41 @@ mod tests {
     fn single_upstream_constructs() {
         let upstream = UpstreamResolver::new(&["1.1.1.1:53".parse().unwrap()]);
         assert!(upstream.is_some());
+    }
+
+    #[test]
+    fn nodata_keeps_noerror_and_nxdomain_passes_through() {
+        use hickory_proto::op::Query;
+        use hickory_resolver::net::NoRecords;
+
+        // NODATA — name exists, just no record of this type (the AAAA-on-an
+        // A-only-host case). MUST stay NoError; NXDOMAIN here would make
+        // getaddrinfo drop the name and break the connection.
+        let nodata = NetError::Dns(DnsError::NoRecordsFound(NoRecords::new(
+            Query::new(),
+            ResponseCode::NoError,
+        )));
+        assert_eq!(
+            upstream_error_response_code(&nodata),
+            ResponseCode::NoError,
+            "NODATA must be reported as NoError, never NXDOMAIN"
+        );
+
+        // A genuine non-existent name is forwarded as NXDOMAIN unchanged.
+        let nxdomain = NetError::Dns(DnsError::NoRecordsFound(NoRecords::new(
+            Query::new(),
+            ResponseCode::NXDomain,
+        )));
+        assert_eq!(
+            upstream_error_response_code(&nxdomain),
+            ResponseCode::NXDomain
+        );
+
+        // Non-DNS failures (here: the "resource too busy" transport signal)
+        // fall back to SERVFAIL so the stub resolver retries.
+        assert_eq!(
+            upstream_error_response_code(&NetError::Busy),
+            ResponseCode::ServFail
+        );
     }
 }

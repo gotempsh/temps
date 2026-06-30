@@ -68,6 +68,30 @@ pub trait OtelStorage: Send + Sync {
     /// List distinct metric names for a project.
     async fn list_metric_names(&self, project_id: i32) -> StorageResult<Vec<String>>;
 
+    /// List distinct attribute (label) keys observed on a metric within a time
+    /// window — powers label-filter key autocomplete. Implementations sample the
+    /// most recent matching rows so the call stays fast on high-volume metrics
+    /// (a complete scan is intentionally traded for bounded latency).
+    async fn list_metric_label_keys(
+        &self,
+        project_id: i32,
+        metric_name: &str,
+        start_time: chrono::DateTime<chrono::Utc>,
+        end_time: chrono::DateTime<chrono::Utc>,
+    ) -> StorageResult<Vec<String>>;
+
+    /// List distinct values seen for a given label key on a metric within a time
+    /// window — powers value autocomplete once a key is chosen. Sampled and
+    /// capped for the same latency reasons as `list_metric_label_keys`.
+    async fn list_metric_label_values(
+        &self,
+        project_id: i32,
+        metric_name: &str,
+        label_key: &str,
+        start_time: chrono::DateTime<chrono::Utc>,
+        end_time: chrono::DateTime<chrono::Utc>,
+    ) -> StorageResult<Vec<String>>;
+
     /// Query trace spans matching the given filters.
     async fn query_spans(&self, query: TraceQuery) -> StorageResult<Vec<SpanRecord>>;
 

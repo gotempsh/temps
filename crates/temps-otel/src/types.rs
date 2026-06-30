@@ -66,6 +66,8 @@ pub enum MetricType {
     Gauge,
     Sum,
     Histogram,
+    ExponentialHistogram,
+    Summary,
 }
 
 impl std::fmt::Display for MetricType {
@@ -74,8 +76,162 @@ impl std::fmt::Display for MetricType {
             MetricType::Gauge => write!(f, "gauge"),
             MetricType::Sum => write!(f, "sum"),
             MetricType::Histogram => write!(f, "histogram"),
+            MetricType::ExponentialHistogram => write!(f, "exponential_histogram"),
+            MetricType::Summary => write!(f, "summary"),
         }
     }
+}
+
+/// The aggregation applied when reducing raw metric points into a time bucket.
+///
+/// Store-neutral: every storage backend (ClickHouse today, TimescaleDB later)
+/// must be able to satisfy this contract. `Quantile(q)` carries the requested
+/// quantile in `[0.0, 1.0]` (e.g. `0.95` for p95).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricAggregation {
+    /// Arithmetic mean of the scalar value in each bucket. The default.
+    #[default]
+    Avg,
+    /// Sum of the scalar value in each bucket.
+    Sum,
+    /// Minimum scalar value in each bucket.
+    Min,
+    /// Maximum scalar value in each bucket.
+    Max,
+    /// Number of points in each bucket.
+    Count,
+    /// Per-second rate of change of a cumulative monotonic counter, computed as
+    /// `(max - min) / window_seconds` within each bucket. Non-monotonic series
+    /// fall back to a simple delta.
+    RatePerSec,
+    /// A quantile of the scalar value in each bucket. The carried `f64` is the
+    /// requested quantile in `[0.0, 1.0]`.
+    #[serde(untagged)]
+    Quantile(f64),
+}
+
+impl std::fmt::Display for MetricAggregation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MetricAggregation::Avg => write!(f, "avg"),
+            MetricAggregation::Sum => write!(f, "sum"),
+            MetricAggregation::Min => write!(f, "min"),
+            MetricAggregation::Max => write!(f, "max"),
+            MetricAggregation::Count => write!(f, "count"),
+            MetricAggregation::RatePerSec => write!(f, "rate_per_sec"),
+            MetricAggregation::Quantile(q) => write!(f, "quantile({q})"),
+        }
+    }
+}
+
+impl MetricAggregation {
+    /// Parse a query-string aggregation token into a typed aggregation.
+    ///
+    /// Accepts the keyword forms (`avg`, `sum`, `min`, `max`, `count`, `rate`)
+    /// and quantile forms `p50`/`p95`/`p99` and `quantile:0.95` / `q0.95`.
+    /// Unknown or out-of-range inputs fall back to [`MetricAggregation::Avg`].
+    pub fn parse(s: &str) -> Self {
+        let lower = s.trim().to_ascii_lowercase();
+        match lower.as_str() {
+            "avg" | "average" | "mean" => return MetricAggregation::Avg,
+            "sum" | "total" => return MetricAggregation::Sum,
+            "min" | "minimum" => return MetricAggregation::Min,
+            "max" | "maximum" => return MetricAggregation::Max,
+            "count" => return MetricAggregation::Count,
+            "rate" | "rate_per_sec" | "ratepersec" => return MetricAggregation::RatePerSec,
+            _ => {}
+        }
+        // pNN shorthand (p50 -> 0.50, p95 -> 0.95, p999 -> 0.999, p99.9 -> 0.999)
+        if let Some(rest) = lower.strip_prefix('p') {
+            if let Ok(on) = rest.parse::<f64>() {
+                let q = if rest.contains('.') {
+                    on / 100.0
+                } else {
+                    on / 10f64.powi(rest.len() as i32)
+                };
+                if (0.0..=1.0).contains(&q) {
+                    return MetricAggregation::Quantile(q);
+                }
+            }
+        }
+        // quantile:0.95 / q0.95 / quantile(0.95)
+        for prefix in ["quantile:", "quantile(", "q"] {
+            if let Some(rest) = lower.strip_prefix(prefix) {
+                let cleaned = rest.trim_end_matches(')');
+                if let Ok(q) = cleaned.parse::<f64>() {
+                    if (0.0..=1.0).contains(&q) {
+                        return MetricAggregation::Quantile(q);
+                    }
+                }
+            }
+        }
+        MetricAggregation::Avg
+    }
+
+    /// The clamped quantile for a `Quantile` aggregation, else `None`.
+    pub fn quantile(&self) -> Option<f64> {
+        match self {
+            MetricAggregation::Quantile(q) => Some(q.clamp(0.0, 1.0)),
+            _ => None,
+        }
+    }
+}
+
+/// The aggregation temporality of a Sum/Histogram/ExponentialHistogram metric.
+///
+/// Mirrors OTel's `AggregationTemporality` proto enum: whether reported values
+/// are cumulative since the start of the series (Cumulative) or only the delta
+/// since the previous report (Delta).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AggregationTemporality {
+    /// Temporality not reported by the producer.
+    Unspecified,
+    /// Each value covers only the interval since the previous report.
+    Delta,
+    /// Each value is cumulative since the start of the series.
+    Cumulative,
+}
+
+impl std::fmt::Display for AggregationTemporality {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AggregationTemporality::Unspecified => write!(f, "unspecified"),
+            AggregationTemporality::Delta => write!(f, "delta"),
+            AggregationTemporality::Cumulative => write!(f, "cumulative"),
+        }
+    }
+}
+
+impl AggregationTemporality {
+    /// Map the raw protobuf `aggregation_temporality` i32 to our enum.
+    ///
+    /// Unknown values fall back to `Unspecified` so unexpected producers never
+    /// cause a decode failure.
+    pub fn from_proto(value: i32) -> Self {
+        match value {
+            1 => AggregationTemporality::Delta,
+            2 => AggregationTemporality::Cumulative,
+            _ => AggregationTemporality::Unspecified,
+        }
+    }
+}
+
+/// A single exemplar — a sampled measurement linking a metric point back to a
+/// trace/span that contributed to it.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct Exemplar {
+    #[schema(value_type = String, format = DateTime)]
+    pub timestamp: DateTime<Utc>,
+    /// The raw measured value of this exemplar.
+    pub value: f64,
+    /// The trace this exemplar links to, hex-encoded (absent when empty).
+    pub trace_id: Option<String>,
+    /// The span this exemplar links to, hex-encoded (absent when empty).
+    pub span_id: Option<String>,
+    /// Filtered attributes attached to this exemplar.
+    pub attributes: BTreeMap<String, String>,
 }
 
 /// A single metric data point ready for storage.
@@ -87,13 +243,30 @@ pub struct MetricPoint {
     pub metric_name: String,
     pub metric_type: MetricType,
     pub unit: String,
+    /// Human-readable description from the OTel `Metric.description` field.
+    #[serde(default)]
+    pub description: Option<String>,
     #[schema(value_type = String, format = DateTime)]
     pub timestamp: DateTime<Utc>,
+    /// Start of the interval this point covers (from `start_time_unix_nano`).
+    /// Used for delta/cumulative reasoning; absent when the producer omits it.
+    #[serde(default)]
+    #[schema(value_type = Option<String>, format = DateTime)]
+    pub start_time: Option<DateTime<Utc>>,
+    /// Aggregation temporality (Sum/Histogram/ExponentialHistogram only).
+    #[serde(default)]
+    pub temporality: Option<AggregationTemporality>,
+    /// Whether a Sum is monotonic (counter vs up-down counter). `None` for non-Sum.
+    #[serde(default)]
+    pub is_monotonic: Option<bool>,
+    /// Data-point flags bitmask (e.g. NO_RECORDED_VALUE) from the OTLP point.
+    #[serde(default)]
+    pub flags: u32,
     /// For Gauge/Sum: the scalar value.
     pub value: Option<f64>,
-    /// For Histogram: count of observations.
+    /// For Histogram/Summary/ExponentialHistogram: count of observations.
     pub histogram_count: Option<u64>,
-    /// For Histogram: sum of observations.
+    /// For Histogram/Summary/ExponentialHistogram: sum of observations.
     pub histogram_sum: Option<f64>,
     /// For Histogram: min value.
     pub histogram_min: Option<f64>,
@@ -103,8 +276,87 @@ pub struct MetricPoint {
     pub histogram_bounds: Option<Vec<f64>>,
     /// For Histogram: count per bucket.
     pub histogram_bucket_counts: Option<Vec<u64>>,
+    // ── ExponentialHistogram fields ──────────────────────────────────
+    /// Resolution scale of the exponential buckets.
+    #[serde(default)]
+    pub exp_scale: Option<i32>,
+    /// Count of values that are exactly zero (or within the zero threshold).
+    #[serde(default)]
+    pub exp_zero_count: Option<u64>,
+    /// The threshold below which values are counted in `exp_zero_count`.
+    #[serde(default)]
+    pub exp_zero_threshold: Option<f64>,
+    /// Bucket offset for the positive range.
+    #[serde(default)]
+    pub exp_positive_offset: Option<i32>,
+    /// Per-bucket counts for the positive range.
+    #[serde(default)]
+    pub exp_positive_counts: Option<Vec<u64>>,
+    /// Bucket offset for the negative range.
+    #[serde(default)]
+    pub exp_negative_offset: Option<i32>,
+    /// Per-bucket counts for the negative range.
+    #[serde(default)]
+    pub exp_negative_counts: Option<Vec<u64>>,
+    // ── Summary fields ───────────────────────────────────────────────
+    /// Summary quantile/value pairs `(quantile, value)`.
+    #[serde(default)]
+    pub summary_quantiles: Option<Vec<(f64, f64)>>,
+    /// Exemplars sampled for this data point, linking back to traces.
+    #[serde(default)]
+    pub exemplars: Vec<Exemplar>,
     /// Attribute labels on this data point.
     pub attributes: BTreeMap<String, String>,
+}
+
+impl MetricPoint {
+    /// Construct a minimal Gauge-shaped `MetricPoint` with all optional
+    /// full-fidelity fields defaulted. Helpers (decode, tests) fill in only the
+    /// fields they care about; this keeps every call site compiling as the type
+    /// grows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn skeleton(
+        project_id: i32,
+        deployment_id: Option<i32>,
+        resource: ResourceInfo,
+        metric_name: String,
+        metric_type: MetricType,
+        unit: String,
+        timestamp: DateTime<Utc>,
+        attributes: BTreeMap<String, String>,
+    ) -> Self {
+        Self {
+            project_id,
+            deployment_id,
+            resource,
+            metric_name,
+            metric_type,
+            unit,
+            description: None,
+            timestamp,
+            start_time: None,
+            temporality: None,
+            is_monotonic: None,
+            flags: 0,
+            value: None,
+            histogram_count: None,
+            histogram_sum: None,
+            histogram_min: None,
+            histogram_max: None,
+            histogram_bounds: None,
+            histogram_bucket_counts: None,
+            exp_scale: None,
+            exp_zero_count: None,
+            exp_zero_threshold: None,
+            exp_positive_offset: None,
+            exp_positive_counts: None,
+            exp_negative_offset: None,
+            exp_negative_counts: None,
+            summary_quantiles: None,
+            exemplars: Vec::new(),
+            attributes,
+        }
+    }
 }
 
 // ── Traces ───────────────────────────────────────────────────────────
@@ -781,6 +1033,13 @@ impl GenAiSpanDetail {
 }
 
 /// Filter for querying metrics.
+///
+/// This is the **store-neutral query contract** every backend must satisfy.
+/// The basic shape (`metric_name`/`service_name`/`environment`/time window /
+/// `bucket_interval`/`limit`) is honoured by both ClickHouse and TimescaleDB.
+/// The richer options (`metric_type`, `label_filters`, `group_by`,
+/// `aggregation`) are populated by the query API and are forward-compatible:
+/// each is `#[serde(default)]` so older callers and JSON payloads still parse.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MetricQuery {
     pub project_id: i32,
@@ -791,6 +1050,22 @@ pub struct MetricQuery {
     pub end_time: Option<DateTime<Utc>>,
     pub bucket_interval: Option<String>,
     pub limit: Option<u64>,
+    /// Restrict to a single metric type (gauge/sum/histogram/…). `None` = any.
+    #[serde(default)]
+    pub metric_type: Option<MetricType>,
+    /// Exact-match data-point label filters as `(key, value)` pairs. ANDead
+    /// together. Keys MUST pass the same allowlist as ingest before reaching a
+    /// store; values are always bound, never concatenated.
+    #[serde(default)]
+    pub label_filters: Vec<(String, String)>,
+    /// Label keys to group the series by, producing one bucket stream per
+    /// distinct label-set. Keys MUST pass the allowlist. Empty = no grouping
+    /// (one aggregate stream).
+    #[serde(default)]
+    pub group_by: Vec<String>,
+    /// The aggregation reducing raw points into each bucket. Defaults to `Avg`.
+    #[serde(default)]
+    pub aggregation: MetricAggregation,
 }
 
 /// Filter for querying log records.
@@ -807,7 +1082,38 @@ pub struct LogQuery {
     pub offset: Option<u64>,
 }
 
+/// An explicit-bucket histogram aggregated over a time bucket.
+///
+/// Carries the reduced scalars (count/sum/min/max) plus the explicit bucket
+/// layout — `bounds` (the upper bounds) and `bucket_counts` (observation counts,
+/// summed element-wise across the window; length is `bounds.len() + 1`, the last
+/// entry being the +Inf overflow bucket). With these, a caller can reconstruct
+/// any quantile (e.g. p95) via cumulative-count interpolation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct HistogramSummary {
+    /// Total observation count summed across the bucket window.
+    pub count: u64,
+    /// Sum of observed values across the bucket window.
+    pub sum: f64,
+    /// Minimum observed value, when reported by the producer.
+    pub min: Option<f64>,
+    /// Maximum observed value, when reported by the producer.
+    pub max: Option<f64>,
+    /// Explicit bucket upper bounds (OTLP `explicit_bounds`), ascending.
+    pub bounds: Vec<f64>,
+    /// Per-bucket observation counts summed element-wise across the window.
+    /// Length is `bounds.len() + 1` (the trailing element is the +Inf bucket).
+    pub bucket_counts: Vec<u64>,
+}
+
 /// A time-bucketed metric aggregate for chart display.
+///
+/// Store-neutral response contract. The legacy scalar fields
+/// (`avg_value`/`min_value`/`max_value`/`count`) are always populated for chart
+/// back-compat. The richer fields describe the explicitly-requested
+/// [`MetricAggregation`] (`value`), optional `quantiles`, an optional
+/// `histogram_summary`, and a `series_key` identifying the label-set when the
+/// query used `group_by`.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct MetricBucket {
     #[schema(value_type = String, format = DateTime)]
@@ -816,6 +1122,48 @@ pub struct MetricBucket {
     pub min_value: f64,
     pub max_value: f64,
     pub count: i64,
+    /// The value of the requested [`MetricAggregation`] for this bucket. For the
+    /// default `Avg` aggregation this equals `avg_value`. `#[serde(default)]` so
+    /// pre-existing payloads (which only carried avg/min/max/count) still parse.
+    #[serde(default)]
+    pub value: f64,
+    /// Computed quantile/value pairs `(quantile, value)` when the query asked for
+    /// quantile aggregation; otherwise empty.
+    #[serde(default)]
+    pub quantiles: Vec<(f64, f64)>,
+    /// A reduced histogram summary when the bucketed metric is a histogram.
+    #[serde(default)]
+    pub histogram_summary: Option<HistogramSummary>,
+    /// The label-set this bucket belongs to, as ordered `(key, value)` pairs,
+    /// when the query grouped by labels. Empty/`None` = the single ungrouped
+    /// aggregate stream.
+    #[serde(default)]
+    pub series_key: Option<Vec<(String, String)>>,
+}
+
+impl MetricBucket {
+    /// Construct a scalar bucket from the four legacy aggregate columns,
+    /// defaulting the richer fields. `value` is set to `avg_value` so callers
+    /// that don't request a specific aggregation get a sensible default.
+    pub fn scalar(
+        bucket: DateTime<Utc>,
+        avg_value: f64,
+        min_value: f64,
+        max_value: f64,
+        count: i64,
+    ) -> Self {
+        Self {
+            bucket,
+            avg_value,
+            min_value,
+            max_value,
+            count,
+            value: avg_value,
+            quantiles: Vec::new(),
+            histogram_summary: None,
+            series_key: None,
+        }
+    }
 }
 
 /// Quota usage information for a project.
@@ -897,6 +1245,173 @@ mod tests {
         assert_eq!(MetricType::Gauge.to_string(), "gauge");
         assert_eq!(MetricType::Sum.to_string(), "sum");
         assert_eq!(MetricType::Histogram.to_string(), "histogram");
+        assert_eq!(
+            MetricType::ExponentialHistogram.to_string(),
+            "exponential_histogram"
+        );
+        assert_eq!(MetricType::Summary.to_string(), "summary");
+    }
+
+    #[test]
+    fn test_aggregation_temporality_display() {
+        assert_eq!(
+            AggregationTemporality::Unspecified.to_string(),
+            "unspecified"
+        );
+        assert_eq!(AggregationTemporality::Delta.to_string(), "delta");
+        assert_eq!(AggregationTemporality::Cumulative.to_string(), "cumulative");
+    }
+
+    #[test]
+    fn test_aggregation_temporality_from_proto() {
+        assert_eq!(
+            AggregationTemporality::from_proto(0),
+            AggregationTemporality::Unspecified
+        );
+        assert_eq!(
+            AggregationTemporality::from_proto(1),
+            AggregationTemporality::Delta
+        );
+        assert_eq!(
+            AggregationTemporality::from_proto(2),
+            AggregationTemporality::Cumulative
+        );
+        // Unknown values fall back to Unspecified.
+        assert_eq!(
+            AggregationTemporality::from_proto(99),
+            AggregationTemporality::Unspecified
+        );
+    }
+
+    #[test]
+    fn test_aggregation_temporality_serde_roundtrip() {
+        let json = serde_json::to_string(&AggregationTemporality::Cumulative).unwrap();
+        assert_eq!(json, "\"cumulative\"");
+        let parsed: AggregationTemporality = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, AggregationTemporality::Cumulative);
+    }
+
+    // ── MetricAggregation ───────────────────────────────────────────
+
+    #[test]
+    fn test_metric_aggregation_default_is_avg() {
+        assert_eq!(MetricAggregation::default(), MetricAggregation::Avg);
+    }
+
+    #[test]
+    fn test_metric_aggregation_parse_keywords() {
+        assert_eq!(MetricAggregation::parse("avg"), MetricAggregation::Avg);
+        assert_eq!(MetricAggregation::parse("MEAN"), MetricAggregation::Avg);
+        assert_eq!(MetricAggregation::parse("sum"), MetricAggregation::Sum);
+        assert_eq!(MetricAggregation::parse("min"), MetricAggregation::Min);
+        assert_eq!(MetricAggregation::parse("max"), MetricAggregation::Max);
+        assert_eq!(MetricAggregation::parse("count"), MetricAggregation::Count);
+        assert_eq!(
+            MetricAggregation::parse("rate"),
+            MetricAggregation::RatePerSec
+        );
+        // Unknown falls back to Avg.
+        assert_eq!(MetricAggregation::parse("bogus"), MetricAggregation::Avg);
+    }
+
+    #[test]
+    fn test_metric_aggregation_parse_quantiles() {
+        assert_eq!(
+            MetricAggregation::parse("p50"),
+            MetricAggregation::Quantile(0.5)
+        );
+        assert_eq!(
+            MetricAggregation::parse("p95"),
+            MetricAggregation::Quantile(0.95)
+        );
+        assert_eq!(
+            MetricAggregation::parse("p99"),
+            MetricAggregation::Quantile(0.99)
+        );
+        assert_eq!(
+            MetricAggregation::parse("p999"),
+            MetricAggregation::Quantile(0.999)
+        );
+        assert_eq!(
+            MetricAggregation::parse("quantile:0.95"),
+            MetricAggregation::Quantile(0.95)
+        );
+        assert_eq!(
+            MetricAggregation::parse("q0.9"),
+            MetricAggregation::Quantile(0.9)
+        );
+        // Explicit out-of-range quantile falls back to Avg.
+        assert_eq!(
+            MetricAggregation::parse("quantile:2.0"),
+            MetricAggregation::Avg
+        );
+        assert_eq!(MetricAggregation::parse("q1.5"), MetricAggregation::Avg);
+    }
+
+    #[test]
+    fn test_metric_aggregation_quantile_accessor_clamps() {
+        assert_eq!(MetricAggregation::Avg.quantile(), None);
+        assert_eq!(MetricAggregation::Quantile(0.95).quantile(), Some(0.95));
+        // Out-of-range stored value is clamped on read.
+        assert_eq!(MetricAggregation::Quantile(1.5).quantile(), Some(1.0));
+        assert_eq!(MetricAggregation::Quantile(-0.5).quantile(), Some(0.0));
+    }
+
+    #[test]
+    fn test_metric_query_default_contract_fields() {
+        let q = MetricQuery::default();
+        assert!(q.metric_type.is_none());
+        assert!(q.label_filters.is_empty());
+        assert!(q.group_by.is_empty());
+        assert_eq!(q.aggregation, MetricAggregation::Avg);
+    }
+
+    #[test]
+    fn test_metric_bucket_scalar_defaults_rich_fields() {
+        let now = chrono::Utc::now();
+        let b = MetricBucket::scalar(now, 10.0, 5.0, 20.0, 3);
+        assert_eq!(b.avg_value, 10.0);
+        assert_eq!(b.min_value, 5.0);
+        assert_eq!(b.max_value, 20.0);
+        assert_eq!(b.count, 3);
+        // `value` defaults to avg; richer fields are empty/None.
+        assert_eq!(b.value, 10.0);
+        assert!(b.quantiles.is_empty());
+        assert!(b.histogram_summary.is_none());
+        assert!(b.series_key.is_none());
+    }
+
+    #[test]
+    fn test_metric_bucket_backcompat_deserialize_without_rich_fields() {
+        // A payload from before the richer fields existed must still parse,
+        // defaulting value/quantiles/histogram_summary/series_key.
+        let json = r#"{"bucket":"2026-01-01T00:00:00Z","avg_value":1.0,"min_value":0.0,"max_value":2.0,"count":5}"#;
+        let b: MetricBucket = serde_json::from_str(json).unwrap();
+        assert_eq!(b.avg_value, 1.0);
+        assert_eq!(b.value, 0.0); // default, no value key present
+        assert!(b.quantiles.is_empty());
+        assert!(b.series_key.is_none());
+    }
+
+    #[test]
+    fn test_metric_point_skeleton_defaults() {
+        let p = MetricPoint::skeleton(
+            7,
+            None,
+            ResourceInfo::default(),
+            "m".into(),
+            MetricType::Gauge,
+            "1".into(),
+            chrono::Utc::now(),
+            BTreeMap::new(),
+        );
+        assert_eq!(p.project_id, 7);
+        assert!(p.temporality.is_none());
+        assert!(p.is_monotonic.is_none());
+        assert_eq!(p.flags, 0);
+        assert!(p.exemplars.is_empty());
+        assert!(p.summary_quantiles.is_none());
+        assert!(p.exp_scale.is_none());
     }
 
     #[test]

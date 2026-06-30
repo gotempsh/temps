@@ -40,12 +40,101 @@ pub struct JoinCommand {
     /// Labels for node scheduling (key=value pairs)
     #[arg(long, value_delimiter = ',')]
     pub labels: Vec<String>,
+
+    /// Expected SHA-256 fingerprint of the cluster CA, shown when the enrollment
+    /// token was minted. When set, the join aborts if the CA returned by the
+    /// control plane doesn't match — defeating a man-in-the-middle that swaps in
+    /// its own CA (ADR-020 WS-2.2).
+    #[arg(long)]
+    pub ca_fingerprint: Option<String>,
 }
 
 /// Response body from the control plane registration endpoint.
 #[derive(serde::Deserialize)]
 struct RegisterResponse {
     id: i32,
+    /// Signed per-node leaf cert (PEM) for mTLS — present when we sent a CSR.
+    #[serde(default)]
+    cert_pem: Option<String>,
+    /// Cluster CA cert (PEM) the node pins as its trust root.
+    #[serde(default)]
+    ca_cert_pem: Option<String>,
+}
+
+/// Generated mTLS material to send + save during join (ADR-020 WS-2.1).
+struct NodeTlsMaterial {
+    key_pem: String,
+    csr_pem: String,
+}
+
+/// Generate a per-node keypair + CSR. The private key never leaves this host.
+/// `ip` is the address the control plane will connect to (the node's
+/// private/WG IP) and MUST be a SAN, or the CP's server-cert hostname check
+/// fails (ADR-020 WS-2.1).
+fn generate_node_tls_material(node_name: &str, ip: &str) -> Option<NodeTlsMaterial> {
+    let sans = vec![ip.to_string(), node_name.to_string()];
+    match temps_core::node_pki::generate_node_keypair_csr(node_name, &sans) {
+        Ok(csr) => Some(NodeTlsMaterial {
+            key_pem: csr.key_pem,
+            csr_pem: csr.csr_pem,
+        }),
+        Err(e) => {
+            eprintln!("Warning: could not generate node TLS material ({e}); joining without mTLS.");
+            None
+        }
+    }
+}
+
+/// Write the node key + leaf cert + cluster CA to the agent data dir (key 0600)
+/// and return their paths for the agent config. Best-effort: on any IO error we
+/// warn and return None so the node still joins (over plaintext HTTP).
+fn write_node_certs(
+    key_pem: &str,
+    cert_pem: &str,
+    ca_cert_pem: &str,
+) -> Option<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
+    let dir = crate::commands::agent::agent_data_dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("Warning: could not create agent data dir for certs: {e}");
+        return None;
+    }
+    let key_path = dir.join("node.key.pem");
+    let cert_path = dir.join("node.cert.pem");
+    let ca_path = dir.join("cluster-ca.pem");
+
+    if let Err(e) = std::fs::write(&key_path, key_pem) {
+        eprintln!("Warning: could not write node key: {e}");
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+    }
+    if let Err(e) = std::fs::write(&cert_path, cert_pem) {
+        eprintln!("Warning: could not write node cert: {e}");
+        return None;
+    }
+    if let Err(e) = std::fs::write(&ca_path, ca_cert_pem) {
+        eprintln!("Warning: could not write cluster CA: {e}");
+        return None;
+    }
+    Some((cert_path, key_path, ca_path))
+}
+
+/// Persist the signed leaf + cluster CA from the register response, returning
+/// the `(cert, key, ca)` paths for the agent config. Returns `None` (so the
+/// node serves plaintext HTTP) when no CSR was sent or the CP did not sign one.
+fn persist_tls(
+    material: &Option<NodeTlsMaterial>,
+    response: &RegisterResponse,
+) -> Option<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
+    let material = material.as_ref()?;
+    let cert_pem = response.cert_pem.as_ref()?;
+    let ca_cert_pem = response.ca_cert_pem.as_ref()?;
+    let paths = write_node_certs(&material.key_pem, cert_pem, ca_cert_pem)?;
+    println!("mTLS certificate provisioned — the agent will serve TLS.");
+    Some(paths)
 }
 
 impl JoinCommand {
@@ -131,6 +220,11 @@ impl JoinCommand {
 
         let register_url = format!("{}/api/internal/nodes/register", self.target);
 
+        // Generate per-node mTLS material; send the CSR so the control plane
+        // can sign a leaf for us (ADR-020 WS-2.1). The leaf must be valid for
+        // the private address the CP connects to.
+        let tls_material = generate_node_tls_material(node_name, private_address.trim());
+
         let register_body = serde_json::json!({
             "name": node_name,
             "token": agent_token,
@@ -138,6 +232,7 @@ impl JoinCommand {
             "address": format!("http://{}:{}", private_address.trim(), self.agent_address.split(':').next_back().unwrap_or("3100").trim()),
             "private_address": private_address,
             "labels": labels,
+            "csr_pem": tls_material.as_ref().map(|m| m.csr_pem.clone()),
         });
 
         let response = client
@@ -163,6 +258,31 @@ impl JoinCommand {
             register_response.id
         );
 
+        // Verify the cluster CA out of band before trusting it (ADR-020 WS-2.2):
+        // if the operator passed the expected fingerprint, the CA the control
+        // plane returned must match it, or a MITM could have swapped its own CA.
+        if let Some(expected) = self.ca_fingerprint.as_deref() {
+            match register_response.ca_cert_pem.as_deref() {
+                Some(ca_pem) => {
+                    let actual = temps_core::node_pki::ca_fingerprint_sha256(ca_pem)
+                        .map_err(|e| anyhow::anyhow!("could not fingerprint received CA: {e}"))?;
+                    if !actual.eq_ignore_ascii_case(expected.trim()) {
+                        anyhow::bail!(
+                            "Cluster CA fingerprint mismatch — expected {expected}, got {actual}. \
+                             Aborting join (possible man-in-the-middle)."
+                        );
+                    }
+                    println!("Cluster CA fingerprint verified.");
+                }
+                None => anyhow::bail!(
+                    "--ca-fingerprint was provided but the control plane returned no CA certificate."
+                ),
+            }
+        }
+
+        // Persist the signed leaf + cluster CA so `temps agent` can serve mTLS.
+        let tls_paths = persist_tls(&tls_material, &register_response);
+
         // Save config for `temps agent`
         let config = temps_agent::AgentConfig {
             listen_address: self.agent_address.clone(),
@@ -172,6 +292,9 @@ impl JoinCommand {
             node_id: register_response.id,
             labels: labels.clone(),
             dns_data_dir: crate::commands::agent::agent_data_dir().join("dns"),
+            tls_cert_path: tls_paths.as_ref().map(|p| p.0.clone()),
+            tls_key_path: tls_paths.as_ref().map(|p| p.1.clone()),
+            cluster_ca_path: tls_paths.as_ref().map(|p| p.2.clone()),
         };
         self.save_agent_config(&config)?;
 
@@ -281,6 +404,10 @@ impl JoinCommand {
             .unwrap_or("3100")
             .trim();
 
+        // Generate per-node mTLS material and send the CSR (ADR-020 WS-2.1).
+        // The leaf must be valid for the WG IP the CP connects to.
+        let tls_material = generate_node_tls_material(node_name, &relay_response.assigned_ip);
+
         let register_body = serde_json::json!({
             "name": node_name,
             "token": relay_response.agent_token,
@@ -290,6 +417,7 @@ impl JoinCommand {
             "wg_public_key": keypair.public_key,
             "public_endpoint": public_endpoint,
             "labels": labels,
+            "csr_pem": tls_material.as_ref().map(|m| m.csr_pem.clone()),
         });
 
         let response = register_client
@@ -308,16 +436,24 @@ impl JoinCommand {
             );
         }
 
-        // Try to get node_id from the register response; fall back to relay response
-        let node_id = match response.json::<RegisterResponse>().await {
-            Ok(r) => r.id,
-            Err(_) => relay_response.node_id,
+        // Parse the register response (node_id + signed certs); fall back to the
+        // relay-provided node_id if the body can't be parsed.
+        let register_response: RegisterResponse = match response.json().await {
+            Ok(r) => r,
+            Err(_) => RegisterResponse {
+                id: relay_response.node_id,
+                cert_pem: None,
+                ca_cert_pem: None,
+            },
         };
+        let node_id = register_response.id;
 
         println!(
             "Registered with control plane successfully (node_id={}).",
             node_id
         );
+
+        let tls_paths = persist_tls(&tls_material, &register_response);
 
         // Save config for `temps agent`
         let config = temps_agent::AgentConfig {
@@ -328,6 +464,9 @@ impl JoinCommand {
             node_id,
             labels: labels.clone(),
             dns_data_dir: crate::commands::agent::agent_data_dir().join("dns"),
+            tls_cert_path: tls_paths.as_ref().map(|p| p.0.clone()),
+            tls_key_path: tls_paths.as_ref().map(|p| p.1.clone()),
+            cluster_ca_path: tls_paths.as_ref().map(|p| p.2.clone()),
         };
         self.save_agent_config(&config)?;
 

@@ -1281,19 +1281,43 @@ impl MarkDeploymentCompleteJob {
             )
         })?;
 
-        let remote = temps_deployer::remote::RemoteNodeDeployer::new(
-            node.address.clone(),
-            token,
-            node.name.clone(),
-        )
-        .map_err(|e| {
-            format!(
-                "Failed to create remote deployer for node '{}': {}",
-                node.name, e
-            )
-        })?;
+        // Use mutual TLS for https:// nodes when the cluster CA deps are wired
+        // (ADR-020 WS-2.1); otherwise plain HTTP.
+        let remote: Arc<dyn temps_deployer::ContainerDeployer> =
+            if let Some(ref cs) = self.config_service {
+                Arc::new(
+                    crate::cluster_ca::build_node_deployer(
+                        &node.address,
+                        token,
+                        node.name.clone(),
+                        cs.as_ref(),
+                        self.encryption_service.as_ref(),
+                    )
+                    .await
+                    .map_err(|e| {
+                        format!(
+                            "Failed to create remote deployer for node '{}': {}",
+                            node.name, e
+                        )
+                    })?,
+                )
+            } else {
+                Arc::new(
+                    temps_deployer::remote::RemoteNodeDeployer::new(
+                        node.address.clone(),
+                        token,
+                        node.name.clone(),
+                    )
+                    .map_err(|e| {
+                        format!(
+                            "Failed to create remote deployer for node '{}': {}",
+                            node.name, e
+                        )
+                    })?,
+                )
+            };
 
-        Ok(Arc::new(remote))
+        Ok(remote)
     }
 
     /// Capture a container's logs to durable storage before it is torn down.

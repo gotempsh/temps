@@ -87,6 +87,11 @@ pub fn parse_log_line(
             env: ctx.env.clone(),
             project_id: ctx.project_id,
             deploy_id: ctx.deploy_id,
+            // node fields are stamped by the collector after parsing — the
+            // parser only knows Docker-label-derived context, not platform
+            // node placement. Local containers stay None.
+            node_id: None,
+            node_name: None,
         };
     }
 
@@ -104,6 +109,8 @@ pub fn parse_log_line(
         env: ctx.env.clone(),
         project_id: ctx.project_id,
         deploy_id: ctx.deploy_id,
+        node_id: None,
+        node_name: None,
     }
 }
 

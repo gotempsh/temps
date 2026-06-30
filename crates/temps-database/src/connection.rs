@@ -221,6 +221,107 @@ pub async fn connect_without_migrations(database_url: &str) -> ServiceResult<Arc
     Ok(Arc::new(db))
 }
 
+/// Connect for the standalone `temps migrate` command: a SINGLE persistent
+/// backend (pool of 1), tagged `application_name = 'temps_migrate'`, returning
+/// that backend's PID alongside the connection.
+///
+/// The single, stable backend is what makes interruption safe. If the operator
+/// hits Ctrl+C during a slow DDL (e.g. building an index), the CLI process exits
+/// but the Postgres backend keeps running the statement server-side — and a
+/// re-run of `temps migrate` would then race a SECOND backend against the first
+/// on the same schema. Capturing the PID lets the command cancel that exact
+/// backend on interrupt (see [`cancel_migration_backend`]).
+pub async fn connect_for_migrate(database_url: &str) -> ServiceResult<(Arc<DbConnection>, i32)> {
+    let (host, port) = parse_database_url(database_url)
+        .map_err(|e| ServiceError::Database(format!("Invalid database URL: {}", e)))?;
+
+    check_database_connectivity(&host, port)
+        .await
+        .map_err(ServiceError::Database)?;
+
+    let mut opt = ConnectOptions::new(database_url);
+    // Exactly one backend, kept alive for the run, so the PID below is the
+    // backend that executes every migration statement.
+    opt.max_connections(1)
+        .min_connections(1)
+        .sqlx_logging(false);
+
+    let db = match timeout(CONNECTION_TIMEOUT, Database::connect(opt)).await {
+        Ok(Ok(db)) => db,
+        Ok(Err(e)) => {
+            return Err(ServiceError::Database(format!(
+                "Failed to connect to database: {}",
+                e
+            )))
+        }
+        Err(_) => {
+            return Err(ServiceError::Database(format!(
+                "Database connection timed out after {} seconds",
+                CONNECTION_TIMEOUT.as_secs()
+            )))
+        }
+    };
+
+    // Tag the session so operators can spot the migrator in `pg_stat_activity`
+    // and an interrupt can find it by name as a fallback. Best-effort.
+    let _ = db
+        .execute(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SET application_name = 'temps_migrate'".to_owned(),
+        ))
+        .await;
+
+    let pid = db
+        .query_one(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT pg_backend_pid() AS pid".to_owned(),
+        ))
+        .await
+        .map_err(|e| ServiceError::Database(format!("Failed to read backend pid: {}", e)))?
+        .and_then(|row| row.try_get::<i32>("", "pid").ok())
+        .ok_or_else(|| ServiceError::Database("Could not determine backend pid".to_owned()))?;
+
+    Ok((Arc::new(db), pid))
+}
+
+/// Cancel an in-flight migration server-side — used when `temps migrate` is
+/// interrupted (Ctrl+C). Opens a FRESH connection (the migrating one is busy)
+/// and sends a query-cancel to the captured backend `pid`, exactly like pressing
+/// Ctrl+C in `psql`: the running DDL aborts and, because Sea-ORM runs each
+/// migration in a transaction, that transaction rolls back — leaving the DB at
+/// the last successfully-applied migration. Also sweeps any backend tagged
+/// `application_name = 'temps_migrate'` (e.g. a straggler from a prior interrupt)
+/// so a re-run never races a lingering backend. Best-effort.
+pub async fn cancel_migration_backend(database_url: &str, pid: i32) -> ServiceResult<()> {
+    let db = Database::connect(ConnectOptions::new(database_url))
+        .await
+        .map_err(|e| {
+            ServiceError::Database(format!("Failed to connect to cancel migration: {}", e))
+        })?;
+
+    // Precise: cancel the migrating backend we captured.
+    let _ = db
+        .execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT pg_cancel_backend($1)",
+            [pid.into()],
+        ))
+        .await;
+
+    // Fallback: cancel any other session still tagged as a migrator (never this
+    // cancel connection itself).
+    let _ = db
+        .execute(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT pg_cancel_backend(pid) FROM pg_stat_activity \
+             WHERE application_name = 'temps_migrate' AND pid <> pg_backend_pid()"
+                .to_owned(),
+        ))
+        .await;
+
+    Ok(())
+}
+
 /// Apply all pending migrations.
 ///
 /// Uses Sea-ORM's `Migrator::up`, which applies only migrations present in this

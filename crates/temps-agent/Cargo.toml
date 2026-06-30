@@ -35,9 +35,14 @@ temps-dns-resolver = { path = "../temps-dns-resolver" }
 ipnet = "2.10"
 parking_lot = "0.12"
 rand = { workspace = true }
-# Needed for hyper::upgrade::on in the internal proxy's WS tunnel path.
+# Needed for hyper::upgrade::on in the internal proxy's WS tunnel path,
+# and for the mTLS server accept loop (ADR-020 WS-2.1).
 hyper = { workspace = true }
-hyper-util = { version = "0.1", features = ["tokio"] }
+hyper-util = { version = "0.1", features = ["tokio", "http1", "http2", "server-auto"] }
+# mTLS: the agent serves rustls TLS with client-cert verification (WS-2.1).
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+tokio-rustls = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

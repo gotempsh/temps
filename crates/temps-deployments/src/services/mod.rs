@@ -41,5 +41,8 @@ pub use node_service::*;
 pub mod node_scheduler;
 pub use node_scheduler::*;
 
+pub mod remote_log_source;
+pub use remote_log_source::*;
+
 pub mod sensitive_envelope;
 pub use sensitive_envelope::*;

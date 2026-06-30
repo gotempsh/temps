@@ -232,7 +232,42 @@ fn any_value_to_string(val: &proto::common::v1::AnyValue) -> String {
         Some(proto::common::v1::any_value::Value::IntValue(i)) => i.to_string(),
         Some(proto::common::v1::any_value::Value::DoubleValue(d)) => d.to_string(),
         Some(proto::common::v1::any_value::Value::BytesValue(b)) => hex::encode(b),
-        _ => String::new(),
+        // Preserve complex values as JSON text rather than flattening to "".
+        Some(proto::common::v1::any_value::Value::ArrayValue(_))
+        | Some(proto::common::v1::any_value::Value::KvlistValue(_)) => {
+            any_value_to_json(val).to_string()
+        }
+        None => String::new(),
+    }
+}
+
+/// Render an OTLP `AnyValue` as a `serde_json::Value`, preserving nested
+/// arrays and key/value lists so complex attributes survive as JSON text.
+fn any_value_to_json(val: &proto::common::v1::AnyValue) -> serde_json::Value {
+    use serde_json::Value as J;
+    match &val.value {
+        Some(proto::common::v1::any_value::Value::StringValue(s)) => J::String(s.clone()),
+        Some(proto::common::v1::any_value::Value::BoolValue(b)) => J::Bool(*b),
+        Some(proto::common::v1::any_value::Value::IntValue(i)) => J::Number((*i).into()),
+        Some(proto::common::v1::any_value::Value::DoubleValue(d)) => {
+            serde_json::Number::from_f64(*d)
+                .map(J::Number)
+                .unwrap_or(J::Null)
+        }
+        Some(proto::common::v1::any_value::Value::BytesValue(b)) => J::String(hex::encode(b)),
+        Some(proto::common::v1::any_value::Value::ArrayValue(arr)) => {
+            J::Array(arr.values.iter().map(any_value_to_json).collect())
+        }
+        Some(proto::common::v1::any_value::Value::KvlistValue(kvl)) => {
+            let mut map = serde_json::Map::new();
+            for kv in &kvl.values {
+                if let Some(v) = &kv.value {
+                    map.insert(kv.key.clone(), any_value_to_json(v));
+                }
+            }
+            J::Object(map)
+        }
+        None => J::Null,
     }
 }
 
@@ -251,68 +286,125 @@ fn extract_metric_points(
     deployment_id: Option<i32>,
     points: &mut Vec<MetricPoint>,
 ) {
-    let base = |timestamp: u64, attrs: &[proto::common::v1::KeyValue]| MetricPoint {
-        project_id,
-        deployment_id,
-        resource: resource.clone(),
-        metric_name: metric.name.clone(),
-        metric_type: MetricType::Gauge,
-        unit: metric.unit.clone(),
-        timestamp: nanos_to_datetime(timestamp),
-        value: None,
-        histogram_count: None,
-        histogram_sum: None,
-        histogram_min: None,
-        histogram_max: None,
-        histogram_bounds: None,
-        histogram_bucket_counts: None,
-        attributes: kv_to_string_map(attrs),
+    let description = if metric.description.is_empty() {
+        None
+    } else {
+        Some(metric.description.clone())
+    };
+
+    // Build a skeleton MetricPoint with the shared per-point fields populated.
+    // `start_time_unix_nano == 0` is treated as "not set" per the OTLP convention.
+    let base = |start_time_unix_nano: u64,
+                time_unix_nano: u64,
+                attrs: &[proto::common::v1::KeyValue],
+                metric_type: MetricType,
+                flags: u32| {
+        let mut p = MetricPoint::skeleton(
+            project_id,
+            deployment_id,
+            resource.clone(),
+            metric.name.clone(),
+            metric_type,
+            metric.unit.clone(),
+            nanos_to_datetime(time_unix_nano),
+            kv_to_string_map(attrs),
+        );
+        p.description = description.clone();
+        p.flags = flags;
+        if start_time_unix_nano > 0 {
+            p.start_time = Some(nanos_to_datetime(start_time_unix_nano));
+        }
+        p
     };
 
     match &metric.data {
         Some(proto::metrics::v1::metric::Data::Gauge(gauge)) => {
             for dp in &gauge.data_points {
-                let mut p = base(dp.time_unix_nano, &dp.attributes);
-                p.metric_type = MetricType::Gauge;
+                let mut p = base(
+                    dp.start_time_unix_nano,
+                    dp.time_unix_nano,
+                    &dp.attributes,
+                    MetricType::Gauge,
+                    dp.flags,
+                );
                 p.value = Some(number_data_point_value(dp));
+                p.exemplars = number_exemplars(&dp.exemplars);
                 points.push(p);
             }
         }
         Some(proto::metrics::v1::metric::Data::Sum(sum)) => {
+            let temporality = AggregationTemporality::from_proto(sum.aggregation_temporality);
             for dp in &sum.data_points {
-                let mut p = base(dp.time_unix_nano, &dp.attributes);
-                p.metric_type = MetricType::Sum;
+                let mut p = base(
+                    dp.start_time_unix_nano,
+                    dp.time_unix_nano,
+                    &dp.attributes,
+                    MetricType::Sum,
+                    dp.flags,
+                );
+                p.temporality = Some(temporality);
+                p.is_monotonic = Some(sum.is_monotonic);
                 p.value = Some(number_data_point_value(dp));
+                p.exemplars = number_exemplars(&dp.exemplars);
                 points.push(p);
             }
         }
         Some(proto::metrics::v1::metric::Data::Histogram(hist)) => {
+            let temporality = AggregationTemporality::from_proto(hist.aggregation_temporality);
             for dp in &hist.data_points {
-                let mut p = base(dp.time_unix_nano, &dp.attributes);
-                p.metric_type = MetricType::Histogram;
+                let mut p = base(
+                    dp.start_time_unix_nano,
+                    dp.time_unix_nano,
+                    &dp.attributes,
+                    MetricType::Histogram,
+                    dp.flags,
+                );
+                p.temporality = Some(temporality);
                 p.histogram_count = Some(dp.count);
                 p.histogram_sum = dp.sum;
                 p.histogram_min = dp.min;
                 p.histogram_max = dp.max;
                 p.histogram_bounds = Some(dp.explicit_bounds.clone());
                 p.histogram_bucket_counts = Some(dp.bucket_counts.clone());
-                // Use mean as the scalar value for aggregation
+                p.exemplars = number_exemplars(&dp.exemplars);
+                // Keep writing the synthetic mean as the scalar `value` so the
+                // anomaly detector / continuous aggregates keep working. A later
+                // Timescale phase de-synthesizes this once those readers move
+                // to the structured columns.
                 if dp.count > 0 {
                     p.value = dp.sum.map(|s| s / dp.count as f64);
                 }
                 points.push(p);
             }
         }
-        // ExponentialHistogram and Summary are less common;
-        // store them as histograms with available data
         Some(proto::metrics::v1::metric::Data::ExponentialHistogram(eh)) => {
+            let temporality = AggregationTemporality::from_proto(eh.aggregation_temporality);
             for dp in &eh.data_points {
-                let mut p = base(dp.time_unix_nano, &dp.attributes);
-                p.metric_type = MetricType::Histogram;
+                let mut p = base(
+                    dp.start_time_unix_nano,
+                    dp.time_unix_nano,
+                    &dp.attributes,
+                    MetricType::ExponentialHistogram,
+                    dp.flags,
+                );
+                p.temporality = Some(temporality);
                 p.histogram_count = Some(dp.count);
                 p.histogram_sum = dp.sum;
                 p.histogram_min = dp.min;
                 p.histogram_max = dp.max;
+                p.exp_scale = Some(dp.scale);
+                p.exp_zero_count = Some(dp.zero_count);
+                p.exp_zero_threshold = Some(dp.zero_threshold);
+                if let Some(pos) = &dp.positive {
+                    p.exp_positive_offset = Some(pos.offset);
+                    p.exp_positive_counts = Some(pos.bucket_counts.clone());
+                }
+                if let Some(neg) = &dp.negative {
+                    p.exp_negative_offset = Some(neg.offset);
+                    p.exp_negative_counts = Some(neg.bucket_counts.clone());
+                }
+                p.exemplars = number_exemplars(&dp.exemplars);
+                // Keep the synthetic mean (see Histogram note above).
                 if dp.count > 0 {
                     p.value = dp.sum.map(|s| s / dp.count as f64);
                 }
@@ -321,10 +413,22 @@ fn extract_metric_points(
         }
         Some(proto::metrics::v1::metric::Data::Summary(summary)) => {
             for dp in &summary.data_points {
-                let mut p = base(dp.time_unix_nano, &dp.attributes);
-                p.metric_type = MetricType::Histogram;
+                let mut p = base(
+                    dp.start_time_unix_nano,
+                    dp.time_unix_nano,
+                    &dp.attributes,
+                    MetricType::Summary,
+                    dp.flags,
+                );
                 p.histogram_count = Some(dp.count);
                 p.histogram_sum = Some(dp.sum);
+                p.summary_quantiles = Some(
+                    dp.quantile_values
+                        .iter()
+                        .map(|q| (q.quantile, q.value))
+                        .collect(),
+                );
+                // Keep the synthetic mean (see Histogram note above).
                 if dp.count > 0 {
                     p.value = Some(dp.sum / dp.count as f64);
                 }
@@ -341,6 +445,37 @@ fn number_data_point_value(dp: &proto::metrics::v1::NumberDataPoint) -> f64 {
         Some(proto::metrics::v1::number_data_point::Value::AsInt(i)) => *i as f64,
         None => 0.0,
     }
+}
+
+fn exemplar_value(ex: &proto::metrics::v1::Exemplar) -> f64 {
+    match &ex.value {
+        Some(proto::metrics::v1::exemplar::Value::AsDouble(d)) => *d,
+        Some(proto::metrics::v1::exemplar::Value::AsInt(i)) => *i as f64,
+        None => 0.0,
+    }
+}
+
+/// Convert a slice of OTLP exemplars into our domain `Exemplar` records,
+/// hex-encoding trace/span IDs and dropping empty ones.
+fn number_exemplars(exemplars: &[proto::metrics::v1::Exemplar]) -> Vec<Exemplar> {
+    exemplars
+        .iter()
+        .map(|ex| Exemplar {
+            timestamp: nanos_to_datetime(ex.time_unix_nano),
+            value: exemplar_value(ex),
+            trace_id: if ex.trace_id.is_empty() {
+                None
+            } else {
+                Some(hex::encode(&ex.trace_id))
+            },
+            span_id: if ex.span_id.is_empty() {
+                None
+            } else {
+                Some(hex::encode(&ex.span_id))
+            },
+            attributes: kv_to_string_map(&ex.filtered_attributes),
+        })
+        .collect()
 }
 
 fn extract_span_record(
@@ -805,6 +940,246 @@ mod tests {
             points[0].attributes.get("host").map(|s| s.as_str()),
             Some("web-1")
         );
+    }
+
+    fn metrics_request_with(
+        data: proto::metrics::v1::metric::Data,
+        name: &str,
+        unit: &str,
+        description: &str,
+    ) -> Vec<u8> {
+        use prost::Message;
+        let request = proto::collector::metrics::v1::ExportMetricsServiceRequest {
+            resource_metrics: vec![proto::metrics::v1::ResourceMetrics {
+                resource: Some(test_support::resource("metrics-svc")),
+                scope_metrics: vec![proto::metrics::v1::ScopeMetrics {
+                    scope: None,
+                    metrics: vec![proto::metrics::v1::Metric {
+                        name: name.into(),
+                        description: description.into(),
+                        unit: unit.into(),
+                        data: Some(data),
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        request.encode_to_vec()
+    }
+
+    #[test]
+    fn test_decode_sum_monotonicity_and_temporality() {
+        let data = proto::metrics::v1::metric::Data::Sum(proto::metrics::v1::Sum {
+            data_points: vec![proto::metrics::v1::NumberDataPoint {
+                start_time_unix_nano: 1_700_000_000_000_000_000,
+                time_unix_nano: 1_700_000_001_000_000_000,
+                value: Some(proto::metrics::v1::number_data_point::Value::AsInt(99)),
+                attributes: vec![test_support::kv("route", "/api")],
+                ..Default::default()
+            }],
+            aggregation_temporality: 2, // CUMULATIVE
+            is_monotonic: true,
+        });
+        let encoded = metrics_request_with(data, "requests.total", "1", "Total requests");
+        let points = decode_metrics_request(&encoded, 5, Some(3)).unwrap();
+
+        assert_eq!(points.len(), 1);
+        let p = &points[0];
+        assert_eq!(p.metric_type, MetricType::Sum);
+        assert_eq!(p.value, Some(99.0));
+        assert_eq!(p.temporality, Some(AggregationTemporality::Cumulative));
+        assert_eq!(p.is_monotonic, Some(true));
+        assert_eq!(p.description.as_deref(), Some("Total requests"));
+        assert!(p.start_time.is_some());
+        assert_eq!(p.deployment_id, Some(3));
+        assert_eq!(p.attributes.get("route").map(|s| s.as_str()), Some("/api"));
+    }
+
+    #[test]
+    fn test_decode_explicit_histogram() {
+        let data = proto::metrics::v1::metric::Data::Histogram(proto::metrics::v1::Histogram {
+            data_points: vec![proto::metrics::v1::HistogramDataPoint {
+                start_time_unix_nano: 0,
+                time_unix_nano: 1_700_000_000_000_000_000,
+                count: 10,
+                sum: Some(123.0),
+                bucket_counts: vec![2, 3, 5],
+                explicit_bounds: vec![1.0, 5.0],
+                min: Some(0.5),
+                max: Some(9.0),
+                flags: 0,
+                ..Default::default()
+            }],
+            aggregation_temporality: 1, // DELTA
+        });
+        let encoded = metrics_request_with(data, "latency", "ms", "");
+        let points = decode_metrics_request(&encoded, 1, None).unwrap();
+
+        assert_eq!(points.len(), 1);
+        let p = &points[0];
+        assert_eq!(p.metric_type, MetricType::Histogram);
+        assert_eq!(p.temporality, Some(AggregationTemporality::Delta));
+        assert_eq!(p.histogram_count, Some(10));
+        assert_eq!(p.histogram_sum, Some(123.0));
+        assert_eq!(p.histogram_min, Some(0.5));
+        assert_eq!(p.histogram_max, Some(9.0));
+        assert_eq!(p.histogram_bounds.as_deref(), Some(&[1.0, 5.0][..]));
+        assert_eq!(p.histogram_bucket_counts.as_deref(), Some(&[2, 3, 5][..]));
+        // Synthetic mean preserved for the anomaly detector.
+        assert_eq!(p.value, Some(12.3));
+        // start_time_unix_nano == 0 is treated as unset.
+        assert!(p.start_time.is_none());
+        // Description empty → None.
+        assert!(p.description.is_none());
+    }
+
+    #[test]
+    fn test_decode_exponential_histogram() {
+        let data = proto::metrics::v1::metric::Data::ExponentialHistogram(
+            proto::metrics::v1::ExponentialHistogram {
+                data_points: vec![proto::metrics::v1::ExponentialHistogramDataPoint {
+                    start_time_unix_nano: 0,
+                    time_unix_nano: 1_700_000_000_000_000_000,
+                    count: 8,
+                    sum: Some(40.0),
+                    scale: 3,
+                    zero_count: 1,
+                    zero_threshold: 1e-6,
+                    positive: Some(
+                        proto::metrics::v1::exponential_histogram_data_point::Buckets {
+                            offset: 2,
+                            bucket_counts: vec![1, 2, 3],
+                        },
+                    ),
+                    negative: Some(
+                        proto::metrics::v1::exponential_histogram_data_point::Buckets {
+                            offset: -1,
+                            bucket_counts: vec![4, 5],
+                        },
+                    ),
+                    min: Some(0.1),
+                    max: Some(10.0),
+                    flags: 0,
+                    ..Default::default()
+                }],
+                aggregation_temporality: 2, // CUMULATIVE
+            },
+        );
+        let encoded = metrics_request_with(data, "exp.hist", "ms", "");
+        let points = decode_metrics_request(&encoded, 1, None).unwrap();
+
+        assert_eq!(points.len(), 1);
+        let p = &points[0];
+        assert_eq!(p.metric_type, MetricType::ExponentialHistogram);
+        assert_eq!(p.temporality, Some(AggregationTemporality::Cumulative));
+        assert_eq!(p.histogram_count, Some(8));
+        assert_eq!(p.histogram_sum, Some(40.0));
+        assert_eq!(p.exp_scale, Some(3));
+        assert_eq!(p.exp_zero_count, Some(1));
+        assert_eq!(p.exp_zero_threshold, Some(1e-6));
+        assert_eq!(p.exp_positive_offset, Some(2));
+        assert_eq!(p.exp_positive_counts.as_deref(), Some(&[1, 2, 3][..]));
+        assert_eq!(p.exp_negative_offset, Some(-1));
+        assert_eq!(p.exp_negative_counts.as_deref(), Some(&[4, 5][..]));
+        // Synthetic mean preserved.
+        assert_eq!(p.value, Some(5.0));
+    }
+
+    #[test]
+    fn test_decode_summary_quantiles() {
+        use proto::metrics::v1::summary_data_point::ValueAtQuantile;
+        let data = proto::metrics::v1::metric::Data::Summary(proto::metrics::v1::Summary {
+            data_points: vec![proto::metrics::v1::SummaryDataPoint {
+                start_time_unix_nano: 0,
+                time_unix_nano: 1_700_000_000_000_000_000,
+                count: 4,
+                sum: 20.0,
+                quantile_values: vec![
+                    ValueAtQuantile {
+                        quantile: 0.5,
+                        value: 4.0,
+                    },
+                    ValueAtQuantile {
+                        quantile: 0.99,
+                        value: 9.0,
+                    },
+                ],
+                flags: 0,
+                ..Default::default()
+            }],
+        });
+        let encoded = metrics_request_with(data, "rpc.duration", "ms", "");
+        let points = decode_metrics_request(&encoded, 1, None).unwrap();
+
+        assert_eq!(points.len(), 1);
+        let p = &points[0];
+        assert_eq!(p.metric_type, MetricType::Summary);
+        assert_eq!(p.histogram_count, Some(4));
+        assert_eq!(p.histogram_sum, Some(20.0));
+        assert_eq!(p.summary_quantiles, Some(vec![(0.5, 4.0), (0.99, 9.0)]));
+        // Synthetic mean preserved.
+        assert_eq!(p.value, Some(5.0));
+    }
+
+    #[test]
+    fn test_decode_metric_exemplars() {
+        let trace_id = vec![0xaa; 16];
+        let span_id = vec![0xbb; 8];
+        let data = proto::metrics::v1::metric::Data::Sum(proto::metrics::v1::Sum {
+            data_points: vec![proto::metrics::v1::NumberDataPoint {
+                time_unix_nano: 1_700_000_000_000_000_000,
+                value: Some(proto::metrics::v1::number_data_point::Value::AsDouble(7.0)),
+                exemplars: vec![proto::metrics::v1::Exemplar {
+                    time_unix_nano: 1_700_000_000_500_000_000,
+                    value: Some(proto::metrics::v1::exemplar::Value::AsDouble(7.0)),
+                    span_id: span_id.clone(),
+                    trace_id: trace_id.clone(),
+                    filtered_attributes: vec![test_support::kv("k", "v")],
+                }],
+                ..Default::default()
+            }],
+            aggregation_temporality: 1,
+            is_monotonic: false,
+        });
+        let encoded = metrics_request_with(data, "with.exemplar", "1", "");
+        let points = decode_metrics_request(&encoded, 1, None).unwrap();
+
+        assert_eq!(points.len(), 1);
+        let p = &points[0];
+        assert_eq!(p.is_monotonic, Some(false));
+        assert_eq!(p.exemplars.len(), 1);
+        let ex = &p.exemplars[0];
+        assert_eq!(ex.value, 7.0);
+        assert_eq!(
+            ex.trace_id.as_deref(),
+            Some(hex::encode(&trace_id).as_str())
+        );
+        assert_eq!(ex.span_id.as_deref(), Some(hex::encode(&span_id).as_str()));
+        assert_eq!(ex.attributes.get("k").map(|s| s.as_str()), Some("v"));
+    }
+
+    #[test]
+    fn test_complex_attribute_value_preserved_as_json() {
+        // An array-valued attribute should survive as JSON text, not "".
+        let arr = proto::common::v1::AnyValue {
+            value: Some(proto::common::v1::any_value::Value::ArrayValue(
+                proto::common::v1::ArrayValue {
+                    values: vec![
+                        proto::common::v1::AnyValue {
+                            value: Some(proto::common::v1::any_value::Value::IntValue(1)),
+                        },
+                        proto::common::v1::AnyValue {
+                            value: Some(proto::common::v1::any_value::Value::StringValue(
+                                "two".into(),
+                            )),
+                        },
+                    ],
+                },
+            )),
+        };
+        let rendered = any_value_to_string(&arr);
+        assert_eq!(rendered, "[1,\"two\"]");
     }
 
     // ── Logs decode tests ───────────────────────────────────────────

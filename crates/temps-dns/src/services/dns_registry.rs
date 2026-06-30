@@ -380,7 +380,33 @@ impl DnsRegistry {
                 updated_at: Set(now),
                 ..Default::default()
             };
-            am.insert(&txn).await?;
+            // Idempotent publish: the delete above clears our own prior records,
+            // but a re-deploy can reuse a node's deterministic container IP, so the
+            // (fqdn, record_type, target_ip) tuple may still collide with a row left
+            // by an earlier deployment generation (different owner_id). Upsert so the
+            // newest generation/owner wins instead of aborting the whole publish on a
+            // unique-constraint violation (which previously stalled DNS on re-deploy,
+            // leaving the zone pinned to dead container IPs).
+            service_endpoints::Entity::insert(am)
+                .on_conflict(
+                    sea_orm::sea_query::OnConflict::columns([
+                        service_endpoints::Column::Fqdn,
+                        service_endpoints::Column::RecordType,
+                        service_endpoints::Column::TargetIp,
+                    ])
+                    .update_columns([
+                        service_endpoints::Column::TargetPort,
+                        service_endpoints::Column::Ttl,
+                        service_endpoints::Column::OwnerKind,
+                        service_endpoints::Column::OwnerId,
+                        service_endpoints::Column::NodeId,
+                        service_endpoints::Column::Generation,
+                        service_endpoints::Column::UpdatedAt,
+                    ])
+                    .to_owned(),
+                )
+                .exec(&txn)
+                .await?;
         }
 
         txn.commit().await?;
@@ -881,5 +907,63 @@ mod tests {
             bad.validate().unwrap_err(),
             DnsRegistryError::Validation { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn test_replace_endpoints_idempotent_upsert() {
+        // A re-deploy reuses a node's deterministic container IP, so a new
+        // deployment (a different owner_id) re-publishes the same
+        // (fqdn, record_type, target_ip) tuple that is still owned by the
+        // previous deployment. delete-by-owner clears only the new owner's rows
+        // (none yet), so the insert collides with the old row on
+        // service_endpoints_uniq. Before the ON CONFLICT upsert this aborted the
+        // whole publish and stalled DNS on dead container IPs. Verify the publish
+        // now succeeds and the newest owner/generation wins.
+        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Docker/DB not available, skipping test");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let registry = DnsRegistry::new(db.clone());
+
+        let draft = |owner_id: i64| EndpointDraft {
+            fqdn: "production.echo.temps.local".into(),
+            record_type: RecordType::A,
+            target_ip: Some("172.20.0.5".into()),
+            target_port: Some(80),
+            ttl: 10,
+            owner_kind: OwnerKind::Deployment,
+            owner_id,
+            // node_id left NULL to avoid the FK to `nodes` (the conflict under
+            // test is on (fqdn, record_type, target_ip), independent of node_id).
+            node_id: None,
+        };
+
+        // Deployment 100 publishes its endpoint.
+        let g1 = registry
+            .replace_endpoints_for_owner(OwnerKind::Deployment, 100, &[draft(100)])
+            .await
+            .expect("first publish should succeed");
+
+        // Deployment 200 re-deploys onto the same node, reusing the same IP.
+        let g2 = registry
+            .replace_endpoints_for_owner(OwnerKind::Deployment, 200, &[draft(200)])
+            .await
+            .expect("re-deploy reusing the IP must upsert, not violate the unique index");
+
+        assert!(g2 > g1, "each publish bumps the generation");
+
+        // Exactly one row for the tuple, now owned by deployment 200 at gen g2.
+        let rows = service_endpoints::Entity::find()
+            .filter(service_endpoints::Column::Fqdn.eq("production.echo.temps.local"))
+            .all(db.as_ref())
+            .await
+            .expect("query endpoints");
+        assert_eq!(rows.len(), 1, "upsert keeps one row per (fqdn, type, ip)");
+        assert_eq!(rows[0].owner_id, 200, "newest owner wins");
+        assert_eq!(rows[0].generation, g2, "row carries the newest generation");
     }
 }

@@ -15,8 +15,8 @@ use utoipa::OpenApi as OpenApiTrait;
 
 use crate::handlers::{self, create_log_aggregator_app_state, LogAggregatorAppState};
 use crate::services::{
-    ChunkWriterService, CollectorService, LogMetadataService, LogSearchService, RetentionService,
-    TailService,
+    ChunkWriterService, CollectorService, LogMetadataService, LogSearchService,
+    RemoteContainerLogSource, RemoteLogCollectorService, RetentionService, TailService,
 };
 use crate::storage::{FilesystemStorage, LogStorage, S3Storage};
 use crate::types::StorageConfig;
@@ -26,6 +26,10 @@ const FLUSH_TICKER_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Interval for retention cleanup (24 hours)
 const RETENTION_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How often the remote log collector reconciles its open streams against the
+/// set of running remote containers (start new, drop gone).
+const REMOTE_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Maximum retries for the startup container scan
 const STARTUP_SCAN_MAX_RETRIES: u32 = 5;
@@ -208,6 +212,47 @@ impl TempsPlugin for LogAggregatorPlugin {
                 "Log aggregator flush ticker started (interval: {:?})",
                 FLUSH_TICKER_INTERVAL
             );
+
+            // ── Remote worker-node log collector ────────────────────────
+            // If a RemoteContainerLogSource is registered (multi-node setups —
+            // temps-deployments provides it), run a reconcile loop that keeps a
+            // log stream open for every running remote container and feeds the
+            // lines into the SAME chunk pipeline as local logs. Single-node and
+            // test setups register no source, so this is skipped entirely.
+            if let Some(remote_source) = context.get_service::<dyn RemoteContainerLogSource>() {
+                let remote_chunk_writer = context.require_service::<ChunkWriterService>();
+                let remote_metadata = context.require_service::<LogMetadataService>();
+                let remote_tail_tx = context.require_service::<CollectorService>().tail_sender();
+                let remote_collector = Arc::new(RemoteLogCollectorService::new(
+                    remote_source,
+                    remote_chunk_writer,
+                    remote_metadata,
+                    remote_tail_tx,
+                ));
+                tokio::spawn(async move {
+                    // Small initial delay so node registration / agent readiness
+                    // settles before the first reconcile.
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    let mut interval = tokio::time::interval(REMOTE_RECONCILE_INTERVAL);
+                    loop {
+                        interval.tick().await;
+                        if let Err(e) = remote_collector.reconcile().await {
+                            tracing::warn!(
+                                error = %e,
+                                "Remote log collector reconcile failed; will retry"
+                            );
+                        }
+                    }
+                });
+                tracing::info!(
+                    "Remote log collector started (reconcile interval: {:?})",
+                    REMOTE_RECONCILE_INTERVAL
+                );
+            } else {
+                tracing::debug!(
+                    "No remote container log source registered — remote log collection disabled"
+                );
+            }
 
             // ── Container discovery: startup scan ───────────────────────
             // Find already-running containers with sh.temps.* labels and start streaming.

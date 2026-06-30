@@ -8,6 +8,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Worker-node monitoring & alerts.** Temps now automatically watches every
+  worker node and notifies operators through the existing notification channels
+  (email / Slack / webhook) — no per-node rules to configure. You get a
+  **critical alert when a node goes offline** (>90s without a heartbeat, with
+  automatic failover of its workloads), an **info notification when it
+  recovers**, and **warning alerts on resource pressure** (CPU / memory / disk).
+  Resource thresholds are operator-configurable under `multi_node`
+  (`node_cpu_alert_percent` / `node_memory_alert_percent` /
+  `node_disk_alert_percent`, default 90, `null` to disable).
+- **Control plane shown as a node.** The control plane now appears in the node
+  list (id `0`, role `control-plane`) so containers scheduled onto it are
+  visible alongside worker nodes in the dashboard and per-node views.
+- **Node identity in deployed containers.** Every deployed container receives
+  `TEMPS_NODE_NAME`, `TEMPS_NODE_ID`, and `TEMPS_REPLICA` environment variables,
+  so an app can report which node and replica is serving a request.
+- **Remote-node logs in searchable history (ADR-021).** Log history
+  (`/api/logs/search`) now includes containers running on remote worker nodes,
+  not just the control plane. A control-plane collector keeps a stream open to
+  each remote container over the existing mTLS agent channel and feeds the lines
+  into the same searchable store as local logs, tagged with the node they ran on.
+- **Filter history by container or node, or show all.** A project's history
+  spans many deployments and many containers; the history viewer adds a
+  **Container** and a **Node** filter (default "show all", interleaved across
+  every container) plus a per-line **source** column showing which container and
+  worker node each line came from. The search API gained `container_ids` /
+  `node_ids` filters and returns `container_id` / `node_name` per line.
+- **OpenTelemetry metrics.** A full OTLP metrics pipeline backed by ClickHouse,
+  with a Metrics explorer, saved dashboards, and first-class metric alert rules.
+  Alerts support **anomaly detection** (a robust, seasonal median/MAD baseline)
+  alongside static thresholds, with sensitivity presets and a **backtest
+  preview** ("would have fired N times") while you author the rule. Charts
+  overlay **deploy markers** ("did a deploy cause this?") and a firing metric
+  links straight across to its traces and errors in the same window
+  ("what changed"). Datadog-style firing status — triaged dots, severity sort,
+  and a needs-attention header — surfaces on the metrics overview, the
+  dashboards list, and the dashboard view (#158).
+- **Full-fidelity OpenTelemetry metrics on TimescaleDB.** The default
+  (TimescaleDB) metrics backend now stores and queries the complete decoded
+  metric record at parity with the ClickHouse path — histograms (with
+  temporality-aware reconstruction and Prometheus-style p50/p95/p99 bucket
+  interpolation), exponential histograms, summaries, exemplars, and
+  monotonicity/flags/description — served from the raw hypertable with day-one
+  composite and GIN indexes (verified safe on compressed chunks) (#173).
+- **AI-assisted debugging & assistant (bring-your-own-key).** Configure an AI
+  provider (OpenAI, Anthropic, xAI, or Google Gemini) under **Settings → AI
+  Providers** to power a persistent, cross-project AI assistant dock with
+  resumable conversations. It diagnoses **failed deployments** (grounded in the
+  pipeline's failed stages and build-log tails) and **firing alerts**, can
+  agentically **read repository files at the deployed commit via the configured
+  Git provider** (no clone), and humanizes alert notifications. Keys are verified
+  before being stored encrypted, and the first active key serves every AI feature
+  (#158).
 - **Cloudflare Email Sending notification provider.** A new notification
   provider delivers alert emails through Cloudflare's transactional Email
   Sending API instead of a self-managed SMTP relay. Operators configure only an
@@ -17,18 +69,102 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   email template). Adds dedicated `POST`/`PUT /notification-providers/cloudflare`
   endpoints plus a "Cloudflare Email" option in the notification provider UI
   (#160).
+- **Service discovery on a single node (ADR-024).** Containers can now reach
+  each other by their `*.temps.local` name on a standalone control plane, not
+  just in multi-node clusters. The control plane runs the same internal DNS
+  resolver the worker nodes use, fed directly from its own service registry, so
+  a request to `http://production.api.temps.local` resolves from any container
+  it schedules. Purely additive and best-effort: if the resolver can't bind
+  (e.g. port 53 is unavailable), containers keep Docker's embedded DNS exactly
+  as before.
 
 ### Changed
+- **Project navigation grouped into OpenTelemetry + Monitoring.** The OTel
+  signals (Observe, Traces, AI Traces, Metrics, Error Tracking) are now grouped
+  under an **OpenTelemetry** section; operational tools (Uptime, Request Logs,
+  AI Crawlers) under **Monitoring** (#158).
+- **Project header stays on one line.** A long project name in the breadcrumb
+  switcher (and long crumbs on deep paths) now truncates with an ellipsis
+  instead of wrapping the header onto two lines (#158).
 - **Documentation: local build prerequisites.** The installation guide and
   `CONTRIBUTING.md` now document the system prerequisites required to build
   Temps from source locally (toolchain and dependencies), so new contributors
   can get a local build working without trial and error.
 
+### Removed
+- **Legacy project "Metrics" (resource monitoring) page.** Superseded by the
+  OpenTelemetry Metrics surface; its sidebar entry, route, and page component
+  were removed (#158).
+
 ### Fixed
+
 - **Edge cache-miss token isolation**: cacheable static asset misses in `temps edge` no longer attach the edge control-plane bearer token when fetching tenant-routed origin paths. This preserves pull-through caching while preventing deployed applications from observing node/join credentials in the `Authorization` header.
+- **Edge origin fetch credential leak**: removed the privileged bearer credential from cache-miss origin requests that use the public `Host` header for routing, because those requests can be handled by untrusted deployed application code.
+
+- **Notification email provider update hit the wrong endpoint in the SDK.** Both
+  `temps-email` and `temps-notifications` exposed an `update_email_provider`
+  handler, producing a duplicate `updateEmailProvider` operationId; the generated
+  TypeScript SDK silently shadowed one with the other, so the notification
+  provider UI could call the transactional-email endpoint instead. The
+  notifications handler is renamed to `update_notification_email_provider`
+  (`updateNotificationEmailProvider`), keeping the route unchanged
+  (`PUT /notification-providers/email/{id}`) (#163).
+- **Disabled alert rules no longer report as "firing".** A rule disabled while
+  firing kept a frozen `firing` state (the evaluator only scans enabled rules);
+  the status model now treats a disabled monitor as not-firing everywhere, so
+  dashboards and the alerts list don't flash a false red alarm (#158).
+
+- **Flaky provider lifecycle tests isolated.** `test_create_redis_service`,
+  `test_delete_service`, and `test_update_service_parameters` used fixed
+  container names and default host ports, causing intermittent CI failures
+  (`port is already allocated`, `No such container`) under runner contention.
+  They now allocate an unused port and a unique service name, matching the
+  existing `test_create_postgres_service` idiom (#171).
+
+- **Container DNS: IPv4-only hosts were unreachable through the resolver.** The
+  internal resolver's upstream forwarder returned `NXDOMAIN` for the AAAA (IPv6)
+  lookup of a host that has only an IPv4 address, which makes `getaddrinfo`
+  abandon the whole name — so calls to IPv4-only hosts (e.g. `api.github.com`)
+  failed from any container using the resolver, even though the IPv4 record
+  resolved fine. The forwarder now returns the correct `NOERROR`/NODATA while
+  still passing genuine `NXDOMAIN` through. Affects both worker and
+  control-plane resolvers.
 
 ### Security
-- **Edge origin fetch credential leak**: removed the privileged bearer credential from cache-miss origin requests that use the public `Host` header for routing, because those requests can be handled by untrusted deployed application code.
+- **Mutual TLS between the control plane and worker agents (ADR-020).** Optional
+  per-cluster CA that signs each node's CSR into a per-node certificate (private
+  keys never leave the node; the CA key is encrypted at rest). When enabled via
+  `multi_node.require_mtls`, the agent serves rustls mutual TLS and every
+  control-plane→agent call — deploy, drain, log streaming, exec, and the
+  terminal WebSocket — is encrypted and mutually authenticated. Defaults off
+  (observe-then-enforce); existing clusters are unaffected until flipped on.
+- **Short-lived, single-use node enrollment tokens.** Replace the eternal shared
+  join token with expiring, optionally node-scoped enrollment tokens
+  (mint / list / revoke API; only the SHA-256 hash is stored, plaintext shown
+  once). The legacy shared token remains available behind
+  `multi_node.legacy_shared_token_enabled` for upgrades.
+- **Node identity-takeover hardening.** Node re-registration that changes a
+  node's token / address / key must now prove possession of the prior
+  credential, closing a name-keyed-upsert hijack; `/internal/nodes/register` is
+  rate-limited and audit-logged; and `edge_routes` rejects tokens belonging to
+  non-active (draining / offline) nodes.
+- **Per-source S3 credential scoping.** The node S3-credential endpoint is now
+  scoped to sources the node is authorized for, preventing one node's token from
+  exfiltrating every tenant's S3 credentials.
+- **Supply-chain hardening** of the `install.sh` / join scripts (fail-closed
+  checksum verification) and the internal proxy strips client-supplied
+  `x-forwarded-*` / `x-temps-*` headers before forwarding.
+- **Dependency security advisories cleared.** Patched four network-reachable
+  advisories via lockfile bumps: `postgres-protocol` → 0.6.12 (RUSTSEC-2026-0179
+  SCRAM CPU-exhaustion DoS, RUSTSEC-2026-0180 hstore decode panic — both
+  triggerable by a malicious Postgres server temps connects to),
+  `tokio-postgres` → 0.7.18 (RUSTSEC-2026-0178 DataRow panic DoS),
+  `quinn-proto` → 0.11.15 (RUSTSEC-2026-0185 remote memory exhaustion), and the
+  Python plugin SDK's `aiohttp` → 3.14.1 (eight advisories incl. websocket
+  memory-limit bypass and HTTP/1 pipeline flooding). The remaining audit findings
+  (`protobuf` 2.x, `remove_dir_all` 0.5, `opentelemetry_sdk` 0.30, `rsa` 0.9) are
+  transitive, upstream-blocked, and verified unreachable in our usage — documented
+  with reachability proofs in the root `Cargo.toml`.
 
 
 ## [0.1.0-beta.39] - 2026-06-25

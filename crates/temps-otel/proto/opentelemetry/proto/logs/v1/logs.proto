@@ -29,7 +29,11 @@ message LogRecord {
   opentelemetry.proto.common.v1.AnyValue body = 5;
   repeated opentelemetry.proto.common.v1.KeyValue attributes = 6;
   uint32 dropped_attributes_count = 7;
-  uint32 flags = 8;
+  // OTLP spec: LogRecordFlags is a fixed32 (matches Span.flags in trace.proto).
+  // It was previously `uint32` here, so prost expected a varint and rejected
+  // real OTLP exporters (which send fixed32) with "invalid wire type:
+  // ThirtyTwoBit (expected Varint)" — a 400 that dropped every log batch.
+  fixed32 flags = 8;
   bytes trace_id = 9;
   bytes span_id = 10;
 }

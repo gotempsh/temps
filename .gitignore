@@ -19,7 +19,7 @@ dist/
 .settings/
 target
 target2
-ai
+/ai
 
 .cargo/config.toml
 *.crt

@@ -26,6 +26,7 @@ impl ProviderKeyService {
         display_name: &str,
         api_key: &str,
         base_url: Option<&str>,
+        default_model: Option<&str>,
     ) -> Result<ai_provider_keys::Model, AiGatewayError> {
         if provider.is_empty() {
             return Err(AiGatewayError::Validation {
@@ -48,6 +49,7 @@ impl ProviderKeyService {
             display_name: Set(display_name.to_string()),
             api_key_encrypted: Set(encrypted_key),
             base_url: Set(base_url.map(|s| s.to_string())),
+            default_model: Set(default_model.map(|s| s.to_string())),
             is_active: Set(true),
             ..Default::default()
         };
@@ -109,6 +111,7 @@ impl ProviderKeyService {
         display_name: Option<&str>,
         api_key: Option<&str>,
         base_url: Option<Option<&str>>,
+        default_model: Option<Option<&str>>,
         is_active: Option<bool>,
     ) -> Result<ai_provider_keys::Model, AiGatewayError> {
         let existing = self.get_by_id(id).await?;
@@ -129,6 +132,10 @@ impl ProviderKeyService {
 
         if let Some(url) = base_url {
             active.base_url = Set(url.map(|s| s.to_string()));
+        }
+
+        if let Some(model) = default_model {
+            active.default_model = Set(model.map(|s| s.to_string()));
         }
 
         if let Some(active_flag) = is_active {
@@ -165,6 +172,7 @@ mod tests {
             display_name: "OpenAI Production".to_string(),
             api_key_encrypted: "encrypted_value".to_string(),
             base_url: None,
+            default_model: None,
             is_active: true,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -202,7 +210,7 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let service = ProviderKeyService::new(Arc::new(db), test_encryption());
 
-        let result = service.create("", "Test", "sk-123", None).await;
+        let result = service.create("", "Test", "sk-123", None, None).await;
         assert!(matches!(
             result.unwrap_err(),
             AiGatewayError::Validation { .. }
@@ -214,7 +222,7 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let service = ProviderKeyService::new(Arc::new(db), test_encryption());
 
-        let result = service.create("openai", "Test", "", None).await;
+        let result = service.create("openai", "Test", "", None, None).await;
         assert!(matches!(
             result.unwrap_err(),
             AiGatewayError::Validation { .. }

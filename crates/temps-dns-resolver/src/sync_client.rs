@@ -237,6 +237,7 @@ mod tests {
             max_backoff: Duration::from_millis(100),
             http_timeout: Duration::from_secs(2),
             upstream_resolvers: vec![],
+            disable_sync: false,
         }
     }
 

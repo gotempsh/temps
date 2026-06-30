@@ -63,6 +63,8 @@ pub struct Project {
     pub is_on_demand: bool,
     pub deployment_config: Option<temps_entities::prelude::DeploymentConfig>,
     pub attack_mode: bool,
+    pub ai_alert_summaries_enabled: Option<bool>,
+    pub ai_debug_chat_enabled: Option<bool>,
     pub enable_preview_environments: bool,
     /// When true, newly-created preview environments default to on-demand mode.
     pub preview_envs_on_demand: bool,

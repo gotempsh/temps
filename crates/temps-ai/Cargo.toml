@@ -1,0 +1,23 @@
+[package]
+name = "temps-ai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Temps AI foundation: a governed, provider-agnostic seam for text and typed/structured output, plus reusable schemas (ADR-022)"
+keywords = ["ai", "llm", "platform"]
+categories = ["development-tools"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

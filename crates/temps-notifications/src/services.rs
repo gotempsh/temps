@@ -615,11 +615,29 @@ impl EmailProvider {
             NotificationPriority::Critical => ("#dc2626", "#fef2f2", "&#128680;", "Critical"),
         };
 
-        let metadata_html = if notification.metadata.is_empty() {
+        // Inline chart (e.g. an OTel metric-alert's recent series) carried as a
+        // reserved `_chart_svg` key and rendered raw. `_`-prefixed keys are
+        // channel payloads — never shown as plain detail rows.
+        let chart_html = notification
+            .metadata
+            .get("_chart_svg")
+            .map(|svg| {
+                format!(
+                    r#"<tr><td colspan="2" style="padding: 20px 0 0;">{}</td></tr>"#,
+                    svg
+                )
+            })
+            .unwrap_or_default();
+
+        let visible_metadata: Vec<(&String, &String)> = notification
+            .metadata
+            .iter()
+            .filter(|(k, _)| !k.starts_with('_'))
+            .collect();
+        let metadata_html = if visible_metadata.is_empty() {
             String::new()
         } else {
-            let rows: String = notification
-                .metadata
+            let rows: String = visible_metadata
                 .iter()
                 .map(|(k, v)| {
                     // Format key: replace underscores with spaces and title-case
@@ -716,6 +734,7 @@ impl EmailProvider {
                         <tr><td style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 14px; color: #374151; line-height: 1.7;">
                             {message}
                         </td></tr>
+                        {chart}
                         {metadata}
                     </table>
                 </td></tr>
@@ -741,6 +760,7 @@ impl EmailProvider {
             icon = icon,
             label = label,
             message = message_html,
+            chart = chart_html,
             metadata = metadata_html,
             priority = notification.priority,
         )
@@ -971,6 +991,9 @@ impl NotificationProvider for SlackProvider {
         let metadata_fields = notification
             .metadata
             .iter()
+            // `_`-prefixed keys are channel payloads (e.g. the email's `_chart_svg`),
+            // not human-facing fields — skip them here.
+            .filter(|(k, _)| !k.starts_with('_'))
             .map(|(k, v)| {
                 serde_json::json!({
                     "title": k,
@@ -1044,7 +1067,14 @@ impl NotificationProvider for WebhookProvider {
             .timeout(std::time::Duration::from_secs(self.timeout_secs))
             .build()?;
 
-        // Build the payload with all notification data
+        // Build the payload with all notification data. `_`-prefixed keys are
+        // channel-specific payloads (e.g. the email's `_chart_svg`) — drop them
+        // so they don't bloat the webhook body.
+        let metadata: std::collections::HashMap<&String, &String> = notification
+            .metadata
+            .iter()
+            .filter(|(k, _)| !k.starts_with('_'))
+            .collect();
         let payload = serde_json::json!({
             "id": notification.id,
             "title": notification.title,
@@ -1053,7 +1083,7 @@ impl NotificationProvider for WebhookProvider {
             "priority": notification.priority.to_string(),
             "severity": notification.effective_severity().to_string(),
             "timestamp": notification.timestamp.to_rfc3339(),
-            "metadata": notification.metadata,
+            "metadata": metadata,
         });
 
         // Build the request with configured method
@@ -1292,7 +1322,14 @@ impl NotificationService {
         // Pass the previous record's occurrence_count so the gap doubles per
         // ongoing-incident attempt instead of staying at the base delay forever.
         let previous_attempts = existing.as_ref().map(|e| e.occurrence_count).unwrap_or(0);
-        let metadata_json = serde_json::to_string(&notification.metadata)?;
+        // Persist only human-facing metadata; `_`-prefixed channel payloads
+        // (e.g. the email's `_chart_svg`) would bloat the row needlessly.
+        let persisted_metadata: std::collections::HashMap<&String, &String> = notification
+            .metadata
+            .iter()
+            .filter(|(k, _)| !k.starts_with('_'))
+            .collect();
+        let metadata_json = serde_json::to_string(&persisted_metadata)?;
         let next_allowed = Self::get_next_allowed_time(&notification.priority, previous_attempts);
 
         // Create new notification record

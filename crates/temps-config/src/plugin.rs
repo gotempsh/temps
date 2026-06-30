@@ -61,6 +61,9 @@ impl TempsPlugin for ConfigPlugin {
         // Get the ConfigService from the context
         let config_service = context.require_service::<ConfigService>();
         let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
+        let db = context.require_service::<sea_orm::DatabaseConnection>();
+        let enrollment_token_service =
+            Arc::new(crate::enrollment_tokens::EnrollmentTokenService::new(db));
 
         // Get the route table refresher if available (it's registered by the proxy subsystem)
         let route_table_refresher =
@@ -71,6 +74,7 @@ impl TempsPlugin for ConfigPlugin {
             config_service,
             audit_service,
             route_table_refresher,
+            enrollment_token_service,
         });
 
         // Configure routes with the state

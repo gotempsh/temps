@@ -10,12 +10,14 @@ homepage.workspace = true
 [dependencies]
 # Internal crates
 temps-core = { path = "../temps-core" }
+temps-ai = { path = "../temps-ai" }
 temps-config = { path = "../temps-config" }
 temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
 temps-deployer = { path = "../temps-deployer" }
 temps-auth = { path = "../temps-auth" }
 temps-metrics = { path = "../temps-metrics" }
+temps-monitoring = { path = "../temps-monitoring" }
 
 # Async runtime
 tokio = { workspace = true }
@@ -28,6 +30,7 @@ serde_json = { workspace = true }
 
 # Error handling & logging
 thiserror = { workspace = true }
+anyhow = { workspace = true }
 tracing = { workspace = true }
 
 # Date/Time & UUID
@@ -78,3 +81,12 @@ tokio = { workspace = true, features = ["test-util", "macros"] }
 tower = { workspace = true }
 http-body-util = { workspace = true }
 temps-migrations = { path = "../temps-migrations" }
+# For the no-op AuditLogger used in the e2e handler test (AuditLogger is an
+# #[async_trait] returning anyhow::Result).
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+# Real-ClickHouse integration tests (clickhouse_storage_test.rs). Pinned to the
+# workspace version to avoid the transitive-tree conflict resolved at 0.27.2.
+# `http_wait_plain` enables the HTTP /ping readiness wait — the clickhouse-server
+# image never logs "Ready for connections" to stdout/stderr, only to its log file.
+testcontainers = { workspace = true, features = ["http_wait_plain"] }

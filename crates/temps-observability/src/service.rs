@@ -332,6 +332,20 @@ impl ObservabilityService {
     /// Fetch spans from the raw `otel_spans` TimescaleDB hypertable. No
     /// Sea-ORM entity exists for it; we hydrate rows via `FromQueryResult`
     /// instead. Spans are even higher-volume than logs — gated client-side.
+    ///
+    /// By default only ROOT spans are returned (`parent_span_id IS NULL`) — one
+    /// row per trace (the "parent" of the trace), not every child span. The
+    /// unified feed is a high-level activity stream; surfacing every internal
+    /// span (`executing api route`, `resolve page components`, …) would bury the
+    /// signal. (Decode stores a root span's parent as NULL — see otel decode; the
+    /// storage layer likewise identifies roots via `parent_span_id IS NULL`.)
+    ///
+    /// EXCEPTION: when the user is searching by name, the root restriction is
+    /// dropped so the search matches ANY span — including child spans like
+    /// `SELECT guestbook` or `fetch POST …`, which is precisely what someone
+    /// grepping span names is looking for. The root-only path is backed by the
+    /// partial index `idx_otel_spans_root_project_start`; the search path is
+    /// bounded by the time window (chunk pruning) + `name ILIKE`.
     async fn fetch_spans(
         &self,
         filters: &EventFilters,
@@ -343,6 +357,12 @@ impl ObservabilityService {
         );
         let mut values: Vec<sea_orm::Value> = vec![filters.project_id.into()];
         let mut next_param = 2usize;
+
+        // Roots only by default (one row per trace); a name search widens to all
+        // spans so child-span names are discoverable.
+        if filters.search.is_none() {
+            sql.push_str(" AND parent_span_id IS NULL");
+        }
 
         if let Some(from) = filters.from {
             sql.push_str(&format!(" AND start_time >= ${}", next_param));
