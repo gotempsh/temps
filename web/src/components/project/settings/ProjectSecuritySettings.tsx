@@ -24,7 +24,7 @@ import {
 } from '@/components/ui/select'
 import { Separator } from '@/components/ui/separator'
 import { Switch } from '@/components/ui/switch'
-import { InfoIcon, Shield } from 'lucide-react'
+import { InfoIcon, MessageSquare, Shield } from 'lucide-react'
 import { useForm, Controller, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import { useMutation } from '@tanstack/react-query'
@@ -58,6 +58,8 @@ interface SecurityConfig {
 interface FormData {
   security: SecurityConfig
   attack_mode?: boolean
+  ai_debug_chat_enabled?: boolean
+  ai_alert_summaries_enabled?: boolean
 }
 
 export function ProjectSecuritySettings({
@@ -88,6 +90,8 @@ export function ProjectSecuritySettings({
   } = useForm<FormData>({
     defaultValues: {
       attack_mode: project.attack_mode ?? false,
+      ai_debug_chat_enabled: project.ai_debug_chat_enabled ?? false,
+      ai_alert_summaries_enabled: project.ai_alert_summaries_enabled ?? false,
       security: {
         enabled: project.deployment_config?.security?.enabled ?? undefined,
         headers: {
@@ -130,22 +134,39 @@ export function ProjectSecuritySettings({
     if (!project?.id) return
 
     try {
-      // Check if attack_mode has changed
-      const attackModeChanged = data.attack_mode !== project.attack_mode
+      // Collect changed project-level toggles (attack mode + AI opt-ins).
+      const projectSettings: {
+        attack_mode?: boolean
+        ai_debug_chat_enabled?: boolean
+        ai_alert_summaries_enabled?: boolean
+      } = {}
+      if (data.attack_mode !== project.attack_mode) {
+        projectSettings.attack_mode = data.attack_mode
+      }
+      if (
+        (data.ai_debug_chat_enabled ?? false) !==
+        (project.ai_debug_chat_enabled ?? false)
+      ) {
+        projectSettings.ai_debug_chat_enabled = data.ai_debug_chat_enabled
+      }
+      if (
+        (data.ai_alert_summaries_enabled ?? false) !==
+        (project.ai_alert_summaries_enabled ?? false)
+      ) {
+        projectSettings.ai_alert_summaries_enabled =
+          data.ai_alert_summaries_enabled
+      }
 
-      // Update attack mode if changed
-      if (attackModeChanged) {
+      if (Object.keys(projectSettings).length > 0) {
         await toast.promise(
           updateProjectSettings.mutateAsync({
             path: { project_id: project.id },
-            body: {
-              attack_mode: data.attack_mode,
-            },
+            body: projectSettings,
           }),
           {
-            loading: 'Updating attack mode...',
-            success: 'Attack mode updated successfully',
-            error: 'Failed to update attack mode',
+            loading: 'Updating project settings...',
+            success: 'Project settings updated successfully',
+            error: 'Failed to update project settings',
           }
         )
       }
@@ -284,6 +305,64 @@ export function ProjectSecuritySettings({
             }
           >
             Save Attack Mode Settings
+          </Button>
+        </CardFooter>
+      </Card>
+
+      {/* AI Assistance Card */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <MessageSquare className="h-5 w-5" />
+            AI Assistance
+          </CardTitle>
+          <CardDescription>
+            Opt in to AI features powered by your configured AI provider. Off by
+            default; uses your own provider key and counts against its budget.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="flex items-center justify-between">
+            <div className="space-y-0.5">
+              <Label htmlFor="ai-debug-chat">AI debugging chat</Label>
+              <p className="text-sm text-muted-foreground">
+                Offer a “Debug with AI” chat on failed deployments to
+                investigate and fix problems.
+              </p>
+            </div>
+            <Switch
+              id="ai-debug-chat"
+              checked={watch('ai_debug_chat_enabled') ?? false}
+              onCheckedChange={(checked) =>
+                setValue('ai_debug_chat_enabled', checked, {
+                  shouldDirty: true,
+                })
+              }
+            />
+          </div>
+          <Separator />
+          <div className="flex items-center justify-between">
+            <div className="space-y-0.5">
+              <Label htmlFor="ai-alert-summaries">AI alert summaries</Label>
+              <p className="text-sm text-muted-foreground">
+                Enrich metric alert notifications with a plain-language AI
+                summary.
+              </p>
+            </div>
+            <Switch
+              id="ai-alert-summaries"
+              checked={watch('ai_alert_summaries_enabled') ?? false}
+              onCheckedChange={(checked) =>
+                setValue('ai_alert_summaries_enabled', checked, {
+                  shouldDirty: true,
+                })
+              }
+            />
+          </div>
+        </CardContent>
+        <CardFooter>
+          <Button type="submit" disabled={!isDirty || isSubmitting}>
+            Save AI Settings
           </Button>
         </CardFooter>
       </Card>

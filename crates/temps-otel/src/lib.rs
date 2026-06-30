@@ -29,6 +29,7 @@
 //! ```
 
 pub mod anomaly;
+pub mod detectors;
 pub mod error;
 pub mod handlers;
 pub mod ingest;
@@ -71,4 +72,12 @@ pub struct OtelAppState {
     /// the payload are ignored by `otlp_to_store_point` — source assignment
     /// is an invariant of the ingest path, not a user-controlled field.
     pub metrics_write_tx: Option<tokio::sync::mpsc::Sender<Vec<temps_metrics::MetricPoint>>>,
+    /// Service backing per-project saved metric dashboard CRUD (Postgres-backed
+    /// config/metadata, distinct from the ClickHouse/Timescale `OtelStorage`).
+    pub dashboard_service: std::sync::Arc<crate::services::MetricDashboardService>,
+    /// Service backing first-class metric alert rule CRUD (Postgres-backed
+    /// config/metadata; evaluated by the background `MetricAlertEvaluator`).
+    pub metric_alert_service: std::sync::Arc<crate::services::MetricAlertService>,
+    /// Audit logger for dashboard/alert write operations (best-effort, non-fatal).
+    pub audit_service: std::sync::Arc<dyn temps_core::AuditLogger>,
 }

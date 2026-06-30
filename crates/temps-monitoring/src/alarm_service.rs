@@ -739,13 +739,25 @@ impl AlarmService {
 
     /// Send notification for a fired alarm (failure is logged, not propagated)
     async fn send_alarm_notification(&self, request: &FireAlarmRequest, alarm_id: i32) {
-        let metadata = self
+        let mut metadata = self
             .build_notification_metadata(
                 request.project_id,
                 request.service_id,
                 request.environment_id,
             )
             .await;
+        // Merge caller-supplied detail (e.g. the OTel metric-alert's metric/value
+        // fields and the reserved `_chart_svg` chart) so the channels can render
+        // it — the email surfaces the chart, Slack/webhook skip `_`-prefixed keys.
+        if let Some(serde_json::Value::Object(extra)) = &request.metadata {
+            for (k, v) in extra {
+                let s = match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                metadata.insert(k.clone(), s);
+            }
+        }
 
         let notification = NotificationData {
             id: uuid::Uuid::new_v4().to_string(),

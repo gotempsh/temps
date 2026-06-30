@@ -153,6 +153,11 @@ pub fn install_tracing(log_level: &str, log_format: &str) {
              temps_agent={level},\
              temps_edge={level},\
              temps_wireguard={level},\
+             temps_ai={level},\
+             temps_ai_gateway={level},\
+             temps_ai_chat={level},\
+             temps_ai_api_tools={level},\
+             temps_agents={level},\
              pingora=warn,\
              sqlx=warn,\
              sea_orm=warn,\

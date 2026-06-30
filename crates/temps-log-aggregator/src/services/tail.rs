@@ -105,6 +105,8 @@ mod tests {
             env: "1".to_string(),
             project_id: 42,
             deploy_id: None,
+            node_id: None,
+            node_name: None,
         }
     }
 

@@ -381,9 +381,136 @@ pub async fn start_agent_server(
         "Temps agent server started"
     );
 
-    axum::serve(listener, router)
-        .await
-        .map_err(|e| crate::AgentError::ServerError(format!("Agent server error: {}", e)))?;
+    // Serve mutual TLS when the node has been provisioned with certs
+    // (ADR-020 WS-2.1); otherwise plain HTTP for legacy / not-yet-enrolled
+    // nodes. The mTLS path verifies the control plane's client certificate
+    // against the cluster CA on every connection.
+    match (
+        config.tls_cert_path.as_ref(),
+        config.tls_key_path.as_ref(),
+        config.cluster_ca_path.as_ref(),
+    ) {
+        (Some(cert), Some(key), Some(ca)) => {
+            tracing::info!(
+                cert = %cert.display(),
+                "Agent serving with mutual TLS (control-plane client cert verified against cluster CA)"
+            );
+            let server_config = build_tls_server_config(cert, key, ca)?;
+            serve_mtls(listener, router, std::sync::Arc::new(server_config)).await?;
+        }
+        _ => {
+            axum::serve(listener, router).await.map_err(|e| {
+                crate::AgentError::ServerError(format!("Agent server error: {}", e))
+            })?;
+        }
+    }
 
     Ok(())
+}
+
+/// Build a rustls `ServerConfig` that serves the node's leaf cert and requires
+/// the client (the control plane) to present a certificate chaining to the
+/// cluster CA (ADR-020 WS-2.1).
+fn build_tls_server_config(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+    ca_path: &std::path::Path,
+) -> Result<rustls::ServerConfig, crate::AgentError> {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use std::io::BufReader;
+
+    let tls_err = |context: &str, reason: String| crate::AgentError::TlsConfig {
+        context: context.to_string(),
+        reason,
+    };
+
+    let cert_bytes =
+        std::fs::read(cert_path).map_err(|e| tls_err("read leaf cert", e.to_string()))?;
+    let cert_chain: Vec<CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut BufReader::new(&cert_bytes[..]))
+            .collect::<Result<_, _>>()
+            .map_err(|e| tls_err("parse leaf cert", e.to_string()))?;
+    if cert_chain.is_empty() {
+        return Err(tls_err("parse leaf cert", "no certificates found".into()));
+    }
+
+    let key_bytes = std::fs::read(key_path).map_err(|e| tls_err("read node key", e.to_string()))?;
+    let key: PrivateKeyDer<'static> =
+        rustls_pemfile::private_key(&mut BufReader::new(&key_bytes[..]))
+            .map_err(|e| tls_err("parse node key", e.to_string()))?
+            .ok_or_else(|| tls_err("parse node key", "no private key found".into()))?;
+
+    let ca_bytes = std::fs::read(ca_path).map_err(|e| tls_err("read cluster CA", e.to_string()))?;
+    let ca_certs: Vec<CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut BufReader::new(&ca_bytes[..]))
+            .collect::<Result<_, _>>()
+            .map_err(|e| tls_err("parse cluster CA", e.to_string()))?;
+    let mut roots = rustls::RootCertStore::empty();
+    for c in ca_certs {
+        roots
+            .add(c)
+            .map_err(|e| tls_err("add cluster CA root", e.to_string()))?;
+    }
+    // A non-empty root store is required; an empty/garbage CA fails here rather
+    // than silently allowing any client.
+    let verifier = rustls::server::WebPkiClientVerifier::builder(std::sync::Arc::new(roots))
+        .build()
+        .map_err(|e| tls_err("build client-cert verifier", e.to_string()))?;
+
+    rustls::ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(cert_chain, key)
+        .map_err(|e| tls_err("build server config", e.to_string()))
+}
+
+/// Hand-rolled accept loop that TLS-terminates each connection and drives the
+/// axum router over hyper with WebSocket-upgrade support (the agent exposes a
+/// terminal WS route, so `serve_connection_with_upgrades` is required). Mirrors
+/// the pattern in `temps-plugin-sdk/src/runtime.rs`.
+async fn serve_mtls(
+    listener: tokio::net::TcpListener,
+    router: Router,
+    server_config: std::sync::Arc<rustls::ServerConfig>,
+) -> Result<(), crate::AgentError> {
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use tower::Service;
+
+    let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+
+    loop {
+        let (stream, _peer) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::error!("agent: failed to accept connection: {}", e);
+                continue;
+            }
+        };
+        let acceptor = acceptor.clone();
+        let router = router.clone();
+        tokio::spawn(async move {
+            let tls_stream = match acceptor.accept(stream).await {
+                Ok(s) => s,
+                Err(e) => {
+                    // Rejected client (missing/invalid cert) or handshake error.
+                    tracing::warn!("agent: TLS handshake rejected: {}", e);
+                    return;
+                }
+            };
+            let socket = TokioIo::new(tls_stream);
+            let hyper_service =
+                hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                    let mut router = router.clone();
+                    async move { router.call(req).await }
+                });
+            if let Err(err) = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                .serve_connection_with_upgrades(socket, hyper_service)
+                .await
+            {
+                let msg = err.to_string();
+                if !msg.contains("shutting down") {
+                    tracing::warn!("agent: connection error: {}", msg);
+                }
+            }
+        });
+    }
 }

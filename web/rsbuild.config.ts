@@ -28,7 +28,9 @@ export default defineConfig({
   server: {
     proxy: {
       '/api': {
-        target: 'http://localhost:8080',
+        // Override to point the dev server at a different backend (e.g. the
+        // dev-cluster control plane on :80): TEMPS_API_TARGET=http://localhost:80
+        target: process.env.TEMPS_API_TARGET || 'http://localhost:8080',
         headers: {},
         changeOrigin: true,
         ws: true,

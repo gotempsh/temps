@@ -151,6 +151,21 @@ interface ColumnVisibility {
   timestamp: boolean
   level: boolean
   service: boolean
+  /** Per-line source: which container (and worker node) the line came from.
+      The point of multi-container/multi-node history — on by default so a
+      combined view is self-describing. */
+  source: boolean
+}
+
+// Short, human-readable source label for a log line: "<node> · <container12>".
+// Remote lines carry node_name; control-plane-local lines show "local".
+function sourceLabel(
+  containerId?: string,
+  nodeName?: string | null,
+): string {
+  const node = nodeName && nodeName.length > 0 ? nodeName : 'local'
+  const cid = containerId ? containerId.slice(0, 12) : '—'
+  return `${node} · ${cid}`
 }
 
 const CONTEXT_MIN = 0
@@ -169,6 +184,8 @@ type RenderRow =
       level: LogLevel
       message: string
       service: string
+      containerId?: string
+      nodeName?: string | null
     }
   | { kind: 'separator'; key: string }
 
@@ -210,7 +227,13 @@ function buildRenderRows(lines: LogSearchLine[]): RenderRow[] {
   // single container/service — so a neighbor's service is always the match's
   // service. The backend's ContextLine doesn't carry it, so we inherit it here
   // to keep the deployment column populated for context rows too.
-  const pushContext = (chunkId: string, service: string, c: ContextLine) => {
+  const pushContext = (
+    chunkId: string,
+    service: string,
+    containerId: string | undefined,
+    nodeName: string | null | undefined,
+    c: ContextLine,
+  ) => {
     const key = `${chunkId}:${c.line_offset}`
     if (seen.has(key)) return
     seen.add(key)
@@ -228,6 +251,8 @@ function buildRenderRows(lines: LogSearchLine[]): RenderRow[] {
       level: c.level,
       message: c.message,
       service,
+      containerId,
+      nodeName,
     })
     lastChunk = chunkId
     lastOffset = c.line_offset
@@ -247,7 +272,14 @@ function buildRenderRows(lines: LogSearchLine[]): RenderRow[] {
         lastChunk = null
         lastOffset = null
       }
-      for (const c of ctx.before) pushContext(line.chunk_id, line.service, c)
+      for (const c of ctx.before)
+        pushContext(
+          line.chunk_id,
+          line.service,
+          line.container_id,
+          line.node_name,
+          c,
+        )
     }
 
     const matchKey = `${line.chunk_id}:${line.line_offset}`
@@ -268,7 +300,14 @@ function buildRenderRows(lines: LogSearchLine[]): RenderRow[] {
     }
 
     if (ctx?.after?.length) {
-      for (const c of ctx.after) pushContext(line.chunk_id, line.service, c)
+      for (const c of ctx.after)
+        pushContext(
+          line.chunk_id,
+          line.service,
+          line.container_id,
+          line.node_name,
+          c,
+        )
     }
   }
 
@@ -305,6 +344,8 @@ function HistoryLogRow({
   const level = isContext ? row.level : row.line.level
   const message = isContext ? row.message : row.line.message
   const service = isContext ? row.service : row.line.service
+  const containerId = isContext ? row.containerId : row.line.container_id
+  const nodeName = isContext ? row.nodeName : row.line.node_name
   const ts = formatTs(timestamp, showDate)
 
   return (
@@ -346,6 +387,14 @@ function HistoryLogRow({
           {service}
         </span>
       )}
+      {columns.source && (
+        <span
+          className="text-muted-foreground/80 shrink-0 w-[150px] truncate tabular-nums"
+          title={sourceLabel(containerId, nodeName)}
+        >
+          {sourceLabel(containerId, nodeName)}
+        </span>
+      )}
       <span
         className="whitespace-pre-wrap break-all min-w-0 flex-1"
         dangerouslySetInnerHTML={{
@@ -364,6 +413,13 @@ export default function HistoryLogViewer({
   const [searchParams, setSearchParams] = useSearchParams()
   const [selectedEnv, setSelectedEnv] = useState<string | undefined>()
   const [selectedService, setSelectedService] = useState<string | undefined>()
+  // Container / node sub-filters. A project's history spans many containers
+  // across multiple deployments and nodes; these narrow the combined view to a
+  // single container or a single worker node. Undefined = "show all".
+  const [selectedContainer, setSelectedContainer] = useState<
+    string | undefined
+  >()
+  const [selectedNode, setSelectedNode] = useState<number | undefined>()
   // Deployment filter (deployments.id). Seeded once from the ?deploy_id= URL
   // param so a deep link lands pre-filtered; thereafter the URL is kept in sync
   // by the effect below.
@@ -397,7 +453,7 @@ export default function HistoryLogViewer({
   // is the per-line service name (container/service that emitted the log).
   const [columns, setColumns] = useState<ColumnVisibility>(() => {
     if (typeof window === 'undefined') {
-      return { timestamp: true, level: true, service: true }
+      return { timestamp: true, level: true, service: true, source: true }
     }
     try {
       const raw = window.localStorage.getItem('temps.history-log.columns')
@@ -407,12 +463,13 @@ export default function HistoryLogViewer({
           timestamp: parsed.timestamp ?? true,
           level: parsed.level ?? true,
           service: parsed.service ?? true,
+          source: parsed.source ?? true,
         }
       }
     } catch {
       // Ignore corrupted storage and fall through to defaults.
     }
-    return { timestamp: true, level: true, service: true }
+    return { timestamp: true, level: true, service: true, source: true }
   })
   useEffect(() => {
     try {
@@ -458,7 +515,7 @@ export default function HistoryLogViewer({
     timeRange === CUSTOM_RANGE_VALUE && customRange?.from && customRange?.to
       ? `${customRange.from.getTime()}-${customRange.to.getTime()}`
       : ''
-  const filterKey = `${selectedEnv}-${selectedService}-${selectedDeploy}-${selectedLevels.join(',')}-${debouncedText}-${timeRange}-${customRangeKey}-${contextLines}`
+  const filterKey = `${selectedEnv}-${selectedService}-${selectedContainer}-${selectedNode}-${selectedDeploy}-${selectedLevels.join(',')}-${debouncedText}-${timeRange}-${customRangeKey}-${contextLines}`
   const prevFilterKeyRef = useRef(filterKey)
 
   // Debounce search text
@@ -488,6 +545,19 @@ export default function HistoryLogViewer({
       setSelectedEnv(String(environments[0].id))
     }
   }, [environments, selectedEnv])
+
+  // The set of containers/nodes differs per environment + deployment scope, so
+  // clear those sub-filters whenever the scope changes — a stale container_id
+  // would otherwise filter the new scope down to nothing.
+  const scopeRef = useRef(`${selectedEnv}-${selectedDeploy}`)
+  useEffect(() => {
+    const scope = `${selectedEnv}-${selectedDeploy}`
+    if (scope !== scopeRef.current) {
+      scopeRef.current = scope
+      setSelectedContainer(undefined)
+      setSelectedNode(undefined)
+    }
+  }, [selectedEnv, selectedDeploy])
 
   // Project deployments, used to populate the Deployment filter dropdown. We
   // pull a generous page so older deployments are still selectable; the list is
@@ -603,6 +673,8 @@ export default function HistoryLogViewer({
       levels: selectedLevels.length > 0 ? selectedLevels : undefined,
       envs: selectedEnv ? [selectedEnv] : undefined,
       services: selectedService ? [selectedService] : undefined,
+      containerIds: selectedContainer ? [selectedContainer] : undefined,
+      nodeIds: selectedNode != null ? [selectedNode] : undefined,
       deployId: selectedDeploy,
       text: !fulltextDisabled && debouncedText ? debouncedText : undefined,
       // Frontend asks for 500 per page; server caps at 2000.
@@ -611,6 +683,47 @@ export default function HistoryLogViewer({
     },
     !!project.id,
   )
+
+  // Filter options come from `available_sources` — the FULL set of
+  // containers/nodes/services for the scope (project + env + deployment + time),
+  // computed server-side independently of the active container/node/service
+  // filter. Deriving from the (already-filtered) result lines would collapse the
+  // list to the current selection, making it impossible to switch.
+  const sources = data?.available_sources ?? []
+
+  // Service options (all services in scope) — switching service no longer hides
+  // the others.
+  const serviceOptions = useMemo(() => {
+    const set = new Set<string>()
+    for (const s of sources) {
+      if (s.service && s.service !== 'unknown') set.add(s.service)
+    }
+    return Array.from(set).sort()
+  }, [sources])
+
+  // Container options, labeled with their node so replicas are distinguishable.
+  // Narrowed to the selected service (if any) so the list stays relevant.
+  const containerOptions = useMemo(() => {
+    const map = new Map<string, string>()
+    for (const s of sources) {
+      if (!s.container_id) continue
+      if (selectedService && s.service !== selectedService) continue
+      if (!map.has(s.container_id)) {
+        map.set(s.container_id, sourceLabel(s.container_id, s.node_name))
+      }
+    }
+    return Array.from(map.entries()).sort((a, b) => a[1].localeCompare(b[1]))
+  }, [sources, selectedService])
+
+  const nodeOptions = useMemo(() => {
+    const map = new Map<number, string>()
+    for (const s of sources) {
+      if (s.node_id != null && !map.has(s.node_id)) {
+        map.set(s.node_id, s.node_name || `node-${s.node_id}`)
+      }
+    }
+    return Array.from(map.entries()).sort((a, b) => a[1].localeCompare(b[1]))
+  }, [sources])
 
   // Build the rendered rope in ASC order (oldest at index 0, newest at end)
   // so the UI renders terminal-style with newest at the bottom.
@@ -684,6 +797,8 @@ export default function HistoryLogViewer({
       if (selectedLevels.length > 0) body.levels = selectedLevels
       if (selectedEnv) body.envs = [selectedEnv]
       if (selectedService) body.services = [selectedService]
+      if (selectedContainer) body.container_ids = [selectedContainer]
+      if (selectedNode != null) body.node_ids = [selectedNode]
       if (selectedDeploy != null) body.deploy_id = selectedDeploy
       if (!fulltextDisabled && debouncedText) body.text = debouncedText
       if (contextLines > 0) body.context_lines = contextLines
@@ -724,6 +839,8 @@ export default function HistoryLogViewer({
     selectedLevels,
     selectedEnv,
     selectedService,
+    selectedContainer,
+    selectedNode,
     selectedDeploy,
     fulltextDisabled,
     debouncedText,
@@ -864,21 +981,63 @@ export default function HistoryLogViewer({
             </SelectTrigger>
             <SelectContent>
               <SelectItem value="all">All services</SelectItem>
-              {Array.from(
-                new Set(
-                  (data?.lines ?? [])
-                    .map((l) => l.service)
-                    .filter((s) => s && s !== 'unknown'),
-                ),
-              )
-                .sort()
-                .map((service) => (
-                  <SelectItem key={service} value={service}>
-                    {service}
-                  </SelectItem>
-                ))}
+              {serviceOptions.map((service) => (
+                <SelectItem key={service} value={service}>
+                  {service}
+                </SelectItem>
+              ))}
             </SelectContent>
           </Select>
+
+          {/* Container filter — the explicit "filter by container / show all"
+              control. Default "All containers" interleaves every container in
+              the project; picking one isolates a single replica. Options are
+              labeled with their node so replicas are distinguishable. */}
+          {(containerOptions.length > 1 || selectedContainer) && (
+            <Select
+              value={selectedContainer ?? 'all'}
+              onValueChange={(v) =>
+                setSelectedContainer(v === 'all' ? undefined : v)
+              }
+            >
+              <SelectTrigger className="w-full sm:w-auto sm:max-w-[260px]">
+                <SelectValue placeholder="All containers" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All containers</SelectItem>
+                {containerOptions.map(([id, label]) => (
+                  <SelectItem key={id} value={id}>
+                    {label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          )}
+
+          {/* Node filter — only shown when logs come from remote worker nodes
+              (multi-node). Lets you scope history to a single node. */}
+          {(nodeOptions.length > 0 || selectedNode != null) && (
+            <Select
+              value={selectedNode != null ? String(selectedNode) : 'all'}
+              onValueChange={(v) =>
+                setSelectedNode(
+                  v === 'all' ? undefined : Number.parseInt(v, 10),
+                )
+              }
+            >
+              <SelectTrigger className="w-full sm:w-auto sm:max-w-[200px]">
+                <SelectValue placeholder="All nodes" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All nodes</SelectItem>
+                {nodeOptions.map(([id, label]) => (
+                  <SelectItem key={id} value={String(id)}>
+                    {label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          )}
 
           {/* Deployment filter. Selecting one scopes the logs to the chunks
               tagged with that deployment's id AND defaults the time window to
@@ -1058,7 +1217,15 @@ export default function HistoryLogViewer({
                   setColumns((c) => ({ ...c, service: v === true }))
                 }
               >
-                Deployment
+                Service
+              </DropdownMenuCheckboxItem>
+              <DropdownMenuCheckboxItem
+                checked={columns.source}
+                onCheckedChange={(v) =>
+                  setColumns((c) => ({ ...c, source: v === true }))
+                }
+              >
+                Source (container · node)
               </DropdownMenuCheckboxItem>
             </DropdownMenuContent>
           </DropdownMenu>

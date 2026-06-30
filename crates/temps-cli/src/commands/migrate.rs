@@ -70,7 +70,12 @@ impl MigrateCommand {
             // any error surfaces here rather than during a server boot. The
             // connection is read-only until we actually apply, so it's safe to
             // use for the dry-run/plan preview as well.
-            let db = temps_database::connect_without_migrations(&self.database_url)
+            //
+            // A single, stable backend (whose PID we capture) lets us cancel the
+            // in-flight migration server-side on Ctrl+C — otherwise the Postgres
+            // backend keeps running the DDL after the CLI exits, and a re-run
+            // would race a second backend against it.
+            let (db, backend_pid) = temps_database::connect_for_migrate(&self.database_url)
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to connect to database: {}", e))?;
 
@@ -117,9 +122,38 @@ impl MigrateCommand {
             // Stream progress so each migration is reported the moment it starts
             // and finishes — a slow index build shows as the in-flight line
             // rather than a frozen "Running database migrations…".
-            let report = temps_database::run_migrations_streaming(&db, print_progress)
-                .await
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            //
+            // Race the apply against Ctrl+C. On interrupt we cancel the migrating
+            // backend SERVER-SIDE (the captured PID) — dropping the client future
+            // alone would leave Postgres running the DDL, so a re-run could put a
+            // second backend on the same schema. The cancelled statement's
+            // transaction rolls back, leaving the DB at the last applied step.
+            let report = tokio::select! {
+                res = temps_database::run_migrations_streaming(&db, print_progress) => {
+                    res.map_err(|e| anyhow::anyhow!("{}", e))?
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    println!();
+                    println!(
+                        "{}",
+                        "Interrupted — cancelling the running migration…".yellow()
+                    );
+                    if let Err(e) =
+                        temps_database::cancel_migration_backend(&self.database_url, backend_pid)
+                            .await
+                    {
+                        eprintln!("  could not cancel the database backend: {e}");
+                        eprintln!(
+                            "  check manually: SELECT pg_cancel_backend({backend_pid});"
+                        );
+                    }
+                    anyhow::bail!(
+                        "Migration interrupted. The in-flight migration was cancelled and \
+                         rolled back; the database is at the last successfully-applied \
+                         migration. Re-run `temps migrate` to continue."
+                    );
+                }
+            };
 
             // Surface anything planned but not attempted (everything after a
             // failure) so the operator knows the set is incomplete.

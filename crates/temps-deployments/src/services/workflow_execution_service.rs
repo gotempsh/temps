@@ -840,6 +840,9 @@ impl WorkflowExecutionService {
                 if let Some(enc_service) = self.encryption_service.get() {
                     builder = builder.encryption_service(enc_service.clone());
                 }
+                // Config service for resolving the cluster CA when deploying to
+                // https:// nodes over mTLS (ADR-020 WS-2.1).
+                builder = builder.config_service(self.config_service.clone());
 
                 // Inject image builder for transferring images to remote nodes
                 builder = builder.image_builder(self.image_builder.clone());
@@ -1035,6 +1038,9 @@ impl WorkflowExecutionService {
                 if let Some(enc_service) = self.encryption_service.get() {
                     builder = builder.encryption_service(enc_service.clone());
                 }
+                // Config service for resolving the cluster CA when deploying to
+                // https:// nodes over mTLS (ADR-020 WS-2.1).
+                builder = builder.config_service(self.config_service.clone());
 
                 let job = builder.build()?;
 

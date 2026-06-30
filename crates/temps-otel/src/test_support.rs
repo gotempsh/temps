@@ -112,6 +112,59 @@ impl OtelStorage for MockOtelStorage {
         Ok(names)
     }
 
+    async fn list_metric_label_keys(
+        &self,
+        project_id: i32,
+        metric_name: &str,
+        start_time: chrono::DateTime<chrono::Utc>,
+        end_time: chrono::DateTime<chrono::Utc>,
+    ) -> StorageResult<Vec<String>> {
+        let mut keys: Vec<String> = self
+            .metrics
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| {
+                m.project_id == project_id
+                    && m.metric_name == metric_name
+                    && m.timestamp >= start_time
+                    && m.timestamp <= end_time
+            })
+            .flat_map(|m| m.attributes.keys().cloned())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        keys.sort();
+        Ok(keys)
+    }
+
+    async fn list_metric_label_values(
+        &self,
+        project_id: i32,
+        metric_name: &str,
+        label_key: &str,
+        start_time: chrono::DateTime<chrono::Utc>,
+        end_time: chrono::DateTime<chrono::Utc>,
+    ) -> StorageResult<Vec<String>> {
+        let mut values: Vec<String> = self
+            .metrics
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| {
+                m.project_id == project_id
+                    && m.metric_name == metric_name
+                    && m.timestamp >= start_time
+                    && m.timestamp <= end_time
+            })
+            .filter_map(|m| m.attributes.get(label_key).cloned())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        values.sort();
+        Ok(values)
+    }
+
     async fn query_spans(&self, query: TraceQuery) -> StorageResult<Vec<SpanRecord>> {
         let spans = self.spans.lock().unwrap();
         let filtered: Vec<SpanRecord> = spans
@@ -623,6 +676,56 @@ pub fn resource(service_name: &str) -> proto::resource::v1::Resource {
     proto::resource::v1::Resource {
         attributes: vec![kv("service.name", service_name)],
         dropped_attributes_count: 0,
+    }
+}
+
+/// Build a minimal gauge `MetricPoint` for storage-level tests, with the given
+/// data-point attributes. All histogram/exponential/summary fields are left
+/// empty — callers that need those should construct the point directly.
+pub fn metric_point(
+    project_id: i32,
+    metric_name: &str,
+    timestamp: chrono::DateTime<chrono::Utc>,
+    attributes: &[(&str, &str)],
+) -> MetricPoint {
+    MetricPoint {
+        project_id,
+        deployment_id: None,
+        resource: ResourceInfo {
+            service_name: "svc".to_string(),
+            service_version: None,
+            deployment_environment: None,
+            attributes: std::collections::BTreeMap::new(),
+        },
+        metric_name: metric_name.to_string(),
+        metric_type: MetricType::Gauge,
+        unit: String::new(),
+        description: None,
+        timestamp,
+        start_time: None,
+        temporality: None,
+        is_monotonic: None,
+        flags: 0,
+        value: Some(1.0),
+        histogram_count: None,
+        histogram_sum: None,
+        histogram_min: None,
+        histogram_max: None,
+        histogram_bounds: None,
+        histogram_bucket_counts: None,
+        exp_scale: None,
+        exp_zero_count: None,
+        exp_zero_threshold: None,
+        exp_positive_offset: None,
+        exp_positive_counts: None,
+        exp_negative_offset: None,
+        exp_negative_counts: None,
+        summary_quantiles: None,
+        exemplars: Vec::new(),
+        attributes: attributes
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
     }
 }
 

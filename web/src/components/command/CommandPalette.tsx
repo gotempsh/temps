@@ -516,9 +516,15 @@ const projectNavItems: NavigationItem[] = [
   },
   {
     title: 'Metrics',
-    url: 'monitoring',
+    url: 'metrics',
     icon: BarChart3,
-    keywords: ['metrics', 'monitoring', 'cpu', 'memory', 'resources'],
+    keywords: ['metrics', 'opentelemetry', 'otel', 'cpu', 'memory', 'resources', 'observe'],
+  },
+  {
+    title: 'Observe',
+    url: 'observe',
+    icon: Activity,
+    keywords: ['observe', 'events', 'opentelemetry', 'otel', 'timeline', 'all events'],
   },
   {
     title: 'Services',

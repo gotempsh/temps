@@ -5,6 +5,8 @@ members = [
     "crates/temps-cli",
     # Library crates
     "crates/temps-core",
+    "crates/temps-ai",
+    "crates/temps-ai-chat",
     "crates/temps-entities",
     "crates/temps-migrations",
     "crates/temps-database",
@@ -78,6 +80,7 @@ members = [
     "crates/temps-revenue",
     "crates/temps-observability",
     "crates/temps-metrics",
+    "crates/temps-ai-api-tools",
     "examples/example-plugin",
     "examples/lighthouse-plugin",
     "examples/indexnow-plugin",
@@ -172,7 +175,7 @@ hyper = { version = "1.5.2", features = ["full"] }
 # ============================================================================
 # HTTP Client
 # ============================================================================
-reqwest = { version = "0.12.15", features = ["json", "stream", "multipart"] }
+reqwest = { version = "0.12.15", features = ["json", "stream", "multipart", "rustls-tls"] }
 
 # ============================================================================
 # API Documentation (OpenAPI/Swagger)
@@ -229,6 +232,13 @@ rustls = { version = "0.23", default-features = false, features = [
 ] }
 rustls-pemfile = "2.0"
 rustls-platform-verifier = "0.5"
+# Async TLS for the agent's mTLS listener (ADR-020 WS-2.1). `ring` matches the
+# process-default CryptoProvider installed by the CLI.
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "ring",
+    "tls12",
+    "logging",
+] }
 webpki-roots = "0.26"
 
 # ============================================================================
@@ -346,17 +356,39 @@ debug = false
 # ============================================================================
 # Known vulnerabilities from transitive dependencies (blocked on upstream):
 #
-# 1. CVE-2025-53605: Protobuf 2.28.0 (MEDIUM severity)
-#    - Path: pingora → prometheus 0.13.4 → protobuf 2.28.0
-#    - Fix: Requires prometheus to upgrade to 0.14+ (which uses protobuf 3.7.2+)
-#    - Status: Waiting for pingora to update prometheus dependency
-#    - Mitigation: protobuf is used internally by Prometheus metrics, not exposed to untrusted input
+# 1. RUSTSEC-2024-0437 / GHSA-2gh3-rmm4-6rq5 / CVE-2025-53605: protobuf 2.28.0 (MEDIUM)
+#    - Path: pingora-core 0.8.0 → prometheus 0.13.4 → protobuf 2.28.0
+#    - Fix: needs prometheus 0.14+ (protobuf 3.7.2+). pingora-core 0.8.0 AND 0.8.1
+#      both pin prometheus ^0.13, and a [patch.crates-io] to protobuf 3.x fails to
+#      compile (prometheus 0.13's generated code uses 2.x-only RepeatedField /
+#      CodedInputStream APIs). Total upstream block until pingora bumps prometheus.
+#    - Reachability: the vuln is a recursion crash when PARSING untrusted protobuf.
+#      pingora emits metrics via TextEncoder (not ProtobufEncoder); its
+#      PrometheusServer is not wired into any temps listener; the OTLP ingest path
+#      uses prost, not protobuf 2.x. The 2.x parse code is compiled in but never
+#      fed attacker input -> not reachable. (verified 2026-06-29)
 #
-# 2. GHSA-mc8h-8q98-g5hr: remove_dir_all 0.5.3 (LOW severity)
-#    - Path: nixpacks → tempdir → remove_dir_all 0.5.3
-#    - Fix: Requires nixpacks to update to use tempfile instead of deprecated tempdir
-#    - Status: Tracked in nixpacks repository (nixpacks 1.41.0 is latest, still uses tempdir)
-#    - Mitigation: TOCTOU race condition, low impact in our usage
+# 2. RUSTSEC-2023-0018 / GHSA-mc8h-8q98-g5hr: remove_dir_all 0.5.3 (LOW)
+#    - Path: nixpacks 1.41.0 → tempdir 0.3.7 → remove_dir_all 0.5.3
+#    - Fix: needs nixpacks to drop deprecated tempdir for tempfile. nixpacks 1.41.0
+#      is the crates.io latest and still uses tempdir, which hard-requires
+#      remove_dir_all ^0.5 (so `--precise 0.8.0` is impossible).
+#    - Reachability: the TOCTOU race lives in nixpacks get_output_dir()'s
+#      TempDir::new()/remove_dir_all(output.root) branch, taken only when out_dir
+#      is None. temps-presets always passes out_dir: Some(...) (nixpacks_preset.rs
+#      ~L507), so that branch never executes -> dead code here. (verified 2026-06-29)
+#
+# 2b. GHSA-w9wp-h8wv-79jx: opentelemetry_sdk 0.30.0 (MEDIUM, dependabot-only)
+#    - Path: relay-event-schema (git pin getsentry/relay) → opentelemetry-proto 0.30
+#      → opentelemetry_sdk 0.30.0
+#    - Fix: needs the pinned relay git rev moved to one using opentelemetry 0.32+;
+#      the pin locks opentelemetry-proto to ^0.30 -> opentelemetry_sdk 0.30, with no
+#      [patch] override possible. Bumping the relay rev is out of scope for a patch.
+#    - Reachability: the unbounded-alloc bug is in the W3C BaggagePropagator. relay
+#      pulls opentelemetry-proto only for OTLP span TYPE conversion; the propagation
+#      module is compiled in (trace feature) but BaggagePropagator is never
+#      instantiated and .extract() is never called on attacker headers anywhere in
+#      the workspace -> not reachable. (verified 2026-06-29)
 #
 # 3. GHSA-xxx: libcrux-intrinsics 0.0.3 (HIGH severity, dev-dependency only)
 #    - Path: testcontainers → russh → libcrux-ml-kem → libcrux-intrinsics 0.0.3
@@ -376,6 +408,18 @@ debug = false
 # - rustls-webpki 0.103.10 (RUSTSEC-2026-0098, -0099, -0104): RESOLVED by cargo update rustls-webpki@0.103 → 0.103.13
 # - rand 0.9.2 (RUSTSEC-2026-0097): RESOLVED by cargo update rand@0.9 → 0.9.4
 # - rand 0.8.5 (RUSTSEC-2026-0097): RESOLVED by cargo update rand@0.8 → 0.8.6
+# - postgres-protocol 0.6.11 (RUSTSEC-2026-0179 unbounded-SCRAM-iteration CPU
+#     exhaustion DoS; RUSTSEC-2026-0180 hstore decode panic DoS): RESOLVED by
+#     cargo update postgres-protocol → 0.6.12. Network-reachable: temps connects to
+#     user-managed external Postgres servers, so a malicious/compromised server
+#     could trigger these against the temps process.
+# - tokio-postgres 0.7.17 (RUSTSEC-2026-0178 DataRow-with-too-few-fields panic
+#     DoS): RESOLVED by cargo update tokio-postgres → 0.7.18 (pulls postgres-types
+#     → 0.2.14). Same user-managed-server reachability as above.
+# - quinn-proto 0.11.14 (RUSTSEC-2026-0185 remote memory exhaustion via unbounded
+#     out-of-order stream reassembly): RESOLVED by cargo update quinn-proto →
+#     0.11.15. (Orphaned lock entry with no active dependents — bumped for hygiene
+#     so `cargo audit` stays clean.)
 # - rustls-webpki 0.101.7 (RUSTSEC-2026-0098, -0099, -0104) on rustls 0.21:
 #     RESOLVED by disabling default features on aws-sdk-s3, aws-sdk-sesv2, and
 #     aws-config so the deprecated `rustls` feature (which activates
@@ -385,8 +429,14 @@ debug = false
 #
 # 5. RUSTSEC-2023-0071: rsa 0.9.10 (MEDIUM severity)
 #    - Title: Marvin Attack: potential key recovery through timing sidechannels
-#    - Status: No fixed upgrade available upstream
-#    - Mitigation: RSA used for SSH key operations only, not exposed to network timing attacks
+#    - Path: jsonwebtoken 10.4.0 → { octocrab (GitHub App JWT signing),
+#      openidconnect (OIDC id_token verification) }
+#    - Status: no fixed version exists upstream (the rsa crate has no constant-time
+#      release yet). Tracked.
+#    - Mitigation: used for RS256 JWT sign/verify, NOT for RSA decryption of
+#      attacker-supplied ciphertext. The Marvin side-channel targets PKCS#1v1.5
+#      private-key ops; our JWT signing key is not exposed to a remote timing
+#      oracle, and OIDC token verification is a public-key op (unaffected).
 #
 # All remaining items are transitive dependencies from third-party crates that we
 # cannot directly patch without forking. Monitoring upstream for updates.

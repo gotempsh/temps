@@ -881,6 +881,7 @@ export function MonitoringSettings() {
   const settingsSections = [
     { id: 'resources', label: 'Health' },
     { id: 'alerts', label: 'Alerts' },
+    { id: 'alarms', label: 'Alarms' },
     { id: 'notifications', label: 'Notifications' },
   ] as const
 

@@ -4075,6 +4075,8 @@ mod tests {
             gitlab_webhook_id: None,
             gitlab_webhook_signing_token: None,
             attack_mode: false,
+            ai_alert_summaries_enabled: None,
+            ai_debug_chat_enabled: None,
             enable_preview_environments: true,
             preview_envs_on_demand: false,
             preview_envs_idle_timeout_seconds: 300,

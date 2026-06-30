@@ -44,6 +44,9 @@ pub enum EnvVarError {
     #[error("Secret env var '{key}' requires a non-empty value on create")]
     SecretValueRequired { key: String },
 
+    #[error("Environment variable '{key}' already exists in one of the selected environments")]
+    AlreadyExists { key: String },
+
     #[error("Other error: {0}")]
     Other(String),
 }
@@ -226,10 +229,7 @@ impl EnvVarService {
 
         for env_id in &environment_ids {
             if existing_env_ids.contains(env_id) {
-                return Err(EnvVarError::Other(format!(
-                    "Environment variable '{}' already exists in one of the selected environments",
-                    key
-                )));
+                return Err(EnvVarError::AlreadyExists { key: key.clone() });
             }
         }
 
@@ -608,6 +608,45 @@ mod tests {
         let d2 = service.decrypt_value(1, "K", &e2, true).unwrap();
         assert_eq!(d1, "value");
         assert_eq!(d2, "value");
+    }
+
+    #[tokio::test]
+    async fn test_create_env_var_duplicate_returns_already_exists() {
+        // Re-creating a key that already exists in one of the selected
+        // environments must surface a typed AlreadyExists error (mapped to HTTP
+        // 409), not the catch-all Other (which mapped to 500). Regression guard.
+        let svc = make_encryption_service();
+        let existing_var = make_env_var_model(1, 10, "DB_URL", "v", false);
+        let existing_link = env_var_environments::Model {
+            id: 1,
+            env_var_id: 1,
+            environment_id: 5,
+            created_at: chrono::Utc::now(),
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![(existing_var, Some(existing_link))]])
+                .into_connection(),
+        );
+        let service = EnvVarService::new(db, svc);
+
+        // Requesting environment 5, which already has the key -> duplicate.
+        let result = service
+            .create_environment_variable(
+                10,
+                vec![5],
+                "DB_URL".to_string(),
+                "newval".to_string(),
+                false,
+                false,
+            )
+            .await;
+
+        match result {
+            Err(EnvVarError::AlreadyExists { key }) => assert_eq!(key, "DB_URL"),
+            Err(other) => panic!("expected EnvVarError::AlreadyExists, got {other:?}"),
+            Ok(_) => panic!("expected EnvVarError::AlreadyExists, got Ok"),
+        }
     }
 
     #[tokio::test]

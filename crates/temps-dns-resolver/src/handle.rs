@@ -49,8 +49,20 @@ impl ResolverHandle {
         let shutdown = Arc::new(Notify::new());
 
         // ----- Sync loop -----
-        let sync_client = SyncClient::new(config.clone(), zone.clone(), shutdown.clone())?;
-        let sync_task = tokio::spawn(async move { sync_client.run().await });
+        // Worker nodes long-poll the control plane over HTTP. In control-plane
+        // mode (`disable_sync`, ADR-024) the caller owns the `ZoneStore` and
+        // feeds it directly from the local `service_endpoints` DB, so we skip
+        // the HTTP sync entirely and just park a task on `shutdown` to keep the
+        // handle's shape (and `shutdown()` semantics) unchanged.
+        let sync_task = if config.disable_sync {
+            let sd = shutdown.clone();
+            tokio::spawn(async move {
+                sd.notified().await;
+            })
+        } else {
+            let sync_client = SyncClient::new(config.clone(), zone.clone(), shutdown.clone())?;
+            tokio::spawn(async move { sync_client.run().await })
+        };
 
         // ----- Upstream forwarder -----
         // Built once per resolver. `None` means the operator has

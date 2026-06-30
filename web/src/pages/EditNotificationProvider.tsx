@@ -6,7 +6,8 @@ import { zodResolver } from '@hookform/resolvers/zod'
 import { toast } from 'sonner'
 import {
   getNotificationProviderOptions,
-  updateEmailProviderMutation,
+  updateNotificationEmailProviderMutation,
+  updateNotificationProviderMutation,
   updateSlackProviderMutation,
   updateWebhookProviderMutation,
   testNotificationProviderMutation as testProvider2Mutation,
@@ -105,11 +106,19 @@ export function EditNotificationProvider() {
       const config = provider.config as Record<string, unknown>
       form.reset({
         name: provider.name,
-        provider_type: provider.provider_type as 'email' | 'slack' | 'webhook',
+        provider_type: provider.provider_type as
+          | 'email'
+          | 'slack'
+          | 'webhook'
+          | 'cloudflare',
         config: {
           // Slack config
           webhook_url: config.webhook_url as string,
           channel: config.channel as string,
+
+          // Cloudflare config
+          account_id: config.account_id as string,
+          api_token: config.api_token as string,
 
           // Email config
           smtp_host: config.smtp_host as string,
@@ -138,7 +147,7 @@ export function EditNotificationProvider() {
 
   // Update mutations
   const updateEmailMutation = useMutation({
-    ...updateEmailProviderMutation(),
+    ...updateNotificationEmailProviderMutation(),
     meta: {
       errorTitle: 'Failed to update email provider',
     },
@@ -168,6 +177,20 @@ export function EditNotificationProvider() {
     },
     onSuccess: () => {
       toast.success('Webhook provider updated successfully')
+      queryClient.invalidateQueries({ queryKey: ['getNotificationProviders'] })
+      navigate('/settings/notifications')
+    },
+  })
+
+  // Cloudflare uses the generic notification-provider endpoint (provider_type
+  // + opaque config) rather than a dedicated typed mutation.
+  const updateCloudflareMutation = useMutation({
+    ...updateNotificationProviderMutation(),
+    meta: {
+      errorTitle: 'Failed to update Cloudflare provider',
+    },
+    onSuccess: () => {
+      toast.success('Cloudflare provider updated successfully')
       queryClient.invalidateQueries({ queryKey: ['getNotificationProviders'] })
       navigate('/settings/notifications')
     },
@@ -222,6 +245,21 @@ export function EditNotificationProvider() {
             method: data.config.method || 'POST',
             headers: (data.config.headers as Record<string, string>) || {},
             timeout_secs: data.config.timeout_secs || 30,
+          },
+        },
+      })
+    } else if (data.provider_type === 'cloudflare') {
+      await updateCloudflareMutation.mutateAsync({
+        path: { id: provider.id },
+        body: {
+          name: data.name,
+          enabled: provider.enabled,
+          config: {
+            account_id: data.config.account_id!,
+            api_token: data.config.api_token!,
+            from_address: data.config.from_address!,
+            from_name: data.config.from_name || undefined,
+            to_addresses: data.config.to_addresses!,
           },
         },
       })
@@ -302,7 +340,10 @@ export function EditNotificationProvider() {
   }
 
   const isSubmitting =
-    updateEmailMutation.isPending || updateSlackMutation.isPending || updateWebhookMutation.isPending
+    updateEmailMutation.isPending ||
+    updateSlackMutation.isPending ||
+    updateWebhookMutation.isPending ||
+    updateCloudflareMutation.isPending
 
   return (
     <div className="max-w-4xl mx-auto space-y-6">

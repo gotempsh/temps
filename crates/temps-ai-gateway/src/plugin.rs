@@ -48,6 +48,15 @@ impl TempsPlugin for AiGatewayPlugin {
             let gateway_service = Arc::new(GatewayService::new(provider_key_service.clone()));
             context.register_service(gateway_service.clone());
 
+            // ADR-022: register the general AI foundation so any feature can get
+            // text or typed/structured output from the configured model through
+            // one governed seam. Best-effort + self-gating, safe to always register.
+            let ai_service = Arc::new(crate::services::GatewayAiService::new(
+                gateway_service.clone(),
+                db.clone(),
+            ));
+            context.register_service(ai_service as Arc<dyn temps_ai::AiService>);
+
             let usage_service = Arc::new(UsageService::new(db));
             context.register_service(usage_service.clone());
 

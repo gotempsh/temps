@@ -101,6 +101,9 @@ export function ProviderForm({
                       <SelectItem value="email">Email</SelectItem>
                       <SelectItem value="slack">Slack</SelectItem>
                       <SelectItem value="webhook">Webhook</SelectItem>
+                      <SelectItem value="cloudflare">
+                        Cloudflare Email
+                      </SelectItem>
                     </SelectContent>
                   </Select>
                   <FormMessage />
@@ -590,6 +593,127 @@ export function ProviderForm({
 }`}
               </pre>
             </div>
+          </div>
+        )}
+
+        {providerType === 'cloudflare' && (
+          <div className="space-y-6">
+            <div className="space-y-4">
+              <h3 className="text-sm font-medium leading-none">
+                Cloudflare Email Sending
+              </h3>
+              <p className="text-sm text-muted-foreground">
+                Sends notification emails through Cloudflare&apos;s
+                transactional Email Sending API. The sender domain must be
+                configured for Email Sending in your Cloudflare account.
+              </p>
+            </div>
+
+            <FormField
+              control={form.control}
+              name="config.account_id"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>Account ID</FormLabel>
+                  <FormControl>
+                    <Input
+                      {...field}
+                      placeholder="023e105f4ecef8ad9ca31a8372d0c353"
+                    />
+                  </FormControl>
+                  <FormDescription>
+                    Your Cloudflare account identifier
+                  </FormDescription>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+
+            <FormField
+              control={form.control}
+              name="config.api_token"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>API Token</FormLabel>
+                  <FormControl>
+                    <Input
+                      {...field}
+                      type="password"
+                      placeholder="••••••••"
+                      autoComplete="off"
+                    />
+                  </FormControl>
+                  <FormDescription>
+                    A Cloudflare API token with the Email Sending permission
+                  </FormDescription>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+
+            <FormField
+              control={form.control}
+              name="config.from_name"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>From Name</FormLabel>
+                  <FormControl>
+                    <Input {...field} placeholder="Notification System" />
+                  </FormControl>
+                  <FormDescription>
+                    The name that will appear in the email sender field
+                  </FormDescription>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+
+            <FormField
+              control={form.control}
+              name="config.from_address"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>From Address</FormLabel>
+                  <FormControl>
+                    <Input
+                      {...field}
+                      type="email"
+                      placeholder="welcome@infracf.example.com"
+                    />
+                  </FormControl>
+                  <FormDescription>
+                    Must belong to a domain enabled for Cloudflare Email Sending
+                  </FormDescription>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+
+            <FormField
+              control={form.control}
+              name="config.to_addresses"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>To Addresses</FormLabel>
+                  <FormControl>
+                    <Input
+                      {...field}
+                      placeholder="recipient1@example.com, recipient2@example.com"
+                      onChange={(e) =>
+                        field.onChange(
+                          e.target.value.split(',').map((email) => email.trim())
+                        )
+                      }
+                      value={field.value?.join(', ') || ''}
+                    />
+                  </FormControl>
+                  <FormDescription>
+                    Separate multiple email addresses with commas
+                  </FormDescription>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
           </div>
         )}
 

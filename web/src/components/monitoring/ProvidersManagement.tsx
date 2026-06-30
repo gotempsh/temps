@@ -4,7 +4,7 @@ import {
   deleteNotificationProviderMutation as deleteProviderSafelyMutation,
   listNotificationProvidersOptions,
   testNotificationProviderMutation as testProviderMutation,
-  updateEmailProviderMutation,
+  updateNotificationEmailProviderMutation,
   updateNotificationProviderMutation,
   updateSlackProviderMutation,
   updateWebhookProviderMutation,
@@ -39,7 +39,7 @@ import { ProviderForm } from './ProviderForm'
 import { ProviderFormData, providerSchema } from './schemas'
 
 interface ExtendedNotificationProvider extends NotificationProviderResponse {
-  provider_type: 'email' | 'slack' | 'webhook'
+  provider_type: 'email' | 'slack' | 'webhook' | 'cloudflare'
   config: {
     // Slack config
     webhook_url?: string
@@ -60,6 +60,10 @@ interface ExtendedNotificationProvider extends NotificationProviderResponse {
     method?: 'POST' | 'PUT' | 'PATCH'
     headers?: Record<string, string>
     timeout_secs?: number
+
+    // Cloudflare config
+    account_id?: string
+    api_token?: string
   }
 }
 
@@ -78,7 +82,7 @@ export function ProvidersManagement() {
   })
 
   const updateEmailMutation = useMutation({
-    ...updateEmailProviderMutation(),
+    ...updateNotificationEmailProviderMutation(),
     meta: {
       errorTitle: 'Failed to update email provider',
     },
@@ -110,6 +114,21 @@ export function ProvidersManagement() {
     },
     onSuccess: () => {
       toast.success('Webhook provider updated successfully')
+      setIsEditDialogOpen(false)
+      setEditingProvider(null)
+      refetch()
+    },
+  })
+
+  // Cloudflare uses the generic notification-provider endpoint (provider_type
+  // + opaque config) rather than a dedicated typed mutation.
+  const updateCloudflareMutation = useMutation({
+    ...updateNotificationProviderMutation(),
+    meta: {
+      errorTitle: 'Failed to update Cloudflare provider',
+    },
+    onSuccess: () => {
+      toast.success('Cloudflare provider updated successfully')
       setIsEditDialogOpen(false)
       setEditingProvider(null)
       refetch()
@@ -180,6 +199,21 @@ export function ProvidersManagement() {
             method: data.config.method || 'POST',
             headers: (data.config.headers || {}) as Record<string, string>,
             timeout_secs: data.config.timeout_secs || 30,
+          },
+        },
+      })
+    } else if (data.provider_type === 'cloudflare') {
+      await updateCloudflareMutation.mutateAsync({
+        path: { id: editingProvider.id },
+        body: {
+          name: data.name,
+          enabled: editingProvider.enabled,
+          config: {
+            account_id: data.config.account_id!,
+            api_token: data.config.api_token!,
+            from_address: data.config.from_address!,
+            from_name: data.config.from_name || undefined,
+            to_addresses: data.config.to_addresses!,
           },
         },
       })
@@ -266,11 +300,14 @@ export function ProvidersManagement() {
         ? updateEmailMutation.isPending
         : watchedProviderType === 'slack'
           ? updateSlackMutation.isPending
-          : updateWebhookMutation.isPending,
+          : watchedProviderType === 'cloudflare'
+            ? updateCloudflareMutation.isPending
+            : updateWebhookMutation.isPending,
     [
       watchedProviderType,
       updateEmailMutation.isPending,
       updateSlackMutation.isPending,
+      updateCloudflareMutation.isPending,
       updateWebhookMutation.isPending,
     ]
   )
@@ -358,7 +395,8 @@ export function ProvidersManagement() {
                 </CardHeader>
                 <CardContent>
                   <p className="text-sm text-muted-foreground truncate">
-                    {provider.provider_type === 'email'
+                    {provider.provider_type === 'email' ||
+                    provider.provider_type === 'cloudflare'
                       ? typedProvider.config?.from_address ||
                         'No address configured'
                       : provider.provider_type === 'slack'

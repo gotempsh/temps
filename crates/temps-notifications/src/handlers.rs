@@ -115,9 +115,11 @@ fn make_audit_context(auth: &temps_auth::AuthContext, metadata: &RequestMetadata
         create_slack_provider,
         create_notification_email_provider,
         create_webhook_provider,
+        create_cloudflare_provider,
         update_slack_provider,
-        update_email_provider,
+        update_notification_email_provider,
         update_webhook_provider,
+        update_cloudflare_provider,
         get_preferences,
         update_preferences,
         delete_preferences,
@@ -136,9 +138,12 @@ fn make_audit_context(auth: &temps_auth::AuthContext, metadata: &RequestMetadata
             CreateSlackProviderRequest,
             CreateNotificationEmailProviderRequest,
             CreateWebhookProviderRequest,
+            CloudflareConfig,
+            CreateCloudflareProviderRequest,
             UpdateSlackProviderRequest,
             UpdateNotificationEmailProviderRequest,
             UpdateWebhookProviderRequest,
+            UpdateCloudflareProviderRequest,
             NotificationPreferencesResponse,
             UpdatePreferencesRequest,
             TriggerDigestResponse,
@@ -291,6 +296,45 @@ pub struct CreateWebhookProviderRequest {
 pub struct UpdateWebhookProviderRequest {
     pub name: Option<String>,
     pub config: WebhookConfig,
+    pub enabled: Option<bool>,
+}
+
+/// Configuration for a Cloudflare Email Sending notification provider.
+///
+/// Notifications are delivered through Cloudflare's transactional Email Sending
+/// API. Only the account, token, sender and recipients are configured here —
+/// subject and body are derived from each notification.
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CloudflareConfig {
+    /// Cloudflare account id that owns the Email Sending configuration.
+    #[schema(example = "023e105f4ecef8ad9ca31a8372d0c353")]
+    pub account_id: String,
+    /// Cloudflare API token with the Email Sending permission. Encrypted at
+    /// rest; like the other notification providers, it is returned decrypted to
+    /// authorized callers so the edit form can prefill (not masked).
+    pub api_token: String,
+    /// Verified sender address (must belong to a domain enabled for Cloudflare
+    /// Email Sending).
+    #[schema(example = "welcome@infracf.example.com")]
+    pub from_address: String,
+    /// Optional human-friendly sender name shown in the recipient's inbox.
+    #[serde(default)]
+    pub from_name: Option<String>,
+    /// Recipients that should receive the notification.
+    pub to_addresses: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CreateCloudflareProviderRequest {
+    pub name: String,
+    pub config: CloudflareConfig,
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct UpdateCloudflareProviderRequest {
+    pub name: Option<String>,
+    pub config: CloudflareConfig,
     pub enabled: Option<bool>,
 }
 
@@ -942,7 +986,7 @@ async fn update_slack_provider(
         ("bearer_auth" = [])
     )
 )]
-async fn update_email_provider(
+async fn update_notification_email_provider(
     State(app_state): State<Arc<NotificationState>>,
     Path(id): Path<i32>,
     RequireAuth(auth): RequireAuth,
@@ -1201,6 +1245,164 @@ async fn update_webhook_provider(
             );
             Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to update Webhook notification provider")
+                .detail(format!("Error: {}", e))
+                .build())
+        }
+    }
+}
+
+/// Create a new Cloudflare Email Sending notification provider
+#[utoipa::path(
+    post,
+    path = "/notification-providers/cloudflare",
+    request_body = CreateCloudflareProviderRequest,
+    responses(
+        (status = 201, description = "Successfully created Cloudflare provider", body = NotificationProviderResponse),
+        (status = 400, description = "Invalid request"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = "Notification Providers",
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+async fn create_cloudflare_provider(
+    State(app_state): State<Arc<NotificationState>>,
+    RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<CreateCloudflareProviderRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, NotificationProvidersCreate);
+    info!("Creating Cloudflare notification provider {}", request.name);
+    let config = serde_json::to_value(request.config).unwrap_or_default();
+    match app_state
+        .notification_service
+        .add_provider(request.name, "cloudflare".to_string(), config)
+        .await
+    {
+        Ok(provider) => {
+            let audit = NotificationProviderAudit {
+                context: make_audit_context(&auth, &metadata),
+                provider_id: provider.id,
+                provider_type: "cloudflare".to_string(),
+                action: "NOTIFICATION_PROVIDER_CREATED".to_string(),
+            };
+            if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
+                error!("Failed to create audit log: {}", e);
+            }
+
+            let config = app_state
+                .notification_service
+                .decrypt_provider_config(&provider.config)
+                .map_err(|e| {
+                    error!("Failed to decrypt provider config: {}", e);
+                    ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .title("Failed to decrypt provider configuration")
+                        .detail(format!("Error: {}", e))
+                        .build()
+                })?;
+            let response = NotificationProviderResponse {
+                id: provider.id,
+                name: provider.name,
+                provider_type: provider.provider_type,
+                config,
+                enabled: provider.enabled,
+                created_at: provider.created_at.timestamp_millis(),
+                updated_at: provider.updated_at.timestamp_millis(),
+            };
+            Ok((StatusCode::CREATED, Json(response)))
+        }
+        Err(e) => {
+            error!("Failed to create Cloudflare notification provider: {}", e);
+            Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title("Failed to create Cloudflare notification provider")
+                .detail(format!("Error: {}", e))
+                .build())
+        }
+    }
+}
+
+/// Update a Cloudflare Email Sending notification provider
+#[utoipa::path(
+    put,
+    path = "/notification-providers/cloudflare/{id}",
+    request_body = UpdateCloudflareProviderRequest,
+    responses(
+        (status = 200, description = "Successfully updated Cloudflare provider", body = NotificationProviderResponse),
+        (status = 404, description = "Provider not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("id" = i32, Path, description = "Provider ID")
+    ),
+    tag = "Notification Providers",
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+async fn update_cloudflare_provider(
+    State(app_state): State<Arc<NotificationState>>,
+    Path(id): Path<i32>,
+    RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<UpdateCloudflareProviderRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, NotificationProvidersWrite);
+    info!("Updating Cloudflare notification provider {}", id);
+    let config = serde_json::to_value(request.config).unwrap_or_default();
+    let update_request = UpdateProviderRequest {
+        name: request.name,
+        config: Some(config),
+        enabled: request.enabled,
+    };
+    match app_state
+        .notification_service
+        .update_provider(id, update_request.into())
+        .await
+    {
+        Ok(Some(provider)) => {
+            let audit = NotificationProviderAudit {
+                context: make_audit_context(&auth, &metadata),
+                provider_id: provider.id,
+                provider_type: "cloudflare".to_string(),
+                action: "NOTIFICATION_PROVIDER_UPDATED".to_string(),
+            };
+            if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
+                error!("Failed to create audit log: {}", e);
+            }
+
+            let config = app_state
+                .notification_service
+                .decrypt_provider_config(&provider.config)
+                .map_err(|e| {
+                    error!("Failed to decrypt provider config: {}", e);
+                    ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .title("Failed to decrypt provider configuration")
+                        .detail(format!("Error: {}", e))
+                        .build()
+                })?;
+            let response = NotificationProviderResponse {
+                id: provider.id,
+                name: provider.name,
+                provider_type: provider.provider_type,
+                config,
+                enabled: provider.enabled,
+                created_at: provider.created_at.timestamp_millis(),
+                updated_at: provider.updated_at.timestamp_millis(),
+            };
+            Ok((StatusCode::OK, Json(response)))
+        }
+        Ok(None) => Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
+            .title("Provider not found")
+            .detail("The requested Cloudflare notification provider does not exist")
+            .build()),
+        Err(e) => {
+            error!(
+                "Failed to update Cloudflare notification provider {}: {}",
+                id, e
+            );
+            Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title("Failed to update Cloudflare notification provider")
                 .detail(format!("Error: {}", e))
                 .build())
         }
@@ -1548,6 +1750,10 @@ pub fn configure_routes() -> Router<Arc<NotificationState>> {
             post(create_webhook_provider),
         )
         .route(
+            "/notification-providers/cloudflare",
+            post(create_cloudflare_provider),
+        )
+        .route(
             "/notification-providers/{id}",
             get(get_notification_provider),
         )
@@ -1561,11 +1767,15 @@ pub fn configure_routes() -> Router<Arc<NotificationState>> {
         )
         .route(
             "/notification-providers/email/{id}",
-            put(update_email_provider),
+            put(update_notification_email_provider),
         )
         .route(
             "/notification-providers/webhook/{id}",
             put(update_webhook_provider),
+        )
+        .route(
+            "/notification-providers/cloudflare/{id}",
+            put(update_cloudflare_provider),
         )
         .route(
             "/notification-providers/{id}",
@@ -1894,7 +2104,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_email_provider() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_update_notification_email_provider() -> Result<(), Box<dyn std::error::Error>> {
         let setup = TestSetup::new().await?;
 
         let request_body = UpdateNotificationEmailProviderRequest {
