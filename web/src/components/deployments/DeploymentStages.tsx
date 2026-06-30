@@ -19,16 +19,20 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { useQuery } from '@tanstack/react-query'
 import AnsiToHtml from 'ansi-to-html'
 import {
+  AlertTriangle,
   Check,
   CheckCircle2,
   ChevronDownIcon,
   ChevronUpIcon,
   Copy,
+  Info,
   Loader2,
   Settings,
+  Sparkles,
   XCircle,
 } from 'lucide-react'
 import { memo, useEffect, useMemo, useRef, useState } from 'react'
+import { useAiAssistant } from '../ai/AiAssistantContext'
 import { ElapsedTime } from '../global/ElapsedTime'
 
 interface DeploymentStagesProps {
@@ -203,23 +207,6 @@ function LogViewer({ project, deployment, job }: LogViewerProps) {
     []
   )
 
-  // Get color class for log level
-  const getLevelColor = (level: string) => {
-    switch (level.toLowerCase()) {
-      case 'error':
-        return 'text-red-500 dark:text-red-400'
-      case 'warning':
-      case 'warn':
-        return 'text-yellow-600 dark:text-yellow-500'
-      case 'success':
-        return 'text-green-600 dark:text-green-500'
-      case 'info':
-        return 'text-blue-500 dark:text-blue-400'
-      default:
-        return 'text-muted-foreground'
-    }
-  }
-
   // Get icon for log level
   const getLevelIcon = (level: string) => {
     switch (level.toLowerCase()) {
@@ -355,7 +342,7 @@ function LogViewer({ project, deployment, job }: LogViewerProps) {
             onClick={() => toggleFilter('info')}
             className="gap-2"
           >
-            <span className="text-blue-500">ℹ️</span>
+            <Info className="text-blue-500" />
             Info
             {logCounts.info > 0 && (
               <span className="ml-1 px-1.5 py-0.5 text-xs rounded-full bg-blue-500/20">
@@ -369,7 +356,7 @@ function LogViewer({ project, deployment, job }: LogViewerProps) {
             onClick={() => toggleFilter('success')}
             className="gap-2"
           >
-            <span className="text-green-500">✅</span>
+            <CheckCircle2 className="text-green-500" />
             Success
             {logCounts.success > 0 && (
               <span className="ml-1 px-1.5 py-0.5 text-xs rounded-full bg-green-500/20">
@@ -383,7 +370,7 @@ function LogViewer({ project, deployment, job }: LogViewerProps) {
             onClick={() => toggleFilter('warning')}
             className="gap-2"
           >
-            <span className="text-yellow-500">⚠️</span>
+            <AlertTriangle className="text-yellow-500" />
             Warning
             {logCounts.warning > 0 && (
               <span className="ml-1 px-1.5 py-0.5 text-xs rounded-full bg-yellow-500/20">
@@ -397,7 +384,7 @@ function LogViewer({ project, deployment, job }: LogViewerProps) {
             onClick={() => toggleFilter('error')}
             className="gap-2"
           >
-            <span className="text-red-500">❌</span>
+            <XCircle className="text-red-500" />
             Error
             {logCounts.error > 0 && (
               <span className="ml-1 px-1.5 py-0.5 text-xs rounded-full bg-red-500/20">
@@ -569,6 +556,11 @@ export function DeploymentStages({
   const [configModalStage, setConfigModalStage] =
     useState<DeploymentJobResponse | null>(null)
 
+  // AI debugging chat (ADR-023), opened from a failed stage into the persistent
+  // app-level dock. The chat is scoped to the whole deployment.
+  const { open: openAiAssistant } = useAiAssistant()
+  const aiChatEnabled = project.ai_debug_chat_enabled === true
+
   // Compute which stages should be expanded based on their status and manual overrides
   const expandedStageIds = useMemo(() => {
     if (!stagesQuery.data) return new Set<number>()
@@ -627,28 +619,6 @@ export function DeploymentStages({
         Error loading deployment stages: {stagesQuery.error.message}
       </div>
     )
-  }
-
-  const expandAll = () => {
-    setManualOverrides(new Map())
-    if (stagesQuery.data) {
-      const allExpanded = new Map<number, boolean>()
-      stagesQuery.data.jobs.forEach((stage) => {
-        allExpanded.set(stage.id, true)
-      })
-      setManualOverrides(allExpanded)
-    }
-  }
-
-  const collapseAll = () => {
-    setManualOverrides(new Map())
-    if (stagesQuery.data) {
-      const allCollapsed = new Map<number, boolean>()
-      stagesQuery.data.jobs.forEach((stage) => {
-        allCollapsed.set(stage.id, false)
-      })
-      setManualOverrides(allCollapsed)
-    }
   }
 
   const getStatusIcon = (status: string) => {
@@ -732,7 +702,35 @@ export function DeploymentStages({
                   {getStatusBadge(stage.status)}
                 </div>
               </div>
-              <div className="flex items-center gap-3">
+              <div className="flex items-center gap-2 sm:gap-3">
+                {aiChatEnabled && stage.status === 'failure' && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-8 gap-1.5 border-primary/30 text-primary hover:bg-primary/10 hover:text-primary"
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      openAiAssistant({
+                        projectId: project.id,
+                        context: {
+                          contextType: 'deployment',
+                          contextId: deployment.id,
+                          title: `Debug deployment #${deployment.id}`,
+                          description:
+                            "AI reads this deployment's failed stages and build logs to explain what went wrong. Ask follow-up questions to dig deeper.",
+                          startPrompt:
+                            'Diagnose this deployment failure and suggest concrete fixes.',
+                          projectSlug: project.slug,
+                          projectName: project.name,
+                        },
+                      })
+                    }}
+                    title="Debug this failure with AI"
+                  >
+                    <Sparkles className="h-4 w-4" />
+                    <span className="hidden sm:inline">Debug with AI</span>
+                  </Button>
+                )}
                 <ElapsedTime
                   startedAt={stage.started_at!}
                   endedAt={stage.finished_at!}

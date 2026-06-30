@@ -288,6 +288,8 @@ pub struct DeployImageJob {
     log_config: Option<ContainerLogConfig>,
     /// Encryption service for decrypting node tokens during remote deployments
     encryption_service: Option<Arc<temps_core::EncryptionService>>,
+    /// Config service — resolves the cluster CA for mTLS to https:// nodes (WS-2.1)
+    config_service: Option<Arc<temps_config::ConfigService>>,
     /// Local image builder — used to `save_image()` before transferring to remote nodes
     image_builder: Option<Arc<dyn temps_deployer::ImageBuilder>>,
 }
@@ -327,6 +329,7 @@ impl DeployImageJob {
             external_image_tag: None,
             log_config: None,
             encryption_service: None,
+            config_service: None,
             image_builder: None,
         }
     }
@@ -378,6 +381,11 @@ impl DeployImageJob {
 
     pub fn with_external_image_tag(mut self, image_tag: String) -> Self {
         self.external_image_tag = Some(image_tag);
+        self
+    }
+
+    pub fn with_config_service(mut self, service: Arc<temps_config::ConfigService>) -> Self {
+        self.config_service = Some(service);
         self
     }
 
@@ -821,11 +829,30 @@ impl DeployImageJob {
                 } => {
                     // Look up the node's token from the node service
                     let token = self.get_node_token(assignment).await?;
-                    let remote = match temps_deployer::remote::RemoteNodeDeployer::new(
-                        address.clone(),
-                        token,
-                        node_name.clone(),
+                    // Build the deployer via the shared factory so https:// nodes
+                    // get mutual TLS (ADR-020 WS-2.1); falls back to plain HTTP
+                    // when the cluster CA deps aren't wired in.
+                    let build_result = match (
+                        self.config_service.as_ref(),
+                        self.encryption_service.as_ref(),
                     ) {
+                        (Some(cs), Some(es)) => {
+                            crate::cluster_ca::build_node_deployer(
+                                address,
+                                token,
+                                node_name.clone(),
+                                cs.as_ref(),
+                                es.as_ref(),
+                            )
+                            .await
+                        }
+                        _ => temps_deployer::remote::RemoteNodeDeployer::new(
+                            address.clone(),
+                            token,
+                            node_name.clone(),
+                        ),
+                    };
+                    let remote = match build_result {
                         Ok(remote) => Arc::new(remote),
                         Err(e) => {
                             self.log(
@@ -1073,7 +1100,7 @@ impl DeployImageJob {
 
         // Use remote environment variables for remote deployments (connection strings
         // rewritten with control plane's private address), fall back to local env vars.
-        let environment_vars = if !assignment.is_local() {
+        let mut environment_vars = if !assignment.is_local() {
             if let Some(ref remote_vars) = self.config.remote_environment_variables {
                 tracing::info!(
                     "Using REMOTE environment variables for non-local assignment (has {} remote vars)",
@@ -1090,6 +1117,22 @@ impl DeployImageJob {
             tracing::info!("Using LOCAL environment variables for local assignment");
             self.config.environment_variables.clone()
         };
+
+        // Inject this replica's node identity so the workload can report which
+        // node (and replica) is serving a given request — useful for debugging
+        // multi-node scheduling and load distribution. Set on every node, local
+        // or remote.
+        let (assigned_node_name, assigned_node_id) = match assignment {
+            crate::services::NodeAssignment::Remote {
+                node_name, node_id, ..
+            } => (node_name.clone(), node_id.to_string()),
+            crate::services::NodeAssignment::Local => {
+                ("control-plane".to_string(), "0".to_string())
+            }
+        };
+        environment_vars.insert("TEMPS_NODE_NAME".to_string(), assigned_node_name);
+        environment_vars.insert("TEMPS_NODE_ID".to_string(), assigned_node_id);
+        environment_vars.insert("TEMPS_REPLICA".to_string(), (replica_index + 1).to_string());
 
         tracing::info!(
             "Deploying container with {} env vars, POSTGRES_HOST={:?}, POSTGRES_URL={:?}",
@@ -1831,6 +1874,7 @@ pub struct DeployImageJobBuilder {
     external_image_tag: Option<String>,
     log_config: Option<ContainerLogConfig>,
     encryption_service: Option<Arc<temps_core::EncryptionService>>,
+    config_service: Option<Arc<temps_config::ConfigService>>,
     image_builder: Option<Arc<dyn temps_deployer::ImageBuilder>>,
 }
 
@@ -1847,6 +1891,7 @@ impl DeployImageJobBuilder {
             external_image_tag: None,
             log_config: None,
             encryption_service: None,
+            config_service: None,
             image_builder: None,
         }
     }
@@ -2002,6 +2047,12 @@ impl DeployImageJobBuilder {
         self
     }
 
+    /// Set the config service (resolves the cluster CA for mTLS to https:// nodes)
+    pub fn config_service(mut self, service: Arc<temps_config::ConfigService>) -> Self {
+        self.config_service = Some(service);
+        self
+    }
+
     /// Set the local image builder for transferring images to remote nodes
     pub fn image_builder(mut self, builder: Arc<dyn temps_deployer::ImageBuilder>) -> Self {
         self.image_builder = Some(builder);
@@ -2040,6 +2091,9 @@ impl DeployImageJobBuilder {
         }
         if let Some(encryption_service) = self.encryption_service {
             job = job.with_encryption_service(encryption_service);
+        }
+        if let Some(config_service) = self.config_service {
+            job = job.with_config_service(config_service);
         }
         if let Some(image_builder) = self.image_builder {
             job = job.with_image_builder(image_builder);

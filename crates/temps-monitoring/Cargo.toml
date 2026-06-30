@@ -8,6 +8,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+temps-auth = { path = "../temps-auth" }
 temps-core = { path = "../temps-core" }
 temps-config = { path = "../temps-config" }
 temps-database = { path = "../temps-database" }
@@ -16,6 +17,7 @@ temps-entities = { path = "../temps-entities" }
 temps-metrics = { path = "../temps-metrics" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+axum = { workspace = true }
 chrono = { workspace = true }
 sea-orm = { workspace = true }
 serde = { workspace = true }
@@ -23,6 +25,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+utoipa = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]

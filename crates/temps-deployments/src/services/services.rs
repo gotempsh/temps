@@ -338,11 +338,14 @@ impl DeploymentService {
             ))
         })?;
 
-        temps_deployer::remote::RemoteNodeDeployer::new(
-            node.address.clone(),
+        crate::cluster_ca::build_node_deployer(
+            &node.address,
             token,
             node.name.clone(),
+            self.config_service.as_ref(),
+            self.encryption_service.as_ref(),
         )
+        .await
         .map_err(|e| {
             DeploymentError::Other(format!(
                 "Failed to build remote deployer for node {}: {}",
@@ -505,19 +508,23 @@ impl DeploymentService {
             url.push_str(&qs);
         }
 
-        // Strict TLS by default; opt-in via the same `insecure_tls` toggle
-        // that the rest of the CP→agent traffic uses, so dev clusters with
-        // self-signed agent certs work without a global escape hatch.
-        let client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(temps_core::tls::insecure_tls_enabled())
-            // No top-level timeout — log streams are long-lived by design.
-            .build()
-            .map_err(|e| {
-                DeploymentError::Other(format!(
-                    "Failed to build HTTP client for node {}: {}",
-                    node_id, e
-                ))
-            })?;
+        // Mutual TLS for https:// nodes (ADR-020 WS-2.1), plain HTTP otherwise
+        // — the shared factory presents the CP's cluster-CA-signed identity so
+        // the stream isn't rejected once `require_mtls` is on. No top-level
+        // timeout: log streams are long-lived by design.
+        let client = crate::cluster_ca::build_node_http_client(
+            &node.address,
+            self.config_service.as_ref(),
+            self.encryption_service.as_ref(),
+            None,
+        )
+        .await
+        .map_err(|e| {
+            DeploymentError::Other(format!(
+                "Failed to build HTTP client for node {}: {}",
+                node_id, e
+            ))
+        })?;
 
         let resp = client
             .get(&url)

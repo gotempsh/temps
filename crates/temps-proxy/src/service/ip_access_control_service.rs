@@ -1,9 +1,20 @@
+use arc_swap::ArcSwap;
+use ipnetwork::IpNetwork;
 use sea_orm::*;
 use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use temps_entities::ip_access_control;
 use thiserror::Error;
+use tracing::{debug, warn};
 use utoipa::ToSchema;
+
+/// How often the in-memory block-rule snapshot is reloaded from the database.
+/// `is_blocked` is on the synchronous proxy hot path, so it must never issue a
+/// query; instead it matches against this snapshot, which a background task keeps
+/// fresh. An admin block list changing within this window is acceptable.
+const BLOCKLIST_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Error, Debug)]
 pub enum IpAccessControlError {
@@ -78,11 +89,50 @@ pub struct UpdateIpAccessControlRequest {
 
 pub struct IpAccessControlService {
     db: Arc<DatabaseConnection>,
+    /// Snapshot of all `action = 'block'` rules, parsed into CIDR networks.
+    /// Read lock-free on every request via `is_blocked`; replaced wholesale by
+    /// `refresh_blocklist`. Starts empty (fail-open) until the first refresh.
+    blocklist: Arc<ArcSwap<Vec<IpNetwork>>>,
 }
 
 impl IpAccessControlService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
-        Self { db }
+        Self {
+            db,
+            blocklist: Arc::new(ArcSwap::from_pointee(Vec::new())),
+        }
+    }
+
+    /// Reload the in-memory block-rule snapshot from the database. Cheap: one
+    /// query over a small admin-curated table, run off the hot path.
+    pub async fn refresh_blocklist(&self) -> Result<(), IpAccessControlError> {
+        let rules = self.list(Some("block".to_string())).await?;
+        let mut networks = Vec::with_capacity(rules.len());
+        for rule in rules {
+            match rule.ip_address.parse::<IpNetwork>() {
+                Ok(network) => networks.push(network),
+                Err(e) => warn!(
+                    "Skipping unparsable IP block rule {} ('{}'): {}",
+                    rule.id, rule.ip_address, e
+                ),
+            }
+        }
+        let count = networks.len();
+        self.blocklist.store(Arc::new(networks));
+        debug!("Refreshed IP block-list snapshot: {} rule(s)", count);
+        Ok(())
+    }
+
+    /// Run the periodic block-list refresh forever. Loads immediately, then every
+    /// `BLOCKLIST_REFRESH_INTERVAL`. Spawned once at startup; this is the only
+    /// mechanism that propagates block-list changes made by other processes/nodes.
+    pub async fn run_refresh_loop(self: Arc<Self>) {
+        loop {
+            if let Err(e) = self.refresh_blocklist().await {
+                warn!("Failed to refresh IP block-list snapshot: {}", e);
+            }
+            tokio::time::sleep(BLOCKLIST_REFRESH_INTERVAL).await;
+        }
     }
 
     /// Create a new IP access control rule
@@ -162,11 +212,20 @@ impl IpAccessControlService {
                 created_at: row.try_get("", "created_at")?,
                 updated_at: row.try_get("", "updated_at")?,
             };
+            self.refresh_blocklist_after_write().await;
             Ok(rule)
         } else {
             Err(IpAccessControlError::Internal(
                 "Failed to insert rule".to_string(),
             ))
+        }
+    }
+
+    /// Best-effort snapshot refresh after a mutation. Failures are logged but never
+    /// fail the write — the periodic refresh loop will reconcile within one interval.
+    async fn refresh_blocklist_after_write(&self) {
+        if let Err(e) = self.refresh_blocklist().await {
+            warn!("Failed to refresh IP block-list after write: {}", e);
         }
     }
 
@@ -247,35 +306,22 @@ impl IpAccessControlService {
         }
     }
 
-    /// Check if an IP address is blocked
+    /// Check if an IP address is blocked.
+    ///
+    /// Runs entirely against the in-memory block-list snapshot — no database query
+    /// — because this is called on the synchronous proxy hot path for every request.
+    /// The `IpNetwork::contains` check mirrors PostgreSQL's `$ip <<= ip_address`
+    /// (the IP is contained within or equal to the stored CIDR/host). Unparsable
+    /// client IPs fail open (not blocked), matching the previous best-effort
+    /// behaviour. The snapshot is kept fresh by `run_refresh_loop`.
     pub async fn is_blocked(&self, ip: &str) -> Result<bool, IpAccessControlError> {
-        // Check if IP is blocked using PostgreSQL inet operators
-        // This supports both exact matches and CIDR ranges
-        // The <<= operator checks if the IP is contained within or equal to the stored CIDR/IP
-        use sea_orm::{ConnectionTrait, Statement};
+        let addr = match ip.parse::<IpAddr>() {
+            Ok(addr) => addr,
+            Err(_) => return Ok(false),
+        };
 
-        let sql = r#"
-            SELECT COUNT(*) as count
-            FROM ip_access_control
-            WHERE action = 'block'
-            AND $1::inet <<= ip_address
-        "#;
-
-        let result = self
-            .db
-            .query_one(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                sql,
-                vec![ip.to_string().into()],
-            ))
-            .await?;
-
-        if let Some(row) = result {
-            let count: i64 = row.try_get("", "count")?;
-            Ok(count > 0)
-        } else {
-            Ok(false)
-        }
+        let blocklist = self.blocklist.load();
+        Ok(blocklist.iter().any(|network| network.contains(addr)))
     }
 
     /// Update an IP access control rule
@@ -362,6 +408,7 @@ impl IpAccessControlService {
                 created_at: row.try_get("", "created_at")?,
                 updated_at: row.try_get("", "updated_at")?,
             };
+            self.refresh_blocklist_after_write().await;
             Ok(rule)
         } else {
             Err(IpAccessControlError::NotFound(id.to_string()))
@@ -372,6 +419,7 @@ impl IpAccessControlService {
     pub async fn delete(&self, id: i32) -> Result<(), IpAccessControlError> {
         let rule = self.get_by_id(id).await?;
         rule.delete(self.db.as_ref()).await?;
+        self.refresh_blocklist_after_write().await;
         Ok(())
     }
 
@@ -433,6 +481,35 @@ mod tests {
         assert!(!IpAccessControlService::is_valid_ipv4("256.1.1.1"));
         assert!(!IpAccessControlService::is_valid_ipv4("192.168.1"));
         assert!(!IpAccessControlService::is_valid_ipv4("invalid"));
+    }
+
+    #[tokio::test]
+    async fn test_is_blocked_matches_in_memory_snapshot() {
+        // No DB query is issued by is_blocked; populate the snapshot directly.
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let service = IpAccessControlService::new(Arc::new(db));
+        service.blocklist.store(Arc::new(vec![
+            "192.168.1.100".parse().unwrap(), // single host -> /32
+            "10.0.0.0/24".parse().unwrap(),   // CIDR range
+        ]));
+
+        // Exact host match
+        assert!(service.is_blocked("192.168.1.100").await.unwrap());
+        // Inside the CIDR range
+        assert!(service.is_blocked("10.0.0.55").await.unwrap());
+        // Outside the CIDR range
+        assert!(!service.is_blocked("10.0.1.1").await.unwrap());
+        // Not listed at all
+        assert!(!service.is_blocked("8.8.8.8").await.unwrap());
+        // Unparsable IP fails open (not blocked)
+        assert!(!service.is_blocked("not-an-ip").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_is_blocked_empty_snapshot_blocks_nothing() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let service = IpAccessControlService::new(Arc::new(db));
+        assert!(!service.is_blocked("192.168.1.100").await.unwrap());
     }
 
     #[test]

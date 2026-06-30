@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
@@ -37,6 +37,83 @@ pub struct NodeAppState {
     pub encryption_service: Arc<temps_core::EncryptionService>,
     /// Anonymous product telemetry reporter (worker_node_joined event).
     pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
+    /// Per-IP + global rate limiter for the registration endpoint
+    /// (ADR-020 WS-1.3 / enroll-3).
+    pub rate_limiter: Arc<RegistrationRateLimiter>,
+    /// Short-lived, single-use node enrollment tokens (ADR-020 WS-1.1).
+    pub enrollment_token_service: Arc<temps_config::EnrollmentTokenService>,
+    /// Notification pipeline — used to alert operators when a node recovers
+    /// (offline->active on heartbeat). Optional: absent if no provider is wired.
+    pub notification_service: Option<Arc<dyn temps_core::notifications::NotificationService>>,
+}
+
+/// Fixed-window rate limiter for the public node-registration endpoint
+/// (ADR-020 WS-1.3 / enroll-3). `/internal/nodes/register` is reachable by
+/// anyone who can route to the control plane, so we cap attempts per source IP
+/// and globally to blunt enrollment DoS and slow brute-force against the join
+/// token. In-memory and best-effort — a restart resets the windows.
+#[derive(Default)]
+pub struct RegistrationRateLimiter {
+    inner: std::sync::Mutex<RateLimitState>,
+}
+
+#[derive(Default)]
+struct RateLimitState {
+    per_ip: std::collections::HashMap<std::net::IpAddr, (std::time::Instant, u32)>,
+    global: Option<(std::time::Instant, u32)>,
+}
+
+impl RegistrationRateLimiter {
+    const WINDOW_SECS: u64 = 60;
+    const PER_IP_MAX: u32 = 10;
+    const GLOBAL_MAX: u32 = 100;
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns `Ok(())` if the attempt is allowed (and records it), or
+    /// `Err(retry_after_secs)` if the per-IP or global window is exhausted.
+    pub fn check(&self, ip: std::net::IpAddr) -> Result<(), u64> {
+        let now = std::time::Instant::now();
+        let window = std::time::Duration::from_secs(Self::WINDOW_SECS);
+        let mut st = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+
+        // Global window — copy values out so we don't hold overlapping borrows.
+        let (mut g_start, mut g_count) = st.global.unwrap_or((now, 0));
+        if now.duration_since(g_start) >= window {
+            g_start = now;
+            g_count = 0;
+        }
+        if g_count >= Self::GLOBAL_MAX {
+            return Err(
+                Self::WINDOW_SECS.saturating_sub(now.duration_since(g_start).as_secs()) + 1,
+            );
+        }
+
+        // Per-IP window.
+        let (mut i_start, mut i_count) = st.per_ip.get(&ip).copied().unwrap_or((now, 0));
+        if now.duration_since(i_start) >= window {
+            i_start = now;
+            i_count = 0;
+        }
+        if i_count >= Self::PER_IP_MAX {
+            return Err(
+                Self::WINDOW_SECS.saturating_sub(now.duration_since(i_start).as_secs()) + 1,
+            );
+        }
+
+        // Both windows have headroom — record the attempt.
+        st.global = Some((g_start, g_count + 1));
+        st.per_ip.insert(ip, (i_start, i_count + 1));
+
+        // Opportunistic prune so the map can't grow unbounded.
+        if st.per_ip.len() > 4096 {
+            st.per_ip
+                .retain(|_, (t, _)| now.duration_since(*t) < window);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -61,6 +138,15 @@ pub struct RegisterNodeApiRequest {
     pub labels: Option<serde_json::Value>,
     /// X25519 public key for ECIES certificate encryption (base64-encoded, edge nodes only)
     pub edge_public_key: Option<String>,
+    /// The node's *current* token, supplied to prove possession when
+    /// re-registering (changing the identity of) a node that already exists.
+    /// Optional; only needed to rebind a still-live node. (ADR-020 WS-1.2.)
+    pub prior_token: Option<String>,
+    /// Node-generated certificate signing request (PEM) for multi-node mTLS
+    /// (ADR-020 WS-2.1). When present, the control plane signs it with the
+    /// cluster CA and returns the leaf + CA cert. Optional — token-only nodes
+    /// (legacy / edge) still register without one.
+    pub csr_pem: Option<String>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -69,6 +155,14 @@ pub struct RegisterNodeResponse {
     pub name: String,
     pub status: String,
     pub message: String,
+    /// The signed per-node leaf certificate (PEM) the agent serves as its TLS
+    /// server cert. Present only when a `csr_pem` was supplied. (ADR-020 WS-2.1.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cert_pem: Option<String>,
+    /// The cluster CA certificate (PEM) the node pins as its trust root.
+    /// Present only when a `csr_pem` was supplied. (ADR-020 WS-2.1.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ca_cert_pem: Option<String>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -572,8 +666,30 @@ fn extract_bearer_token(headers: &HeaderMap) -> Result<String, Problem> {
 )]
 async fn register_node(
     State(app_state): State<Arc<NodeAppState>>,
+    // The router is served with `into_make_service_with_connect_info`, so the
+    // peer address is always present in production; unit tests inject it via a
+    // `MockConnectInfo` layer.
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Json(request): Json<RegisterNodeApiRequest>,
 ) -> Result<impl IntoResponse, Problem> {
+    // Rate-limit enrollment (ADR-020 WS-1.3 / enroll-3) before doing any work:
+    // cap attempts per source IP and globally to blunt registration DoS and
+    // brute-force against the join token.
+    if let Err(retry_after) = app_state.rate_limiter.check(addr.ip()) {
+        warn!(
+            ip = %addr.ip(),
+            retry_after,
+            node = %request.name,
+            "Node registration rate-limited"
+        );
+        return Err(problemdetails::new(StatusCode::TOO_MANY_REQUESTS)
+            .with_title("Too Many Requests")
+            .with_detail(format!(
+                "Node registration rate limit exceeded; retry in {}s",
+                retry_after
+            )));
+    }
+
     // Validate join token against the stored hash in settings
     let settings = app_state.config_service.get_settings().await.map_err(|e| {
         error!("Failed to read settings for join token validation: {}", e);
@@ -582,39 +698,107 @@ async fn register_node(
             .with_detail("Failed to validate join token")
     })?;
 
-    match settings.multi_node.join_token_hash {
-        Some(ref stored_hash) => {
-            // Join token is configured — require it
-            match &request.join_token {
-                Some(provided_token) => {
-                    let provided_hash = sha256_hash(provided_token);
-                    if !constant_time_eq(provided_hash.as_bytes(), stored_hash.as_bytes()) {
-                        warn!(
-                            "Node registration rejected: invalid join token for node '{}'",
-                            request.name
-                        );
-                        return Err(problemdetails::new(StatusCode::FORBIDDEN)
-                            .with_title("Invalid Join Token")
-                            .with_detail("The provided join token is invalid"));
-                    }
-                }
-                None => {
+    // ── Enrollment authorization (ADR-020 WS-1.1) ────────────────────────────
+    // Prefer a short-lived, single-use enrollment token; fall back to the legacy
+    // single shared join token only while it is still enabled.
+    let provided_token = request.join_token.as_deref().ok_or_else(|| {
+        warn!(
+            "Node registration rejected: missing token for node '{}'",
+            request.name
+        );
+        problemdetails::new(StatusCode::FORBIDDEN)
+            .with_title("Join Token Required")
+            .with_detail("A token is required to register a node. Generate an enrollment token in Settings > Worker Nodes.")
+    })?;
+
+    match app_state
+        .enrollment_token_service
+        .validate_and_consume(provided_token)
+        .await
+    {
+        Ok(token_row) => {
+            // Enforce a node-name pin if the token was scoped to one node.
+            if let Some(ref bound) = token_row.bound_node_name {
+                if bound != request.name.trim() {
                     warn!(
-                        "Node registration rejected: missing join token for node '{}'",
-                        request.name
+                        node = %request.name,
+                        bound = %bound,
+                        "Node registration rejected: enrollment token bound to a different node name"
                     );
                     return Err(problemdetails::new(StatusCode::FORBIDDEN)
-                        .with_title("Join Token Required")
-                        .with_detail("A join token is required to register a node. Generate one in Settings > Worker Nodes."));
+                        .with_title("Enrollment Token Mismatch")
+                        .with_detail(format!(
+                            "This enrollment token is bound to node '{}'",
+                            bound
+                        )));
                 }
             }
+            // Enforce a label pin if the token requires specific scheduling
+            // labels — every required key/value must be present on the node.
+            if let Some(serde_json::Value::Object(required)) = token_row.bound_labels.as_ref() {
+                let provided = request
+                    .labels
+                    .clone()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let provided_obj = provided.as_object();
+                let satisfied = required
+                    .iter()
+                    .all(|(k, v)| provided_obj.and_then(|o| o.get(k)) == Some(v));
+                if !satisfied {
+                    warn!(
+                        node = %request.name,
+                        "Node registration rejected: enrollment token requires labels the node did not present"
+                    );
+                    return Err(problemdetails::new(StatusCode::FORBIDDEN)
+                        .with_title("Enrollment Token Label Mismatch")
+                        .with_detail(
+                            "This enrollment token requires specific node labels that were not provided.",
+                        ));
+                }
+            }
+            info!(node = %request.name, "Node authorized via enrollment token");
         }
-        None => {
-            // No join token configured — block all registrations
-            warn!("Node registration rejected: multi-node not enabled (no join token configured) for node '{}'", request.name);
+        Err(temps_config::EnrollmentError::InvalidToken) => {
+            // Not a known enrollment token — try the legacy shared join token.
+            let legacy_ok = settings.multi_node.legacy_shared_token_enabled
+                && match settings.multi_node.join_token_hash {
+                    Some(ref stored_hash) => {
+                        let provided_hash = sha256_hash(provided_token);
+                        constant_time_eq(provided_hash.as_bytes(), stored_hash.as_bytes())
+                    }
+                    None => false,
+                };
+            if !legacy_ok {
+                warn!(
+                    "Node registration rejected: invalid or expired token for node '{}'",
+                    request.name
+                );
+                return Err(problemdetails::new(StatusCode::FORBIDDEN)
+                    .with_title("Invalid Enrollment Token")
+                    .with_detail("The provided token is invalid or expired. Generate a new enrollment token in Settings > Worker Nodes."));
+            }
+            warn!(
+                node = %request.name,
+                "Node authorized via DEPRECATED legacy shared join token — mint per-node enrollment tokens instead"
+            );
+        }
+        Err(
+            e @ (temps_config::EnrollmentError::Expired
+            | temps_config::EnrollmentError::Revoked
+            | temps_config::EnrollmentError::Exhausted),
+        ) => {
+            // It matched a real enrollment token that is no longer usable — do
+            // NOT silently fall through to the legacy shared token.
+            warn!(node = %request.name, "Node registration rejected: {}", e);
             return Err(problemdetails::new(StatusCode::FORBIDDEN)
-                .with_title("Registration Disabled")
-                .with_detail("Node registration is not enabled. Generate a join token in Settings > Worker Nodes to enable multi-node."));
+                .with_title("Enrollment Token Not Usable")
+                .with_detail(e.to_string()));
+        }
+        Err(e) => {
+            error!("Enrollment token validation error: {}", e);
+            return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Internal Server Error")
+                .with_detail("Failed to validate enrollment token"));
         }
     }
 
@@ -678,6 +862,9 @@ async fn register_node(
         role: request.role.unwrap_or_else(|| "worker".to_string()),
         labels: request.labels.unwrap_or(serde_json::json!({})),
         edge_public_key: request.edge_public_key,
+        // Hash the proof-of-possession token (if any) so the service can
+        // constant-time compare it against the stored hash. (ADR-020 WS-1.2.)
+        prior_token_hash: request.prior_token.as_deref().map(sha256_hash),
     };
 
     let node = app_state
@@ -713,6 +900,103 @@ async fn register_node(
     .await;
     allocate_overlay_cidr(app_state.db.clone(), node.id).await;
 
+    // ── mTLS: sign the node's CSR with the cluster CA (ADR-020 WS-2.1) ──
+    // Only when mTLS is enforced AND the worker supplied a CSR: mint/load the
+    // per-cluster CA and return a signed per-node leaf plus the CA cert. With
+    // require_mtls off (default) we ignore the CSR and the node keeps using
+    // plaintext HTTP behind the bearer token — zero behavior change.
+    let (cert_pem, ca_cert_pem) = if let (true, Some(csr_pem)) =
+        (settings.multi_node.require_mtls, request.csr_pem.as_ref())
+    {
+        match crate::cluster_ca::ensure_cluster_ca(
+            app_state.config_service.as_ref(),
+            app_state.encryption_service.as_ref(),
+        )
+        .await
+        {
+            Ok(ca) => {
+                // Server-authoritative SANs: the node's reachable host (the IP
+                // the control plane connects to) + its registered name. The
+                // worker's own CSR SANs are discarded by sign_node_csr — a
+                // compromised worker must not be able to mint a leaf valid for
+                // the CP's or another node's identity (cluster-wide CA trust).
+                let host_only = |addr: &str| -> String {
+                    let a = addr.trim();
+                    let a = a
+                        .strip_prefix("https://")
+                        .or_else(|| a.strip_prefix("http://"))
+                        .unwrap_or(a);
+                    let a = a.split('/').next().unwrap_or(a);
+                    if let Some(rest) = a.strip_prefix('[') {
+                        if let Some(end) = rest.find(']') {
+                            return rest[..end].to_string();
+                        }
+                    }
+                    match a.rsplit_once(':') {
+                        Some((host, port))
+                            if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) =>
+                        {
+                            host.to_string()
+                        }
+                        _ => a.to_string(),
+                    }
+                };
+                let mut allowed_sans = vec![node.name.clone()];
+                let addr_host = host_only(&node.address);
+                if !addr_host.is_empty() && !allowed_sans.contains(&addr_host) {
+                    allowed_sans.push(addr_host);
+                }
+                let priv_host = host_only(&node.private_address);
+                if !priv_host.is_empty() && !allowed_sans.contains(&priv_host) {
+                    allowed_sans.push(priv_host);
+                }
+                match temps_core::node_pki::sign_node_csr(
+                    &ca.cert_pem,
+                    &ca.key_pem,
+                    csr_pem,
+                    &allowed_sans,
+                ) {
+                    Ok(signed) => {
+                        info!(node_id = node.id, "Signed node CSR for mTLS");
+                        // Switch the node's stored address to https:// so the
+                        // control plane uses its mTLS client for every CP->agent
+                        // call to this now-TLS-serving node.
+                        let https_address = node.address.replacen("http://", "https://", 1);
+                        if https_address != node.address {
+                            use sea_orm::{ActiveModelTrait, Set};
+                            let mut active: temps_entities::nodes::ActiveModel =
+                                node.clone().into();
+                            active.address = Set(https_address);
+                            if let Err(e) = active.update(app_state.db.as_ref()).await {
+                                warn!(
+                                    node_id = node.id,
+                                    "Failed to switch node address to https for mTLS: {}", e
+                                );
+                            }
+                        }
+                        (Some(signed.cert_pem), Some(ca.cert_pem))
+                    }
+                    Err(e) => {
+                        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+                            .with_title("Invalid CSR")
+                            .with_detail(format!(
+                                "Failed to sign certificate signing request: {}",
+                                e
+                            )));
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to provision cluster CA: {}", e);
+                return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Internal Server Error")
+                    .with_detail("Failed to provision the cluster certificate authority"));
+            }
+        }
+    } else {
+        (None, None)
+    };
+
     Ok((
         StatusCode::CREATED,
         Json(RegisterNodeResponse {
@@ -720,6 +1004,8 @@ async fn register_node(
             name: node.name,
             status: node.status,
             message: "Node registered successfully. Send heartbeats to stay active.".to_string(),
+            cert_pem,
+            ca_cert_pem,
         }),
     ))
 }
@@ -834,6 +1120,20 @@ async fn node_heartbeat(
         .await
         .map_err(Problem::from)?;
 
+    // The node just came back: it was offline and this heartbeat flipped it to
+    // active. Alert operators (recovery counterpart to the node-offline alert).
+    if was_offline {
+        info!(node_id, node_name = %node.name, "Node recovered (offline -> active)");
+        if let Some(ref notification_service) = app_state.notification_service {
+            crate::jobs::node_health_check::notify_node_recovered(
+                node_id,
+                &node.name,
+                notification_service,
+            )
+            .await;
+        }
+    }
+
     // Reconcile container state when the agent sends its inventory.
     // This happens on the first heartbeat after agent startup/reconnect.
     if let Some(containers) = request.containers {
@@ -913,6 +1213,30 @@ async fn get_s3_credentials(
         return Err(problemdetails::new(StatusCode::UNAUTHORIZED)
             .with_title("Invalid Token")
             .with_detail(format!("Invalid authentication token for node {}", node_id)));
+    }
+
+    // Authorization (ADR-020 WS-4.1 / analyst-1): a valid node token only proves
+    // *which* node is calling — it does NOT entitle that node to every tenant's
+    // S3 credentials. Only hand back a source the node legitimately needs: one
+    // used by a backup of a service hosted on this node. Otherwise a single
+    // compromised worker could enumerate s3_source_id and exfiltrate all keys.
+    if !app_state
+        .node_service
+        .is_authorized_for_s3_source(node_id, s3_source_id)
+        .await
+        .map_err(Problem::from)?
+    {
+        warn!(
+            node_id,
+            s3_source_id,
+            "Node not authorized for S3 source (no backup of a service hosted on this node uses it)"
+        );
+        return Err(problemdetails::new(StatusCode::FORBIDDEN)
+            .with_title("Forbidden")
+            .with_detail(format!(
+                "Node {} is not authorized for S3 source {}",
+                node_id, s3_source_id
+            )));
     }
 
     // Look up the S3 source
@@ -1014,6 +1338,33 @@ async fn edge_routes(
                 .with_title("Invalid Token")
                 .with_detail("No node found with this token")
         })?;
+
+    // Final auth decision via constant-time compare, consistent with the other
+    // node-token handlers (the DB lookup above already matched, but keep the
+    // comparison explicit and timing-safe).
+    if !constant_time_eq(node.token_hash.as_bytes(), token_hash.as_bytes()) {
+        return Err(problemdetails::new(StatusCode::UNAUTHORIZED)
+            .with_title("Invalid Token")
+            .with_detail("No node found with this token"));
+    }
+
+    // WS-3.4 (netiso-6): only an ACTIVE node may pull the route table. A
+    // draining/drained/offline node is being retired and must stop receiving
+    // fresh routes; a deleted node's row is already gone (so the token won't
+    // match at all). Without this gate, a decommissioned node's still-valid
+    // token keeps pulling the full edge route table indefinitely. Log the real
+    // reason, return an opaque 401.
+    if node.status != "active" {
+        warn!(
+            node_id = node.id,
+            node_name = %node.name,
+            status = %node.status,
+            "Edge routes: rejecting token for non-active node"
+        );
+        return Err(problemdetails::new(StatusCode::UNAUTHORIZED)
+            .with_title("Invalid Token")
+            .with_detail("Node is not active"));
+    }
 
     info!(
         "Edge node {} ({}) requested route table",
@@ -1280,6 +1631,38 @@ async fn edge_routes(
     }))
 }
 
+/// Reserved node id for the control plane itself. Real nodes are serial and
+/// start at 1, so `0` is a safe sentinel.
+const CONTROL_PLANE_NODE_ID: i32 = 0;
+
+/// Synthetic node entry for the control plane itself. The CP is always a
+/// scheduling target (`NodeAssignment::Local`), but it is not a row in the
+/// `nodes` table; containers placed there are stored with `node_id = NULL`.
+/// Surfacing it as node `0` makes those containers visible in the node list /
+/// per-node views instead of silently invisible (ADR-020 observability).
+fn control_plane_node_response() -> NodeInfoResponse {
+    // The CP self-samples its own host metrics in the 60s health loop (it isn't
+    // a worker agent, so it has no heartbeat). Surface them like any node;
+    // empty until the first sample lands.
+    let (capacity, last_heartbeat) =
+        match crate::jobs::node_health_check::latest_control_plane_metrics() {
+            Some((cap, sampled_at)) => (cap, Some(sampled_at.to_rfc3339())),
+            None => (serde_json::json!({}), None),
+        };
+    NodeInfoResponse {
+        id: CONTROL_PLANE_NODE_ID,
+        name: "control-plane".to_string(),
+        address: "local".to_string(),
+        private_address: "127.0.0.1".to_string(),
+        role: "control-plane".to_string(),
+        status: "active".to_string(),
+        labels: serde_json::json!({}),
+        capacity,
+        last_heartbeat,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    }
+}
+
 /// List all registered nodes (admin — session auth via RequireAuth)
 #[utoipa::path(
     tag = "Nodes",
@@ -1303,8 +1686,7 @@ async fn admin_list_nodes(
         .await
         .map_err(Problem::from)?;
 
-    let total = nodes.len();
-    let node_responses: Vec<NodeInfoResponse> = nodes
+    let mut node_responses: Vec<NodeInfoResponse> = nodes
         .into_iter()
         .map(|n| NodeInfoResponse {
             id: n.id,
@@ -1320,6 +1702,11 @@ async fn admin_list_nodes(
         })
         .collect();
 
+    // Always surface the control plane itself as a node so containers it runs
+    // (the `Local` scheduling slot, stored with node_id = NULL) are visible.
+    node_responses.insert(0, control_plane_node_response());
+
+    let total = node_responses.len();
     Ok(Json(NodeListResponse {
         nodes: node_responses,
         total,
@@ -1348,6 +1735,9 @@ async fn admin_get_node(
     Path(node_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsRead);
+    if node_id == CONTROL_PLANE_NODE_ID {
+        return Ok(Json(control_plane_node_response()));
+    }
     let node = app_state
         .node_service
         .get_by_id(node_id)
@@ -1392,19 +1782,29 @@ async fn admin_list_node_containers(
     permission_guard!(auth, SettingsRead);
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
-    // Verify the node exists
-    let _node = app_state
-        .node_service
-        .get_by_id(node_id)
-        .await
-        .map_err(Problem::from)?;
+    // Verify the node exists (the synthetic control-plane node, id 0, has no row).
+    if node_id != CONTROL_PLANE_NODE_ID {
+        let _node = app_state
+            .node_service
+            .get_by_id(node_id)
+            .await
+            .map_err(Problem::from)?;
+    }
+
+    // Containers for this node. The control plane's own containers (the `Local`
+    // scheduling slot) are stored with node_id = NULL.
+    let node_filter = if node_id == CONTROL_PLANE_NODE_ID {
+        temps_entities::deployment_containers::Column::NodeId.is_null()
+    } else {
+        temps_entities::deployment_containers::Column::NodeId.eq(node_id)
+    };
 
     // Query containers for this node, joining with deployments, projects, and environments
     let rows: Vec<(
         temps_entities::deployment_containers::Model,
         Option<temps_entities::deployments::Model>,
     )> = temps_entities::deployment_containers::Entity::find()
-        .filter(temps_entities::deployment_containers::Column::NodeId.eq(node_id))
+        .filter(node_filter)
         .filter(temps_entities::deployment_containers::Column::DeletedAt.is_null())
         .find_also_related(temps_entities::deployments::Entity)
         .all(app_state.db.as_ref())
@@ -1477,19 +1877,26 @@ async fn admin_list_node_containers(
 }
 
 /// Create a `RemoteNodeDeployer` for stopping containers on a worker node.
-/// Returns `None` if the node has no encrypted token or decryption fails (best-effort).
-fn create_remote_deployer(
+/// Routes through the shared `cluster_ca::build_node_deployer` factory so an
+/// `https://` node gets mutual TLS (ADR-020 WS-2.1) rather than a plain-HTTP
+/// client the agent would reject under `require_mtls`. Returns `None` if the
+/// node has no encrypted token or decryption/build fails (best-effort).
+async fn create_remote_deployer(
     node: &temps_entities::nodes::Model,
+    config_service: &ConfigService,
     encryption_service: &temps_core::EncryptionService,
 ) -> Option<Arc<dyn ContainerDeployer>> {
     let encrypted_token = node.token_encrypted.as_ref()?;
     let decrypted_bytes = encryption_service.decrypt(encrypted_token).ok()?;
     let token = String::from_utf8(decrypted_bytes).ok()?;
-    let deployer = temps_deployer::remote::RemoteNodeDeployer::new(
-        node.address.clone(),
+    let deployer = crate::cluster_ca::build_node_deployer(
+        &node.address,
         token,
         node.name.clone(),
+        config_service,
+        encryption_service,
     )
+    .await
     .ok()?;
     Some(Arc::new(deployer))
 }
@@ -1583,8 +1990,12 @@ async fn admin_drain_node(
                 .await
                 .unwrap_or_default();
 
-            if let Some(remote_deployer) =
-                create_remote_deployer(&node, &app_state.encryption_service)
+            if let Some(remote_deployer) = create_remote_deployer(
+                &node,
+                &app_state.config_service,
+                &app_state.encryption_service,
+            )
+            .await
             {
                 for container in &containers {
                     if let Err(e) = remote_deployer
@@ -2098,6 +2509,13 @@ impl From<NodeError> for Problem {
             NodeError::AlreadyExists { ref name } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Node Already Exists")
                 .with_detail(format!("Node '{}' already exists", name)),
+            NodeError::IdentityConflict { ref name } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Node Identity Conflict")
+                .with_detail(format!(
+                    "Node '{}' is currently active; re-registering a different identity requires \
+                     proof of the current token, or the node must be drained/removed first",
+                    name
+                )),
             NodeError::Validation { ref message } => problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Validation Error")
                 .with_detail(message.clone()),
@@ -2194,20 +2612,60 @@ mod tests {
         let encryption_service = Arc::new(
             temps_core::EncryptionService::new("01234567890123456789012345678901").unwrap(),
         );
+        // The enrollment-token service gets its OWN mock DB that returns no
+        // matching token (-> InvalidToken), so the register tests exercise the
+        // legacy-shared-token fallback path while the main `db` keeps its own
+        // node-flow query sequence intact.
+        let test_db_for_enrollment = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results(vec![
+                    Vec::<temps_entities::node_enrollment_tokens::Model>::new(),
+                ])
+                .into_connection(),
+        );
         let app_state = Arc::new(NodeAppState {
             node_service,
             db,
             config_service,
             encryption_service,
             telemetry: Arc::new(temps_core::telemetry::NoopTelemetryReporter),
+            rate_limiter: Arc::new(RegistrationRateLimiter::new()),
+            enrollment_token_service: Arc::new(temps_config::EnrollmentTokenService::new(
+                test_db_for_enrollment,
+            )),
+            notification_service: None,
         });
-        configure_routes().with_state(app_state)
+        // The production router is served with connect info; tests use `oneshot`
+        // (no peer address), so inject a mock so the `ConnectInfo` extractor
+        // resolves.
+        let mock_peer: std::net::SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        configure_routes()
+            .layer(axum::extract::connect_info::MockConnectInfo(mock_peer))
+            .with_state(app_state)
     }
 
     fn settings_with_join_token() -> temps_core::AppSettings {
         let mut settings = temps_core::AppSettings::default();
         settings.multi_node.join_token_hash = Some(sha256_hash("test-join-token"));
         settings
+    }
+
+    #[test]
+    fn test_registration_rate_limiter_blocks_per_ip_and_is_per_ip_scoped() {
+        let rl = RegistrationRateLimiter::new();
+        let ip1: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+
+        // The per-IP window allows PER_IP_MAX attempts...
+        for _ in 0..RegistrationRateLimiter::PER_IP_MAX {
+            assert!(rl.check(ip1).is_ok());
+        }
+        // ...and rejects the next one with a retry-after hint.
+        let retry = rl.check(ip1).unwrap_err();
+        assert!(retry > 0 && retry <= RegistrationRateLimiter::WINDOW_SECS + 1);
+
+        // A different source IP has its own independent window.
+        let ip2: std::net::IpAddr = "10.0.0.2".parse().unwrap();
+        assert!(rl.check(ip2).is_ok());
     }
 
     #[tokio::test]

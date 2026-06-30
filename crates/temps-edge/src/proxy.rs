@@ -244,22 +244,28 @@ impl EdgeProxy {
         Ok(true)
     }
 
+    /// Build the pull-through origin request for a cache miss.
+    ///
+    /// Cacheable asset misses are routed by the public tenant `Host` header, so
+    /// the request may terminate in untrusted application code. Do not attach
+    /// the edge control-plane bearer token here; that token is only for direct
+    /// control-plane APIs such as registration and route sync.
+    fn origin_asset_request(&self, ctx: &EdgeCtx) -> reqwest::RequestBuilder {
+        let url = format!("{}{}", self.origin_url, ctx.path);
+
+        self.origin_client
+            .get(&url)
+            .header("Host", &ctx.host)
+            .header("X-Edge-Fetch", "true")
+    }
+
     /// Fetch an asset from the origin and cache it.
     async fn fetch_and_cache(
         &self,
         session: &mut PingoraSession,
         ctx: &mut EdgeCtx,
     ) -> Result<bool> {
-        let url = format!("{}{}", self.origin_url, ctx.path);
-
-        let response = self
-            .origin_client
-            .get(&url)
-            .header("Host", &ctx.host)
-            .header("Authorization", format!("Bearer {}", self.token))
-            .header("X-Edge-Fetch", "true")
-            .send()
-            .await;
+        let response = self.origin_asset_request(ctx).send().await;
 
         match response {
             Ok(resp) => {
@@ -524,5 +530,72 @@ impl ProxyHttp for EdgeProxy {
             upstream_response.insert_header("X-Edge-Region", region.as_str())?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    fn test_proxy() -> EdgeProxy {
+        let route_table = Arc::new(EdgeRouteTable::new());
+        let unique = format!(
+            "temps-edge-proxy-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let cache_dir = std::env::temp_dir().join(unique);
+        let cache = Arc::new(EdgeCache::new(&cache_dir, 1024 * 1024));
+        let (tx, _rx) = mpsc::channel(1);
+        let analytics = EdgeAnalyticsHandle { tx };
+
+        EdgeProxy::new(
+            "https://origin.example",
+            "edge-control-plane-secret",
+            route_table,
+            cache,
+            analytics,
+            None,
+        )
+    }
+
+    #[test]
+    fn origin_asset_request_preserves_tenant_routing_without_edge_token() {
+        let proxy = test_proxy();
+        let ctx = EdgeCtx {
+            host: "malicious-app.example".to_string(),
+            path: "/assets/steal.js".to_string(),
+            cache_status: "MISS",
+            fetch_start: None,
+            bytes_served: 0,
+        };
+
+        let request = proxy
+            .origin_asset_request(&ctx)
+            .build()
+            .expect("test request should build");
+
+        assert_eq!(
+            request.url().as_str(),
+            "https://origin.example/assets/steal.js"
+        );
+        assert_eq!(
+            request.headers().get("Host").and_then(|h| h.to_str().ok()),
+            Some("malicious-app.example")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("X-Edge-Fetch")
+                .and_then(|h| h.to_str().ok()),
+            Some("true")
+        );
+        assert!(
+            request.headers().get("Authorization").is_none(),
+            "origin asset fetches must not expose the edge control-plane token to tenant-routed applications"
+        );
     }
 }

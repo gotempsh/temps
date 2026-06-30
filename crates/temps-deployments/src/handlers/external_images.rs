@@ -88,6 +88,7 @@ pub struct OperationResultsResponse {
 /// Push an external Docker image
 #[utoipa::path(
     post,
+    tag = "External Images",
     path = "/projects/{project_id}/images/push",
     request_body = PushImageRequest,
     responses(
@@ -168,6 +169,7 @@ pub async fn push_external_image(
 /// List all external images for a project
 #[utoipa::path(
     get,
+    tag = "External Images",
     path = "/projects/{project_id}/images",
     responses(
         (status = 200, description = "List of external images", body = Vec<PushedExternalImageResponse>),
@@ -198,6 +200,7 @@ pub async fn list_external_images(
 /// Get details of a specific external image
 #[utoipa::path(
     get,
+    tag = "External Images",
     path = "/projects/{project_id}/images/{image_id}",
     responses(
         (status = 200, description = "Image details", body = PushedExternalImageResponse),
@@ -231,6 +234,7 @@ pub async fn get_external_image(
 /// Execute a deployment operation (deploy, mark_complete, take_screenshot)
 #[utoipa::path(
     post,
+    tag = "Deployments",
     path = "/projects/{project_id}/deployments/{deployment_id}/operations",
     request_body = ExecuteOperationRequest,
     responses(
@@ -321,6 +325,7 @@ pub async fn execute_deployment_operation(
 /// Get all operations for a deployment
 #[utoipa::path(
     get,
+    tag = "Deployments",
     path = "/projects/{project_id}/deployments/{deployment_id}/operations",
     responses(
         (status = 200, description = "List of operations", body = OperationResultsResponse),
@@ -361,6 +366,7 @@ pub async fn get_deployment_operations(
 /// Get the status of a specific operation type
 #[utoipa::path(
     get,
+    tag = "Deployments",
     path = "/projects/{project_id}/deployments/{deployment_id}/operations/{operation_type}",
     responses(
         (status = 200, description = "Operation status", body = OperationResultResponse),

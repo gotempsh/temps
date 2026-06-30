@@ -50,7 +50,7 @@ use temps_log_aggregator::{LogAggregatorPlugin, StorageConfig};
 use temps_logs::LogsPlugin;
 use temps_monitoring::{
     AlarmService, ContainerHealthConfig, ContainerHealthMonitor, DiskSpaceMonitor,
-    OutageDetectionService,
+    MonitoringPlugin, OutageDetectionService,
 };
 use temps_notifications::NotificationsPlugin;
 use temps_observability::ObservabilityPlugin;
@@ -71,7 +71,10 @@ use tracing::{debug, info};
 
 // Multi-node support
 use temps_deployments::handlers::nodes::NodeAppState;
-use temps_deployments::jobs::node_health_check::{check_node_health, failover_offline_nodes};
+use temps_deployments::jobs::node_health_check::{
+    check_control_plane_resources, check_drain_completion, check_node_health, check_node_resources,
+    failover_offline_nodes, notify_nodes_offline, refresh_control_plane_metrics,
+};
 use temps_deployments::services::node_service::NodeService;
 use utoipa_swagger_ui::SwaggerUi;
 
@@ -1276,6 +1279,15 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let otel_plugin = Box::new(OtelPlugin::new());
     plugin_manager.register_plugin(otel_plugin);
 
+    // 9.8. MonitoringPlugin - registers AlarmService in the service registry and
+    // wires the alarms read/ack/resolve HTTP routes (ADR-025 Phase 1).
+    // Must be registered AFTER NotificationsPlugin (step 7) and QueuePlugin (step 2)
+    // since AlarmService requires both. Must be registered BEFORE the background
+    // loops below that consume the registered AlarmService.
+    debug!("Registering MonitoringPlugin");
+    let monitoring_plugin = Box::new(MonitoringPlugin::new());
+    plugin_manager.register_plugin(monitoring_plugin);
+
     // 10. AuthPlugin - provides authentication and authorization (depends on notification service)
     debug!("Registering AuthPlugin");
     let auth_plugin = Box::new(AuthPlugin::new());
@@ -1303,6 +1315,12 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     debug!("Registering AiGatewayPlugin");
     let ai_gateway_plugin = Box::new(temps_ai_gateway::AiGatewayPlugin::new());
     plugin_manager.register_plugin(ai_gateway_plugin);
+
+    // AI Chat Plugin - persistent AI debugging conversations (ADR-023). After the
+    // AI gateway so the AiService it provides is registered.
+    debug!("Registering AiChatPlugin");
+    let ai_chat_plugin = Box::new(temps_ai_chat::AiChatPlugin::new());
+    plugin_manager.register_plugin(ai_chat_plugin);
 
     // 12. ApiKeyPlugin - provides API key management (depends on auth services)
     debug!("Registering ApiKeyPlugin");
@@ -1481,17 +1499,16 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         );
     }
 
-    // Start alarm service, outage detection, and container health monitoring
-    if let (Some(notification_service), Some(queue_service)) = (
+    // Start alarm service, outage detection, and container health monitoring.
+    // AlarmService is already constructed and registered by MonitoringPlugin
+    // (step 9.8 above). We retrieve the same Arc here so the background loops
+    // share the single instance with the HTTP handlers.
+    if let (Some(notification_service), Some(queue_service), Some(alarm_service)) = (
         service_context.get_service::<dyn temps_core::notifications::NotificationService>(),
         service_context.get_service::<dyn temps_core::JobQueue>(),
+        service_context.get_service::<AlarmService>(),
     ) {
-        // Create the alarm service (shared across outage detection and container health)
-        let alarm_service = Arc::new(AlarmService::new(
-            db.clone(),
-            notification_service.clone(),
-            queue_service.clone(),
-        ));
+        // alarm_service is the same Arc<AlarmService> registered by MonitoringPlugin.
 
         // Start event-driven outage detection (listens to StatusCheckCompleted jobs).
         // The job queue is attached so monitoring.downtime workflows can be fired
@@ -1768,6 +1785,10 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         config_service: config_service_for_nodes,
         encryption_service: encryption_service_for_nodes,
         telemetry: node_telemetry,
+        rate_limiter: Arc::new(temps_deployments::handlers::nodes::RegistrationRateLimiter::new()),
+        enrollment_token_service: Arc::new(temps_config::EnrollmentTokenService::new(db.clone())),
+        notification_service: service_context
+            .get_service::<dyn temps_core::notifications::NotificationService>(),
     });
     let node_routes =
         temps_deployments::handlers::nodes::configure_routes().with_state(node_app_state);
@@ -1778,16 +1799,32 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         let health_db = db.clone();
         let deployment_service_for_failover =
             service_context.get_service::<temps_deployments::DeploymentService>();
+        let health_notification_service =
+            service_context.get_service::<dyn temps_core::notifications::NotificationService>();
+        let health_config_service = service_context.get_service::<temps_config::ConfigService>();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
                 interval.tick().await;
+                // Sample the control plane's own host metrics so the synthetic
+                // control-plane node shows live CPU/mem/disk (it has no agent
+                // heartbeat). Always runs, independent of alert config.
+                refresh_control_plane_metrics();
                 let offline_ids = check_node_health(&health_node_service, health_db.as_ref()).await;
                 if !offline_ids.is_empty() {
                     tracing::info!(
                         "Node health check: marked {} node(s) as offline",
                         offline_ids.len()
                     );
+                    // Alert operators that worker node(s) went down (best-effort).
+                    if let Some(ref notification_service) = health_notification_service {
+                        notify_nodes_offline(
+                            &offline_ids,
+                            &health_node_service,
+                            notification_service,
+                        )
+                        .await;
+                    }
                     // Trigger failover redeployment for affected environments
                     if let Some(ref deployment_service) = deployment_service_for_failover {
                         failover_offline_nodes(
@@ -1797,6 +1834,30 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                         )
                         .await;
                     }
+                }
+
+                // Alert on node resource pressure (CPU/mem/disk) against the
+                // operator-configurable thresholds in settings.multi_node.
+                if let (Some(ref notification_service), Some(ref config_service)) =
+                    (&health_notification_service, &health_config_service)
+                {
+                    check_node_resources(health_db.as_ref(), config_service, notification_service)
+                        .await;
+                    // The control plane isn't a `nodes` row, so it's excluded
+                    // from the query above — alert on its own metrics separately.
+                    check_control_plane_resources(config_service, notification_service).await;
+                }
+
+                // Transition fully-drained nodes from "draining" to "drained".
+                // Without this, a node whose containers have all migrated stays
+                // stuck in "draining" forever (it never auto-completes), so the
+                // operator can never safely remove it. (ADR-020 WS-5.1 / lifecycle-7)
+                let drained_ids = check_drain_completion(&health_node_service).await;
+                if !drained_ids.is_empty() {
+                    tracing::info!(
+                        "Node drain check: {} node(s) completed draining",
+                        drained_ids.len()
+                    );
                 }
             }
         });
@@ -1822,6 +1883,178 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let split = plugin_manager
         .build_split_application()
         .map_err(|e| anyhow::anyhow!("Failed to build application: {}", e))?;
+
+    // ADR-024: Populate the ApiToolsHandle now that the Axum router is fully
+    // assembled.  InternalApiCaller holds a clone of the merged admin router
+    // (which carries the auth middleware layers) and the unified OpenAPI doc
+    // — both are only available at this point, after plugin initialisation and
+    // build_split_application().  The handle was registered as a service by
+    // AiChatPlugin::register_services(); all adapters (OSS ChatTool, EE rig
+    // Tool) retrieved it at that time and hold clones that share the same
+    // OnceLock.
+    {
+        let service_context = plugin_manager.service_context();
+        if let Some(handle) = service_context.get_service::<temps_ai_api_tools::ApiToolsHandle>() {
+            match create_openapi(&plugin_manager) {
+                Ok(openapi) => {
+                    // The admin router carries the full plugin API surface plus
+                    // the auth middleware stack (permission_guard! reads
+                    // AuthContext from extensions, which the middleware injects).
+                    // We clone it here so InternalApiCaller can replay synthetic
+                    // requests through it without consuming the original.
+                    //
+                    // ALLOWLIST for the AI `call_api` tool — opt-in / secure by
+                    // default. The model may call ONLY these read-only GET
+                    // operations; every other endpoint (including any newly added
+                    // one) is invisible to it. This is deliberately an allowlist,
+                    // not a denylist: GET endpoints across the platform return
+                    // decrypted secrets (service params → DB passwords, env-var
+                    // reveals, notification configs → Slack/SMTP/Cloudflare creds,
+                    // S3 credentials, …), and a hand-maintained denylist can't be
+                    // kept exhaustive. Curated for the SRE/debugging use case:
+                    // observability, runtime/deploy status, errors, and MASKED
+                    // metadata. Adding an entry is a security decision — verify the
+                    // operation's response contains NO decrypted secret/token/key.
+                    let allowlist: Vec<String> = [
+                        // ── OpenTelemetry: metrics / traces / logs / health ──
+                        "query_metrics",
+                        "list_metric_names",
+                        "list_metric_label_keys",
+                        "list_metric_label_values",
+                        "query_traces",
+                        "query_trace_summaries",
+                        "get_trace",
+                        "query_genai_traces",
+                        "get_genai_trace",
+                        "query_logs",
+                        "list_insights",
+                        "get_health",
+                        "get_quota",
+                        "get_pipeline_stats",
+                        // ── Container runtime: logs + metrics (no secrets) ──
+                        "get_container_metrics",
+                        "get_container_logs",
+                        "get_container_logs_by_id",
+                        "get_container_info",
+                        "get_container_detail",
+                        "list_containers",
+                        // ── Deployments: status / jobs / history ──
+                        "get_deployment",
+                        "get_last_deployment",
+                        "get_project_deployments",
+                        "get_deployment_jobs",
+                        "get_deployment_operations",
+                        "get_deployment_operation_status",
+                        "get_activity_graph",
+                        "get_deployment_job_logs",
+                        "list_deployment_container_logs",
+                        "get_deployment_container_log_content",
+                        // ── Environments: metadata + MASKED env-var lists only ──
+                        // (the *_value reveal endpoints are intentionally excluded)
+                        "get_environments",
+                        "get_environment",
+                        "get_environment_domains",
+                        "get_environment_crons",
+                        "get_cron_by_id",
+                        "get_cron_executions",
+                        "get_environment_variables",
+                        "get_resolved_environment_variables",
+                        // ── Error tracking ──
+                        "get_error_dashboard_stats",
+                        "get_error_event",
+                        "get_error_group",
+                        "get_error_stats",
+                        "get_error_time_series",
+                        "has_error_groups",
+                        "list_error_events",
+                        "list_error_groups",
+                        "list_alert_rules",
+                        "get_alert_rule",
+                        // ── Service status / health / types (NOT params/env) ──
+                        "get_service_health_status",
+                        "list_service_health_statuses",
+                        "get_service_stats",
+                        "get_service_runtime",
+                        "list_project_services",
+                        "list_service_projects",
+                        "get_service_types",
+                        "get_service_type_parameters",
+                        "get_cluster_health",
+                        "get_cluster_member",
+                        "getPostgresWalHealth",
+                        "ExternalServiceMetricsGetLatest",
+                        "ExternalServiceMetricsGetRange",
+                        "ExternalServiceMetricsStatus",
+                        "ExternalServiceMetricsByDatabase",
+                        "ExternalServiceMetricsGetAlertRules",
+                        // ── Domains: metadata (no challenge tokens) ──
+                        "list_domains",
+                        "get_domain",
+                        "get_domain_by_name",
+                        "get_domain_dns_records",
+                        "list_custom_domains_for_project",
+                        "get_custom_domain",
+                        "check_domain_status",
+                        "list_managed_domains",
+                        "get_on_demand_cert_status",
+                        // ── Platform / monitor status ──
+                        "get_status_overview",
+                        "get_disk_status",
+                        "get_current_monitor_status",
+                        "get_projects_health",
+                        "get_projects_monitor_health",
+                        "get_project_statistics",
+                        // ── Backups: metadata only (NOT s3 credentials/source) ──
+                        "get_backup",
+                        "get_backup_schedule",
+                        "list_backup_schedules",
+                        "list_backups_for_schedule",
+                        "list_external_service_backups",
+                        "list_source_backups",
+                        "list_schedule_runs",
+                        "list_restore_runs_for_service",
+                        "get_restore_capabilities",
+                        // ── Audit trail ──
+                        "list_audit_logs",
+                        "get_audit_log",
+                        // ── Analytics (the user's own traffic data) ──
+                        "get_general_stats",
+                        "get_visitor_stats",
+                        "get_today_stats",
+                        "get_recent_activity",
+                        "get_events_timeline",
+                        "get_events_count",
+                        "get_page_paths",
+                        "get_performance_metrics",
+                    ]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                    let caller = temps_ai_api_tools::InternalApiCaller::new_allowlisted(
+                        split.admin.clone(),
+                        &openapi,
+                        allowlist,
+                    );
+                    handle.set(caller);
+                    debug!("ADR-024: InternalApiCaller populated in ApiToolsHandle");
+                }
+                Err(e) => {
+                    // Non-fatal: the AI API tools simply won't be available this
+                    // run.  Log the error so operators can diagnose it without
+                    // taking down the whole server.
+                    tracing::warn!(
+                        error = %e,
+                        "ADR-024: failed to build OpenAPI doc for InternalApiCaller; \
+                         AI API tools will not be available"
+                    );
+                }
+            }
+        } else {
+            // AiChatPlugin is not loaded (e.g. AI is disabled). This is expected
+            // in reduced-feature deployments; no action needed.
+            debug!("ADR-024: ApiToolsHandle not registered (AiChatPlugin absent); skipping InternalApiCaller setup");
+        }
+    }
 
     // Agent-facing node + route-sync routes are public (workers anywhere on
     // the internet POST to them with bearer tokens).

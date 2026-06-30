@@ -6,7 +6,7 @@ import { zodResolver } from '@hookform/resolvers/zod'
 import { toast } from 'sonner'
 import {
   getNotificationProviderOptions,
-  updateEmailProviderMutation,
+  updateNotificationEmailProviderMutation,
   updateNotificationProviderMutation,
   updateSlackProviderMutation,
   updateWebhookProviderMutation,
@@ -147,7 +147,7 @@ export function EditNotificationProvider() {
 
   // Update mutations
   const updateEmailMutation = useMutation({
-    ...updateEmailProviderMutation(),
+    ...updateNotificationEmailProviderMutation(),
     meta: {
       errorTitle: 'Failed to update email provider',
     },

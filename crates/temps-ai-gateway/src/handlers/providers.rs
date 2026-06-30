@@ -131,6 +131,8 @@ pub struct ProviderKeyResponse {
     /// Masked API key (only last 4 chars visible)
     pub api_key_masked: String,
     pub base_url: Option<String>,
+    /// Model id this provider serves (NULL → per-provider default).
+    pub default_model: Option<String>,
     pub is_active: bool,
     pub created_at: String,
     pub updated_at: String,
@@ -144,6 +146,7 @@ impl From<temps_entities::ai_provider_keys::Model> for ProviderKeyResponse {
             display_name: model.display_name,
             api_key_masked: "***".to_string(), // Never expose encrypted key
             base_url: model.base_url,
+            default_model: model.default_model,
             is_active: model.is_active,
             created_at: model.created_at.to_rfc3339(),
             updated_at: model.updated_at.to_rfc3339(),
@@ -157,13 +160,38 @@ pub struct CreateProviderKeyRequest {
     pub display_name: String,
     pub api_key: String,
     pub base_url: Option<String>,
+    /// Optional model id to pin for this provider (e.g. "gpt-4o-mini").
+    pub default_model: Option<String>,
+}
+
+/// Deserialize a PATCH field that distinguishes three states:
+/// absent (`None`), present-null (`Some(None)` → clear), and present-value
+/// (`Some(Some(v))` → set). Plain `Option<Option<T>>` cannot do this because
+/// serde collapses an explicit JSON `null` to the outer `None`, making "clear
+/// this field" indistinguishable from "field omitted". Pair with
+/// `#[serde(default, deserialize_with = "deserialize_optional_field")]`.
+fn deserialize_optional_field<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    // serde only invokes this when the key is present, so wrap whatever we parse
+    // — including an explicit `null` — in an outer `Some`.
+    Ok(Some(Option::<T>::deserialize(deserializer)?))
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateProviderKeyRequest {
     pub display_name: Option<String>,
     pub api_key: Option<String>,
+    /// Double-Option: absent = leave unchanged, present-null = clear (revert to
+    /// the provider's default endpoint), present-value = set.
+    #[serde(default, deserialize_with = "deserialize_optional_field")]
     pub base_url: Option<Option<String>>,
+    /// Double-Option: absent = leave unchanged, present-null = clear the pinned
+    /// model (revert to the per-provider default), present-value = set.
+    #[serde(default, deserialize_with = "deserialize_optional_field")]
+    pub default_model: Option<Option<String>>,
     pub is_active: Option<bool>,
 }
 
@@ -255,6 +283,7 @@ async fn create_provider_key(
             &request.display_name,
             &request.api_key,
             request.base_url.as_deref(),
+            request.default_model.as_deref(),
         )
         .await?;
 
@@ -290,6 +319,7 @@ async fn update_provider_key(
             request.display_name.as_deref(),
             request.api_key.as_deref(),
             request.base_url.as_ref().map(|o| o.as_deref()),
+            request.default_model.as_ref().map(|o| o.as_deref()),
             request.is_active,
         )
         .await?;
@@ -445,4 +475,46 @@ fn friendly_error_message(err: &AiGatewayError) -> String {
         }
     }
     err.to_string()
+}
+
+#[cfg(test)]
+mod patch_deser_tests {
+    use super::UpdateProviderKeyRequest;
+
+    #[test]
+    fn base_url_present_value_sets() {
+        let r: UpdateProviderKeyRequest =
+            serde_json::from_str(r#"{"base_url":"http://localhost:11434/v1"}"#).unwrap();
+        assert_eq!(
+            r.base_url,
+            Some(Some("http://localhost:11434/v1".to_string()))
+        );
+    }
+
+    #[test]
+    fn base_url_explicit_null_clears() {
+        let r: UpdateProviderKeyRequest = serde_json::from_str(r#"{"base_url":null}"#).unwrap();
+        // The fix: explicit null is now distinguishable from absent.
+        assert_eq!(r.base_url, Some(None));
+    }
+
+    #[test]
+    fn base_url_absent_is_unchanged() {
+        let r: UpdateProviderKeyRequest = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(r.base_url, None);
+    }
+
+    #[test]
+    fn default_model_three_states() {
+        let set: UpdateProviderKeyRequest =
+            serde_json::from_str(r#"{"default_model":"gpt-5-mini"}"#).unwrap();
+        assert_eq!(set.default_model, Some(Some("gpt-5-mini".to_string())));
+
+        let clear: UpdateProviderKeyRequest =
+            serde_json::from_str(r#"{"default_model":null}"#).unwrap();
+        assert_eq!(clear.default_model, Some(None));
+
+        let absent: UpdateProviderKeyRequest = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(absent.default_model, None);
+    }
 }

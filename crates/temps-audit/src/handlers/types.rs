@@ -2,7 +2,7 @@ use crate::services::{AuditLogWithDetails, AuditService};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_core::DateTime;
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 pub struct AppState {
     pub audit_service: Arc<AuditService>,
 }
@@ -61,26 +61,34 @@ pub struct AuditLogIpInfo {
     pub longitude: Option<f64>,
 }
 
-/// Query parameters for listing audit logs
-#[derive(Deserialize, Clone, ToSchema)]
+/// Query parameters for listing audit logs.
+///
+/// Every field is optional — omitting one means "don't filter on it". Deriving
+/// `IntoParams` makes utoipa render them as optional query params with the
+/// correct types; the previous hand-written `params(("operation_type", Query,
+/// …))` tuples defaulted every param to `required: true, type: string`, which
+/// misled both API clients and the AI `describe_api`/`call_api` tools into
+/// thinking all filters were mandatory.
+#[derive(Deserialize, Clone, ToSchema, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ListAuditLogsQuery {
-    /// Filter logs by operation type
-    #[schema(example = "user.login")]
+    /// Filter logs by operation type (omit for all)
+    #[param(example = "user.login")]
     pub operation_type: Option<String>,
-    /// Filter logs by user ID
-    #[schema(example = 1)]
+    /// Filter logs by user ID (omit for all users)
+    #[param(example = 1)]
     pub user_id: Option<i32>,
     /// Start timestamp (milliseconds since epoch)
-    #[schema(example = 1)]
+    #[param(example = 1)]
     pub from: Option<DateTime>,
     /// End timestamp (milliseconds since epoch)
-    #[schema(example = 1)]
+    #[param(example = 1)]
     pub to: Option<DateTime>,
     /// Maximum number of logs to return
-    #[schema(example = 100)]
+    #[param(example = 100)]
     pub limit: Option<i32>,
     /// Number of logs to skip
-    #[schema(example = 0)]
+    #[param(example = 0)]
     pub offset: Option<i32>,
 }
 

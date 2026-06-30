@@ -26,6 +26,20 @@ use temps_otel::services::OtelService;
 use temps_otel::storage::timescaledb::TimescaleDbStorage;
 use temps_otel::OtelAppState;
 
+/// No-op audit logger so the handler app state can be built without a real
+/// audit service (dashboard write endpoints audit-log best-effort).
+struct NoOpAuditLogger;
+
+#[async_trait::async_trait]
+impl temps_core::AuditLogger for NoOpAuditLogger {
+    async fn create_audit_log(
+        &self,
+        _operation: &dyn temps_core::AuditOperation,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
 /// Known API key for testing.
 const TEST_API_KEY: &str = "tk_test_e2e_integration_key_12345";
 
@@ -120,10 +134,17 @@ async fn setup_e2e() -> Option<(
     let auth_service = Arc::new(OtelAuthService::new(db.clone()));
     let rate_limiter = Arc::new(RateLimiter::new(10000, Duration::from_secs(60)));
     let otel_service = Arc::new(OtelService::new(storage, auth_service, rate_limiter));
+    let dashboard_service = Arc::new(temps_otel::services::MetricDashboardService::new(
+        db.clone(),
+    ));
+    let metric_alert_service = Arc::new(temps_otel::services::MetricAlertService::new(db.clone()));
     let app_state = OtelAppState {
         otel_service,
         metrics_store: None,
         metrics_write_tx: None,
+        dashboard_service,
+        metric_alert_service,
+        audit_service: Arc::new(NoOpAuditLogger),
     };
 
     // Create auth middleware that injects AuthContext into request extensions.

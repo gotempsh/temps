@@ -538,6 +538,8 @@ pub async fn update_project_settings(
             settings.preview_envs_idle_timeout_seconds,
             settings.preview_envs_wake_timeout_seconds,
             settings.preset_config.clone(),
+            settings.ai_alert_summaries_enabled,
+            settings.ai_debug_chat_enabled,
         )
         .await
         .map_err(Problem::from)?;

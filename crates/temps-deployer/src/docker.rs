@@ -605,6 +605,30 @@ impl DockerRuntime {
         Ok(())
     }
 
+    /// Read the IPv4 gateway of the app bridge network (`self.network_name`),
+    /// e.g. `172.19.0.1`. Used to bind the control-plane DNS resolver on the
+    /// bridge gateway (ADR-024). Returns `None` on any inspect failure or if
+    /// Docker assigned no IPv4 gateway. We explicitly skip any IPv6 IPAM
+    /// config: the resolver binds IPv4, and a dual-stack network can list its
+    /// configs in either order — taking the first gateway regardless of family
+    /// could hand back an IPv6 address we then fail to bind.
+    pub async fn inspect_app_network_gateway(&self) -> Option<std::net::IpAddr> {
+        let info = self
+            .docker
+            .inspect_network(
+                &self.network_name,
+                None::<bollard::query_parameters::InspectNetworkOptions>,
+            )
+            .await
+            .ok()?;
+        info.ipam?
+            .config?
+            .into_iter()
+            .filter_map(|c| c.gateway)
+            .filter_map(|gw| gw.parse::<std::net::IpAddr>().ok())
+            .find(|ip| ip.is_ipv4())
+    }
+
     async fn create_tar_context_body(
         &self,
         context_path: PathBuf,

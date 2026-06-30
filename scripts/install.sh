@@ -58,6 +58,56 @@ warning() {
     echo -e "${Yellow}warning${Color_Off}:" "$@"
 }
 
+# Verify a downloaded file against its published `.sha256` sibling asset
+# (ADR-020 WS-7 / supplychain-1, supplychain-8). We fail CLOSED: if the
+# checksum cannot be fetched or does not match, we refuse to install rather
+# than silently running an unverified binary. An explicit, loud opt-out
+# (TEMPS_INSTALL_SKIP_CHECKSUM=1) exists for the rare case a release lacks
+# the asset, so users are never hard-blocked — but the default is verified.
+verify_checksum() {
+    local file="$1" url_sha="$2"
+    local sha_file="$file.sha256" expected actual
+
+    if ! curl --fail --silent --location --output "$sha_file" "$url_sha" 2>/dev/null; then
+        rm -f "$sha_file"
+        if [[ "${TEMPS_INSTALL_SKIP_CHECKSUM:-}" = "1" ]]; then
+            warning "Checksum not found at \"$url_sha\"; skipping verification (TEMPS_INSTALL_SKIP_CHECKSUM=1)."
+            return 0
+        fi
+        rm -f "$file"
+        error "Could not download a checksum from \"$url_sha\" to verify the binary.
+Refusing to install an unverified binary. To override (NOT recommended), re-run with
+TEMPS_INSTALL_SKIP_CHECKSUM=1."
+    fi
+
+    # Accept both '<hash>' and '<hash>  filename' formats: take the first 64-hex token.
+    expected=$(grep -oE '[0-9a-fA-F]{64}' "$sha_file" | head -n 1)
+    rm -f "$sha_file"
+    if [[ -z "$expected" ]]; then
+        rm -f "$file"
+        error "Checksum file from \"$url_sha\" did not contain a valid SHA-256 digest."
+    fi
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual=$(sha256sum "$file" | awk '{print $1}')
+    elif command -v shasum >/dev/null 2>&1; then
+        actual=$(shasum -a 256 "$file" | awk '{print $1}')
+    else
+        rm -f "$file"
+        error "Neither 'sha256sum' nor 'shasum' is available to verify the download."
+    fi
+
+    if [[ "$(printf '%s' "$expected" | tr 'A-F' 'a-f')" != "$(printf '%s' "$actual" | tr 'A-F' 'a-f')" ]]; then
+        rm -f "$file"
+        error "Checksum verification FAILED — the download may be corrupted or tampered with.
+  expected: $expected
+  actual:   $actual
+Aborting installation."
+    fi
+
+    success "Checksum verified (sha256)."
+}
+
 command -v curl >/dev/null ||
     error 'curl is required to install temps'
 
@@ -193,6 +243,10 @@ tarball="$install_dir/temps-$target.tar.gz"
 
 curl --fail --location --progress-bar --output "$tarball" "$temps_uri" ||
     error "Failed to download temps from \"$temps_uri\""
+
+info "Verifying download integrity..."
+
+verify_checksum "$tarball" "$temps_uri.sha256"
 
 info "Extracting temps..."
 

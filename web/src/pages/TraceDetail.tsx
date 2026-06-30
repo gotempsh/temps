@@ -1,16 +1,32 @@
-import { ProjectResponse } from '@/api/client'
-import { getTraceOptions } from '@/api/client/@tanstack/react-query.gen'
-import type { SpanRecord } from '@/api/client/types.gen'
+import { LogSeverity, ProjectResponse } from '@/api/client'
+import {
+  getTraceOptions,
+  queryLogsOptions,
+} from '@/api/client/@tanstack/react-query.gen'
+import type { LogRecord, SpanRecord } from '@/api/client/types.gen'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Card, CardContent } from '@/components/ui/card'
 import {
   Collapsible,
   CollapsibleContent,
   CollapsibleTrigger,
 } from '@/components/ui/collapsible'
-import { ScrollArea } from '@/components/ui/scroll-area'
+import {
+  Sheet,
+  SheetContent,
+  SheetHeader,
+  SheetTitle,
+} from '@/components/ui/sheet'
+import { useIsMobile } from '@/components/hooks/use-mobile'
 import { Skeleton } from '@/components/ui/skeleton'
+import {
+  Tabs,
+  TabsContent,
+  TabsList,
+  TabsTrigger,
+} from '@/components/ui/tabs'
+import { useAssistantPageContext } from '@/components/ai/AiAssistantContext'
 import {
   Tooltip,
   TooltipContent,
@@ -105,6 +121,25 @@ function statusIcon(status?: string) {
   }
 }
 
+function logSeverityBadge(severity: LogSeverity, text?: string) {
+  const label = text || severity
+  switch (severity) {
+    case 'FATAL':
+    case 'ERROR':
+      return <Badge variant="destructive">{label}</Badge>
+    case 'WARN':
+      return <Badge variant="warning">{label}</Badge>
+    case 'INFO':
+      return <Badge variant="secondary">{label}</Badge>
+    default:
+      return (
+        <Badge variant="outline" className="text-muted-foreground">
+          {label}
+        </Badge>
+      )
+  }
+}
+
 function statusBadgeVariant(
   status?: string
 ): 'destructive' | 'default' | 'secondary' | 'outline' {
@@ -150,10 +185,420 @@ function formatTimestamp(ts: string): string {
   })
 }
 
+// Stable per-service colour (Datadog/OpenObserve colour-code spans by service).
+const SERVICE_COLORS = [
+  '#6366f1', // indigo
+  '#10b981', // emerald
+  '#f59e0b', // amber
+  '#ec4899', // pink
+  '#06b6d4', // cyan
+  '#8b5cf6', // violet
+  '#ef4444', // red
+  '#14b8a6', // teal
+]
+function serviceColor(name?: string): string {
+  if (!name) return '#94a3b8'
+  let h = 0
+  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) | 0
+  return SERVICE_COLORS[Math.abs(h) % SERVICE_COLORS.length]
+}
+
+/** Full detail for one span — reused by every layout (drawer, side panel, or
+ *  bottom panel). Includes its own OTel logs (correlated by `span_id`). */
+function SpanDetailBody({
+  span,
+  spanLogs,
+}: {
+  span: SpanRecord
+  spanLogs: LogRecord[]
+}) {
+  return (
+    <div className="space-y-4">
+      <div className="space-y-2">
+        <div className="flex flex-wrap items-center gap-2">
+          {statusIcon(span.status_code)}
+          {span.status_code?.toUpperCase() !== 'UNSET' && span.status_code && (
+            <Badge variant={statusBadgeVariant(span.status_code)}>
+              {span.status_code}
+            </Badge>
+          )}
+          <Badge variant="outline">{kindLabel(span.kind)}</Badge>
+          {span.resource?.service_name && (
+            <span
+              className="inline-flex items-center gap-1.5 text-xs text-muted-foreground"
+              title={span.resource.service_name}
+            >
+              <span
+                className="h-2.5 w-2.5 rounded-full"
+                style={{ backgroundColor: serviceColor(span.resource.service_name) }}
+              />
+              {span.resource.service_name}
+            </span>
+          )}
+        </div>
+        {span.status_message && (
+          <p className="break-words rounded bg-destructive/10 p-2 text-xs text-destructive">
+            {span.status_message}
+          </p>
+        )}
+      </div>
+
+      <div>
+        <h4 className="mb-2 text-xs font-medium text-muted-foreground">Timing</h4>
+        <div className="grid grid-cols-2 gap-2 text-xs">
+          <div>
+            <span className="text-muted-foreground">Start:</span>
+            <span className="ml-1 font-mono">{formatTimestamp(span.start_time)}</span>
+          </div>
+          <div>
+            <span className="text-muted-foreground">End:</span>
+            <span className="ml-1 font-mono">{formatTimestamp(span.end_time)}</span>
+          </div>
+          <div>
+            <span className="text-muted-foreground">Duration:</span>
+            <span className="ml-1 font-mono">{formatDuration(span.duration_ms)}</span>
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <h4 className="mb-2 text-xs font-medium text-muted-foreground">IDs</h4>
+        <div className="space-y-1 font-mono text-xs">
+          <div className="flex gap-2">
+            <span className="shrink-0 text-muted-foreground">span:</span>
+            <span className="break-all">{span.span_id}</span>
+          </div>
+          <div className="flex gap-2">
+            <span className="shrink-0 text-muted-foreground">trace:</span>
+            <span className="break-all">{span.trace_id}</span>
+          </div>
+          {span.parent_span_id && (
+            <div className="flex gap-2">
+              <span className="shrink-0 text-muted-foreground">parent:</span>
+              <span className="break-all">{span.parent_span_id}</span>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {span.attributes && Object.keys(span.attributes).length > 0 && (
+        <Collapsible defaultOpen>
+          <CollapsibleTrigger className="flex items-center gap-1 text-xs font-medium text-muted-foreground hover:text-foreground">
+            <ChevronRight className="h-3 w-3 transition-transform data-[state=open]:rotate-90" />
+            Attributes ({Object.keys(span.attributes).length})
+          </CollapsibleTrigger>
+          <CollapsibleContent>
+            <div className="mt-2 space-y-1">
+              {Object.entries(span.attributes).map(([key, value]) => (
+                <div
+                  key={key}
+                  className="flex gap-2 border-b border-border/50 py-0.5 font-mono text-xs"
+                >
+                  <span className="shrink-0 text-muted-foreground">{key}:</span>
+                  <span className="break-all">
+                    {typeof value === 'object' ? JSON.stringify(value) : String(value)}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </CollapsibleContent>
+        </Collapsible>
+      )}
+
+      {span.events && span.events.length > 0 && (
+        <Collapsible defaultOpen>
+          <CollapsibleTrigger className="flex items-center gap-1 text-xs font-medium text-muted-foreground hover:text-foreground">
+            <ChevronRight className="h-3 w-3 transition-transform data-[state=open]:rotate-90" />
+            Events ({span.events.length})
+          </CollapsibleTrigger>
+          <CollapsibleContent>
+            <div className="mt-2 space-y-2">
+              {span.events.map((event) => (
+                <div
+                  key={`evt-${event.name}-${event.timestamp}`}
+                  className="space-y-1 rounded border p-2 text-xs"
+                >
+                  <div className="flex items-center gap-2">
+                    <Clock className="h-3 w-3 text-muted-foreground" />
+                    <span className="font-medium">{event.name}</span>
+                    <span className="font-mono text-muted-foreground">
+                      {formatTimestamp(event.timestamp)}
+                    </span>
+                  </div>
+                  {event.attributes && Object.keys(event.attributes).length > 0 && (
+                    <div className="ml-5 space-y-0.5">
+                      {Object.entries(event.attributes).map(([k, v]) => (
+                        <div key={k} className="flex gap-2 font-mono">
+                          <span className="shrink-0 text-muted-foreground">{k}:</span>
+                          <span className="break-all">
+                            {typeof v === 'object' ? JSON.stringify(v) : String(v)}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </CollapsibleContent>
+        </Collapsible>
+      )}
+
+      {spanLogs.length > 0 && (
+        <Collapsible defaultOpen>
+          <CollapsibleTrigger className="flex items-center gap-1 text-xs font-medium text-muted-foreground hover:text-foreground">
+            <ChevronRight className="h-3 w-3 transition-transform data-[state=open]:rotate-90" />
+            Logs ({spanLogs.length})
+          </CollapsibleTrigger>
+          <CollapsibleContent>
+            <div className="mt-2 space-y-1 font-mono text-xs">
+              {spanLogs.map((log, i) => (
+                <div
+                  key={`spanlog-${i}`}
+                  className="flex items-start gap-2 border-b border-border/50 py-1 last:border-b-0"
+                >
+                  <span className="shrink-0 tabular-nums text-muted-foreground">
+                    {formatTimestamp(log.timestamp)}
+                  </span>
+                  <span className="shrink-0">
+                    {logSeverityBadge(log.severity, log.severity_text)}
+                  </span>
+                  <span className="min-w-0 flex-1 break-words text-foreground">
+                    {log.body}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </CollapsibleContent>
+        </Collapsible>
+      )}
+    </div>
+  )
+}
+
+/** Shared span waterfall (tree + timeline bars). `colorBy="service"` colours each
+ *  bar by its service and shows a service dot, like OpenObserve/Datadog. */
+function SpanWaterfall({
+  flatSpans,
+  traceStart,
+  traceEnd,
+  traceDuration,
+  selectedSpanId,
+  onSelect,
+  colorBy = 'status',
+  className,
+}: {
+  flatSpans: SpanTreeNode[]
+  traceStart: number
+  traceEnd: number
+  traceDuration: number
+  selectedSpanId: string | null
+  onSelect: (spanId: string | null) => void
+  colorBy?: 'status' | 'service'
+  className?: string
+}) {
+  return (
+    <div className={cn('overflow-auto', className)}>
+      <div className="sticky top-0 z-10 flex min-w-[420px] items-center border-b bg-background px-4 py-2 text-xs text-muted-foreground sm:min-w-[500px]">
+        <div className="w-[120px] shrink-0 sm:w-[180px] md:w-[280px]">Span Name</div>
+        <div className="flex flex-1 justify-between">
+          <span>{formatTimestamp(new Date(traceStart).toISOString())}</span>
+          <span>{formatDuration(traceDuration)}</span>
+          <span>{formatTimestamp(new Date(traceEnd).toISOString())}</span>
+        </div>
+      </div>
+      {flatSpans.map((node) => {
+        const spanStart = new Date(node.span.start_time).getTime() - traceStart
+        const spanDuration =
+          new Date(node.span.end_time).getTime() -
+          new Date(node.span.start_time).getTime()
+        const maxBarPct = 92
+        const leftPct = traceDuration > 0 ? (spanStart / traceDuration) * maxBarPct : 0
+        const widthPct =
+          traceDuration > 0
+            ? Math.max((spanDuration / traceDuration) * maxBarPct, 0.5)
+            : maxBarPct
+        const isError = node.span.status_code?.toUpperCase() === 'ERROR'
+        const isSelected = selectedSpanId === node.span.span_id
+        const svc = node.span.resource?.service_name
+        const barColor =
+          colorBy === 'service' && !isError ? serviceColor(svc) : undefined
+        return (
+          <TooltipProvider key={node.span.span_id}>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  onClick={() => onSelect(isSelected ? null : node.span.span_id)}
+                  className={cn(
+                    'flex w-full min-w-[420px] items-center border-b px-4 py-1.5 text-left transition-colors hover:bg-accent/50 sm:min-w-[500px]',
+                    isSelected && 'bg-accent'
+                  )}
+                >
+                  <div
+                    className="flex w-[120px] shrink-0 items-center gap-1.5 sm:w-[180px] md:w-[280px]"
+                    style={{ paddingLeft: `${node.depth * 16}px` }}
+                  >
+                    {node.children.length > 0 ? (
+                      <ChevronDown className="h-3 w-3 shrink-0 text-muted-foreground" />
+                    ) : (
+                      <span className="w-3 shrink-0" />
+                    )}
+                    {colorBy === 'service' ? (
+                      <span
+                        className="h-2.5 w-2.5 shrink-0 rounded-full"
+                        style={{ backgroundColor: serviceColor(svc) }}
+                      />
+                    ) : (
+                      statusIcon(node.span.status_code)
+                    )}
+                    <span className="truncate text-xs">{node.span.name}</span>
+                  </div>
+                  <div className="relative h-6 flex-1">
+                    <div
+                      className={cn(
+                        'absolute top-1 h-4 min-w-[2px] rounded-sm',
+                        isError ? 'bg-red-500/80' : !barColor && 'bg-primary/70'
+                      )}
+                      style={{
+                        left: `${leftPct}%`,
+                        width: `${widthPct}%`,
+                        backgroundColor: barColor,
+                      }}
+                    />
+                    <span
+                      className="absolute top-0.5 whitespace-nowrap text-[10px] text-muted-foreground"
+                      style={{ left: `${leftPct + widthPct + 0.5}%` }}
+                    >
+                      {formatDuration(spanDuration)}
+                    </span>
+                  </div>
+                </button>
+              </TooltipTrigger>
+              <TooltipContent side="top" className="max-w-xs">
+                <div className="space-y-1">
+                  <p className="font-medium">{node.span.name}</p>
+                  {svc && <p className="text-xs">Service: {svc}</p>}
+                  <p className="text-xs">Duration: {formatDuration(spanDuration)}</p>
+                  <p className="text-xs">Kind: {kindLabel(node.span.kind)}</p>
+                </div>
+              </TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+        )
+      })}
+    </div>
+  )
+}
+
+interface LayoutProps {
+  flatSpans: SpanTreeNode[]
+  traceStart: number
+  traceEnd: number
+  traceDuration: number
+  correlatedLogs: LogRecord[]
+}
+
+/** Shared selection hook for the layout variants. */
+function useSpanSelection(flatSpans: SpanTreeNode[], correlatedLogs: LogRecord[]) {
+  const [selectedSpanId, setSelectedSpanId] = useState<string | null>(null)
+  const span = useMemo(
+    () =>
+      selectedSpanId
+        ? (flatSpans.find((n) => n.span.span_id === selectedSpanId)?.span ?? null)
+        : null,
+    [selectedSpanId, flatSpans]
+  )
+  const logs = useMemo(
+    () =>
+      selectedSpanId
+        ? correlatedLogs.filter((l) => l.span_id === selectedSpanId)
+        : [],
+    [selectedSpanId, correlatedLogs]
+  )
+  return { selectedSpanId, setSelectedSpanId, span, logs }
+}
+
+/** The trace Spans view: a service-coloured waterfall on the left and the
+ *  selected span's detail on the right (full width when none is selected). */
+function SpansView(props: LayoutProps) {
+  const { flatSpans, traceStart, traceEnd, traceDuration, correlatedLogs } = props
+  const { selectedSpanId, setSelectedSpanId, span, logs } = useSpanSelection(
+    flatSpans,
+    correlatedLogs
+  )
+  // On a phone there isn't room for a side panel, and an inline panel below the
+  // waterfall would land off-screen (unfocused). So below `md` the detail opens
+  // in a focused drawer; at `md`+ it's the persistent side panel.
+  const isMobile = useIsMobile()
+  const showSidePanel = !!span && !isMobile
+  return (
+    <div
+      className={cn(
+        'grid gap-3',
+        showSidePanel && 'md:grid-cols-[minmax(0,1fr)_minmax(440px,0.9fr)]'
+      )}
+    >
+      <Card className="min-w-0">
+        <CardContent className="p-0">
+          <SpanWaterfall
+            flatSpans={flatSpans}
+            traceStart={traceStart}
+            traceEnd={traceEnd}
+            traceDuration={traceDuration}
+            selectedSpanId={selectedSpanId}
+            onSelect={setSelectedSpanId}
+            colorBy="service"
+            className="h-[400px] sm:h-[600px]"
+          />
+        </CardContent>
+      </Card>
+
+      {/* Desktop / tablet: persistent side panel. */}
+      {showSidePanel && span && (
+        <Card className="min-w-0 md:sticky md:top-4 md:max-h-[600px] md:self-start md:overflow-auto">
+          <CardContent className="p-4">
+            <div className="mb-3 flex items-center justify-between gap-2">
+              <h3 className="truncate text-sm font-semibold">{span.name}</h3>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setSelectedSpanId(null)}
+              >
+                Close
+              </Button>
+            </div>
+            <SpanDetailBody span={span} spanLogs={logs} />
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Mobile: focused drawer so the selected span's detail is brought to the
+          front instead of stacking off-screen below the waterfall. */}
+      <Sheet
+        open={!!span && isMobile}
+        onOpenChange={(o) => !o && setSelectedSpanId(null)}
+      >
+        <SheetContent side="right" className="w-full overflow-y-auto sm:max-w-md">
+          <SheetHeader>
+            <SheetTitle className="truncate pr-6 text-left text-base">
+              {span?.name}
+            </SheetTitle>
+          </SheetHeader>
+          {span && (
+            <div className="mt-4">
+              <SpanDetailBody span={span} spanLogs={logs} />
+            </div>
+          )}
+        </SheetContent>
+      </Sheet>
+    </div>
+  )
+}
+
 export default function TraceDetail({ project }: TraceDetailProps) {
   const { traceId } = useParams()
   const navigate = useNavigate()
-  const [selectedSpanId, setSelectedSpanId] = useState<string | null>(null)
 
   const { data, isLoading, isFetching, error, refetch } = useQuery({
     ...getTraceOptions({
@@ -164,6 +609,21 @@ export default function TraceDetail({ project }: TraceDetailProps) {
     }),
     enabled: !!project.id && !!traceId,
   })
+
+  // OTel logs correlated to this trace (emitted within its spans). The query is
+  // by trace_id only — no time window — so logs are matched regardless of when
+  // the trace ran. Returned newest-first; we render oldest-first to read along
+  // with the waterfall.
+  const { data: logsData } = useQuery({
+    ...queryLogsOptions({
+      query: { project_id: project.id, trace_id: traceId || '', limit: 200 },
+    }),
+    enabled: !!project.id && !!traceId,
+  })
+  const correlatedLogs = useMemo(
+    () => [...(logsData?.data ?? [])].reverse(),
+    [logsData],
+  )
 
   const spans: SpanRecord[] = useMemo(() => {
     if (!data) return []
@@ -188,10 +648,14 @@ export default function TraceDetail({ project }: TraceDetailProps) {
 
   const traceDuration = traceEnd - traceStart
 
-  const selectedSpan = useMemo(() => {
-    if (!selectedSpanId) return null
-    return spans.find((s) => s.span_id === selectedSpanId) || null
-  }, [spans, selectedSpanId])
+  // Shared props for every trace-detail layout variant (ui.sh picker below).
+  const layoutProps: LayoutProps = {
+    flatSpans,
+    traceStart,
+    traceEnd,
+    traceDuration,
+    correlatedLogs,
+  }
 
   // Services involved
   const services = useMemo(() => {
@@ -208,6 +672,21 @@ export default function TraceDetail({ project }: TraceDetailProps) {
     [spans]
   )
   const traceStatus = hasError ? 'ERROR' : 'OK'
+
+  // Tell the assistant what the user is looking at, so "this trace"/"these
+  // logs" resolve without restating. Ephemeral framing — see the chat dock.
+  const assistantContext = useMemo(() => {
+    if (!traceId || spans.length === 0) return null
+    const rootName = tree[0]?.span?.name ?? '(root span)'
+    return [
+      'The user is viewing a distributed trace (OpenTelemetry) in the Temps console.',
+      `Project: "${project.name}" (slug: ${project.slug}, id: ${project.id}).`,
+      `Trace id: ${traceId}.`,
+      `Root span: ${rootName}. Duration: ${formatDuration(traceDuration)}. ${spans.length} span(s) across service(s): ${services.join(', ') || 'unknown'}. Status: ${hasError ? 'ERROR' : 'OK'}.`,
+      'If they say "this trace"/"this span"/"these logs", they mean this one. You can pull details with the temps CLI: `traces get_trace --trace_id <id>` and `telemetry-logs query_logs --trace_id <id>`.',
+    ].join('\n')
+  }, [traceId, project, tree, traceDuration, spans.length, services, hasError])
+  useAssistantPageContext(assistantContext, 'this trace')
 
   if (isLoading) {
     return (
@@ -274,27 +753,28 @@ export default function TraceDetail({ project }: TraceDetailProps) {
   return (
     <div className="space-y-4">
       {/* Header */}
-      <div className="flex items-center gap-3">
+      <div className="flex items-center gap-2 sm:gap-3">
         <Button
           variant="ghost"
           size="sm"
           onClick={() => navigate(-1)}
-          className="gap-2"
+          className="shrink-0 gap-2"
         >
           <ArrowLeft className="h-4 w-4" />
-          Back
+          <span className="hidden sm:inline">Back</span>
         </Button>
         <div className="flex-1 min-w-0">
-          <h2 className="text-lg font-semibold truncate">
+          <h2 className="truncate text-base font-semibold sm:text-lg">
             {rootSpan?.name || traceId}
           </h2>
-          <p className="text-sm text-muted-foreground font-mono truncate">
+          <p className="truncate font-mono text-xs text-muted-foreground sm:text-sm">
             {traceId}
           </p>
         </div>
         <Button
           variant="ghost"
           size="icon"
+          className="shrink-0"
           onClick={() => refetch()}
           disabled={isFetching}
         >
@@ -305,7 +785,7 @@ export default function TraceDetail({ project }: TraceDetailProps) {
       {/* Summary cards */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <Card>
-          <CardContent className="p-4">
+          <CardContent className="p-3 sm:p-4">
             <p className="text-xs text-muted-foreground mb-1">Duration</p>
             <p className="text-lg font-semibold">
               {formatDuration(traceDuration)}
@@ -313,19 +793,19 @@ export default function TraceDetail({ project }: TraceDetailProps) {
           </CardContent>
         </Card>
         <Card>
-          <CardContent className="p-4">
+          <CardContent className="p-3 sm:p-4">
             <p className="text-xs text-muted-foreground mb-1">Spans</p>
             <p className="text-lg font-semibold">{spans.length}</p>
           </CardContent>
         </Card>
         <Card>
-          <CardContent className="p-4">
+          <CardContent className="p-3 sm:p-4">
             <p className="text-xs text-muted-foreground mb-1">Services</p>
             <p className="text-lg font-semibold">{services.length}</p>
           </CardContent>
         </Card>
         <Card>
-          <CardContent className="p-4">
+          <CardContent className="p-3 sm:p-4">
             <p className="text-xs text-muted-foreground mb-1">Status</p>
             <div className="flex items-center gap-2">
               {statusIcon(traceStatus)}
@@ -337,349 +817,76 @@ export default function TraceDetail({ project }: TraceDetailProps) {
         </Card>
       </div>
 
-      {/* Waterfall + Detail panel */}
-      <div className="flex flex-col lg:flex-row gap-4">
-        {/* Waterfall chart */}
-        <Card className={cn('flex-1 min-w-0', selectedSpan && 'lg:w-1/2')}>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium">
-              Span Waterfall
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="p-0 overflow-x-auto">
-            <ScrollArea className="h-[600px]">
-              {/* Timeline header */}
-              <div className="flex items-center border-b px-4 py-2 text-xs text-muted-foreground sticky top-0 bg-background z-10 min-w-[500px]">
-                <div className="w-[180px] md:w-[280px] shrink-0">Span Name</div>
-                <div className="flex-1 flex justify-between">
-                  <span>{formatTimestamp(new Date(traceStart).toISOString())}</span>
-                  <span>{formatDuration(traceDuration)}</span>
-                  <span>{formatTimestamp(new Date(traceEnd).toISOString())}</span>
-                </div>
-              </div>
+      {/* Spans / Logs tabs */}
+      <Tabs defaultValue="spans" className="w-full">
+        <TabsList>
+          <TabsTrigger value="spans" className="gap-1.5">
+            Spans
+            <span className="text-xs text-muted-foreground">{spans.length}</span>
+          </TabsTrigger>
+          <TabsTrigger value="logs" className="gap-1.5">
+            Logs
+            {correlatedLogs.length > 0 && (
+              <span className="text-xs text-muted-foreground">
+                {correlatedLogs.length}
+              </span>
+            )}
+          </TabsTrigger>
+        </TabsList>
 
-              {/* Span rows */}
-              {flatSpans.map((node) => {
-                const spanStart =
-                  new Date(node.span.start_time).getTime() - traceStart
-                const spanDuration =
-                  new Date(node.span.end_time).getTime() -
-                  new Date(node.span.start_time).getTime()
-                // Reserve 8% on the right for the duration label
-                const maxBarPct = 92
-                const leftPct =
-                  traceDuration > 0 ? (spanStart / traceDuration) * maxBarPct : 0
-                const widthPct =
-                  traceDuration > 0
-                    ? Math.max((spanDuration / traceDuration) * maxBarPct, 0.5)
-                    : maxBarPct
-                const isError = node.span.status_code?.toUpperCase() === 'ERROR'
-                const isSelected = selectedSpanId === node.span.span_id
+        {/* Spans: waterfall on the left, span detail on the right when one is
+            selected (full width otherwise). */}
+        <TabsContent value="spans" className="mt-4">
+          <SpansView {...layoutProps} />
+        </TabsContent>
 
-                return (
-                  <TooltipProvider key={node.span.span_id}>
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <button
-                          type="button"
-                          onClick={() =>
-                            setSelectedSpanId(
-                              isSelected ? null : node.span.span_id
-                            )
-                          }
-                          className={cn(
-                            'flex items-center w-full border-b px-4 py-1.5 text-left hover:bg-accent/50 transition-colors min-w-[500px]',
-                            isSelected && 'bg-accent'
-                          )}
-                        >
-                          {/* Span name with indent */}
-                          <div
-                            className="w-[180px] md:w-[280px] shrink-0 flex items-center gap-1.5 min-w-0"
-                            style={{
-                              paddingLeft: `${node.depth * 16}px`,
-                            }}
-                          >
-                            {node.children.length > 0 ? (
-                              <ChevronDown className="h-3 w-3 shrink-0 text-muted-foreground" />
-                            ) : (
-                              <span className="w-3 shrink-0" />
-                            )}
-                            {statusIcon(node.span.status_code)}
-                            <span className="text-xs truncate">
-                              {node.span.name}
-                            </span>
-                          </div>
-
-                          {/* Waterfall bar */}
-                          <div className="flex-1 relative h-6">
-                            <div
-                              className={cn(
-                                'absolute top-1 h-4 rounded-sm min-w-[2px]',
-                                isError
-                                  ? 'bg-red-500/80'
-                                  : 'bg-primary/70'
-                              )}
-                              style={{
-                                left: `${leftPct}%`,
-                                width: `${widthPct}%`,
-                              }}
-                            />
-                            {/* Duration label */}
-                            <span
-                              className="absolute top-0.5 text-[10px] text-muted-foreground whitespace-nowrap"
-                              style={{
-                                left: `${leftPct + widthPct + 0.5}%`,
-                              }}
-                            >
-                              {formatDuration(spanDuration)}
-                            </span>
-                          </div>
-                        </button>
-                      </TooltipTrigger>
-                      <TooltipContent side="top" className="max-w-xs">
-                        <div className="space-y-1">
-                          <p className="font-medium">{node.span.name}</p>
-                          {node.span.resource?.service_name && (
-                            <p className="text-xs">
-                              Service: {node.span.resource.service_name}
-                            </p>
-                          )}
-                          <p className="text-xs">
-                            Duration: {formatDuration(spanDuration)}
-                          </p>
-                          <p className="text-xs">
-                            Kind: {kindLabel(node.span.kind)}
-                          </p>
-                        </div>
-                      </TooltipContent>
-                    </Tooltip>
-                  </TooltipProvider>
-                )
-              })}
-            </ScrollArea>
-          </CardContent>
-        </Card>
-
-        {/* Span detail panel */}
-        {selectedSpan && (
-          <Card className="w-full lg:w-[400px] shrink-0">
-            <CardHeader className="pb-2">
-              <div className="flex items-center justify-between">
-                <CardTitle className="text-sm font-medium truncate">
-                  {selectedSpan.name}
-                </CardTitle>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => setSelectedSpanId(null)}
-                  className="h-6 w-6 p-0"
-                >
-                  ×
-                </Button>
-              </div>
-            </CardHeader>
+        {/* Logs: the correlated logs, full width. */}
+        <TabsContent value="logs" className="mt-4">
+          <Card>
             <CardContent className="p-0">
-              <ScrollArea className="h-[400px] lg:h-[560px]">
-                <div className="p-4 space-y-4 overflow-x-auto">
-                  {/* Basic info */}
-                  <div className="space-y-2">
-                    <div className="flex items-center gap-2">
-                      {statusIcon(selectedSpan.status_code)}
-                      {selectedSpan.status_code?.toUpperCase() !== 'UNSET' &&
-                        selectedSpan.status_code && (
-                          <Badge variant={statusBadgeVariant(selectedSpan.status_code)}>
-                            {selectedSpan.status_code}
-                          </Badge>
-                        )}
-                      <Badge variant="outline">
-                        {kindLabel(selectedSpan.kind)}
-                      </Badge>
+              {correlatedLogs.length === 0 ? (
+                <p className="p-6 text-sm text-muted-foreground">
+                  No logs are correlated to this trace. Logs appear here when your
+                  app emits them within the trace&apos;s spans via OpenTelemetry.
+                </p>
+              ) : (
+                <div className="font-mono text-xs">
+                  {correlatedLogs.map((log, i) => (
+                    <div
+                      key={i}
+                      className="flex items-start gap-3 border-b px-4 py-1.5 last:border-b-0 sm:px-6"
+                    >
+                      <span className="shrink-0 tabular-nums text-muted-foreground">
+                        {formatTimestamp(log.timestamp)}
+                      </span>
+                      <span className="shrink-0">
+                        {logSeverityBadge(log.severity, log.severity_text)}
+                      </span>
+                      <span className="min-w-0 flex-1 break-words text-foreground">
+                        {log.body}
+                      </span>
                     </div>
-                    {selectedSpan.status_message && (
-                      <p className="text-xs text-destructive bg-destructive/10 rounded p-2 break-words">
-                        {selectedSpan.status_message}
-                      </p>
-                    )}
+                  ))}
+                  <div className="px-4 py-2 sm:px-6">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() =>
+                        navigate(
+                          `/projects/${project.slug}/telemetry-logs?trace=${traceId}`,
+                        )
+                      }
+                    >
+                      Open in Logs explorer →
+                    </Button>
                   </div>
-
-                  {/* Timing */}
-                  <div>
-                    <h4 className="text-xs font-medium text-muted-foreground mb-2">
-                      Timing
-                    </h4>
-                    <div className="grid grid-cols-2 gap-2 text-xs">
-                      <div>
-                        <span className="text-muted-foreground">Start:</span>
-                        <span className="ml-1 font-mono">
-                          {formatTimestamp(selectedSpan.start_time)}
-                        </span>
-                      </div>
-                      <div>
-                        <span className="text-muted-foreground">End:</span>
-                        <span className="ml-1 font-mono">
-                          {formatTimestamp(selectedSpan.end_time)}
-                        </span>
-                      </div>
-                      <div>
-                        <span className="text-muted-foreground">Duration:</span>
-                        <span className="ml-1 font-mono">
-                          {formatDuration(selectedSpan.duration_ms)}
-                        </span>
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* IDs */}
-                  <div>
-                    <h4 className="text-xs font-medium text-muted-foreground mb-2">
-                      IDs
-                    </h4>
-                    <div className="space-y-1 text-xs font-mono">
-                      <div className="flex gap-2">
-                        <span className="text-muted-foreground shrink-0">
-                          span:
-                        </span>
-                        <span className="break-all">{selectedSpan.span_id}</span>
-                      </div>
-                      <div className="flex gap-2">
-                        <span className="text-muted-foreground shrink-0">
-                          trace:
-                        </span>
-                        <span className="break-all">{selectedSpan.trace_id}</span>
-                      </div>
-                      {selectedSpan.parent_span_id && (
-                        <div className="flex gap-2">
-                          <span className="text-muted-foreground shrink-0">
-                            parent:
-                          </span>
-                          <span className="break-all">
-                            {selectedSpan.parent_span_id}
-                          </span>
-                        </div>
-                      )}
-                    </div>
-                  </div>
-
-                  {/* Resource */}
-                  {selectedSpan.resource && (
-                    <div>
-                      <h4 className="text-xs font-medium text-muted-foreground mb-2">
-                        Resource
-                      </h4>
-                      <div className="space-y-1 text-xs">
-                        {selectedSpan.resource.service_name && (
-                          <div className="flex gap-2">
-                            <span className="text-muted-foreground shrink-0">
-                              service.name:
-                            </span>
-                            <span className="break-all">
-                              {selectedSpan.resource.service_name}
-                            </span>
-                          </div>
-                        )}
-                        {selectedSpan.resource.service_version && (
-                          <div className="flex gap-2">
-                            <span className="text-muted-foreground shrink-0">
-                              service.version:
-                            </span>
-                            <span className="break-all">
-                              {selectedSpan.resource.service_version}
-                            </span>
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Attributes */}
-                  {selectedSpan.attributes &&
-                    Object.keys(selectedSpan.attributes).length > 0 && (
-                      <Collapsible defaultOpen>
-                        <CollapsibleTrigger className="flex items-center gap-1 text-xs font-medium text-muted-foreground hover:text-foreground">
-                          <ChevronRight className="h-3 w-3 transition-transform data-[state=open]:rotate-90" />
-                          Attributes ({Object.keys(selectedSpan.attributes).length})
-                        </CollapsibleTrigger>
-                        <CollapsibleContent>
-                          <div className="mt-2 space-y-1">
-                            {Object.entries(selectedSpan.attributes).map(
-                              ([key, value]) => (
-                                <div
-                                  key={key}
-                                  className="flex gap-2 text-xs font-mono py-0.5 border-b border-border/50"
-                                >
-                                  <span className="text-muted-foreground shrink-0">
-                                    {key}:
-                                  </span>
-                                  <span className="break-all">
-                                    {typeof value === 'object'
-                                      ? JSON.stringify(value)
-                                      : String(value)}
-                                  </span>
-                                </div>
-                              )
-                            )}
-                          </div>
-                        </CollapsibleContent>
-                      </Collapsible>
-                    )}
-
-                  {/* Events */}
-                  {selectedSpan.events && selectedSpan.events.length > 0 && (
-                    <Collapsible defaultOpen>
-                      <CollapsibleTrigger className="flex items-center gap-1 text-xs font-medium text-muted-foreground hover:text-foreground">
-                        <ChevronRight className="h-3 w-3 transition-transform data-[state=open]:rotate-90" />
-                        Events ({selectedSpan.events.length})
-                      </CollapsibleTrigger>
-                      <CollapsibleContent>
-                        <div className="mt-2 space-y-2">
-                          {selectedSpan.events.map((event) => (
-                            <div
-                              key={`evt-${event.name}-${event.timestamp}`}
-                              className="rounded border p-2 text-xs space-y-1"
-                            >
-                              <div className="flex items-center gap-2">
-                                <Clock className="h-3 w-3 text-muted-foreground" />
-                                <span className="font-medium">
-                                  {event.name}
-                                </span>
-                                <span className="text-muted-foreground font-mono">
-                                  {formatTimestamp(event.timestamp)}
-                                </span>
-                              </div>
-                              {event.attributes &&
-                                Object.keys(event.attributes).length > 0 && (
-                                  <div className="ml-5 space-y-0.5">
-                                    {Object.entries(event.attributes).map(
-                                      ([k, v]) => (
-                                        <div
-                                          key={k}
-                                          className="flex gap-2 font-mono"
-                                        >
-                                          <span className="text-muted-foreground shrink-0">
-                                            {k}:
-                                          </span>
-                                          <span className="break-all">
-                                            {typeof v === 'object'
-                                              ? JSON.stringify(v)
-                                              : String(v)}
-                                          </span>
-                                        </div>
-                                      )
-                                    )}
-                                  </div>
-                                )}
-                            </div>
-                          ))}
-                        </div>
-                      </CollapsibleContent>
-                    </Collapsible>
-                  )}
                 </div>
-              </ScrollArea>
+              )}
             </CardContent>
           </Card>
-        )}
-      </div>
+        </TabsContent>
+      </Tabs>
+
     </div>
   )
 }

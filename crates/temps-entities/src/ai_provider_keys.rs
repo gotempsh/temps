@@ -17,6 +17,10 @@ pub struct Model {
     pub api_key_encrypted: String,
     /// Optional base URL override for custom/self-hosted providers
     pub base_url: Option<String>,
+    /// Optional model id this provider should serve (e.g. "gpt-4o-mini" or a
+    /// local Ollama tag). NULL → fall back to the per-provider default in
+    /// `resolve_model`. Set/edited from the AI Providers settings UI.
+    pub default_model: Option<String>,
     /// Whether this provider key is active and available for routing
     pub is_active: bool,
     pub created_at: DBDateTime,

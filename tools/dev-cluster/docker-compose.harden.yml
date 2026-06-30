@@ -1,0 +1,54 @@
+# Isolated overlay for testing the ADR-020 multi-node hardening branch.
+#
+# Layered on top of docker-compose.yml via:
+#   docker compose -p temps-harden-test -f docker-compose.yml -f docker-compose.harden.yml up -d
+#
+# Goal: a clean, throwaway 3-worker cluster built from THIS worktree's
+# hardened source, WITHOUT touching the user's existing `temps-dev-*`
+# state volumes. We:
+#   - rename every STATE volume to `temps-harden-*` (fresh, disposable)
+#   - keep the build-cache volumes (cargo-cache, cargo-git,
+#     workspace-target) at their base names so the warm cache is reused
+#     (non-destructive — a build only adds artifacts)
+#   - rename containers to `temps-harden-*` so they never collide with a
+#     running dev-cluster
+#   - reuse the `temps-underlay` network + fixed IPs (the dev-cluster
+#     project is down, so the subnet is free)
+
+volumes:
+  postgres-data:
+    name: temps-harden-postgres-data
+  control-data:
+    name: temps-harden-cp-data
+  control-docker:
+    name: temps-harden-cp-docker
+  worker1-data:
+    name: temps-harden-w1-data
+  worker1-docker:
+    name: temps-harden-w1-docker
+  worker1-home:
+    name: temps-harden-w1-home
+  worker2-data:
+    name: temps-harden-w2-data
+  worker2-docker:
+    name: temps-harden-w2-docker
+  worker2-home:
+    name: temps-harden-w2-home
+  worker3-data:
+    name: temps-harden-w3-data
+  worker3-docker:
+    name: temps-harden-w3-docker
+  worker3-home:
+    name: temps-harden-w3-home
+
+services:
+  postgres:
+    container_name: temps-harden-postgres
+  control-plane:
+    container_name: temps-harden-control-plane
+  worker-1:
+    container_name: temps-harden-worker-1
+  worker-2:
+    container_name: temps-harden-worker-2
+  worker-3:
+    container_name: temps-harden-worker-3

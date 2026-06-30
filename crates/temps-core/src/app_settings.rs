@@ -409,7 +409,6 @@ pub struct DiskSpaceAlertSettings {
 /// Multi-node cluster settings
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(default)]
-#[derive(Default)]
 pub struct MultiNodeSettings {
     /// SHA-256 hash of the join token (never store plaintext)
     pub join_token_hash: Option<String>,
@@ -417,6 +416,72 @@ pub struct MultiNodeSettings {
     /// Used by remote worker nodes to reach services (databases, etc.) running on the control plane.
     /// Set via `--private-address` or `TEMPS_PRIVATE_ADDRESS`.
     pub private_address: Option<String>,
+    /// Whether the legacy single shared join token is still accepted for node
+    /// registration (ADR-020 WS-1.1). Defaults to `true` so existing clusters
+    /// keep working on upgrade; fresh installs should set it `false` and rely on
+    /// short-lived, single-use enrollment tokens instead.
+    #[serde(default = "default_legacy_shared_token_enabled")]
+    pub legacy_shared_token_enabled: bool,
+    /// Per-cluster CA certificate (PEM) for multi-node mTLS (ADR-020 WS-2.1).
+    /// Public — distributed to nodes as the trust root and used by the control
+    /// plane as the root for verifying agent server certs. Minted lazily on the
+    /// first CSR-bearing registration.
+    #[serde(default)]
+    pub cluster_ca_cert_pem: Option<String>,
+    /// Per-cluster CA private key, AES-256-GCM ciphertext (EncryptionService).
+    /// SECRET — never returned over HTTP (elided in the masked response).
+    #[serde(default)]
+    pub cluster_ca_key_encrypted: Option<String>,
+    /// Whether to enforce multi-node mTLS (ADR-020 WS-2.1). When `false`
+    /// (default), the control plane ignores join-time CSRs and nodes keep
+    /// serving plaintext HTTP — zero behavior change. When `true`, the CP signs
+    /// node CSRs, nodes serve mutual TLS, and every CP→agent call uses the
+    /// cluster client cert. Observe-then-enforce: flip this on only once all
+    /// workers have re-enrolled with certs.
+    #[serde(default)]
+    pub require_mtls: bool,
+    /// CPU-usage percent above which a worker node raises a resource alert
+    /// (ADR-020 / monitoring). `None` disables CPU alerting. Default 90.
+    #[serde(default = "default_node_cpu_alert_percent")]
+    pub node_cpu_alert_percent: Option<f64>,
+    /// Memory-usage percent above which a worker node raises a resource alert.
+    /// `None` disables memory alerting. Default 90.
+    #[serde(default = "default_node_memory_alert_percent")]
+    pub node_memory_alert_percent: Option<f64>,
+    /// Disk-usage percent above which a worker node raises a resource alert.
+    /// `None` disables disk alerting. Default 90.
+    #[serde(default = "default_node_disk_alert_percent")]
+    pub node_disk_alert_percent: Option<f64>,
+}
+
+fn default_node_cpu_alert_percent() -> Option<f64> {
+    Some(90.0)
+}
+fn default_node_memory_alert_percent() -> Option<f64> {
+    Some(90.0)
+}
+fn default_node_disk_alert_percent() -> Option<f64> {
+    Some(90.0)
+}
+
+fn default_legacy_shared_token_enabled() -> bool {
+    true
+}
+
+impl Default for MultiNodeSettings {
+    fn default() -> Self {
+        Self {
+            join_token_hash: None,
+            private_address: None,
+            legacy_shared_token_enabled: true,
+            cluster_ca_cert_pem: None,
+            cluster_ca_key_encrypted: None,
+            require_mtls: false,
+            node_cpu_alert_percent: default_node_cpu_alert_percent(),
+            node_memory_alert_percent: default_node_memory_alert_percent(),
+            node_disk_alert_percent: default_node_disk_alert_percent(),
+        }
+    }
 }
 
 /// Workspace preview gateway settings.

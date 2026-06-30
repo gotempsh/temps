@@ -168,6 +168,15 @@ pub struct SearchLogsRequest {
     /// Filter by environments
     #[serde(default)]
     pub envs: Vec<String>,
+    /// Filter to specific containers (Docker container IDs). Empty = all
+    /// containers. Drives "filter by container / show all" in a project's
+    /// history, which spans multiple deployments and containers.
+    #[serde(default)]
+    pub container_ids: Vec<String>,
+    /// Filter to specific worker nodes (node_id). Empty = all nodes, including
+    /// control-plane-local logs.
+    #[serde(default)]
+    pub node_ids: Vec<i32>,
     /// Filter by deployment ID (deployments.id)
     pub deploy_id: Option<i32>,
     /// Full text search query
@@ -189,6 +198,10 @@ pub struct SearchLogsResponse {
     pub next_cursor: Option<String>,
     pub search_mode: SearchMode,
     pub total_scanned: u64,
+    /// Distinct containers/nodes/services available in the queried scope, for
+    /// the filter dropdowns. Populated on the first page (no cursor).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_sources: Vec<LogSource>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -237,6 +250,7 @@ pub struct PurgeLogsRequest {
             TailLogsRequest,
             PurgeLogsRequest,
             LogSearchLine,
+            LogSource,
             ContextLine,
             LineContext,
             SearchMode,
@@ -315,6 +329,8 @@ async fn search_logs(
         levels,
         services: request.services,
         envs: request.envs,
+        container_ids: request.container_ids,
+        node_ids: request.node_ids,
         deploy_id: request.deploy_id,
         text: request.text,
         field_filters: vec![],
@@ -330,6 +346,7 @@ async fn search_logs(
         next_cursor: result.next_cursor,
         search_mode: result.search_mode,
         total_scanned: result.total_scanned,
+        available_sources: result.available_sources,
     }))
 }
 
@@ -691,6 +708,8 @@ mod tests {
             env: env.to_string(),
             project_id,
             deploy_id: None,
+            node_id: None,
+            node_name: None,
         }
     }
 
