@@ -2713,6 +2713,34 @@ export type CreateGitLabPatRequest = {
     token: string;
 };
 
+export type CreateGiteaPatRequest = {
+    base_url: string;
+    name: string;
+    token: string;
+};
+
+export type BitbucketAuthInput = {
+    type: 'access_token';
+    token: string;
+} | {
+    type: 'app_password';
+    password: string;
+    username: string;
+};
+
+export type CreateBitbucketRequest = {
+    auth: BitbucketAuthInput;
+    name: string;
+};
+
+export type CreateGenericRequest = {
+    base_url?: string | null;
+    clone_url: string;
+    name: string;
+    token?: string | null;
+    token_username?: string | null;
+};
+
 export type CreateIncidentRequest = {
     description?: string | null;
     environment_id?: number | null;
@@ -25866,6 +25894,99 @@ export type CreateGitlabPatProviderResponses = {
 };
 
 export type CreateGitlabPatProviderResponse = CreateGitlabPatProviderResponses[keyof CreateGitlabPatProviderResponses];
+
+export type CreateGiteaPatProviderData = {
+    body: CreateGiteaPatRequest;
+    path?: never;
+    query?: never;
+    url: '/git-providers/gitea/pat';
+};
+
+export type CreateGiteaPatProviderErrors = {
+    /**
+     * Bad request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateGiteaPatProviderResponses = {
+    /**
+     * Gitea PAT provider created successfully
+     */
+    201: ProviderResponse;
+};
+
+export type CreateGiteaPatProviderResponse = CreateGiteaPatProviderResponses[keyof CreateGiteaPatProviderResponses];
+
+export type CreateBitbucketProviderData = {
+    body: CreateBitbucketRequest;
+    path?: never;
+    query?: never;
+    url: '/git-providers/bitbucket';
+};
+
+export type CreateBitbucketProviderErrors = {
+    /**
+     * Bad request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateBitbucketProviderResponses = {
+    /**
+     * Bitbucket provider created successfully
+     */
+    201: ProviderResponse;
+};
+
+export type CreateBitbucketProviderResponse = CreateBitbucketProviderResponses[keyof CreateBitbucketProviderResponses];
+
+export type CreateGenericProviderData = {
+    body: CreateGenericRequest;
+    path?: never;
+    query?: never;
+    url: '/git-providers/generic';
+};
+
+export type CreateGenericProviderErrors = {
+    /**
+     * Bad request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateGenericProviderResponses = {
+    /**
+     * Generic git provider created successfully
+     */
+    201: ProviderResponse;
+};
+
+export type CreateGenericProviderResponse = CreateGenericProviderResponses[keyof CreateGenericProviderResponses];
 
 export type DeleteGitProviderData = {
     body?: never;

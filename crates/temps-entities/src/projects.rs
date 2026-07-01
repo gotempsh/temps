@@ -68,6 +68,27 @@ pub struct Model {
     /// Never serialized in API responses.
     #[serde(skip_serializing)]
     pub gitlab_webhook_signing_token: Option<String>,
+    /// Encrypted HMAC-SHA256 signing token for Gitea webhook signature verification.
+    /// Sent as the `secret` field when creating the Gitea repo hook.
+    /// Never serialized in API responses (MUST-FIX 5).
+    #[serde(skip_serializing)]
+    pub gitea_webhook_signing_token: Option<String>,
+    /// Encrypted secret-in-path token for Bitbucket webhook delivery URL.
+    /// Embedded in the webhook callback URL path instead of HMAC (Bitbucket
+    /// Cloud does not provide HMAC body signing).
+    /// Never serialized in API responses (MUST-FIX 5).
+    #[serde(skip_serializing)]
+    pub bitbucket_webhook_token: Option<String>,
+    /// The hook UUID returned by Bitbucket when we auto-registered the webhook
+    /// via `POST /2.0/repositories/{workspace}/{slug}/hooks`. Stored so we can
+    /// `DELETE` it on disconnect. Bitbucket UUIDs include braces: `{uuid-v4}`.
+    /// NULL when no auto-registered hook exists for this project.
+    pub bitbucket_webhook_hook_id: Option<String>,
+    /// Encrypted secret-in-path token for Generic/Manual git provider webhook URL.
+    /// Embedded in the webhook callback URL path.
+    /// Never serialized in API responses (MUST-FIX 5).
+    #[serde(skip_serializing)]
+    pub generic_webhook_token: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

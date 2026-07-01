@@ -51,6 +51,7 @@ import {
   EllipsisVertical,
   ExternalLink,
   GitBranch,
+  GitFork,
   GithubIcon,
   Globe,
   Key,
@@ -281,16 +282,35 @@ export default function GitProviderDetail() {
     switch (provider.provider_type) {
       case 'github':
         return <GithubIcon className="h-6 w-6" />
+      case 'gitea':
+        return <GitFork className="h-6 w-6" />
+      case 'generic':
+        return <Globe className="h-6 w-6" />
+      case 'gitlab':
+      case 'bitbucket':
       default:
         return <GitBranch className="h-6 w-6" />
     }
   }
 
   const getProviderDisplayName = () => {
-    return (
-      provider.provider_type.charAt(0).toUpperCase() +
-      provider.provider_type.slice(1)
-    )
+    switch (provider.provider_type) {
+      case 'github':
+        return 'GitHub'
+      case 'gitlab':
+        return 'GitLab'
+      case 'gitea':
+        return 'Gitea'
+      case 'bitbucket':
+        return 'Bitbucket'
+      case 'generic':
+        return 'Other Git Provider'
+      default:
+        return (
+          provider.provider_type.charAt(0).toUpperCase() +
+          provider.provider_type.slice(1)
+        )
+    }
   }
 
   const getAuthMethodDisplayName = () => {

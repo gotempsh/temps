@@ -1,4 +1,7 @@
 import {
+  createBitbucketProviderMutation,
+  createGenericProviderMutation,
+  createGiteaPatProviderMutation,
   createGithubPatProviderMutation,
   createGitlabOauthProviderMutation,
   createGitlabPatProviderMutation,
@@ -29,11 +32,14 @@ import {
   Copy,
   ExternalLink,
   GitBranch,
+  GitFork,
   GithubIcon,
+  Globe,
   Info,
   Key,
   Loader2,
   Lock,
+  Server,
   Settings,
   Shield,
   Sparkles,
@@ -51,9 +57,14 @@ type Step =
   | 'configure-gitlab-method'
   | 'configure-gitlab-app'
   | 'configure-gitlab-app-credentials'
+  | 'configure-gitea-pat'
+  | 'configure-bitbucket'
+  | 'configure-generic'
   | 'success'
-type Provider = 'github' | 'gitlab'
+type Provider = 'github' | 'gitlab' | 'gitea' | 'bitbucket' | 'generic'
 type Method = 'app' | 'pat' | 'existing-app' | 'gitlab-app' | 'gitlab-pat'
+type BitbucketAuthMethod = 'access_token' | 'app_password'
+type GenericMode = 'public' | 'private'
 
 interface GitProviderFlowProps {
   onSuccess?: () => void
@@ -89,6 +100,18 @@ export function GitProviderFlow({
   const [gitlabClientId, setGitlabClientId] = useState('')
   const [gitlabClientSecret, setGitlabClientSecret] = useState('')
   const [gitlabAppName, setGitlabAppName] = useState('GitLab OAuth App')
+  // Gitea state
+  const [giteaBaseUrl, setGiteaBaseUrl] = useState('https://')
+  // Bitbucket state
+  const [bitbucketAuthMethod, setBitbucketAuthMethod] =
+    useState<BitbucketAuthMethod>('access_token')
+  const [bitbucketUsername, setBitbucketUsername] = useState('')
+  // Generic ("Other Git Providers") state
+  const [genericMode, setGenericMode] = useState<GenericMode>('public')
+  const [genericCloneUrl, setGenericCloneUrl] = useState('')
+  const [genericBaseUrl, setGenericBaseUrl] = useState('')
+  const [genericTokenUsername, setGenericTokenUsername] =
+    useState('x-access-token')
   const [isPollingInstallations, setIsPollingInstallations] = useState(false)
   const [isWaitingForWebhook, setIsWaitingForWebhook] = useState(false)
   const pollingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -277,6 +300,56 @@ export function GitProviderFlow({
     },
     onSuccess: async () => {
       toast.success('GitLab OAuth provider added successfully!')
+      await queryClient.invalidateQueries({ queryKey: ['listGitProviders'] })
+      await queryClient.invalidateQueries({ queryKey: ['listConnections'] })
+      setCurrentStep('success')
+      setTimeout(() => {
+        onSuccess?.()
+      }, 500)
+    },
+  })
+
+  const createGiteaPAT = useMutation({
+    ...createGiteaPatProviderMutation(),
+    meta: {
+      errorTitle: 'Failed to add Gitea provider',
+    },
+    onSuccess: async () => {
+      toast.success('Gitea provider added successfully!')
+      await queryClient.invalidateQueries({ queryKey: ['listGitProviders'] })
+      await queryClient.invalidateQueries({ queryKey: ['listConnections'] })
+      setCurrentStep('success')
+      setTimeout(() => {
+        onSuccess?.()
+      }, 500)
+    },
+  })
+
+  const createBitbucket = useMutation({
+    ...createBitbucketProviderMutation(),
+    meta: {
+      errorTitle: 'Failed to add Bitbucket provider',
+    },
+    onSuccess: async () => {
+      toast.success('Bitbucket provider added successfully!', {
+        description: 'A webhook has been automatically registered.',
+      })
+      await queryClient.invalidateQueries({ queryKey: ['listGitProviders'] })
+      await queryClient.invalidateQueries({ queryKey: ['listConnections'] })
+      setCurrentStep('success')
+      setTimeout(() => {
+        onSuccess?.()
+      }, 500)
+    },
+  })
+
+  const createGeneric = useMutation({
+    ...createGenericProviderMutation(),
+    meta: {
+      errorTitle: 'Failed to add git provider',
+    },
+    onSuccess: async () => {
+      toast.success('Git provider added successfully!')
       await queryClient.invalidateQueries({ queryKey: ['listGitProviders'] })
       await queryClient.invalidateQueries({ queryKey: ['listConnections'] })
       setCurrentStep('success')
@@ -494,6 +567,15 @@ export function GitProviderFlow({
     } else if (provider === 'gitlab') {
       setProviderName('GitLab')
       setCurrentStep('configure-gitlab-method')
+    } else if (provider === 'gitea') {
+      setProviderName('Gitea')
+      setCurrentStep('configure-gitea-pat')
+    } else if (provider === 'bitbucket') {
+      setProviderName('Bitbucket')
+      setCurrentStep('configure-bitbucket')
+    } else if (provider === 'generic') {
+      setProviderName('Other Git Provider')
+      setCurrentStep('configure-generic')
     }
   }
 
@@ -517,6 +599,79 @@ export function GitProviderFlow({
     })
   }
 
+  const handleGiteaSubmit = async () => {
+    if (!giteaBaseUrl || !/^https:\/\/.+/.test(giteaBaseUrl)) {
+      toast.error('Please enter a valid HTTPS Gitea URL')
+      return
+    }
+    if (!patToken) {
+      toast.error('Please enter a personal access token')
+      return
+    }
+
+    await createGiteaPAT.mutateAsync({
+      body: {
+        name: providerName || 'Gitea',
+        token: patToken,
+        base_url: giteaBaseUrl,
+      },
+    })
+  }
+
+  const handleBitbucketSubmit = async () => {
+    if (bitbucketAuthMethod === 'access_token') {
+      if (!patToken) {
+        toast.error('Please enter an access token')
+        return
+      }
+      await createBitbucket.mutateAsync({
+        body: {
+          name: providerName || 'Bitbucket',
+          auth: { type: 'access_token', token: patToken },
+        },
+      })
+    } else {
+      if (!bitbucketUsername || !patToken) {
+        toast.error('Please enter both username and app password')
+        return
+      }
+      await createBitbucket.mutateAsync({
+        body: {
+          name: providerName || 'Bitbucket',
+          auth: {
+            type: 'app_password',
+            username: bitbucketUsername,
+            password: patToken,
+          },
+        },
+      })
+    }
+  }
+
+  const handleGenericSubmit = async () => {
+    if (!genericCloneUrl || !/^https:\/\/.+/.test(genericCloneUrl)) {
+      toast.error('Please enter a valid HTTPS clone URL')
+      return
+    }
+    if (genericMode === 'private' && !patToken) {
+      toast.error('Please enter an access token for the private repository')
+      return
+    }
+
+    await createGeneric.mutateAsync({
+      body: {
+        name: providerName || 'Other Git Provider',
+        clone_url: genericCloneUrl,
+        base_url: genericBaseUrl || undefined,
+        token: genericMode === 'private' ? patToken : undefined,
+        token_username:
+          genericMode === 'private'
+            ? genericTokenUsername || 'x-access-token'
+            : undefined,
+      },
+    })
+  }
+
   const handleBack = () => {
     if (currentStep === 'provider') {
       onCancel?.()
@@ -534,6 +689,15 @@ export function GitProviderFlow({
       setCurrentStep('configure-gitlab-method')
     } else if (currentStep === 'configure-gitlab-app-credentials') {
       setCurrentStep('configure-gitlab-app')
+    } else if (currentStep === 'configure-gitea-pat') {
+      setCurrentStep('provider')
+      setSelectedProvider(null)
+    } else if (currentStep === 'configure-bitbucket') {
+      setCurrentStep('provider')
+      setSelectedProvider(null)
+    } else if (currentStep === 'configure-generic') {
+      setCurrentStep('provider')
+      setSelectedProvider(null)
     }
   }
 
@@ -767,6 +931,249 @@ export function GitProviderFlow({
                     }}
                   >
                     Select GitLab
+                    <ArrowRight className="h-4 w-4" />
+                  </Button>
+                </div>
+              </CardContent>
+            </Card>
+
+            {/* Gitea */}
+            <Card
+              className={cn(
+                'cursor-pointer transition-all duration-200',
+                selectedProvider === 'gitea' &&
+                  'ring-2 ring-primary border-primary',
+                selectedProvider !== 'gitea' &&
+                  'hover:border-muted-foreground/50 hover:shadow-md'
+              )}
+              onClick={() => setSelectedProvider('gitea')}
+            >
+              <CardHeader className="pb-4">
+                <div className="flex items-start justify-between">
+                  <div className="flex items-center gap-3">
+                    <div
+                      className={cn(
+                        'p-3 rounded-lg',
+                        selectedProvider === 'gitea'
+                          ? 'bg-primary/10'
+                          : 'bg-muted'
+                      )}
+                    >
+                      <GitFork className="h-6 w-6" />
+                    </div>
+                    <div>
+                      <CardTitle className="text-lg">Gitea</CardTitle>
+                      <CardDescription className="mt-1">
+                        Connect with a self-hosted Gitea instance
+                      </CardDescription>
+                    </div>
+                  </div>
+                  {selectedProvider === 'gitea' && (
+                    <CheckCircle2 className="h-5 w-5 text-primary" />
+                  )}
+                </div>
+              </CardHeader>
+              <CardContent>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <div className="flex items-start gap-2 text-sm">
+                    <CheckCircle2 className="h-3.5 w-3.5 text-green-500 flex-shrink-0 mt-0.5" />
+                    <span className="text-muted-foreground text-xs">
+                      Personal Access Tokens
+                    </span>
+                  </div>
+                  <div className="flex items-start gap-2 text-sm">
+                    <CheckCircle2 className="h-3.5 w-3.5 text-green-500 flex-shrink-0 mt-0.5" />
+                    <span className="text-muted-foreground text-xs">
+                      Private repositories
+                    </span>
+                  </div>
+                  <div className="flex items-start gap-2 text-sm">
+                    <CheckCircle2 className="h-3.5 w-3.5 text-green-500 flex-shrink-0 mt-0.5" />
+                    <span className="text-muted-foreground text-xs">
+                      Pull request previews
+                    </span>
+                  </div>
+                  <div className="flex items-start gap-2 text-sm">
+                    <CheckCircle2 className="h-3.5 w-3.5 text-green-500 flex-shrink-0 mt-0.5" />
+                    <span className="text-muted-foreground text-xs">
+                      Self-hosted support
+                    </span>
+                  </div>
+                </div>
+                <div className="mt-4 flex justify-end">
+                  <Button
+                    variant={selectedProvider === 'gitea' ? 'default' : 'ghost'}
+                    className="gap-2"
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      handleProviderSelect('gitea')
+                    }}
+                  >
+                    Select Gitea
+                    <ArrowRight className="h-4 w-4" />
+                  </Button>
+                </div>
+              </CardContent>
+            </Card>
+
+            {/* Bitbucket */}
+            <Card
+              className={cn(
+                'cursor-pointer transition-all duration-200',
+                selectedProvider === 'bitbucket' &&
+                  'ring-2 ring-primary border-primary',
+                selectedProvider !== 'bitbucket' &&
+                  'hover:border-muted-foreground/50 hover:shadow-md'
+              )}
+              onClick={() => setSelectedProvider('bitbucket')}
+            >
+              <CardHeader className="pb-4">
+                <div className="flex items-start justify-between">
+                  <div className="flex items-center gap-3">
+                    <div
+                      className={cn(
+                        'p-3 rounded-lg',
+                        selectedProvider === 'bitbucket'
+                          ? 'bg-primary/10'
+                          : 'bg-muted'
+                      )}
+                    >
+                      <GitBranch className="h-6 w-6" />
+                    </div>
+                    <div>
+                      <CardTitle className="text-lg">Bitbucket</CardTitle>
+                      <CardDescription className="mt-1">
+                        Connect with Bitbucket Cloud
+                      </CardDescription>
+                    </div>
+                  </div>
+                  {selectedProvider === 'bitbucket' && (
+                    <CheckCircle2 className="h-5 w-5 text-primary" />
+                  )}
+                </div>
+              </CardHeader>
+              <CardContent>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <div className="flex items-start gap-2 text-sm">
+                    <CheckCircle2 className="h-3.5 w-3.5 text-green-500 flex-shrink-0 mt-0.5" />
+                    <span className="text-muted-foreground text-xs">
+                      Access tokens & app passwords
+                    </span>
+                  </div>
+                  <div className="flex items-start gap-2 text-sm">
+                    <CheckCircle2 className="h-3.5 w-3.5 text-green-500 flex-shrink-0 mt-0.5" />
+                    <span className="text-muted-foreground text-xs">
+                      Private repositories
+                    </span>
+                  </div>
+                  <div className="flex items-start gap-2 text-sm">
+                    <CheckCircle2 className="h-3.5 w-3.5 text-green-500 flex-shrink-0 mt-0.5" />
+                    <span className="text-muted-foreground text-xs">
+                      Automatic webhooks
+                    </span>
+                  </div>
+                  <div className="flex items-start gap-2 text-sm">
+                    <CheckCircle2 className="h-3.5 w-3.5 text-green-500 flex-shrink-0 mt-0.5" />
+                    <span className="text-muted-foreground text-xs">
+                      Pull request previews
+                    </span>
+                  </div>
+                </div>
+                <div className="mt-4 flex justify-end">
+                  <Button
+                    variant={
+                      selectedProvider === 'bitbucket' ? 'default' : 'ghost'
+                    }
+                    className="gap-2"
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      handleProviderSelect('bitbucket')
+                    }}
+                  >
+                    Select Bitbucket
+                    <ArrowRight className="h-4 w-4" />
+                  </Button>
+                </div>
+              </CardContent>
+            </Card>
+
+            {/* Other Git Providers (Generic) */}
+            <Card
+              className={cn(
+                'cursor-pointer transition-all duration-200',
+                selectedProvider === 'generic' &&
+                  'ring-2 ring-primary border-primary',
+                selectedProvider !== 'generic' &&
+                  'hover:border-muted-foreground/50 hover:shadow-md'
+              )}
+              onClick={() => setSelectedProvider('generic')}
+            >
+              <CardHeader className="pb-4">
+                <div className="flex items-start justify-between">
+                  <div className="flex items-center gap-3">
+                    <div
+                      className={cn(
+                        'p-3 rounded-lg',
+                        selectedProvider === 'generic'
+                          ? 'bg-primary/10'
+                          : 'bg-muted'
+                      )}
+                    >
+                      <Globe className="h-6 w-6" />
+                    </div>
+                    <div>
+                      <CardTitle className="text-lg">
+                        Other Git Providers
+                      </CardTitle>
+                      <CardDescription className="mt-1">
+                        Connect any Git repository via clone URL
+                      </CardDescription>
+                    </div>
+                  </div>
+                  {selectedProvider === 'generic' && (
+                    <CheckCircle2 className="h-5 w-5 text-primary" />
+                  )}
+                </div>
+              </CardHeader>
+              <CardContent>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <div className="flex items-start gap-2 text-sm">
+                    <CheckCircle2 className="h-3.5 w-3.5 text-green-500 flex-shrink-0 mt-0.5" />
+                    <span className="text-muted-foreground text-xs">
+                      Public repositories
+                    </span>
+                  </div>
+                  <div className="flex items-start gap-2 text-sm">
+                    <CheckCircle2 className="h-3.5 w-3.5 text-green-500 flex-shrink-0 mt-0.5" />
+                    <span className="text-muted-foreground text-xs">
+                      Private via HTTPS token
+                    </span>
+                  </div>
+                  <div className="flex items-start gap-2 text-sm">
+                    <CheckCircle2 className="h-3.5 w-3.5 text-green-500 flex-shrink-0 mt-0.5" />
+                    <span className="text-muted-foreground text-xs">
+                      Any Git host
+                    </span>
+                  </div>
+                  <div className="flex items-start gap-2 text-sm">
+                    <CheckCircle2 className="h-3.5 w-3.5 text-green-500 flex-shrink-0 mt-0.5" />
+                    <span className="text-muted-foreground text-xs">
+                      Manual webhooks
+                    </span>
+                  </div>
+                </div>
+                <div className="mt-4 flex justify-end">
+                  <Button
+                    variant={
+                      selectedProvider === 'generic' ? 'default' : 'ghost'
+                    }
+                    className="gap-2"
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      handleProviderSelect('generic')
+                    }}
+                  >
+                    Select Other
                     <ArrowRight className="h-4 w-4" />
                   </Button>
                 </div>
@@ -2018,6 +2425,467 @@ export function GitProviderFlow({
               ) : (
                 <>
                   Add GitLab OAuth Provider
+                  <CheckCircle2 className="ml-2 h-4 w-4" />
+                </>
+              )}
+            </Button>
+          </div>
+        </>
+      )}
+
+      {/* Step: Configure Gitea PAT */}
+      {currentStep === 'configure-gitea-pat' && (
+        <>
+          <div className="text-center px-2">
+            <p className="text-sm sm:text-base text-muted-foreground">
+              Enter your Gitea instance URL and personal access token
+            </p>
+          </div>
+
+          <Card>
+            <CardContent className="pt-6 space-y-4">
+              <div>
+                <Label htmlFor="provider-name">
+                  Connection Name (Optional)
+                </Label>
+                <Input
+                  id="provider-name"
+                  value={providerName}
+                  onChange={(e) => setProviderName(e.target.value)}
+                  placeholder="Gitea"
+                  className="mt-1"
+                />
+                <p className="text-xs text-muted-foreground mt-1">
+                  A friendly name to identify this connection
+                </p>
+              </div>
+
+              <div>
+                <Label htmlFor="gitea-url">Gitea Base URL</Label>
+                <Input
+                  id="gitea-url"
+                  type="url"
+                  value={giteaBaseUrl}
+                  onChange={(e) => setGiteaBaseUrl(e.target.value)}
+                  placeholder="https://git.example.com"
+                  className="mt-1"
+                />
+                <p className="text-xs text-muted-foreground mt-1">
+                  The HTTPS URL of your self-hosted Gitea instance
+                </p>
+              </div>
+
+              <div>
+                <Label htmlFor="gitea-pat">Personal Access Token</Label>
+                <Input
+                  id="gitea-pat"
+                  type="password"
+                  value={patToken}
+                  onChange={(e) => setPatToken(e.target.value)}
+                  placeholder="Enter your Gitea token"
+                  className="mt-1 font-mono"
+                />
+                <p className="text-xs text-muted-foreground mt-1">
+                  Token needs the{' '}
+                  <code className="px-1 py-0.5 bg-muted rounded text-xs">
+                    repository
+                  </code>{' '}
+                  scope
+                </p>
+              </div>
+
+              <Alert>
+                <Shield className="h-4 w-4" />
+                <AlertDescription>
+                  Your token will be encrypted and stored securely. We&apos;ll
+                  never display it again after this setup.
+                </AlertDescription>
+              </Alert>
+            </CardContent>
+          </Card>
+
+          <div className="flex items-center justify-between">
+            <Button variant="outline" onClick={handleBack}>
+              <ArrowLeft className="mr-2 h-4 w-4" />
+              Back
+            </Button>
+            <Button
+              onClick={handleGiteaSubmit}
+              disabled={!patToken || !giteaBaseUrl || createGiteaPAT.isPending}
+            >
+              {createGiteaPAT.isPending ? (
+                <>
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  Connecting...
+                </>
+              ) : (
+                <>
+                  Add Gitea Provider
+                  <CheckCircle2 className="ml-2 h-4 w-4" />
+                </>
+              )}
+            </Button>
+          </div>
+        </>
+      )}
+
+      {/* Step: Configure Bitbucket */}
+      {currentStep === 'configure-bitbucket' && (
+        <>
+          <div className="text-center px-2">
+            <p className="text-sm sm:text-base text-muted-foreground">
+              Choose how to authenticate with Bitbucket Cloud
+            </p>
+          </div>
+
+          <Card>
+            <CardContent className="pt-6 space-y-4">
+              <div>
+                <Label htmlFor="provider-name">
+                  Connection Name (Optional)
+                </Label>
+                <Input
+                  id="provider-name"
+                  value={providerName}
+                  onChange={(e) => setProviderName(e.target.value)}
+                  placeholder="Bitbucket"
+                  className="mt-1"
+                />
+                <p className="text-xs text-muted-foreground mt-1">
+                  A friendly name to identify this connection
+                </p>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <Card
+                  className={cn(
+                    'cursor-pointer transition-all',
+                    bitbucketAuthMethod === 'access_token' &&
+                      'ring-2 ring-primary border-primary',
+                    bitbucketAuthMethod !== 'access_token' &&
+                      'hover:border-muted-foreground/50'
+                  )}
+                  onClick={() => setBitbucketAuthMethod('access_token')}
+                >
+                  <CardHeader className="pb-3">
+                    <div className="flex items-center gap-2">
+                      <Key className="h-5 w-5" />
+                      <CardTitle className="text-base">Access Token</CardTitle>
+                      {bitbucketAuthMethod === 'access_token' && (
+                        <CheckCircle2 className="h-4 w-4 text-primary ml-auto" />
+                      )}
+                    </div>
+                    <CardDescription className="text-xs">
+                      Repository, project, or workspace access token
+                    </CardDescription>
+                  </CardHeader>
+                </Card>
+
+                <Card
+                  className={cn(
+                    'cursor-pointer transition-all',
+                    bitbucketAuthMethod === 'app_password' &&
+                      'ring-2 ring-primary border-primary',
+                    bitbucketAuthMethod !== 'app_password' &&
+                      'hover:border-muted-foreground/50'
+                  )}
+                  onClick={() => setBitbucketAuthMethod('app_password')}
+                >
+                  <CardHeader className="pb-3">
+                    <div className="flex items-center gap-2">
+                      <Lock className="h-5 w-5" />
+                      <CardTitle className="text-base">App Password</CardTitle>
+                      {bitbucketAuthMethod === 'app_password' && (
+                        <CheckCircle2 className="h-4 w-4 text-primary ml-auto" />
+                      )}
+                    </div>
+                    <CardDescription className="text-xs">
+                      Username plus an app password
+                    </CardDescription>
+                  </CardHeader>
+                </Card>
+              </div>
+
+              {bitbucketAuthMethod === 'app_password' && (
+                <div>
+                  <Label htmlFor="bitbucket-username">Username</Label>
+                  <Input
+                    id="bitbucket-username"
+                    value={bitbucketUsername}
+                    onChange={(e) => setBitbucketUsername(e.target.value)}
+                    placeholder="your-bitbucket-username"
+                    className="mt-1"
+                  />
+                  <p className="text-xs text-muted-foreground mt-1">
+                    Your Bitbucket account username
+                  </p>
+                </div>
+              )}
+
+              <div>
+                <Label htmlFor="bitbucket-token">
+                  {bitbucketAuthMethod === 'access_token'
+                    ? 'Access Token'
+                    : 'App Password'}
+                </Label>
+                <Input
+                  id="bitbucket-token"
+                  type="password"
+                  value={patToken}
+                  onChange={(e) => setPatToken(e.target.value)}
+                  placeholder={
+                    bitbucketAuthMethod === 'access_token'
+                      ? 'Enter your access token'
+                      : 'Enter your app password'
+                  }
+                  className="mt-1 font-mono"
+                />
+                <p className="text-xs text-muted-foreground mt-1">
+                  {bitbucketAuthMethod === 'access_token'
+                    ? 'Requires repository read and webhook permissions'
+                    : 'Create one under Personal settings → App passwords'}
+                </p>
+              </div>
+
+              <Alert className="border-blue-200 bg-blue-50/50 dark:bg-blue-950/20">
+                <Info className="h-4 w-4 text-blue-600" />
+                <AlertDescription className="text-sm">
+                  A webhook will be automatically registered on your Bitbucket
+                  repositories once the provider is connected.
+                </AlertDescription>
+              </Alert>
+
+              <Alert>
+                <Shield className="h-4 w-4" />
+                <AlertDescription>
+                  Your credentials will be encrypted and stored securely.
+                  We&apos;ll never display them again after this setup.
+                </AlertDescription>
+              </Alert>
+            </CardContent>
+          </Card>
+
+          <div className="flex items-center justify-between">
+            <Button variant="outline" onClick={handleBack}>
+              <ArrowLeft className="mr-2 h-4 w-4" />
+              Back
+            </Button>
+            <Button
+              onClick={handleBitbucketSubmit}
+              disabled={
+                !patToken ||
+                (bitbucketAuthMethod === 'app_password' &&
+                  !bitbucketUsername) ||
+                createBitbucket.isPending
+              }
+            >
+              {createBitbucket.isPending ? (
+                <>
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  Connecting...
+                </>
+              ) : (
+                <>
+                  Add Bitbucket Provider
+                  <CheckCircle2 className="ml-2 h-4 w-4" />
+                </>
+              )}
+            </Button>
+          </div>
+        </>
+      )}
+
+      {/* Step: Configure Generic / Other Git Providers */}
+      {currentStep === 'configure-generic' && (
+        <>
+          <div className="text-center px-2">
+            <p className="text-sm sm:text-base text-muted-foreground">
+              Connect any Git repository by its clone URL
+            </p>
+          </div>
+
+          <Card>
+            <CardContent className="pt-6 space-y-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <Card
+                  className={cn(
+                    'cursor-pointer transition-all',
+                    genericMode === 'public' &&
+                      'ring-2 ring-primary border-primary',
+                    genericMode !== 'public' &&
+                      'hover:border-muted-foreground/50'
+                  )}
+                  onClick={() => setGenericMode('public')}
+                >
+                  <CardHeader className="pb-3">
+                    <div className="flex items-center gap-2">
+                      <Globe className="h-5 w-5" />
+                      <CardTitle className="text-base">
+                        Public repository
+                      </CardTitle>
+                      {genericMode === 'public' && (
+                        <CheckCircle2 className="h-4 w-4 text-primary ml-auto" />
+                      )}
+                    </div>
+                    <CardDescription className="text-xs">
+                      Clone URL only, no authentication
+                    </CardDescription>
+                  </CardHeader>
+                </Card>
+
+                <Card
+                  className={cn(
+                    'cursor-pointer transition-all',
+                    genericMode === 'private' &&
+                      'ring-2 ring-primary border-primary',
+                    genericMode !== 'private' &&
+                      'hover:border-muted-foreground/50'
+                  )}
+                  onClick={() => setGenericMode('private')}
+                >
+                  <CardHeader className="pb-3">
+                    <div className="flex items-center gap-2">
+                      <Lock className="h-5 w-5" />
+                      <CardTitle className="text-base">
+                        Private (HTTPS token)
+                      </CardTitle>
+                      {genericMode === 'private' && (
+                        <CheckCircle2 className="h-4 w-4 text-primary ml-auto" />
+                      )}
+                    </div>
+                    <CardDescription className="text-xs">
+                      Clone URL with a token for access
+                    </CardDescription>
+                  </CardHeader>
+                </Card>
+              </div>
+
+              <div>
+                <Label htmlFor="provider-name">
+                  Connection Name (Optional)
+                </Label>
+                <Input
+                  id="provider-name"
+                  value={providerName}
+                  onChange={(e) => setProviderName(e.target.value)}
+                  placeholder="Other Git Provider"
+                  className="mt-1"
+                />
+                <p className="text-xs text-muted-foreground mt-1">
+                  A friendly name to identify this connection
+                </p>
+              </div>
+
+              <div>
+                <Label htmlFor="generic-clone-url">Clone URL</Label>
+                <Input
+                  id="generic-clone-url"
+                  type="url"
+                  value={genericCloneUrl}
+                  onChange={(e) => setGenericCloneUrl(e.target.value)}
+                  placeholder="https://git.example.com/owner/repo.git"
+                  className="mt-1 font-mono"
+                />
+                <p className="text-xs text-muted-foreground mt-1">
+                  The HTTPS clone URL of the repository
+                </p>
+              </div>
+
+              <div>
+                <Label htmlFor="generic-base-url">Base URL (Optional)</Label>
+                <Input
+                  id="generic-base-url"
+                  type="url"
+                  value={genericBaseUrl}
+                  onChange={(e) => setGenericBaseUrl(e.target.value)}
+                  placeholder="https://git.example.com"
+                  className="mt-1"
+                />
+                <p className="text-xs text-muted-foreground mt-1">
+                  The base URL of the Git host, if different from the clone URL
+                </p>
+              </div>
+
+              {genericMode === 'private' && (
+                <>
+                  <div>
+                    <Label htmlFor="generic-token-username">
+                      Token Username (Optional)
+                    </Label>
+                    <Input
+                      id="generic-token-username"
+                      value={genericTokenUsername}
+                      onChange={(e) => setGenericTokenUsername(e.target.value)}
+                      placeholder="x-access-token"
+                      className="mt-1 font-mono"
+                    />
+                    <p className="text-xs text-muted-foreground mt-1">
+                      Defaults to{' '}
+                      <code className="px-1 py-0.5 bg-muted rounded text-xs">
+                        x-access-token
+                      </code>{' '}
+                      if left blank
+                    </p>
+                  </div>
+
+                  <div>
+                    <Label htmlFor="generic-token">Access Token</Label>
+                    <Input
+                      id="generic-token"
+                      type="password"
+                      value={patToken}
+                      onChange={(e) => setPatToken(e.target.value)}
+                      placeholder="Enter your access token"
+                      className="mt-1 font-mono"
+                    />
+                    <p className="text-xs text-muted-foreground mt-1">
+                      Used to authenticate over HTTPS when cloning
+                    </p>
+                  </div>
+                </>
+              )}
+
+              <Alert className="border-blue-200 bg-blue-50/50 dark:bg-blue-950/20">
+                <Server className="h-4 w-4 text-blue-600" />
+                <AlertDescription className="text-sm">
+                  Webhooks for generic providers are not registered
+                  automatically. After connecting, open the provider&apos;s
+                  detail page to find the webhook URL to add manually on your Git
+                  host.
+                </AlertDescription>
+              </Alert>
+
+              <Alert>
+                <Shield className="h-4 w-4" />
+                <AlertDescription>
+                  Any token will be encrypted and stored securely. We&apos;ll
+                  never display it again after this setup.
+                </AlertDescription>
+              </Alert>
+            </CardContent>
+          </Card>
+
+          <div className="flex items-center justify-between">
+            <Button variant="outline" onClick={handleBack}>
+              <ArrowLeft className="mr-2 h-4 w-4" />
+              Back
+            </Button>
+            <Button
+              onClick={handleGenericSubmit}
+              disabled={
+                !genericCloneUrl ||
+                (genericMode === 'private' && !patToken) ||
+                createGeneric.isPending
+              }
+            >
+              {createGeneric.isPending ? (
+                <>
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  Connecting...
+                </>
+              ) : (
+                <>
+                  Add Provider
                   <CheckCircle2 className="ml-2 h-4 w-4" />
                 </>
               )}

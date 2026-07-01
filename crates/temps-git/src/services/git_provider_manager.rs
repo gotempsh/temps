@@ -776,6 +776,8 @@ impl GitProviderManager {
         // Bitbucket etc. this needs updating.
         let username = match provider.provider_type.as_str() {
             "gitlab" => "oauth2",
+            "gitea" => "x-access-token",
+            "bitbucket" => "x-token-auth",
             _ => "x-access-token",
         }
         .to_string();
@@ -1241,6 +1243,266 @@ impl GitProviderManager {
             );
             // Don't fail the provider creation if sync can't be kicked off.
         }
+
+        Ok(provider)
+    }
+
+    /// Create a git provider entry for a Gitea PAT connection.
+    ///
+    /// # Arguments
+    /// * `name` — display name for the provider
+    /// * `pat_token` — Gitea personal access token
+    /// * `user_id` — ID of the Temps user creating the connection
+    /// * `base_url` — HTTPS base URL of the Gitea instance, e.g.
+    ///   `https://git.example.com`. MUST already be validated with
+    ///   `validate_git_url` by the calling handler (MUST-FIX 4).
+    pub async fn create_gitea_pat_provider(
+        &self,
+        name: String,
+        pat_token: String,
+        user_id: i32,
+        base_url: String,
+    ) -> Result<git_providers::Model, GitProviderManagerError> {
+        // MUST-FIX 4: validate the base_url with HTTPS-only validate_git_url,
+        // not validate_external_url (which permits plaintext http).
+        temps_core::url_validation::validate_git_url(&base_url).map_err(|e| {
+            GitProviderManagerError::InvalidConfiguration(format!(
+                "Gitea base_url failed HTTPS validation: {}",
+                e
+            ))
+        })?;
+
+        let auth_method = AuthMethod::PersonalAccessToken {
+            token: pat_token.clone(),
+        };
+
+        let api_url = format!("{}/api/v1", base_url.trim_end_matches('/'));
+
+        let provider = self
+            .create_provider(
+                name,
+                GitProviderType::Gitea,
+                auth_method.clone(),
+                Some(base_url.clone()),
+                Some(api_url.clone()),
+                None,
+                false,
+            )
+            .await?;
+
+        // Resolve the Gitea username via the PAT before creating the connection.
+        let provider_service = GitProviderFactory::create_provider(
+            GitProviderType::Gitea,
+            auth_method,
+            Some(base_url),
+            Some(api_url),
+            self.db.clone(),
+        )
+        .await?;
+
+        let user_info = provider_service.get_user(&pat_token).await?;
+
+        let connection = self
+            .create_connection(
+                provider.id,
+                user_id,
+                user_info.username,
+                "User".to_string(),
+                Some(pat_token),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await?;
+
+        // Kick off background repository sync.
+        let manager = Arc::new(self.clone());
+        if let Err(e) = manager.spawn_sync_repositories(connection.id).await {
+            tracing::warn!(
+                "Failed to start background sync for Gitea PAT connection {}: {}",
+                connection.id,
+                e
+            );
+        }
+
+        Ok(provider)
+    }
+
+    /// Create a Bitbucket Cloud provider with PAT (Repository/Workspace Access Token)
+    /// or App Password authentication.
+    ///
+    /// Unlike `create_gitea_pat_provider`, there is no user-supplied `base_url` —
+    /// Bitbucket Cloud's API base is the fixed constant `https://api.bitbucket.org/2.0`.
+    ///
+    /// A `bitbucket_webhook_token` is generated at creation time and stored encrypted
+    /// in the returned provider model. The UI surfaces the webhook URL:
+    /// `{temps_url}/api/webhook/git/bitbucket/events/{token}` for the user to
+    /// configure manually in Bitbucket (auto-registration is deferred to v1.5).
+    pub async fn create_bitbucket_provider(
+        &self,
+        name: String,
+        auth_method: AuthMethod,
+        user_id: i32,
+    ) -> Result<git_providers::Model, GitProviderManagerError> {
+        let provider = self
+            .create_provider(
+                name,
+                GitProviderType::Bitbucket,
+                auth_method.clone(),
+                // base_url and api_url are fixed for Bitbucket Cloud.
+                Some("https://bitbucket.org".to_string()),
+                Some("https://api.bitbucket.org/2.0".to_string()),
+                None,
+                false,
+            )
+            .await?;
+
+        // Resolve the Bitbucket user info to populate the connection account name.
+        let provider_service = GitProviderFactory::create_provider(
+            GitProviderType::Bitbucket,
+            auth_method.clone(),
+            Some("https://bitbucket.org".to_string()),
+            Some("https://api.bitbucket.org/2.0".to_string()),
+            self.db.clone(),
+        )
+        .await?;
+
+        // Use a dummy token string for get_user — BitbucketProvider uses auth_method
+        // directly and ignores the access_token parameter.
+        let user_info = provider_service.get_user("").await?;
+
+        let access_token = match &auth_method {
+            AuthMethod::PersonalAccessToken { token } => Some(token.clone()),
+            AuthMethod::BasicAuth { password, .. } => Some(password.clone()),
+            _ => None,
+        };
+
+        let connection = self
+            .create_connection(
+                provider.id,
+                user_id,
+                user_info.username,
+                "User".to_string(),
+                access_token,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await?;
+
+        // Kick off background repository sync.
+        let manager = std::sync::Arc::new(self.clone());
+        if let Err(e) = manager.spawn_sync_repositories(connection.id).await {
+            tracing::warn!(
+                "Failed to start background sync for Bitbucket connection {}: {}",
+                connection.id,
+                e
+            );
+        }
+
+        Ok(provider)
+    }
+
+    /// Create a Generic/Manual git provider connection.
+    ///
+    /// Supports two v1 modes:
+    /// - **Mode A — Public repository:** `token_opt` is `None` → clones without
+    ///   credentials via `git_ops::clone_repo`.
+    /// - **Mode B — Private HTTPS token:** `token_opt` is `Some(token)` →
+    ///   clones via `git_ops::clone_repo_with_credentials`. The `token_username`
+    ///   parameter sets the HTTP Basic username (default `x-access-token`).
+    ///
+    /// # Security (MUST-FIX 4)
+    /// `clone_url` is validated with the HTTPS-only `validate_git_url` at
+    /// create time. The clone path re-validates independently (defense-in-depth).
+    ///
+    /// A `generic_webhook_token` is generated at creation time and stored
+    /// encrypted in the returned provider model. The UI surfaces the webhook
+    /// URL: `{temps_url}/api/webhook/git/generic/events/{token}` for the user
+    /// to configure manually in their git host.
+    pub async fn create_generic_provider(
+        &self,
+        name: String,
+        clone_url: String,
+        token_username: String,
+        token_opt: Option<String>,
+        base_url_opt: Option<String>,
+        user_id: i32,
+    ) -> Result<git_providers::Model, GitProviderManagerError> {
+        // MUST-FIX 4: validate clone_url with HTTPS-only validate_git_url
+        // at create time.
+        temps_core::url_validation::validate_git_url(&clone_url).map_err(|e| {
+            GitProviderManagerError::InvalidConfiguration(format!(
+                "Generic provider clone_url failed HTTPS validation: {}",
+                e
+            ))
+        })?;
+
+        let auth_method = match &token_opt {
+            Some(token) if !token_username.is_empty() => AuthMethod::BasicAuth {
+                username: token_username.clone(),
+                password: token.clone(),
+            },
+            Some(token) => AuthMethod::PersonalAccessToken {
+                token: token.clone(),
+            },
+            None => {
+                // Mode A: public repo — use a placeholder OAuth to signal "no creds"
+                // The GenericProvider inspects the auth_method and falls through to
+                // credential_string() returning None.
+                AuthMethod::OAuth {
+                    client_id: String::new(),
+                    client_secret: String::new(),
+                    redirect_uri: String::new(),
+                }
+            }
+        };
+
+        let provider = self
+            .create_provider(
+                name,
+                GitProviderType::Generic,
+                auth_method.clone(),
+                base_url_opt,
+                None, // api_url: Generic has no REST API
+                None, // webhook_secret: Generic uses secret-in-path, stored on the project
+                false,
+            )
+            .await?;
+
+        // Generic providers have no user API — use the clone_url host as the
+        // account name for display purposes.
+        let account_name = reqwest::Url::parse(&clone_url)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.to_string()))
+            .unwrap_or_else(|| "generic".to_string());
+
+        // Store clone_url and token_username in connection metadata JSON so that
+        // the clone path can retrieve them (ADR Decision 1c).
+        let connection_metadata = serde_json::json!({
+            "clone_url": clone_url,
+            "token_username": token_username,
+        });
+
+        let access_token = token_opt.clone();
+
+        let _connection = self
+            .create_connection(
+                provider.id,
+                user_id,
+                account_name,
+                "User".to_string(),
+                access_token,
+                None,
+                None,
+                Some(connection_metadata),
+                None,
+            )
+            .await?;
+
+        // Generic providers do not support repository sync — no spawn_sync_repositories call.
 
         Ok(provider)
     }
@@ -2276,9 +2538,36 @@ impl GitProviderManager {
 
                 Ok((auth_url, state))
             }
-            _ => Err(GitProviderManagerError::ProviderError(
-                GitProviderError::NotImplemented,
-            )),
+            GitProviderType::Gitea => {
+                // Gitea does not support OAuth in v1. Each Gitea instance
+                // requires its own OAuth app registration and there is no
+                // central store. Use a Personal Access Token instead:
+                // Settings > Applications > Access Tokens.
+                Err(GitProviderManagerError::InvalidConfiguration(
+                    "Gitea does not support OAuth in v1. \
+                     Please create a Personal Access Token in your Gitea instance \
+                     at Settings > Applications > Access Tokens and use the PAT flow."
+                        .to_string(),
+                ))
+            }
+            GitProviderType::Bitbucket => {
+                // Bitbucket Cloud OAuth deferred to v2. Use Repository/Workspace
+                // Access Tokens (RATs/WATs) or App Passwords via the PAT flow.
+                Err(GitProviderManagerError::InvalidConfiguration(
+                    "Bitbucket OAuth is not yet supported. \
+                     Please use a Repository Access Token (RAT) or App Password \
+                     from Bitbucket > Repository settings > Access tokens."
+                        .to_string(),
+                ))
+            }
+            GitProviderType::Generic => {
+                // Generic/Manual providers do not support OAuth by definition.
+                Err(GitProviderManagerError::InvalidConfiguration(
+                    "Manual/Generic git providers do not support OAuth. \
+                     Configure the clone URL and an optional HTTPS token instead."
+                        .to_string(),
+                ))
+            }
         }
     }
 

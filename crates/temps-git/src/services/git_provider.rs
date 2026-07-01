@@ -794,16 +794,24 @@ impl GitProviderFactory {
                 Ok(Box::new(GitLabProvider::new(base_url, auth_method)))
             }
             GitProviderType::Bitbucket => {
-                // Future implementation
-                Err(GitProviderError::NotImplemented)
+                use crate::services::bitbucket_provider::BitbucketProvider;
+                Ok(Box::new(BitbucketProvider::new(auth_method)))
             }
             GitProviderType::Gitea => {
-                // Future implementation
-                Err(GitProviderError::NotImplemented)
+                use crate::services::gitea_provider::GiteaProvider;
+                let url = base_url.ok_or_else(|| {
+                    GitProviderError::InvalidConfiguration(
+                        "Gitea provider requires a base_url \
+                         (e.g. https://git.example.com). \
+                         Validate with HTTPS before passing here."
+                            .to_string(),
+                    )
+                })?;
+                Ok(Box::new(GiteaProvider::new(url, auth_method)))
             }
             GitProviderType::Generic => {
-                // Future implementation for generic git servers
-                Err(GitProviderError::NotImplemented)
+                use crate::services::generic_provider::GenericProvider;
+                Ok(Box::new(GenericProvider::new(base_url, auth_method)))
             }
         }
     }

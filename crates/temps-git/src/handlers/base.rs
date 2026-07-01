@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use temps_auth::{permission_check, Permission, RequireAuth};
+use tracing::info;
 
 use temps_core::problemdetails::{new as problem_new, Problem};
 use temps_core::UtcDateTime;
@@ -228,6 +229,59 @@ pub struct CreateGitLabOAuthRequest {
     pub client_id: String,
     pub client_secret: String,
     pub redirect_uri: String,
+    pub base_url: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct CreateGiteaPATRequest {
+    /// Display name for this provider.
+    pub name: String,
+    /// Personal access token issued by the Gitea instance.
+    pub token: String,
+    /// HTTPS base URL of the Gitea instance, e.g. `https://git.example.com`.
+    pub base_url: String,
+}
+
+/// Authentication input for a Bitbucket Cloud provider. Use `access_token` for
+/// a Repository or Workspace Access Token (PAT), or `username` + `app_password`
+/// for App Password (HTTP Basic) authentication.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BitbucketAuthInput {
+    /// Personal / Workspace / Repository Access Token.
+    AccessToken {
+        /// The Bitbucket access token value.
+        token: String,
+    },
+    /// HTTP Basic / App Password authentication.
+    AppPassword {
+        /// Bitbucket account username.
+        username: String,
+        /// App password generated in Bitbucket security settings.
+        password: String,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct CreateBitbucketRequest {
+    /// Display name for this provider.
+    pub name: String,
+    /// Authentication credentials — either an access token or an app password.
+    pub auth: BitbucketAuthInput,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct CreateGenericRequest {
+    /// Display name for this provider.
+    pub name: String,
+    /// HTTPS clone URL for the repository, e.g. `https://git.example.com/org/repo.git`.
+    pub clone_url: String,
+    /// HTTP Basic username used with the token. Defaults to `x-access-token` when
+    /// absent or empty. Ignored for public (unauthenticated) repositories.
+    pub token_username: Option<String>,
+    /// Access token or password. Omit (or set to `null`) for public repositories.
+    pub token: Option<String>,
+    /// Optional base URL of the git host for display purposes (no API is called).
     pub base_url: Option<String>,
 }
 
@@ -1409,6 +1463,9 @@ pub fn configure_routes() -> axum::Router<Arc<AppState>> {
             "/git-providers/gitlab/oauth",
             post(create_gitlab_oauth_provider),
         )
+        .route("/git-providers/gitea/pat", post(create_gitea_pat_provider))
+        .route("/git-providers/bitbucket", post(create_bitbucket_provider))
+        .route("/git-providers/generic", post(create_generic_provider))
         .route(
             "/git-providers/{provider_id}/credentials",
             patch(update_git_provider_credentials),
@@ -1740,6 +1797,9 @@ fn parse_auth_method(method_type: &str, config: serde_json::Value) -> Result<Aut
         create_github_pat_provider,
         create_gitlab_pat_provider,
         create_gitlab_oauth_provider,
+        create_gitea_pat_provider,
+        create_bitbucket_provider,
+        create_generic_provider,
         update_git_provider_credentials,
         delete_git_provider,
         check_provider_deletion_safety,
@@ -1770,6 +1830,10 @@ fn parse_auth_method(method_type: &str, config: serde_json::Value) -> Result<Aut
             CreateGitHubPATRequest,
             CreateGitLabPATRequest,
             CreateGitLabOAuthRequest,
+            CreateGiteaPATRequest,
+            BitbucketAuthInput,
+            CreateBitbucketRequest,
+            CreateGenericRequest,
             UpdateProviderCredentialsRequest,
             ProjectUsageInfoResponse,
             ProviderDeletionCheckResponse,
@@ -1918,6 +1982,226 @@ pub async fn create_gitlab_oauth_provider(
             request.base_url,
         )
         .await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(ProviderResponse {
+            id: provider.id,
+            name: provider.name,
+            provider_type: provider.provider_type,
+            base_url: provider.base_url,
+            auth_method: provider.auth_method,
+            is_active: provider.is_active,
+            is_default: provider.is_default,
+            created_at: provider.created_at,
+            updated_at: provider.updated_at,
+        }),
+    ))
+}
+
+/// Create a Gitea Personal Access Token provider
+#[utoipa::path(
+    post,
+    path = "/git-providers/gitea/pat",
+    request_body = CreateGiteaPATRequest,
+    responses(
+        (status = 201, description = "Gitea PAT provider created successfully", body = ProviderResponse),
+        (status = 400, description = "Bad request — invalid URL or missing fields"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = "Git Providers",
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+pub async fn create_gitea_pat_provider(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(auth): RequireAuth,
+    Json(request): Json<CreateGiteaPATRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_check!(auth, Permission::GitProvidersCreate);
+
+    // HIGH security fix: validate base_url is HTTPS-only at the handler layer.
+    // reject_ssrf_url (validate_external_url) permits http://; we need the
+    // stricter validate_git_url which also enforces HTTPS.  We do NOT change
+    // reject_ssrf_url globally because GitLab/GitHub use it for api_url too.
+    if let Err(e) = temps_core::url_validation::validate_git_url(&request.base_url) {
+        return Err(problem_new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Gitea URL")
+            .with_detail(format!(
+                "base_url '{}' must be an HTTPS URL: {}",
+                temps_core::url_validation::redact_url_password(&request.base_url),
+                e
+            )));
+    }
+    // SSRF guard: also reject RFC1918 / loopback / metadata addresses.
+    reject_ssrf_url("base_url", Some(&request.base_url))?;
+
+    let user_id = auth.user_id();
+
+    let provider = state
+        .git_provider_manager
+        .create_gitea_pat_provider(
+            request.name.clone(),
+            request.token,
+            user_id,
+            request.base_url,
+        )
+        .await?;
+
+    info!(
+        provider_id = provider.id,
+        provider_name = %provider.name,
+        user_id = user_id,
+        "Gitea PAT provider created"
+    );
+
+    Ok((
+        StatusCode::CREATED,
+        Json(ProviderResponse {
+            id: provider.id,
+            name: provider.name,
+            provider_type: provider.provider_type,
+            base_url: provider.base_url,
+            auth_method: provider.auth_method,
+            is_active: provider.is_active,
+            is_default: provider.is_default,
+            created_at: provider.created_at,
+            updated_at: provider.updated_at,
+        }),
+    ))
+}
+
+/// Create a Bitbucket Cloud provider with access token or app password authentication
+#[utoipa::path(
+    post,
+    path = "/git-providers/bitbucket",
+    request_body = CreateBitbucketRequest,
+    responses(
+        (status = 201, description = "Bitbucket provider created successfully", body = ProviderResponse),
+        (status = 400, description = "Bad request — missing or invalid auth fields"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = "Git Providers",
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+pub async fn create_bitbucket_provider(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(auth): RequireAuth,
+    Json(request): Json<CreateBitbucketRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_check!(auth, Permission::GitProvidersCreate);
+
+    let user_id = auth.user_id();
+
+    let auth_method = match request.auth {
+        BitbucketAuthInput::AccessToken { token } => AuthMethod::PersonalAccessToken { token },
+        BitbucketAuthInput::AppPassword { username, password } => {
+            AuthMethod::BasicAuth { username, password }
+        }
+    };
+
+    let provider = state
+        .git_provider_manager
+        .create_bitbucket_provider(request.name.clone(), auth_method, user_id)
+        .await?;
+
+    info!(
+        provider_id = provider.id,
+        provider_name = %provider.name,
+        user_id = user_id,
+        "Bitbucket provider created"
+    );
+
+    Ok((
+        StatusCode::CREATED,
+        Json(ProviderResponse {
+            id: provider.id,
+            name: provider.name,
+            provider_type: provider.provider_type,
+            base_url: provider.base_url,
+            auth_method: provider.auth_method,
+            is_active: provider.is_active,
+            is_default: provider.is_default,
+            created_at: provider.created_at,
+            updated_at: provider.updated_at,
+        }),
+    ))
+}
+
+/// Create a Generic git provider for self-hosted or arbitrary HTTPS git hosts.
+/// Supports public repositories (no token) and private repositories (token-based).
+#[utoipa::path(
+    post,
+    path = "/git-providers/generic",
+    request_body = CreateGenericRequest,
+    responses(
+        (status = 201, description = "Generic git provider created successfully", body = ProviderResponse),
+        (status = 400, description = "Bad request — invalid clone URL or missing fields"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = "Git Providers",
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+pub async fn create_generic_provider(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(auth): RequireAuth,
+    Json(request): Json<CreateGenericRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_check!(auth, Permission::GitProvidersCreate);
+
+    // HIGH security fix: validate clone_url is HTTPS-only at the handler
+    // layer. The service also validates, but defense-in-depth ensures the
+    // 400 is returned here with a clear message before any service call.
+    if let Err(e) = temps_core::url_validation::validate_git_url(&request.clone_url) {
+        return Err(problem_new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Clone URL")
+            .with_detail(format!(
+                "clone_url '{}' must be an HTTPS URL: {}",
+                temps_core::url_validation::redact_url_password(&request.clone_url),
+                e
+            )));
+    }
+    // SSRF guard: also reject RFC1918 / loopback / metadata addresses for
+    // the optional base_url.
+    reject_ssrf_url("base_url", request.base_url.as_ref())?;
+
+    let user_id = auth.user_id();
+
+    // Default token_username to "x-access-token" when absent or empty.
+    let token_username = match request.token_username.as_deref() {
+        Some(u) if !u.is_empty() => u.to_string(),
+        _ => "x-access-token".to_string(),
+    };
+
+    let provider = state
+        .git_provider_manager
+        .create_generic_provider(
+            request.name.clone(),
+            request.clone_url,
+            token_username,
+            request.token,
+            request.base_url,
+            user_id,
+        )
+        .await?;
+
+    info!(
+        provider_id = provider.id,
+        provider_name = %provider.name,
+        user_id = user_id,
+        "Generic git provider created"
+    );
 
     Ok((
         StatusCode::CREATED,

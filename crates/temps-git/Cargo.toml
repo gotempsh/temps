@@ -9,6 +9,16 @@ homepage.workspace = true
 
 [dev-dependencies]
 mockito = "1.5"
+bollard = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+tempfile = "3.10"
+tokio = { workspace = true }
+hmac = "0.12.1"
+sha2 = { workspace = true }
+hex = { workspace = true }
+base64 = "0.22"
+futures = { workspace = true }
 
 [dependencies]
 temps-auth = { path = "../temps-auth" }
@@ -52,3 +62,4 @@ flate2 = "1.0"
 tar = "0.4.45"
 tempfile = "3.10"
 rand = { workspace = true }
+subtle = "2.6.1"

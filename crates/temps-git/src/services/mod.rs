@@ -1,11 +1,14 @@
+pub mod bitbucket_provider;
 pub mod cache;
 pub mod connection_health;
+pub mod generic_provider;
 pub mod git_ops;
 pub mod git_provider;
 pub mod git_provider_manager;
 pub mod git_provider_manager_trait;
 pub mod git_repository_api;
 pub mod git_service;
+pub mod gitea_provider;
 pub mod github;
 pub mod github_provider;
 pub mod gitlab_provider;

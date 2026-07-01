@@ -37,7 +37,9 @@ import {
   ChevronRight,
   EllipsisVertical,
   GitBranch,
+  GitFork,
   GithubIcon,
+  Globe,
   Loader2,
   Plus,
   RefreshCw,
@@ -247,6 +249,10 @@ export function GitSources() {
             }) =>
               provider.provider_type === 'github' ? (
                 <GithubIcon className={className} />
+              ) : provider.provider_type === 'gitea' ? (
+                <GitFork className={className} />
+              ) : provider.provider_type === 'generic' ? (
+                <Globe className={className} />
               ) : (
                 <GitBranch className={className} />
               )
