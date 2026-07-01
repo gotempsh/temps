@@ -5,6 +5,9 @@ import {
   listGitProviders,
   createGithubPatProvider,
   createGitlabPatProvider,
+  createGiteaPatProvider,
+  createBitbucketProvider,
+  createGenericProvider,
   deleteGitProvider,
   getGitProvider,
   listSyncedRepositories,
@@ -33,6 +36,12 @@ interface AddOptions {
   name?: string
   token?: string
   baseUrl?: string
+  // Bitbucket app-password auth
+  username?: string
+  password?: string
+  // Generic (Other) HTTPS provider
+  cloneUrl?: string
+  tokenUsername?: string
   yes?: boolean
 }
 
@@ -52,6 +61,10 @@ interface ConnectOptions {
   name?: string
   token?: string
   baseUrl?: string
+  username?: string
+  password?: string
+  cloneUrl?: string
+  tokenUsername?: string
   yes?: boolean
 }
 
@@ -103,10 +116,14 @@ export function registerProvidersCommands(program: Command): void {
   providers
     .command('add')
     .description('Add a new Git provider')
-    .option('-p, --provider <provider>', 'Provider type (github, gitlab)')
+    .option('-p, --provider <provider>', 'Provider type (github, gitlab, bitbucket, gitea, generic)')
     .option('-n, --name <name>', 'Provider name')
-    .option('-t, --token <token>', 'Personal access token')
-    .option('--base-url <url>', 'GitLab base URL (for self-hosted GitLab)')
+    .option('-t, --token <token>', 'Personal access token (or Bitbucket access token / app password)')
+    .option('--base-url <url>', 'Instance base URL (GitLab/Gitea self-hosted; required for gitea)')
+    .option('--username <username>', 'Bitbucket username (selects app-password auth)')
+    .option('--password <password>', 'Bitbucket app password (used with --username)')
+    .option('--clone-url <url>', 'HTTPS clone URL (generic provider)')
+    .option('--token-username <username>', 'HTTP Basic username for the token (generic; default x-access-token)')
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .action(addProvider)
 
@@ -158,11 +175,15 @@ export function registerProvidersCommands(program: Command): void {
 
   git
     .command('connect')
-    .description('Connect a Git provider (github, gitlab)')
-    .requiredOption('-p, --provider <provider>', 'Provider type (github, gitlab)')
+    .description('Connect a Git provider (github, gitlab, bitbucket, gitea, generic)')
+    .requiredOption('-p, --provider <provider>', 'Provider type (github, gitlab, bitbucket, gitea, generic)')
     .option('-n, --name <name>', 'Provider name')
-    .option('-t, --token <token>', 'Personal access token')
-    .option('--base-url <url>', 'GitLab base URL (for self-hosted GitLab)')
+    .option('-t, --token <token>', 'Personal access token (or Bitbucket access token / app password)')
+    .option('--base-url <url>', 'Instance base URL (GitLab/Gitea self-hosted; required for gitea)')
+    .option('--username <username>', 'Bitbucket username (selects app-password auth)')
+    .option('--password <password>', 'Bitbucket app password (used with --username)')
+    .option('--clone-url <url>', 'HTTPS clone URL (generic provider)')
+    .option('--token-username <username>', 'HTTP Basic username for the token (generic; default x-access-token)')
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .action(connectGitProvider)
 
@@ -282,91 +303,120 @@ async function listProviders(options: { json?: boolean }): Promise<void> {
   newline()
 }
 
+const SUPPORTED_PROVIDERS = ['github', 'gitlab', 'bitbucket', 'gitea', 'generic']
+
 async function addProvider(options: AddOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  let provider: string
-  let name: string
-  let token: string
-  let baseUrl: string | null = null
+  const interactive = !options.yes
 
-  // Check if automation mode (all required params provided)
-  const isAutomation = options.yes && options.provider && options.name && options.token
-
-  if (isAutomation) {
-    provider = options.provider!
-    name = options.name!
-    token = options.token!
-    baseUrl = options.baseUrl || null
-
-    if (provider !== 'github' && provider !== 'gitlab') {
-      warning(`Invalid provider: ${provider}. Supported: github, gitlab`)
-      return
-    }
-  } else {
-    // Interactive mode
-    provider = options.provider || await promptSelect({
+  // 1. Provider
+  let provider = options.provider
+  if (!provider && interactive) {
+    provider = await promptSelect({
       message: 'Git provider',
       choices: [
         { name: 'GitHub', value: 'github' },
         { name: 'GitLab', value: 'gitlab' },
+        { name: 'Bitbucket', value: 'bitbucket' },
+        { name: 'Gitea / Forgejo', value: 'gitea' },
+        { name: 'Other Git Providers (generic HTTPS)', value: 'generic' },
       ],
     })
+  }
+  if (!provider || !SUPPORTED_PROVIDERS.includes(provider)) {
+    warning(`Invalid provider: ${provider}. Supported: ${SUPPORTED_PROVIDERS.join(', ')}`)
+    return
+  }
 
-    if (provider !== 'github' && provider !== 'gitlab') {
-      warning(`Invalid provider: ${provider}. Supported: github, gitlab`)
-      return
-    }
+  // 2. Name (shared by all providers)
+  const name = options.name || (interactive
+    ? await promptText({ message: 'Provider name', default: `${provider}-connection`, required: true })
+    : '')
+  if (!name) {
+    warning('Provider name is required (use -n/--name)')
+    return
+  }
 
-    info(`\nTo connect ${provider}, you'll need to create a personal access token.`)
-
-    const tokenUrl: Record<string, string> = {
-      github: 'https://github.com/settings/tokens/new',
-      gitlab: 'https://gitlab.com/-/profile/personal_access_tokens',
-    }
-
-    info(`Visit: ${colors.primary(tokenUrl[provider])}\n`)
-
-    name = options.name || await promptText({
-      message: 'Provider name',
-      default: `${provider}-connection`,
-      required: true,
-    })
-
-    token = options.token || await promptPassword({
-      message: 'Personal access token',
-    })
-
-    if (provider === 'gitlab') {
-      baseUrl = options.baseUrl || await promptText({
-        message: 'GitLab base URL (leave empty for gitlab.com)',
-        default: '',
-      }) || null
-    }
+  // Helper: prompt for a required PAT unless supplied
+  const getToken = async (): Promise<string> => {
+    const t = options.token || (interactive ? await promptPassword({ message: 'Personal access token' }) : '')
+    return t
   }
 
   await withSpinner(`Connecting to ${provider}...`, async () => {
     if (provider === 'github') {
-      const { error } = await createGithubPatProvider({
-        client,
-        body: { name, token },
-      })
-      if (error) {
-        throw new Error(getErrorMessage(error))
-      }
+      const token = await getToken()
+      if (!token) throw new Error('A token is required (use -t/--token)')
+      const { error } = await createGithubPatProvider({ client, body: { name, token } })
+      if (error) throw new Error(getErrorMessage(error))
     } else if (provider === 'gitlab') {
-      const { error } = await createGitlabPatProvider({
+      const token = await getToken()
+      if (!token) throw new Error('A token is required (use -t/--token)')
+      const baseUrl = options.baseUrl || (interactive
+        ? (await promptText({ message: 'GitLab base URL (leave empty for gitlab.com)', default: '' }) || null)
+        : null)
+      const { error } = await createGitlabPatProvider({ client, body: { name, token, base_url: baseUrl } })
+      if (error) throw new Error(getErrorMessage(error))
+    } else if (provider === 'gitea') {
+      const baseUrl = options.baseUrl || (interactive
+        ? await promptText({ message: 'Gitea instance URL (https://...)', required: true })
+        : '')
+      if (!baseUrl) throw new Error('Gitea requires --base-url (the HTTPS instance URL)')
+      const token = await getToken()
+      if (!token) throw new Error('A token is required (use -t/--token)')
+      const { error } = await createGiteaPatProvider({ client, body: { name, token, base_url: baseUrl } })
+      if (error) throw new Error(getErrorMessage(error))
+    } else if (provider === 'bitbucket') {
+      // Access token, or app password (username + password). --username selects app-password auth.
+      let auth: { type: 'access_token'; token: string } | { type: 'app_password'; username: string; password: string }
+      if (options.username) {
+        const password = options.password || options.token || (interactive ? await promptPassword({ message: 'Bitbucket app password' }) : '')
+        if (!password) throw new Error('Bitbucket app password is required (use --password or -t/--token)')
+        auth = { type: 'app_password', username: options.username, password }
+      } else if (options.token || !interactive) {
+        if (!options.token) throw new Error('Bitbucket access token is required (use -t/--token), or --username for app-password auth')
+        auth = { type: 'access_token', token: options.token }
+      } else {
+        const method = await promptSelect({
+          message: 'Bitbucket authentication',
+          choices: [
+            { name: 'Access token (recommended)', value: 'access_token' },
+            { name: 'App password', value: 'app_password' },
+          ],
+        })
+        if (method === 'app_password') {
+          const username = await promptText({ message: 'Atlassian username', required: true })
+          const password = await promptPassword({ message: 'App password' })
+          auth = { type: 'app_password', username, password }
+        } else {
+          const token = await promptPassword({ message: 'Access token' })
+          auth = { type: 'access_token', token }
+        }
+      }
+      const { error } = await createBitbucketProvider({ client, body: { name, auth } })
+      if (error) throw new Error(getErrorMessage(error))
+    } else if (provider === 'generic') {
+      const cloneUrl = options.cloneUrl || (interactive
+        ? await promptText({ message: 'HTTPS clone URL (https://...)', required: true })
+        : '')
+      if (!cloneUrl) throw new Error('The generic provider requires --clone-url (an HTTPS clone URL)')
+      let token: string | null = options.token ?? null
+      if (token === null && interactive) {
+        token = (await promptText({ message: 'Access token (leave empty for a public repo)', default: '' })) || null
+      }
+      const { error } = await createGenericProvider({
         client,
         body: {
           name,
+          clone_url: cloneUrl,
+          base_url: options.baseUrl ?? null,
           token,
-          base_url: baseUrl,
+          token_username: options.tokenUsername ?? null,
         },
       })
-      if (error) {
-        throw new Error(getErrorMessage(error))
-      }
+      if (error) throw new Error(getErrorMessage(error))
     }
   })
 
@@ -609,8 +659,8 @@ async function deletionCheckAction(options: IdJsonOptions): Promise<void> {
 }
 
 async function connectGitProvider(options: ConnectOptions): Promise<void> {
-  if (options.provider !== 'github' && options.provider !== 'gitlab') {
-    warning(`Unsupported provider: ${options.provider}. Supported: github, gitlab`)
+  if (!SUPPORTED_PROVIDERS.includes(options.provider)) {
+    warning(`Unsupported provider: ${options.provider}. Supported: ${SUPPORTED_PROVIDERS.join(', ')}`)
     return
   }
 
@@ -619,6 +669,10 @@ async function connectGitProvider(options: ConnectOptions): Promise<void> {
     name: options.name,
     token: options.token,
     baseUrl: options.baseUrl,
+    username: options.username,
+    password: options.password,
+    cloneUrl: options.cloneUrl,
+    tokenUsername: options.tokenUsername,
     yes: options.yes,
   })
 }

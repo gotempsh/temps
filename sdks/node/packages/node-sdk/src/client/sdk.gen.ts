@@ -7558,3 +7558,65 @@ export const getAuditLog = <ThrowOnError extends boolean = false>(options: Optio
         ...options
     });
 };
+
+import type { CreateGiteaPatProviderData, CreateGiteaPatProviderResponses, CreateGiteaPatProviderErrors, CreateBitbucketProviderData, CreateBitbucketProviderResponses, CreateBitbucketProviderErrors, CreateGenericProviderData, CreateGenericProviderResponses, CreateGenericProviderErrors } from './types.gen';
+
+/**
+ * Connect a self-hosted Gitea (or Forgejo / Codeberg) provider with a personal access token.
+ */
+export const createGiteaPatProvider = <ThrowOnError extends boolean = false>(options: Options<CreateGiteaPatProviderData, ThrowOnError>) => {
+    return (options.client ?? _heyApiClient).post<CreateGiteaPatProviderResponses, CreateGiteaPatProviderErrors, ThrowOnError>({
+        security: [
+            {
+                scheme: 'bearer',
+                type: 'http'
+            }
+        ],
+        url: '/git-providers/gitea/pat',
+        ...options,
+        headers: {
+            'Content-Type': 'application/json',
+            ...options.headers
+        }
+    });
+};
+
+/**
+ * Connect a Bitbucket Cloud provider with an access token or app password.
+ */
+export const createBitbucketProvider = <ThrowOnError extends boolean = false>(options: Options<CreateBitbucketProviderData, ThrowOnError>) => {
+    return (options.client ?? _heyApiClient).post<CreateBitbucketProviderResponses, CreateBitbucketProviderErrors, ThrowOnError>({
+        security: [
+            {
+                scheme: 'bearer',
+                type: 'http'
+            }
+        ],
+        url: '/git-providers/bitbucket',
+        ...options,
+        headers: {
+            'Content-Type': 'application/json',
+            ...options.headers
+        }
+    });
+};
+
+/**
+ * Connect a generic HTTPS git provider (public or token-authenticated clone URL).
+ */
+export const createGenericProvider = <ThrowOnError extends boolean = false>(options: Options<CreateGenericProviderData, ThrowOnError>) => {
+    return (options.client ?? _heyApiClient).post<CreateGenericProviderResponses, CreateGenericProviderErrors, ThrowOnError>({
+        security: [
+            {
+                scheme: 'bearer',
+                type: 'http'
+            }
+        ],
+        url: '/git-providers/generic',
+        ...options,
+        headers: {
+            'Content-Type': 'application/json',
+            ...options.headers
+        }
+    });
+};

@@ -590,6 +590,15 @@ class Git {
   createGitlabPatProvider = (options: Parameters<typeof sdk.createGitlabPatProvider>[0]) =>
     sdk.createGitlabPatProvider({ ...options, client: this.client });
 
+  createGiteaPatProvider = (options: Parameters<typeof sdk.createGiteaPatProvider>[0]) =>
+    sdk.createGiteaPatProvider({ ...options, client: this.client });
+
+  createBitbucketProvider = (options: Parameters<typeof sdk.createBitbucketProvider>[0]) =>
+    sdk.createBitbucketProvider({ ...options, client: this.client });
+
+  createGenericProvider = (options: Parameters<typeof sdk.createGenericProvider>[0]) =>
+    sdk.createGenericProvider({ ...options, client: this.client });
+
   deleteProvider = (options: Parameters<typeof sdk.deleteProvider3>[0]) =>
     sdk.deleteProvider3({ ...options, client: this.client });
 

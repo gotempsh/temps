@@ -29818,3 +29818,88 @@ export type GetAuditLogResponse = GetAuditLogResponses[keyof GetAuditLogResponse
 export type ClientOptions = {
     baseUrl: `${string}://${string}/api` | (string & {});
 };
+
+// ── Manually added: Gitea / Bitbucket / Generic git providers ──
+// These mirror the @hey-api output for the corresponding endpoints; kept in sync
+// with the backend OpenAPI spec (/git-providers/{gitea/pat,bitbucket,generic}).
+export type CreateGiteaPatRequest = {
+    base_url: string;
+    name: string;
+    token: string;
+};
+
+export type BitbucketAuthInput = {
+    token: string;
+    type: 'access_token';
+} | {
+    password: string;
+    type: 'app_password';
+    username: string;
+};
+
+export type CreateBitbucketRequest = {
+    auth: BitbucketAuthInput;
+    name: string;
+};
+
+export type CreateGenericRequest = {
+    base_url?: string | null;
+    clone_url: string;
+    name: string;
+    token?: string | null;
+    token_username?: string | null;
+};
+
+export type CreateGiteaPatProviderData = {
+    body: CreateGiteaPatRequest;
+    path?: never;
+    query?: never;
+    url: '/git-providers/gitea/pat';
+};
+
+export type CreateGiteaPatProviderResponses = {
+    201: ProviderResponse;
+};
+
+export type CreateGiteaPatProviderErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    500: unknown;
+};
+
+export type CreateBitbucketProviderData = {
+    body: CreateBitbucketRequest;
+    path?: never;
+    query?: never;
+    url: '/git-providers/bitbucket';
+};
+
+export type CreateBitbucketProviderResponses = {
+    201: ProviderResponse;
+};
+
+export type CreateBitbucketProviderErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    500: unknown;
+};
+
+export type CreateGenericProviderData = {
+    body: CreateGenericRequest;
+    path?: never;
+    query?: never;
+    url: '/git-providers/generic';
+};
+
+export type CreateGenericProviderResponses = {
+    201: ProviderResponse;
+};
+
+export type CreateGenericProviderErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    500: unknown;
+};

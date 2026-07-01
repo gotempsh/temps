@@ -538,6 +538,15 @@ export type AggregatedBucketsResponse = {
 export type AggregationLevel = 'events' | 'sessions' | 'visitors';
 
 /**
+ * The aggregation temporality of a Sum/Histogram/ExponentialHistogram metric.
+ *
+ * Mirrors OTel's `AggregationTemporality` proto enum: whether reported values
+ * are cumulative since the start of the series (Cumulative) or only the delta
+ * since the previous report (Delta).
+ */
+export type AggregationTemporality = 'unspecified' | 'delta' | 'cumulative';
+
+/**
  * Response wrapping the AI agent breakdown rows.
  */
 export type AiAgentBreakdownResponse = {
@@ -571,6 +580,70 @@ export type AiAgentDescriptor = {
     agent: string;
     provider: string;
     purpose: string;
+};
+
+/**
+ * One row in the pages-by-agent breakdown. Returned by
+ * [`ProxyLogService::get_ai_agent_pages`] for a single named agent.
+ * `unique_ips` counts distinct client IPs that hit this path via that agent
+ * (same definition as the per-agent unique-IPs in [`AiAgentBreakdownRow`]).
+ */
+export type AiAgentPageRow = {
+    /**
+     * Last-seen timestamp in RFC3339 format, or `None` if no rows matched.
+     */
+    last_seen?: string | null;
+    path: string;
+    request_count: number;
+    unique_ips: number;
+};
+
+/**
+ * Response wrapping the per-agent pages breakdown rows.
+ */
+export type AiAgentPagesResponse = {
+    /**
+     * The agent name this breakdown is scoped to.
+     */
+    agent: string;
+    end_time: string;
+    items: Array<AiAgentPageRow>;
+    start_time: string;
+};
+
+/**
+ * Response wrapping the AI agent timeline rows.
+ */
+export type AiAgentTimelineResponse = {
+    /**
+     * Bucket interval used for the buckets (so the UI can label the x-axis).
+     */
+    bucket: string;
+    end_time: string;
+    /**
+     * Echoes the grouping dimension actually applied.
+     */
+    group_by: string;
+    items: Array<AiAgentTimelineRow>;
+    start_time: string;
+};
+
+/**
+ * One point in the AI-agent timeline: the request count for a single
+ * (`bucket`, `key`) pair, where `key` is a provider or agent name depending on
+ * the requested grouping. The UI pivots these into one stacked series per
+ * `key` across the shared bucket x-axis.
+ */
+export type AiAgentTimelineRow = {
+    /**
+     * Bucket start in RFC3339 format.
+     */
+    bucket: string;
+    /**
+     * Provider or agent name this count belongs to.
+     */
+    key: string;
+    request_count: number;
 };
 
 /**
@@ -612,6 +685,96 @@ export type AiPageBreakdownRow = {
     last_seen?: string | null;
     path: string;
     request_count: number;
+};
+
+/**
+ * Response wrapping the AI status breakdown rows.
+ */
+export type AiStatusBreakdownResponse = {
+    end_time: string;
+    items: Array<AiStatusBreakdownRow>;
+    start_time: string;
+};
+
+/**
+ * One row in the AI-agent HTTP status breakdown: the request count for a
+ * status class (`2xx`/`3xx`/`4xx`/`5xx`/`other`) across crawler traffic.
+ */
+export type AiStatusBreakdownRow = {
+    request_count: number;
+    /**
+     * Status class label.
+     */
+    status_class: string;
+};
+
+/**
+ * Paginated list of alarms.
+ */
+export type AlarmListResponse = {
+    items: Array<AlarmResponse>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+/**
+ * Full alarm representation returned by list/summary endpoints.
+ */
+export type AlarmResponse = {
+    /**
+     * ISO-8601 UTC timestamp when the alarm was acknowledged, if any.
+     */
+    acknowledged_at?: string | null;
+    /**
+     * User ID who acknowledged the alarm, if any.
+     */
+    acknowledged_by?: number | null;
+    alarm_type: string;
+    container_id?: number | null;
+    /**
+     * ISO-8601 UTC timestamp when the row was created.
+     */
+    created_at: string;
+    deployment_id?: number | null;
+    environment_id?: number | null;
+    /**
+     * ISO-8601 UTC timestamp when the alarm fired.
+     */
+    fired_at: string;
+    id: number;
+    message?: string | null;
+    /**
+     * Arbitrary JSON metadata attached by the alarm source.
+     */
+    metadata?: unknown;
+    project_id: number;
+    /**
+     * ISO-8601 UTC timestamp when the alarm was resolved, if any.
+     */
+    resolved_at?: string | null;
+    service_id?: number | null;
+    severity: string;
+    status: string;
+    title: string;
+    /**
+     * ISO-8601 UTC timestamp when the row was last updated.
+     */
+    updated_at: string;
+};
+
+/**
+ * Re-export AlarmSummary for the OpenAPI schema.
+ */
+export type AlarmSummaryResponse = {
+    acknowledged: number;
+    by_type: {
+        [key: string]: number;
+    };
+    critical: number;
+    firing: number;
+    total_active: number;
+    warning: number;
 };
 
 export type AlertRuleResponse = {
@@ -660,6 +823,95 @@ export type AnalyticsSessionEventsResponse = {
     total_events: number;
 };
 
+/**
+ * Anomaly baseline algorithm. Adding one (e.g. a new robust variant) is a
+ * code-only enum addition — no migration, since it lives inside the blob.
+ */
+export type AnomalyAlgorithm = 'robust' | 'basic' | 'agile' | 'ewma';
+
+/**
+ * Seasonal anomaly-band detector parameters (stub — not yet evaluated).
+ */
+export type AnomalyParams = {
+    /**
+     * Baseline model. `robust` is the default (seasonal, stable, flags level
+     * shifts); `ewma`/`agile` adopt level shifts; `basic` is non-seasonal.
+     */
+    algorithm?: AnomalyAlgorithm;
+    /**
+     * How far back to build the baseline. `None` = an evaluator default.
+     */
+    baseline_lookback_days?: number | null;
+    /**
+     * Band width in robust standard deviations (Datadog's `bounds`).
+     */
+    deviations?: number;
+    /**
+     * Which side(s) of the band a deviation must be on to count.
+     */
+    direction?: Direction;
+    /**
+     * Fraction (0..=1) of points in the window that must be anomalous to fire.
+     */
+    pct_anomalous?: number;
+    /**
+     * Seasonality model for the baseline.
+     */
+    seasonality?: Seasonality;
+};
+
+export type AnomalyPreviewPointResponse = {
+    breaching: boolean;
+    bucket: string;
+    /**
+     * Lower edge of the expected band at this point.
+     */
+    lower: number;
+    /**
+     * Upper edge of the expected band at this point.
+     */
+    upper: number;
+    value: number;
+};
+
+export type AnomalyPreviewRequest = {
+    /**
+     * One of `avg|sum|min|max|count|rate|p50|p90|p95|p99`.
+     */
+    aggregation: string;
+    /**
+     * Must be an `anomaly` detector — the band to backtest.
+     */
+    detection_config: DetectionConfig;
+    /**
+     * RFC 3339; defaults to now.
+     */
+    end_time?: string | null;
+    metric_name: string;
+    project_id: number;
+    /**
+     * RFC 3339; defaults to 7 days before `end_time`.
+     */
+    start_time?: string | null;
+    window_secs: number;
+};
+
+export type AnomalyPreviewResponse = {
+    /**
+     * Baseline sample count (drives the `sufficient` flag).
+     */
+    baseline_samples: number;
+    /**
+     * How many points in the range would have fired.
+     */
+    breach_count: number;
+    points: Array<AnomalyPreviewPointResponse>;
+    /**
+     * Whether the baseline had enough history for a trustworthy band.
+     */
+    sufficient: boolean;
+};
+
 export type ApiKeyListResponse = {
     api_keys: Array<ApiKeyResponse>;
     total: number;
@@ -691,6 +943,19 @@ export type AppSettings = {
      * hardware that already has its own per-host headroom).
      */
     build_limits?: BuildLimitsSettings;
+    /**
+     * Binary version tag (e.g. "v0.1.0") of the *console* process
+     * (`temps serve`, role=all or role=console) that last started. Written
+     * on console startup; read by the standalone `temps proxy` to detect
+     * version skew during a rolling upgrade (ADR-017 Phase 3). `None` on
+     * installs that never ran a console build carrying this field.
+     *
+     * This is informational state written by the binary itself — NOT an
+     * operator-tunable setting. It is intentionally absent from
+     * `AppSettingsResponse` and the PATCH path so an operator cannot
+     * accidentally overwrite the self-recorded value.
+     */
+    console_version?: string | null;
     container_logs?: ContainerLogSettings;
     disk_space_alert?: DiskSpaceAlertSettings;
     dns_provider?: DnsProviderSettings;
@@ -704,13 +969,35 @@ export type AppSettings = {
      * internet must keep this `false` — otherwise a MitM steals the join token.
      */
     insecure_tls?: boolean;
+    /**
+     * URL that service containers use to reach the Temps API from *inside*
+     * the Docker network (OTLP metrics ingest, agent callbacks, etc.). On
+     * Docker Desktop this defaults to `http://host.docker.internal:<console_port>`;
+     * on Linux it requires the `host.docker.internal:host-gateway` host
+     * mapping (which Temps adds to provisioned containers). Distinct from
+     * `external_url`, which is the public-facing address.
+     */
+    internal_url?: string | null;
     letsencrypt?: LetsEncryptSettings;
+    /**
+     * Metrics observability settings. Controls the MetricsStore backend,
+     * scrape interval, and tiered retention windows.
+     */
+    monitoring?: MonitoringSettings;
     multi_node?: MultiNodeSettings;
+    on_demand_tls?: OnDemandTlsSettings;
     preview_domain?: string;
     preview_gateway?: PreviewGatewaySettings;
     rate_limiting?: RateLimitSettings;
     screenshots?: ScreenshotSettings;
     security_headers?: SecurityHeadersSettings;
+    /**
+     * Set to `true` by `temps setup` (all modes) once initial configuration
+     * has been applied. The web onboarding wizard reads this from the server
+     * and skips itself when true, preventing the "Configure Base Domain" wall
+     * from appearing on installs that were already configured via the CLI.
+     */
+    setup_complete?: boolean;
 };
 
 /**
@@ -723,15 +1010,32 @@ export type AppSettingsResponse = {
     disk_space_alert: DiskSpaceAlertSettings;
     dns_provider: DnsProviderSettingsMasked;
     docker_registry: DockerRegistrySettingsMasked;
+    /**
+     * The storage backend the runtime is **actually** using for metrics,
+     * after reconciling the `monitoring.store` toggle with the server's
+     * `TEMPS_CLICKHOUSE_*` configuration. When `monitoring.store` is
+     * `click_house` but those env vars are not fully set, the runtime falls
+     * back to TimescaleDB — in that case this reports `timescale_db` even
+     * though `monitoring.store` says `click_house`. The UI shows this as the
+     * effective backend and warns when it diverges from the configured store.
+     */
+    effective_metrics_store: MetricsStoreKind;
     external_url?: string | null;
     insecure_tls: boolean;
+    internal_url?: string | null;
     letsencrypt: LetsEncryptSettings;
+    monitoring: MonitoringSettingsMasked;
     multi_node: MultiNodeSettingsMasked;
     preview_domain: string;
     preview_gateway: PreviewGatewaySettingsMasked;
     rate_limiting: RateLimitSettings;
     screenshots: ScreenshotSettings;
     security_headers: SecurityHeadersSettings;
+    /**
+     * Whether `temps setup` has been run at least once. The web onboarding
+     * wizard checks this field on load and skips itself when true.
+     */
+    setup_complete: boolean;
 };
 
 export type ArchiveMode = 'off' | 'on' | 'always' | 'unknown';
@@ -877,6 +1181,16 @@ export type AuthTokenResponse = {
     access_token: string;
     expires_at: number;
     refresh_token: string;
+};
+
+/**
+ * Auto-watch (Watchdog-style) detector parameters (stub — not evaluated).
+ */
+export type AutoWatchParams = {
+    /**
+     * The engine self-tunes the band; the user supplies only the direction.
+     */
+    direction?: Direction;
 };
 
 export type AutofixerRunResponse = {
@@ -1107,6 +1421,29 @@ export type BackupScheduleResponse = {
 };
 
 /**
+ * Authentication input for a Bitbucket Cloud provider. Use `access_token` for
+ * a Repository or Workspace Access Token (PAT), or `username` + `app_password`
+ * for App Password (HTTP Basic) authentication.
+ */
+export type BitbucketAuthInput = {
+    /**
+     * The Bitbucket access token value.
+     */
+    token: string;
+    type: 'access_token';
+} | {
+    /**
+     * App password generated in Bitbucket security settings.
+     */
+    password: string;
+    type: 'app_password';
+    /**
+     * Bitbucket account username.
+     */
+    username: string;
+};
+
+/**
  * Response after uploading a blob
  */
 export type BlobResponse = {
@@ -1245,6 +1582,26 @@ export type CancelBackupResponse = {
      * idempotent.
      */
     cancelled: number;
+};
+
+/**
+ * Current on-demand cert status for a single hostname (ADR-018 §5). Backs
+ * `GET /domains/by-host/{hostname}/cert-status`.
+ */
+export type CertStatusResponse = {
+    /**
+     * On-demand negative-cache deadline (epoch millis), when in backoff.
+     */
+    backoff_until?: number | null;
+    /**
+     * SNI hostname.
+     */
+    hostname: string;
+    last_attempt?: null | OnDemandCertAttemptResponse;
+    /**
+     * Current cert lifecycle status from the `domains` row, when one exists.
+     */
+    status?: string | null;
 };
 
 /**
@@ -1522,6 +1879,39 @@ export type CliLoginRequest = {
 };
 
 /**
+ * Configuration for a Cloudflare Email Sending notification provider.
+ *
+ * Notifications are delivered through Cloudflare's transactional Email Sending
+ * API. Only the account, token, sender and recipients are configured here —
+ * subject and body are derived from each notification.
+ */
+export type CloudflareConfig = {
+    /**
+     * Cloudflare account id that owns the Email Sending configuration.
+     */
+    account_id: string;
+    /**
+     * Cloudflare API token with the Email Sending permission. Encrypted at
+     * rest; like the other notification providers, it is returned decrypted to
+     * authorized callers so the edit form can prefill (not masked).
+     */
+    api_token: string;
+    /**
+     * Verified sender address (must belong to a domain enabled for Cloudflare
+     * Email Sending).
+     */
+    from_address: string;
+    /**
+     * Optional human-friendly sender name shown in the recipient's inbox.
+     */
+    from_name?: string | null;
+    /**
+     * Recipients that should receive the notification.
+     */
+    to_addresses: Array<string>;
+};
+
+/**
  * Response body for `GET /external-services/{id}/cluster-health`.
  */
 export type ClusterHealthReportResponse = {
@@ -1689,6 +2079,13 @@ export type CommitInfo = {
 export type CommitListResponse = {
     commits: Array<CommitInfo>;
 };
+
+/**
+ * Comparator for static/forecast threshold detectors. Serializes to the
+ * keyword forms `gt|gte|lt|lte` (NOT the SQL operators used by
+ * `temps-monitoring::compare`).
+ */
+export type Comparator = 'gt' | 'gte' | 'lt' | 'lte';
 
 export type ConnectionListQuery = {
     direction?: string | null;
@@ -2192,6 +2589,23 @@ export type ContextLogsResponse = {
     target_index: number;
 };
 
+export type ConversationDetailResponse = ConversationResponse & {
+    /**
+     * Turns oldest-first. The `system` seed message is omitted (internal).
+     */
+    messages: Array<MessageResponse>;
+};
+
+export type ConversationResponse = {
+    context_id: string;
+    context_type: string;
+    created_at: string;
+    last_activity_at: string;
+    public_id: string;
+    status: string;
+    title?: string | null;
+};
+
 /**
  * A conversation summary grouping related AI invocations.
  */
@@ -2335,11 +2749,45 @@ export type CreateBackupScheduleRequest = {
     target_all_services?: boolean | null;
 };
 
+export type CreateBitbucketRequest = {
+    /**
+     * Authentication credentials — either an access token or an app password.
+     */
+    auth: BitbucketAuthInput;
+    /**
+     * Display name for this provider.
+     */
+    name: string;
+};
+
+export type CreateCloudflareProviderRequest = {
+    config: CloudflareConfig;
+    enabled?: boolean | null;
+    name: string;
+};
+
+export type CreateConversationRequest = {
+    /**
+     * The entity id (ints stringified).
+     */
+    context_id: string;
+    /**
+     * e.g. `"deployment"`.
+     */
+    context_type: string;
+};
+
 export type CreateDsnRequest = {
     base_url?: string | null;
     deployment_id?: number | null;
     environment_id?: number | null;
     name?: string | null;
+};
+
+export type CreateDashboardRequest = {
+    layout: DashboardLayout;
+    name: string;
+    project_id: number;
 };
 
 /**
@@ -2464,6 +2912,30 @@ export type CreateFunnelStep = {
     event_name: string;
 };
 
+export type CreateGenericRequest = {
+    /**
+     * Optional base URL of the git host for display purposes (no API is called).
+     */
+    base_url?: string | null;
+    /**
+     * HTTPS clone URL for the repository, e.g. `https://git.example.com/org/repo.git`.
+     */
+    clone_url: string;
+    /**
+     * Display name for this provider.
+     */
+    name: string;
+    /**
+     * Access token or password. Omit (or set to `null`) for public repositories.
+     */
+    token?: string | null;
+    /**
+     * HTTP Basic username used with the token. Defaults to `x-access-token` when
+     * absent or empty. Ignored for public (unauthenticated) repositories.
+     */
+    token_username?: string | null;
+};
+
 export type CreateGitHubPatRequest = {
     name: string;
     token: string;
@@ -2480,6 +2952,21 @@ export type CreateGitLabOAuthRequest = {
 export type CreateGitLabPatRequest = {
     base_url?: string | null;
     name: string;
+    token: string;
+};
+
+export type CreateGiteaPatRequest = {
+    /**
+     * HTTPS base URL of the Gitea instance, e.g. `https://git.example.com`.
+     */
+    base_url: string;
+    /**
+     * Display name for this provider.
+     */
+    name: string;
+    /**
+     * Personal access token issued by the Gitea instance.
+     */
     token: string;
 };
 
@@ -2527,6 +3014,28 @@ export type CreateMcpRequest = {
     description?: string | null;
     name: string;
     slug: string;
+};
+
+export type CreateMetricAlertRequest = {
+    /**
+     * One of `avg|sum|min|max|count|rate|p50|p90|p95|p99`.
+     */
+    aggregation: string;
+    /**
+     * The detector: a discriminated union keyed by `kind`. Today only
+     * `{ "kind": "static", "comparator": "gt", "threshold": 500 }` is evaluable.
+     */
+    detection_config: DetectionConfig;
+    enabled: boolean;
+    for_duration_secs: number;
+    metric_name: string;
+    name: string;
+    project_id: number;
+    /**
+     * One of `info|warning|critical`.
+     */
+    severity: string;
+    window_secs: number;
 };
 
 export type CreateMonitorRequest = {
@@ -2625,10 +3134,23 @@ export type CreatePrResponse = {
 
 /**
  * Request to create a project from a template
+ *
+ * Supports two deploy modes:
+ * * **Fork mode** — when `git_provider_connection_id` is set, the template
+ * repo is cloned into a new repository under the user's Git account and the
+ * project tracks that fork (git-push deploys, automatic deploy on push).
+ * * **One-click public-repo mode** — when `git_provider_connection_id` is
+ * omitted, the project deploys directly from the template's public source
+ * repository (no fork, no Git account required). This is the activation
+ * path: a brand-new user with no Git provider connected can still deploy a
+ * demo in one click. `repository_name` / `repository_owner` are ignored in
+ * this mode, and automatic-deploy-on-push is unavailable (there is no fork
+ * to receive webhooks).
  */
 export type CreateProjectFromTemplateRequest = {
     /**
-     * Enable automatic deployment on push (defaults to true)
+     * Enable automatic deployment on push (defaults to true). Only honoured in
+     * fork mode; public-repo deploys cannot receive push webhooks.
      */
     automatic_deploy?: boolean;
     /**
@@ -2636,9 +3158,10 @@ export type CreateProjectFromTemplateRequest = {
      */
     environment_variables?: Array<EnvVarInput>;
     /**
-     * Git provider connection ID (required to create the repository)
+     * Git provider connection ID. When omitted, the project deploys directly
+     * from the template's public source repository instead of forking it.
      */
-    git_provider_connection_id: number;
+    git_provider_connection_id?: number | null;
     /**
      * Whether to make the repository private (defaults to true)
      */
@@ -2648,9 +3171,10 @@ export type CreateProjectFromTemplateRequest = {
      */
     project_name: string;
     /**
-     * Name for the new repository to create
+     * Name for the new repository to create. Required in fork mode; ignored in
+     * one-click public-repo mode.
      */
-    repository_name: string;
+    repository_name?: string | null;
     /**
      * Owner/organization for the new repository (defaults to authenticated user)
      */
@@ -2774,6 +3298,10 @@ export type CreateProjectSecretRequest = {
 export type CreateProviderKeyRequest = {
     api_key: string;
     base_url?: string | null;
+    /**
+     * Optional model id to pin for this provider (e.g. "gpt-4o-mini").
+     */
+    default_model?: string | null;
     display_name: string;
     provider: string;
 };
@@ -2998,6 +3526,16 @@ export type CustomerMovementResponse = {
 };
 
 /**
+ * The typed layout persisted (as JSONB) in `metric_dashboards.layout`.
+ */
+export type DashboardLayout = {
+    /**
+     * Ordered sections that make up the dashboard.
+     */
+    sections: Array<DashboardSection>;
+};
+
+/**
  * Query parameters for batch dashboard analytics
  */
 export type DashboardProjectsAnalyticsQuery = {
@@ -3028,6 +3566,47 @@ export type DashboardProjectsAnalyticsResponse = {
 };
 
 /**
+ * A titled group of tiles within a dashboard.
+ */
+export type DashboardSection = {
+    /**
+     * Stable client-generated section id.
+     */
+    id: string;
+    /**
+     * Tiles rendered within this section.
+     */
+    tiles: Array<DashboardTile>;
+    /**
+     * Section heading.
+     */
+    title: string;
+};
+
+/**
+ * A single metric tile within a dashboard section.
+ */
+export type DashboardTile = {
+    /**
+     * Aggregation applied per bucket: one of
+     * `avg|sum|min|max|count|rate|p50|p90|p95|p99`.
+     */
+    aggregation: string;
+    /**
+     * Stable client-generated tile id (used as a React key / for reordering).
+     */
+    id: string;
+    /**
+     * The metric name to chart (e.g. `http.server.duration`).
+     */
+    metric_name: string;
+    /**
+     * Optional display title; falls back to the metric name in the UI.
+     */
+    title?: string | null;
+};
+
+/**
  * A specific data implication the user needs to understand
  */
 export type DataImplication = {
@@ -3049,6 +3628,39 @@ export type DataImplication = {
  * Severity of a data implication
  */
 export type DataImplicationSeverity = 'info' | 'warning' | 'data-not-migrated' | 'potential-data-loss';
+
+/**
+ * Response for the per-database metrics breakdown.
+ */
+export type DatabaseMetricsResponse = {
+    /**
+     * One entry per database, sorted by the first metric descending
+     * (largest first) so the biggest database leads the table.
+     */
+    databases: Array<DatabaseMetricsRow>;
+};
+
+/**
+ * Per-database metric values for a Postgres service.
+ *
+ * A Postgres instance can host many databases (some unrelated to this
+ * service). The collector records per-`datname` series; this groups the
+ * latest value of each requested metric by database so the UI can render a
+ * "Databases" breakdown table instead of one collapsed number.
+ */
+export type DatabaseMetricsRow = {
+    /**
+     * Database name (`datname`).
+     */
+    database: string;
+    /**
+     * Latest value of each requested metric for this database
+     * (e.g. `{"pg.database_size_bytes": 7943871, "pg.cache_hit_ratio": 0.99}`).
+     */
+    metrics: {
+        [key: string]: number;
+    };
+};
 
 /**
  * Request to delete keys
@@ -3109,6 +3721,13 @@ export type DeployFromImageRequest = {
      */
     external_image_id?: number | null;
     /**
+     * Optional HTTP health-check path override (e.g. "/api/healthz").
+     * Image deploys can't read `.temps.yaml`, so this sets the path the deployer
+     * probes after the container starts and the path the environment's uptime
+     * monitor checks. Must start with '/'. When omitted, defaults to "/".
+     */
+    health_check_path?: string | null;
+    /**
      * Docker image reference (e.g., "ghcr.io/org/app:v1.0")
      * Required if external_image_id is not provided
      */
@@ -3124,6 +3743,11 @@ export type DeployFromImageRequest = {
  */
 export type DeployFromImageUploadQuery = {
     /**
+     * Optional HTTP health-check path override (e.g. "/api/healthz").
+     * Must start with '/'. When omitted, defaults to "/".
+     */
+    health_check_path?: string | null;
+    /**
      * Tag to apply to the imported image (e.g., "myapp:v1.0")
      * If not provided, a unique tag will be generated
      */
@@ -3131,6 +3755,13 @@ export type DeployFromImageUploadQuery = {
 };
 
 export type DeployFromStaticRequest = {
+    /**
+     * Optional HTTP health-check path override (e.g. "/api/healthz").
+     * Static deploys can't read `.temps.yaml`, so this sets the path the deployer
+     * probes after the container starts and the path the environment's uptime
+     * monitor checks. Must start with '/'. When omitted, defaults to "/".
+     */
+    health_check_path?: string | null;
     /**
      * Optional deployment metadata
      */
@@ -3161,9 +3792,11 @@ export type DeploymentConfig = {
      */
     antiAffinity?: boolean;
     /**
-     * Enable automatic deployments on git push
+     * Enable automatic deployments on git push.
+     * `None` = inherit from project config; `Some(true/false)` = explicit override.
+     * Stored as JSONB so absent key → `None` (inherit), never silently defaults to false.
      */
-    automaticDeploy?: boolean;
+    automaticDeploy?: boolean | null;
     /**
      * Enable container exec/shell access (disabled by default for security)
      */
@@ -3345,6 +3978,49 @@ export type DeploymentConfiguration = {
     working_dir?: string | null;
 };
 
+/**
+ * A single captured container-log dump, including its full text content.
+ */
+export type DeploymentContainerLogContentResponse = {
+    captured_at: number;
+    container_name: string;
+    /**
+     * The captured plain-text log content.
+     */
+    content: string;
+    id: number;
+    service_name?: string | null;
+    size_bytes: number;
+    truncated: boolean;
+};
+
+/**
+ * Metadata for one captured (historical) container-log dump. Listed on the
+ * deployment detail page so a user can pick which past container's logs to read.
+ */
+export type DeploymentContainerLogResponse = {
+    /**
+     * Unix epoch milliseconds of when the logs were captured (just before
+     * teardown). Matches the timestamp convention used by `DeploymentResponse`.
+     */
+    captured_at: number;
+    container_id: string;
+    container_name: string;
+    deployment_id: number;
+    id: number;
+    node_id?: number | null;
+    service_name?: string | null;
+    size_bytes: number;
+    truncated: boolean;
+};
+
+/**
+ * The list of captured container-log dumps for a deployment.
+ */
+export type DeploymentContainerLogsListResponse = {
+    logs: Array<DeploymentContainerLogResponse>;
+};
+
 export type DeploymentEnvironmentResponse = {
     domains: Array<string>;
     id: number;
@@ -3420,6 +4096,13 @@ export type DeploymentMetadata = {
     fileCount?: number | null;
     gitPushEvent?: null | GitPushEvent;
     /**
+     * Explicit deploy-time HTTP health-check path override.
+     * Image/static deploys can't read `.temps.yaml`, so this lets the deploy
+     * request set a custom path (e.g. "/api/healthz"). When present it takes
+     * priority over any `.temps.yaml` `health.path` value. Always starts with '/'.
+     */
+    healthCheckPath?: string | null;
+    /**
      * Total size of the built image in bytes
      */
     imageSizeBytes?: number | null;
@@ -3493,6 +4176,27 @@ export type DeploymentStateResponse = {
  */
 export type DeploymentStrategy = 'replace' | 'blue-green' | 'rolling';
 
+/**
+ * The typed detector definition stored (as jsonb) in
+ * `metric_alert_rules.detection_config`.
+ *
+ * Today only [`DetectionConfig::Static`] is evaluable; the other variants are
+ * schema-present (so the SDK/UI and storage are already future-shaped) but
+ * rejected by [`DetectionConfig::validate`] until their evaluator lands. Each is
+ * then enabled code-only, with no schema migration.
+ */
+export type DetectionConfig = (StaticParams & {
+    kind: 'static';
+}) | (AnomalyParams & {
+    kind: 'anomaly';
+}) | (ForecastParams & {
+    kind: 'forecast';
+}) | (OutlierParams & {
+    kind: 'outlier';
+}) | (AutoWatchParams & {
+    kind: 'auto_watch';
+});
+
 export type DeviceCount = {
     count: number;
     device_type: string;
@@ -3511,6 +4215,11 @@ export type DigestSections = {
     performance?: boolean;
     projects?: boolean;
 };
+
+/**
+ * Which side(s) of an anomaly band count as a deviation.
+ */
+export type Direction = 'both' | 'above' | 'below';
 
 /**
  * Response after disabling Blob service
@@ -4169,6 +4878,12 @@ export type DomainResponse = {
     last_error?: string | null;
     last_error_type?: string | null;
     last_renewed?: number | null;
+    /**
+     * On-demand TLS negative-cache deadline (epoch millis), when this hostname's
+     * on-demand HTTP-01 issuance is in backoff after a failure (ADR-018 §4).
+     * `None` means no active backoff.
+     */
+    on_demand_backoff_until?: number | null;
     status: string;
     updated_at: number;
     verification_method: string;
@@ -4509,6 +5224,19 @@ export type EnrichVisitorResponse = {
     visitor_id: string;
 };
 
+export type EnrollmentTokenInfo = {
+    bound_node_name?: string | null;
+    created_at: string;
+    expires_at: string;
+    id: number;
+    max_uses: number;
+    used_count: number;
+};
+
+export type EnrollmentTokenListResponse = {
+    tokens: Array<EnrollmentTokenInfo>;
+};
+
 export type EntityInfoResponse = {
     /**
      * Full container path
@@ -4664,6 +5392,13 @@ export type EnvironmentInfo = {
 };
 
 export type EnvironmentResponse = {
+    /**
+     * Per-environment CAPTCHA attack-mode override.
+     * `null` means inherit the project-level `attack_mode`; `true`/`false`
+     * explicitly enable/disable the challenge for this environment. Always
+     * serialized (NOT skipped) so the UI can distinguish `null` from `false`.
+     */
+    attack_mode?: boolean | null;
     branch?: string | null;
     created_at: number;
     current_deployment_id?: number | null;
@@ -5426,6 +6161,11 @@ export type ExternalServiceInfo = {
      * Cluster members (empty for standalone services).
      */
     members?: Array<ServiceMemberInfo>;
+    /**
+     * Whether metric collection is enabled for this service. The UI uses this
+     * to decide whether to poll the monitoring endpoints.
+     */
+    metrics_enabled?: boolean;
     name: string;
     /**
      * Node ID where the service runs. Null means control plane (local).
@@ -5474,6 +6214,28 @@ export type FieldResponse = {
      * Whether the field is nullable
      */
     nullable: boolean;
+};
+
+/**
+ * Forecast model family.
+ */
+export type ForecastAlgorithm = 'linear' | 'seasonal';
+
+/**
+ * Forecast detector parameters (stub — not yet evaluated).
+ */
+export type ForecastParams = {
+    algorithm?: ForecastAlgorithm;
+    /**
+     * Comparator + threshold the *forecast* is checked against.
+     */
+    comparator: Comparator;
+    deviations?: number;
+    /**
+     * How far ahead to project before checking the breach condition.
+     */
+    forecast_horizon_secs: number;
+    threshold: number;
 };
 
 export type FullError = {
@@ -5578,7 +6340,7 @@ export type GatewayStatus = {
     host_port?: number | null;
     /**
      * Image reference the container was created with (e.g.
-     * `kfsoftware/temps-preview-gateway:dev`).
+     * `ghcr.io/gotempsh/temps-preview-gateway:latest`).
      */
     image?: string | null;
     /**
@@ -6180,6 +6942,24 @@ export type GitRefResponse = {
     url: string;
 };
 
+/**
+ * A conversation in the unified cross-project switcher: carries the project it
+ * belongs to (name/slug) so the UI can show where the chat was started and
+ * link back to the source.
+ */
+export type GlobalConversationResponse = {
+    context_id: string;
+    context_type: string;
+    created_at: string;
+    last_activity_at: string;
+    project_id: number;
+    project_name?: string | null;
+    project_slug?: string | null;
+    public_id: string;
+    status: string;
+    title?: string | null;
+};
+
 export type GlobalEventStatsResponse = {
     bounce_rate?: number | null;
     bounced: number;
@@ -6396,6 +7176,43 @@ export type HierarchyLevel = {
      * Human-readable name for this level
      */
     name: string;
+};
+
+/**
+ * An explicit-bucket histogram aggregated over a time bucket.
+ *
+ * Carries the reduced scalars (count/sum/min/max) plus the explicit bucket
+ * layout — `bounds` (the upper bounds) and `bucket_counts` (observation counts,
+ * summed element-wise across the window; length is `bounds.len() + 1`, the last
+ * entry being the +Inf overflow bucket). With these, a caller can reconstruct
+ * any quantile (e.g. p95) via cumulative-count interpolation.
+ */
+export type HistogramSummary = {
+    /**
+     * Explicit bucket upper bounds (OTLP `explicit_bounds`), ascending.
+     */
+    bounds: Array<number>;
+    /**
+     * Per-bucket observation counts summed element-wise across the window.
+     * Length is `bounds.len() + 1` (the trailing element is the +Inf bucket).
+     */
+    bucket_counts: Array<number>;
+    /**
+     * Total observation count summed across the bucket window.
+     */
+    count: number;
+    /**
+     * Maximum observed value, when reported by the producer.
+     */
+    max?: number | null;
+    /**
+     * Minimum observed value, when reported by the producer.
+     */
+    min?: number | null;
+    /**
+     * Sum of observed values across the bucket window.
+     */
+    sum: number;
 };
 
 export type HourlyPageSessions = {
@@ -7113,6 +7930,20 @@ export type LetsEncryptSettings = {
     environment?: string;
 };
 
+/**
+ * Raw surrounding lines for a single match (grep -C style).
+ */
+export type LineContext = {
+    /**
+     * Lines immediately after the match, oldest-first.
+     */
+    after: Array<ContextLine>;
+    /**
+     * Lines immediately before the match, oldest-first.
+     */
+    before: Array<ContextLine>;
+};
+
 export type LinkServiceRequest = {
     project_id: number;
 };
@@ -7128,7 +7959,14 @@ export type ListApiKeysQuery = {
 };
 
 /**
- * Query parameters for listing audit logs
+ * Query parameters for listing audit logs.
+ *
+ * Every field is optional — omitting one means "don't filter on it". Deriving
+ * `IntoParams` makes utoipa render them as optional query params with the
+ * correct types; the previous hand-written `params(("operation_type", Query,
+ * …))` tuples defaulted every param to `required: true, type: string`, which
+ * misled both API clients and the AI `describe_api`/`call_api` tools into
+ * thinking all filters were mandatory.
  */
 export type ListAuditLogsQuery = {
     /**
@@ -7144,7 +7982,7 @@ export type ListAuditLogsQuery = {
      */
     offset?: number | null;
     /**
-     * Filter logs by operation type
+     * Filter logs by operation type (omit for all)
      */
     operation_type?: string | null;
     /**
@@ -7152,7 +7990,7 @@ export type ListAuditLogsQuery = {
      */
     to?: string | null;
     /**
-     * Filter logs by user ID
+     * Filter logs by user ID (omit for all users)
      */
     user_id?: number | null;
 };
@@ -7245,6 +8083,17 @@ export type ListJobsResponse = {
  */
 export type ListMcpsResponse = {
     items: Array<McpDefinitionResponse>;
+    total: number;
+};
+
+/**
+ * Paginated list of on-demand cert attempts (ADR-018 §5 console "Certificates"
+ * surface). Joined with current `domains.status`, newest first.
+ */
+export type ListOnDemandCertsResponse = {
+    certs: Array<OnDemandCertRow>;
+    page: number;
+    page_size: number;
     total: number;
 };
 
@@ -7426,11 +8275,25 @@ export type LogRecord = {
  */
 export type LogSearchLine = {
     chunk_id: string;
-    deploy_id?: string | null;
+    /**
+     * Container this line came from — lets the UI tag/group lines by container
+     * in a combined ("show all") multi-container view.
+     */
+    container_id?: string;
+    context?: null | LineContext;
+    deploy_id?: number | null;
     fields?: unknown;
     level: LogLevel;
     line_offset: number;
     message: string;
+    /**
+     * Worker node the line came from (`None` = control-plane-local).
+     */
+    node_id?: number | null;
+    /**
+     * Human-readable node name for display.
+     */
+    node_name?: string | null;
     service: string;
     timestamp: string;
 };
@@ -7439,6 +8302,19 @@ export type LogSearchLine = {
  * Log severity level (simplified from OTel's 24 levels).
  */
 export type LogSeverity = 'TRACE' | 'DEBUG' | 'INFO' | 'WARN' | 'ERROR' | 'FATAL';
+
+/**
+ * A distinct log source (container) seen in the queried scope. Used to populate
+ * the history filter dropdowns with the *full* set of containers/nodes for the
+ * project + env + deployment + time window — independent of the active
+ * container/node/service filter, so the user can switch between them.
+ */
+export type LogSource = {
+    container_id: string;
+    node_id?: number | null;
+    node_name?: string | null;
+    service: string;
+};
 
 /**
  * Log output stream
@@ -7521,6 +8397,36 @@ export type McpDefinitionResponse = {
 export type MessageContent = string | Array<ContentPart>;
 
 /**
+ * One ordered segment of an assistant turn: a chunk of prose, or a tool
+ * invocation. Mirrors the `metadata.parts` persisted by the chat service.
+ */
+export type MessagePart = {
+    text: string;
+    type: 'text';
+} | {
+    tool: ToolInfo;
+    type: 'tool';
+};
+
+export type MessageResponse = {
+    content: string;
+    created_at: string;
+    /**
+     * Ordered render segments (text / tool, in the order they occurred) so a
+     * reloaded chat shows the same interleaving as the live stream. Absent for
+     * older messages persisted before parts were tracked; the client then falls
+     * back to `tools` (rendered first) + `content`.
+     */
+    parts?: Array<MessagePart> | null;
+    role: string;
+    /**
+     * Tools the assistant ran on this turn (persisted in message metadata), so
+     * the chat replays its tool work after a reload. Absent for plain turns.
+     */
+    tools?: Array<ToolInfo> | null;
+};
+
+/**
  * How to treat metered-billing subscriptions when computing MRR.
  *
  * * `DeriveFromInvoices` (default): ignore the subscription row's
@@ -7534,24 +8440,80 @@ export type MessageContent = string | Array<ContentPart>;
 export type MeteredMode = 'derive_from_invoices' | 'use_subscription' | 'ignore';
 
 /**
+ * The aggregation applied when reducing raw metric points into a time bucket.
+ *
+ * Store-neutral: every storage backend (ClickHouse today, TimescaleDB later)
+ * must be able to satisfy this contract. `Quantile(q)` carries the requested
+ * quantile in `[0.0, 1.0]` (e.g. `0.95` for p95).
+ */
+export type MetricAggregation = 'avg' | 'sum' | 'min' | 'max' | 'count' | 'rate_per_sec' | {
+    /**
+     * A quantile of the scalar value in each bucket. The carried `f64` is the
+     * requested quantile in `[0.0, 1.0]`.
+     */
+    quantile: number;
+};
+
+/**
  * A time-bucketed metric aggregate for chart display.
+ *
+ * Store-neutral response contract. The legacy scalar fields
+ * (`avg_value`/`min_value`/`max_value`/`count`) are always populated for chart
+ * back-compat. The richer fields describe the explicitly-requested
+ * [`MetricAggregation`] (`value`), optional `quantiles`, an optional
+ * `histogram_summary`, and a `series_key` identifying the label-set when the
+ * query used `group_by`.
  */
 export type MetricBucket = {
     avg_value: number;
     bucket: string;
     count: number;
+    histogram_summary?: null | HistogramSummary;
     max_value: number;
     min_value: number;
+    /**
+     * Computed quantile/value pairs `(quantile, value)` when the query asked for
+     * quantile aggregation; otherwise empty.
+     */
+    quantiles?: Array<[
+        number,
+        number
+    ]>;
+    /**
+     * The label-set this bucket belongs to, as ordered `(key, value)` pairs,
+     * when the query grouped by labels. Empty/`None` = the single ungrouped
+     * aggregate stream.
+     */
+    series_key?: Array<[
+        string,
+        string
+    ]> | null;
+    /**
+     * The value of the requested [`MetricAggregation`] for this bucket. For the
+     * default `Avg` aggregation this equals `avg_value`. `#[serde(default)]` so
+     * pre-existing payloads (which only carried avg/min/max/count) still parse.
+     */
+    value?: number;
 };
 
-export type MetricNamesResponse = {
-    names: Array<string>;
+/**
+ * A single `(timestamp, value)` data point in a metric series.
+ */
+export type MetricDataPoint = {
+    /**
+     * ISO 8601 timestamp with `Z` suffix.
+     */
+    time: string;
+    /**
+     * Metric value at this bucket.
+     */
+    value: number;
 };
 
 /**
  * The type of an OTel metric.
  */
-export type MetricType = 'gauge' | 'sum' | 'histogram';
+export type MetricType = 'gauge' | 'sum' | 'histogram' | 'exponential_histogram' | 'summary';
 
 export type MetricsOverTimeResponse = {
     cls: Array<number | null>;
@@ -7595,10 +8557,39 @@ export type MetricsQuery = {
     start_date: string;
 };
 
-export type MetricsResponse = {
-    count: number;
-    data: Array<MetricBucket>;
+/**
+ * Query params for range metric queries.
+ */
+export type MetricsRangeQuery = {
+    /**
+     * Metric name, e.g. `"pg.connections_active"`.
+     */
+    metric: string;
+    /**
+     * Optional histogram percentile (0–100).  When provided, the endpoint
+     * fetches histogram buckets and computes the requested quantile.
+     */
+    percentile?: number | null;
+    /**
+     * Time window: `"1h"` | `"6h"` | `"24h"` | `"7d"`.
+     */
+    range?: string;
 };
+
+/**
+ * Freshness status: when metrics were last received for this service.
+ */
+export type MetricsStatusResponse = {
+    /**
+     * ISO 8601 timestamp of the most recent metric row, or null if none yet.
+     */
+    last_received_at?: string | null;
+};
+
+/**
+ * Which storage backend to use for the MetricsStore.
+ */
+export type MetricsStoreKind = 'timescale_db' | 'click_house';
 
 export type MetricsSummaryResponse = {
     active_customers: number;
@@ -7716,6 +8707,37 @@ export type MigrationSummary = {
      * Features from the source platform that cannot be migrated
      */
     unsupported_features?: Array<UnsupportedFeature>;
+};
+
+export type MintEnrollmentTokenRequest = {
+    /**
+     * Optional: restrict the token to register one specific node name.
+     */
+    bound_node_name?: string | null;
+    /**
+     * Maximum registrations this token may authorize (default 1).
+     */
+    max_uses?: number | null;
+    /**
+     * Time-to-live in seconds (default 3600 = 1h).
+     */
+    ttl_secs?: number | null;
+};
+
+export type MintEnrollmentTokenResponse = {
+    /**
+     * SHA-256 fingerprint of the cluster CA (if mTLS is set up). Pass it to the
+     * worker as `temps join --ca-fingerprint <fp>` to verify the CA on join.
+     */
+    ca_fingerprint?: string | null;
+    expires_at: string;
+    id: number;
+    max_uses: number;
+    message: string;
+    /**
+     * The plaintext enrollment token — shown only once, save it now.
+     */
+    token: string;
 };
 
 /**
@@ -7837,6 +8859,69 @@ export type MonitorStatus = {
     uptime_percentage: number;
 };
 
+/**
+ * Global metrics observability configuration.
+ *
+ * Controls whether the MetricsScraper and AlertEvaluator background tasks
+ * are active, which storage backend they write to, and how long data is kept
+ * at each retention tier.
+ */
+export type MonitoringSettings = {
+    /**
+     * ClickHouse DSN, required only when `store = "click_house"`.
+     * Example: `"http://localhost:8123"`.
+     */
+    clickhouse_url?: string | null;
+    /**
+     * Enable or disable all metrics collection (scraping + alerting).
+     * Defaults to `false` so new installs don't write to TimescaleDB until
+     * an operator explicitly enables the feature.
+     */
+    enabled?: boolean;
+    /**
+     * How many years of daily-aggregate data to keep (converted to days internally).
+     */
+    retention_daily_years?: number;
+    /**
+     * How many days of hourly-aggregate data to keep.
+     */
+    retention_hourly_days?: number;
+    /**
+     * How many days of raw (30 s resolution) metric data to keep.
+     */
+    retention_raw_days?: number;
+    /**
+     * How often the MetricsScraper collects data from all sources, in seconds.
+     * Minimum effective value is 10 s; values below that are clamped at runtime.
+     */
+    scrape_interval_secs?: number;
+    /**
+     * Storage backend for metric data.
+     */
+    store?: MetricsStoreKind;
+};
+
+/**
+ * Monitoring settings with the ClickHouse DSN masked.
+ *
+ * `clickhouse_url` can embed credentials (`http://user:pass@host`), so it is
+ * reported only as a boolean (`clickhouse_url_set`) rather than echoed back —
+ * consistent with how the DNS API key and Docker registry password are masked.
+ */
+export type MonitoringSettingsMasked = {
+    /**
+     * True when a ClickHouse DSN is configured. The DSN itself is never
+     * returned over HTTP because it may contain credentials.
+     */
+    clickhouse_url_set: boolean;
+    enabled: boolean;
+    retention_daily_years: number;
+    retention_hourly_days: number;
+    retention_raw_days: number;
+    scrape_interval_secs: number;
+    store: MetricsStoreKind;
+};
+
 export type MrrBucketResponse = {
     bucket: string;
     charge_count: number;
@@ -7850,23 +8935,85 @@ export type MrrBucketResponse = {
  */
 export type MultiNodeSettings = {
     /**
+     * Per-cluster CA certificate (PEM) for multi-node mTLS (ADR-020 WS-2.1).
+     * Public — distributed to nodes as the trust root and used by the control
+     * plane as the root for verifying agent server certs. Minted lazily on the
+     * first CSR-bearing registration.
+     */
+    cluster_ca_cert_pem?: string | null;
+    /**
+     * Per-cluster CA private key, AES-256-GCM ciphertext (EncryptionService).
+     * SECRET — never returned over HTTP (elided in the masked response).
+     */
+    cluster_ca_key_encrypted?: string | null;
+    /**
      * SHA-256 hash of the join token (never store plaintext)
      */
     join_token_hash?: string | null;
+    /**
+     * Whether the legacy single shared join token is still accepted for node
+     * registration (ADR-020 WS-1.1). Defaults to `true` so existing clusters
+     * keep working on upgrade; fresh installs should set it `false` and rely on
+     * short-lived, single-use enrollment tokens instead.
+     */
+    legacy_shared_token_enabled?: boolean;
+    /**
+     * CPU-usage percent above which a worker node raises a resource alert
+     * (ADR-020 / monitoring). `None` disables CPU alerting. Default 90.
+     */
+    node_cpu_alert_percent?: number | null;
+    /**
+     * Disk-usage percent above which a worker node raises a resource alert.
+     * `None` disables disk alerting. Default 90.
+     */
+    node_disk_alert_percent?: number | null;
+    /**
+     * Memory-usage percent above which a worker node raises a resource alert.
+     * `None` disables memory alerting. Default 90.
+     */
+    node_memory_alert_percent?: number | null;
     /**
      * Private/WireGuard IP address of the control plane node.
      * Used by remote worker nodes to reach services (databases, etc.) running on the control plane.
      * Set via `--private-address` or `TEMPS_PRIVATE_ADDRESS`.
      */
     private_address?: string | null;
+    /**
+     * Whether to enforce multi-node mTLS (ADR-020 WS-2.1). When `false`
+     * (default), the control plane ignores join-time CSRs and nodes keep
+     * serving plaintext HTTP — zero behavior change. When `true`, the CP signs
+     * node CSRs, nodes serve mutual TLS, and every CP→agent call uses the
+     * cluster client cert. Observe-then-enforce: flip this on only once all
+     * workers have re-enrolled with certs.
+     */
+    require_mtls?: boolean;
 };
 
 /**
  * Multi-node settings with `join_token_hash` elided.
  */
 export type MultiNodeSettingsMasked = {
+    /**
+     * SHA-256 fingerprint of the cluster CA certificate (public — operators can
+     * verify it out of band; the CA private key is never exposed).
+     */
+    cluster_ca_fingerprint?: string | null;
     has_join_token: boolean;
+    /**
+     * Whether the deprecated shared join token is still accepted.
+     */
+    legacy_shared_token_enabled: boolean;
+    /**
+     * Node resource-alert thresholds (percent); `None` = that alert disabled.
+     */
+    node_cpu_alert_percent?: number | null;
+    node_disk_alert_percent?: number | null;
+    node_memory_alert_percent?: number | null;
     private_address?: string | null;
+    /**
+     * Whether control-plane↔agent mutual TLS is enforced.
+     */
+    require_mtls: boolean;
 };
 
 /**
@@ -8131,6 +9278,136 @@ export type OidcTestConnectionResponse = {
     success: boolean;
 };
 
+/**
+ * A single on-demand HTTP-01 issuance attempt from the append-only
+ * `on_demand_cert_attempts` audit log. Carries the full forensic detail for one
+ * attempt; the current cert state lives on the enclosing row's domain fields.
+ *
+ * Contains no private-key or certificate material — only audit metadata — so it
+ * is safe to return without masking.
+ */
+export type OnDemandCertAttemptResponse = {
+    /**
+     * Did we reach the Let's Encrypt API?
+     */
+    acme_request_sent?: boolean | null;
+    /**
+     * HTTP status or ACME error type returned by Let's Encrypt, when known.
+     */
+    acme_response_status?: string | null;
+    /**
+     * Did the proxy serve the `/.well-known/acme-challenge/` request?
+     */
+    challenge_served?: boolean | null;
+    /**
+     * When the attempt was recorded (epoch millis).
+     */
+    created_at: number;
+    /**
+     * End-to-end issuance duration in milliseconds (0/None for skipped).
+     */
+    duration_ms?: number | null;
+    /**
+     * Coarse error category for UI labelling: `"rate_limited"`, `"dns_failure"`,
+     * `"acme_order_expired"`, `"challenge_mismatch"`, `"timeout"`, `"internal"`.
+     */
+    error_category?: string | null;
+    /**
+     * Full `Display` chain of the error (all `source()` levels), when failed.
+     */
+    error_chain?: string | null;
+    /**
+     * SNI hostname that triggered the attempt.
+     */
+    hostname: string;
+    id: number;
+    /**
+     * Final outcome: `"issued"`, `"failed"`, `"skipped_duplicate"`,
+     * `"skipped_gate"`, `"skipped_rate_limit"`, or `"skipped_no_route"`.
+     */
+    outcome: string;
+    /**
+     * What triggered the attempt (always `"tls_callback"` today).
+     */
+    trigger: string;
+};
+
+/**
+ * One row of the on-demand certificates list: the most-recent attempt for a
+ * hostname plus the current authoritative cert state from its `domains` row.
+ */
+export type OnDemandCertRow = {
+    /**
+     * The audit record for the attempt this row represents (newest first in
+     * the list).
+     */
+    attempt: OnDemandCertAttemptResponse;
+    /**
+     * On-demand negative-cache deadline (epoch millis), when in backoff.
+     */
+    backoff_until?: number | null;
+    /**
+     * Certificate expiration (epoch millis), when an active cert exists.
+     */
+    expiration_time?: number | null;
+    /**
+     * SNI hostname.
+     */
+    hostname: string;
+    /**
+     * Current cert lifecycle status from the `domains` row, when one exists:
+     * `on_demand_pending`, `on_demand_issuing`, `active`, `on_demand_failed`,
+     * etc. `None` when no `domains` row exists yet for this hostname.
+     */
+    status?: string | null;
+};
+
+/**
+ * On-demand (lazy) HTTP-01 TLS issuance settings (ADR-018).
+ *
+ * When `enabled`, the proxy's `certificate_callback` triggers ACME HTTP-01
+ * issuance for allowlisted, STABLE hostnames (per-environment aliases and the
+ * console host) that have no active cert, rather than silently failing the
+ * handshake. Ephemeral per-deployment hostnames are NEVER certed (ADR §2).
+ *
+ * Off by default — operators opt in explicitly, except QuickStart (`sslip.io`)
+ * installs where `temps setup` auto-enables it and derives `zone`.
+ */
+export type OnDemandTlsSettings = {
+    /**
+     * How ephemeral per-deployment hostnames behave when they have no cert
+     * (they are NEVER certed — see ADR §2). One of:
+     * - `"http"` (default): serve plain HTTP on :80.
+     * - `"redirect_to_env"`: 308-redirect to the stable per-environment URL,
+     * which IS certed.
+     */
+    deployment_url_mode?: string;
+    /**
+     * Master switch. When `false` (default) the proxy's on-demand cert gate
+     * rejects every SNI and no issuance is ever triggered.
+     */
+    enabled?: boolean;
+    /**
+     * Global cap on total on-demand issuances per hour across all hostnames
+     * (ADR §4 Layer 3). The operator's self-imposed safety net, separate from
+     * the Let's Encrypt rate limit.
+     */
+    hourly_cap?: number;
+    /**
+     * Maximum number of ACME issuance flows allowed to run simultaneously
+     * (the concurrent-issuance semaphore, ADR §4 Layer 1). Min 1.
+     */
+    max_concurrent?: number;
+    /**
+     * Zone suffix for the allowlist gate. A hostname passes the gate only if
+     * it is a direct subdomain of this zone (e.g. zone `1.2.3.4.sslip.io`
+     * admits `myapp.1.2.3.4.sslip.io` but not `deep.sub.1.2.3.4.sslip.io`).
+     * `None` (default) means "auto-derive from `external_url`"; if no zone can
+     * be derived the gate rejects all SNI, disabling the feature.
+     */
+    zone?: string | null;
+};
+
 export type OpenAiError = {
     code?: string | null;
     message: string;
@@ -8158,6 +9435,90 @@ export type OperationResultResponse = {
 export type OperationResultsResponse = {
     deployment_id: string;
     operations: Array<OperationResultResponse>;
+};
+
+export type OtelDashboardResponse = {
+    created_at: string;
+    id: number;
+    layout: DashboardLayout;
+    name: string;
+    project_id: number;
+    updated_at: string;
+};
+
+export type OtelDashboardsResponse = {
+    data: Array<OtelDashboardResponse>;
+    total: number;
+};
+
+export type OtelMetricAlertRuleResponse = {
+    aggregation: string;
+    created_at: string;
+    /**
+     * The typed detector definition (discriminated union keyed by `kind`).
+     */
+    detection_config: DetectionConfig;
+    /**
+     * Coarse detector discriminator: `static|anomaly|forecast|outlier|auto_watch`.
+     */
+    detection_kind: string;
+    enabled: boolean;
+    for_duration_secs: number;
+    id: number;
+    last_evaluated_at?: string | null;
+    /**
+     * One of `ok|firing|unknown`.
+     */
+    last_state: string;
+    last_value?: number | null;
+    metric_name: string;
+    name: string;
+    project_id: number;
+    severity: string;
+    updated_at: string;
+    window_secs: number;
+};
+
+export type OtelMetricAlertsResponse = {
+    data: Array<OtelMetricAlertRuleResponse>;
+    total: number;
+};
+
+export type OtelMetricLabelKeysResponse = {
+    keys: Array<string>;
+};
+
+export type OtelMetricLabelValuesResponse = {
+    values: Array<string>;
+};
+
+export type OtelMetricNamesResponse = {
+    names: Array<string>;
+};
+
+export type OtelMetricsResponse = {
+    count: number;
+    data: Array<MetricBucket>;
+};
+
+/**
+ * Outlier detection algorithm.
+ */
+export type OutlierAlgorithm = 'dbscan' | 'scaled_dbscan' | 'mad' | 'scaled_mad';
+
+/**
+ * Outlier (cross-series population) detector parameters (stub — not evaluated).
+ */
+export type OutlierParams = {
+    algorithm?: OutlierAlgorithm;
+    /**
+     * Label key defining the peer population compared across series (e.g. `host`).
+     */
+    peer_group_key: string;
+    /**
+     * Sensitivity; higher tolerates larger spread before flagging.
+     */
+    tolerance?: number;
 };
 
 /**
@@ -9339,7 +10700,7 @@ export type ProjectHealthSummary = {
      */
     status: string;
     /**
-     * Total errors (status >= 400) in the period
+     * Total server errors (status >= 500) in the period
      */
     total_errors: number;
     /**
@@ -9393,6 +10754,14 @@ export type ProjectQuery = {
 };
 
 export type ProjectResponse = {
+    /**
+     * Opt-in to AI summarization of metric alert notifications (NULL/false = off).
+     */
+    ai_alert_summaries_enabled?: boolean | null;
+    /**
+     * Opt-in to AI debugging chat, e.g. on deployment failures (NULL/false = off).
+     */
+    ai_debug_chat_enabled?: boolean | null;
     /**
      * Attack mode - when enabled, requires CAPTCHA verification for all project environments
      */
@@ -9751,6 +11120,10 @@ export type ProviderKeyResponse = {
     api_key_masked: string;
     base_url?: string | null;
     created_at: string;
+    /**
+     * Model id this provider serves (NULL → per-provider default).
+     */
+    default_model?: string | null;
     display_name: string;
     id: number;
     is_active: boolean;
@@ -10224,6 +11597,13 @@ export type RegisterNodeApiRequest = {
      */
     address: string;
     /**
+     * Node-generated certificate signing request (PEM) for multi-node mTLS
+     * (ADR-020 WS-2.1). When present, the control plane signs it with the
+     * cluster CA and returns the leaf + CA cert. Optional — token-only nodes
+     * (legacy / edge) still register without one.
+     */
+    csr_pem?: string | null;
+    /**
      * X25519 public key for ECIES certificate encryption (base64-encoded, edge nodes only)
      */
     edge_public_key?: string | null;
@@ -10239,6 +11619,12 @@ export type RegisterNodeApiRequest = {
      * Unique name for this node
      */
     name: string;
+    /**
+     * The node's *current* token, supplied to prove possession when
+     * re-registering (changing the identity of) a node that already exists.
+     * Optional; only needed to rebind a still-live node. (ADR-020 WS-1.2.)
+     */
+    prior_token?: string | null;
     /**
      * Private/WireGuard address for inter-node communication
      */
@@ -10262,6 +11648,16 @@ export type RegisterNodeApiRequest = {
 };
 
 export type RegisterNodeResponse = {
+    /**
+     * The cluster CA certificate (PEM) the node pins as its trust root.
+     * Present only when a `csr_pem` was supplied. (ADR-020 WS-2.1.)
+     */
+    ca_cert_pem?: string | null;
+    /**
+     * The signed per-node leaf certificate (PEM) the agent serves as its TLS
+     * server cert. Present only when a `csr_pem` was supplied. (ADR-020 WS-2.1.)
+     */
+    cert_pem?: string | null;
     id: number;
     message: string;
     name: string;
@@ -11207,13 +12603,26 @@ export type ScreenshotSettings = {
 
 export type SearchLogsRequest = {
     /**
+     * Filter to specific containers (Docker container IDs). Empty = all
+     * containers. Drives "filter by container / show all" in a project's
+     * history, which spans multiple deployments and containers.
+     */
+    container_ids?: Array<string>;
+    /**
+     * grep -C: number of raw context lines to include before and after each
+     * match (0 = none, default). Clamped to 50 server-side. The surrounding
+     * lines ignore the level/text filters — they are the actual adjacent log
+     * lines, merged across overlapping matches.
+     */
+    context_lines?: number | null;
+    /**
      * Pagination cursor
      */
     cursor?: string | null;
     /**
-     * Filter by deploy ID
+     * Filter by deployment ID (deployments.id)
      */
-    deploy_id?: string | null;
+    deploy_id?: number | null;
     /**
      * End of time range (ISO 8601). Defaults to now.
      */
@@ -11226,6 +12635,11 @@ export type SearchLogsRequest = {
      * Filter by log levels
      */
     levels?: Array<string>;
+    /**
+     * Filter to specific worker nodes (node_id). Empty = all nodes, including
+     * control-plane-local logs.
+     */
+    node_ids?: Array<number>;
     /**
      * Page size (default: 100, max: 500)
      */
@@ -11249,6 +12663,11 @@ export type SearchLogsRequest = {
 };
 
 export type SearchLogsResponse = {
+    /**
+     * Distinct containers/nodes/services available in the queried scope, for
+     * the filter dropdowns. Populated on the first page (no cursor).
+     */
+    available_sources?: Array<LogSource>;
     lines: Array<LogSearchLine>;
     next_cursor?: string | null;
     search_mode: SearchMode;
@@ -11259,6 +12678,11 @@ export type SearchLogsResponse = {
  * Search execution mode
  */
 export type SearchMode = 'index' | 'archive';
+
+/**
+ * Seasonality model for an anomaly baseline.
+ */
+export type Seasonality = 'none' | 'hourly' | 'daily' | 'weekly';
 
 export type SecretResponse = {
     created_at: string;
@@ -11412,6 +12836,17 @@ export type SendEmailResponseBody = {
     status: string;
 };
 
+export type SendMessageRequest = {
+    content: string;
+    /**
+     * Optional, client-supplied description of the page/entity the user is
+     * currently viewing (e.g. a trace in a project). Injected into the model's
+     * view of this turn only — never stored or shown in history. Capped server
+     * side; oversized values are ignored rather than rejected.
+     */
+    page_context?: string | null;
+};
+
 export type SentryChunkUploadResponse = {
     accept: Array<string>;
     chunkSize: number;
@@ -11501,6 +12936,28 @@ export type ServiceAccessInfo = {
 export type ServiceAction = 'create' | 'link-external' | 'skip';
 
 /**
+ * Wire representation of a monitoring alert rule.
+ *
+ * Registered under a domain-prefixed OpenAPI schema name to avoid colliding
+ * with `temps-error-tracking`'s unrelated `AlertRuleResponse` (utoipa keys
+ * schemas by their bare struct name, so without `as = ...` the last crate to
+ * register would silently shadow this one in the merged spec / generated SDK).
+ */
+export type ServiceAlertRuleResponse = {
+    comparator: string;
+    deployment_id?: number | null;
+    enabled: boolean;
+    for_duration_secs: number;
+    id: number;
+    metric_name: string;
+    name: string;
+    service_id?: number | null;
+    severity: string;
+    silenced_until?: string | null;
+    threshold: number;
+};
+
+/**
  * A single backup entry in the per-service backup list.
  */
 export type ServiceBackupEntryResponse = {
@@ -11584,6 +13041,30 @@ export type ServiceBackupListResponse = {
      * Total number of backups for this service across all pages.
      */
     total: number;
+};
+
+/**
+ * Request body for creating an alert rule on an external service.
+ *
+ * Domain-prefixed schema name — see [`AlertRuleResponse`] for why.
+ */
+export type ServiceCreateAlertRuleRequest = {
+    /**
+     * One of `>`, `<`, `>=`, `<=`.
+     */
+    comparator: string;
+    enabled?: boolean;
+    /**
+     * Seconds the breach must persist before the alarm fires (0 = immediate).
+     */
+    for_duration_secs?: number;
+    metric_name: string;
+    name: string;
+    /**
+     * `"warning"` or `"critical"`.
+     */
+    severity: string;
+    threshold: number;
 };
 
 export type ServiceHealthResponse = {
@@ -11742,6 +13223,7 @@ export type ServicePlan = {
  * - `memory_swap_mb`→ `HostConfig.memory_swap`   (bytes; ≥ memory)
  * - `nano_cpus`     → `HostConfig.nano_cpus`     (1e9 = 1 full CPU)
  * - `cpu_shares`    → `HostConfig.cpu_shares`    (relative weight, default 1024)
+ * - `shm_size_mb`   → `HostConfig.shm_size`      (bytes; default 64 MiB)
  *
  * IMPORTANT: enabling hard memory limits causes the kernel OOM killer to
  * terminate the container when the working set exceeds the limit. The
@@ -11767,6 +13249,15 @@ export type ServiceResourceLimits = {
      * CPU quota in nano-cpus. 1_000_000_000 = 1 full CPU core. None = unlimited.
      */
     nano_cpus?: number | null;
+    /**
+     * Shared memory (/dev/shm) size in MiB. None = Docker default (64 MiB).
+     * Maps to HostConfig.shm_size (bytes). PostgreSQL uses /dev/shm for parallel
+     * query workers and large work_mem; the 64 MiB default causes "could not
+     * resize shared memory segment ... No space left on device" under load.
+     * NOTE: shm_size is fixed at container-create time — Docker's live update
+     * API cannot change it, so changing this value recreates the container.
+     */
+    shm_size_mb?: number | null;
 };
 
 /**
@@ -11791,6 +13282,21 @@ export type ServiceTypeInfo = {
 };
 
 export type ServiceTypeRoute = 'mongodb' | 'postgres' | 'redis' | 's3' | 'kv' | 'blob' | 'rustfs' | 'minio';
+
+/**
+ * Request body for updating an existing alert rule.
+ *
+ * Domain-prefixed schema name — see [`AlertRuleResponse`] for why.
+ */
+export type ServiceUpdateAlertRuleRequest = {
+    comparator?: string | null;
+    enabled?: boolean | null;
+    for_duration_secs?: number | null;
+    metric_name?: string | null;
+    name?: string | null;
+    severity?: string | null;
+    threshold?: number | null;
+};
 
 export type SesCredentialsRequest = {
     access_key_id: string;
@@ -12639,6 +14145,20 @@ export type StaticBundleResponse = {
 };
 
 /**
+ * Static threshold detector: compare the aggregated `value` against `threshold`.
+ */
+export type StaticParams = {
+    /**
+     * How `value` is compared against `threshold`.
+     */
+    comparator: Comparator;
+    /**
+     * The threshold the aggregated value is compared against.
+     */
+    threshold: number;
+};
+
+/**
  * Configuration for static site presets (Vite, Next.js, Docusaurus, etc.)
  * These presets build static sites that are served via a web server
  */
@@ -12887,6 +14407,10 @@ export type TemplateResponse = {
      */
     env_vars: Array<EnvVarTemplateResponse>;
     /**
+     * Container port the prebuilt image listens on (image deploys only).
+     */
+    exposed_port?: number | null;
+    /**
      * Feature highlights
      */
     features: Array<string>;
@@ -12894,6 +14418,15 @@ export type TemplateResponse = {
      * Git repository reference
      */
     git: GitRefResponse;
+    /**
+     * HTTP health-check path probed after the container starts (image deploys).
+     */
+    health_check_path?: string | null;
+    /**
+     * Prebuilt Docker image reference. When set, the one-click deploy pulls and
+     * runs this image directly (no build); when absent it builds from `git`.
+     */
+    image?: string | null;
     /**
      * URL to template image/icon
      */
@@ -13095,8 +14628,70 @@ export type TodayStatsResponse = {
     total_requests: number;
 };
 
+/**
+ * Request body to toggle OTLP metric ingestion for a deployment.
+ */
+export type ToggleDeploymentMetricsRequest = {
+    /**
+     * Whether to enable (`true`) or disable (`false`) metric ingestion.
+     */
+    enabled: boolean;
+    /**
+     * Prometheus scrape path (optional, defaults to `/metrics`).
+     */
+    path?: string | null;
+    /**
+     * Prometheus scrape port (optional).
+     */
+    port?: number | null;
+};
+
+/**
+ * Request body to toggle metric collection for an external service.
+ */
+export type ToggleServiceMetricsRequest = {
+    /**
+     * Whether to enable (`true`) or disable (`false`) metric collection.
+     */
+    enabled: boolean;
+};
+
 export type TokenRenewalRequest = {
     refresh_token: string;
+};
+
+/**
+ * Payload for the `tool_call` SSE event: the model is about to run a tool.
+ * Serialized as compact single-line JSON onto one `data:` line.
+ */
+export type ToolCallEvent = {
+    /**
+     * The raw JSON-args string the model emitted.
+     */
+    arguments: string;
+    id: string;
+    name: string;
+};
+
+/**
+ * One persisted tool invocation + its result, attached to an assistant message.
+ */
+export type ToolInfo = {
+    arguments: string;
+    id: string;
+    name: string;
+    result?: string | null;
+};
+
+/**
+ * Payload for the `tool_result` SSE event: a tool finished running. Serialized
+ * as compact single-line JSON; `content` is JSON-string-escaped so it stays on
+ * one `data:` line even when long.
+ */
+export type ToolResultEvent = {
+    content: string;
+    id: string;
+    name: string;
 };
 
 export type TopModelsQueryParams = {
@@ -13471,6 +15066,12 @@ export type UpdateBlobResponse = {
     success: boolean;
 };
 
+export type UpdateCloudflareProviderRequest = {
+    config: CloudflareConfig;
+    enabled?: boolean | null;
+    name?: string | null;
+};
+
 export type UpdateConfigBody = {
     config?: null | ProviderConfig;
 };
@@ -13485,6 +15086,11 @@ export type UpdateCustomDomainRequest = {
      */
     service_name?: string | null;
     status_code?: number | null;
+};
+
+export type UpdateDashboardRequest = {
+    layout?: null | DashboardLayout;
+    name?: string | null;
 };
 
 export type UpdateDeploymentConfigRequest = {
@@ -13545,11 +15151,26 @@ export type UpdateEnvironmentSettingsRequest = {
      */
     anti_affinity?: boolean | null;
     /**
+     * Per-environment CAPTCHA attack-mode override (tri-state):
+     * - absent → leave the current override unchanged
+     * - JSON `null` → clear the override (inherit the project-level setting)
+     * - `true`/`false` → override the project setting for this environment
+     */
+    attack_mode?: boolean | null;
+    /**
      * Enable/disable automatic deployments for this environment
      */
     automatic_deploy?: boolean | null;
     branch?: string | null;
+    /**
+     * Maximum (limit) CPU in microcores. Send JSON `null` to clear → "no limit".
+     * Absent leaves the current value unchanged.
+     */
     cpu_limit?: number | null;
+    /**
+     * Minimum (request) CPU in microcores. Send JSON `null` to clear (no request).
+     * Absent leaves the current value unchanged.
+     */
     cpu_request?: number | null;
     /**
      * Port exposed by the container (overrides project-level port for this environment)
@@ -13565,7 +15186,15 @@ export type UpdateEnvironmentSettingsRequest = {
      * Seconds of inactivity before stopping containers (60-86400). Default: 300.
      */
     idle_timeout_seconds?: number | null;
+    /**
+     * Maximum (limit) memory in MB. Send JSON `null` to clear → "no limit".
+     * Absent leaves the current value unchanged.
+     */
     memory_limit?: number | null;
+    /**
+     * Minimum (request) memory in MB. Send JSON `null` to clear (no request).
+     * Absent leaves the current value unchanged.
+     */
     memory_request?: number | null;
     /**
      * Enable on-demand mode (scale-to-zero). Containers are stopped after
@@ -13739,6 +15368,17 @@ export type UpdateMcpRequest = {
     name?: string | null;
 };
 
+export type UpdateMetricAlertRequest = {
+    aggregation?: string | null;
+    detection_config?: null | DetectionConfig;
+    enabled?: boolean | null;
+    for_duration_secs?: number | null;
+    metric_name?: string | null;
+    name?: string | null;
+    severity?: string | null;
+    window_secs?: number | null;
+};
+
 export type UpdateNotificationEmailProviderRequest = {
     config: EmailConfig;
     enabled?: boolean | null;
@@ -13779,6 +15419,14 @@ export type UpdateProjectSecretRequest = {
 };
 
 export type UpdateProjectSettingsRequest = {
+    /**
+     * Opt in to AI summarization of metric alert notifications (ADR-021).
+     */
+    ai_alert_summaries_enabled?: boolean | null;
+    /**
+     * Opt in to AI debugging chat, e.g. on deployment failures (ADR-023).
+     */
+    ai_debug_chat_enabled?: boolean | null;
     /**
      * Enable/disable attack mode (CAPTCHA protection) for all project environments
      */
@@ -13852,7 +15500,16 @@ export type UpdateProviderCredentialsRequest = {
 
 export type UpdateProviderKeyRequest = {
     api_key?: string | null;
+    /**
+     * Double-Option: absent = leave unchanged, present-null = clear (revert to
+     * the provider's default endpoint), present-value = set.
+     */
     base_url?: string | null;
+    /**
+     * Double-Option: absent = leave unchanged, present-null = clear the pinned
+     * model (revert to the per-provider default), present-value = set.
+     */
+    default_model?: string | null;
     display_name?: string | null;
     is_active?: boolean | null;
 };
@@ -14008,7 +15665,7 @@ export type UpgradeExternalServiceRequest = {
 export type UpgradeRequest = {
     /**
      * Image reference to pull and run (e.g.
-     * `kfsoftware/temps-preview-gateway:0.2.1`). Empty resets to default.
+     * `ghcr.io/gotempsh/temps-preview-gateway:latest`). Empty resets to default.
      */
     image: string;
 };
@@ -15638,6 +17295,24 @@ export type WebhookTriggerResponses = {
 };
 
 export type WebhookTriggerResponse2 = WebhookTriggerResponses[keyof WebhookTriggerResponses];
+
+export type ListAllConversationsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/ai/conversations';
+};
+
+export type ListAllConversationsErrors = {
+    401: unknown;
+    403: unknown;
+};
+
+export type ListAllConversationsResponses = {
+    200: Array<GlobalConversationResponse>;
+};
+
+export type ListAllConversationsResponse = ListAllConversationsResponses[keyof ListAllConversationsResponses];
 
 export type GetPricingData = {
     body?: never;
@@ -20034,6 +21709,136 @@ export type GetScanByDeploymentResponses = {
 
 export type GetScanByDeploymentResponse = GetScanByDeploymentResponses[keyof GetScanByDeploymentResponses];
 
+export type DeploymentMetricsGetRangeData = {
+    body?: never;
+    path: {
+        /**
+         * Deployment ID
+         */
+        id: number;
+    };
+    query: {
+        /**
+         * Metric name, e.g. `"pg.connections_active"`.
+         */
+        metric: string;
+        /**
+         * Time window: `"1h"` | `"6h"` | `"24h"` | `"7d"`.
+         */
+        range?: string;
+        /**
+         * Optional histogram percentile (0–100).  When provided, the endpoint
+         * fetches histogram buckets and computes the requested quantile.
+         */
+        percentile?: number | null;
+    };
+    url: '/deployments/{id}/metrics';
+};
+
+export type DeploymentMetricsGetRangeErrors = {
+    /**
+     * Invalid query parameters
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * Metrics store not available
+     */
+    503: unknown;
+};
+
+export type DeploymentMetricsGetRangeResponses = {
+    /**
+     * Metric time series data points
+     */
+    200: Array<MetricDataPoint>;
+};
+
+export type DeploymentMetricsGetRangeResponse = DeploymentMetricsGetRangeResponses[keyof DeploymentMetricsGetRangeResponses];
+
+export type DeploymentMetricsToggleData = {
+    body: ToggleDeploymentMetricsRequest;
+    path: {
+        /**
+         * Deployment ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/deployments/{id}/metrics/enable';
+};
+
+export type DeploymentMetricsToggleErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DeploymentMetricsToggleResponses = {
+    /**
+     * Metrics toggle applied
+     */
+    200: unknown;
+};
+
+export type DeploymentMetricsGetLatestData = {
+    body?: never;
+    path: {
+        /**
+         * Deployment ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/deployments/{id}/metrics/latest';
+};
+
+export type DeploymentMetricsGetLatestErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * Metrics store not available
+     */
+    503: unknown;
+};
+
+export type DeploymentMetricsGetLatestResponses = {
+    /**
+     * Map of metric name to latest value
+     */
+    200: {
+        [key: string]: number;
+    };
+};
+
+export type DeploymentMetricsGetLatestResponse = DeploymentMetricsGetLatestResponses[keyof DeploymentMetricsGetLatestResponses];
+
 export type ListDnsProvidersData = {
     body?: never;
     path?: never;
@@ -20535,6 +22340,82 @@ export type GetDomainByHostResponses = {
 };
 
 export type GetDomainByHostResponse = GetDomainByHostResponses[keyof GetDomainByHostResponses];
+
+export type GetOnDemandCertStatusData = {
+    body?: never;
+    path: {
+        /**
+         * Domain hostname
+         */
+        hostname: string;
+    };
+    query?: never;
+    url: '/domains/by-host/{hostname}/cert-status';
+};
+
+export type GetOnDemandCertStatusErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetOnDemandCertStatusResponses = {
+    /**
+     * On-demand cert status retrieved successfully
+     */
+    200: CertStatusResponse;
+};
+
+export type GetOnDemandCertStatusResponse = GetOnDemandCertStatusResponses[keyof GetOnDemandCertStatusResponses];
+
+export type ListOnDemandCertsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Page number (1-indexed)
+         */
+        page?: number | null;
+        /**
+         * Number of items per page (max 100)
+         */
+        page_size?: number | null;
+    };
+    url: '/domains/on-demand-certs';
+};
+
+export type ListOnDemandCertsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListOnDemandCertsResponses = {
+    /**
+     * On-demand cert attempts retrieved successfully
+     */
+    200: ListOnDemandCertsResponse;
+};
+
+export type ListOnDemandCertsResponse2 = ListOnDemandCertsResponses[keyof ListOnDemandCertsResponses];
 
 export type CancelDomainOrderData = {
     body?: never;
@@ -22666,6 +24547,368 @@ export type PromoteClusterMemberResponses = {
     202: unknown;
 };
 
+export type ExternalServiceMetricsGetRangeData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query: {
+        /**
+         * Metric name, e.g. `"pg.connections_active"`.
+         */
+        metric: string;
+        /**
+         * Time window: `"1h"` | `"6h"` | `"24h"` | `"7d"`.
+         */
+        range?: string;
+        /**
+         * Optional histogram percentile (0–100).  When provided, the endpoint
+         * fetches histogram buckets and computes the requested quantile.
+         */
+        percentile?: number | null;
+    };
+    url: '/external-services/{id}/metrics';
+};
+
+export type ExternalServiceMetricsGetRangeErrors = {
+    /**
+     * Invalid query parameters
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * Metrics store not available
+     */
+    503: unknown;
+};
+
+export type ExternalServiceMetricsGetRangeResponses = {
+    /**
+     * Metric time series data points
+     */
+    200: Array<MetricDataPoint>;
+};
+
+export type ExternalServiceMetricsGetRangeResponse = ExternalServiceMetricsGetRangeResponses[keyof ExternalServiceMetricsGetRangeResponses];
+
+export type ExternalServiceMetricsGetAlertRulesData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/metrics/alert-rules';
+};
+
+export type ExternalServiceMetricsGetAlertRulesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ExternalServiceMetricsGetAlertRulesResponses = {
+    /**
+     * List of alert rules
+     */
+    200: Array<ServiceAlertRuleResponse>;
+};
+
+export type ExternalServiceMetricsGetAlertRulesResponse = ExternalServiceMetricsGetAlertRulesResponses[keyof ExternalServiceMetricsGetAlertRulesResponses];
+
+export type ExternalServiceMetricsCreateAlertRuleData = {
+    body: ServiceCreateAlertRuleRequest;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/metrics/alert-rules';
+};
+
+export type ExternalServiceMetricsCreateAlertRuleErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ExternalServiceMetricsCreateAlertRuleResponses = {
+    /**
+     * Alert rule created
+     */
+    201: ServiceAlertRuleResponse;
+};
+
+export type ExternalServiceMetricsCreateAlertRuleResponse = ExternalServiceMetricsCreateAlertRuleResponses[keyof ExternalServiceMetricsCreateAlertRuleResponses];
+
+export type ExternalServiceMetricsDeleteAlertRuleData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+        /**
+         * Alert rule ID
+         */
+        rule_id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/metrics/alert-rules/{rule_id}';
+};
+
+export type ExternalServiceMetricsDeleteAlertRuleErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Alert rule not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ExternalServiceMetricsDeleteAlertRuleResponses = {
+    /**
+     * Alert rule deleted
+     */
+    204: void;
+};
+
+export type ExternalServiceMetricsDeleteAlertRuleResponse = ExternalServiceMetricsDeleteAlertRuleResponses[keyof ExternalServiceMetricsDeleteAlertRuleResponses];
+
+export type ExternalServiceMetricsUpdateAlertRuleData = {
+    body: ServiceUpdateAlertRuleRequest;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+        /**
+         * Alert rule ID
+         */
+        rule_id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/metrics/alert-rules/{rule_id}';
+};
+
+export type ExternalServiceMetricsUpdateAlertRuleErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Alert rule not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ExternalServiceMetricsUpdateAlertRuleResponses = {
+    /**
+     * Updated alert rule
+     */
+    200: ServiceAlertRuleResponse;
+};
+
+export type ExternalServiceMetricsUpdateAlertRuleResponse = ExternalServiceMetricsUpdateAlertRuleResponses[keyof ExternalServiceMetricsUpdateAlertRuleResponses];
+
+export type ExternalServiceMetricsByDatabaseData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/metrics/by-database';
+};
+
+export type ExternalServiceMetricsByDatabaseErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * Metrics not available
+     */
+    503: unknown;
+};
+
+export type ExternalServiceMetricsByDatabaseResponses = {
+    /**
+     * Per-database metric breakdown
+     */
+    200: DatabaseMetricsResponse;
+};
+
+export type ExternalServiceMetricsByDatabaseResponse = ExternalServiceMetricsByDatabaseResponses[keyof ExternalServiceMetricsByDatabaseResponses];
+
+export type ExternalServiceMetricsToggleData = {
+    body: ToggleServiceMetricsRequest;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/metrics/enable';
+};
+
+export type ExternalServiceMetricsToggleErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Service not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ExternalServiceMetricsToggleResponses = {
+    /**
+     * Metrics toggle applied
+     */
+    200: unknown;
+};
+
+export type ExternalServiceMetricsGetLatestData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/metrics/latest';
+};
+
+export type ExternalServiceMetricsGetLatestErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * Metrics store not available
+     */
+    503: unknown;
+};
+
+export type ExternalServiceMetricsGetLatestResponses = {
+    /**
+     * Map of metric name to latest value
+     */
+    200: {
+        [key: string]: number;
+    };
+};
+
+export type ExternalServiceMetricsGetLatestResponse = ExternalServiceMetricsGetLatestResponses[keyof ExternalServiceMetricsGetLatestResponses];
+
+export type ExternalServiceMetricsStatusData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/metrics/status';
+};
+
+export type ExternalServiceMetricsStatusErrors = {
+    /**
+     * Metrics not available
+     */
+    503: unknown;
+};
+
+export type ExternalServiceMetricsStatusResponses = {
+    /**
+     * Metrics freshness status
+     */
+    200: MetricsStatusResponse;
+};
+
+export type ExternalServiceMetricsStatusResponse = ExternalServiceMetricsStatusResponses[keyof ExternalServiceMetricsStatusResponses];
+
 export type GetServicePreviewEnvironmentVariablesMaskedData = {
     body?: never;
     path: {
@@ -24393,6 +26636,111 @@ export type CreateGitProviderResponses = {
 };
 
 export type CreateGitProviderResponse = CreateGitProviderResponses[keyof CreateGitProviderResponses];
+
+export type CreateBitbucketProviderData = {
+    body: CreateBitbucketRequest;
+    path?: never;
+    query?: never;
+    url: '/git-providers/bitbucket';
+};
+
+export type CreateBitbucketProviderErrors = {
+    /**
+     * Bad request — missing or invalid auth fields
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateBitbucketProviderResponses = {
+    /**
+     * Bitbucket provider created successfully
+     */
+    201: ProviderResponse;
+};
+
+export type CreateBitbucketProviderResponse = CreateBitbucketProviderResponses[keyof CreateBitbucketProviderResponses];
+
+export type CreateGenericProviderData = {
+    body: CreateGenericRequest;
+    path?: never;
+    query?: never;
+    url: '/git-providers/generic';
+};
+
+export type CreateGenericProviderErrors = {
+    /**
+     * Bad request — invalid clone URL or missing fields
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateGenericProviderResponses = {
+    /**
+     * Generic git provider created successfully
+     */
+    201: ProviderResponse;
+};
+
+export type CreateGenericProviderResponse = CreateGenericProviderResponses[keyof CreateGenericProviderResponses];
+
+export type CreateGiteaPatProviderData = {
+    body: CreateGiteaPatRequest;
+    path?: never;
+    query?: never;
+    url: '/git-providers/gitea/pat';
+};
+
+export type CreateGiteaPatProviderErrors = {
+    /**
+     * Bad request — invalid URL or missing fields
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateGiteaPatProviderResponses = {
+    /**
+     * Gitea PAT provider created successfully
+     */
+    201: ProviderResponse;
+};
+
+export type CreateGiteaPatProviderResponse = CreateGiteaPatProviderResponses[keyof CreateGiteaPatProviderResponses];
 
 export type CreateGithubPatProviderData = {
     body: CreateGitHubPatRequest;
@@ -26854,6 +29202,60 @@ export type GetUptimeHistoryResponses = {
 
 export type GetUptimeHistoryResponse = GetUptimeHistoryResponses[keyof GetUptimeHistoryResponses];
 
+export type NodeMetricsGetRangeData = {
+    body?: never;
+    path: {
+        /**
+         * Node ID
+         */
+        id: number;
+    };
+    query: {
+        /**
+         * Metric name, e.g. `"pg.connections_active"`.
+         */
+        metric: string;
+        /**
+         * Time window: `"1h"` | `"6h"` | `"24h"` | `"7d"`.
+         */
+        range?: string;
+        /**
+         * Optional histogram percentile (0–100).  When provided, the endpoint
+         * fetches histogram buckets and computes the requested quantile.
+         */
+        percentile?: number | null;
+    };
+    url: '/nodes/{id}/metrics';
+};
+
+export type NodeMetricsGetRangeErrors = {
+    /**
+     * Invalid query parameters
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * Metrics store not available
+     */
+    503: unknown;
+};
+
+export type NodeMetricsGetRangeResponses = {
+    /**
+     * Metric time series data points
+     */
+    200: Array<MetricDataPoint>;
+};
+
+export type NodeMetricsGetRangeResponse = NodeMetricsGetRangeResponses[keyof NodeMetricsGetRangeResponses];
+
 export type DeletePreferencesData = {
     body?: never;
     path?: never;
@@ -26996,6 +29398,65 @@ export type CreateNotificationProviderResponses = {
 
 export type CreateNotificationProviderResponse = CreateNotificationProviderResponses[keyof CreateNotificationProviderResponses];
 
+export type CreateCloudflareProviderData = {
+    body: CreateCloudflareProviderRequest;
+    path?: never;
+    query?: never;
+    url: '/notification-providers/cloudflare';
+};
+
+export type CreateCloudflareProviderErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateCloudflareProviderResponses = {
+    /**
+     * Successfully created Cloudflare provider
+     */
+    201: NotificationProviderResponse;
+};
+
+export type CreateCloudflareProviderResponse = CreateCloudflareProviderResponses[keyof CreateCloudflareProviderResponses];
+
+export type UpdateCloudflareProviderData = {
+    body: UpdateCloudflareProviderRequest;
+    path: {
+        /**
+         * Provider ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/notification-providers/cloudflare/{id}';
+};
+
+export type UpdateCloudflareProviderErrors = {
+    /**
+     * Provider not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateCloudflareProviderResponses = {
+    /**
+     * Successfully updated Cloudflare provider
+     */
+    200: NotificationProviderResponse;
+};
+
+export type UpdateCloudflareProviderResponse = UpdateCloudflareProviderResponses[keyof UpdateCloudflareProviderResponses];
+
 export type CreateNotificationEmailProviderData = {
     body: CreateNotificationEmailProviderRequest;
     path?: never;
@@ -27023,7 +29484,7 @@ export type CreateNotificationEmailProviderResponses = {
 
 export type CreateNotificationEmailProviderResponse = CreateNotificationEmailProviderResponses[keyof CreateNotificationEmailProviderResponses];
 
-export type UpdateEmailProvider2Data = {
+export type UpdateNotificationEmailProviderData = {
     body: UpdateNotificationEmailProviderRequest;
     path: {
         /**
@@ -27035,7 +29496,7 @@ export type UpdateEmailProvider2Data = {
     url: '/notification-providers/email/{id}';
 };
 
-export type UpdateEmailProvider2Errors = {
+export type UpdateNotificationEmailProviderErrors = {
     /**
      * Provider not found
      */
@@ -27046,14 +29507,14 @@ export type UpdateEmailProvider2Errors = {
     500: unknown;
 };
 
-export type UpdateEmailProvider2Responses = {
+export type UpdateNotificationEmailProviderResponses = {
     /**
      * Successfully updated Email provider
      */
     200: NotificationProviderResponse;
 };
 
-export type UpdateEmailProvider2Response = UpdateEmailProvider2Responses[keyof UpdateEmailProvider2Responses];
+export type UpdateNotificationEmailProviderResponse = UpdateNotificationEmailProviderResponses[keyof UpdateNotificationEmailProviderResponses];
 
 export type CreateSlackProviderData = {
     body: CreateSlackProviderRequest;
@@ -27339,6 +29800,499 @@ export type ListOrdersResponses = {
 
 export type ListOrdersResponse2 = ListOrdersResponses[keyof ListOrdersResponses];
 
+export type ListAlertsData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Page number (default: 1)
+         */
+        page?: number;
+        /**
+         * Page size (default: 20, max: 100)
+         */
+        page_size?: number;
+    };
+    url: '/otel/alerts';
+};
+
+export type ListAlertsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListAlertsError = ListAlertsErrors[keyof ListAlertsErrors];
+
+export type ListAlertsResponses = {
+    /**
+     * Alert rules for the project
+     */
+    200: OtelMetricAlertsResponse;
+};
+
+export type ListAlertsResponse = ListAlertsResponses[keyof ListAlertsResponses];
+
+export type CreateAlertData = {
+    body: CreateMetricAlertRequest;
+    path?: never;
+    query?: never;
+    url: '/otel/alerts';
+};
+
+export type CreateAlertErrors = {
+    /**
+     * Validation error
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type CreateAlertError = CreateAlertErrors[keyof CreateAlertErrors];
+
+export type CreateAlertResponses = {
+    /**
+     * Alert rule created
+     */
+    201: OtelMetricAlertRuleResponse;
+};
+
+export type CreateAlertResponse = CreateAlertResponses[keyof CreateAlertResponses];
+
+export type PreviewAlertData = {
+    body: AnomalyPreviewRequest;
+    path?: never;
+    query?: never;
+    url: '/otel/alerts/preview';
+};
+
+export type PreviewAlertErrors = {
+    /**
+     * Not an anomaly detector / bad input
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type PreviewAlertError = PreviewAlertErrors[keyof PreviewAlertErrors];
+
+export type PreviewAlertResponses = {
+    /**
+     * Per-bucket band + breach points
+     */
+    200: AnomalyPreviewResponse;
+};
+
+export type PreviewAlertResponse = PreviewAlertResponses[keyof PreviewAlertResponses];
+
+export type DeleteAlertData = {
+    body?: never;
+    path: {
+        /**
+         * Alert rule ID
+         */
+        id: number;
+    };
+    query: {
+        /**
+         * Owning project ID (scopes the delete)
+         */
+        project_id: number;
+    };
+    url: '/otel/alerts/{id}';
+};
+
+export type DeleteAlertErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Alert rule not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type DeleteAlertError = DeleteAlertErrors[keyof DeleteAlertErrors];
+
+export type DeleteAlertResponses = {
+    /**
+     * Alert rule deleted
+     */
+    204: void;
+};
+
+export type DeleteAlertResponse = DeleteAlertResponses[keyof DeleteAlertResponses];
+
+export type GetAlertData = {
+    body?: never;
+    path: {
+        /**
+         * Alert rule ID
+         */
+        id: number;
+    };
+    query: {
+        /**
+         * Owning project ID (scopes the lookup)
+         */
+        project_id: number;
+    };
+    url: '/otel/alerts/{id}';
+};
+
+export type GetAlertErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Alert rule not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetAlertError = GetAlertErrors[keyof GetAlertErrors];
+
+export type GetAlertResponses = {
+    /**
+     * Alert rule
+     */
+    200: OtelMetricAlertRuleResponse;
+};
+
+export type GetAlertResponse = GetAlertResponses[keyof GetAlertResponses];
+
+export type UpdateAlertData = {
+    body: UpdateMetricAlertRequest;
+    path: {
+        /**
+         * Alert rule ID
+         */
+        id: number;
+    };
+    query: {
+        /**
+         * Owning project ID (scopes the update)
+         */
+        project_id: number;
+    };
+    url: '/otel/alerts/{id}';
+};
+
+export type UpdateAlertErrors = {
+    /**
+     * Validation error
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Alert rule not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type UpdateAlertError = UpdateAlertErrors[keyof UpdateAlertErrors];
+
+export type UpdateAlertResponses = {
+    /**
+     * Alert rule updated
+     */
+    200: OtelMetricAlertRuleResponse;
+};
+
+export type UpdateAlertResponse = UpdateAlertResponses[keyof UpdateAlertResponses];
+
+export type ListDashboardsData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Page number (default: 1)
+         */
+        page?: number;
+        /**
+         * Page size (default: 20, max: 100)
+         */
+        page_size?: number;
+    };
+    url: '/otel/dashboards';
+};
+
+export type ListDashboardsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListDashboardsError = ListDashboardsErrors[keyof ListDashboardsErrors];
+
+export type ListDashboardsResponses = {
+    /**
+     * Dashboards for the project
+     */
+    200: OtelDashboardsResponse;
+};
+
+export type ListDashboardsResponse = ListDashboardsResponses[keyof ListDashboardsResponses];
+
+export type CreateDashboardData = {
+    body: CreateDashboardRequest;
+    path?: never;
+    query?: never;
+    url: '/otel/dashboards';
+};
+
+export type CreateDashboardErrors = {
+    /**
+     * Validation error
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type CreateDashboardError = CreateDashboardErrors[keyof CreateDashboardErrors];
+
+export type CreateDashboardResponses = {
+    /**
+     * Dashboard created
+     */
+    201: OtelDashboardResponse;
+};
+
+export type CreateDashboardResponse = CreateDashboardResponses[keyof CreateDashboardResponses];
+
+export type DeleteDashboardData = {
+    body?: never;
+    path: {
+        /**
+         * Dashboard ID
+         */
+        id: number;
+    };
+    query: {
+        /**
+         * Owning project ID (scopes the delete)
+         */
+        project_id: number;
+    };
+    url: '/otel/dashboards/{id}';
+};
+
+export type DeleteDashboardErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Dashboard not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type DeleteDashboardError = DeleteDashboardErrors[keyof DeleteDashboardErrors];
+
+export type DeleteDashboardResponses = {
+    /**
+     * Dashboard deleted
+     */
+    204: void;
+};
+
+export type DeleteDashboardResponse = DeleteDashboardResponses[keyof DeleteDashboardResponses];
+
+export type GetDashboardData = {
+    body?: never;
+    path: {
+        /**
+         * Dashboard ID
+         */
+        id: number;
+    };
+    query: {
+        /**
+         * Owning project ID (scopes the lookup)
+         */
+        project_id: number;
+    };
+    url: '/otel/dashboards/{id}';
+};
+
+export type GetDashboardErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Dashboard not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetDashboardError = GetDashboardErrors[keyof GetDashboardErrors];
+
+export type GetDashboardResponses = {
+    /**
+     * Dashboard
+     */
+    200: OtelDashboardResponse;
+};
+
+export type GetDashboardResponse = GetDashboardResponses[keyof GetDashboardResponses];
+
+export type UpdateDashboardData = {
+    body: UpdateDashboardRequest;
+    path: {
+        /**
+         * Dashboard ID
+         */
+        id: number;
+    };
+    query: {
+        /**
+         * Owning project ID (scopes the update)
+         */
+        project_id: number;
+    };
+    url: '/otel/dashboards/{id}';
+};
+
+export type UpdateDashboardErrors = {
+    /**
+     * Validation error
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Dashboard not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type UpdateDashboardError = UpdateDashboardErrors[keyof UpdateDashboardErrors];
+
+export type UpdateDashboardResponses = {
+    /**
+     * Dashboard updated
+     */
+    200: OtelDashboardResponse;
+};
+
+export type UpdateDashboardResponse = UpdateDashboardResponses[keyof UpdateDashboardResponses];
+
 export type QueryGenaiTracesData = {
     body?: never;
     path?: never;
@@ -27611,6 +30565,114 @@ export type QueryLogsResponses = {
 
 export type QueryLogsResponse = QueryLogsResponses[keyof QueryLogsResponses];
 
+export type ListMetricLabelKeysData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Metric to inspect
+         */
+        metric_name: string;
+        /**
+         * Window start (RFC 3339); defaults to 24h before end
+         */
+        start_time?: string;
+        /**
+         * Window end (RFC 3339); defaults to now
+         */
+        end_time?: string;
+    };
+    url: '/otel/metric-label-keys';
+};
+
+export type ListMetricLabelKeysErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListMetricLabelKeysError = ListMetricLabelKeysErrors[keyof ListMetricLabelKeysErrors];
+
+export type ListMetricLabelKeysResponses = {
+    /**
+     * Distinct label keys
+     */
+    200: OtelMetricLabelKeysResponse;
+};
+
+export type ListMetricLabelKeysResponse = ListMetricLabelKeysResponses[keyof ListMetricLabelKeysResponses];
+
+export type ListMetricLabelValuesData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Metric to inspect
+         */
+        metric_name: string;
+        /**
+         * Label key whose values to list (must match [a-zA-Z0-9_.:-])
+         */
+        label_key: string;
+        /**
+         * Window start (RFC 3339); defaults to 24h before end
+         */
+        start_time?: string;
+        /**
+         * Window end (RFC 3339); defaults to now
+         */
+        end_time?: string;
+    };
+    url: '/otel/metric-label-values';
+};
+
+export type ListMetricLabelValuesErrors = {
+    /**
+     * Invalid label key
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListMetricLabelValuesError = ListMetricLabelValuesErrors[keyof ListMetricLabelValuesErrors];
+
+export type ListMetricLabelValuesResponses = {
+    /**
+     * Distinct label values
+     */
+    200: OtelMetricLabelValuesResponse;
+};
+
+export type ListMetricLabelValuesResponse = ListMetricLabelValuesResponses[keyof ListMetricLabelValuesResponses];
+
 export type ListMetricNamesData = {
     body?: never;
     path: {
@@ -27644,7 +30706,7 @@ export type ListMetricNamesResponses = {
     /**
      * List of metric names
      */
-    200: MetricNamesResponse;
+    200: OtelMetricNamesResponse;
 };
 
 export type ListMetricNamesResponse = ListMetricNamesResponses[keyof ListMetricNamesResponses];
@@ -27685,11 +30747,31 @@ export type QueryMetricsData = {
          * Max buckets to return (default: 1000)
          */
         limit?: number;
+        /**
+         * Filter by metric type (gauge, sum, histogram, exponential_histogram, summary)
+         */
+        metric_type?: string;
+        /**
+         * Per-bucket aggregation: avg (default), sum, min, max, count, rate, p50/p95/p99, quantile:0.95
+         */
+        aggregation?: string;
+        /**
+         * Comma-separated key=value data-point label filters (keys must match [a-zA-Z0-9_.:-])
+         */
+        label_filters?: string;
+        /**
+         * Comma-separated label keys to group series by
+         */
+        group_by?: string;
     };
     url: '/otel/metrics';
 };
 
 export type QueryMetricsErrors = {
+    /**
+     * Invalid label key
+     */
+    400: ProblemDetails;
     /**
      * Unauthorized
      */
@@ -27710,7 +30792,7 @@ export type QueryMetricsResponses = {
     /**
      * Metrics data
      */
-    200: MetricsResponse;
+    200: OtelMetricsResponse;
 };
 
 export type QueryMetricsResponse = QueryMetricsResponses[keyof QueryMetricsResponses];
@@ -27822,6 +30904,14 @@ export type QueryTraceSummariesData = {
          * Filter by deployment ID
          */
         deployment_id?: number;
+        /**
+         * Sort field: 'start_time' (default) or 'duration'
+         */
+        sort_by?: string;
+        /**
+         * Sort direction: 'asc' or 'desc' (default)
+         */
+        sort_order?: string;
         /**
          * Max traces to return (default: 50, max: 100)
          */
@@ -29865,6 +32955,326 @@ export type GetAggregatedBucketsResponses = {
 
 export type GetAggregatedBucketsResponse = GetAggregatedBucketsResponses[keyof GetAggregatedBucketsResponses];
 
+export type FindConversationData = {
+    body?: never;
+    path: {
+        project_id: number;
+    };
+    query: {
+        context_type: string;
+        context_id: string;
+    };
+    url: '/projects/{project_id}/ai/conversations';
+};
+
+export type FindConversationErrors = {
+    401: unknown;
+    403: unknown;
+};
+
+export type FindConversationResponses = {
+    200: null | ConversationResponse;
+};
+
+export type FindConversationResponse = FindConversationResponses[keyof FindConversationResponses];
+
+export type CreateConversationData = {
+    body: CreateConversationRequest;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/ai/conversations';
+};
+
+export type CreateConversationErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type CreateConversationResponses = {
+    200: ConversationResponse;
+};
+
+export type CreateConversationResponse = CreateConversationResponses[keyof CreateConversationResponses];
+
+export type ListConversationsData = {
+    body?: never;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/ai/conversations/list';
+};
+
+export type ListConversationsErrors = {
+    401: unknown;
+    403: unknown;
+};
+
+export type ListConversationsResponses = {
+    200: Array<ConversationResponse>;
+};
+
+export type ListConversationsResponse = ListConversationsResponses[keyof ListConversationsResponses];
+
+export type GetConversationData = {
+    body?: never;
+    path: {
+        project_id: number;
+        public_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/ai/conversations/{public_id}';
+};
+
+export type GetConversationErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type GetConversationResponses = {
+    200: ConversationDetailResponse;
+};
+
+export type GetConversationResponse = GetConversationResponses[keyof GetConversationResponses];
+
+export type ArchiveConversationData = {
+    body?: never;
+    path: {
+        project_id: number;
+        public_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/ai/conversations/{public_id}/archive';
+};
+
+export type ArchiveConversationErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type ArchiveConversationResponses = {
+    204: void;
+};
+
+export type ArchiveConversationResponse = ArchiveConversationResponses[keyof ArchiveConversationResponses];
+
+export type SendMessageData = {
+    body: SendMessageRequest;
+    path: {
+        project_id: number;
+        public_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/ai/conversations/{public_id}/messages';
+};
+
+export type SendMessageErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type SendMessageResponses = {
+    /**
+     * SSE stream of assistant text deltas
+     */
+    200: unknown;
+};
+
+export type ListProjectAlarmsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: {
+        /**
+         * Filter by alarm type (e.g. `container_restart`, `outage`).
+         */
+        alarm_type?: string | null;
+        /**
+         * Filter by status: `firing`, `acknowledged`, or `resolved`.
+         */
+        status?: string | null;
+        /**
+         * Filter by severity: `info`, `warning`, or `critical`.
+         */
+        severity?: string | null;
+        /**
+         * Filter by environment ID.
+         */
+        environment_id?: number | null;
+        /**
+         * Filter by deployment ID.
+         */
+        deployment_id?: number | null;
+        /**
+         * Filter by external service ID.
+         */
+        service_id?: number | null;
+        /**
+         * Page number (1-based, default 1).
+         */
+        page?: number | null;
+        /**
+         * Items per page (default 20, max 100).
+         */
+        page_size?: number | null;
+    };
+    url: '/projects/{project_id}/alarms';
+};
+
+export type ListProjectAlarmsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListProjectAlarmsResponses = {
+    /**
+     * Paginated list of alarms
+     */
+    200: AlarmListResponse;
+};
+
+export type ListProjectAlarmsResponse = ListProjectAlarmsResponses[keyof ListProjectAlarmsResponses];
+
+export type GetProjectAlarmsSummaryData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/alarms/summary';
+};
+
+export type GetProjectAlarmsSummaryErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetProjectAlarmsSummaryResponses = {
+    /**
+     * Alarm summary counts
+     */
+    200: AlarmSummaryResponse;
+};
+
+export type GetProjectAlarmsSummaryResponse = GetProjectAlarmsSummaryResponses[keyof GetProjectAlarmsSummaryResponses];
+
+export type AcknowledgeAlarmData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Alarm ID
+         */
+        alarm_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/alarms/{alarm_id}/acknowledge';
+};
+
+export type AcknowledgeAlarmErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Alarm not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type AcknowledgeAlarmResponses = {
+    /**
+     * Alarm acknowledged
+     */
+    200: unknown;
+};
+
+export type ResolveAlarmData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Alarm ID
+         */
+        alarm_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/alarms/{alarm_id}/resolve';
+};
+
+export type ResolveAlarmErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Alarm not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ResolveAlarmResponses = {
+    /**
+     * Alarm resolved
+     */
+    200: unknown;
+};
+
 export type StartAnalysisData = {
     body: StartAnalysisRequest;
     path: {
@@ -30614,6 +34024,82 @@ export type CancelDeploymentResponses = {
 };
 
 export type CancelDeploymentResponse = CancelDeploymentResponses[keyof CancelDeploymentResponses];
+
+export type ListDeploymentContainerLogsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Deployment ID
+         */
+        deployment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/deployments/{deployment_id}/container-logs';
+};
+
+export type ListDeploymentContainerLogsErrors = {
+    /**
+     * Deployment not found in this project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListDeploymentContainerLogsResponses = {
+    /**
+     * Captured container logs for the deployment
+     */
+    200: DeploymentContainerLogsListResponse;
+};
+
+export type ListDeploymentContainerLogsResponse = ListDeploymentContainerLogsResponses[keyof ListDeploymentContainerLogsResponses];
+
+export type GetDeploymentContainerLogContentData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Deployment ID
+         */
+        deployment_id: number;
+        /**
+         * Captured log ID
+         */
+        log_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/deployments/{deployment_id}/container-logs/{log_id}';
+};
+
+export type GetDeploymentContainerLogContentErrors = {
+    /**
+     * Captured log not found in this project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetDeploymentContainerLogContentResponses = {
+    /**
+     * Captured container log content
+     */
+    200: DeploymentContainerLogContentResponse;
+};
+
+export type GetDeploymentContainerLogContentResponse = GetDeploymentContainerLogContentResponses[keyof GetDeploymentContainerLogContentResponses];
 
 export type GetDeploymentJobsData = {
     body?: never;
@@ -32476,6 +35962,11 @@ export type DeployFromImageUploadData = {
          * If not provided, a unique tag will be generated
          */
         tag?: string | null;
+        /**
+         * Optional HTTP health-check path override (e.g. "/api/healthz").
+         * Must start with '/'. When omitted, defaults to "/".
+         */
+        health_check_path?: string | null;
     };
     url: '/projects/{project_id}/environments/{environment_id}/deploy/image-upload';
 };
@@ -36603,6 +40094,59 @@ export type GetProxyLogByRequestIdResponses = {
 
 export type GetProxyLogByRequestIdResponse = GetProxyLogByRequestIdResponses[keyof GetProxyLogByRequestIdResponses];
 
+export type GetAiAgentPagesData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Canonical agent name to filter by (e.g. `ChatGPT-User`, `ClaudeBot`).
+         * Must be a name returned by `GET /proxy-logs/ai-agents/known`.
+         */
+        agent: string;
+        /**
+         * Filter by project ID.
+         */
+        project_id?: number | null;
+        /**
+         * Filter by environment ID.
+         */
+        environment_id?: number | null;
+        /**
+         * Start time (ISO 8601). Defaults to `end_time - 7d`.
+         */
+        start_time?: string | null;
+        /**
+         * End time (ISO 8601). Defaults to now.
+         */
+        end_time?: string | null;
+        /**
+         * Maximum rows to return. Capped at 100 server-side.
+         */
+        limit?: number | null;
+    };
+    url: '/proxy-logs/stats/ai-agent-pages';
+};
+
+export type GetAiAgentPagesErrors = {
+    /**
+     * Invalid parameters
+     */
+    400: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetAiAgentPagesResponses = {
+    /**
+     * Pages breakdown for the requested agent
+     */
+    200: AiAgentPagesResponse;
+};
+
+export type GetAiAgentPagesResponse = GetAiAgentPagesResponses[keyof GetAiAgentPagesResponses];
+
 export type GetAiAgentBreakdownData = {
     body?: never;
     path?: never;
@@ -36657,6 +40201,59 @@ export type GetAiAgentBreakdownResponses = {
 
 export type GetAiAgentBreakdownResponse = GetAiAgentBreakdownResponses[keyof GetAiAgentBreakdownResponses];
 
+export type GetAiAgentTimelineData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Filter by project ID.
+         */
+        project_id?: number | null;
+        /**
+         * Filter by environment ID.
+         */
+        environment_id?: number | null;
+        /**
+         * Start time (ISO 8601). Defaults to `end_time - 7d`.
+         */
+        start_time?: string | null;
+        /**
+         * End time (ISO 8601). Defaults to now.
+         */
+        end_time?: string | null;
+        /**
+         * Grouping dimension: `provider` (default) or `agent`.
+         */
+        group_by?: string | null;
+        /**
+         * Bucket interval override (e.g. `1 hour`, `1 day`). Auto-selected from the
+         * window width when omitted.
+         */
+        bucket?: string | null;
+    };
+    url: '/proxy-logs/stats/ai-agents/timeline';
+};
+
+export type GetAiAgentTimelineErrors = {
+    /**
+     * Invalid parameters
+     */
+    400: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetAiAgentTimelineResponses = {
+    /**
+     * AI agent timeline
+     */
+    200: AiAgentTimelineResponse;
+};
+
+export type GetAiAgentTimelineResponse = GetAiAgentTimelineResponses[keyof GetAiAgentTimelineResponses];
+
 export type GetAiPageBreakdownData = {
     body?: never;
     path?: never;
@@ -36710,6 +40307,60 @@ export type GetAiPageBreakdownResponses = {
 };
 
 export type GetAiPageBreakdownResponse = GetAiPageBreakdownResponses[keyof GetAiPageBreakdownResponses];
+
+export type GetAiStatusBreakdownData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Filter by project ID (recommended for per-project analytics).
+         */
+        project_id?: number | null;
+        /**
+         * Filter by environment ID.
+         */
+        environment_id?: number | null;
+        /**
+         * Start time (ISO 8601). Defaults to `end_time - 7d`.
+         */
+        start_time?: string | null;
+        /**
+         * End time (ISO 8601). Defaults to now.
+         */
+        end_time?: string | null;
+        /**
+         * Maximum rows to return. Capped at 100 server-side.
+         */
+        limit?: number | null;
+        /**
+         * Optional exact path filter. Only used by the AI pages breakdown — when
+         * set, returns the single matching page so callers can ask "how many AI
+         * agents hit this page?".
+         */
+        path?: string | null;
+    };
+    url: '/proxy-logs/stats/ai-status';
+};
+
+export type GetAiStatusBreakdownErrors = {
+    /**
+     * Invalid parameters
+     */
+    400: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetAiStatusBreakdownResponses = {
+    /**
+     * AI status breakdown
+     */
+    200: AiStatusBreakdownResponse;
+};
+
+export type GetAiStatusBreakdownResponse = GetAiStatusBreakdownResponses[keyof GetAiStatusBreakdownResponses];
 
 export type GetProjectsHealthData = {
     body?: never;
@@ -37890,6 +41541,108 @@ export type GetDiskStatusResponses = {
 };
 
 export type GetDiskStatusResponse = GetDiskStatusResponses[keyof GetDiskStatusResponses];
+
+export type ListEnrollmentTokensData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/settings/enrollment-tokens';
+};
+
+export type ListEnrollmentTokensErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListEnrollmentTokensResponses = {
+    /**
+     * Active enrollment tokens
+     */
+    200: EnrollmentTokenListResponse;
+};
+
+export type ListEnrollmentTokensResponse = ListEnrollmentTokensResponses[keyof ListEnrollmentTokensResponses];
+
+export type MintEnrollmentTokenData = {
+    body: MintEnrollmentTokenRequest;
+    path?: never;
+    query?: never;
+    url: '/settings/enrollment-tokens';
+};
+
+export type MintEnrollmentTokenErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type MintEnrollmentTokenResponses = {
+    /**
+     * Enrollment token minted
+     */
+    200: MintEnrollmentTokenResponse;
+};
+
+export type MintEnrollmentTokenResponse2 = MintEnrollmentTokenResponses[keyof MintEnrollmentTokenResponses];
+
+export type RevokeEnrollmentTokenData = {
+    body?: never;
+    path: {
+        /**
+         * Enrollment token id
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/settings/enrollment-tokens/{id}';
+};
+
+export type RevokeEnrollmentTokenErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Enrollment token not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RevokeEnrollmentTokenResponses = {
+    /**
+     * Enrollment token revoked
+     */
+    200: SettingsUpdateResponse;
+};
+
+export type RevokeEnrollmentTokenResponse = RevokeEnrollmentTokenResponses[keyof RevokeEnrollmentTokenResponses];
 
 export type RevokeJoinTokenData = {
     body?: never;
@@ -40314,31 +44067,31 @@ export type IngestSentryEventResponse = IngestSentryEventResponses[keyof IngestS
 export type ListAuditLogsData = {
     body?: never;
     path?: never;
-    query: {
+    query?: {
         /**
-         * Filter logs by operation type
+         * Filter logs by operation type (omit for all)
          */
-        operation_type: unknown;
+        operation_type?: string;
         /**
-         * Filter logs by user ID
+         * Filter logs by user ID (omit for all users)
          */
-        user_id: unknown;
+        user_id?: number;
         /**
          * Start timestamp (milliseconds since epoch)
          */
-        from: unknown;
+        from?: string;
         /**
          * End timestamp (milliseconds since epoch)
          */
-        to: unknown;
+        to?: string;
         /**
          * Maximum number of logs to return
          */
-        limit: unknown;
+        limit?: number;
         /**
          * Number of logs to skip
          */
-        offset: unknown;
+        offset?: number;
     };
     url: 'audit/logs';
 };
