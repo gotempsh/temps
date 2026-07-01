@@ -338,11 +338,14 @@ impl DeploymentService {
             ))
         })?;
 
-        temps_deployer::remote::RemoteNodeDeployer::new(
-            node.address.clone(),
+        crate::cluster_ca::build_node_deployer(
+            &node.address,
             token,
             node.name.clone(),
+            self.config_service.as_ref(),
+            self.encryption_service.as_ref(),
         )
+        .await
         .map_err(|e| {
             DeploymentError::Other(format!(
                 "Failed to build remote deployer for node {}: {}",
@@ -505,19 +508,23 @@ impl DeploymentService {
             url.push_str(&qs);
         }
 
-        // Strict TLS by default; opt-in via the same `insecure_tls` toggle
-        // that the rest of the CP→agent traffic uses, so dev clusters with
-        // self-signed agent certs work without a global escape hatch.
-        let client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(temps_core::tls::insecure_tls_enabled())
-            // No top-level timeout — log streams are long-lived by design.
-            .build()
-            .map_err(|e| {
-                DeploymentError::Other(format!(
-                    "Failed to build HTTP client for node {}: {}",
-                    node_id, e
-                ))
-            })?;
+        // Mutual TLS for https:// nodes (ADR-020 WS-2.1), plain HTTP otherwise
+        // — the shared factory presents the CP's cluster-CA-signed identity so
+        // the stream isn't rejected once `require_mtls` is on. No top-level
+        // timeout: log streams are long-lived by design.
+        let client = crate::cluster_ca::build_node_http_client(
+            &node.address,
+            self.config_service.as_ref(),
+            self.encryption_service.as_ref(),
+            None,
+        )
+        .await
+        .map_err(|e| {
+            DeploymentError::Other(format!(
+                "Failed to build HTTP client for node {}: {}",
+                node_id, e
+            ))
+        })?;
 
         let resp = client
             .get(&url)
@@ -3207,6 +3214,42 @@ impl DeploymentService {
         };
 
         Ok((container, env_info))
+    }
+
+    /// Check whether container exec/terminal access is enabled for an
+    /// environment after applying project-level defaults and environment-level
+    /// overrides.
+    pub async fn is_container_exec_enabled(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+    ) -> Result<bool, DeploymentError> {
+        let project = projects::Entity::find_by_id(project_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| DeploymentError::NotFound("Project not found".to_string()))?;
+
+        let environment = environments::Entity::find_by_id(environment_id)
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| DeploymentError::NotFound("Environment not found".to_string()))?;
+
+        let enabled = match (
+            project.deployment_config.as_ref(),
+            environment.deployment_config.as_ref(),
+        ) {
+            (Some(project_config), Some(environment_config)) => {
+                project_config
+                    .merge(environment_config)
+                    .container_exec_enabled
+            }
+            (Some(project_config), None) => project_config.container_exec_enabled,
+            (None, Some(environment_config)) => environment_config.container_exec_enabled,
+            (None, None) => false,
+        };
+
+        Ok(enabled)
     }
 
     /// Stop a specific container

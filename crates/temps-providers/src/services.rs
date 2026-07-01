@@ -9468,13 +9468,16 @@ mod tests {
     async fn test_create_redis_service() {
         let (manager, _test_db) = setup_test_manager().await;
         let random_unused_port = get_unused_port();
+        // Unique service name so the derived container name (redis-<name>) does
+        // not collide with other tests' containers on the shared CI runner.
+        let service_name = format!("test-redis-{}", chrono::Utc::now().timestamp_millis());
         let mut params = HashMap::new();
         params.insert(
             "port".to_string(),
             JsonValue::String(random_unused_port.to_string()),
         );
         let request = CreateExternalServiceRequest {
-            name: "test-redis".to_string(),
+            name: service_name.clone(),
             service_type: ServiceType::Redis,
             version: Some("7".to_string()),
             parameters: params,
@@ -9486,7 +9489,7 @@ mod tests {
         let result = manager.create_service(request).await;
 
         let service = result.expect("Failed to create Redis service");
-        assert_eq!(service.name, "test-redis");
+        assert_eq!(service.name, service_name);
         assert_eq!(service.service_type, ServiceType::Redis);
         assert_eq!(service.status, "running");
 
@@ -9591,15 +9594,23 @@ mod tests {
     async fn test_delete_service() {
         let (manager, _test_db) = setup_test_manager().await;
 
-        // Create a service first
+        // Create a service first. Use an explicit unused port and a unique name
+        // so the Redis container does not collide with the default port (6379)
+        // or another test's container name on the shared CI runner.
+        let random_unused_port = get_unused_port();
+        let service_name = format!("test-delete-{}", chrono::Utc::now().timestamp_millis());
         let mut params = HashMap::new();
         params.insert(
             "password".to_string(),
             JsonValue::String("redis_pass".to_string()),
         );
+        params.insert(
+            "port".to_string(),
+            JsonValue::String(random_unused_port.to_string()),
+        );
 
         let request = CreateExternalServiceRequest {
-            name: "test-delete".to_string(),
+            name: service_name,
             service_type: ServiceType::Redis,
             version: None,
             parameters: params,
@@ -9629,7 +9640,14 @@ mod tests {
     async fn test_update_service_parameters() {
         let (manager, _test_db) = setup_test_manager().await;
 
-        // Create a service first
+        // Create a service first. Use an explicit unused port and unique names
+        // so the Postgres container (and its post-rename recreate) does not
+        // collide with the default port (5449) or another test's container name
+        // on the shared CI runner.
+        let random_unused_port = get_unused_port();
+        let ts = chrono::Utc::now().timestamp_millis();
+        let service_name = format!("test-update-{}", ts);
+        let renamed_name = format!("test-update-renamed-{}", ts);
         let mut params = HashMap::new();
         params.insert(
             "database".to_string(),
@@ -9643,9 +9661,13 @@ mod tests {
             "password".to_string(),
             JsonValue::String("original_pass".to_string()),
         );
+        params.insert(
+            "port".to_string(),
+            JsonValue::String(random_unused_port.to_string()),
+        );
 
         let request = CreateExternalServiceRequest {
-            name: "test-update".to_string(),
+            name: service_name,
             service_type: ServiceType::Postgres,
             version: None,
             parameters: params,
@@ -9663,7 +9685,7 @@ mod tests {
         // the strategy rejects the whole update with a validation error.
         // The test asserts the rename + docker_image path works.
         let update_request = UpdateExternalServiceRequest {
-            name: Some("test-update-renamed".to_string()),
+            name: Some(renamed_name.clone()),
             parameters: HashMap::new(),
             docker_image: Some("gotempsh/postgres-walg:18-bookworm".to_string()),
         };
@@ -9675,7 +9697,7 @@ mod tests {
             updated_service.err()
         );
         let updated = updated_service.unwrap();
-        assert_eq!(updated.name, "test-update-renamed");
+        assert_eq!(updated.name, renamed_name);
 
         // Sensitive readonly fields must NOT have been mutated.
         let params_after = manager.get_service_parameters(service_id).await.unwrap();

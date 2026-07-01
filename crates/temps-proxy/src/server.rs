@@ -272,6 +272,20 @@ pub fn setup_proxy_server(
         crate::service::ip_access_control_service::IpAccessControlService::new(db.clone()),
     );
 
+    // Keep the IP block list in memory so `is_blocked` never queries Postgres on
+    // the request hot path. A dedicated thread owns the periodic refresh, mirroring
+    // the proxy-log batch writer above.
+    {
+        let ip_access_refresher = ip_access_control_service.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create tokio runtime for IP block-list refresh");
+            rt.block_on(ip_access_refresher.run_refresh_loop());
+        });
+    }
+
     let challenge_service = Arc::new(crate::service::challenge_service::ChallengeService::new(
         db.clone(),
     ));
@@ -459,6 +473,20 @@ pub fn create_proxy_service(
     let ip_access_control_service = Arc::new(
         crate::service::ip_access_control_service::IpAccessControlService::new(db.clone()),
     );
+
+    // Keep the IP block list in memory so `is_blocked` never queries Postgres on
+    // the request hot path. A dedicated thread owns the periodic refresh, mirroring
+    // the proxy-log batch writer above.
+    {
+        let ip_access_refresher = ip_access_control_service.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create tokio runtime for IP block-list refresh");
+            rt.block_on(ip_access_refresher.run_refresh_loop());
+        });
+    }
 
     let challenge_service = Arc::new(crate::service::challenge_service::ChallengeService::new(
         db.clone(),

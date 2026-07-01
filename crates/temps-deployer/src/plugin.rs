@@ -165,6 +165,44 @@ impl TempsPlugin for DeployerPlugin {
                     limits.memory_limit_mb
                 );
             }
+
+            // ADR-024: start the control-plane DNS resolver so containers
+            // deployed locally on the control plane — and every single-node
+            // install — can resolve `*.temps.local`. This plugin only runs on
+            // the control plane (workers build DockerRuntime via `temps agent`),
+            // so it is the right home. Best-effort: any failure (Docker down,
+            // :53 already bound, no gateway) leaves containers on Docker's
+            // embedded DNS, exactly as before this change.
+            //
+            // `get_service` (not `require_service`) is deliberate: the DB is an
+            // optional dependency for this best-effort enhancement. A missing
+            // DB (e.g. an embedded/test configuration) must skip DNS startup,
+            // never fail the deployer plugin — do not promote this to
+            // `require_service`.
+            if let Some(db) = context.get_service::<sea_orm::DatabaseConnection>() {
+                match docker_runtime.ensure_network_exists().await {
+                    Ok(()) => match docker_runtime.inspect_app_network_gateway().await {
+                        Some(gateway) => {
+                            let snapshot_dir =
+                                config_service.get_server_config().data_dir.join("dns");
+                            if let Some(slot) =
+                                temps_dns::start_control_plane_resolver(db, gateway, snapshot_dir)
+                                    .await
+                            {
+                                docker_runtime = docker_runtime.with_overlay_dns_slot(slot);
+                            }
+                        }
+                        None => tracing::warn!(
+                            "app-network gateway not found; control-plane DNS resolver not started"
+                        ),
+                    },
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "could not ensure app network; control-plane DNS resolver not started"
+                    ),
+                }
+            }
+
             let docker_runtime = Arc::new(docker_runtime);
 
             // Register the concrete service

@@ -289,6 +289,7 @@ pub struct PaginatedStaticBundlesResponse {
 /// The image will be pulled and deployed to the specified environment.
 #[utoipa::path(
     post,
+    tag = "Deployments",
     path = "/projects/{project_id}/environments/{environment_id}/deploy/image",
     request_body = DeployFromImageRequest,
     responses(
@@ -595,6 +596,7 @@ pub async fn deploy_from_image(
 /// Triggers a deployment using a previously uploaded static file bundle.
 #[utoipa::path(
     post,
+    tag = "Deployments",
     path = "/projects/{project_id}/environments/{environment_id}/deploy/static",
     request_body = DeployFromStaticRequest,
     responses(
@@ -883,6 +885,7 @@ pub async fn deploy_from_static(
 /// or `docker save myimage:tag | gzip > image.tar.gz` (gzip compressed tarballs are also supported).
 #[utoipa::path(
     post,
+    tag = "Deployments",
     path = "/projects/{project_id}/environments/{environment_id}/deploy/image-upload",
     params(DeployFromImageUploadQuery),
     responses(
@@ -1304,6 +1307,7 @@ pub async fn deploy_from_image_upload(
 /// deployed later using the deploy/static endpoint.
 #[utoipa::path(
     post,
+    tag = "Static Bundles",
     path = "/projects/{project_id}/upload/static",
     responses(
         (status = 201, description = "Bundle uploaded successfully", body = StaticBundleResponse),
@@ -1623,6 +1627,7 @@ pub async fn upload_static_bundle(
 /// The image can be deployed later using the deploy/image endpoint.
 #[utoipa::path(
     post,
+    tag = "External Images",
     path = "/projects/{project_id}/external-images",
     request_body = RegisterImageRequest,
     responses(
@@ -1701,6 +1706,7 @@ pub async fn register_external_image(
 /// List external images for a project
 #[utoipa::path(
     get,
+    tag = "External Images",
     path = "/projects/{project_id}/external-images",
     params(
         ("project_id" = i32, Path, description = "Project ID"),
@@ -1751,6 +1757,7 @@ pub async fn list_remote_external_images(
 /// Get details of a specific external image
 #[utoipa::path(
     get,
+    tag = "External Images",
     path = "/projects/{project_id}/external-images/{image_id}",
     responses(
         (status = 200, description = "Image details", body = ExternalImageResponse),
@@ -1792,6 +1799,7 @@ pub async fn get_remote_external_image(
 /// Delete an external image
 #[utoipa::path(
     delete,
+    tag = "External Images",
     path = "/projects/{project_id}/external-images/{image_id}",
     responses(
         (status = 204, description = "Image deleted"),
@@ -1847,6 +1855,7 @@ pub async fn delete_external_image(
 /// List static bundles for a project
 #[utoipa::path(
     get,
+    tag = "Static Bundles",
     path = "/projects/{project_id}/static-bundles",
     params(
         ("project_id" = i32, Path, description = "Project ID"),
@@ -1897,6 +1906,7 @@ pub async fn list_static_bundles(
 /// Get details of a specific static bundle
 #[utoipa::path(
     get,
+    tag = "Static Bundles",
     path = "/projects/{project_id}/static-bundles/{bundle_id}",
     responses(
         (status = 200, description = "Bundle details", body = StaticBundleResponse),
@@ -1938,6 +1948,7 @@ pub async fn get_static_bundle(
 /// Delete a static bundle
 #[utoipa::path(
     delete,
+    tag = "Static Bundles",
     path = "/projects/{project_id}/static-bundles/{bundle_id}",
     responses(
         (status = 204, description = "Bundle deleted"),

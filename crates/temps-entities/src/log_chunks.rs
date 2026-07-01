@@ -12,6 +12,13 @@ pub struct Model {
     pub service: String,
     pub container_id: String,
     pub deploy_id: Option<i32>,
+    /// Worker node this chunk's container ran on. `NULL` = control-plane-local
+    /// container (collected via the local Docker daemon). `Some` = a remote
+    /// worker node, collected by the remote log collector over mTLS.
+    pub node_id: Option<i32>,
+    /// Human-readable node name, denormalized at write time so history results
+    /// can display the source node without a join.
+    pub node_name: Option<String>,
     pub started_at: DBDateTime,
     pub ended_at: DBDateTime,
     pub storage_key: String,

@@ -60,6 +60,54 @@ impl RemoteNodeDeployer {
         })
     }
 
+    /// Construct a deployer that talks to the agent over **mutual TLS**
+    /// (ADR-020 WS-2.1): the control plane presents `client_identity_pem`
+    /// (its leaf cert + key, signed by the cluster CA) and pins the agent's
+    /// server cert to the cluster CA (`ca_cert_pem`). Built-in roots are
+    /// disabled so ONLY the cluster CA is trusted. Used for nodes whose
+    /// `agent_url` is `https://`.
+    pub fn new_mtls(
+        agent_url: String,
+        token: String,
+        node_name: String,
+        client_identity_pem: &str,
+        ca_cert_pem: &str,
+    ) -> Result<Self, DeployerError> {
+        let identity =
+            reqwest::Identity::from_pem(client_identity_pem.as_bytes()).map_err(|e| {
+                DeployerError::NetworkError(format!(
+                    "Invalid control-plane client identity for node {}: {}",
+                    node_name, e
+                ))
+            })?;
+        let ca = reqwest::Certificate::from_pem(ca_cert_pem.as_bytes()).map_err(|e| {
+            DeployerError::NetworkError(format!(
+                "Invalid cluster CA certificate for node {}: {}",
+                node_name, e
+            ))
+        })?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(300))
+            .use_rustls_tls()
+            .identity(identity)
+            .add_root_certificate(ca)
+            .tls_built_in_root_certs(false)
+            .build()
+            .map_err(|e| {
+                DeployerError::NetworkError(format!(
+                    "Failed to create mTLS client for node {}: {}",
+                    node_name, e
+                ))
+            })?;
+
+        Ok(Self {
+            agent_url,
+            token,
+            node_name,
+            client,
+        })
+    }
+
     /// Helper to make authenticated GET requests to the agent.
     async fn agent_get<T: for<'de> Deserialize<'de>>(
         &self,
@@ -465,6 +513,151 @@ mod tests {
         .unwrap();
         assert_eq!(deployer.node_name(), "worker-3");
         assert_eq!(deployer.agent_url(), "https://worker-3.internal:3100");
+    }
+
+    /// Live **REAL DEPLOYMENT** over mTLS: drives the production
+    /// `RemoteNodeDeployer::deploy_container` to actually create + start a
+    /// container on the worker's Docker through the mutual-TLS channel — the
+    /// genuine end-to-end deploy path, not just a control-plane round-trip.
+    /// Gated on `TEMPS_MTLS_DEPLOY_IMAGE` (the image, which MUST already be
+    /// present in the worker's Docker, e.g. pre-pulled) plus the same
+    /// `TEMPS_MTLS_*` connection env. Run inside a cluster container.
+    #[tokio::test]
+    async fn test_mtls_real_deploy_live() {
+        let image = match std::env::var("TEMPS_MTLS_DEPLOY_IMAGE") {
+            Ok(i) => i,
+            Err(_) => {
+                eprintln!("TEMPS_MTLS_DEPLOY_IMAGE not set — skipping real mTLS deploy test");
+                return;
+            }
+        };
+        let (url, token, cert, key, ca) = match (
+            std::env::var("TEMPS_MTLS_AGENT_URL"),
+            std::env::var("TEMPS_MTLS_TOKEN"),
+            std::env::var("TEMPS_MTLS_CERT"),
+            std::env::var("TEMPS_MTLS_KEY"),
+            std::env::var("TEMPS_MTLS_CA"),
+        ) {
+            (Ok(u), Ok(t), Ok(c), Ok(k), Ok(a)) => (u, t, c, k, a),
+            _ => {
+                eprintln!("TEMPS_MTLS_* not set — skipping real mTLS deploy test");
+                return;
+            }
+        };
+        let cert_pem = std::fs::read_to_string(&cert).expect("read client cert PEM");
+        let key_pem = std::fs::read_to_string(&key).expect("read client key PEM");
+        let ca_pem = std::fs::read_to_string(&ca).expect("read cluster CA PEM");
+        let identity = format!("{}\n{}", cert_pem.trim(), key_pem.trim());
+
+        let deployer = RemoteNodeDeployer::new_mtls(
+            url.clone(),
+            token,
+            "mtls-deploy-probe".to_string(),
+            &identity,
+            &ca_pem,
+        )
+        .expect("build mTLS deployer");
+
+        // Deployed containers run with cap_drop:ALL + no-new-privileges, so the
+        // probe image must be unprivileged-friendly (no startup chown, high
+        // port). Port + command are env-configurable to fit such an image.
+        let container_port: u16 = std::env::var("TEMPS_MTLS_DEPLOY_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(80);
+        let command = std::env::var("TEMPS_MTLS_DEPLOY_CMD")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.split(' ').map(|x| x.to_string()).collect::<Vec<_>>());
+
+        let name = "mtls-deploy-probe".to_string();
+        let req = DeployRequest {
+            image_name: image.clone(),
+            container_name: name.clone(),
+            environment_vars: std::collections::HashMap::new(),
+            secrets: std::collections::HashMap::new(),
+            port_mappings: vec![crate::PortMapping {
+                host_port: 18080,
+                container_port,
+                protocol: crate::Protocol::Tcp,
+            }],
+            network_name: None,
+            resource_limits: crate::ResourceLimits::default(),
+            restart_policy: crate::RestartPolicy::Never,
+            log_path: std::path::PathBuf::from("/tmp/mtls-deploy-probe.log"),
+            command,
+            log_config: None,
+            labels: std::collections::HashMap::new(),
+        };
+
+        let result = deployer
+            .deploy_container(req)
+            .await
+            .expect("deploy_container over mTLS must succeed");
+        eprintln!(
+            "✓ REAL deploy over mTLS: image={} container_id={} status={:?} host_port={}",
+            image, result.container_id, result.status, result.host_port
+        );
+        assert!(
+            !result.container_id.is_empty(),
+            "expected a real container id"
+        );
+    }
+
+    /// Live end-to-end check of the control-plane reqwest+rustls **mutual TLS**
+    /// client against a real agent serving mTLS (ADR-020 WS-2.1). Unlike the
+    /// curl-based `verify-mtls.sh` harness (which proves the *agent* side), this
+    /// drives the exact production client path — `new_mtls` loading a CA-signed
+    /// client identity, pinning the cluster CA, completing the rustls handshake,
+    /// and round-tripping an authenticated request. Skips gracefully unless the
+    /// `TEMPS_MTLS_*` env is set (so normal `cargo test` runs are unaffected);
+    /// run it inside a cluster container that can reach the agent. A client cert
+    /// SAN is irrelevant here (client certs aren't hostname-checked), so any
+    /// CA-signed leaf faithfully stands in for the control plane's identity.
+    #[tokio::test]
+    async fn test_mtls_deploy_channel_live() {
+        let (url, token, cert, key, ca) = match (
+            std::env::var("TEMPS_MTLS_AGENT_URL"),
+            std::env::var("TEMPS_MTLS_TOKEN"),
+            std::env::var("TEMPS_MTLS_CERT"),
+            std::env::var("TEMPS_MTLS_KEY"),
+            std::env::var("TEMPS_MTLS_CA"),
+        ) {
+            (Ok(u), Ok(t), Ok(c), Ok(k), Ok(a)) => (u, t, c, k, a),
+            _ => {
+                eprintln!("TEMPS_MTLS_* not set — skipping live mTLS deploy-channel test");
+                return;
+            }
+        };
+
+        let cert_pem = std::fs::read_to_string(&cert).expect("read client cert PEM");
+        let key_pem = std::fs::read_to_string(&key).expect("read client key PEM");
+        let ca_pem = std::fs::read_to_string(&ca).expect("read cluster CA PEM");
+        // reqwest's PEM Identity wants the cert chain followed by the key — the
+        // same layout `cluster_ca::cp_client_identity` produces in production.
+        let identity = format!("{}\n{}", cert_pem.trim(), key_pem.trim());
+
+        let deployer = RemoteNodeDeployer::new_mtls(
+            url.clone(),
+            token,
+            "mtls-live-test".to_string(),
+            &identity,
+            &ca_pem,
+        )
+        .expect("build mTLS deployer");
+
+        // A lightweight authenticated read that fully round-trips the mutual-TLS
+        // channel: TLS handshake (server cert validated against the pinned CA +
+        // our client cert presented), bearer auth, JSON response.
+        let containers = deployer
+            .list_containers()
+            .await
+            .expect("list_containers over mTLS must succeed");
+        eprintln!(
+            "✓ mTLS deploy channel live: agent {} returned {} container(s)",
+            url,
+            containers.len()
+        );
     }
 
     #[tokio::test]

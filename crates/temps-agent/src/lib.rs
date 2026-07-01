@@ -47,6 +47,9 @@ pub enum AgentError {
 
     #[error("Docker error: {0}")]
     Docker(String),
+
+    #[error("TLS configuration failed ({context}): {reason}")]
+    TlsConfig { context: String, reason: String },
 }
 
 /// Health report sent in heartbeats and returned from GET /agent/health.
@@ -89,6 +92,19 @@ pub struct AgentConfig {
     /// proceeds with an empty zone in that case.
     #[serde(default = "default_dns_data_dir")]
     pub dns_data_dir: std::path::PathBuf,
+    /// Path to the per-node leaf certificate (PEM) the agent serves as its TLS
+    /// server cert (ADR-020 WS-2.1). `None` => the agent serves plaintext HTTP
+    /// (legacy / not-yet-enrolled-with-mTLS). `#[serde(default)]` so old
+    /// `agent.json` files without these fields still parse.
+    #[serde(default)]
+    pub tls_cert_path: Option<std::path::PathBuf>,
+    /// Path to the node private key (PEM) for the leaf above. Never leaves the node.
+    #[serde(default)]
+    pub tls_key_path: Option<std::path::PathBuf>,
+    /// Path to the cluster CA certificate (PEM), used as the single root that
+    /// verifies the control plane's client certificate.
+    #[serde(default)]
+    pub cluster_ca_path: Option<std::path::PathBuf>,
 }
 
 fn default_dns_data_dir() -> std::path::PathBuf {
@@ -372,6 +388,9 @@ mod tests {
             node_id: 1,
             labels: serde_json::json!({}),
             dns_data_dir: default_dns_data_dir(),
+            tls_cert_path: None,
+            tls_key_path: None,
+            cluster_ca_path: None,
         };
 
         let json = serde_json::to_string(&config).unwrap();

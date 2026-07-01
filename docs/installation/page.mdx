@@ -191,6 +191,20 @@ temps --version
 
 ### Build from Source
 
+Install the local build prerequisites before compiling from source. The release build compiles native Rust dependencies, OpenTelemetry protobufs, and the web UI bundle.
+
+```bash {{ title: 'Amazon Linux 2023 prerequisites' }}
+sudo dnf groupinstall -y "Development Tools"
+sudo dnf install -y \
+  rust cargo rustfmt rust-std-static-wasm32-unknown-unknown \
+  cmake pkgconf-pkg-config openssl-devel protobuf-compiler \
+  perl-FindBin perl-IPC-Cmd perl-File-Compare perl-File-Copy perl-Time-Piece
+
+cargo install wasm-pack
+```
+
+For Debian/Ubuntu, macOS, and contributor setup details, see [CONTRIBUTING.md](https://github.com/gotempsh/temps/blob/main/CONTRIBUTING.md#prerequisites).
+
 ```bash
 # Clone the repository
 git clone https://github.com/gotempsh/temps.git

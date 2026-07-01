@@ -1,0 +1,16 @@
+{
+  "name": "temps-otel-demo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "OpenTelemetry tracing + error-tracking demo for Temps multi-node. One image, two roles (gateway/backend): the gateway calls the backend over the cluster DNS so you get a distributed trace, and emits synthetic errors to Temps error tracking.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node -r ./tracing.js server.js"
+  },
+  "dependencies": {
+    "@opentelemetry/sdk-node": "latest",
+    "@opentelemetry/exporter-trace-otlp-proto": "latest",
+    "@opentelemetry/instrumentation-http": "latest",
+    "@sentry/node": "latest"
+  }
+}

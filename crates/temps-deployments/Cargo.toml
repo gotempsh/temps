@@ -49,6 +49,7 @@ async-trait = { workspace = true }
 futures-util = { workspace = true }
 uuid = { workspace = true }
 bollard = { workspace = true }
+sysinfo = { workspace = true }
 tar = { workspace = true }
 bytes = { workspace = true }
 http-body-util = { workspace = true }
@@ -60,6 +61,10 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 urlencoding = { workspace = true }
 tokio-tungstenite = { workspace = true }
+# mTLS for the terminal WebSocket proxy (ADR-020 WS-2.1): build a rustls
+# ClientConfig presenting the CP's cluster-CA-signed identity.
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 
 [dev-dependencies]
 testcontainers = { workspace = true }

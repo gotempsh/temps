@@ -1,6 +1,9 @@
 //! HTTP handlers for OTLP ingest and query endpoints.
 
+pub mod audit;
+pub mod dashboard_handler;
 pub mod ingest_handler;
+pub mod metric_alert_handler;
 pub mod query_handler;
 
 use axum::routing::{get, post};
@@ -55,6 +58,14 @@ pub fn configure_routes() -> Router<OtelAppState> {
             "/otel/metric-names/{project_id}",
             get(query_handler::list_metric_names),
         )
+        .route(
+            "/otel/metric-label-keys",
+            get(query_handler::list_metric_label_keys),
+        )
+        .route(
+            "/otel/metric-label-values",
+            get(query_handler::list_metric_label_values),
+        )
         .route("/otel/traces", get(query_handler::query_traces))
         .route(
             "/otel/trace-summaries",
@@ -80,5 +91,33 @@ pub fn configure_routes() -> Router<OtelAppState> {
         .route(
             "/otel/genai/traces/{project_id}/{trace_id}",
             get(query_handler::get_genai_trace),
+        )
+        // Metric dashboards (per-project saved dashboard CRUD)
+        .route(
+            "/otel/dashboards",
+            get(dashboard_handler::list_dashboards).post(dashboard_handler::create_dashboard),
+        )
+        .route(
+            "/otel/dashboards/{id}",
+            get(dashboard_handler::get_dashboard)
+                .patch(dashboard_handler::update_dashboard)
+                .delete(dashboard_handler::delete_dashboard),
+        )
+        // Metric alert rules (first-class metric-centric alerting)
+        .route(
+            "/otel/alerts",
+            get(metric_alert_handler::list_alerts).post(metric_alert_handler::create_alert),
+        )
+        // Anomaly backtest/preview. Static segment registered before `{id}` so it
+        // isn't captured as a rule id (matchit prefers static, but be explicit).
+        .route(
+            "/otel/alerts/preview",
+            post(metric_alert_handler::preview_alert),
+        )
+        .route(
+            "/otel/alerts/{id}",
+            get(metric_alert_handler::get_alert)
+                .patch(metric_alert_handler::update_alert)
+                .delete(metric_alert_handler::delete_alert),
         )
 }

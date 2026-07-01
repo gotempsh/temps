@@ -34,6 +34,12 @@
   /* Vercel red (#e5484d) */
   --destructive: oklch(0.627 0.2193 23.03);
   --destructive-foreground: oklch(0.985 0 0);
+  /* Status semantics — success (green) + warning (amber), matching the chart
+     tones. Used by AlertStateBadge (ok/warn) and the metrics health surfaces. */
+  --success: oklch(0.627 0.1684 150.31); /* green — solid fill paired with white text */
+  --success-foreground: oklch(0.985 0 0);
+  --warning: oklch(0.773 0.1776 69.61); /* amber */
+  --warning-foreground: oklch(0.145 0 0);
   /* gray-200 borders (#eaeaea) — Vercel's signature subtle border */
   --border: oklch(0.922 0 0);
   --input: oklch(0.922 0 0);
@@ -111,6 +117,12 @@
   /* Vercel red (#e5484d / error) */
   --destructive: oklch(0.627 0.2193 23.03);
   --destructive-foreground: oklch(0.985 0 0);
+  /* Status semantics — same green/amber as light (chart tones are mode-stable);
+     dark foreground reads well on both. */
+  --success: oklch(0.627 0.1684 150.31); /* green — solid fill paired with white text */
+  --success-foreground: oklch(0.985 0 0);
+  --warning: oklch(0.773 0.1776 69.61); /* amber */
+  --warning-foreground: oklch(0.145 0 0);
   /* gray-200 borders (#2e2e2e) */
   --border: oklch(0.269 0 0);
   --input: oklch(0.269 0 0);
@@ -179,6 +191,10 @@
   --color-accent-foreground: var(--accent-foreground);
   --color-destructive: var(--destructive);
   --color-destructive-foreground: var(--destructive-foreground);
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
@@ -262,6 +278,30 @@ body {
   .no-scrollbar {
     -ms-overflow-style: none; /* IE and Edge */
     scrollbar-width: none; /* Firefox */
+  }
+
+  /* Thin, subtle scrollbar — used for chat code blocks and capped panes so the
+     overflow indicator isn't a chunky OS bar over a dark surface. */
+  .scrollbar-thin {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(148 163 184 / 0.35) transparent; /* slate, translucent */
+  }
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  .scrollbar-thin::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background-color: rgb(148 163 184 / 0.35);
+    border-radius: 9999px;
+  }
+  .scrollbar-thin:hover::-webkit-scrollbar-thumb {
+    background-color: rgb(148 163 184 / 0.55);
+  }
+  .scrollbar-thin::-webkit-scrollbar-corner {
+    background: transparent;
   }
 
   /* Animations for Tailwind v4 */

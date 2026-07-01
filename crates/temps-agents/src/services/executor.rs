@@ -4079,6 +4079,8 @@ mod tests {
             bitbucket_webhook_hook_id: None,
             generic_webhook_token: None,
             attack_mode: false,
+            ai_alert_summaries_enabled: None,
+            ai_debug_chat_enabled: None,
             enable_preview_environments: true,
             preview_envs_on_demand: false,
             preview_envs_idle_timeout_seconds: 300,

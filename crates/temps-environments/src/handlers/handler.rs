@@ -65,6 +65,10 @@ impl From<crate::services::env_var_service::EnvVarError> for Problem {
             EnvVarError::SecretValueRequired { .. } => temps_core::error_builder::bad_request()
                 .detail(err.to_string())
                 .build(),
+            EnvVarError::AlreadyExists { .. } => temps_core::error_builder::conflict()
+                .title("Environment Variable Already Exists")
+                .detail(err.to_string())
+                .build(),
             EnvVarError::Other(msg) => temps_core::error_builder::internal_server_error()
                 .detail(msg)
                 .build(),

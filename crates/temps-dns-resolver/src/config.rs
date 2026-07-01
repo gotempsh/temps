@@ -57,6 +57,13 @@ pub struct ResolverConfig {
     /// forwarder (we fall back to NXDOMAIN like a strict authoritative
     /// server).
     pub upstream_resolvers: Vec<SocketAddr>,
+
+    /// Control-plane / single-node mode. When `true`, the resolver does NOT
+    /// spawn the HTTP long-poll [`crate::sync_client::SyncClient`]; the caller
+    /// owns the `ZoneStore` and feeds it directly (the control plane reads its
+    /// own `service_endpoints` database). `node_token` / `control_plane_url`
+    /// are unused in this mode. Defaults to `false` (worker behaviour).
+    pub disable_sync: bool,
 }
 
 impl ResolverConfig {
@@ -89,6 +96,32 @@ impl ResolverConfig {
                 SocketAddr::new("1.0.0.1".parse().expect("static ipv4"), 53),
                 SocketAddr::new("8.8.8.8".parse().expect("static ipv4"), 53),
             ],
+            disable_sync: false,
+        }
+    }
+
+    /// Control-plane / single-node constructor (ADR-024). Binds **only** on the
+    /// app-bridge gateway — NOT `127.0.0.53`, which `systemd-resolved` owns on a
+    /// real control-plane host — and disables the HTTP sync loop. The control
+    /// plane is the authoritative `service_endpoints` source, so it feeds the
+    /// `ZoneStore` directly instead of long-polling itself.
+    pub fn new_local_feed(node_id: i32, bridge_gateway: IpAddr, snapshot_dir: PathBuf) -> Self {
+        Self {
+            node_id,
+            node_token: String::new(),
+            control_plane_url: String::new(),
+            listen_addrs: vec![SocketAddr::new(bridge_gateway, 53)],
+            snapshot_dir,
+            poll_interval: Duration::from_secs(1),
+            initial_backoff: Duration::from_secs(1),
+            max_backoff: Duration::from_secs(30),
+            http_timeout: Duration::from_secs(10),
+            upstream_resolvers: vec![
+                SocketAddr::new("1.1.1.1".parse().expect("static ipv4"), 53),
+                SocketAddr::new("1.0.0.1".parse().expect("static ipv4"), 53),
+                SocketAddr::new("8.8.8.8".parse().expect("static ipv4"), 53),
+            ],
+            disable_sync: true,
         }
     }
 
@@ -101,5 +134,44 @@ impl ResolverConfig {
 
     pub fn snapshot_path(&self) -> PathBuf {
         self.snapshot_dir.join("zone.json")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_local_feed_binds_only_gateway_and_disables_sync() {
+        let gw: IpAddr = "172.19.0.1".parse().unwrap();
+        let cfg = ResolverConfig::new_local_feed(0, gw, PathBuf::from("/tmp/dns"));
+        assert!(
+            cfg.disable_sync,
+            "control-plane feed must disable HTTP sync"
+        );
+        // Binds ONLY the bridge gateway — never 127.0.0.53, which
+        // systemd-resolved owns on a real control-plane host (ADR-024).
+        assert_eq!(cfg.listen_addrs, vec![SocketAddr::new(gw, 53)]);
+        assert_eq!(cfg.node_id, 0);
+        assert!(cfg.node_token.is_empty());
+        assert!(cfg.control_plane_url.is_empty());
+    }
+
+    #[test]
+    fn new_keeps_sync_enabled_for_workers() {
+        let gw: IpAddr = "172.20.0.1".parse().unwrap();
+        let cfg = ResolverConfig::new(
+            1,
+            "tok".into(),
+            "http://cp".into(),
+            gw,
+            PathBuf::from("/tmp"),
+        );
+        assert!(
+            !cfg.disable_sync,
+            "worker config must keep the HTTP sync loop"
+        );
+        // Workers bind both the gateway and the host-local debug address.
+        assert_eq!(cfg.listen_addrs.len(), 2);
     }
 }

@@ -13,7 +13,7 @@ use utoipa::ToSchema;
 
 use crate::types::*;
 use crate::OtelAppState;
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{permission_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::Problem;
 use temps_core::ProblemDetails;
 
@@ -29,6 +29,40 @@ pub struct MetricQueryParams {
     pub end_time: Option<String>,
     pub bucket_interval: Option<String>,
     pub limit: Option<u64>,
+    /// Restrict to a single metric type: gauge | sum | histogram |
+    /// exponential_histogram | summary. Unknown values are ignored (no filter).
+    pub metric_type: Option<String>,
+    /// Aggregation applied per bucket: avg (default) | sum | min | max | count |
+    /// rate | p50/p95/p99 | quantile:0.95. Unknown values fall back to avg.
+    pub aggregation: Option<String>,
+    /// Exact-match data-point label filters as comma-separated `key=value`
+    /// pairs, e.g. `http.method=GET,http.status_code=200`. Keys must match the
+    /// metric-name allowlist `[a-zA-Z0-9_.:-]`.
+    pub label_filters: Option<String>,
+    /// Comma-separated label keys to group the series by, e.g.
+    /// `http.method,http.route`. Each key must match the allowlist.
+    pub group_by: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MetricLabelKeysParams {
+    pub project_id: i32,
+    pub metric_name: String,
+    /// Window start (RFC 3339). Defaults to 24h before `end_time`.
+    pub start_time: Option<String>,
+    /// Window end (RFC 3339). Defaults to now.
+    pub end_time: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MetricLabelValuesParams {
+    pub project_id: i32,
+    pub metric_name: String,
+    pub label_key: String,
+    /// Window start (RFC 3339). Defaults to 24h before `end_time`.
+    pub start_time: Option<String>,
+    /// Window end (RFC 3339). Defaults to now.
+    pub end_time: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,14 +118,24 @@ pub struct HealthQueryParams {
 // ── Response DTOs ───────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, ToSchema)]
-pub struct MetricsResponse {
+pub struct OtelMetricsResponse {
     pub data: Vec<MetricBucket>,
     pub count: usize,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
-pub struct MetricNamesResponse {
+pub struct OtelMetricNamesResponse {
     pub names: Vec<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct OtelMetricLabelKeysResponse {
+    pub keys: Vec<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct OtelMetricLabelValuesResponse {
+    pub values: Vec<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -172,6 +216,22 @@ fn parse_datetime(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
         .map(|dt| dt.with_timezone(&chrono::Utc))
 }
 
+/// Resolve an optional RFC-3339 (start, end) pair into a concrete window for the
+/// label-discovery queries. Missing `end` → now; missing `start` → 24h before
+/// `end`. Keeping the window bounded is what keeps the sampled scans cheap.
+fn discovery_window(
+    start: Option<&str>,
+    end: Option<&str>,
+) -> (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) {
+    let end = end
+        .and_then(parse_datetime)
+        .unwrap_or_else(chrono::Utc::now);
+    let start = start
+        .and_then(parse_datetime)
+        .unwrap_or_else(|| end - chrono::Duration::hours(24));
+    (start, end)
+}
+
 fn parse_attributes(s: &str) -> BTreeMap<String, String> {
     s.split(',')
         .filter_map(|pair| {
@@ -186,9 +246,35 @@ fn parse_attributes(s: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// Parse a metric type query token into the typed enum. Unknown → `None`.
+fn parse_metric_type(s: &str) -> Option<MetricType> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "gauge" => Some(MetricType::Gauge),
+        "sum" | "counter" => Some(MetricType::Sum),
+        "histogram" => Some(MetricType::Histogram),
+        "exponential_histogram" | "exp_histogram" => Some(MetricType::ExponentialHistogram),
+        "summary" => Some(MetricType::Summary),
+        _ => None,
+    }
+}
+
+/// Parse a comma-separated list of label keys, trimming and dropping empties.
+fn parse_label_keys(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(|k| k.trim())
+        .filter(|k| !k.is_empty())
+        .map(|k| k.to_string())
+        .collect()
+}
+
+/// Parse comma-separated `key=value` label filters into ordered pairs.
+fn parse_label_filters(s: &str) -> Vec<(String, String)> {
+    parse_attributes(s).into_iter().collect()
+}
+
 /// Query metrics with time bucketing.
 #[utoipa::path(
-    tag = "OTel",
+    tag = "Telemetry Metrics",
     get,
     path = "/otel/metrics",
     params(
@@ -200,9 +286,14 @@ fn parse_attributes(s: &str) -> BTreeMap<String, String> {
         ("end_time" = Option<String>, Query, description = "End time (RFC 3339)"),
         ("bucket_interval" = Option<String>, Query, description = "Bucket interval (e.g. '1 hour', '5 minutes')"),
         ("limit" = Option<u64>, Query, description = "Max buckets to return (default: 1000)"),
+        ("metric_type" = Option<String>, Query, description = "Filter by metric type (gauge, sum, histogram, exponential_histogram, summary)"),
+        ("aggregation" = Option<String>, Query, description = "Per-bucket aggregation: avg (default), sum, min, max, count, rate, p50/p95/p99, quantile:0.95"),
+        ("label_filters" = Option<String>, Query, description = "Comma-separated key=value data-point label filters (keys must match [a-zA-Z0-9_.:-])"),
+        ("group_by" = Option<String>, Query, description = "Comma-separated label keys to group series by"),
     ),
     responses(
-        (status = 200, description = "Metrics data", body = MetricsResponse),
+        (status = 200, description = "Metrics data", body = OtelMetricsResponse),
+        (status = 400, description = "Invalid label key", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails),
@@ -215,6 +306,9 @@ pub async fn query_metrics(
     Query(params): Query<MetricQueryParams>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, OtelRead);
+    // Confine a project-scoped deployment token to its own project (no-op for
+    // user/API-key/session auth).
+    project_scope_guard!(auth, params.project_id);
 
     let query = MetricQuery {
         project_id: params.project_id,
@@ -225,24 +319,40 @@ pub async fn query_metrics(
         end_time: params.end_time.as_deref().and_then(parse_datetime),
         bucket_interval: params.bucket_interval,
         limit: params.limit,
+        metric_type: params.metric_type.as_deref().and_then(parse_metric_type),
+        label_filters: params
+            .label_filters
+            .as_deref()
+            .map(parse_label_filters)
+            .unwrap_or_default(),
+        group_by: params
+            .group_by
+            .as_deref()
+            .map(parse_label_keys)
+            .unwrap_or_default(),
+        aggregation: params
+            .aggregation
+            .as_deref()
+            .map(MetricAggregation::parse)
+            .unwrap_or_default(),
     };
 
     let data = state.otel_service.query_metrics(query).await?;
     let count = data.len();
 
-    Ok(Json(MetricsResponse { data, count }))
+    Ok(Json(OtelMetricsResponse { data, count }))
 }
 
 /// List distinct metric names for a project.
 #[utoipa::path(
-    tag = "OTel",
+    tag = "Telemetry Metrics",
     get,
     path = "/otel/metric-names/{project_id}",
     params(
         ("project_id" = i32, Path, description = "Project ID"),
     ),
     responses(
-        (status = 200, description = "List of metric names", body = MetricNamesResponse),
+        (status = 200, description = "List of metric names", body = OtelMetricNamesResponse),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails),
@@ -255,14 +365,101 @@ pub async fn list_metric_names(
     Path(project_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, OtelRead);
+    // Confine a project-scoped deployment token to its own project (no-op for
+    // user/API-key/session auth).
+    project_scope_guard!(auth, project_id);
 
     let names = state.otel_service.list_metric_names(project_id).await?;
-    Ok(Json(MetricNamesResponse { names }))
+    Ok(Json(OtelMetricNamesResponse { names }))
+}
+
+/// List the attribute (label) keys observed on a metric — powers the
+/// label-filter key autocomplete.
+#[utoipa::path(
+    tag = "Telemetry Metrics",
+    get,
+    path = "/otel/metric-label-keys",
+    params(
+        ("project_id" = i32, Query, description = "Project ID"),
+        ("metric_name" = String, Query, description = "Metric to inspect"),
+        ("start_time" = Option<String>, Query, description = "Window start (RFC 3339); defaults to 24h before end"),
+        ("end_time" = Option<String>, Query, description = "Window end (RFC 3339); defaults to now"),
+    ),
+    responses(
+        (status = 200, description = "Distinct label keys", body = OtelMetricLabelKeysResponse),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_metric_label_keys(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<OtelAppState>,
+    Query(params): Query<MetricLabelKeysParams>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, OtelRead);
+    // Confine a project-scoped deployment token to its own project's telemetry
+    // (no-op for user/API-key/session auth).
+    project_scope_guard!(auth, params.project_id);
+
+    let (start, end) = discovery_window(params.start_time.as_deref(), params.end_time.as_deref());
+    let keys = state
+        .otel_service
+        .list_metric_label_keys(params.project_id, &params.metric_name, start, end)
+        .await?;
+    Ok(Json(OtelMetricLabelKeysResponse { keys }))
+}
+
+/// List the distinct values seen for a label key on a metric — powers value
+/// autocomplete once a key is chosen.
+#[utoipa::path(
+    tag = "Telemetry Metrics",
+    get,
+    path = "/otel/metric-label-values",
+    params(
+        ("project_id" = i32, Query, description = "Project ID"),
+        ("metric_name" = String, Query, description = "Metric to inspect"),
+        ("label_key" = String, Query, description = "Label key whose values to list (must match [a-zA-Z0-9_.:-])"),
+        ("start_time" = Option<String>, Query, description = "Window start (RFC 3339); defaults to 24h before end"),
+        ("end_time" = Option<String>, Query, description = "Window end (RFC 3339); defaults to now"),
+    ),
+    responses(
+        (status = 200, description = "Distinct label values", body = OtelMetricLabelValuesResponse),
+        (status = 400, description = "Invalid label key", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_metric_label_values(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<OtelAppState>,
+    Query(params): Query<MetricLabelValuesParams>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, OtelRead);
+    // Confine a project-scoped deployment token to its own project's telemetry
+    // (no-op for user/API-key/session auth).
+    project_scope_guard!(auth, params.project_id);
+
+    let (start, end) = discovery_window(params.start_time.as_deref(), params.end_time.as_deref());
+    let values = state
+        .otel_service
+        .list_metric_label_values(
+            params.project_id,
+            &params.metric_name,
+            &params.label_key,
+            start,
+            end,
+        )
+        .await?;
+    Ok(Json(OtelMetricLabelValuesResponse { values }))
 }
 
 /// Query trace spans with optional filters.
 #[utoipa::path(
-    tag = "OTel",
+    tag = "Traces",
     get,
     path = "/otel/traces",
     params(
@@ -292,6 +489,9 @@ pub async fn query_traces(
     Query(params): Query<TraceQueryParams>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, OtelRead);
+    // Confine a project-scoped deployment token to its own project (no-op for
+    // user/API-key/session auth).
+    project_scope_guard!(auth, params.project_id);
 
     let status = params.status.as_deref().map(|s| match s {
         "OK" | "ok" => SpanStatusCode::Ok,
@@ -331,7 +531,7 @@ pub async fn query_traces(
 /// Query trace summaries — one row per trace with span count, error count,
 /// root span info, and proper trace-level pagination.
 #[utoipa::path(
-    tag = "OTel",
+    tag = "Traces",
     get,
     path = "/otel/trace-summaries",
     params(
@@ -363,6 +563,9 @@ pub async fn query_trace_summaries(
     Query(params): Query<TraceQueryParams>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, OtelRead);
+    // Confine a project-scoped deployment token to its own project (no-op for
+    // user/API-key/session auth).
+    project_scope_guard!(auth, params.project_id);
 
     let status = params.status.as_deref().map(|s| match s {
         "OK" | "ok" => SpanStatusCode::Ok,
@@ -415,7 +618,7 @@ pub async fn query_trace_summaries(
 
 /// Get all spans for a specific trace.
 #[utoipa::path(
-    tag = "OTel",
+    tag = "Traces",
     get,
     path = "/otel/traces/{project_id}/{trace_id}",
     params(
@@ -436,6 +639,9 @@ pub async fn get_trace(
     Path((project_id, trace_id)): Path<(i32, String)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, OtelRead);
+    // Confine a project-scoped deployment token to its own project (no-op for
+    // user/API-key/session auth).
+    project_scope_guard!(auth, project_id);
 
     let data = state.otel_service.get_trace(project_id, &trace_id).await?;
     let count = data.len();
@@ -445,7 +651,7 @@ pub async fn get_trace(
 
 /// Query log records with optional filters.
 #[utoipa::path(
-    tag = "OTel",
+    tag = "Telemetry Logs",
     get,
     path = "/otel/logs",
     params(
@@ -473,6 +679,9 @@ pub async fn query_logs(
     Query(params): Query<LogQueryParams>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, OtelRead);
+    // Confine a project-scoped deployment token to its own project (no-op for
+    // user/API-key/session auth).
+    project_scope_guard!(auth, params.project_id);
 
     let severity = params.severity.as_deref().map(|s| match s {
         "TRACE" | "trace" => LogSeverity::Trace,
@@ -504,7 +713,7 @@ pub async fn query_logs(
 
 /// List anomaly insights for a project.
 #[utoipa::path(
-    tag = "OTel",
+    tag = "Insights",
     get,
     path = "/otel/insights/{project_id}",
     params(
@@ -528,6 +737,9 @@ pub async fn list_insights(
     Query(params): Query<InsightQueryParams>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, OtelRead);
+    // Confine a project-scoped deployment token to its own project (no-op for
+    // user/API-key/session auth).
+    project_scope_guard!(auth, project_id);
 
     let status = params.status.as_deref().map(|s| match s {
         "resolved" => InsightStatus::Resolved,
@@ -570,6 +782,9 @@ pub async fn get_health(
     Query(params): Query<HealthQueryParams>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, OtelRead);
+    // Confine a project-scoped deployment token to its own project (no-op for
+    // user/API-key/session auth).
+    project_scope_guard!(auth, project_id);
 
     let summaries = state
         .otel_service
@@ -601,6 +816,9 @@ pub async fn get_quota(
     Path(project_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, OtelRead);
+    // Confine a project-scoped deployment token to its own project (no-op for
+    // user/API-key/session auth).
+    project_scope_guard!(auth, project_id);
 
     let quota = state.otel_service.get_storage_quota(project_id).await?;
     Ok(Json(QuotaResponse { quota }))
@@ -659,6 +877,9 @@ pub async fn query_genai_traces(
     Query(params): Query<GenAiQueryParams>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, OtelRead);
+    // Confine a project-scoped deployment token to its own project (no-op for
+    // user/API-key/session auth).
+    project_scope_guard!(auth, params.project_id);
 
     // Build attribute filters. For gen_ai_system, we use gen_ai.provider.name (current)
     // but the SQL also handles the deprecated gen_ai.system via COALESCE.
@@ -725,6 +946,9 @@ pub async fn get_genai_trace(
     Path((project_id, trace_id)): Path<(i32, String)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, OtelRead);
+    // Confine a project-scoped deployment token to its own project (no-op for
+    // user/API-key/session auth).
+    project_scope_guard!(auth, project_id);
 
     let spans = state
         .otel_service
@@ -792,5 +1016,70 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result.get("valid").unwrap(), "ok");
         assert_eq!(result.get("good").unwrap(), "yes");
+    }
+
+    // ── Metric query param parsing ──────────────────────────────────
+
+    #[test]
+    fn test_parse_metric_type() {
+        assert_eq!(parse_metric_type("gauge"), Some(MetricType::Gauge));
+        assert_eq!(parse_metric_type("Sum"), Some(MetricType::Sum));
+        assert_eq!(parse_metric_type("counter"), Some(MetricType::Sum));
+        assert_eq!(parse_metric_type("histogram"), Some(MetricType::Histogram));
+        assert_eq!(
+            parse_metric_type("exponential_histogram"),
+            Some(MetricType::ExponentialHistogram)
+        );
+        assert_eq!(parse_metric_type("summary"), Some(MetricType::Summary));
+        assert_eq!(parse_metric_type("nonsense"), None);
+    }
+
+    #[test]
+    fn test_parse_label_keys() {
+        let keys = parse_label_keys("http.method, http.route ,,");
+        assert_eq!(
+            keys,
+            vec!["http.method".to_string(), "http.route".to_string()]
+        );
+        assert!(parse_label_keys("").is_empty());
+        assert!(parse_label_keys("  ,  , ").is_empty());
+    }
+
+    #[test]
+    fn test_parse_label_filters() {
+        let filters = parse_label_filters("http.method=GET,http.status_code=200");
+        // parse_attributes returns a BTreeMap (sorted), so order is deterministic.
+        assert_eq!(
+            filters,
+            vec![
+                ("http.method".to_string(), "GET".to_string()),
+                ("http.status_code".to_string(), "200".to_string()),
+            ]
+        );
+        assert!(parse_label_filters("").is_empty());
+    }
+
+    #[test]
+    fn test_discovery_window_defaults_to_last_24h() {
+        // No bounds → [now-24h, now], so the span is ~24h.
+        let (start, end) = discovery_window(None, None);
+        let span = end - start;
+        assert_eq!(span.num_hours(), 24);
+    }
+
+    #[test]
+    fn test_discovery_window_start_defaults_relative_to_end() {
+        // Explicit end, missing start → start is 24h before that end (not now).
+        let (start, end) = discovery_window(None, Some("2026-01-10T12:00:00Z"));
+        assert_eq!(end.to_rfc3339(), "2026-01-10T12:00:00+00:00");
+        assert_eq!(start.to_rfc3339(), "2026-01-09T12:00:00+00:00");
+    }
+
+    #[test]
+    fn test_discovery_window_honors_both_bounds() {
+        let (start, end) =
+            discovery_window(Some("2026-01-01T00:00:00Z"), Some("2026-01-02T00:00:00Z"));
+        assert_eq!(start.to_rfc3339(), "2026-01-01T00:00:00+00:00");
+        assert_eq!(end.to_rfc3339(), "2026-01-02T00:00:00+00:00");
     }
 }

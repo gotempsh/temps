@@ -214,7 +214,7 @@ export const ProtectedLayout = ({
 
   if (isLoading) {
     return (
-      <div className="flex items-center justify-center h-screen">
+      <div className="flex items-center justify-center h-dvh">
         <div className="text-center space-y-2">
           <div className="h-8 w-8 animate-spin rounded-full border-4 border-primary border-t-transparent mx-auto" />
           <p className="text-sm text-muted-foreground">Loading...</p>
@@ -244,7 +244,7 @@ export const ProtectedLayout = ({
       categorized.category === 'network' ? 'Retry connection' : 'Try again'
 
     return (
-      <div className="flex min-h-screen items-center justify-center bg-muted/20 p-4">
+      <div className="flex min-h-dvh items-center justify-center bg-muted/20 p-4">
         <Card className="w-full max-w-xl shadow-sm">
           <CardHeader className="space-y-4">
             <div className="flex items-start gap-4">

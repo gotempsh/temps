@@ -210,7 +210,7 @@ const LiveLogRow = memo(function LiveLogRow({
       )}
       {columns.service && serviceLabel && (
         <span
-          className="text-muted-foreground shrink-0 w-[70px] truncate"
+          className="text-muted-foreground shrink-0 w-[120px] truncate"
           title={serviceLabel}
         >
           {serviceLabel}
@@ -322,8 +322,42 @@ function formatIntervalLabel(ms: IntervalMs): string {
 // previously lived here as estimateLineHeight; removed when we adopted the
 // history viewer's terminal-style fixed-cadence rows.
 
+// Sentinel container id meaning "stream every container in the environment".
+const ALL_CONTAINERS = '__all__'
+// Above this many containers, "All containers" live mode would open too many
+// browser WebSockets at once — we stop and ask the user to pick a single
+// container or use the History tab (which searches across all of them).
+const MAX_LIVE_ALL_CONTAINERS = 20
+
+// A visible log line plus its optional source (which container/node it came
+// from). `source` is only set in "All containers" mode; single-container mode
+// leaves it undefined and the row falls back to the selected container's
+// service name. `tsMs` is the line's log timestamp in epoch ms, precomputed at
+// enqueue time in all-mode so the merged buffer can be sorted chronologically
+// with a cheap numeric key (no re-parse).
+interface LogEntry {
+  raw: string
+  source?: string
+  tsMs?: number
+}
+
+// Pull the leading ISO timestamp out of a raw line (present when the stream was
+// requested with timestamps=true) and return it as epoch ms.
+function extractTsMs(raw: string): number | undefined {
+  const m = raw.match(TIMESTAMP_PREFIX)
+  if (!m) return undefined
+  const t = Date.parse(m[1])
+  return Number.isNaN(t) ? undefined : t
+}
+
+// Short per-line source label for the merged "All containers" view —
+// "<node>/<container>" so replicas across nodes are distinguishable.
+function containerSourceLabel(c: ContainerInfoResponse): string {
+  return c.node_name ? `${c.node_name}/${c.container_name}` : c.container_name
+}
+
 export default function LogViewer({ project }: { project: ProjectResponse }) {
-  const [logs, setLogs] = useState<string[]>([])
+  const [logs, setLogs] = useState<LogEntry[]>([])
   const [connectionStatus, setConnectionStatus] = useState<
     'connecting' | 'connected' | 'error' | 'permanent_error'
   >('connecting')
@@ -389,7 +423,7 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
   const retryTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // Buffered lines awaiting flush. Drained at different cadences depending on
   // mode (rAF for live, setInterval for interval, never for pause).
-  const pendingLogsRef = useRef<string[]>([])
+  const pendingLogsRef = useRef<LogEntry[]>([])
   const rafHandleRef = useRef<number | null>(null)
   const flushTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const lastFlushTsRef = useRef<number>(0)
@@ -428,7 +462,7 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
   // virtualizer, and the search-nav all agree on what's on screen.
   const filteredLogs = useMemo(() => {
     if (selectedLevels.length === 0) return logs
-    return logs.filter((raw) => selectedLevels.includes(inferLevel(raw)))
+    return logs.filter((e) => selectedLevels.includes(inferLevel(e.raw)))
   }, [logs, selectedLevels])
 
   // Dynamic row height. Log lines are often long JSON payloads that wrap to
@@ -529,12 +563,19 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
   useEffect(() => {
     const containers = containersData?.containers ?? []
     if (containers.length === 0) return
+    // Keep "All containers" selected across container-list refetches.
+    if (selectedContainer === ALL_CONTAINERS) return
 
     const stillExists = containers.some(
       (c) => c.container_id === selectedContainer,
     )
     if (!selectedContainer || !stillExists) {
-      setSelectedContainer(containers[0].container_id)
+      // Default to the combined "All containers" view when there's more than
+      // one replica/container — that's the natural multi-node default. A
+      // single-container project just selects that container.
+      setSelectedContainer(
+        containers.length > 1 ? ALL_CONTAINERS : containers[0].container_id,
+      )
     }
   }, [containersData, selectedContainer])
 
@@ -548,6 +589,36 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
     )
     return container?.service_name ?? container?.container_name ?? null
   }, [containersData, selectedContainer])
+
+  // ── "All containers" live mode ──────────────────────────────────────
+  // When the picker's "All containers" sentinel is selected we open one
+  // WebSocket per container and merge them, instead of the single-container
+  // stream. Search stays client-side highlight and there is no backward
+  // pagination — that's the History tab's job (it already searches across all
+  // containers). Ordering is best-effort chronological via a per-flush sort.
+  const isAllContainers = selectedContainer === ALL_CONTAINERS
+  const allContainersList = useMemo(
+    () => containersData?.containers ?? [],
+    [containersData],
+  )
+  // Stable signature of the container set so the multi-WS effect doesn't churn
+  // on every 3s container-list refetch (which returns a fresh object).
+  const containerIdsSig = useMemo(
+    () =>
+      allContainersList
+        .map((c) => c.container_id)
+        .sort()
+        .join(','),
+    [allContainersList],
+  )
+  const tooManyForAll =
+    isAllContainers && allContainersList.length > MAX_LIVE_ALL_CONTAINERS
+  // Ref mirror so the once-created flushPending callback knows whether to sort
+  // each batch chronologically (only worth the parse cost when merging streams).
+  const isAllRef = useRef(false)
+  useEffect(() => {
+    isAllRef.current = isAllContainers
+  }, [isAllContainers])
 
   const toggleLevel = useCallback((level: LiveLogLevel) => {
     setSelectedLevels((prev) =>
@@ -573,15 +644,27 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
     lastFlushTsRef.current = Date.now()
     setLogs((prev) => {
       const merged = [...prev, ...incoming]
+      // "All containers" mode: sort the *whole* merged buffer by log timestamp
+      // so the streams interleave chronologically. A per-batch sort isn't
+      // enough — each container's backlog arrives as its own burst, so the
+      // bursts would otherwise just concatenate container-by-container. tsMs is
+      // precomputed at enqueue, so this is a cheap numeric-key sort (stable in
+      // modern JS, so equal timestamps keep arrival order). After sorting, the
+      // newest lines are the tail, so slice(-MAX) keeps the most recent.
+      if (isAllRef.current) {
+        merged.sort((a, b) => (a.tsMs ?? 0) - (b.tsMs ?? 0))
+      }
       const trimmed =
         merged.length > MAX_VISIBLE_LOGS
           ? merged.slice(-MAX_VISIBLE_LOGS)
           : merged
-      // Capture where this batch starts in the trimmed list so the row
-      // renderer can apply the fade-in animation to just the new rows.
-      // When we trim, the start is `length - incoming.length`; when we
-      // don't, it's `prev.length`.
-      const batchStart = Math.max(0, trimmed.length - incoming.length)
+      // Capture where this batch starts so the row renderer can fade in the new
+      // rows. After an all-mode sort the new lines aren't a contiguous tail, so
+      // skip the animation there (batchStart = end) so we don't fade in the
+      // wrong rows.
+      const batchStart = isAllRef.current
+        ? trimmed.length
+        : Math.max(0, trimmed.length - incoming.length)
       lastBatchStartRef.current = batchStart
       setLastBatchStart(batchStart)
       return trimmed
@@ -597,9 +680,15 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
   // the oldest pending line and bump the dropped counter so the user
   // notices they're sampling.
   const enqueueLog = useCallback(
-    (line: string) => {
+    (line: string, source?: string) => {
       const buf = pendingLogsRef.current
-      buf.push(line)
+      // In all-mode, stamp each line with its log time so the merged buffer can
+      // be sorted chronologically. Fall back to now() if the line carries no
+      // timestamp (so it sorts at the live frontier rather than jumping).
+      const tsMs = isAllRef.current
+        ? (extractTsMs(line) ?? Date.now())
+        : undefined
+      buf.push({ raw: line, source, tsMs })
       if (buf.length > MAX_PENDING_BUFFER) {
         const overflow = buf.length - MAX_PENDING_BUFFER
         buf.splice(0, overflow)
@@ -712,11 +801,11 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
         // viewer's existing "newest at the bottom" assumption. We render
         // a single-line representation so the new format slots into the
         // existing string-based logs[] buffer without changes.
-        const formatted = json.lines.map((l) => {
-          if (showTimestamps) {
-            return `${l.timestamp} [${l.level}] ${l.service}: ${l.message}`
-          }
-          return `[${l.level}] ${l.service}: ${l.message}`
+        const formatted: LogEntry[] = json.lines.map((l) => {
+          const raw = showTimestamps
+            ? `${l.timestamp} [${l.level}] ${l.service}: ${l.message}`
+            : `[${l.level}] ${l.service}: ${l.message}`
+          return { raw }
         })
         if (!abort.signal.aborted) {
           setLogs(formatted)
@@ -786,6 +875,10 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
 
     // Wait for container to be selected - don't connect without a specific container
     if (!selectedContainer) return
+
+    // "All containers" mode is handled by the dedicated multi-WS effect below;
+    // the single-container stream must not try to open /containers/__all__/logs.
+    if (isAllContainers) return
 
     // Build a source-only signature (everything that affects what stream we
      // connect to, excluding mode). If only mode changed since the last run,
@@ -1054,6 +1147,129 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
     mode.kind,
   ])
 
+  // ── "All containers" multi-WebSocket effect ─────────────────────────
+  // Opens one WebSocket per container and merges their lines into the shared
+  // buffer, each tagged with its source. Mutually exclusive with the single-
+  // container effect above (both guard on isAllContainers). Only runs in Live
+  // mode — Pause holds the buffer; Interval already polls env-wide search
+  // (which is all-container) so it needs no special handling here.
+  useEffect(() => {
+    if (!selectedTarget) return
+    if (!isAllContainers) return
+    if (mode.kind !== 'live') return
+    const containers = allContainersList
+    if (containers.length === 0) return
+    // Fan-out cap: too many containers to stream live at once — the pane shows
+    // a hint (tooManyForAll) telling the user to pick one or use History.
+    if (containers.length > MAX_LIVE_ALL_CONTAINERS) return
+
+    // Fresh buffer whenever we (re)enter all-mode or the container set changes.
+    setLogs([])
+    pendingLogsRef.current = []
+    setBufferedCount(0)
+    setDroppedSinceFlush(0)
+    droppedSinceFlushRef.current = 0
+    setRetryCount(0)
+    setErrorMessage('')
+    setConnectionStatus('connected')
+    if (rafHandleRef.current != null) {
+      cancelAnimationFrame(rafHandleRef.current)
+      rafHandleRef.current = null
+    }
+    if (flushTimeoutRef.current != null) {
+      clearTimeout(flushTimeoutRef.current)
+      flushTimeoutRef.current = null
+    }
+
+    let cleaning = false
+    const sockets: WebSocket[] = []
+    const reconnectTimers: Array<ReturnType<typeof setTimeout>> = []
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+    // Split the tail budget across containers so entering all-mode doesn't dump
+    // N×tail lines of backlog at once.
+    const perTail = Math.max(
+      50,
+      Math.floor(Math.min(tail, 800) / containers.length),
+    )
+
+    const openOne = (c: ContainerInfoResponse) => {
+      if (cleaning) return
+      const params = new URLSearchParams()
+      params.append('tail', String(perTail))
+      // Always request timestamps in all-mode — needed to interleave streams
+      // chronologically (and to populate the timestamp column if shown).
+      params.append('timestamps', 'true')
+      const wsUrl = `${protocol}//${window.location.host}/api/projects/${project.id}/environments/${selectedTarget}/containers/${c.container_id}/logs?${params.toString()}`
+      const source = containerSourceLabel(c)
+      let ws: WebSocket
+      try {
+        ws = new WebSocket(wsUrl)
+      } catch {
+        return
+      }
+      sockets.push(ws)
+      ws.onmessage = (event) => {
+        if (cleaning) return
+        try {
+          const parsed = JSON.parse(event.data)
+          if (parsed.error && parsed.stack) {
+            enqueueLog(`ERROR: ${parsed.error}\n${parsed.stack}`, source)
+          } else if (parsed.message) {
+            enqueueLog(parsed.message, source)
+          } else if (parsed.log) {
+            enqueueLog(parsed.log, source)
+          } else {
+            enqueueLog(JSON.stringify(parsed, null, 2), source)
+          }
+        } catch {
+          enqueueLog(event.data, source)
+        }
+      }
+      ws.onclose = (event) => {
+        if (cleaning || event.code === 1000) return
+        // Best-effort reconnect of just this one stream after a short delay.
+        const t = setTimeout(() => {
+          if (!cleaning) openOne(c)
+        }, 2000)
+        reconnectTimers.push(t)
+      }
+      ws.onerror = () => {
+        // onclose follows and owns the reconnect.
+      }
+    }
+
+    for (const c of containers) openOne(c)
+
+    return () => {
+      cleaning = true
+      for (const t of reconnectTimers) clearTimeout(t)
+      for (const ws of sockets) {
+        ws.onopen = null
+        ws.onmessage = null
+        ws.onerror = null
+        ws.onclose = null
+        try {
+          ws.close(1000, 'Switching source')
+        } catch {
+          // best-effort
+        }
+      }
+      if (rafHandleRef.current != null) {
+        cancelAnimationFrame(rafHandleRef.current)
+        rafHandleRef.current = null
+      }
+      if (flushTimeoutRef.current != null) {
+        clearTimeout(flushTimeoutRef.current)
+        flushTimeoutRef.current = null
+      }
+      pendingLogsRef.current = []
+    }
+    // containerIdsSig (not allContainersList/containersData) is the dep so the
+    // sockets don't churn on every 3s container-list refetch — only when the
+    // actual set of container ids changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAllContainers, selectedTarget, mode.kind, tail, containerIdsSig])
+
   // Shared connectWS function for retry
   const handleRetryConnection = useCallback(() => {
     setRetryCount(0)
@@ -1301,17 +1517,36 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
             >
               <SelectTrigger className="w-full sm:w-auto sm:max-w-[400px] text-left">
                 <SelectValue placeholder="Select container">
-                  {selectedContainer && (
-                    <SelectedContainerLabel
-                      container={containersData?.containers?.find(
-                        (x) => x.container_id === selectedContainer
-                      )}
-                      containerId={selectedContainer}
-                    />
+                  {isAllContainers ? (
+                    <span className="flex items-center gap-2">
+                      <span className="font-medium">All containers</span>
+                      <span className="text-xs text-muted-foreground">
+                        {allContainersList.length} live
+                      </span>
+                    </span>
+                  ) : (
+                    selectedContainer && (
+                      <SelectedContainerLabel
+                        container={containersData?.containers?.find(
+                          (x) => x.container_id === selectedContainer
+                        )}
+                        containerId={selectedContainer}
+                      />
+                    )
                   )}
                 </SelectValue>
               </SelectTrigger>
               <SelectContent>
+                {allContainersList.length > 1 && (
+                  <SelectItem value={ALL_CONTAINERS}>
+                    <div className="flex items-center gap-2">
+                      <span className="font-medium">All containers</span>
+                      <span className="text-xs text-muted-foreground">
+                        {allContainersList.length} containers · interleaved
+                      </span>
+                    </div>
+                  </SelectItem>
+                )}
                 {containersData?.containers?.map((container) => (
                   <SelectItem
                     key={container.container_id}
@@ -1385,9 +1620,9 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
                   onCheckedChange={(v) =>
                     setColumns((c) => ({ ...c, service: v === true }))
                   }
-                  disabled={!selectedContainerServiceName}
+                  disabled={!isAllContainers && !selectedContainerServiceName}
                 >
-                  Service
+                  {isAllContainers ? 'Source' : 'Service'}
                 </DropdownMenuCheckboxItem>
               </DropdownMenuContent>
             </DropdownMenu>
@@ -1506,7 +1741,10 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
               {mode.kind === 'live' && (
                 <span className="flex items-center gap-2">
                   <span>
-                    Live · {logs.length.toLocaleString()} lines
+                    Live
+                    {isAllContainers &&
+                      ` · ${allContainersList.length} containers`}{' '}
+                    · {logs.length.toLocaleString()} lines
                     {lps > 0.5 && ` · ~${Math.round(lps).toLocaleString()} lps`}
                   </span>
                   {lps >= LPS_SAMPLED_THRESHOLD && (
@@ -1607,6 +1845,20 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
                 <p className="text-sm">Select an environment to view logs</p>
               </div>
             </div>
+          ) : tooManyForAll ? (
+            <div className="h-[calc(100vh-360px)] min-h-[300px] flex items-center justify-center text-muted-foreground">
+              <div className="text-center max-w-md px-4">
+                <AlertCircle className="h-12 w-12 mx-auto mb-3 opacity-50" />
+                <p className="text-sm">
+                  Too many containers ({allContainersList.length}) to stream live
+                  at once.
+                </p>
+                <p className="text-xs mt-1">
+                  Pick a single container above, or use the History tab to search
+                  across all of them.
+                </p>
+              </div>
+            </div>
           ) : (
             <div
               ref={parentRef}
@@ -1649,8 +1901,8 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
                 }}
               >
                 {virtualizer.getVirtualItems().map((virtualRow) => {
-                  const raw = filteredLogs[virtualRow.index]
-                  if (raw === undefined) return null
+                  const entry = filteredLogs[virtualRow.index]
+                  if (entry === undefined) return null
                   // Fresh-batch animation runs only when no level filter is
                   // active. With a filter on, virtualRow.index points into
                   // the filtered rope and lastBatchStart points into the
@@ -1677,13 +1929,15 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
                       className={cn(isFresh && 'log-fresh-line')}
                     >
                       <LiveLogRow
-                        raw={raw}
+                        raw={entry.raw}
                         columns={columns}
                         searchTerm={searchTerm}
                         isHighlighted={
                           virtualRow.index === currentMatchIndex
                         }
-                        serviceLabel={selectedContainerServiceName}
+                        serviceLabel={
+                          entry.source ?? selectedContainerServiceName
+                        }
                       />
                     </div>
                   )

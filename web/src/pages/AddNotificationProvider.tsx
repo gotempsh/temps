@@ -1,5 +1,6 @@
 import {
   createNotificationEmailProviderMutation,
+  createNotificationProviderMutation,
   createSlackProviderMutation,
   createWebhookProviderMutation,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -20,6 +21,7 @@ import {
   ArrowRight,
   Bell,
   Check,
+  Cloud,
   Mail,
   MoreHorizontal,
   Slack,
@@ -37,7 +39,12 @@ import {
 import { cn } from '@/lib/utils'
 
 type Step = 'provider-type' | 'configuration' | 'complete'
-type ProviderType = 'email' | 'slack' | 'webhook' | 'coming-soon'
+type ProviderType =
+  | 'email'
+  | 'slack'
+  | 'webhook'
+  | 'cloudflare'
+  | 'coming-soon'
 
 interface ProviderOption {
   id: ProviderType
@@ -45,6 +52,13 @@ interface ProviderOption {
   description: string
   icon: React.ReactNode
   available: boolean
+}
+
+const providerLabels: Partial<Record<ProviderType, string>> = {
+  email: 'Email',
+  slack: 'Slack',
+  webhook: 'Webhook',
+  cloudflare: 'Cloudflare Email',
 }
 
 const providerOptions: ProviderOption[] = [
@@ -67,6 +81,14 @@ const providerOptions: ProviderOption[] = [
     name: 'Webhook',
     description: 'Send JSON payloads to any HTTP endpoint for custom integrations',
     icon: <Webhook className="h-6 w-6" />,
+    available: true,
+  },
+  {
+    id: 'cloudflare',
+    name: 'Cloudflare Email',
+    description:
+      'Send notification emails through Cloudflare Email Sending (no SMTP required)',
+    icon: <Cloud className="h-6 w-6" />,
     available: true,
   },
   {
@@ -168,10 +190,29 @@ export function AddNotificationProvider() {
     },
   })
 
+  // Cloudflare uses the generic notification-provider endpoint (provider_type
+  // + opaque config) rather than a dedicated typed mutation.
+  const createCloudflareMutation = useMutation({
+    ...createNotificationProviderMutation(),
+    meta: {
+      errorTitle: 'Failed to add Cloudflare provider',
+    },
+    onSuccess: () => {
+      setCurrentStep('complete')
+      toast.success('Cloudflare provider added successfully')
+      setTimeout(() => {
+        navigate('/settings/notifications')
+      }, 2000)
+    },
+  })
+
   const handleProviderSelect = (provider: ProviderType) => {
     if (provider === 'coming-soon') return
     setSelectedProvider(provider)
-    form.setValue('provider_type', provider as 'email' | 'slack' | 'webhook')
+    form.setValue(
+      'provider_type',
+      provider as 'email' | 'slack' | 'webhook' | 'cloudflare'
+    )
     setCurrentStep('configuration')
   }
 
@@ -206,6 +247,21 @@ export function AddNotificationProvider() {
           },
         },
       })
+    } else if (data.provider_type === 'cloudflare') {
+      await createCloudflareMutation.mutateAsync({
+        body: {
+          name: data.name,
+          provider_type: 'cloudflare',
+          enabled: true,
+          config: {
+            account_id: data.config.account_id!,
+            api_token: data.config.api_token!,
+            from_address: data.config.from_address!,
+            from_name: data.config.from_name || undefined,
+            to_addresses: data.config.to_addresses!,
+          },
+        },
+      })
     } else {
       await createEmailMutation.mutateAsync({
         body: {
@@ -232,7 +288,10 @@ export function AddNotificationProvider() {
   }
 
   const isLoading =
-    createEmailMutation.isPending || createSlackMutation.isPending || createWebhookMutation.isPending
+    createEmailMutation.isPending ||
+    createSlackMutation.isPending ||
+    createWebhookMutation.isPending ||
+    createCloudflareMutation.isPending
 
   const renderStepIndicator = () => {
     const steps = [
@@ -340,12 +399,12 @@ export function AddNotificationProvider() {
           <Card>
             <CardHeader>
               <CardTitle>
-                Configure {selectedProvider === 'email' ? 'Email' : selectedProvider === 'slack' ? 'Slack' : 'Webhook'}{' '}
+                Configure {providerLabels[selectedProvider] ?? 'Notification'}{' '}
                 Provider
               </CardTitle>
               <CardDescription>
                 Enter the configuration details for your{' '}
-                {selectedProvider === 'email' ? 'email' : selectedProvider === 'slack' ? 'Slack' : 'webhook'} notification
+                {providerLabels[selectedProvider] ?? 'notification'} notification
                 provider
               </CardDescription>
             </CardHeader>

@@ -23,7 +23,8 @@ pub use error::LogAggregatorError;
 pub use plugin::LogAggregatorPlugin;
 pub use services::{
     ChunkWriterService, CollectorService, FlushResult, LogMetadataService, LogSearchService,
-    RetentionService, TailService,
+    RemoteContainerInfo, RemoteContainerLogSource, RemoteLogCollectorService, RemoteLogSourceError,
+    RemoteLogStream, RetentionService, TailService,
 };
 pub use storage::{FilesystemStorage, LogStorage, S3Storage};
 pub use types::*;

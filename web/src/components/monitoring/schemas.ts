@@ -66,12 +66,16 @@ export const weeklyDigestSchema = z.object({
 export const providerSchema = z
   .object({
     name: z.string().min(1, 'Name is required'),
-    provider_type: z.enum(['email', 'slack', 'webhook']),
+    provider_type: z.enum(['email', 'slack', 'webhook', 'cloudflare']),
     config: z.object({
       // Slack config
       webhook_url: z.string().optional(),
       channel: z.string().optional(),
       slack_username: z.string().optional(),
+
+      // Cloudflare config
+      account_id: z.string().optional(),
+      api_token: z.string().optional(),
 
       // Email config
       smtp_host: z.string().optional(),
@@ -151,6 +155,32 @@ export const providerSchema = z
         } catch {
           return false
         }
+      }
+      // Cloudflare provider validation
+      if (data.provider_type === 'cloudflare') {
+        const { account_id, api_token, from_address, to_addresses } =
+          data.config
+
+        if (
+          !account_id ||
+          !api_token ||
+          !from_address ||
+          !to_addresses ||
+          to_addresses.length === 0
+        ) {
+          return false
+        }
+
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+        if (!emailRegex.test(from_address)) {
+          return false
+        }
+        for (const email of to_addresses) {
+          if (!emailRegex.test(email)) {
+            return false
+          }
+        }
+        return true
       }
       return false
     },
