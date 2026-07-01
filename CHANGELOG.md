@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **More Git providers: Bitbucket, Gitea, and any HTTPS server.** Alongside
+  GitHub and GitLab, Temps now connects to **Bitbucket Cloud** (access token or
+  app password, with the push webhook and pull-request comments registered
+  automatically), self-hosted **Gitea / Forgejo / Codeberg** (personal access
+  token over HTTPS, HMAC-verified webhooks), and **any other HTTPS git server**
+  via a manual clone URL (public or token-authenticated) — Azure DevOps, Gogs,
+  SourceHut, Bitbucket Data Center, and the like. All provider and clone URLs
+  are HTTPS-only so access tokens are never sent in the clear; webhook secrets
+  are generated with a CSPRNG and looked up in constant time.
 - **Worker-node monitoring & alerts.** Temps now automatically watches every
   worker node and notifies operators through the existing notification channels
   (email / Slack / webhook) — no per-node rules to configure. You get a
