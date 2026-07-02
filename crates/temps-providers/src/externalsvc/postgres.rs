@@ -449,7 +449,22 @@ impl PostgresService {
             healthcheck: Some(bollard::models::HealthConfig {
                 test: Some(vec![
                     "CMD-SHELL".to_string(),
-                    "pg_isready -U postgres".to_string(),
+                    // Without -d, pg_isready (via libpq) defaults the target
+                    // database to the username being checked. The hardcoded
+                    // "postgres" here was wrong for any service with a
+                    // non-default username/database (e.g. username="appuser",
+                    // database="appdb") — the postmaster would receive a
+                    // connection attempt for a role/database that doesn't
+                    // exist, logging a FATAL every interval (1s) forever.
+                    // pg_isready still reports healthy either way (the
+                    // server did respond), so this was invisible in the UI,
+                    // just a permanent log-spam leak. Use the real
+                    // configured username/database instead.
+                    format!(
+                        "pg_isready -U {} -d {}",
+                        shell_escape(&config.username),
+                        shell_escape(&config.database)
+                    ),
                 ]),
                 interval: Some(1000000000), // 1 second
                 timeout: Some(3000000000),  // 3 seconds
