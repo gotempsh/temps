@@ -1559,7 +1559,11 @@ WHERE project_id = $1
 /// trend badge. Returns `None` when there's no previous-period baseline to compare
 /// against — a `previous` of 0 can't be turned into a real ratio, so we omit the
 /// trend entirely rather than fabricate a flat +/-100%.
-fn calculate_trend_percentage(current: i64, previous: i64) -> Option<f64> {
+///
+/// Shared by both the Timescale (`events_service`) and ClickHouse
+/// (`clickhouse_backend`) `AnalyticsEvents` implementations so the two backends
+/// can't drift back into inconsistent trend semantics.
+pub(crate) fn calculate_trend_percentage(current: i64, previous: i64) -> Option<f64> {
     if previous > 0 {
         Some(((current - previous) as f64 / previous as f64) * 100.0)
     } else {

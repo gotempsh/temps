@@ -36,7 +36,7 @@ use clickhouse::Row;
 use serde::Deserialize;
 use temps_core::UtcDateTime;
 
-use crate::services::events_service::EventsError;
+use crate::services::events_service::{calculate_trend_percentage, EventsError};
 use crate::services::queries::{
     ActiveVisitorsSpec, AggregatedBucketsSpec, DashboardProjectsSpec, EventTypeBreakdownSpec,
     EventsCountSpec, EventsTimelineSpec, HasEventsSpec, HourlyVisitsSpec, PropertyBreakdownSpec,
@@ -1052,16 +1052,7 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
 
             let current = current_map.get(&pid).copied().unwrap_or(0);
             let previous = previous_map.get(&pid).copied().unwrap_or(0);
-            // Identical trend semantics to the Timescale impl: None when
-            // both periods are zero, 100% when previous is zero but
-            // current is positive.
-            let trend_percentage = if previous > 0 {
-                Some(((current - previous) as f64 / previous as f64) * 100.0)
-            } else if current > 0 {
-                Some(100.0)
-            } else {
-                None
-            };
+            let trend_percentage = calculate_trend_percentage(current, previous);
 
             projects.insert(
                 pid.to_string(),
