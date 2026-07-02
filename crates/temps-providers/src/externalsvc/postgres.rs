@@ -32,15 +32,44 @@ use super::{
 
 /// POSIX-safe shell escaping: wraps value in single quotes, escaping any
 /// embedded single quotes. Safe for use in `sh -c` command strings.
-fn shell_escape(s: &str) -> String {
+///
+/// Shared across the Postgres provider files (`postgres_upgrade`,
+/// `postgres_lifecycle`) instead of each keeping its own copy -- the drift
+/// between duplicated copies of this exact kind of string-builder is what
+/// caused the healthcheck bug this crate's `postgres_healthcheck_cmd` fixes.
+pub(crate) fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Rejections from same-version-only [`PostgresService::upgrade`]. The
+/// `ExternalService::upgrade` trait method returns `anyhow::Result<()>`
+/// across every provider, so this can't be a variant of a typed
+/// `Result<(), E>` without changing that trait's signature everywhere.
+/// Instead it's wrapped into the `anyhow::Error` via `?`/`.into()` so
+/// callers can `downcast_ref::<PostgresUpgradeRejected>()` for an exact,
+/// wording-independent match instead of matching on `e.to_string()`.
+#[derive(Debug, thiserror::Error)]
+pub enum PostgresUpgradeRejected {
+    #[error("Cannot downgrade PostgreSQL (from {from} to {to})")]
+    Downgrade { from: u32, to: u32 },
+
+    #[error(
+        "Cannot change PostgreSQL major version via this endpoint (from {from} to {to}). \
+         Use the major-version upgrade API (POST /external-services/{{id}}/upgrades) instead, \
+         which performs a real pg_dumpall/restore with a retained rollback volume and a \
+         mandatory pre-upgrade backup."
+    )]
+    MajorVersionChange { from: u32, to: u32 },
 }
 
 /// Builds the `pg_isready` healthcheck command pinned to the configured
 /// username/database. Without `-d`, `pg_isready` (via libpq) defaults the
 /// target database to the username, so any service where `database !=
 /// username` would log a FATAL on every healthcheck tick.
-fn postgres_healthcheck_cmd(username: &str, database: &str) -> String {
+///
+/// Shared with `postgres_lifecycle` so both container-creation sites build
+/// the exact same healthcheck command.
+pub(crate) fn postgres_healthcheck_cmd(username: &str, database: &str) -> String {
     format!(
         "pg_isready -U {} -d {}",
         shell_escape(username),
@@ -3088,11 +3117,11 @@ impl ExternalService for PostgresService {
         );
 
         if old_version > new_version {
-            return Err(anyhow::anyhow!(
-                "Cannot downgrade PostgreSQL (from {} to {})",
-                old_version,
-                new_version
-            ));
+            return Err(PostgresUpgradeRejected::Downgrade {
+                from: old_version,
+                to: new_version,
+            }
+            .into());
         }
 
         // Major version upgrades (e.g. 17 -> 18) are handled exclusively by
@@ -3110,14 +3139,11 @@ impl ExternalService for PostgresService {
         // nothing has been touched yet (no stop, no volume changes), so this
         // is a safe no-op rejection, not a partial failure.
         if old_version != new_version {
-            return Err(anyhow::anyhow!(
-                "Cannot change PostgreSQL major version via this endpoint (from {} to {}). \
-                 Use the major-version upgrade API (POST /external-services/{{id}}/upgrades) \
-                 instead, which performs a real pg_dumpall/restore with a retained rollback \
-                 volume and a mandatory pre-upgrade backup.",
-                old_version,
-                new_version
-            ));
+            return Err(PostgresUpgradeRejected::MajorVersionChange {
+                from: old_version,
+                to: new_version,
+            }
+            .into());
         }
 
         // Verify the new image can be pulled BEFORE stopping the old container

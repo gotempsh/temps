@@ -44,6 +44,15 @@ pub enum ExternalServiceError {
     #[error("Failed to initialize service {id}: {reason}")]
     InitializationFailed { id: i32, reason: String },
 
+    /// A same-version `upgrade()` call was rejected before touching the
+    /// container (unsupported downgrade, or a major-version change that
+    /// must go through the dedicated upgrade orchestrator instead). Client
+    /// error, not a server failure -- kept distinct from
+    /// `InitializationFailed` so handlers can map it to 400 without
+    /// string-matching the message.
+    #[error("Upgrade rejected for service {id}: {reason}")]
+    UpgradeRejected { id: i32, reason: String },
+
     #[error("Failed to encrypt parameter '{param_name}' for service {service_id}: {reason}")]
     EncryptionFailed {
         service_id: i32,
@@ -1481,6 +1490,7 @@ impl ExternalServiceManager {
             "Upgrading service {} to Docker image {}",
             service_id, new_docker_image
         );
+        self.ensure_no_active_upgrade(service_id).await?;
 
         let service = self.get_service(service_id).await?;
         let old_parameters = self.get_service_parameters(service_id).await?;
@@ -1535,13 +1545,29 @@ impl ExternalServiceManager {
         let service_instance =
             self.create_service_instance(service.name.clone(), service_type_enum);
 
-        // Call the upgrade method on the service instance
+        // Call the upgrade method on the service instance. `upgrade()`
+        // returns `anyhow::Result` (shared across every provider), so a
+        // same-version rejection is downcast here -- before the error is
+        // stringified below -- into a typed `UpgradeRejected` variant the
+        // handler can match on directly instead of substring-matching the
+        // message text.
         service_instance
             .upgrade(old_config, new_config.clone())
             .await
-            .map_err(|e| ExternalServiceError::InitializationFailed {
-                id: service_id,
-                reason: format!("Upgrade failed: {}", e),
+            .map_err(|e| {
+                if let Some(rejected) =
+                    e.downcast_ref::<crate::externalsvc::postgres::PostgresUpgradeRejected>()
+                {
+                    ExternalServiceError::UpgradeRejected {
+                        id: service_id,
+                        reason: rejected.to_string(),
+                    }
+                } else {
+                    ExternalServiceError::InitializationFailed {
+                        id: service_id,
+                        reason: format!("Upgrade failed: {}", e),
+                    }
+                }
             })?;
 
         // Update the service configuration in the database with the new Docker image
@@ -3936,6 +3962,7 @@ echo "[restore] Pre-seed complete"
 
     async fn initialize_service(&self, service_id: i32) -> Result<(), ExternalServiceError> {
         info!("Initializing service: {}", service_id);
+        self.ensure_no_active_upgrade(service_id).await?;
         let service = self.get_service(service_id).await?;
         let parameters = self.get_service_parameters(service_id).await?;
         let service_type_enum = ServiceType::from_str(&service.service_type).map_err(|_| {
@@ -6717,18 +6744,24 @@ echo "[restore] Pre-seed complete"
             .collect()
     }
 
-    /// Guard against reconciling/(re)starting a container while a Postgres
-    /// major upgrade is actively working on it. The upgrade orchestrator
-    /// stops the container and deletes/recreates its volumes across
-    /// several phases (`postgres_upgrade.rs`); a concurrent `start()` call
-    /// (health-check-triggered restart, operator restart, startup
-    /// reconcile) would recreate the container against an implicitly
-    /// re-created empty volume, silently diverging from the volume the
-    /// orchestrator is dumping/restoring — accepting writes that never
-    /// make it into the upgraded database.
+    /// Guard against reconciling/(re)starting or recreating a container
+    /// while a Postgres major upgrade (or its rollback) is actively working
+    /// on it. The upgrade orchestrator stops the container and
+    /// deletes/recreates its volumes across several phases
+    /// (`postgres_upgrade.rs`), and `rollback()` does the same in reverse;
+    /// a concurrent container mutation (start, reconcile, resource-limit
+    /// recreate, a same-version image swap) would recreate the container
+    /// against an implicitly re-created empty volume, silently diverging
+    /// from the volume the orchestrator/rollback is dumping/restoring —
+    /// accepting writes that never make it into the upgraded database.
     ///
-    /// Only PENDING/RUNNING rows are active; FAILED/COMPLETED/CANCELLED/
-    /// ROLLED_BACK are terminal and don't block a start.
+    /// Called from every entry point that stops/recreates a service's
+    /// container: `start_service`, `initialize_service` (covers
+    /// `update_service`, service creation, and the resource-limit recreate
+    /// path), and the legacy same-version `upgrade_service`.
+    ///
+    /// PENDING/RUNNING/ROLLING_BACK rows are active; FAILED/COMPLETED/
+    /// CANCELLED/ROLLED_BACK are terminal and don't block a start.
     async fn ensure_no_active_upgrade(&self, service_id: i32) -> Result<(), ExternalServiceError> {
         use crate::externalsvc::postgres_upgrade::status;
 
@@ -6737,7 +6770,8 @@ echo "[restore] Pre-seed complete"
             .filter(
                 postgres_major_upgrades::Column::Status
                     .eq(status::PENDING)
-                    .or(postgres_major_upgrades::Column::Status.eq(status::RUNNING)),
+                    .or(postgres_major_upgrades::Column::Status.eq(status::RUNNING))
+                    .or(postgres_major_upgrades::Column::Status.eq(status::ROLLING_BACK)),
             )
             .one(self.db.as_ref())
             .await

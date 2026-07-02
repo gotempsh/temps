@@ -711,17 +711,19 @@ async fn upgrade_service(
 
             Ok((StatusCode::OK, Json(service)))
         }
-        Err(e) => match e.to_string().as_str() {
-            "Service not found" => Err(not_found().detail("Service not found").build()),
-            msg if msg.contains("Upgrade not implemented")
-                || msg.contains("Cannot change PostgreSQL major version")
-                || msg.contains("Cannot downgrade PostgreSQL") =>
-            {
-                Err(bad_request().detail(msg).build())
+        Err(e) => match &e {
+            crate::services::ExternalServiceError::UpgradeRejected { .. } => {
+                Err(bad_request().detail(e.to_string()).build())
             }
-            _ => Err(internal_server_error()
-                .detail(format!("Failed to upgrade service: {}", e))
-                .build()),
+            _ => match e.to_string().as_str() {
+                "Service not found" => Err(not_found().detail("Service not found").build()),
+                msg if msg.contains("Upgrade not implemented") => {
+                    Err(bad_request().detail(msg).build())
+                }
+                _ => Err(internal_server_error()
+                    .detail(format!("Failed to upgrade service: {}", e))
+                    .build()),
+            },
         },
     }
 }
@@ -1212,8 +1214,8 @@ async fn start_service(
                         crate::services::ExternalServiceError::UpgradeInProgress { .. } => {
                             Err(conflict().detail(e.to_string()).build())
                         }
-                        _ if e.to_string() == "Service not found" => {
-                            Err(not_found().detail("Service not found").build())
+                        crate::services::ExternalServiceError::ServiceNotFound { .. } => {
+                            Err(not_found().detail(e.to_string()).build())
                         }
                         _ => Err(internal_server_error()
                             .detail(format!("Failed to start service: {}", e))

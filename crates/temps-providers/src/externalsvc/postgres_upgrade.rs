@@ -29,6 +29,8 @@ use temps_entities::postgres_major_upgrades;
 use temps_logs::LogService;
 use thiserror::Error;
 
+use super::postgres::shell_escape;
+
 /// Pre-upgrade backup provider trait.
 ///
 /// Implemented by `temps-backup::BackupService` to avoid a circular dep
@@ -221,13 +223,6 @@ pub enum PostgresUpgradeError {
     Database(#[from] sea_orm::DbErr),
 }
 
-/// POSIX-safe shell escaping used when interpolating user-controlled
-/// strings into `sh -c` invocations. Single-quotes the value and escapes
-/// any embedded single quotes.
-fn shell_escape(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
 /// Escape a string for safe interpolation into a `sed` BRE/ERE pattern.
 /// Used when the dumped service username is baked into a regex that
 /// filters out the dump's `DROP ROLE` statements for the connected user.
@@ -418,6 +413,14 @@ pub mod status {
     pub const FAILED: &str = "failed";
     pub const COMPLETED: &str = "completed";
     pub const CANCELLED: &str = "cancelled";
+    /// A completed upgrade is actively being rolled back: the live volume
+    /// has been (or is about to be) deleted and is being replaced by a copy
+    /// of the rollback volume. Active for `ensure_no_active_upgrade`
+    /// purposes, same as PENDING/RUNNING — a concurrent start must not
+    /// recreate the container against a volume mid-restore. Retryable: a
+    /// `rollback()` call is idempotent, so a row stuck here after a failed
+    /// attempt can simply be re-rolled-back.
+    pub const ROLLING_BACK: &str = "rolling_back";
     /// Upgrade was completed, then rolled back to the pre-upgrade PGDATA
     /// volume and old image. Terminal — a new upgrade must be started
     /// separately to re-attempt.
@@ -1576,7 +1579,13 @@ impl PostgresUpgradeOrchestrator {
                 reason: format!("start copy container: {}", e),
             })?;
 
-        let wait_result = self
+        // Capture the wait outcome instead of propagating it immediately:
+        // `auto_remove` is disabled above, so an early `?` return here would
+        // skip the removal below and leak the sidecar holding a reference to
+        // both volumes, wedging any retry's volume removal ("volume is in
+        // use") forever. Every exit path from here must still try to remove
+        // the container.
+        let wait_outcome = self
             .docker
             .wait_container(
                 &created.id,
@@ -1584,11 +1593,7 @@ impl PostgresUpgradeOrchestrator {
             )
             .try_collect::<Vec<_>>()
             .await
-            .map_err(|e| PostgresUpgradeError::SnapshotFailed {
-                upgrade_id: row.id,
-                service_id: row.service_id,
-                reason: format!("wait copy container: {}", e),
-            })?;
+            .map_err(|e| format!("wait copy container: {}", e));
 
         let remove_result = self
             .docker
@@ -1604,7 +1609,13 @@ impl PostgresUpgradeOrchestrator {
 
         if let Err(e) = remove_result {
             let msg = e.to_string();
-            if !msg.contains("removal of container") || !msg.contains("is already in progress") {
+            let already_gone = msg.contains("No such container")
+                || msg.contains("no such container")
+                || msg.contains("not found")
+                || msg.contains("404");
+            let already_removing = msg.contains("removal of container")
+                && msg.contains("is already in progress");
+            if !already_gone && !already_removing {
                 return Err(PostgresUpgradeError::SnapshotFailed {
                     upgrade_id: row.id,
                     service_id: row.service_id,
@@ -1653,6 +1664,12 @@ impl PostgresUpgradeOrchestrator {
                 }
             }
         }
+
+        let wait_result = wait_outcome.map_err(|reason| PostgresUpgradeError::SnapshotFailed {
+            upgrade_id: row.id,
+            service_id: row.service_id,
+            reason,
+        })?;
 
         if let Some(nonzero) = wait_result
             .iter()
@@ -1822,12 +1839,15 @@ impl PostgresUpgradeOrchestrator {
     ) -> Result<postgres_major_upgrades::Model, PostgresUpgradeError> {
         let row = self.load_upgrade(upgrade_id).await?;
 
-        // Preconditions
-        if row.status != status::COMPLETED {
+        // Preconditions. ROLLING_BACK is accepted alongside COMPLETED so a
+        // rollback that failed partway (leaving the row stuck in
+        // ROLLING_BACK) can be retried through this same entry point —
+        // every step below tolerates "already in that state".
+        if row.status != status::COMPLETED && row.status != status::ROLLING_BACK {
             return Err(PostgresUpgradeError::NotRollbackable {
                 upgrade_id,
                 reason: format!(
-                    "only completed upgrades can be rolled back; current status is '{}'",
+                    "only completed (or a previously interrupted rollback) can be rolled back; current status is '{}'",
                     row.status
                 ),
             });
@@ -1849,6 +1869,14 @@ impl PostgresUpgradeOrchestrator {
                 });
             }
         }
+
+        // Mark the row actively rolling back *before* touching any
+        // container or volume, so `ensure_no_active_upgrade` blocks a
+        // concurrent start for the entire multi-step restore below, not
+        // just while status was PENDING/RUNNING during the original
+        // upgrade. Idempotent if already ROLLING_BACK (a retry).
+        self.set_status(upgrade_id, status::ROLLING_BACK, None)
+            .await?;
 
         self.log_service
             .log_warning(
