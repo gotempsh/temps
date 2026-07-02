@@ -1978,6 +1978,32 @@ async fn setup_dns_challenge(
     let mut results = Vec::new();
     let mut records_created: u32 = 0;
 
+    // Remove stale TXT records left over from a previous order/renewal before creating
+    // this batch. This must happen once per distinct record name, before ANY record in
+    // the batch is created: a wildcard order publishes two TXT records under the same
+    // `_acme-challenge` name (one per authorization), so removing per-record (interleaved
+    // with creation) would delete a sibling record this same loop just created.
+    {
+        use std::collections::HashSet;
+        use temps_dns::providers::DnsRecordType;
+
+        let mut cleaned_names = HashSet::new();
+        for (name, _value) in &dns_txt_records {
+            let record_name = acme_txt_record_name(&base_domain, name);
+            if cleaned_names.insert(record_name.clone()) {
+                if let Err(e) = provider_instance
+                    .remove_record(&base_domain, &record_name, DnsRecordType::TXT)
+                    .await
+                {
+                    debug!(
+                        "No existing TXT record to remove for {} (or removal failed: {})",
+                        record_name, e
+                    );
+                }
+            }
+        }
+    }
+
     // Create each DNS TXT record
     for (name, value) in &dns_txt_records {
         let result =
@@ -2045,19 +2071,10 @@ fn extract_base_domain(domain: &str) -> String {
     }
 }
 
-/// Create a single ACME challenge TXT record using the DNS provider
-/// This will first remove any existing TXT records with the same name before creating the new one
-async fn create_acme_txt_record(
-    provider: &dyn temps_dns::providers::DnsProvider,
-    base_domain: &str,
-    name: &str,
-    value: &str,
-) -> DnsChallengeRecordResult {
-    use temps_dns::providers::{DnsRecordContent, DnsRecordRequest, DnsRecordType};
-
-    // Extract the record name relative to the base domain
-    // e.g., "_acme-challenge.example.com" for base domain "example.com" -> "_acme-challenge"
-    let record_name = if name.ends_with(&format!(".{}", base_domain)) {
+/// Extract the record name relative to the base domain
+/// e.g., "_acme-challenge.example.com" for base domain "example.com" -> "_acme-challenge"
+fn acme_txt_record_name(base_domain: &str, name: &str) -> String {
+    if name.ends_with(&format!(".{}", base_domain)) {
         name.strip_suffix(&format!(".{}", base_domain))
             .unwrap_or(name)
             .to_string()
@@ -2065,33 +2082,27 @@ async fn create_acme_txt_record(
         "@".to_string()
     } else {
         name.to_string()
-    };
+    }
+}
+
+/// Create a single ACME challenge TXT record using the DNS provider.
+/// Callers must remove stale records for every name in the batch before calling this
+/// (see `setup_dns_challenge`) -- removing here, per-record, would delete a sibling
+/// authorization's record that a wildcard order just created under the same name.
+async fn create_acme_txt_record(
+    provider: &dyn temps_dns::providers::DnsProvider,
+    base_domain: &str,
+    name: &str,
+    value: &str,
+) -> DnsChallengeRecordResult {
+    use temps_dns::providers::{DnsRecordContent, DnsRecordRequest};
+
+    let record_name = acme_txt_record_name(base_domain, name);
 
     debug!(
         "Creating TXT record: name={} (relative: {}), value={}, base_domain={}",
         name, record_name, value, base_domain
     );
-
-    // First, try to remove any existing TXT record with the same name
-    // This is important for ACME challenges as old tokens can interfere with validation
-    match provider
-        .remove_record(base_domain, &record_name, DnsRecordType::TXT)
-        .await
-    {
-        Ok(()) => {
-            debug!(
-                "Removed existing TXT record {} for {} before creating new one",
-                record_name, base_domain
-            );
-        }
-        Err(e) => {
-            // It's okay if removal fails (record might not exist)
-            debug!(
-                "No existing TXT record to remove for {} (or removal failed: {})",
-                record_name, e
-            );
-        }
-    }
 
     let request = DnsRecordRequest {
         name: record_name.clone(),

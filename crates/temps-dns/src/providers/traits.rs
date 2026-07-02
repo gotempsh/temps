@@ -379,16 +379,25 @@ pub trait DnsProvider: Send + Sync {
         self.create_record(domain, request).await
     }
 
-    /// Remove a record by name and type
+    /// Remove all records matching a name and type
+    ///
+    /// Deletes every record with this name and type, not just the first match.
+    /// This matters for ACME DNS-01 challenges: a wildcard order creates two
+    /// `_acme-challenge` TXT records (one per authorization) with the same name
+    /// but different values, and both must be removed on cleanup/renewal or
+    /// they accumulate until Let's Encrypt rejects the validation.
     async fn remove_record(
         &self,
         domain: &str,
         name: &str,
         record_type: DnsRecordType,
     ) -> Result<(), DnsError> {
-        if let Some(record) = self.get_record(domain, name, record_type).await? {
-            if let Some(id) = record.id {
-                return self.delete_record(domain, &id).await;
+        let records = self.list_records(domain).await?;
+        for record in records {
+            if record.name == name && record.content.record_type() == record_type {
+                if let Some(id) = record.id {
+                    self.delete_record(domain, &id).await?;
+                }
             }
         }
         Ok(())
@@ -1019,6 +1028,163 @@ mod tests {
         let result = provider.delete_record("example.com", "rec123").await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), DnsError::NotSupported(_)));
+    }
+
+    // ==================== remove_record default impl tests ====================
+
+    /// In-memory provider used to test the default `remove_record` implementation
+    /// against a real multi-record `list_records` result set (all real providers
+    /// route `remove_record` through this same default).
+    struct MockDnsProvider {
+        records: std::sync::Mutex<Vec<DnsRecord>>,
+        next_id: std::sync::atomic::AtomicU32,
+    }
+
+    impl MockDnsProvider {
+        fn new(records: Vec<DnsRecord>) -> Self {
+            Self {
+                records: std::sync::Mutex::new(records),
+                next_id: std::sync::atomic::AtomicU32::new(1000),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl DnsProvider for MockDnsProvider {
+        fn provider_type(&self) -> DnsProviderType {
+            DnsProviderType::Cloudflare
+        }
+
+        fn capabilities(&self) -> DnsProviderCapabilities {
+            DnsProviderCapabilities::default()
+        }
+
+        async fn test_connection(&self) -> Result<bool, DnsError> {
+            Ok(true)
+        }
+
+        async fn list_zones(&self) -> Result<Vec<DnsZone>, DnsError> {
+            Ok(vec![])
+        }
+
+        async fn get_zone(&self, _domain: &str) -> Result<Option<DnsZone>, DnsError> {
+            Ok(None)
+        }
+
+        async fn list_records(&self, _domain: &str) -> Result<Vec<DnsRecord>, DnsError> {
+            Ok(self.records.lock().unwrap().clone())
+        }
+
+        async fn get_record(
+            &self,
+            _domain: &str,
+            name: &str,
+            record_type: DnsRecordType,
+        ) -> Result<Option<DnsRecord>, DnsError> {
+            Ok(self
+                .records
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| r.name == name && r.content.record_type() == record_type)
+                .cloned())
+        }
+
+        async fn create_record(
+            &self,
+            domain: &str,
+            request: DnsRecordRequest,
+        ) -> Result<DnsRecord, DnsError> {
+            let id = self
+                .next_id
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                .to_string();
+            let record = DnsRecord {
+                id: Some(id),
+                zone: domain.to_string(),
+                fqdn: format!("{}.{}", request.name, domain),
+                name: request.name,
+                content: request.content,
+                ttl: request.ttl.unwrap_or(300),
+                proxied: request.proxied,
+                metadata: HashMap::new(),
+            };
+            self.records.lock().unwrap().push(record.clone());
+            Ok(record)
+        }
+
+        async fn update_record(
+            &self,
+            _domain: &str,
+            record_id: &str,
+            request: DnsRecordRequest,
+        ) -> Result<DnsRecord, DnsError> {
+            let mut records = self.records.lock().unwrap();
+            let record = records
+                .iter_mut()
+                .find(|r| r.id.as_deref() == Some(record_id))
+                .ok_or_else(|| DnsError::RecordNotFound(record_id.to_string()))?;
+            record.content = request.content;
+            record.name = request.name;
+            Ok(record.clone())
+        }
+
+        async fn delete_record(&self, _domain: &str, record_id: &str) -> Result<(), DnsError> {
+            self.records
+                .lock()
+                .unwrap()
+                .retain(|r| r.id.as_deref() != Some(record_id));
+            Ok(())
+        }
+    }
+
+    fn txt_record(id: &str, name: &str, content: &str) -> DnsRecord {
+        DnsRecord {
+            id: Some(id.to_string()),
+            zone: "example.com".to_string(),
+            name: name.to_string(),
+            fqdn: format!("{}.example.com", name),
+            content: DnsRecordContent::TXT {
+                content: content.to_string(),
+            },
+            ttl: 120,
+            proxied: false,
+            metadata: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remove_record_deletes_all_matching_records() {
+        // Mirrors the wildcard ACME DNS-01 scenario: two `_acme-challenge` TXT
+        // records with the same name but different values (one per authorization),
+        // plus an unrelated record that must survive the cleanup.
+        let provider = MockDnsProvider::new(vec![
+            txt_record("1", "_acme-challenge", "token-a"),
+            txt_record("2", "_acme-challenge", "token-b"),
+            txt_record("3", "www", "unrelated"),
+        ]);
+
+        provider
+            .remove_record("example.com", "_acme-challenge", DnsRecordType::TXT)
+            .await
+            .unwrap();
+
+        let remaining = provider.list_records("example.com").await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, Some("3".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_remove_record_no_matching_records_is_noop() {
+        let provider = MockDnsProvider::new(vec![txt_record("1", "www", "unrelated")]);
+
+        provider
+            .remove_record("example.com", "_acme-challenge", DnsRecordType::TXT)
+            .await
+            .unwrap();
+
+        let remaining = provider.list_records("example.com").await.unwrap();
+        assert_eq!(remaining.len(), 1);
     }
 
     // ==================== Serialization tests ====================
