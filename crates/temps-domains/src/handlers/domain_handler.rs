@@ -1975,46 +1975,8 @@ async fn setup_dns_challenge(
         dns_provider.name
     );
 
-    let mut results = Vec::new();
-    let mut records_created: u32 = 0;
-
-    // Remove stale TXT records left over from a previous order/renewal before creating
-    // this batch. This must happen once per distinct record name, before ANY record in
-    // the batch is created: a wildcard order publishes two TXT records under the same
-    // `_acme-challenge` name (one per authorization), so removing per-record (interleaved
-    // with creation) would delete a sibling record this same loop just created.
-    {
-        use std::collections::HashSet;
-        use temps_dns::providers::DnsRecordType;
-
-        let mut cleaned_names = HashSet::new();
-        for (name, _value) in &dns_txt_records {
-            let record_name = acme_txt_record_name(&base_domain, name);
-            if cleaned_names.insert(record_name.clone()) {
-                if let Err(e) = provider_instance
-                    .remove_record(&base_domain, &record_name, DnsRecordType::TXT)
-                    .await
-                {
-                    debug!(
-                        "No existing TXT record to remove for {} (or removal failed: {})",
-                        record_name, e
-                    );
-                }
-            }
-        }
-    }
-
-    // Create each DNS TXT record
-    for (name, value) in &dns_txt_records {
-        let result =
-            create_acme_txt_record(provider_instance.as_ref(), &base_domain, name, value).await;
-
-        if result.success {
-            records_created += 1;
-        }
-
-        results.push(result);
-    }
+    let (results, records_created) =
+        setup_dns_txt_records(provider_instance.as_ref(), &base_domain, &dns_txt_records).await;
 
     let total_records = dns_txt_records.len() as u32;
     let all_success = records_created == total_records;
@@ -2085,9 +2047,51 @@ fn acme_txt_record_name(base_domain: &str, name: &str) -> String {
     }
 }
 
+/// Remove stale TXT records left over from a previous order/renewal, then create every
+/// record in the batch. Cleanup happens once per distinct record name, before ANY record
+/// in the batch is created: a wildcard order publishes two TXT records under the same
+/// `_acme-challenge` name (one per authorization), so removing per-record (interleaved
+/// with creation) would delete a sibling record this same batch just created.
+async fn setup_dns_txt_records(
+    provider: &dyn temps_dns::providers::DnsProvider,
+    base_domain: &str,
+    dns_txt_records: &[(String, String)],
+) -> (Vec<DnsChallengeRecordResult>, u32) {
+    use std::collections::HashSet;
+    use temps_dns::providers::DnsRecordType;
+
+    let mut cleaned_names = HashSet::new();
+    for (name, _value) in dns_txt_records {
+        let record_name = acme_txt_record_name(base_domain, name);
+        if cleaned_names.insert(record_name.clone()) {
+            if let Err(e) = provider
+                .remove_record(base_domain, &record_name, DnsRecordType::TXT)
+                .await
+            {
+                debug!(
+                    "No existing TXT record to remove for {} (or removal failed: {})",
+                    record_name, e
+                );
+            }
+        }
+    }
+
+    let mut results = Vec::new();
+    let mut records_created: u32 = 0;
+    for (name, value) in dns_txt_records {
+        let result = create_acme_txt_record(provider, base_domain, name, value).await;
+        if result.success {
+            records_created += 1;
+        }
+        results.push(result);
+    }
+
+    (results, records_created)
+}
+
 /// Create a single ACME challenge TXT record using the DNS provider.
 /// Callers must remove stale records for every name in the batch before calling this
-/// (see `setup_dns_challenge`) -- removing here, per-record, would delete a sibling
+/// (see `setup_dns_txt_records`) -- removing here, per-record, would delete a sibling
 /// authorization's record that a wildcard order just created under the same name.
 async fn create_acme_txt_record(
     provider: &dyn temps_dns::providers::DnsProvider,
@@ -2347,4 +2351,227 @@ pub fn configure_routes() -> Router<Arc<DomainAppState>> {
         // DNS challenge auto-provisioning
         .route("/domains/{domain_id}/setup-dns", post(setup_dns_challenge))
         .route("/orders", get(list_orders))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Mutex;
+    use temps_dns::providers::{
+        DnsProvider, DnsProviderCapabilities, DnsProviderType, DnsRecord, DnsRecordContent,
+        DnsRecordRequest, DnsRecordType, DnsZone,
+    };
+    use temps_dns::DnsError;
+
+    /// In-memory DNS provider used to drive `setup_dns_txt_records` end-to-end without
+    /// a live Cloudflare/Route53/etc. account. Mirrors the real providers' semantics:
+    /// `list_records`/`remove_record` see every record in the zone, `create_record`
+    /// always appends (multiple records may share a name, as ACME wildcard orders need).
+    struct MockDnsProvider {
+        records: Mutex<Vec<DnsRecord>>,
+        next_id: AtomicU32,
+    }
+
+    impl MockDnsProvider {
+        fn new() -> Self {
+            Self {
+                records: Mutex::new(Vec::new()),
+                next_id: AtomicU32::new(1),
+            }
+        }
+
+        fn seed(records: Vec<DnsRecord>) -> Self {
+            let provider = Self::new();
+            *provider.records.lock().unwrap() = records;
+            provider
+        }
+
+        fn record_names(&self) -> Vec<(String, String)> {
+            self.records
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| (r.name.clone(), r.content.to_value_string()))
+                .collect()
+        }
+    }
+
+    fn txt_record(id: &str, name: &str, content: &str) -> DnsRecord {
+        DnsRecord {
+            id: Some(id.to_string()),
+            zone: "example.com".to_string(),
+            name: name.to_string(),
+            fqdn: format!("{}.example.com", name),
+            content: DnsRecordContent::TXT {
+                content: content.to_string(),
+            },
+            ttl: 120,
+            proxied: false,
+            metadata: HashMap::new(),
+        }
+    }
+
+    #[async_trait]
+    impl DnsProvider for MockDnsProvider {
+        fn provider_type(&self) -> DnsProviderType {
+            DnsProviderType::Cloudflare
+        }
+
+        fn capabilities(&self) -> DnsProviderCapabilities {
+            DnsProviderCapabilities::default()
+        }
+
+        async fn test_connection(&self) -> Result<bool, DnsError> {
+            Ok(true)
+        }
+
+        async fn list_zones(&self) -> Result<Vec<DnsZone>, DnsError> {
+            Ok(vec![])
+        }
+
+        async fn get_zone(&self, _domain: &str) -> Result<Option<DnsZone>, DnsError> {
+            Ok(None)
+        }
+
+        async fn list_records(&self, _domain: &str) -> Result<Vec<DnsRecord>, DnsError> {
+            Ok(self.records.lock().unwrap().clone())
+        }
+
+        async fn get_record(
+            &self,
+            _domain: &str,
+            name: &str,
+            record_type: DnsRecordType,
+        ) -> Result<Option<DnsRecord>, DnsError> {
+            Ok(self
+                .records
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| r.name == name && r.content.record_type() == record_type)
+                .cloned())
+        }
+
+        async fn create_record(
+            &self,
+            domain: &str,
+            request: DnsRecordRequest,
+        ) -> Result<DnsRecord, DnsError> {
+            let id = self.next_id.fetch_add(1, Ordering::SeqCst).to_string();
+            let record = DnsRecord {
+                id: Some(id),
+                zone: domain.to_string(),
+                fqdn: format!("{}.{}", request.name, domain),
+                name: request.name,
+                content: request.content,
+                ttl: request.ttl.unwrap_or(300),
+                proxied: request.proxied,
+                metadata: HashMap::new(),
+            };
+            self.records.lock().unwrap().push(record.clone());
+            Ok(record)
+        }
+
+        async fn update_record(
+            &self,
+            _domain: &str,
+            record_id: &str,
+            request: DnsRecordRequest,
+        ) -> Result<DnsRecord, DnsError> {
+            let mut records = self.records.lock().unwrap();
+            let record = records
+                .iter_mut()
+                .find(|r| r.id.as_deref() == Some(record_id))
+                .ok_or_else(|| DnsError::RecordNotFound(record_id.to_string()))?;
+            record.content = request.content;
+            record.name = request.name;
+            Ok(record.clone())
+        }
+
+        async fn delete_record(&self, _domain: &str, record_id: &str) -> Result<(), DnsError> {
+            self.records
+                .lock()
+                .unwrap()
+                .retain(|r| r.id.as_deref() != Some(record_id));
+            Ok(())
+        }
+    }
+
+    // ==================== acme_txt_record_name ====================
+
+    #[test]
+    fn test_acme_txt_record_name_subdomain() {
+        assert_eq!(
+            acme_txt_record_name("example.com", "_acme-challenge.example.com"),
+            "_acme-challenge"
+        );
+    }
+
+    #[test]
+    fn test_acme_txt_record_name_apex() {
+        assert_eq!(acme_txt_record_name("example.com", "example.com"), "@");
+    }
+
+    // ==================== setup_dns_txt_records ====================
+
+    #[tokio::test]
+    async fn test_wildcard_batch_keeps_both_sibling_records() {
+        // A wildcard order (*.example.com + example.com) publishes two TXT records
+        // under the same `_acme-challenge` name, one per authorization. Cleanup must
+        // not delete the first once the second is created in the same batch.
+        let provider = MockDnsProvider::new();
+        let dns_txt_records = vec![
+            (
+                "_acme-challenge.example.com".to_string(),
+                "token-wildcard".to_string(),
+            ),
+            (
+                "_acme-challenge.example.com".to_string(),
+                "token-base".to_string(),
+            ),
+        ];
+
+        let (results, records_created) =
+            setup_dns_txt_records(&provider, "example.com", &dns_txt_records).await;
+
+        assert_eq!(records_created, 2);
+        assert!(results.iter().all(|r| r.success));
+
+        let remaining = provider.record_names();
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.iter().any(|(_, v)| v == "token-wildcard"));
+        assert!(remaining.iter().any(|(_, v)| v == "token-base"));
+    }
+
+    #[tokio::test]
+    async fn test_renewal_batch_removes_stale_records_from_prior_order() {
+        // Simulates a renewal: the zone already has TXT records from a previous
+        // order (different values, same name) that must be gone after this batch,
+        // replaced by exactly the new batch's records.
+        let provider = MockDnsProvider::seed(vec![
+            txt_record("1", "_acme-challenge", "stale-token-a"),
+            txt_record("2", "_acme-challenge", "stale-token-b"),
+            txt_record("3", "www", "unrelated"),
+        ]);
+        let dns_txt_records = vec![(
+            "_acme-challenge.example.com".to_string(),
+            "fresh-token".to_string(),
+        )];
+
+        let (results, records_created) =
+            setup_dns_txt_records(&provider, "example.com", &dns_txt_records).await;
+
+        assert_eq!(records_created, 1);
+        assert!(results.iter().all(|r| r.success));
+
+        let remaining = provider.record_names();
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining
+            .iter()
+            .any(|(n, v)| n == "_acme-challenge" && v == "fresh-token"));
+        assert!(remaining.iter().any(|(n, _)| n == "www"));
+    }
 }
