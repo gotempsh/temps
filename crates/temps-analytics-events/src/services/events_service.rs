@@ -1030,12 +1030,16 @@ WHERE project_id = $1
     /// Get dashboard analytics for multiple projects in a single batch.
     /// Returns unique visitor counts, previous-period comparison, and hourly sparkline.
     ///
-    /// Uses a hybrid approach:
-    /// - **Current period**: queries raw `events` table for exact accuracy (the continuous
-    ///   aggregate has a 1-hour end_offset gap, so recent data would be missing).
-    ///   For a 24h window this is fast with the `idx_events_project_timestamp` index.
-    /// - **Previous period**: queries `events_hourly` continuous aggregate for speed
-    ///   (older data is fully materialized, approximate is fine for trend comparison).
+    /// Both periods query the raw `events` table directly with the same
+    /// `idx_events_project_timestamp` index. The previous period used to read from the
+    /// `events_hourly` continuous aggregate for speed, but that aggregate's older buckets
+    /// are only backfilled by a best-effort async job on startup
+    /// (`run_post_migration_backfill`) and its recurring policy only refreshes the last
+    /// 3 hours — so right after a restart (or if that job is still catching up), the
+    /// aggregate could return no row for a project's previous-period window. That missing
+    /// row was indistinguishable from "genuinely zero visitors" and fed straight into the
+    /// trend fallback below, producing a misleading +/-100% instead of the real change.
+    /// Reading raw events for both periods removes that dependency entirely.
     pub async fn get_dashboard_projects_analytics(
         &self,
         project_ids: &[i32],
@@ -1108,16 +1112,15 @@ WHERE project_id = $1
             .map(|r| (r.project_id, r.count))
             .collect();
 
-        // Query 2: Unique visitor counts per project (previous period — continuous aggregate)
-        // Previous period is older data, fully covered by the aggregate. Approximate is fine
-        // for trend comparison (SUM of hourly distincts may slightly overcount).
+        // Query 2: Unique visitor counts per project (previous period — raw events, same
+        // source and index as the current period, so it's never stale after a restart).
         let prev_counts_sql = format!(
             r#"
             SELECT
                 project_id,
-                COALESCE(SUM(unique_visitors), 0)::bigint as count
-            FROM events_hourly
-            WHERE bucket >= $1 AND bucket <= $2
+                COUNT(DISTINCT visitor_id) FILTER (WHERE visitor_id IS NOT NULL)::bigint as count
+            FROM events
+            WHERE timestamp >= $1 AND timestamp <= $2
               AND project_id IN ({in_clause})
             GROUP BY project_id
             "#,
@@ -1210,16 +1213,7 @@ WHERE project_id = $1
             let current = counts_map.get(&pid).copied().unwrap_or(0);
             let previous = prev_counts_map.get(&pid).copied().unwrap_or(0);
 
-            // Calculate trend percentage: None if previous was 0 (no baseline)
-            let trend_percentage = if previous > 0 {
-                Some(((current - previous) as f64 / previous as f64) * 100.0)
-            } else if current > 0 {
-                // Had zero visitors before, now has some — show as 100% growth
-                Some(100.0)
-            } else {
-                // Both zero — no trend to show
-                None
-            };
+            let trend_percentage = calculate_trend_percentage(current, previous);
 
             projects.insert(
                 pid.to_string(),
@@ -1558,6 +1552,18 @@ WHERE project_id = $1
         }
 
         Ok(result)
+    }
+}
+
+/// Computes the percentage change between two visitor counts for the dashboard
+/// trend badge. Returns `None` when there's no previous-period baseline to compare
+/// against — a `previous` of 0 can't be turned into a real ratio, so we omit the
+/// trend entirely rather than fabricate a flat +/-100%.
+fn calculate_trend_percentage(current: i64, previous: i64) -> Option<f64> {
+    if previous > 0 {
+        Some(((current - previous) as f64 / previous as f64) * 100.0)
+    } else {
+        None
     }
 }
 
@@ -2751,5 +2757,34 @@ mod tests {
         );
 
         println!("✅ record_event crawler-flag persistence test passed!");
+    }
+
+    #[test]
+    fn test_calculate_trend_percentage_no_previous_baseline_omits_trend() {
+        // Previously this returned a hardcoded Some(100.0), which showed a misleading
+        // flat "+100%" badge any time the previous-period count was missing or zero —
+        // notably right after a restart, before the previous-period query had accurate
+        // data. There's no real baseline to compute a ratio against, so this must be None.
+        assert_eq!(calculate_trend_percentage(1, 0), None);
+        assert_eq!(calculate_trend_percentage(50, 0), None);
+    }
+
+    #[test]
+    fn test_calculate_trend_percentage_both_zero_omits_trend() {
+        assert_eq!(calculate_trend_percentage(0, 0), None);
+    }
+
+    #[test]
+    fn test_calculate_trend_percentage_computes_real_ratio() {
+        assert_eq!(calculate_trend_percentage(150, 100), Some(50.0));
+        assert_eq!(calculate_trend_percentage(50, 100), Some(-50.0));
+        assert_eq!(calculate_trend_percentage(100, 100), Some(0.0));
+    }
+
+    #[test]
+    fn test_calculate_trend_percentage_drop_to_zero_is_negative_hundred() {
+        // A real drop to zero visitors is a genuine -100%, unlike the fabricated case
+        // above where there was never a previous baseline to measure against.
+        assert_eq!(calculate_trend_percentage(0, 100), Some(-100.0));
     }
 }
