@@ -12,7 +12,9 @@ use axum::{
 use temps_auth::RequireAuth;
 use temps_auth::{deny_deployment_token, permission_guard, project_scope_guard};
 use temps_core::{
-    error_builder::{bad_request, forbidden, internal_server_error, not_found, ErrorBuilder},
+    error_builder::{
+        bad_request, conflict, forbidden, internal_server_error, not_found, ErrorBuilder,
+    },
     problemdetails::Problem,
 };
 use tracing::{error, info};
@@ -1155,6 +1157,7 @@ async fn list_service_health_statuses(
     responses(
         (status = 200, description = "Service started successfully", body = ExternalServiceInfo),
         (status = 404, description = "Service not found"),
+        (status = 409, description = "A Postgres major upgrade is in progress for this service"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -1202,8 +1205,13 @@ async fn start_service(
                 }
                 Err(e) => {
                     error!("Failed to start service: {}", e);
-                    match e.to_string().as_str() {
-                        "Service not found" => Err(not_found().detail("Service not found").build()),
+                    match e {
+                        crate::services::ExternalServiceError::UpgradeInProgress { .. } => {
+                            Err(conflict().detail(e.to_string()).build())
+                        }
+                        _ if e.to_string() == "Service not found" => {
+                            Err(not_found().detail("Service not found").build())
+                        }
                         _ => Err(internal_server_error()
                             .detail(format!("Failed to start service: {}", e))
                             .build()),
