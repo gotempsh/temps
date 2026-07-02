@@ -92,6 +92,27 @@ fn ch_interval(bucket: Option<&str>) -> &'static str {
     }
 }
 
+/// Millisecond width matching each [`ch_interval`] bucket size, for use as the
+/// numeric STEP in a `WITH FILL` clause over a Unix-milliseconds column.
+/// Interval values aren't castable via `toInt64(...)` in CH 24.8 ("Illegal
+/// type IntervalHour of argument of function toInt64"), so STEP must be a
+/// plain number matching the bucket width instead. Month has no fixed
+/// length; 30 days is an approximation, consistent with this file's existing
+/// "approximate is fine" tolerance for CH-backed analytics (see module docs).
+fn ch_interval_step_ms(bucket: Option<&str>) -> i64 {
+    const MINUTE: i64 = 60_000;
+    const HOUR: i64 = 3_600_000;
+    const DAY: i64 = 86_400_000;
+    match bucket {
+        Some("hour") | Some("1 hour") | Some("1h") => HOUR,
+        Some("day") | Some("1 day") | Some("1d") => DAY,
+        Some("week") | Some("1 week") | Some("1w") => 7 * DAY,
+        Some("month") | Some("1 month") | Some("1mo") => 30 * DAY,
+        Some("5 minutes") | Some("5m") => 5 * MINUTE,
+        _ => HOUR,
+    }
+}
+
 /// Convert a `chrono::DateTime<Utc>` to seconds since the Unix epoch — the
 /// shape ClickHouse's `DateTime64(3)` parses cleanly via `fromUnixTimestamp64Milli`.
 fn to_unix_milli(t: UtcDateTime) -> i64 {
@@ -508,19 +529,30 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
         // Auto-detect bucket size if not provided. Same heuristic as the
         // Timescale impl so dashboards pick the same granularity.
         let duration = q.range.end - q.range.start;
-        let interval = match q.bucket_size.as_deref() {
-            Some("hour") => "INTERVAL 1 HOUR",
-            Some("day") => "INTERVAL 1 DAY",
-            Some("week") => "INTERVAL 1 WEEK",
-            _ => {
-                if duration.num_days() <= 1 {
-                    "INTERVAL 1 HOUR"
-                } else if duration.num_days() <= 30 {
-                    "INTERVAL 1 DAY"
-                } else {
-                    "INTERVAL 1 WEEK"
-                }
-            }
+        let bucket_size = q
+            .bucket_size
+            .as_deref()
+            .unwrap_or(if duration.num_days() <= 1 {
+                "hour"
+            } else if duration.num_days() <= 30 {
+                "day"
+            } else {
+                "week"
+            });
+        let interval = match bucket_size {
+            "hour" => "INTERVAL 1 HOUR",
+            "day" => "INTERVAL 1 DAY",
+            _ => "INTERVAL 1 WEEK",
+        };
+        // `bucket_ms` is a numeric (Unix-milliseconds) column, so WITH FILL's STEP
+        // must be a plain number, not an Interval value -- `toInt64(INTERVAL 1
+        // HOUR)` fails in CH 24.8 with "Illegal type IntervalHour of argument of
+        // function toInt64". Interval types aren't castable that way; step by the
+        // equivalent millisecond count instead.
+        let step_ms: i64 = match bucket_size {
+            "hour" => 3_600_000,
+            "day" => 86_400_000,
+            _ => 604_800_000,
         };
 
         let env_filter_flag: i32 = q.scope.environment_id.map(|_| 1).unwrap_or(0);
@@ -548,7 +580,7 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
             WITH FILL
                 FROM toUnixTimestamp64Milli(toDateTime64(toStartOfInterval(fromUnixTimestamp64Milli(?), {interval}), 3, 'UTC'))
                 TO toUnixTimestamp64Milli(toDateTime64(toStartOfInterval(fromUnixTimestamp64Milli(?), {interval}), 3, 'UTC')) + 1
-                STEP toInt64({interval})
+                STEP {step_ms}
             "#
         );
 
@@ -1075,6 +1107,7 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
     ) -> Result<AggregatedBucketsResponse, EventsError> {
         let level_expr = count_expr(q.aggregation_level);
         let interval = ch_interval(Some(q.bucket_size.as_str()));
+        let step_ms = ch_interval_step_ms(Some(q.bucket_size.as_str()));
         let env_filter_flag: i32 = q.scope.environment_id.map(|_| 1).unwrap_or(0);
         let env_filter_value: i32 = q.scope.environment_id.unwrap_or(0);
         let dep_filter_flag: i32 = q.scope.deployment_id.map(|_| 1).unwrap_or(0);
@@ -1098,7 +1131,7 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
             WITH FILL
                 FROM toUnixTimestamp64Milli(toDateTime64(toStartOfInterval(fromUnixTimestamp64Milli(?), {interval}), 3, 'UTC'))
                 TO toUnixTimestamp64Milli(toDateTime64(toStartOfInterval(fromUnixTimestamp64Milli(?), {interval}), 3, 'UTC')) + 1
-                STEP toInt64({interval})
+                STEP {step_ms}
             "#
         );
 
@@ -1223,18 +1256,31 @@ mod tests {
         Box<dyn std::any::Any + Send>,
     )> {
         use testcontainers::{
-            core::{ContainerPort, WaitFor},
+            core::{wait::HttpWaitStrategy, ContainerPort, WaitFor},
             runners::AsyncRunner,
             GenericImage, ImageExt,
         };
 
         // Probe Docker. If not reachable, skip.
+        //
+        // The clickhouse-server image writes "Ready for connections" only to its
+        // in-container log file — never to stdout/stderr — so a log-message wait
+        // always times out and the test silently skips. Wait on the HTTP /ping
+        // endpoint (returns 200 "Ok." once the server accepts queries) instead,
+        // per the same fix already applied in temps-otel's clickhouse tests.
         let image = GenericImage::new("clickhouse/clickhouse-server", "24.8")
             .with_exposed_port(ContainerPort::Tcp(8123))
-            .with_wait_for(WaitFor::message_on_stdout("Ready for connections"))
+            .with_wait_for(WaitFor::http(
+                HttpWaitStrategy::new("/ping")
+                    .with_port(ContainerPort::Tcp(8123))
+                    .with_expected_status_code(200u16),
+            ))
             .with_env_var("CLICKHOUSE_DB", "temps_test")
-            .with_env_var("CLICKHOUSE_USER", "default")
-            .with_env_var("CLICKHOUSE_PASSWORD", "");
+            // Do NOT set CLICKHOUSE_USER=default (the image's user-init then
+            // rejects the pre-existing default user) and do NOT use an empty
+            // password (an empty CLICKHOUSE_PASSWORD leaves `default`
+            // unauthenticatable in 24.8).
+            .with_env_var("CLICKHOUSE_PASSWORD", "test");
 
         let container = match image.start().await {
             Ok(c) => c,
@@ -1257,7 +1303,7 @@ mod tests {
             .with_url(&url)
             .with_database("temps_test")
             .with_user("default")
-            .with_password("");
+            .with_password("test");
 
         // Wait briefly for CH to fully accept HTTP queries (the readiness
         // message is on stdout but the HTTP listener can lag a moment).
@@ -1774,7 +1820,12 @@ mod tests {
             "second migration run must apply nothing, got {:?}",
             report.applied
         );
-        assert_eq!(report.skipped.len(), 3, "all three migrations skipped");
+        // Keep in sync with `MIGRATIONS` in temps-analytics-backend/src/migrations.rs.
+        // This assertion was stale (hardcoded at 3 from when the list had only 3
+        // entries) and went unnoticed because this test always silently skipped
+        // before the ClickHouse container wait-condition fix above -- it never
+        // actually ran against a live container to catch the drift.
+        assert_eq!(report.skipped.len(), 6, "all six migrations skipped");
     }
 
     /// Regression test: `query_dashboard_projects` used to hardcode the trend to a
