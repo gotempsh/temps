@@ -713,7 +713,10 @@ async fn upgrade_service(
         }
         Err(e) => match e.to_string().as_str() {
             "Service not found" => Err(not_found().detail("Service not found").build()),
-            msg if msg.contains("Upgrade not implemented") => {
+            msg if msg.contains("Upgrade not implemented")
+                || msg.contains("Cannot change PostgreSQL major version")
+                || msg.contains("Cannot downgrade PostgreSQL") =>
+            {
                 Err(bad_request().detail(msg).build())
             }
             _ => Err(internal_server_error()
