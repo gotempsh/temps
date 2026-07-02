@@ -1242,7 +1242,7 @@ impl PostgresUpgradeOrchestrator {
                     read_only: Some(true),
                     ..Default::default()
                 }]),
-                auto_remove: Some(false),
+                auto_remove: Some(true),
                 ..Default::default()
             }),
             ..Default::default()
@@ -1538,7 +1538,10 @@ impl PostgresUpgradeOrchestrator {
                         ..Default::default()
                     },
                 ]),
-                auto_remove: Some(true),
+                // We remove manually below (with an exit-code check and a
+                // wait-for-removal poll) so a lost race against Docker's own
+                // auto-remove can't be mistaken for a hard failure.
+                auto_remove: Some(false),
                 ..Default::default()
             }),
             ..Default::default()
