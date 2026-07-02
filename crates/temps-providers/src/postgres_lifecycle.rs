@@ -91,6 +91,18 @@ impl PostgresLifecycleAdapter {
         format!("'{}'", s.replace('\'', "'\\''"))
     }
 
+    /// Builds the `pg_isready` healthcheck command pinned to the configured
+    /// username/database. Without `-d`, `pg_isready` (via libpq) defaults the
+    /// target database to the username, so any service where `database !=
+    /// username` would log a FATAL on every healthcheck tick.
+    fn postgres_healthcheck_cmd(username: &str, database: &str) -> String {
+        format!(
+            "pg_isready -U {} -d {}",
+            Self::shell_escape(username),
+            Self::shell_escape(database)
+        )
+    }
+
     fn sql_string_literal(s: &str) -> String {
         format!("'{}'", s.replace('\'', "''"))
     }
@@ -473,11 +485,7 @@ impl PostgresContainerLifecycle for PostgresLifecycleAdapter {
                     // reports healthy (the server did respond), but the
                     // container's logs fill up with noise for its entire
                     // lifetime. Pin -d explicitly to the configured database.
-                    format!(
-                        "pg_isready -U {} -d {}",
-                        Self::shell_escape(&cfg.username),
-                        Self::shell_escape(&cfg.database)
-                    ),
+                    Self::postgres_healthcheck_cmd(&cfg.username, &cfg.database),
                 ]),
                 interval: Some(1_000_000_000),
                 timeout: Some(3_000_000_000),
@@ -589,5 +597,22 @@ impl PostgresContainerLifecycle for PostgresLifecycleAdapter {
             .await
             .map_err(|e| format!("update service {} config: {}", service_id, e))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PostgresLifecycleAdapter;
+
+    #[test]
+    fn healthcheck_cmd_pins_database_when_it_differs_from_username() {
+        let cmd = PostgresLifecycleAdapter::postgres_healthcheck_cmd("appuser", "appdb");
+        assert_eq!(cmd, "pg_isready -U 'appuser' -d 'appdb'");
+    }
+
+    #[test]
+    fn healthcheck_cmd_escapes_single_quotes_in_username_and_database() {
+        let cmd = PostgresLifecycleAdapter::postgres_healthcheck_cmd("a'user", "a'db");
+        assert_eq!(cmd, "pg_isready -U 'a'\\''user' -d 'a'\\''db'");
     }
 }

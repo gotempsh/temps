@@ -36,6 +36,18 @@ fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Builds the `pg_isready` healthcheck command pinned to the configured
+/// username/database. Without `-d`, `pg_isready` (via libpq) defaults the
+/// target database to the username, so any service where `database !=
+/// username` would log a FATAL on every healthcheck tick.
+fn postgres_healthcheck_cmd(username: &str, database: &str) -> String {
+    format!(
+        "pg_isready -U {} -d {}",
+        shell_escape(username),
+        shell_escape(database)
+    )
+}
+
 /// Input configuration for creating a PostgreSQL service
 /// This is what users provide when creating the service
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -460,11 +472,7 @@ impl PostgresService {
                     // server did respond), so this was invisible in the UI,
                     // just a permanent log-spam leak. Use the real
                     // configured username/database instead.
-                    format!(
-                        "pg_isready -U {} -d {}",
-                        shell_escape(&config.username),
-                        shell_escape(&config.database)
-                    ),
+                    postgres_healthcheck_cmd(&config.username, &config.database),
                 ]),
                 interval: Some(1000000000), // 1 second
                 timeout: Some(3000000000),  // 3 seconds
@@ -3816,6 +3824,18 @@ mod tests {
     use super::*;
 
     use crate::externalsvc::DEPLOYMENT_MODE_MUTEX as ENV_MUTEX;
+
+    #[test]
+    fn healthcheck_cmd_pins_database_when_it_differs_from_username() {
+        let cmd = postgres_healthcheck_cmd("appuser", "appdb");
+        assert_eq!(cmd, "pg_isready -U 'appuser' -d 'appdb'");
+    }
+
+    #[test]
+    fn healthcheck_cmd_escapes_single_quotes_in_username_and_database() {
+        let cmd = postgres_healthcheck_cmd("a'user", "a'db");
+        assert_eq!(cmd, "pg_isready -U 'a'\\''user' -d 'a'\\''db'");
+    }
 
     #[test]
     fn test_postgres_input_config_default_values() {
