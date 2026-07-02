@@ -308,33 +308,26 @@ impl PostgresLifecycleAdapter {
         // readiness phase on that one-shot race.
         let timeout = Duration::from_secs(30);
         let deadline = Instant::now() + timeout;
-        let mut last_exit = None;
-        let mut last_output = String::new();
-        loop {
-            match self
+        let (last_exit, last_output) = loop {
+            let attempt = self
                 .exec_in_container(
                     container_name,
                     vec!["sh".to_string(), "-lc".to_string(), cmd.clone()],
                     Some(vec![format!("PGPASSWORD={}", cfg.password)]),
                 )
-                .await
-            {
-                Ok((exit_code, _)) if exit_code == Some(0) => return Ok(()),
-                Ok((exit_code, output)) => {
-                    last_exit = exit_code;
-                    last_output = output;
-                }
-                Err(e) => {
-                    last_exit = None;
-                    last_output = e;
-                }
-            }
+                .await;
+
+            let (exit_code, output) = match attempt {
+                Ok((Some(0), _)) => return Ok(()),
+                Ok((exit_code, output)) => (exit_code, output),
+                Err(e) => (None, e),
+            };
 
             if Instant::now() >= deadline {
-                break;
+                break (exit_code, output);
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
-        }
+        };
 
         let logs = self.container_logs(container_name).await;
         Err(format!(

@@ -1613,8 +1613,8 @@ impl PostgresUpgradeOrchestrator {
                 || msg.contains("no such container")
                 || msg.contains("not found")
                 || msg.contains("404");
-            let already_removing = msg.contains("removal of container")
-                && msg.contains("is already in progress");
+            let already_removing =
+                msg.contains("removal of container") && msg.contains("is already in progress");
             if !already_gone && !already_removing {
                 return Err(PostgresUpgradeError::SnapshotFailed {
                     upgrade_id: row.id,
