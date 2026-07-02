@@ -1290,143 +1290,159 @@ mod tests {
         Some((backend, client, Box::new(container)))
     }
 
+    // Local row type: matches the production DDL field-for-field. We duplicate it
+    // here rather than taking a dep on the fan-out module, because the fan-out
+    // type is `#[cfg(feature = "clickhouse")]`-gated within ch_fanout but the test
+    // module here is already feature-gated, so we could in principle use it. The
+    // duplication is intentional: if the test row diverges from the production
+    // row, the test fails loudly. Shared by every seeding helper below so we
+    // don't duplicate the 50-field struct a third time per test.
+    #[derive(::clickhouse::Row, serde::Serialize)]
+    struct SeedRow {
+        event_id: i64,
+        project_id: i32,
+        environment_id: Option<i32>,
+        deployment_id: Option<i32>,
+        session_id: String,
+        visitor_id: Option<i32>,
+        timestamp: i64,
+        hostname: String,
+        pathname: String,
+        page_path: String,
+        href: String,
+        querystring: String,
+        page_title: String,
+        referrer: String,
+        referrer_hostname: String,
+        event_type: String,
+        event_name: String,
+        props: String,
+        user_agent: String,
+        browser: String,
+        browser_version: String,
+        operating_system: String,
+        operating_system_version: String,
+        device_type: String,
+        screen_width: Option<i16>,
+        screen_height: Option<i16>,
+        viewport_width: Option<i16>,
+        viewport_height: Option<i16>,
+        ip_geolocation_id: Option<i32>,
+        country: String,
+        region: String,
+        city: String,
+        channel: String,
+        utm_source: String,
+        utm_medium: String,
+        utm_campaign: String,
+        utm_term: String,
+        utm_content: String,
+        ttfb: Option<f32>,
+        lcp: Option<f32>,
+        fid: Option<f32>,
+        fcp: Option<f32>,
+        cls: Option<f32>,
+        inp: Option<f32>,
+        is_entry: u8,
+        is_exit: u8,
+        is_bounce: u8,
+        is_crawler: u8,
+        time_on_page: Option<i32>,
+        session_page_number: Option<i32>,
+        scroll_depth: Option<i32>,
+        clicks: Option<i32>,
+        language: String,
+        crawler_name: String,
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn make_row(
+        event_id: i64,
+        project_id: i32,
+        session_id: &str,
+        visitor_id: Option<i32>,
+        event_type: &str,
+        event_name: &str,
+        ts_ms: i64,
+    ) -> SeedRow {
+        SeedRow {
+            event_id,
+            project_id,
+            environment_id: Some(1),
+            deployment_id: None,
+            session_id: session_id.to_string(),
+            visitor_id,
+            timestamp: ts_ms,
+            hostname: "example.com".into(),
+            pathname: "/".into(),
+            page_path: "/".into(),
+            href: "https://example.com/".into(),
+            querystring: String::new(),
+            page_title: "Home".into(),
+            referrer: String::new(),
+            referrer_hostname: String::new(),
+            event_type: event_type.into(),
+            event_name: event_name.into(),
+            props: "{}".into(),
+            user_agent: "test-agent".into(),
+            browser: "Firefox".into(),
+            browser_version: "120".into(),
+            operating_system: "Linux".into(),
+            operating_system_version: "6".into(),
+            device_type: "desktop".into(),
+            screen_width: Some(1920),
+            screen_height: Some(1080),
+            viewport_width: Some(1920),
+            viewport_height: Some(1080),
+            ip_geolocation_id: None,
+            country: "US".into(),
+            region: "CA".into(),
+            city: "San Francisco".into(),
+            channel: "direct".into(),
+            utm_source: String::new(),
+            utm_medium: String::new(),
+            utm_campaign: String::new(),
+            utm_term: String::new(),
+            utm_content: String::new(),
+            ttfb: None,
+            lcp: None,
+            fid: None,
+            fcp: None,
+            cls: None,
+            inp: None,
+            is_entry: 0,
+            is_exit: 0,
+            is_bounce: 0,
+            is_crawler: 0,
+            time_on_page: None,
+            session_page_number: None,
+            scroll_depth: None,
+            clicks: None,
+            language: "en".into(),
+            crawler_name: String::new(),
+        }
+    }
+
+    /// Writes rows via the inserter, then forces the background
+    /// ReplacingMergeTree merge with `OPTIMIZE TABLE ... FINAL` so `FINAL` reads
+    /// return deterministic results in tests (production tolerates some
+    /// duplication during merges; tests want determinism).
+    async fn insert_rows(client: &::clickhouse::Client, rows: &[SeedRow]) {
+        let mut inserter = client.insert::<SeedRow>("events").expect("inserter setup");
+        for row in rows {
+            inserter.write(row).await.expect("insert row");
+        }
+        inserter.end().await.expect("inserter end");
+
+        client
+            .query("OPTIMIZE TABLE events FINAL")
+            .execute()
+            .await
+            .expect("optimize");
+    }
+
     /// Insert a few hand-crafted rows so we have something to query.
-    /// Mirrors the field order of the `ChEventRow` shape in
-    /// `ch_fanout::ChEventRow`. Uses the public clickhouse client API so
-    /// any drift between this and the worker would also fail compilation.
     async fn seed_rows(client: &::clickhouse::Client) {
-        // Local row type: matches the production DDL field-for-field. We
-        // duplicate it here rather than taking a dep on the fan-out
-        // module, because the fan-out type is `#[cfg(feature =
-        // "clickhouse")]`-gated within ch_fanout but the test module here
-        // is already feature-gated, so we could in principle use it. The
-        // duplication is intentional: if the test row diverges from the
-        // production row, the test fails loudly.
-        #[derive(::clickhouse::Row, serde::Serialize)]
-        struct SeedRow {
-            event_id: i64,
-            project_id: i32,
-            environment_id: Option<i32>,
-            deployment_id: Option<i32>,
-            session_id: String,
-            visitor_id: Option<i32>,
-            timestamp: i64,
-            hostname: String,
-            pathname: String,
-            page_path: String,
-            href: String,
-            querystring: String,
-            page_title: String,
-            referrer: String,
-            referrer_hostname: String,
-            event_type: String,
-            event_name: String,
-            props: String,
-            user_agent: String,
-            browser: String,
-            browser_version: String,
-            operating_system: String,
-            operating_system_version: String,
-            device_type: String,
-            screen_width: Option<i16>,
-            screen_height: Option<i16>,
-            viewport_width: Option<i16>,
-            viewport_height: Option<i16>,
-            ip_geolocation_id: Option<i32>,
-            country: String,
-            region: String,
-            city: String,
-            channel: String,
-            utm_source: String,
-            utm_medium: String,
-            utm_campaign: String,
-            utm_term: String,
-            utm_content: String,
-            ttfb: Option<f32>,
-            lcp: Option<f32>,
-            fid: Option<f32>,
-            fcp: Option<f32>,
-            cls: Option<f32>,
-            inp: Option<f32>,
-            is_entry: u8,
-            is_exit: u8,
-            is_bounce: u8,
-            is_crawler: u8,
-            time_on_page: Option<i32>,
-            session_page_number: Option<i32>,
-            scroll_depth: Option<i32>,
-            clicks: Option<i32>,
-            language: String,
-            crawler_name: String,
-        }
-
-        fn make(
-            event_id: i64,
-            project_id: i32,
-            session_id: &str,
-            visitor_id: Option<i32>,
-            event_type: &str,
-            event_name: &str,
-            ts_ms: i64,
-        ) -> SeedRow {
-            SeedRow {
-                event_id,
-                project_id,
-                environment_id: Some(1),
-                deployment_id: None,
-                session_id: session_id.to_string(),
-                visitor_id,
-                timestamp: ts_ms,
-                hostname: "example.com".into(),
-                pathname: "/".into(),
-                page_path: "/".into(),
-                href: "https://example.com/".into(),
-                querystring: String::new(),
-                page_title: "Home".into(),
-                referrer: String::new(),
-                referrer_hostname: String::new(),
-                event_type: event_type.into(),
-                event_name: event_name.into(),
-                props: "{}".into(),
-                user_agent: "test-agent".into(),
-                browser: "Firefox".into(),
-                browser_version: "120".into(),
-                operating_system: "Linux".into(),
-                operating_system_version: "6".into(),
-                device_type: "desktop".into(),
-                screen_width: Some(1920),
-                screen_height: Some(1080),
-                viewport_width: Some(1920),
-                viewport_height: Some(1080),
-                ip_geolocation_id: None,
-                country: "US".into(),
-                region: "CA".into(),
-                city: "San Francisco".into(),
-                channel: "direct".into(),
-                utm_source: String::new(),
-                utm_medium: String::new(),
-                utm_campaign: String::new(),
-                utm_term: String::new(),
-                utm_content: String::new(),
-                ttfb: None,
-                lcp: None,
-                fid: None,
-                fcp: None,
-                cls: None,
-                inp: None,
-                is_entry: 0,
-                is_exit: 0,
-                is_bounce: 0,
-                is_crawler: 0,
-                time_on_page: None,
-                session_page_number: None,
-                scroll_depth: None,
-                clicks: None,
-                language: "en".into(),
-                crawler_name: String::new(),
-            }
-        }
-
         let now = Utc::now();
         let t = |mins_ago: i64| (now - Duration::minutes(mins_ago)).timestamp_millis();
 
@@ -1435,29 +1451,15 @@ mod tests {
         // Project 8, session C, visitor 102: 1 page_view (different project — must
         // not leak into project 7 queries).
         let rows = [
-            make(1, 7, "sess-a", Some(100), "page_view", "page_view", t(60)),
-            make(2, 7, "sess-a", Some(100), "page_view", "page_view", t(50)),
-            make(3, 7, "sess-a", Some(100), "signup", "signup", t(45)),
-            make(4, 7, "sess-b", Some(101), "page_view", "page_view", t(30)),
-            make(5, 7, "sess-b", Some(101), "click", "click", t(25)),
-            make(6, 8, "sess-c", Some(102), "page_view", "page_view", t(20)),
+            make_row(1, 7, "sess-a", Some(100), "page_view", "page_view", t(60)),
+            make_row(2, 7, "sess-a", Some(100), "page_view", "page_view", t(50)),
+            make_row(3, 7, "sess-a", Some(100), "signup", "signup", t(45)),
+            make_row(4, 7, "sess-b", Some(101), "page_view", "page_view", t(30)),
+            make_row(5, 7, "sess-b", Some(101), "click", "click", t(25)),
+            make_row(6, 8, "sess-c", Some(102), "page_view", "page_view", t(20)),
         ];
 
-        let mut inserter = client.insert::<SeedRow>("events").expect("inserter setup");
-        for row in &rows {
-            inserter.write(row).await.expect("insert row");
-        }
-        inserter.end().await.expect("inserter end");
-
-        // ReplacingMergeTree merges happen in the background; OPTIMIZE FINAL
-        // forces them so FINAL reads return deterministic results in this
-        // test. Production queries use FINAL on the read side and tolerate
-        // some duplication during merges, but tests want determinism.
-        client
-            .query("OPTIMIZE TABLE events FINAL")
-            .execute()
-            .await
-            .expect("optimize");
+        insert_rows(client, &rows).await;
     }
 
     fn project_scope(project_id: i32) -> AnalyticsScope {
@@ -1773,6 +1775,189 @@ mod tests {
             report.applied
         );
         assert_eq!(report.skipped.len(), 3, "all three migrations skipped");
+    }
+
+    /// Regression test: `query_dashboard_projects` used to hardcode the trend to a
+    /// flat `+100.0` whenever a project's previous-period count was 0 — whether
+    /// that was a genuinely brand-new project or (on the Timescale backend) an
+    /// artifact of a not-yet-warmed continuous aggregate. The ClickHouse backend
+    /// never had the aggregate-staleness problem (it always read raw `events` for
+    /// both periods), but it carried the identical fabricated-percentage bug,
+    /// explicitly written to "mirror the Timescale impl". This locks in the fix:
+    /// no previous-period baseline must omit the trend, and a real previous count
+    /// must produce the real ratio, not a hardcoded value.
+    #[tokio::test]
+    async fn ch_dashboard_trend_omits_fabricated_percentage() {
+        let Some((backend, client, _container)) = setup_clickhouse().await else {
+            return; // Docker not available, skip.
+        };
+
+        let now = Utc::now();
+        let t = |mins_ago: i64| (now - Duration::minutes(mins_ago)).timestamp_millis();
+
+        // Project 20: brand new -- only current-period traffic (3 visitors),
+        // nothing in the previous period at all.
+        let rows_new_project = [
+            make_row(
+                101,
+                20,
+                "sess-new-a",
+                Some(200),
+                "page_view",
+                "page_view",
+                t(30),
+            ),
+            make_row(
+                102,
+                20,
+                "sess-new-b",
+                Some(201),
+                "page_view",
+                "page_view",
+                t(20),
+            ),
+            make_row(
+                103,
+                20,
+                "sess-new-c",
+                Some(202),
+                "page_view",
+                "page_view",
+                t(10),
+            ),
+        ];
+
+        // Project 21: real traffic in both periods -- previous=4, current=6,
+        // a genuine +50% trend, to prove real ratios still compute correctly.
+        let range = full_range();
+        let duration = range.end - range.start;
+        // Anchor "recent" (current period) and "older" (previous period) relative
+        // to the query range rather than `now`, so this doesn't depend on how
+        // `full_range()`'s slack is defined.
+        let prev_ms = (range.start - duration + chrono::Duration::minutes(10)).timestamp_millis();
+        let curr_ms = (range.start + chrono::Duration::minutes(10)).timestamp_millis();
+        let rows_baseline_project = [
+            make_row(
+                104,
+                21,
+                "sess-prev-a",
+                Some(210),
+                "page_view",
+                "page_view",
+                prev_ms,
+            ),
+            make_row(
+                105,
+                21,
+                "sess-prev-b",
+                Some(211),
+                "page_view",
+                "page_view",
+                prev_ms,
+            ),
+            make_row(
+                106,
+                21,
+                "sess-prev-c",
+                Some(212),
+                "page_view",
+                "page_view",
+                prev_ms,
+            ),
+            make_row(
+                107,
+                21,
+                "sess-prev-d",
+                Some(213),
+                "page_view",
+                "page_view",
+                prev_ms,
+            ),
+            make_row(
+                108,
+                21,
+                "sess-curr-a",
+                Some(220),
+                "page_view",
+                "page_view",
+                curr_ms,
+            ),
+            make_row(
+                109,
+                21,
+                "sess-curr-b",
+                Some(221),
+                "page_view",
+                "page_view",
+                curr_ms,
+            ),
+            make_row(
+                110,
+                21,
+                "sess-curr-c",
+                Some(222),
+                "page_view",
+                "page_view",
+                curr_ms,
+            ),
+            make_row(
+                111,
+                21,
+                "sess-curr-d",
+                Some(223),
+                "page_view",
+                "page_view",
+                curr_ms,
+            ),
+            make_row(
+                112,
+                21,
+                "sess-curr-e",
+                Some(224),
+                "page_view",
+                "page_view",
+                curr_ms,
+            ),
+            make_row(
+                113,
+                21,
+                "sess-curr-f",
+                Some(225),
+                "page_view",
+                "page_view",
+                curr_ms,
+            ),
+        ];
+
+        insert_rows(&client, &rows_new_project).await;
+        insert_rows(&client, &rows_baseline_project).await;
+
+        let dash = backend
+            .query_dashboard_projects(crate::services::queries::DashboardProjectsSpec {
+                project_ids: vec![20, 21],
+                range,
+            })
+            .await
+            .expect("query_dashboard_projects");
+
+        let new_project = dash.projects.get("20").expect("project 20 in response");
+        assert_eq!(new_project.unique_visitors, 3);
+        assert_eq!(new_project.previous_unique_visitors, 0);
+        assert_eq!(
+            new_project.trend_percentage, None,
+            "a brand-new project with no previous-period baseline must not show a fabricated +100%"
+        );
+
+        let baseline_project = dash.projects.get("21").expect("project 21 in response");
+        assert_eq!(baseline_project.unique_visitors, 6);
+        assert_eq!(baseline_project.previous_unique_visitors, 4);
+        assert_eq!(
+            baseline_project.trend_percentage,
+            Some(50.0),
+            "trend must be the real (6-4)/4*100 ratio, not a hardcoded fallback"
+        );
+
+        println!("✅ ClickHouse dashboard trend regression test passed!");
     }
 
     // ── SQL-shape guards (no Docker required) ──────────────────────────────

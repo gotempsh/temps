@@ -2763,6 +2763,261 @@ mod tests {
         println!("✅ record_event crawler-flag persistence test passed!");
     }
 
+    /// Regression test for the dashboard "visitors in last 24h" trend badge showing
+    /// a fabricated +100%/-100% right after a restart. The `events_hourly`
+    /// continuous aggregate is created `WITH NO DATA` by migrations and is only
+    /// backfilled by a best-effort async job at server startup
+    /// (`run_post_migration_backfill`), which this test deliberately never calls —
+    /// leaving the aggregate empty, exactly like a freshly restarted server.
+    /// `get_dashboard_projects_analytics` must still report accurate
+    /// previous-period counts (read from raw `events`, not the empty aggregate) and
+    /// must not fabricate a trend percentage when a project has no baseline.
+    #[tokio::test]
+    async fn test_dashboard_projects_analytics_survives_empty_continuous_aggregate() {
+        use chrono::Duration;
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+        use temps_database::test_utils::TestDatabase;
+        use temps_entities::{deployments, environments, events, projects, visitor};
+
+        let test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+
+        async fn make_project(db: &DatabaseConnection, slug: &str) -> projects::Model {
+            projects::ActiveModel {
+                name: Set(slug.to_string()),
+                repo_name: Set(slug.to_string()),
+                repo_owner: Set("test-owner".to_string()),
+                directory: Set("/".to_string()),
+                main_branch: Set("main".to_string()),
+                preset: Set(temps_entities::preset::Preset::NextJs),
+                slug: Set(slug.to_string()),
+                is_deleted: Set(false),
+                is_public_repo: Set(false),
+                deleted_at: Set(None),
+                last_deployment: Set(None),
+                created_at: Set(Utc::now()),
+                updated_at: Set(Utc::now()),
+                ..Default::default()
+            }
+            .insert(db)
+            .await
+            .expect("insert project")
+        }
+
+        async fn make_environment(
+            db: &DatabaseConnection,
+            project_id: i32,
+            slug: &str,
+        ) -> environments::Model {
+            environments::ActiveModel {
+                project_id: Set(project_id),
+                name: Set(slug.to_string()),
+                slug: Set(slug.to_string()),
+                subdomain: Set(slug.to_string()),
+                host: Set(String::new()),
+                upstreams: Set(UpstreamList::new()),
+                current_deployment_id: Set(None),
+                last_deployment: Set(None),
+                created_at: Set(Utc::now()),
+                updated_at: Set(Utc::now()),
+                ..Default::default()
+            }
+            .insert(db)
+            .await
+            .expect("insert environment")
+        }
+
+        async fn make_deployment(
+            db: &DatabaseConnection,
+            project_id: i32,
+            environment_id: i32,
+            slug: &str,
+        ) -> deployments::Model {
+            deployments::ActiveModel {
+                project_id: Set(project_id),
+                environment_id: Set(environment_id),
+                slug: Set(slug.to_string()),
+                state: Set("ready".to_string()),
+                metadata: Set(Some(deployments::DeploymentMetadata::default())),
+                created_at: Set(Utc::now()),
+                updated_at: Set(Utc::now()),
+                ..Default::default()
+            }
+            .insert(db)
+            .await
+            .expect("insert deployment")
+        }
+
+        async fn make_visitor(
+            db: &DatabaseConnection,
+            project_id: i32,
+            environment_id: i32,
+            visitor_id: &str,
+            seen_at: UtcDateTime,
+        ) -> visitor::Model {
+            visitor::ActiveModel {
+                visitor_id: Set(visitor_id.to_string()),
+                project_id: Set(project_id),
+                environment_id: Set(environment_id),
+                first_seen: Set(seen_at),
+                last_seen: Set(seen_at),
+                ..Default::default()
+            }
+            .insert(db)
+            .await
+            .expect("insert visitor")
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        async fn make_page_view(
+            db: &DatabaseConnection,
+            project_id: i32,
+            environment_id: i32,
+            deployment_id: i32,
+            visitor_row_id: i32,
+            session_id: &str,
+            at: UtcDateTime,
+        ) {
+            events::ActiveModel {
+                project_id: Set(project_id),
+                environment_id: Set(Some(environment_id)),
+                deployment_id: Set(Some(deployment_id)),
+                visitor_id: Set(Some(visitor_row_id)),
+                session_id: Set(Some(session_id.to_string())),
+                event_type: Set("page_view".to_string()),
+                hostname: Set("example.com".to_string()),
+                pathname: Set("/".to_string()),
+                page_path: Set("/".to_string()),
+                href: Set("https://example.com/".to_string()),
+                timestamp: Set(at),
+                ..Default::default()
+            }
+            .insert(db)
+            .await
+            .expect("insert event");
+        }
+
+        let now = Utc::now();
+        let start = now - Duration::hours(24);
+        let end = now;
+        // get_dashboard_projects_analytics's previous window is [start - (end-start), start).
+        let prev_ts = start - Duration::hours(6);
+        let curr_ts = now - Duration::hours(2);
+
+        // Project A: real traffic in both windows -- a genuine +50% trend (6 vs 4).
+        let project_a = make_project(&db, "trend-baseline").await;
+        let env_a = make_environment(&db, project_a.id, "trend-baseline-env").await;
+        let dep_a = make_deployment(&db, project_a.id, env_a.id, "trend-baseline-dep").await;
+        for i in 0..4 {
+            let v =
+                make_visitor(&db, project_a.id, env_a.id, &format!("a-prev-{i}"), prev_ts).await;
+            make_page_view(
+                &db,
+                project_a.id,
+                env_a.id,
+                dep_a.id,
+                v.id,
+                &format!("a-prev-sess-{i}"),
+                prev_ts,
+            )
+            .await;
+        }
+        for i in 0..6 {
+            let v =
+                make_visitor(&db, project_a.id, env_a.id, &format!("a-curr-{i}"), curr_ts).await;
+            make_page_view(
+                &db,
+                project_a.id,
+                env_a.id,
+                dep_a.id,
+                v.id,
+                &format!("a-curr-sess-{i}"),
+                curr_ts,
+            )
+            .await;
+        }
+
+        // Project B: brand new -- only current-period traffic, nothing previously.
+        let project_b = make_project(&db, "trend-new-project").await;
+        let env_b = make_environment(&db, project_b.id, "trend-new-project-env").await;
+        let dep_b = make_deployment(&db, project_b.id, env_b.id, "trend-new-project-dep").await;
+        for i in 0..3 {
+            let v =
+                make_visitor(&db, project_b.id, env_b.id, &format!("b-curr-{i}"), curr_ts).await;
+            make_page_view(
+                &db,
+                project_b.id,
+                env_b.id,
+                dep_b.id,
+                v.id,
+                &format!("b-curr-sess-{i}"),
+                curr_ts,
+            )
+            .await;
+        }
+
+        // Sanity-check the regression scenario itself: `events_hourly` must still be
+        // empty here, since only `run_post_migration_backfill` (never called in this
+        // test) populates it. This is what a freshly restarted server looks like.
+        #[derive(FromQueryResult)]
+        struct Count {
+            count: i64,
+        }
+        let agg_row_count = Count::find_by_statement(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT COUNT(*)::bigint as count FROM events_hourly",
+        ))
+        .one(db.as_ref())
+        .await
+        .expect("count events_hourly")
+        .map(|c| c.count)
+        .unwrap_or(0);
+        assert_eq!(
+            agg_row_count, 0,
+            "events_hourly must be empty to exercise the restart-staleness scenario"
+        );
+
+        let service = AnalyticsEventsService::new(db.clone());
+        let response = service
+            .get_dashboard_projects_analytics(&[project_a.id, project_b.id], start, end)
+            .await
+            .expect("get_dashboard_projects_analytics");
+
+        let a = response
+            .projects
+            .get(&project_a.id.to_string())
+            .expect("project A in response");
+        assert_eq!(a.unique_visitors, 6);
+        assert_eq!(
+            a.previous_unique_visitors, 4,
+            "previous-period count must come from raw events, not the empty continuous aggregate"
+        );
+        assert_eq!(
+            a.trend_percentage,
+            Some(50.0),
+            "trend must be the real (6-4)/4*100 ratio, not derived from a stale/empty aggregate"
+        );
+
+        let b = response
+            .projects
+            .get(&project_b.id.to_string())
+            .expect("project B in response");
+        assert_eq!(b.unique_visitors, 3);
+        assert_eq!(b.previous_unique_visitors, 0);
+        assert_eq!(
+            b.trend_percentage, None,
+            "a brand-new project with no previous-period baseline must not show a fabricated +100%"
+        );
+
+        println!("✅ dashboard trend regression test passed (TimescaleDB)!");
+    }
+
     #[test]
     fn test_calculate_trend_percentage_no_previous_baseline_omits_trend() {
         // Previously this returned a hardcoded Some(100.0), which showed a misleading
