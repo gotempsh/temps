@@ -289,6 +289,7 @@ fn property_breakdown_sql(col: &str, sentinel: &str, count_sql: &str) -> String 
                        OR (? = 1 AND referrer_hostname = ?)
                        OR (? = 2 AND referrer_hostname = ''))
                 GROUP BY value
+                HAVING count > 0
             ),
             total AS (SELECT sum(count) AS t FROM value_counts)
             SELECT
@@ -2075,6 +2076,20 @@ mod tests {
             !sql.contains("total)) AS total_count")
                 || sql.contains("assumeNotNull((SELECT t FROM total)) AS total_count"),
             "total_count column must be assumeNotNull-wrapped; SQL:\n{sql}"
+        );
+    }
+
+    /// A group whose events all have a NULL `visitor_id`/`session_id` (e.g.
+    /// spoofed-referrer spam posted straight to the ingest endpoint, never
+    /// through a real browser session) must not surface with `count = 0` —
+    /// `uniq(...)` skips NULLs but `GROUP BY value` doesn't, so without this
+    /// guard the zero-count group still comes back in the top-N list.
+    #[test]
+    fn property_breakdown_sql_filters_zero_count_groups() {
+        let sql = property_breakdown_sql("referrer_hostname", "Direct", "uniq(visitor_id)");
+        assert!(
+            sql.contains("HAVING count > 0"),
+            "value_counts CTE must drop zero-count groups; SQL:\n{sql}"
         );
     }
 

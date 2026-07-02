@@ -597,6 +597,7 @@ impl AnalyticsEventsService {
                 FROM {}
                 WHERE {}
                 GROUP BY {}
+                HAVING COUNT({} e.{}) > 0
             ),
             total AS (
                 SELECT COALESCE(SUM(count), 0)::bigint as total_count
@@ -620,6 +621,8 @@ impl AnalyticsEventsService {
             from_clause,
             conditions.join(" AND "),
             select_column,
+            agg_distinct,
+            agg_field,
             limit_val
         );
 
@@ -3045,5 +3048,218 @@ mod tests {
         // A real drop to zero visitors is a genuine -100%, unlike the fabricated case
         // above where there was never a previous baseline to measure against.
         assert_eq!(calculate_trend_percentage(0, 100), Some(-100.0));
+    }
+
+    /// Regression test for the referrer-spam display bug: a referrer_hostname
+    /// whose events all lack a resolvable visitor (e.g. a bot POSTing straight
+    /// to the ingest endpoint with a spoofed `referrer`, never through a real
+    /// browser session) must not show up in the "visitors" breakdown with
+    /// count = 0 — see the `HAVING` clause in `get_property_breakdown`.
+    #[tokio::test]
+    async fn test_property_breakdown_excludes_zero_visitor_referrers() {
+        use sea_orm::{ActiveModelTrait, Set};
+        use temps_database::test_utils::TestDatabase;
+        use temps_entities::{
+            deployments, environments, projects, source_type::SourceType,
+            upstream_config::UpstreamList, visitor,
+        };
+
+        let test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+
+        let project = projects::ActiveModel {
+            name: Set("referrer-spam-test".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            preset_config: Set(None),
+            deployment_config: Set(None),
+            slug: Set("referrer-spam-test".to_string()),
+            is_deleted: Set(false),
+            deleted_at: Set(None),
+            last_deployment: Set(None),
+            is_public_repo: Set(false),
+            git_url: Set(None),
+            git_provider_connection_id: Set(None),
+            attack_mode: Set(false),
+            enable_preview_environments: Set(false),
+            source_type: Set(SourceType::Git),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert test project");
+
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".to_string()),
+            branch: Set(Some("main".to_string())),
+            slug: Set("production".to_string()),
+            subdomain: Set("prod".to_string()),
+            host: Set(String::new()),
+            upstreams: Set(UpstreamList::new()),
+            is_preview: Set(false),
+            current_deployment_id: Set(None),
+            deleted_at: Set(None),
+            deployment_config: Set(None),
+            last_deployment: Set(None),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert test environment");
+
+        let deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set(format!("test-deploy-{}", uuid::Uuid::new_v4())),
+            state: Set("ready".to_string()),
+            metadata: Set(Some(deployments::DeploymentMetadata::default())),
+            deploying_at: Set(None),
+            ready_at: Set(Some(chrono::Utc::now())),
+            started_at: Set(Some(chrono::Utc::now())),
+            finished_at: Set(Some(chrono::Utc::now())),
+            context_vars: Set(None),
+            branch_ref: Set(Some("main".to_string())),
+            tag_ref: Set(None),
+            commit_sha: Set(None),
+            commit_message: Set(None),
+            commit_author: Set(None),
+            commit_json: Set(None),
+            cancelled_reason: Set(None),
+            static_dir_location: Set(None),
+            screenshot_location: Set(None),
+            image_name: Set(None),
+            deployment_config: Set(None),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert test deployment");
+
+        let service = AnalyticsEventsService::new(db.clone());
+
+        // A real visitor, referred by bing.com — must be counted.
+        let visitor_uuid = uuid::Uuid::new_v4().to_string();
+        visitor::ActiveModel {
+            visitor_id: Set(visitor_uuid.clone()),
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            first_seen: Set(chrono::Utc::now()),
+            last_seen: Set(chrono::Utc::now()),
+            has_activity: Set(false),
+            is_crawler: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert test visitor");
+
+        service
+            .record_event(
+                project.id,
+                Some(environment.id),
+                Some(deployment.id),
+                Some("real-visitor-session".to_string()),
+                Some(visitor_uuid),
+                "page_view",
+                serde_json::json!({}),
+                "/",
+                "",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("https://www.bing.com/search?q=temps".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("Failed to record real-visitor event");
+
+        // Referrer spam: a raw hit against the ingest path with a spoofed
+        // `referrer`, carrying no visitor_id at all — mirrors a bot POSTing
+        // straight to the tracking endpoint without a real browser session.
+        service
+            .record_event(
+                project.id,
+                Some(environment.id),
+                Some(deployment.id),
+                Some("spam-session".to_string()),
+                None,
+                "page_view",
+                serde_json::json!({}),
+                "/",
+                "",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("https://www.pornhub.com/".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("Failed to record spam event");
+
+        let breakdown = service
+            .get_property_breakdown(
+                chrono::Utc::now() - chrono::Duration::hours(1),
+                chrono::Utc::now() + chrono::Duration::hours(1),
+                project.id,
+                None,
+                None,
+                None,
+                crate::types::PropertyColumn::ReferrerHostname,
+                "visitors",
+                None,
+                None,
+            )
+            .await
+            .expect("Failed to get property breakdown");
+
+        let hosts: Vec<&str> = breakdown.items.iter().map(|i| i.value.as_str()).collect();
+        assert!(
+            hosts.contains(&"www.bing.com"),
+            "referrer with a real visitor must be present: {:?}",
+            hosts
+        );
+        assert!(
+            !hosts.contains(&"www.pornhub.com"),
+            "referrer with zero attributable visitors must be excluded, got: {:?}",
+            hosts
+        );
+
+        println!("✅ property breakdown excludes zero-visitor referrer spam!");
     }
 }
