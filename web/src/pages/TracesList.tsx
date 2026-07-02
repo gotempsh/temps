@@ -48,6 +48,7 @@ import {
   ArrowDown,
   ArrowUp,
   ArrowUpDown,
+  Bot,
   Check,
   ChevronLeft,
   ChevronRight,
@@ -865,6 +866,17 @@ export default function TracesList({ project }: TracesListProps) {
             disabled={isFetching}
           >
             <RefreshCw className={`h-4 w-4 ${isFetching ? 'animate-spin' : ''}`} />
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className="gap-2"
+            onClick={() =>
+              navigate(`/projects/${project.slug}/ai-gateway?tab=activity`)
+            }
+          >
+            <Bot className="h-3.5 w-3.5" />
+            <span className="hidden sm:inline">AI Traces</span>
           </Button>
           <Button
             variant="outline"

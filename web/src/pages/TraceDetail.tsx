@@ -44,6 +44,7 @@ import {
   CheckCircle2,
   XCircle,
   RefreshCw,
+  Bot,
 } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
@@ -673,6 +674,18 @@ export default function TraceDetail({ project }: TraceDetailProps) {
   )
   const traceStatus = hasError ? 'ERROR' : 'OK'
 
+  // Count spans that carry OpenTelemetry GenAI semantic-convention attributes
+  // (`gen_ai.*`). When present, this trace has LLM calls whose prompts and
+  // responses read far better in the dedicated AI conversation view than in the
+  // raw waterfall — so we surface a jump to it.
+  const genAiSpanCount = useMemo(
+    () =>
+      spans.filter((s) =>
+        Object.keys(s.attributes ?? {}).some((k) => k.startsWith('gen_ai.'))
+      ).length,
+    [spans]
+  )
+
   // Tell the assistant what the user is looking at, so "this trace"/"these
   // logs" resolve without restating. Ephemeral framing — see the chat dock.
   const assistantContext = useMemo(() => {
@@ -816,6 +829,39 @@ export default function TraceDetail({ project }: TraceDetailProps) {
           </CardContent>
         </Card>
       </div>
+
+      {/* AI conversation jump — when this trace has GenAI (LLM) spans, the
+          prompts/responses read far better in the dedicated AI view than in the
+          raw waterfall below. One click, trace pre-selected. */}
+      {genAiSpanCount > 0 && (
+        <button
+          type="button"
+          onClick={() =>
+            navigate(
+              `/projects/${project.slug}/ai-gateway?tab=activity&trace=${traceId}`
+            )
+          }
+          className="group flex w-full items-center gap-3 rounded-lg border border-primary/30 bg-primary/5 p-3 text-left transition-colors hover:bg-primary/10"
+        >
+          <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-primary/10 text-primary">
+            <Bot className="h-4 w-4" />
+          </span>
+          <div className="min-w-0 flex-1">
+            <p className="text-sm font-medium">
+              This trace has {genAiSpanCount} AI invocation
+              {genAiSpanCount === 1 ? '' : 's'}
+            </p>
+            <p className="text-xs text-muted-foreground">
+              See the prompts, responses, tokens, and tool calls as a conversation.
+            </p>
+          </div>
+          <span className="hidden items-center gap-1 text-xs font-medium text-primary sm:flex">
+            View AI conversation
+            <ChevronRight className="h-4 w-4 transition-transform group-hover:translate-x-0.5" />
+          </span>
+          <ChevronRight className="h-4 w-4 shrink-0 text-primary sm:hidden" />
+        </button>
+      )}
 
       {/* Spans / Logs tabs */}
       <Tabs defaultValue="spans" className="w-full">
