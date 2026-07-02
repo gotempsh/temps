@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use temps_entities::{
     external_service_backups, external_service_health_checks, external_services, nodes,
-    project_services, projects, service_members,
+    postgres_major_upgrades, project_services, projects, service_members,
 };
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
@@ -75,6 +75,16 @@ pub enum ExternalServiceError {
 
     #[error("Failed to start service {id}: {reason}")]
     StartFailed { id: i32, reason: String },
+
+    #[error(
+        "Service {id} has a major upgrade in progress (upgrade_id={upgrade_id}, phase={phase}); \
+         refusing to start/reconcile the container until it completes or is cancelled"
+    )]
+    UpgradeInProgress {
+        id: i32,
+        upgrade_id: i32,
+        phase: String,
+    },
 
     #[error("Failed to stop service {id}: {reason}")]
     StopFailed { id: i32, reason: String },
@@ -6707,10 +6717,50 @@ echo "[restore] Pre-seed complete"
             .collect()
     }
 
+    /// Guard against reconciling/(re)starting a container while a Postgres
+    /// major upgrade is actively working on it. The upgrade orchestrator
+    /// stops the container and deletes/recreates its volumes across
+    /// several phases (`postgres_upgrade.rs`); a concurrent `start()` call
+    /// (health-check-triggered restart, operator restart, startup
+    /// reconcile) would recreate the container against an implicitly
+    /// re-created empty volume, silently diverging from the volume the
+    /// orchestrator is dumping/restoring — accepting writes that never
+    /// make it into the upgraded database.
+    ///
+    /// Only PENDING/RUNNING rows are active; FAILED/COMPLETED/CANCELLED/
+    /// ROLLED_BACK are terminal and don't block a start.
+    async fn ensure_no_active_upgrade(&self, service_id: i32) -> Result<(), ExternalServiceError> {
+        use crate::externalsvc::postgres_upgrade::status;
+
+        let active = postgres_major_upgrades::Entity::find()
+            .filter(postgres_major_upgrades::Column::ServiceId.eq(service_id))
+            .filter(
+                postgres_major_upgrades::Column::Status
+                    .eq(status::PENDING)
+                    .or(postgres_major_upgrades::Column::Status.eq(status::RUNNING)),
+            )
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| ExternalServiceError::DatabaseError {
+                reason: format!("failed to check for active major upgrade: {}", e),
+            })?;
+
+        if let Some(upgrade) = active {
+            return Err(ExternalServiceError::UpgradeInProgress {
+                id: service_id,
+                upgrade_id: upgrade.id,
+                phase: upgrade.phase,
+            });
+        }
+
+        Ok(())
+    }
+
     pub async fn start_service(
         &self,
         service_id: i32,
     ) -> Result<ExternalServiceInfo, ExternalServiceError> {
+        self.ensure_no_active_upgrade(service_id).await?;
         let service = self.get_service(service_id).await?;
         let service_type_enum = ServiceType::from_str(&service.service_type).map_err(|_| {
             ExternalServiceError::InvalidServiceType {
