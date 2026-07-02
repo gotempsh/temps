@@ -2201,6 +2201,9 @@ mod tests {
     ///   3. The shell-escape + command construction used by the orchestrator
     ///      survives round-trip through `sh -c` with real user/password/db
     ///      values containing typical characters.
+    ///   4. `pg_dumpall` carries the WHOLE cluster: several databases (not just
+    ///      the default one) all survive the restore, and every database's
+    ///      table count is identical before and after.
     ///
     /// This validates the failure-prone shell/Docker-exec plumbing without
     /// having to stand up the full control-plane database, the encryption
@@ -2477,6 +2480,89 @@ mod tests {
             );
             run_exec_ok(&docker, &old_container, &seed_cmd, None).await?;
 
+            // --- Whole-cluster coverage --------------------------------------
+            // `pg_dumpall` dumps the ENTIRE cluster (every database + globals),
+            // which is the whole reason the orchestrator uses it. Prove that:
+            // create two databases besides the default one, give each a DISTINCT
+            // set of tables, then after the restore assert (a) every database
+            // came back and (b) each database's table count is identical before
+            // vs after. The single-table probe above only proves one table in
+            // one database survived — it would not catch a restore that silently
+            // dropped a database or some of its tables.
+            let extra_dbs = ["upgrade_extra_a", "upgrade_extra_b"];
+            let all_dbs = [db, extra_dbs[0], extra_dbs[1]];
+
+            // Each CREATE DATABASE must be its own statement: it cannot run
+            // inside a transaction block, so it can't share a multi-statement -c.
+            for extra in extra_dbs {
+                let create_db = format!(
+                    "export PGPASSWORD={pw}; psql -v ON_ERROR_STOP=1 -U {u} -d postgres -c {sql}",
+                    pw = shell_escape(password),
+                    u = shell_escape(user),
+                    sql = shell_escape(&format!("CREATE DATABASE {extra}")),
+                );
+                run_exec_ok(&docker, &old_container, &create_db, Some(password)).await?;
+            }
+
+            // Seed a distinct number of tables (each with a row) per database.
+            // The default `upgradetest` already has `upgrade_probe`, so +1 => 2
+            // tables; extra_a gets 3; extra_b gets 5 — all distinct, so a
+            // per-database comparison is a real signal, not a coincidence.
+            let seed_plan = [(db, 1usize), (extra_dbs[0], 3), (extra_dbs[1], 5)];
+            for (dbname, n) in seed_plan {
+                let mut stmts = String::new();
+                for i in 0..n {
+                    stmts.push_str(&format!(
+                        "CREATE TABLE seed_{i}(id INT PRIMARY KEY, note TEXT NOT NULL); \
+                         INSERT INTO seed_{i}(id, note) VALUES ({i}, 'r{i}'); "
+                    ));
+                }
+                let seed_more = format!(
+                    "export PGPASSWORD={pw}; psql -v ON_ERROR_STOP=1 -U {u} -d {d} -c {sql}",
+                    pw = shell_escape(password),
+                    u = shell_escape(user),
+                    d = shell_escape(dbname),
+                    sql = shell_escape(&stmts),
+                );
+                run_exec_ok(&docker, &old_container, &seed_more, Some(password)).await?;
+            }
+
+            // Count base tables in a database of a given container. Parses the
+            // first integer line so an incidental psql notice on stderr can't
+            // corrupt the result. Mirrors the `wait_ready` closure's shape:
+            // owned copies moved into the future so there are no borrow snags.
+            let count_tables = |container: &str, dbname: &str| {
+                let docker = Arc::clone(&docker);
+                let container = container.to_string();
+                let dbname = dbname.to_string();
+                let user = user.to_string();
+                let password = password.to_string();
+                async move {
+                    let sql = "SELECT count(*) FROM information_schema.tables \
+                               WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
+                               AND table_type = 'BASE TABLE'";
+                    let cmd = format!(
+                        "export PGPASSWORD={pw}; psql -v ON_ERROR_STOP=1 -U {u} -d {d} -tAc {sql}",
+                        pw = shell_escape(&password),
+                        u = shell_escape(&user),
+                        d = shell_escape(&dbname),
+                        sql = shell_escape(sql),
+                    );
+                    let out =
+                        run_exec_capture(&docker, &container, &cmd, Some(password.as_str())).await?;
+                    out.lines()
+                        .filter_map(|l| l.trim().parse::<i64>().ok())
+                        .next()
+                        .ok_or_else(|| format!("no table count for {dbname} (raw output: {out:?})"))
+                }
+            };
+
+            // Snapshot every database's table count BEFORE the dump.
+            let mut before_counts: Vec<(&str, i64)> = Vec::new();
+            for dbname in all_dbs {
+                before_counts.push((dbname, count_tables(&old_container, dbname).await?));
+            }
+
             // Dump — mirrors exactly what `phase_dump` shells out, including
             // the atomic marker file write.
             let dump_cmd = format!(
@@ -2703,6 +2789,47 @@ mod tests {
                 "restored data did not match. got: {:?}",
                 got
             );
+
+            // Every database in the cluster must have come back.
+            let db_list_sql = "SELECT datname FROM pg_database \
+                               WHERE datistemplate = false AND datname <> 'postgres' \
+                               ORDER BY datname";
+            let db_list_cmd = format!(
+                "export PGPASSWORD={pw}; psql -v ON_ERROR_STOP=1 -U {u} -d postgres -tAc {sql}",
+                pw = shell_escape(password),
+                u = shell_escape(user),
+                sql = shell_escape(db_list_sql),
+            );
+            let db_list_out =
+                run_exec_capture(&docker, &new_container, &db_list_cmd, Some(password)).await?;
+            let restored_dbs: std::collections::HashSet<String> = db_list_out
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect();
+            for dbname in all_dbs {
+                if !restored_dbs.contains(dbname) {
+                    return Err(format!(
+                        "database {dbname:?} missing after restore; restored databases = {restored_dbs:?}"
+                    ));
+                }
+            }
+
+            // Each database must have exactly as many tables as before the dump.
+            for (dbname, before) in before_counts {
+                let after = count_tables(&new_container, dbname).await?;
+                if before <= 0 {
+                    return Err(format!(
+                        "precondition failed: {dbname:?} had no seeded tables before the dump"
+                    ));
+                }
+                if before != after {
+                    return Err(format!(
+                        "table count for database {dbname:?} changed across the upgrade: \
+                         before={before} after={after}"
+                    ));
+                }
+            }
 
             // Run ANALYZE (same shape as phase_analyze) to confirm planner
             // stats refresh works on the restored DB.
