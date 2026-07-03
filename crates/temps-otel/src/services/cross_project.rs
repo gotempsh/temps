@@ -250,6 +250,69 @@ impl CrossProjectTraceService {
         Ok(())
     }
 
+    /// For a batch of `trace_id`s, resolve the "canonical" root span name +
+    /// service from whichever **sharing** project owns the trace's root span.
+    ///
+    /// Used to name trace-list rows whose local project holds only child spans
+    /// (which would otherwise render as "(unnamed)"). Best-effort: trace_ids
+    /// with no discoverable root — or whose root lives in an opted-out project —
+    /// are simply absent from the returned map. Returns
+    /// `trace_id -> (root_span_name, service_name)`.
+    pub async fn resolve_root_names(
+        &self,
+        trace_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, (String, String)>, CrossProjectTraceError> {
+        use std::collections::HashMap;
+        if trace_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        // Pick one root-owning summary per trace, from a sharing project only.
+        //   WHERE s.trace_id IN ($1, $2, …)
+        let mut sql = String::from(
+            "SELECT DISTINCT ON (s.trace_id) s.trace_id, s.root_span_name, s.service_name \
+             FROM otel_trace_summaries s \
+             JOIN projects p ON p.id = s.project_id \
+             WHERE s.has_root = TRUE AND s.root_span_name <> '' \
+               AND p.cross_project_trace_sharing = TRUE \
+               AND s.trace_id IN (",
+        );
+        for i in 0..trace_ids.len() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("${}", i + 1));
+        }
+        sql.push_str(") ORDER BY s.trace_id, s.has_root DESC");
+
+        let values: Vec<sea_orm::Value> = trace_ids.iter().map(|t| t.clone().into()).collect();
+
+        let rows = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                &sql,
+                values,
+            ))
+            .await
+            .map_err(|e| CrossProjectTraceError::QueryProjects {
+                trace_id: format!("batch of {}", trace_ids.len()),
+                source: e,
+            })?;
+
+        let mut map = HashMap::with_capacity(rows.len());
+        for row in &rows {
+            let tid: String = match row.try_get("", "trace_id") {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let name: String = row.try_get("", "root_span_name").unwrap_or_default();
+            let svc: String = row.try_get("", "service_name").unwrap_or_default();
+            map.insert(tid, (name, svc));
+        }
+        Ok(map)
+    }
+
     // ── Phase 1: sibling discovery ──────────────────────────────────────────
 
     /// Returns projects that share `trace_id`, excluding `exclude_project_id`

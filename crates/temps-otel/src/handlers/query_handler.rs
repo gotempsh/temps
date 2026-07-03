@@ -616,8 +616,39 @@ pub async fn query_trace_summaries(
         ..query.clone()
     };
 
-    let data = state.otel_service.query_trace_summaries(query).await?;
+    let mut data = state.otel_service.query_trace_summaries(query).await?;
     let total = state.otel_service.count_traces(count_query).await?;
+
+    // Name cross-project trace rows whose root span lives in a sibling project:
+    // when this project holds only child spans, the summary has no root and would
+    // render as "(unnamed)". Backfill the root name/service from the root-owning
+    // (sharing) project. Best-effort — a failure leaves the rows as-is.
+    let unnamed: Vec<String> = data
+        .iter()
+        .filter(|s| s.root_span_name.trim().is_empty())
+        .map(|s| s.trace_id.clone())
+        .collect();
+    if !unnamed.is_empty() {
+        match state
+            .cross_project_service
+            .resolve_root_names(&unnamed)
+            .await
+        {
+            Ok(names) => {
+                for s in data.iter_mut() {
+                    if let Some((name, svc)) = names.get(&s.trace_id) {
+                        if s.root_span_name.trim().is_empty() {
+                            s.root_span_name = name.clone();
+                        }
+                        if s.service_name.trim().is_empty() {
+                            s.service_name = svc.clone();
+                        }
+                    }
+                }
+            }
+            Err(e) => warn!("cross-project trace name backfill failed: {e}"),
+        }
+    }
 
     Ok(Json(TraceSummariesResponse { data, total }))
 }
