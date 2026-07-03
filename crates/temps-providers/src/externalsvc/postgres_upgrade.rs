@@ -29,7 +29,7 @@ use temps_entities::postgres_major_upgrades;
 use temps_logs::LogService;
 use thiserror::Error;
 
-use super::postgres::shell_escape;
+use super::postgres::{shell_escape, validate_pg_username};
 
 /// Pre-upgrade backup provider trait.
 ///
@@ -989,10 +989,30 @@ impl PostgresUpgradeOrchestrator {
         //   CREATE ROLE {user};
         //   ALTER ROLE {user} WITH ...
         // The role name appears after an optional "IF EXISTS " for DROP.
-        let sed_filter = format!(
-            "sed -E '/^(DROP ROLE (IF EXISTS )?|CREATE ROLE |ALTER ROLE ){user}($| |;)/d'",
+        // Defense-in-depth: reject any username outside a plain identifier
+        // charset before it is baked into the sed program below. The sed
+        // argument is fully shell-escaped, so this is not the primary guard —
+        // it just ensures a crafted username can never reach the shell or the
+        // sed program in the first place.
+        validate_pg_username(&conn.username).map_err(|reason| {
+            PostgresUpgradeError::RestoreFailed {
+                upgrade_id: row.id,
+                service_id: row.service_id,
+                reason,
+            }
+        })?;
+
+        // Build the sed role-filter program, then shell-escape the ENTIRE sed
+        // argument. `regex_escape_for_sed` neutralizes regex metacharacters but
+        // NOT the single quotes that wrap the program, so the sed string must
+        // still pass through `shell_escape` before interpolation — the
+        // `-U {user}` arg below already does; this one previously did not, so a
+        // `'` in the username could break out of the sed quotes into the shell.
+        let sed_program = format!(
+            "/^(DROP ROLE (IF EXISTS )?|CREATE ROLE |ALTER ROLE ){user}($| |;)/d",
             user = regex_escape_for_sed(&conn.username),
         );
+        let sed_filter = format!("sed -E {}", shell_escape(&sed_program));
         let psql_cmd = format!(
             "set -eu; export PGPASSWORD={pw}; {sed} /dump/data.sql | psql -v ON_ERROR_STOP=1 -h {host} -U {user} -d postgres",
             pw = shell_escape(&conn.password),
@@ -2706,10 +2726,11 @@ mod tests {
             wait_ready(&new_container).await?;
 
             // Restore via throwaway psql sidecar — same shape as `phase_restore`.
-            let sed_filter = format!(
-                "sed -E '/^(DROP ROLE (IF EXISTS )?|CREATE ROLE |ALTER ROLE ){u}($| |;)/d'",
+            let sed_program = format!(
+                "/^(DROP ROLE (IF EXISTS )?|CREATE ROLE |ALTER ROLE ){u}($| |;)/d",
                 u = regex_escape_for_sed(user),
             );
+            let sed_filter = format!("sed -E {}", shell_escape(&sed_program));
             let psql_cmd = format!(
                 "set -eu; export PGPASSWORD={pw}; {sed} /dump/data.sql | psql -v ON_ERROR_STOP=1 -h {host} -U {u} -d postgres",
                 pw = shell_escape(password),

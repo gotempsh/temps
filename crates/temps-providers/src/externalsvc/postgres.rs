@@ -77,6 +77,34 @@ pub(crate) fn postgres_healthcheck_cmd(username: &str, database: &str) -> String
     )
 }
 
+/// Validate a PostgreSQL role/username before it is interpolated into a
+/// shell command or SQL. Allows only `[A-Za-z0-9_]` (the realistic role-name
+/// charset), non-empty, and at most 63 bytes.
+///
+/// Defense-in-depth: the upgrade orchestrator already `shell_escape`s the
+/// username at every interpolation site, but rejecting shell/SQL
+/// metacharacters (quotes, `$`, `;`, spaces, backticks, …) up front means a
+/// crafted username can never reach a `sh -c` string or a `sed` program in
+/// the first place. Mirrors [`PostgresService::validate_database_name`], but
+/// permits uppercase since role names are commonly mixed-case.
+pub(crate) fn validate_pg_username(name: &str) -> std::result::Result<(), String> {
+    if name.is_empty() {
+        return Err("PostgreSQL username cannot be empty".to_string());
+    }
+    if name.len() > 63 {
+        return Err(format!(
+            "PostgreSQL username '{name}' exceeds the 63 character limit"
+        ));
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(format!(
+            "PostgreSQL username '{name}' contains invalid characters; only \
+             ASCII letters, digits, and underscores are allowed"
+        ));
+    }
+    Ok(())
+}
+
 /// Input configuration for creating a PostgreSQL service
 /// This is what users provide when creating the service
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -4894,6 +4922,32 @@ mod tests {
     }
 
     // ── Database Name SQL Injection Prevention Tests ─────────────────
+
+    #[test]
+    fn test_validate_pg_username_accepts_realistic_names() {
+        assert!(validate_pg_username("postgres").is_ok());
+        assert!(validate_pg_username("appuser").is_ok());
+        assert!(validate_pg_username("My_User123").is_ok());
+        assert!(validate_pg_username("_svc").is_ok());
+        assert!(validate_pg_username(&"a".repeat(63)).is_ok());
+    }
+
+    #[test]
+    fn test_validate_pg_username_rejects_shell_and_sed_injection() {
+        // Empty / too long.
+        assert!(validate_pg_username("").is_err());
+        assert!(validate_pg_username(&"a".repeat(64)).is_err());
+        // The exact break-out vector for the phase_restore sed filter: a
+        // single quote closes the sed program's quoting.
+        assert!(validate_pg_username("admin'").is_err());
+        assert!(validate_pg_username("a'$(id)#").is_err());
+        // Other shell/SQL metacharacters.
+        assert!(validate_pg_username("u;drop").is_err());
+        assert!(validate_pg_username("a b").is_err());
+        assert!(validate_pg_username("a`b`").is_err());
+        assert!(validate_pg_username("a$b").is_err());
+        assert!(validate_pg_username("a-b").is_err());
+    }
 
     #[test]
     fn test_validate_database_name_valid_names() {

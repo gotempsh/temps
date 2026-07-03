@@ -715,8 +715,14 @@ async fn upgrade_service(
             crate::services::ExternalServiceError::UpgradeRejected { .. } => {
                 Err(bad_request().detail(e.to_string()).build())
             }
+            // Typed match: `ServiceNotFound` displays as "Service {id} not
+            // found", so the previous `e.to_string() == "Service not found"`
+            // arm was dead and a missing service fell through to 500 instead
+            // of 404. Mirrors the same fix already made in `start_service`.
+            crate::services::ExternalServiceError::ServiceNotFound { .. } => {
+                Err(not_found().detail(e.to_string()).build())
+            }
             _ => match e.to_string().as_str() {
-                "Service not found" => Err(not_found().detail("Service not found").build()),
                 msg if msg.contains("Upgrade not implemented") => {
                     Err(bad_request().detail(msg).build())
                 }
