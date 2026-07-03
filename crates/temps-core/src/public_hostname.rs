@@ -11,20 +11,15 @@ const SHORT_HASH_LEN: usize = 8;
 /// The mode is stored per managed domain (`dns_managed_domains.generated_hostname_mode`)
 /// rather than globally, so a provider such as Cloudflare can offer the flat layout
 /// required by its Universal SSL wildcard cert without changing every domain's behaviour.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum PublicHostnameStrategy {
     /// Preserve Temps' existing generated hostname layout (`{service}-{env}.base`).
+    #[default]
     Standard,
     /// Force generated service hostnames to one label below `preview_domain`
     /// (`{env}-{service}.base`) so a single-label wildcard cert covers them.
     Flat,
-}
-
-impl Default for PublicHostnameStrategy {
-    fn default() -> Self {
-        Self::Standard
-    }
 }
 
 impl PublicHostnameStrategy {
@@ -180,9 +175,6 @@ fn sanitize_label(label: &str) -> String {
         if lower.is_ascii_alphanumeric() {
             output.push(lower);
             previous_hyphen = false;
-        } else if lower == '-' && !previous_hyphen {
-            output.push('-');
-            previous_hyphen = true;
         } else if !previous_hyphen {
             output.push('-');
             previous_hyphen = true;
