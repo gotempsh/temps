@@ -226,6 +226,7 @@ impl OtelConfig {
             metric_alert_handler::UpdateMetricAlertRequest,
             metric_alert_handler::OtelMetricAlertRuleResponse,
             metric_alert_handler::OtelMetricAlertsResponse,
+            crate::services::metric_alert_evaluator::SeriesStateEntry,
             metric_alert_handler::AnomalyPreviewRequest,
             metric_alert_handler::AnomalyPreviewResponse,
             metric_alert_handler::AnomalyPreviewPointResponse,
@@ -438,6 +439,49 @@ impl TempsPlugin for OtelPlugin {
                 Arc::new(crate::services::MetricAlertService::new(db.clone()));
             let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
 
+            // 5. Metric alert evaluator
+            //
+            // Builds its own AlarmService instance (separate from console.rs's)
+            // wired to the same NotificationService + JobQueue, then spawns the
+            // background evaluator. The two AlarmService instances keep
+            // independent in-memory cooldown maps, but fire_alarm's actual
+            // cooldown check queries the DB `alarms` table by type+deployment+
+            // container, so duplicate suppression is still correct. OTEL rules
+            // always set deployment_id=None, so collisions with the monitoring
+            // evaluator are unlikely.
+            let metric_alert_evaluator = {
+                let notification_service =
+                    context.require_service::<dyn temps_core::notifications::NotificationService>();
+                let job_queue = context.require_service::<dyn temps_core::JobQueue>();
+                let alarm_service = Arc::new(temps_monitoring::AlarmService::new(
+                    db.clone(),
+                    notification_service.clone(),
+                    job_queue.clone(),
+                ));
+                // Dynamic per-series alarms bypass the per-rule cooldown: the
+                // evaluator's per-series state machine already guarantees
+                // exactly-once firing per series until it resolves (ADR-026).
+                let alarm_service_dynamic = Arc::new(
+                    temps_monitoring::AlarmService::new(
+                        db.clone(),
+                        notification_service,
+                        job_queue,
+                    )
+                    .with_cooldown(chrono::Duration::zero()),
+                );
+                // ADR-022: optional general AI foundation, registered by the AI
+                // gateway plugin when present. Absent -> deterministic Tier-1 text.
+                let ai = context.get_service::<dyn temps_ai::AiService>();
+                Arc::new(crate::services::MetricAlertEvaluator::new(
+                    metric_alert_service.clone(),
+                    otel_service.clone(),
+                    alarm_service,
+                    alarm_service_dynamic,
+                    db.clone(),
+                    ai,
+                ))
+            };
+
             // Create app state for handlers
             let app_state = OtelAppState {
                 otel_service: otel_service.clone(),
@@ -445,6 +489,7 @@ impl TempsPlugin for OtelPlugin {
                 metrics_write_tx: Some(metrics_write_tx),
                 dashboard_service: dashboard_service.clone(),
                 metric_alert_service: metric_alert_service.clone(),
+                metric_alert_evaluator: metric_alert_evaluator.clone(),
                 audit_service: audit_service.clone(),
             };
             context.register_service(Arc::new(app_state.clone()));
@@ -520,35 +565,9 @@ impl TempsPlugin for OtelPlugin {
                 });
             }
 
-            // 5. Metric alert evaluator
-            //
-            // Builds its own AlarmService instance (separate from console.rs's)
-            // wired to the same NotificationService + JobQueue, then spawns the
-            // background evaluator. The two AlarmService instances keep
-            // independent in-memory cooldown maps, but fire_alarm's actual
-            // cooldown check queries the DB `alarms` table by type+deployment+
-            // container, so duplicate suppression is still correct. OTEL rules
-            // always set deployment_id=None, so collisions with the monitoring
-            // evaluator are unlikely.
+            // Spawn the metric alert evaluator run loop (evaluator already created above).
             {
-                let notification_service =
-                    context.require_service::<dyn temps_core::notifications::NotificationService>();
-                let job_queue = context.require_service::<dyn temps_core::JobQueue>();
-                let alarm_service = Arc::new(temps_monitoring::AlarmService::new(
-                    db.clone(),
-                    notification_service,
-                    job_queue,
-                ));
-                // ADR-022: optional general AI foundation, registered by the AI
-                // gateway plugin when present. Absent -> deterministic Tier-1 text.
-                let ai = context.get_service::<dyn temps_ai::AiService>();
-                let evaluator = Arc::new(crate::services::MetricAlertEvaluator::new(
-                    metric_alert_service.clone(),
-                    otel_service.clone(),
-                    alarm_service,
-                    db.clone(),
-                    ai,
-                ));
+                let evaluator = metric_alert_evaluator;
                 tokio::spawn(async move {
                     evaluator.run().await;
                 });

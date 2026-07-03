@@ -135,6 +135,9 @@ mod m20260630_000001_add_ai_pending_actions_and_write_toggle;
 mod m20260701_000001_add_ai_action_plans;
 mod m20260701_000001_add_provider_webhook_tokens;
 mod m20260701_000002_add_bitbucket_webhook_hook_id;
+mod m20260702_000001_add_label_filters_to_metric_alert_rules;
+mod m20260702_000002_add_dynamic_alerting_to_metric_alert_rules;
+mod m20260702_000003_add_grouped_threshold_and_series_state_to_metric_alert_rules;
 
 pub struct Migrator;
 
@@ -273,6 +276,11 @@ impl MigratorTrait for Migrator {
             Box::new(m20260701_000001_add_ai_action_plans::Migration),
             Box::new(m20260701_000001_add_provider_webhook_tokens::Migration),
             Box::new(m20260701_000002_add_bitbucket_webhook_hook_id::Migration),
+            Box::new(m20260702_000001_add_label_filters_to_metric_alert_rules::Migration),
+            Box::new(m20260702_000002_add_dynamic_alerting_to_metric_alert_rules::Migration),
+            Box::new(
+                m20260702_000003_add_grouped_threshold_and_series_state_to_metric_alert_rules::Migration,
+            ),
         ]
     }
 }

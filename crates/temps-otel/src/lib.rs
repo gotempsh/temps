@@ -78,6 +78,9 @@ pub struct OtelAppState {
     /// Service backing first-class metric alert rule CRUD (Postgres-backed
     /// config/metadata; evaluated by the background `MetricAlertEvaluator`).
     pub metric_alert_service: std::sync::Arc<crate::services::MetricAlertService>,
+    /// The background metric alert evaluator, shared so read handlers can snapshot
+    /// its in-memory per-series firing state (ADR-026 Phase 3 `firing_series`).
+    pub metric_alert_evaluator: std::sync::Arc<crate::services::MetricAlertEvaluator>,
     /// Audit logger for dashboard/alert write operations (best-effort, non-fatal).
     pub audit_service: std::sync::Arc<dyn temps_core::AuditLogger>,
 }
