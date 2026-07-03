@@ -339,6 +339,36 @@ impl NotificationProvider for CloudflareProvider {
     }
 }
 
+/// HTML-encode the five characters that can break element structure or inject
+/// new tags when user-controlled text is interpolated into an HTML template.
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Escape Slack mrkdwn special characters so user-controlled text cannot inject
+/// hyperlinks (`<url|text>`), `<!channel>` mention floods, `&entity;` refs, or
+/// forge bold/italic/code/strikethrough formatting.
+fn slack_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('*', "\\*")
+        .replace('_', "\\_")
+        .replace('`', "\\`")
+        .replace('~', "\\~")
+}
+
 #[async_trait]
 pub trait NotificationProvider: Send + Sync {
     async fn initialize(&mut self, db: Arc<DatabaseConnection>) -> Result<()>;
@@ -659,7 +689,7 @@ impl EmailProvider {
                             <td style="padding: 8px 12px; color: #6b7280; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; font-size: 13px; white-space: nowrap; vertical-align: top;">{}</td>
                             <td style="padding: 8px 12px; color: #1f2937; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; font-size: 13px; word-break: break-all;">{}</td>
                         </tr>"#,
-                        label, v
+                        html_escape(&label), html_escape(v)
                     )
                 })
                 .collect();
@@ -679,18 +709,11 @@ impl EmailProvider {
             )
         };
 
-        // If the message already contains HTML tags, use it directly.
-        // Otherwise escape plain text and convert newlines to <br>.
-        let message_html = if notification.message.contains("</") {
-            notification.message.clone()
-        } else {
-            notification
-                .message
-                .replace('&', "&amp;")
-                .replace('<', "&lt;")
-                .replace('>', "&gt;")
-                .replace('\n', "<br>")
-        };
+        // Always escape the message as plain text, then convert newlines to <br>.
+        // Escape must happen first so the literal <br> tags we insert are not
+        // themselves escaped in a subsequent pass.
+        let message_html = html_escape(&notification.message).replace('\n', "<br>");
+        let title_html = html_escape(&notification.title);
 
         format!(
             r#"<!DOCTYPE html>
@@ -753,7 +776,7 @@ impl EmailProvider {
     </table>
 </body>
 </html>"#,
-            title = notification.title,
+            title = title_html,
             timestamp = notification.timestamp.format("%b %d, %Y at %H:%M UTC"),
             accent_color = accent_color,
             bg_color = bg_color,
@@ -996,19 +1019,21 @@ impl NotificationProvider for SlackProvider {
             .filter(|(k, _)| !k.starts_with('_'))
             .map(|(k, v)| {
                 serde_json::json!({
-                    "title": k,
-                    "value": v,
+                    "title": slack_escape(k),
+                    "value": slack_escape(v),
                     "short": true
                 })
             })
             .collect::<Vec<_>>();
 
+        let safe_title = slack_escape(&notification.title);
+        let safe_message = slack_escape(&notification.message);
         let payload = serde_json::json!({
             "channel": self.channel,
             "attachments": [{
                 "color": color,
-                "title": notification.title,
-                "text": notification.message,
+                "title": safe_title,
+                "text": safe_message,
                 "fields": metadata_fields,
                 "footer": format!("Priority: {:?} | Type: {:?}", notification.priority, notification.notification_type)
             }]
@@ -2933,5 +2958,238 @@ mod tests {
         assert!(html.contains("<table"));
         assert!(!html.contains("display: flex"));
         assert!(!html.contains("display: grid"));
+    }
+
+    // ── Escape helper unit tests ──────────────────────────────────────
+
+    #[test]
+    fn test_html_escape_encodes_all_special_chars() {
+        assert_eq!(html_escape("<"), "&lt;");
+        assert_eq!(html_escape(">"), "&gt;");
+        assert_eq!(html_escape("&"), "&amp;");
+        assert_eq!(html_escape("\""), "&quot;");
+        assert_eq!(html_escape("'"), "&#x27;");
+        assert_eq!(
+            html_escape("<script>alert('xss')</script>"),
+            "&lt;script&gt;alert(&#x27;xss&#x27;)&lt;/script&gt;"
+        );
+    }
+
+    #[test]
+    fn test_html_escape_passes_safe_chars_through() {
+        assert_eq!(html_escape("hello world 123"), "hello world 123");
+        assert_eq!(html_escape(""), "");
+        // Newlines, tabs, and spaces are not HTML-special — must not be altered.
+        assert_eq!(html_escape("line1\nline2\ttab"), "line1\nline2\ttab");
+    }
+
+    #[test]
+    fn test_slack_escape_encodes_mrkdwn_special_chars() {
+        assert_eq!(slack_escape("<"), "&lt;");
+        assert_eq!(slack_escape(">"), "&gt;");
+        assert_eq!(slack_escape("&"), "&amp;");
+        // Full injection sequences must be neutralised.
+        assert_eq!(slack_escape("<!channel>"), "&lt;!channel&gt;");
+        assert_eq!(
+            slack_escape("<https://evil.example|Click here>"),
+            "&lt;https://evil.example|Click here&gt;"
+        );
+        assert_eq!(slack_escape("&amp;"), "&amp;amp;");
+        // mrkdwn formatting characters must not let user text forge emphasis or
+        // code blocks (e.g. a bolded fake severity, or a `DROP TABLE` code block).
+        assert_eq!(slack_escape("*bold*"), "\\*bold\\*");
+        assert_eq!(slack_escape("_italic_"), "\\_italic\\_");
+        assert_eq!(slack_escape("`code`"), "\\`code\\`");
+        assert_eq!(slack_escape("~strike~"), "\\~strike\\~");
+    }
+
+    #[test]
+    fn test_slack_escape_passes_safe_chars_through() {
+        assert_eq!(slack_escape("hello world 123"), "hello world 123");
+        assert_eq!(slack_escape(""), "");
+    }
+
+    // ── Regression tests: HTML injection via title/metadata ───────────
+
+    #[test]
+    fn test_email_title_injection_does_not_break_html_structure() {
+        // Simulates an OTel series_label value injected into the alarm title by
+        // Phase 3 (per-series dynamic alerting). The value contains a closing tag
+        // that would break the <h1> and inject a phishing anchor.
+        let notification = Notification {
+            id: "sec-test".to_string(),
+            title: r#"Metric threshold breached [endpoint=</h1><a href="https://evil.example">Click to resolve</a>]"#.to_string(),
+            message: "Normal message".to_string(),
+            notification_type: NotificationType::Alert,
+            priority: NotificationPriority::Critical,
+            severity: None,
+            timestamp: Utc::now(),
+            metadata: std::collections::HashMap::new(),
+            bypass_throttling: false,
+        };
+
+        let html = EmailProvider::render_notification_email(&notification);
+
+        // The injected anchor tag must not appear verbatim in the rendered output.
+        assert!(
+            !html.contains(r#"<a href="https://evil.example">"#),
+            "rendered HTML must not contain injected anchor tag"
+        );
+        // The title content must still appear, but escaped.
+        assert!(
+            html.contains("&lt;/h1&gt;"),
+            "closing h1 in title must be HTML-escaped"
+        );
+        assert!(
+            html.contains("&lt;a href=&quot;https://evil.example&quot;&gt;"),
+            "injected anchor in title must be fully HTML-escaped"
+        );
+    }
+
+    #[test]
+    fn test_email_metadata_value_injection_does_not_break_html_structure() {
+        // Simulates an OTel attribute value (series_key) injected into the
+        // DETAILS table. The value closes the current <td> and injects a script.
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            "series_label".to_string(),
+            r#"endpoint=</td><script>alert(1)</script>"#.to_string(),
+        );
+
+        let notification = Notification {
+            id: "sec-test-2".to_string(),
+            title: "Metric threshold breached".to_string(),
+            message: "Normal message".to_string(),
+            notification_type: NotificationType::Alert,
+            priority: NotificationPriority::High,
+            severity: None,
+            timestamp: Utc::now(),
+            metadata,
+            bypass_throttling: false,
+        };
+
+        let html = EmailProvider::render_notification_email(&notification);
+
+        assert!(
+            !html.contains("<script>"),
+            "rendered HTML must not contain injected script tag"
+        );
+        assert!(
+            html.contains("&lt;/td&gt;"),
+            "injected closing td in metadata value must be HTML-escaped"
+        );
+    }
+
+    // ── Regression test: HTML injection via message body (ADR-026 Phase 3) ──
+    //
+    // Attack path: OTel per-series label (e.g., `env=</td><a href="...">`) is
+    // embedded into `alarm.title` by the metric-alert evaluator.  When the alarm
+    // resolves, `alarm_service::send_resolved_notification` formats the message as
+    //   format!("Alarm '{}' has been resolved.\nOriginal severity: {}", alarm.title, …)
+    // and sends it through `render_notification_email`.  The old `contains("</")` heuristic
+    // would have passed the entire message through unescaped, injecting arbitrary HTML.
+    #[test]
+    fn test_email_message_injection_via_resolved_alarm_label_is_escaped() {
+        // Mirrors exactly what alarm_service::send_resolved_notification produces when
+        // alarm.title embeds an attacker-controlled OTel series_label.
+        let injected_title =
+            r#"Metric threshold breached [env=</td><a href="https://evil.example">click</a>]"#;
+        let message = format!(
+            "Alarm '{}' has been resolved.\nOriginal severity: critical",
+            injected_title
+        );
+
+        let notification = Notification {
+            id: "sec-test-msg".to_string(),
+            title: "Resolved: Metric threshold breached".to_string(),
+            message,
+            notification_type: NotificationType::Info,
+            priority: NotificationPriority::Normal,
+            severity: None,
+            timestamp: Utc::now(),
+            metadata: std::collections::HashMap::new(),
+            bypass_throttling: false,
+        };
+
+        let html = EmailProvider::render_notification_email(&notification);
+
+        // The injected anchor must not appear verbatim.
+        assert!(
+            !html.contains(r#"<a href="https://evil.example">"#),
+            "rendered HTML must not contain unescaped injected anchor from message"
+        );
+        // The closing </td> from the injection must not appear verbatim.
+        assert!(
+            !html.contains("</td><a"),
+            "rendered HTML must not contain unescaped </td> injection from message"
+        );
+        // The angle-bracket content must be entity-encoded instead.
+        assert!(
+            html.contains("&lt;/td&gt;"),
+            "injected </td> in message must be HTML-escaped to &lt;/td&gt;"
+        );
+        assert!(
+            html.contains("&lt;a href=&quot;https://evil.example&quot;&gt;"),
+            "injected anchor in message must be fully HTML-escaped"
+        );
+        // Newlines must still become <br> so multi-line messages render correctly.
+        assert!(
+            html.contains("<br>"),
+            "newline in message must be converted to <br>"
+        );
+    }
+
+    #[test]
+    fn test_safe_title_renders_identically_without_escaping() {
+        // A title with no HTML-special characters must produce the exact same
+        // visible text after escaping (byte-for-byte in the rendered document).
+        let title = "Metric alert fired for deployment my-app in environment production";
+        let notification = Notification {
+            id: "safe-test".to_string(),
+            title: title.to_string(),
+            message: "Normal message".to_string(),
+            notification_type: NotificationType::Alert,
+            priority: NotificationPriority::High,
+            severity: None,
+            timestamp: Utc::now(),
+            metadata: std::collections::HashMap::new(),
+            bypass_throttling: false,
+        };
+
+        let html = EmailProvider::render_notification_email(&notification);
+
+        // The title must appear verbatim — no extra escaping of safe characters.
+        assert!(
+            html.contains(title),
+            "safe title must appear unchanged in rendered HTML"
+        );
+    }
+
+    #[test]
+    fn test_slack_channel_mention_injection_is_neutralised() {
+        // The Slack mrkdwn `<!channel>` sequence would trigger an @channel
+        // notification flood if passed through unescaped.
+        let title = "Metric alert [env=<!channel>]";
+        let message = "Value exceeded threshold. See <https://evil.example|dashboard>.";
+
+        let escaped_title = slack_escape(title);
+        let escaped_message = slack_escape(message);
+
+        assert!(
+            !escaped_title.contains("<!channel>"),
+            "<!channel> must be neutralised in Slack title"
+        );
+        assert!(
+            escaped_title.contains("&lt;!channel&gt;"),
+            "escaped title must contain the HTML-entity form"
+        );
+        assert!(
+            !escaped_message.contains("<https://evil.example|dashboard>"),
+            "mrkdwn link must be neutralised in Slack message"
+        );
+        assert!(
+            escaped_message.contains("&lt;https://evil.example|dashboard&gt;"),
+            "escaped message must contain the HTML-entity form"
+        );
     }
 }

@@ -14,12 +14,14 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bollard::Docker;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection, EntityTrait};
 use temps_core::EncryptionService;
 use temps_entities::external_services;
 
-use crate::externalsvc::postgres::{PostgresConfig, PostgresInputConfig};
+use crate::externalsvc::postgres::{
+    postgres_healthcheck_cmd, shell_escape, PostgresConfig, PostgresInputConfig,
+};
 use crate::externalsvc::postgres_upgrade::{PostgresConnection, PostgresContainerLifecycle};
 use crate::services::ExternalServiceManager;
 use crate::utils::ensure_network_exists;
@@ -85,6 +87,259 @@ impl PostgresLifecycleAdapter {
             .parse::<u32>()
             .map_err(|e| format!("bad version in '{}': {}", image, e))?;
         Ok(format!("/var/lib/postgresql/{}/docker", version))
+    }
+
+    fn sql_string_literal(s: &str) -> String {
+        format!("'{}'", s.replace('\'', "''"))
+    }
+
+    async fn exec_in_container(
+        &self,
+        container_name: &str,
+        cmd: Vec<String>,
+        env: Option<Vec<String>>,
+    ) -> Result<(Option<i64>, String), String> {
+        let exec = self
+            .docker
+            .create_exec(
+                container_name,
+                bollard::models::ExecConfig {
+                    cmd: Some(cmd),
+                    env,
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| format!("create_exec({}) failed: {}", container_name, e))?;
+
+        let mut output_text = String::new();
+        if let Ok(bollard::exec::StartExecResults::Attached { mut output, .. }) =
+            self.docker.start_exec(&exec.id, None).await
+        {
+            while let Some(chunk) = output.next().await {
+                match chunk {
+                    Ok(chunk) => output_text.push_str(&chunk.to_string()),
+                    Err(e) => output_text.push_str(&format!("<exec output error: {}>", e)),
+                }
+            }
+        }
+
+        let inspect = self
+            .docker
+            .inspect_exec(&exec.id)
+            .await
+            .map_err(|e| format!("inspect_exec({}) failed: {}", container_name, e))?;
+        Ok((inspect.exit_code, output_text))
+    }
+
+    async fn container_logs(&self, container_name: &str) -> String {
+        self.docker
+            .logs(
+                container_name,
+                Some(
+                    bollard::query_parameters::LogsOptionsBuilder::new()
+                        .stdout(true)
+                        .stderr(true)
+                        .build(),
+                ),
+            )
+            .try_collect::<Vec<_>>()
+            .await
+            .map(|v| v.into_iter().map(|c| c.to_string()).collect::<String>())
+            .unwrap_or_else(|e| format!("<failed to read logs: {}>", e))
+    }
+
+    async fn wait_for_psql_database(
+        &self,
+        container_name: &str,
+        cfg: &PostgresConfig,
+        database: &str,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        let mut last_exit = None;
+        let mut last_output = String::new();
+        while Instant::now() < deadline {
+            let result = self
+                .exec_in_container(
+                    container_name,
+                    vec![
+                        "psql".to_string(),
+                        "-v".to_string(),
+                        "ON_ERROR_STOP=1".to_string(),
+                        "-U".to_string(),
+                        cfg.username.clone(),
+                        "-d".to_string(),
+                        database.to_string(),
+                        "-tAc".to_string(),
+                        "SELECT 1".to_string(),
+                    ],
+                    Some(vec![format!("PGPASSWORD={}", cfg.password)]),
+                )
+                .await;
+
+            if let Ok((exit_code, output)) = result {
+                last_exit = exit_code;
+                last_output = output;
+                if exit_code == Some(0) {
+                    return Ok(());
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        let logs = self.container_logs(container_name).await;
+        Err(format!(
+            "container '{}' failed psql readiness for database '{}' within {}s \
+             (last exit={:?}, output={}):\n{}",
+            container_name,
+            database,
+            timeout.as_secs(),
+            last_exit,
+            last_output.trim(),
+            logs
+        ))
+    }
+
+    async fn wait_for_container_healthy(
+        &self,
+        container_name: &str,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        let mut last_state = String::new();
+        let mut last_health = String::new();
+        let mut last_error = String::new();
+
+        while Instant::now() < deadline {
+            let inspect = match self
+                .docker
+                .inspect_container(
+                    container_name,
+                    None::<bollard::query_parameters::InspectContainerOptions>,
+                )
+                .await
+            {
+                Ok(inspect) => inspect,
+                Err(e) => {
+                    // Tolerate transient inspect errors (daemon hiccup, a
+                    // brief connection reset right after start_container)
+                    // the same way wait_for_psql_database tolerates
+                    // transient exec errors above -- retry until the
+                    // deadline instead of aborting the whole readiness wait
+                    // on one hiccup.
+                    last_error = e.to_string();
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
+            };
+
+            if let Some(state) = inspect.state {
+                last_state = state
+                    .status
+                    .map(|status| status.to_string())
+                    .unwrap_or_default();
+                last_health = state
+                    .health
+                    .and_then(|health| health.status)
+                    .map(|status| status.to_string())
+                    .unwrap_or_default();
+
+                if state.running == Some(false) || state.dead == Some(true) {
+                    let logs = self.container_logs(container_name).await;
+                    return Err(format!(
+                        "container '{}' stopped before becoming healthy \
+                         (state='{}', health='{}', exit={:?}, error={:?}):\n{}",
+                        container_name, last_state, last_health, state.exit_code, state.error, logs
+                    ));
+                }
+
+                if last_health == "healthy" {
+                    return Ok(());
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        let logs = self.container_logs(container_name).await;
+        Err(format!(
+            "container '{}' did not become healthy within {}s \
+             (last state='{}', health='{}', last inspect error='{}'):\n{}",
+            container_name,
+            timeout.as_secs(),
+            last_state,
+            last_health,
+            last_error,
+            logs
+        ))
+    }
+
+    async fn ensure_database_exists(
+        &self,
+        container_name: &str,
+        cfg: &PostgresConfig,
+    ) -> Result<(), String> {
+        let sql = format!(
+            "SELECT 1 FROM pg_database WHERE datname = {}",
+            Self::sql_string_literal(&cfg.database)
+        );
+        let cmd = format!(
+            "set -e; \
+             if psql -v ON_ERROR_STOP=1 -U {user} -d postgres -tAc {sql} | grep -q 1; then \
+               exit 0; \
+             fi; \
+             if createdb -U {user} {db} 2>/tmp/createdb.err; then \
+               exit 0; \
+             fi; \
+             psql -v ON_ERROR_STOP=1 -U {user} -d postgres -tAc {sql} | grep -q 1 \
+               || {{ cat /tmp/createdb.err >&2; exit 1; }}",
+            user = shell_escape(&cfg.username),
+            sql = shell_escape(&sql),
+            db = shell_escape(&cfg.database),
+        );
+        // A single exec here can race the postgres entrypoint's own
+        // transient init-phase server: `wait_for_psql_database` above only
+        // requires one successful `SELECT 1`, which can land against that
+        // temporary server moments before it's replaced by the final one.
+        // Retry for a short bounded window instead of failing the whole
+        // readiness phase on that one-shot race.
+        let timeout = Duration::from_secs(30);
+        let deadline = Instant::now() + timeout;
+        let (last_exit, last_output) = loop {
+            let attempt = self
+                .exec_in_container(
+                    container_name,
+                    vec!["sh".to_string(), "-lc".to_string(), cmd.clone()],
+                    Some(vec![format!("PGPASSWORD={}", cfg.password)]),
+                )
+                .await;
+
+            let (exit_code, output) = match attempt {
+                Ok((Some(0), _)) => return Ok(()),
+                Ok((exit_code, output)) => (exit_code, output),
+                Err(e) => (None, e),
+            };
+
+            if Instant::now() >= deadline {
+                break (exit_code, output);
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        };
+
+        let logs = self.container_logs(container_name).await;
+        Err(format!(
+            "failed to ensure database '{}' exists in '{}' within {}s \
+             (last exit={:?}, output={}):\n{}",
+            cfg.database,
+            container_name,
+            timeout.as_secs(),
+            last_exit,
+            last_output.trim(),
+            logs
+        ))
     }
 }
 
@@ -242,7 +497,15 @@ impl PostgresContainerLifecycle for PostgresLifecycleAdapter {
             healthcheck: Some(bollard::models::HealthConfig {
                 test: Some(vec![
                     "CMD-SHELL".to_string(),
-                    format!("pg_isready -U {}", cfg.username),
+                    // Without -d, pg_isready (via libpq) defaults the target
+                    // database to the username. For any service where
+                    // database != username, that's a nonexistent database,
+                    // so every healthcheck tick (interval=1s) logs a FATAL
+                    // "database does not exist" forever — pg_isready still
+                    // reports healthy (the server did respond), but the
+                    // container's logs fill up with noise for its entire
+                    // lifetime. Pin -d explicitly to the configured database.
+                    postgres_healthcheck_cmd(&cfg.username, &cfg.database),
                 ]),
                 interval: Some(1_000_000_000),
                 timeout: Some(3_000_000_000),
@@ -293,51 +556,21 @@ impl PostgresContainerLifecycle for PostgresLifecycleAdapter {
             .await
             .map_err(|e| format!("start_container({}) failed: {}", container_name, e))?;
 
-        // Block until Postgres accepts connections.
-        let deadline = Instant::now() + Duration::from_secs(120);
-        loop {
-            if Instant::now() > deadline {
-                return Err(format!(
-                    "container '{}' failed to become ready within 120s",
-                    container_name
-                ));
-            }
-            let exec = self
-                .docker
-                .create_exec(
-                    &container_name,
-                    bollard::models::ExecConfig {
-                        cmd: Some(vec![
-                            "pg_isready".to_string(),
-                            "-U".to_string(),
-                            cfg.username.clone(),
-                            "-d".to_string(),
-                            cfg.database.clone(),
-                        ]),
-                        attach_stdout: Some(true),
-                        attach_stderr: Some(true),
-                        ..Default::default()
-                    },
-                )
-                .await;
-            if let Ok(id) = exec {
-                // Drain the attached stream before inspect_exec, otherwise stdout
-                // backpressure stalls the exec and exit_code never surfaces.
-                use futures::StreamExt;
-                if let Ok(bollard::exec::StartExecResults::Attached { mut output, .. }) =
-                    self.docker.start_exec(&id.id, None).await
-                {
-                    while output.next().await.is_some() {}
-                }
-                let inspect = self.docker.inspect_exec(&id.id).await;
-                if let Ok(info) = inspect {
-                    if info.exit_code == Some(0) {
-                        break;
-                    }
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
+        // Block until Docker's healthcheck sees the final post-entrypoint
+        // server, then make sure the configured application database exists.
+        // A transient init server can accept SQL briefly before shutdown.
+        self.wait_for_container_healthy(&container_name, Duration::from_secs(120))
+            .await?;
+        self.wait_for_psql_database(&container_name, &cfg, "postgres", Duration::from_secs(120))
+            .await?;
+        self.ensure_database_exists(&container_name, &cfg).await?;
+        self.wait_for_psql_database(
+            &container_name,
+            &cfg,
+            &cfg.database,
+            Duration::from_secs(30),
+        )
+        .await?;
 
         Ok(())
     }
@@ -386,3 +619,8 @@ impl PostgresContainerLifecycle for PostgresLifecycleAdapter {
         Ok(())
     }
 }
+
+// `postgres_healthcheck_cmd`/`shell_escape` are shared with
+// `externalsvc::postgres`, which owns their unit tests
+// (`healthcheck_cmd_pins_database_when_it_differs_from_username`,
+// `healthcheck_cmd_escapes_single_quotes_in_username_and_database`).

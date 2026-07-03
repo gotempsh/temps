@@ -30,10 +30,12 @@ import {
 } from '@/components/ui/table'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { cn } from '@/lib/utils'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { format, formatDistanceToNow } from 'date-fns'
 import { AlarmClock, Check, CheckCircle2, X } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { toast } from 'sonner'
 
 const PAGE_SIZE = 20
@@ -103,7 +105,23 @@ export function Alarms() {
     setBreadcrumbs([{ label: 'Monitoring & Alerts' }, { label: 'Alarms' }])
   }, [setBreadcrumbs])
 
-  const [selectedProjectId, setSelectedProjectId] = useState<number | null>(null)
+  // Deep-link support (e.g. from an alert rule's per-series "View" link):
+  // `?project_id=` seeds the project selector so the target alarm is in scope,
+  // and `?alarm_id=` scrolls the matching row into view and highlights it.
+  const [searchParams] = useSearchParams()
+  const deepLinkAlarmId = useMemo(() => {
+    const raw = searchParams.get('alarm_id')
+    const n = raw ? Number(raw) : NaN
+    return Number.isFinite(n) ? n : null
+  }, [searchParams])
+
+  const [selectedProjectId, setSelectedProjectId] = useState<number | null>(
+    () => {
+      const raw = searchParams.get('project_id')
+      const n = raw ? Number(raw) : NaN
+      return Number.isFinite(n) ? n : null
+    },
+  )
   const [status, setStatus] = useState<string>(ALL)
   const [severity, setSeverity] = useState<string>(ALL)
   const [alarmType, setAlarmType] = useState<string>(ALL)
@@ -189,6 +207,14 @@ export function Alarms() {
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
   const hasFilters = status !== ALL || severity !== ALL || alarmType !== ALL
   const isMutating = acknowledge.isPending || resolve.isPending
+
+  // Once the deep-linked alarm's row is on the page, scroll it into view. The
+  // row itself keeps a persistent highlight (below) while the param is present.
+  useEffect(() => {
+    if (deepLinkAlarmId == null || items.length === 0) return
+    const el = document.querySelector(`[data-alarm-id="${deepLinkAlarmId}"]`)
+    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  }, [deepLinkAlarmId, items])
 
   const resetFilters = () => {
     setStatus(ALL)
@@ -388,7 +414,14 @@ export function Alarms() {
                 </TableRow>
               ) : (
                 items.map((alarm) => (
-                  <TableRow key={alarm.id}>
+                  <TableRow
+                    key={alarm.id}
+                    data-alarm-id={alarm.id}
+                    className={cn(
+                      deepLinkAlarmId === alarm.id &&
+                        'bg-primary/5 ring-1 ring-inset ring-primary/40',
+                    )}
+                  >
                     <TableCell>{severityBadge(alarm.severity)}</TableCell>
                     <TableCell>
                       <div className="font-medium">{alarm.title}</div>

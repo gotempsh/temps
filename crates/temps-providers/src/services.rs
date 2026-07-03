@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use temps_entities::{
     external_service_backups, external_service_health_checks, external_services, nodes,
-    project_services, projects, service_members,
+    postgres_major_upgrades, project_services, projects, service_members,
 };
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
@@ -43,6 +43,15 @@ pub enum ExternalServiceError {
 
     #[error("Failed to initialize service {id}: {reason}")]
     InitializationFailed { id: i32, reason: String },
+
+    /// A same-version `upgrade()` call was rejected before touching the
+    /// container (unsupported downgrade, or a major-version change that
+    /// must go through the dedicated upgrade orchestrator instead). Client
+    /// error, not a server failure -- kept distinct from
+    /// `InitializationFailed` so handlers can map it to 400 without
+    /// string-matching the message.
+    #[error("Upgrade rejected for service {id}: {reason}")]
+    UpgradeRejected { id: i32, reason: String },
 
     #[error("Failed to encrypt parameter '{param_name}' for service {service_id}: {reason}")]
     EncryptionFailed {
@@ -75,6 +84,16 @@ pub enum ExternalServiceError {
 
     #[error("Failed to start service {id}: {reason}")]
     StartFailed { id: i32, reason: String },
+
+    #[error(
+        "Service {id} has a major upgrade in progress (upgrade_id={upgrade_id}, phase={phase}); \
+         refusing to start/reconcile the container until it completes or is cancelled"
+    )]
+    UpgradeInProgress {
+        id: i32,
+        upgrade_id: i32,
+        phase: String,
+    },
 
     #[error("Failed to stop service {id}: {reason}")]
     StopFailed { id: i32, reason: String },
@@ -1471,6 +1490,7 @@ impl ExternalServiceManager {
             "Upgrading service {} to Docker image {}",
             service_id, new_docker_image
         );
+        self.ensure_no_active_upgrade(service_id).await?;
 
         let service = self.get_service(service_id).await?;
         let old_parameters = self.get_service_parameters(service_id).await?;
@@ -1525,13 +1545,29 @@ impl ExternalServiceManager {
         let service_instance =
             self.create_service_instance(service.name.clone(), service_type_enum);
 
-        // Call the upgrade method on the service instance
+        // Call the upgrade method on the service instance. `upgrade()`
+        // returns `anyhow::Result` (shared across every provider), so a
+        // same-version rejection is downcast here -- before the error is
+        // stringified below -- into a typed `UpgradeRejected` variant the
+        // handler can match on directly instead of substring-matching the
+        // message text.
         service_instance
             .upgrade(old_config, new_config.clone())
             .await
-            .map_err(|e| ExternalServiceError::InitializationFailed {
-                id: service_id,
-                reason: format!("Upgrade failed: {}", e),
+            .map_err(|e| {
+                if let Some(rejected) =
+                    e.downcast_ref::<crate::externalsvc::postgres::PostgresUpgradeRejected>()
+                {
+                    ExternalServiceError::UpgradeRejected {
+                        id: service_id,
+                        reason: rejected.to_string(),
+                    }
+                } else {
+                    ExternalServiceError::InitializationFailed {
+                        id: service_id,
+                        reason: format!("Upgrade failed: {}", e),
+                    }
+                }
             })?;
 
         // Update the service configuration in the database with the new Docker image
@@ -3926,6 +3962,7 @@ echo "[restore] Pre-seed complete"
 
     async fn initialize_service(&self, service_id: i32) -> Result<(), ExternalServiceError> {
         info!("Initializing service: {}", service_id);
+        self.ensure_no_active_upgrade(service_id).await?;
         let service = self.get_service(service_id).await?;
         let parameters = self.get_service_parameters(service_id).await?;
         let service_type_enum = ServiceType::from_str(&service.service_type).map_err(|_| {
@@ -6707,10 +6744,57 @@ echo "[restore] Pre-seed complete"
             .collect()
     }
 
+    /// Guard against reconciling/(re)starting or recreating a container
+    /// while a Postgres major upgrade (or its rollback) is actively working
+    /// on it. The upgrade orchestrator stops the container and
+    /// deletes/recreates its volumes across several phases
+    /// (`postgres_upgrade.rs`), and `rollback()` does the same in reverse;
+    /// a concurrent container mutation (start, reconcile, resource-limit
+    /// recreate, a same-version image swap) would recreate the container
+    /// against an implicitly re-created empty volume, silently diverging
+    /// from the volume the orchestrator/rollback is dumping/restoring —
+    /// accepting writes that never make it into the upgraded database.
+    ///
+    /// Called from every entry point that stops/recreates a service's
+    /// container: `start_service`, `initialize_service` (covers
+    /// `update_service`, service creation, and the resource-limit recreate
+    /// path), and the legacy same-version `upgrade_service`.
+    ///
+    /// PENDING/RUNNING/ROLLING_BACK rows are active; FAILED/COMPLETED/
+    /// CANCELLED/ROLLED_BACK are terminal and don't block a start.
+    async fn ensure_no_active_upgrade(&self, service_id: i32) -> Result<(), ExternalServiceError> {
+        use crate::externalsvc::postgres_upgrade::status;
+
+        let active = postgres_major_upgrades::Entity::find()
+            .filter(postgres_major_upgrades::Column::ServiceId.eq(service_id))
+            .filter(
+                postgres_major_upgrades::Column::Status
+                    .eq(status::PENDING)
+                    .or(postgres_major_upgrades::Column::Status.eq(status::RUNNING))
+                    .or(postgres_major_upgrades::Column::Status.eq(status::ROLLING_BACK)),
+            )
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| ExternalServiceError::DatabaseError {
+                reason: format!("failed to check for active major upgrade: {}", e),
+            })?;
+
+        if let Some(upgrade) = active {
+            return Err(ExternalServiceError::UpgradeInProgress {
+                id: service_id,
+                upgrade_id: upgrade.id,
+                phase: upgrade.phase,
+            });
+        }
+
+        Ok(())
+    }
+
     pub async fn start_service(
         &self,
         service_id: i32,
     ) -> Result<ExternalServiceInfo, ExternalServiceError> {
+        self.ensure_no_active_upgrade(service_id).await?;
         let service = self.get_service(service_id).await?;
         let service_type_enum = ServiceType::from_str(&service.service_type).map_err(|_| {
             ExternalServiceError::InvalidServiceType {
@@ -9401,6 +9485,145 @@ mod tests {
             dns_registry,
         ));
         (manager, test_db)
+    }
+
+    /// The core safety guard: only PENDING/RUNNING/ROLLING_BACK upgrade rows
+    /// block a start/reconcile; terminal statuses must NOT. A silent regression
+    /// in the status filter reopens the concurrent-container-mutation-vs-upgrade
+    /// race the guard exists to prevent. (Docker-gated only because the test DB
+    /// itself needs a container; the guard logic under test is pure Sea-ORM.)
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn ensure_no_active_upgrade_blocks_only_active_statuses() {
+        use crate::externalsvc::postgres_upgrade::status;
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+        use temps_entities::{postgres_major_upgrades, users};
+
+        let (manager, test_db) = setup_test_manager().await;
+        let port = get_unused_port();
+        let name = format!("guard-test-{}", chrono::Utc::now().timestamp_millis());
+        let mut params = HashMap::new();
+        params.insert(
+            "database".to_string(),
+            JsonValue::String("appdb".to_string()),
+        );
+        params.insert(
+            "username".to_string(),
+            JsonValue::String("appuser".to_string()),
+        );
+        params.insert(
+            "password".to_string(),
+            JsonValue::String("appsecret".to_string()),
+        );
+        params.insert("port".to_string(), JsonValue::String(port.to_string()));
+        params.insert(
+            "docker_image".to_string(),
+            JsonValue::String("postgres:17-bookworm".to_string()),
+        );
+        let svc = manager
+            .create_service(CreateExternalServiceRequest {
+                name,
+                service_type: ServiceType::Postgres,
+                version: Some("17".to_string()),
+                parameters: params,
+                node_id: None,
+                topology: "standalone".to_string(),
+                members: Vec::new(),
+            })
+            .await
+            .expect("create service");
+
+        let result = async {
+            // No upgrade row -> allowed.
+            manager
+                .ensure_no_active_upgrade(svc.id)
+                .await
+                .map_err(|e| format!("no upgrade row should allow: {e}"))?;
+
+            let now = chrono::Utc::now();
+            // A user row to satisfy postgres_major_upgrades.created_by -> users.id.
+            let user = users::ActiveModel {
+                name: Set("Guard Test".to_string()),
+                email: Set(format!(
+                    "guard-user-{}@test.local",
+                    now.timestamp_nanos_opt().unwrap_or(0)
+                )),
+                email_verified: Set(true),
+                mfa_enabled: Set(false),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            }
+            .insert(test_db.db.as_ref())
+            .await
+            .map_err(|e| format!("insert user: {e}"))?;
+
+            let row = postgres_major_upgrades::ActiveModel {
+                service_id: Set(svc.id),
+                from_version: Set("17".to_string()),
+                to_version: Set("18".to_string()),
+                from_image: Set("postgres:17-bookworm".to_string()),
+                to_image: Set("postgres:18-bookworm".to_string()),
+                status: Set(status::PENDING.to_string()),
+                phase: Set(status::PENDING.to_string()),
+                pre_upgrade_backup_id: Set(None),
+                log_id: Set(format!("guard-{}", svc.id)),
+                rollback_volume_name: Set(None),
+                rollback_volume_expires_at: Set(None),
+                error_message: Set(None),
+                attempt: Set(1),
+                started_at: Set(None),
+                finished_at: Set(None),
+                created_by: Set(user.id),
+                created_at: Set(now),
+                ..Default::default()
+            }
+            .insert(test_db.db.as_ref())
+            .await
+            .map_err(|e| format!("insert upgrade row: {e}"))?;
+
+            for st in [status::PENDING, status::RUNNING, status::ROLLING_BACK] {
+                let mut am: postgres_major_upgrades::ActiveModel = row.clone().into();
+                am.status = Set(st.to_string());
+                am.update(test_db.db.as_ref())
+                    .await
+                    .map_err(|e| format!("update status {st}: {e}"))?;
+                match manager.ensure_no_active_upgrade(svc.id).await {
+                    Err(ExternalServiceError::UpgradeInProgress { .. }) => {}
+                    other => return Err(format!("status {st} must block, got {other:?}")),
+                }
+            }
+
+            for st in [
+                status::FAILED,
+                status::COMPLETED,
+                status::CANCELLED,
+                status::ROLLED_BACK,
+            ] {
+                let mut am: postgres_major_upgrades::ActiveModel = row.clone().into();
+                am.status = Set(st.to_string());
+                am.update(test_db.db.as_ref())
+                    .await
+                    .map_err(|e| format!("update status {st}: {e}"))?;
+                manager
+                    .ensure_no_active_upgrade(svc.id)
+                    .await
+                    .map_err(|e| format!("terminal status {st} must not block: {e}"))?;
+            }
+
+            // A different service id is unaffected.
+            manager
+                .ensure_no_active_upgrade(svc.id + 100_000)
+                .await
+                .map_err(|e| format!("unrelated service must not block: {e}"))?;
+            Ok::<(), String>(())
+        }
+        .await;
+
+        let _ = manager.delete_service(svc.id).await;
+        if let Err(e) = result {
+            panic!("ensure_no_active_upgrade guard test failed: {e}");
+        }
     }
 
     #[cfg(feature = "docker-tests")]

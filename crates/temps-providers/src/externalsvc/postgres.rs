@@ -32,8 +32,77 @@ use super::{
 
 /// POSIX-safe shell escaping: wraps value in single quotes, escaping any
 /// embedded single quotes. Safe for use in `sh -c` command strings.
-fn shell_escape(s: &str) -> String {
+///
+/// Shared across the Postgres provider files (`postgres_upgrade`,
+/// `postgres_lifecycle`) instead of each keeping its own copy -- the drift
+/// between duplicated copies of this exact kind of string-builder is what
+/// caused the healthcheck bug this crate's `postgres_healthcheck_cmd` fixes.
+pub(crate) fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Rejections from same-version-only [`PostgresService::upgrade`]. The
+/// `ExternalService::upgrade` trait method returns `anyhow::Result<()>`
+/// across every provider, so this can't be a variant of a typed
+/// `Result<(), E>` without changing that trait's signature everywhere.
+/// Instead it's wrapped into the `anyhow::Error` via `?`/`.into()` so
+/// callers can `downcast_ref::<PostgresUpgradeRejected>()` for an exact,
+/// wording-independent match instead of matching on `e.to_string()`.
+#[derive(Debug, thiserror::Error)]
+pub enum PostgresUpgradeRejected {
+    #[error("Cannot downgrade PostgreSQL (from {from} to {to})")]
+    Downgrade { from: u32, to: u32 },
+
+    #[error(
+        "Cannot change PostgreSQL major version via this endpoint (from {from} to {to}). \
+         Use the major-version upgrade API (POST /external-services/{{id}}/upgrades) instead, \
+         which performs a real pg_dumpall/restore with a retained rollback volume and a \
+         mandatory pre-upgrade backup."
+    )]
+    MajorVersionChange { from: u32, to: u32 },
+}
+
+/// Builds the `pg_isready` healthcheck command pinned to the configured
+/// username/database. Without `-d`, `pg_isready` (via libpq) defaults the
+/// target database to the username, so any service where `database !=
+/// username` would log a FATAL on every healthcheck tick.
+///
+/// Shared with `postgres_lifecycle` so both container-creation sites build
+/// the exact same healthcheck command.
+pub(crate) fn postgres_healthcheck_cmd(username: &str, database: &str) -> String {
+    format!(
+        "pg_isready -U {} -d {}",
+        shell_escape(username),
+        shell_escape(database)
+    )
+}
+
+/// Validate a PostgreSQL role/username before it is interpolated into a
+/// shell command or SQL. Allows only `[A-Za-z0-9_]` (the realistic role-name
+/// charset), non-empty, and at most 63 bytes.
+///
+/// Defense-in-depth: the upgrade orchestrator already `shell_escape`s the
+/// username at every interpolation site, but rejecting shell/SQL
+/// metacharacters (quotes, `$`, `;`, spaces, backticks, …) up front means a
+/// crafted username can never reach a `sh -c` string or a `sed` program in
+/// the first place. Mirrors [`PostgresService::validate_database_name`], but
+/// permits uppercase since role names are commonly mixed-case.
+pub(crate) fn validate_pg_username(name: &str) -> std::result::Result<(), String> {
+    if name.is_empty() {
+        return Err("PostgreSQL username cannot be empty".to_string());
+    }
+    if name.len() > 63 {
+        return Err(format!(
+            "PostgreSQL username '{name}' exceeds the 63 character limit"
+        ));
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(format!(
+            "PostgreSQL username '{name}' contains invalid characters; only \
+             ASCII letters, digits, and underscores are allowed"
+        ));
+    }
+    Ok(())
 }
 
 /// Input configuration for creating a PostgreSQL service
@@ -449,7 +518,18 @@ impl PostgresService {
             healthcheck: Some(bollard::models::HealthConfig {
                 test: Some(vec![
                     "CMD-SHELL".to_string(),
-                    "pg_isready -U postgres".to_string(),
+                    // Without -d, pg_isready (via libpq) defaults the target
+                    // database to the username being checked. The hardcoded
+                    // "postgres" here was wrong for any service with a
+                    // non-default username/database (e.g. username="appuser",
+                    // database="appdb") — the postmaster would receive a
+                    // connection attempt for a role/database that doesn't
+                    // exist, logging a FATAL every interval (1s) forever.
+                    // pg_isready still reports healthy either way (the
+                    // server did respond), so this was invisible in the UI,
+                    // just a permanent log-spam leak. Use the real
+                    // configured username/database instead.
+                    postgres_healthcheck_cmd(&config.username, &config.database),
                 ]),
                 interval: Some(1000000000), // 1 second
                 timeout: Some(3000000000),  // 3 seconds
@@ -1242,293 +1322,6 @@ impl PostgresService {
     fn get_pgdata_path(docker_image: &str) -> Result<String> {
         let version = Self::extract_postgres_version(docker_image)?;
         Ok(format!("/var/lib/postgresql/{}/docker", version))
-    }
-
-    /// Run pg_upgrade to migrate data from old version to new version
-    /// Uses pg_dump/pg_restore for cross-architecture compatibility
-    async fn run_pg_upgrade(
-        &self,
-        _old_config: &PostgresConfig,
-        new_config: &PostgresConfig,
-        old_version: u32,
-        new_version: u32,
-    ) -> Result<()> {
-        info!(
-            "Running PostgreSQL upgrade from version {} to {} using pg_dump/pg_restore",
-            old_version, new_version
-        );
-
-        let container_name = self.get_container_name();
-        let volume_name = format!("{}_data", container_name);
-        let backup_volume = format!("{}_backup_{}", container_name, old_version);
-
-        // STEP 1: Create a backup of the original volume before attempting upgrade
-        info!("Creating backup of original data volume for recovery");
-
-        // Pull busybox image for backup and copy operations
-        info!("Pulling busybox image for backup operations");
-        self.docker
-            .create_image(
-                Some(bollard::query_parameters::CreateImageOptions {
-                    from_image: Some("busybox".to_string()),
-                    tag: Some("latest".to_string()),
-                    ..Default::default()
-                }),
-                None,
-                None,
-            )
-            .try_collect::<Vec<_>>()
-            .await
-            .context("Failed to pull busybox image")?;
-
-        self.docker
-            .create_volume(bollard::models::VolumeCreateRequest {
-                name: Some(backup_volume.clone()),
-                ..Default::default()
-            })
-            .await
-            .context("Failed to create backup volume")?;
-
-        // Copy original data to backup
-        let backup_container_name = format!("{}_backup_copy", container_name);
-        let backup_config = bollard::models::ContainerCreateBody {
-            image: Some("busybox:latest".to_string()),
-            entrypoint: Some(vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                "cp -r /src/* /dest/ && sync".to_string(),
-            ]),
-            host_config: Some(bollard::models::HostConfig {
-                mounts: Some(vec![
-                    bollard::models::Mount {
-                        target: Some("/src".to_string()),
-                        source: Some(volume_name.clone()),
-                        typ: Some(bollard::models::MountTypeEnum::VOLUME),
-                        ..Default::default()
-                    },
-                    bollard::models::Mount {
-                        target: Some("/dest".to_string()),
-                        source: Some(backup_volume.clone()),
-                        typ: Some(bollard::models::MountTypeEnum::VOLUME),
-                        ..Default::default()
-                    },
-                ]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        let backup_container = self
-            .docker
-            .create_container(
-                Some(
-                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
-                        .name(&backup_container_name)
-                        .build(),
-                ),
-                backup_config,
-            )
-            .await
-            .context("Failed to create backup container")?;
-
-        self.docker
-            .start_container(
-                &backup_container.id,
-                None::<bollard::query_parameters::StartContainerOptions>,
-            )
-            .await
-            .context("Failed to start backup container")?;
-
-        // Wait for backup to complete
-        let backup_result = self
-            .docker
-            .wait_container(
-                &backup_container.id,
-                None::<bollard::query_parameters::WaitContainerOptions>,
-            )
-            .try_collect::<Vec<_>>()
-            .await;
-
-        // Clean up backup container
-        let _ = self
-            .docker
-            .remove_container(
-                &backup_container_name,
-                Some(bollard::query_parameters::RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
-            )
-            .await;
-
-        backup_result.context("Backup process failed")?;
-        info!("Backup completed: {}", backup_volume);
-
-        // STEP 2: Create volume for upgraded data
-        let newdata_volume = format!("{}_newdata", container_name);
-        self.docker
-            .create_volume(bollard::models::VolumeCreateRequest {
-                name: Some(newdata_volume.clone()),
-                ..Default::default()
-            })
-            .await
-            .context("Failed to create newdata volume")?;
-
-        // STEP 3: Clean up volumes and remove old container
-        info!("Removing old PostgreSQL {} container", old_version);
-        let _ = self
-            .docker
-            .stop_container(&container_name, None::<StopContainerOptions>)
-            .await;
-
-        let remove_result = self
-            .docker
-            .remove_container(
-                &container_name,
-                Some(bollard::query_parameters::RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
-            )
-            .await;
-
-        if let Err(e) = remove_result {
-            let error_msg = e.to_string();
-            if !error_msg.contains("No such container") {
-                info!("Note: Failed to remove old container: {}", error_msg);
-            }
-        }
-
-        // Wait a moment for the container to be fully removed
-        sleep(Duration::from_millis(500)).await;
-
-        // Remove the old data volume - we'll create a fresh one with v17
-        info!("Removing old data volume for upgrade");
-        let _ = self
-            .docker
-            .remove_volume(
-                &volume_name,
-                None::<bollard::query_parameters::RemoveVolumeOptions>,
-            )
-            .await;
-
-        sleep(Duration::from_millis(500)).await;
-
-        // Pull the new PostgreSQL image
-        info!("Pulling postgres:{}-alpine", new_version);
-        self.docker
-            .create_image(
-                Some(bollard::query_parameters::CreateImageOptions {
-                    from_image: Some("postgres".to_string()),
-                    tag: Some(format!("{}-alpine", new_version)),
-                    ..Default::default()
-                }),
-                None,
-                None,
-            )
-            .try_collect::<Vec<_>>()
-            .await?;
-
-        // STEP 4: Create fresh v17 container - the actual upgrade happens
-        // The PostgreSQL server will automatically migrate data when it starts
-        // if the data format is compatible or will initialize fresh otherwise
-        info!(
-            "Creating new PostgreSQL {} container with fresh volume",
-            new_version
-        );
-
-        // Now create the final v17 container with the upgraded data
-        info!("Creating final PostgreSQL {} container", new_version);
-        let new_docker_image = format!("postgres:{}-alpine", new_version);
-        let pgdata_path = Self::get_pgdata_path(&new_docker_image)
-            .map_err(|e| anyhow::anyhow!("Failed to determine PGDATA path: {}", e))?;
-
-        let final_container_config = bollard::models::ContainerCreateBody {
-            image: Some(new_docker_image),
-            env: Some(vec![
-                "POSTGRES_HOST_AUTH_METHOD=md5".to_string(),
-                format!("POSTGRES_USER=postgres"),
-                format!("POSTGRES_PASSWORD={}", new_config.password),
-                format!("PGDATA={}", pgdata_path),
-            ]),
-            cmd: Some(vec![
-                "postgres".to_string(),
-                "-c".to_string(),
-                format!("max_connections={}", new_config.max_connections),
-            ]),
-            host_config: Some(bollard::models::HostConfig {
-                mounts: Some(vec![bollard::models::Mount {
-                    // Always mount at /var/lib/postgresql - PGDATA env var controls subdirectory
-                    target: Some("/var/lib/postgresql".to_string()),
-                    source: Some(volume_name.clone()),
-                    typ: Some(bollard::models::MountTypeEnum::VOLUME),
-                    read_only: Some(false),
-                    ..Default::default()
-                }]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        let final_container = self
-            .docker
-            .create_container(
-                Some(
-                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
-                        .name(&container_name) // Use original service name
-                        .build(),
-                ),
-                final_container_config,
-            )
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(format!(
-                    "Failed to create final postgres:{} container: {}",
-                    new_version, e
-                ))
-            })?;
-
-        self.docker
-            .start_container(
-                &final_container.id,
-                None::<bollard::query_parameters::StartContainerOptions>,
-            )
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(format!(
-                    "Failed to start final postgres:{} container: {}",
-                    new_version, e
-                ))
-            })?;
-
-        // Wait for final container to be ready
-        info!(
-            "Waiting for PostgreSQL {} container to be ready...",
-            new_version
-        );
-        sleep(Duration::from_secs(3)).await;
-
-        // Keep the upgraded v17 container running - it replaces the old v16 container
-        info!(
-            "PostgreSQL {} container is now running and ready to use",
-            new_version
-        );
-
-        // Clean up temporary volumes
-        let _ = self
-            .docker
-            .remove_volume(
-                &newdata_volume,
-                None::<bollard::query_parameters::RemoveVolumeOptions>,
-            )
-            .await;
-
-        info!(
-            "Upgrade complete. PostgreSQL has been upgraded from v{} to v{}",
-            old_version, new_version
-        );
-
-        Ok(())
     }
 
     async fn restore_backup_file(
@@ -3352,11 +3145,33 @@ impl ExternalService for PostgresService {
         );
 
         if old_version > new_version {
-            return Err(anyhow::anyhow!(
-                "Cannot downgrade PostgreSQL (from {} to {})",
-                old_version,
-                new_version
-            ));
+            return Err(PostgresUpgradeRejected::Downgrade {
+                from: old_version,
+                to: new_version,
+            }
+            .into());
+        }
+
+        // Major version upgrades (e.g. 17 -> 18) are handled exclusively by
+        // the dedicated PostgresUpgradeOrchestrator via
+        // `POST /external-services/{id}/upgrades` (plural). That path does a
+        // real pg_dumpall/restore with a retained rollback volume and a
+        // mandatory pre-upgrade S3 backup. This same-version-only `upgrade()`
+        // used to also handle major-version bumps itself (`run_pg_upgrade`),
+        // but that implementation never actually migrated data — it deleted
+        // the live volume, kept an unused raw-file copy in a `_backup_N`
+        // volume, and booted a brand-new empty cluster hardcoded to
+        // `postgres:{version}-alpine` with `POSTGRES_USER=postgres`,
+        // silently discarding the real configured username/database/data
+        // while reporting success. Refuse here instead of repeating that;
+        // nothing has been touched yet (no stop, no volume changes), so this
+        // is a safe no-op rejection, not a partial failure.
+        if old_version != new_version {
+            return Err(PostgresUpgradeRejected::MajorVersionChange {
+                from: old_version,
+                to: new_version,
+            }
+            .into());
         }
 
         // Verify the new image can be pulled BEFORE stopping the old container
@@ -3368,40 +3183,27 @@ impl ExternalService for PostgresService {
             .await?;
         info!("New Docker image verified and is available");
 
-        if old_version == new_version {
-            // Same major version — image swap only (e.g., postgres:18 -> gotempsh/postgres-walg:18).
-            // No pg_upgrade needed. Just recreate the container with the new image;
-            // data is preserved on the Docker volume.
-            if old_pg_config.docker_image == new_pg_config.docker_image {
-                return Err(anyhow::anyhow!(
-                    "New image is identical to current image ({})",
-                    old_pg_config.docker_image
-                ));
-            }
-            info!(
-                "Same PostgreSQL major version ({}), swapping image without pg_upgrade",
-                old_version
-            );
-            self.stop().await?;
-            let limits = self.resource_limits.read().await.clone();
-            // Preserve archiving state across the image swap by reading
-            // `walg.env` from the existing volume — same rule as `start()`.
-            let enable_archiving = self.compute_desired_enable_archiving().await;
-            self.create_container(&self.docker, &new_pg_config, &limits, enable_archiving)
-                .await?;
-            info!("PostgreSQL image swap completed successfully");
-        } else {
-            // Major version upgrade — requires pg_upgrade
-            info!("Major version upgrade, running pg_upgrade");
-            self.stop().await?;
-            self.run_pg_upgrade(&old_pg_config, &new_pg_config, old_version, new_version)
-                .await?;
-            let limits = self.resource_limits.read().await.clone();
-            let enable_archiving = self.compute_desired_enable_archiving().await;
-            self.create_container(&self.docker, &new_pg_config, &limits, enable_archiving)
-                .await?;
-            info!("PostgreSQL major version upgrade completed successfully");
+        // Same major version — image swap only (e.g., postgres:18 -> gotempsh/postgres-walg:18).
+        // No pg_upgrade needed. Just recreate the container with the new image;
+        // data is preserved on the Docker volume.
+        if old_pg_config.docker_image == new_pg_config.docker_image {
+            return Err(anyhow::anyhow!(
+                "New image is identical to current image ({})",
+                old_pg_config.docker_image
+            ));
         }
+        info!(
+            "Same PostgreSQL major version ({}), swapping image without pg_upgrade",
+            old_version
+        );
+        self.stop().await?;
+        let limits = self.resource_limits.read().await.clone();
+        // Preserve archiving state across the image swap by reading
+        // `walg.env` from the existing volume — same rule as `start()`.
+        let enable_archiving = self.compute_desired_enable_archiving().await;
+        self.create_container(&self.docker, &new_pg_config, &limits, enable_archiving)
+            .await?;
+        info!("PostgreSQL image swap completed successfully");
 
         Ok(())
     }
@@ -3801,6 +3603,18 @@ mod tests {
     use super::*;
 
     use crate::externalsvc::DEPLOYMENT_MODE_MUTEX as ENV_MUTEX;
+
+    #[test]
+    fn healthcheck_cmd_pins_database_when_it_differs_from_username() {
+        let cmd = postgres_healthcheck_cmd("appuser", "appdb");
+        assert_eq!(cmd, "pg_isready -U 'appuser' -d 'appdb'");
+    }
+
+    #[test]
+    fn healthcheck_cmd_escapes_single_quotes_in_username_and_database() {
+        let cmd = postgres_healthcheck_cmd("a'user", "a'db");
+        assert_eq!(cmd, "pg_isready -U 'a'\\''user' -d 'a'\\''db'");
+    }
 
     #[test]
     fn test_postgres_input_config_default_values() {
@@ -4236,10 +4050,22 @@ mod tests {
 
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
-    async fn test_postgres_v17_to_v18_actual_upgrade() {
-        // This test creates a real PostgreSQL 17 container, upgrades it to v18,
-        // and verifies the upgrade by checking the version via SQL
-        // Note: Requires Docker to be running
+    async fn test_postgres_v17_to_v18_upgrade_rejected_and_data_survives() {
+        // `ExternalService::upgrade()` used to attempt major-version bumps
+        // itself via a broken `run_pg_upgrade` that deleted the live volume
+        // and booted a brand-new empty cluster hardcoded to
+        // `postgres:{version}-alpine` / `POSTGRES_USER=postgres` — silently
+        // discarding the real data while reporting success. The old version
+        // of this test only asserted `SELECT version()` on the post-upgrade
+        // container, which is exactly why that data loss went unnoticed: it
+        // never checked that pre-upgrade data was still there.
+        //
+        // `upgrade()` now refuses any major-version change outright and
+        // points callers at the dedicated orchestrator
+        // (`POST /external-services/{id}/upgrades`, `postgres_upgrade.rs`).
+        // This test asserts that refusal, and — the part the original test
+        // was missing — that the v17 container and its data are completely
+        // untouched afterward.
 
         let docker = match Docker::connect_with_defaults() {
             Ok(d) => Arc::new(d),
@@ -4274,7 +4100,9 @@ mod tests {
             parameters: v17_params,
         };
 
-        // Create v18 service configuration
+        // Create v18 service configuration (used only as the `upgrade()`
+        // target — the call is expected to be rejected before touching
+        // anything).
         let v18_params = serde_json::json!({
             "host": "localhost",
             "port": port.to_string(),
@@ -4325,7 +4153,8 @@ mod tests {
             }
         }
 
-        // Connect and verify v17 version
+        // Connect, verify v17 version, and seed a marker row we can check
+        // for survival after the rejected upgrade attempt.
         let connection_string = format!(
             "postgresql://postgres:{}@127.0.0.1:{}/postgres",
             urlencoding::encode(password),
@@ -4383,48 +4212,44 @@ mod tests {
             version_v17.0
         );
 
-        // Close connection pool before upgrade
+        sqlx::query("CREATE TABLE upgrade_survives_marker (id int PRIMARY KEY, note text)")
+            .execute(&db_pool)
+            .await
+            .expect("failed to create marker table");
+        sqlx::query("INSERT INTO upgrade_survives_marker (id, note) VALUES (1, 'pre-upgrade')")
+            .execute(&db_pool)
+            .await
+            .expect("failed to insert marker row");
+
         db_pool.close().await;
 
-        // Perform the upgrade
-        match v17_service
+        // Attempt the major-version upgrade via `upgrade()` — must be
+        // rejected, not attempted.
+        let upgrade_result = v17_service
             .upgrade(v17_config.clone(), v18_config.clone())
-            .await
-        {
+            .await;
+
+        let err = match upgrade_result {
             Ok(_) => {
-                println!("pg_upgrade completed successfully");
-            }
-            Err(e) => {
-                // Cleanup before panicking
                 let _ = v17_service.remove().await;
-                panic!("Failed to upgrade PostgreSQL from v17 to v18: {}", e);
+                panic!(
+                    "upgrade() must reject a major-version change (17 -> 18) instead of \
+                     attempting it directly; use the dedicated orchestrator instead"
+                );
             }
-        }
+            Err(e) => e,
+        };
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("Cannot change PostgreSQL major version"),
+            "expected rejection to name the major-version-change restriction, got: {}",
+            err_msg
+        );
 
-        // Give the upgraded container time to start and initialize
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-
-        // Create v18 service to check health
-        let v18_service = PostgresService::new(service_name.clone(), docker.clone());
-
-        // Wait for v18 PostgreSQL to be healthy
-        retries = 0;
-        loop {
-            match v18_service.health_check().await {
-                Ok(healthy) if healthy => break,
-                _ if retries < 60 => {
-                    retries += 1;
-                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                }
-                _ => {
-                    println!("PostgreSQL 18 failed to start after 60 retries (30 seconds)");
-                    let _ = v18_service.remove().await;
-                    return;
-                }
-            }
-        }
-
-        // Connect and verify v18 version with retries
+        // Nothing should have been touched: same container, same image,
+        // same data. Re-verify against the ORIGINAL v17 service handle —
+        // if `upgrade()` had stopped/replaced the container despite
+        // rejecting, this reconnect would fail or return a different image.
         let mut db_pool = None;
         for attempt in 0..10 {
             match sqlx::postgres::PgPoolOptions::new()
@@ -4437,53 +4262,44 @@ mod tests {
                     break;
                 }
                 Err(e) if attempt < 9 => {
-                    println!(
-                        "V18 connection attempt {} failed: {}. Retrying...",
-                        attempt + 1,
-                        e
-                    );
                     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    let _ = e;
                 }
                 Err(e) => {
-                    println!(
-                        "Failed to connect to v18 PostgreSQL after 10 attempts: {}. Skipping test",
+                    let _ = v17_service.remove().await;
+                    panic!(
+                        "container should still be reachable on v17 after a rejected upgrade, \
+                         but reconnect failed: {}",
                         e
                     );
-                    let _ = v18_service.remove().await;
-                    return;
                 }
             }
         }
-
         let db_pool = db_pool.unwrap();
 
-        let version_v18: (String,) =
-            match sqlx::query_as("SELECT version()").fetch_one(&db_pool).await {
-                Ok(v) => v,
-                Err(e) => {
-                    println!("Failed to query version from v18: {}. Skipping test", e);
-                    db_pool.close().await;
-                    let _ = v18_service.remove().await;
-                    return;
-                }
-            };
-
-        println!("PostgreSQL 18 version: {}", version_v18.0);
+        let version_after: (String,) = sqlx::query_as("SELECT version()")
+            .fetch_one(&db_pool)
+            .await
+            .expect("version query should still work against the untouched v17 container");
         assert!(
-            version_v18.0.contains("18"),
-            "Version should contain '18', got: {}",
-            version_v18.0
+            version_after.0.contains("17"),
+            "container must still be on v17 after a rejected upgrade, got: {}",
+            version_after.0
         );
 
-        // Verify upgrade was successful
-        println!("PostgreSQL upgrade test passed!");
-        println!("  Before: {}", version_v17.0);
-        println!("  After:  {}", version_v18.0);
+        let marker: (i32, String) =
+            sqlx::query_as("SELECT id, note FROM upgrade_survives_marker WHERE id = 1")
+                .fetch_one(&db_pool)
+                .await
+                .expect("marker row must survive a rejected upgrade attempt");
+        assert_eq!(marker.1, "pre-upgrade");
+
+        println!("Major-version upgrade correctly rejected; v17 data intact.");
 
         // Cleanup
         db_pool.close().await;
-        let _ = v18_service.stop().await;
-        let _ = v18_service.remove().await;
+        let _ = v17_service.stop().await;
+        let _ = v17_service.remove().await;
     }
 
     #[test]
@@ -5106,6 +4922,57 @@ mod tests {
     }
 
     // ── Database Name SQL Injection Prevention Tests ─────────────────
+
+    #[test]
+    fn postgres_upgrade_rejected_roundtrips_through_anyhow() {
+        // `ExternalServiceManager::upgrade_service` downcasts the anyhow error
+        // back to this typed variant to map it to HTTP 400. Guard that the type
+        // stays downcastable (a 'static std::error::Error) through the
+        // `?`/`.into()` path — if it stopped being downcastable the response
+        // would silently degrade to 500.
+        let mv: anyhow::Error =
+            PostgresUpgradeRejected::MajorVersionChange { from: 17, to: 18 }.into();
+        assert!(matches!(
+            mv.downcast_ref::<PostgresUpgradeRejected>(),
+            Some(PostgresUpgradeRejected::MajorVersionChange { from: 17, to: 18 })
+        ));
+        assert!(mv
+            .to_string()
+            .contains("Cannot change PostgreSQL major version"));
+
+        let dg: anyhow::Error = PostgresUpgradeRejected::Downgrade { from: 18, to: 17 }.into();
+        assert!(matches!(
+            dg.downcast_ref::<PostgresUpgradeRejected>(),
+            Some(PostgresUpgradeRejected::Downgrade { .. })
+        ));
+        assert!(dg.to_string().contains("Cannot downgrade PostgreSQL"));
+    }
+
+    #[test]
+    fn test_validate_pg_username_accepts_realistic_names() {
+        assert!(validate_pg_username("postgres").is_ok());
+        assert!(validate_pg_username("appuser").is_ok());
+        assert!(validate_pg_username("My_User123").is_ok());
+        assert!(validate_pg_username("_svc").is_ok());
+        assert!(validate_pg_username(&"a".repeat(63)).is_ok());
+    }
+
+    #[test]
+    fn test_validate_pg_username_rejects_shell_and_sed_injection() {
+        // Empty / too long.
+        assert!(validate_pg_username("").is_err());
+        assert!(validate_pg_username(&"a".repeat(64)).is_err());
+        // The exact break-out vector for the phase_restore sed filter: a
+        // single quote closes the sed program's quoting.
+        assert!(validate_pg_username("admin'").is_err());
+        assert!(validate_pg_username("a'$(id)#").is_err());
+        // Other shell/SQL metacharacters.
+        assert!(validate_pg_username("u;drop").is_err());
+        assert!(validate_pg_username("a b").is_err());
+        assert!(validate_pg_username("a`b`").is_err());
+        assert!(validate_pg_username("a$b").is_err());
+        assert!(validate_pg_username("a-b").is_err());
+    }
 
     #[test]
     fn test_validate_database_name_valid_names() {

@@ -48,6 +48,7 @@ import {
   ArrowDown,
   ArrowUp,
   ArrowUpDown,
+  Bot,
   Check,
   ChevronLeft,
   ChevronRight,
@@ -642,10 +643,12 @@ export default function TracesList({ project }: TracesListProps) {
     const p = searchParams.get('page')
     return p ? parseInt(p, 10) : 1
   })
-  // Server-side sort. Default mirrors the backend: newest traces first.
-  const [sortBy, setSortBy] = useState<'start_time' | 'duration'>(() =>
-    searchParams.get('sort') === 'duration' ? 'duration' : 'start_time',
-  )
+  // Server-side sort. Three states per column: desc → asc → unsorted (`null`),
+  // where unsorted reverts to the backend default (newest traces first).
+  const [sortBy, setSortBy] = useState<'start_time' | 'duration' | null>(() => {
+    const s = searchParams.get('sort')
+    return s === 'duration' ? 'duration' : s === 'none' ? null : 'start_time'
+  })
   const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>(() =>
     searchParams.get('dir') === 'asc' ? 'asc' : 'desc',
   )
@@ -709,25 +712,31 @@ export default function TracesList({ project }: TracesListProps) {
     if (environmentId !== 'all') params.set('env', environmentId)
     if (deploymentId !== 'all') params.set('deploy', deploymentId)
     if (page > 1) params.set('page', page.toString())
-    if (sortBy !== 'start_time') params.set('sort', sortBy)
-    if (sortOrder !== 'desc') params.set('dir', sortOrder)
+    if (sortBy === null) params.set('sort', 'none')
+    else if (sortBy !== 'start_time') params.set('sort', sortBy)
+    if (sortBy !== null && sortOrder !== 'desc') params.set('dir', sortOrder)
     setSearchParams(params, { replace: true })
   }, [timeRange, serviceName, status, debouncedSearch, debouncedNamePattern, environmentId, deploymentId, page, sortBy, sortOrder, setSearchParams])
 
-  // Toggle sort on a column header. Clicking the active column flips direction;
-  // clicking a new column selects it (duration starts desc = slowest first,
-  // timestamp starts desc = newest first — the most useful default each way).
+  // Cycle sort on a column header through three states: clicking a new column
+  // selects it descending; clicking the active column goes desc → asc → unsorted
+  // (removing the sort reverts to the backend default, newest-first).
   const handleSort = useCallback(
     (field: 'start_time' | 'duration') => {
       if (sortBy === field) {
-        setSortOrder((d) => (d === 'desc' ? 'asc' : 'desc'))
+        if (sortOrder === 'desc') {
+          setSortOrder('asc')
+        } else {
+          setSortBy(null)
+          setSortOrder('desc')
+        }
       } else {
         setSortBy(field)
         setSortOrder('desc')
       }
       setPage(1)
     },
-    [sortBy],
+    [sortBy, sortOrder],
   )
 
   // Breadcrumbs
@@ -754,8 +763,8 @@ export default function TracesList({ project }: TracesListProps) {
           environmentId !== 'all' ? Number(environmentId) : undefined,
         deployment_id:
           deploymentId !== 'all' ? Number(deploymentId) : undefined,
-        sort_by: sortBy,
-        sort_order: sortOrder,
+        sort_by: sortBy ?? undefined,
+        sort_order: sortBy ? sortOrder : undefined,
         limit: PAGE_SIZE,
         offset: (page - 1) * PAGE_SIZE,
       },
@@ -865,6 +874,17 @@ export default function TracesList({ project }: TracesListProps) {
             disabled={isFetching}
           >
             <RefreshCw className={`h-4 w-4 ${isFetching ? 'animate-spin' : ''}`} />
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className="gap-2"
+            onClick={() =>
+              navigate(`/projects/${project.slug}/ai-gateway?tab=activity`)
+            }
+          >
+            <Bot className="h-3.5 w-3.5" />
+            <span className="hidden sm:inline">AI Traces</span>
           </Button>
           <Button
             variant="outline"

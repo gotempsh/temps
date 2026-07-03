@@ -1,9 +1,16 @@
 import { LogSeverity, ProjectResponse } from '@/api/client'
 import {
+  getCrossProjectTraceSiblingsOptions,
   getTraceOptions,
+  getUnifiedTraceOptions,
   queryLogsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
-import type { LogRecord, SpanRecord } from '@/api/client/types.gen'
+import type {
+  CrossProjectSiblingRef,
+  LogRecord,
+  ProjectRef,
+  SpanRecord,
+} from '@/api/client/types.gen'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -28,97 +35,34 @@ import {
 } from '@/components/ui/tabs'
 import { useAssistantPageContext } from '@/components/ai/AiAssistantContext'
 import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from '@/components/ui/tooltip'
+  SpanWaterfall,
+  formatDuration,
+  formatTimestamp,
+  kindLabel,
+  serviceColor,
+  statusIcon,
+} from '@/components/traces/SpanWaterfall'
+import { ProjectBadge } from '@/components/traces/ProjectBadge'
+import { TraceStatBadges } from '@/components/traces/TraceStatBadges'
+import { buildSpanTree, flattenTree } from '@/utils/spanTree'
+import type { SpanTreeNode } from '@/utils/spanTree'
 import { cn } from '@/lib/utils'
 import { useQuery } from '@tanstack/react-query'
 import {
   ArrowLeft,
-  ChevronDown,
   ChevronRight,
   Clock,
   AlertCircle,
-  CheckCircle2,
-  XCircle,
+  Info,
+  Layers,
   RefreshCw,
+  Bot,
 } from 'lucide-react'
-import { useMemo, useState } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useCallback, useMemo, type ReactNode } from 'react'
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 
 interface TraceDetailProps {
   project: ProjectResponse
-}
-
-interface SpanTreeNode {
-  span: SpanRecord
-  children: SpanTreeNode[]
-  depth: number
-}
-
-// Build a tree of spans from flat list using parent_span_id
-function buildSpanTree(spans: SpanRecord[]): SpanTreeNode[] {
-  const spanMap = new Map<string, SpanTreeNode>()
-  const roots: SpanTreeNode[] = []
-
-  // Create nodes
-  for (const span of spans) {
-    spanMap.set(span.span_id, { span, children: [], depth: 0 })
-  }
-
-  // Build tree
-  for (const span of spans) {
-    const node = spanMap.get(span.span_id)!
-    if (span.parent_span_id && spanMap.has(span.parent_span_id)) {
-      const parent = spanMap.get(span.parent_span_id)!
-      node.depth = parent.depth + 1
-      parent.children.push(node)
-    } else {
-      roots.push(node)
-    }
-  }
-
-  // Sort children by start_time
-  function sortChildren(node: SpanTreeNode) {
-    node.children.sort(
-      (a, b) =>
-        new Date(a.span.start_time).getTime() -
-        new Date(b.span.start_time).getTime()
-    )
-    node.children.forEach(sortChildren)
-  }
-  roots.sort(
-    (a, b) =>
-      new Date(a.span.start_time).getTime() -
-      new Date(b.span.start_time).getTime()
-  )
-  roots.forEach(sortChildren)
-
-  return roots
-}
-
-// Flatten tree into ordered list for rendering
-function flattenTree(nodes: SpanTreeNode[]): SpanTreeNode[] {
-  const result: SpanTreeNode[] = []
-  function walk(node: SpanTreeNode) {
-    result.push(node)
-    node.children.forEach(walk)
-  }
-  nodes.forEach(walk)
-  return result
-}
-
-function statusIcon(status?: string) {
-  switch (status?.toUpperCase()) {
-    case 'ERROR':
-      return <XCircle className="h-3.5 w-3.5 text-red-500" />
-    case 'OK':
-      return <CheckCircle2 className="h-3.5 w-3.5 text-green-500" />
-    default:
-      return null
-  }
 }
 
 function logSeverityBadge(severity: LogSeverity, text?: string) {
@@ -151,56 +95,6 @@ function statusBadgeVariant(
     default:
       return 'secondary'
   }
-}
-
-function kindLabel(kind?: string): string {
-  switch (kind) {
-    case 'Server':
-      return 'SERVER'
-    case 'Client':
-      return 'CLIENT'
-    case 'Producer':
-      return 'PRODUCER'
-    case 'Consumer':
-      return 'CONSUMER'
-    case 'Internal':
-      return 'INTERNAL'
-    default:
-      return kind || 'UNSPECIFIED'
-  }
-}
-
-function formatDuration(ms: number): string {
-  if (ms < 1) return `${(ms * 1000).toFixed(0)}µs`
-  if (ms < 1000) return `${ms.toFixed(1)}ms`
-  return `${(ms / 1000).toFixed(2)}s`
-}
-
-function formatTimestamp(ts: string): string {
-  const d = new Date(ts)
-  return d.toLocaleString(undefined, {
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-  })
-}
-
-// Stable per-service colour (Datadog/OpenObserve colour-code spans by service).
-const SERVICE_COLORS = [
-  '#6366f1', // indigo
-  '#10b981', // emerald
-  '#f59e0b', // amber
-  '#ec4899', // pink
-  '#06b6d4', // cyan
-  '#8b5cf6', // violet
-  '#ef4444', // red
-  '#14b8a6', // teal
-]
-function serviceColor(name?: string): string {
-  if (!name) return '#94a3b8'
-  let h = 0
-  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) | 0
-  return SERVICE_COLORS[Math.abs(h) % SERVICE_COLORS.length]
 }
 
 /** Full detail for one span — reused by every layout (drawer, side panel, or
@@ -376,132 +270,40 @@ function SpanDetailBody({
   )
 }
 
-/** Shared span waterfall (tree + timeline bars). `colorBy="service"` colours each
- *  bar by its service and shows a service dot, like OpenObserve/Datadog. */
-function SpanWaterfall({
-  flatSpans,
-  traceStart,
-  traceEnd,
-  traceDuration,
-  selectedSpanId,
-  onSelect,
-  colorBy = 'status',
-  className,
-}: {
-  flatSpans: SpanTreeNode[]
-  traceStart: number
-  traceEnd: number
-  traceDuration: number
-  selectedSpanId: string | null
-  onSelect: (spanId: string | null) => void
-  colorBy?: 'status' | 'service'
-  className?: string
-}) {
-  return (
-    <div className={cn('overflow-auto', className)}>
-      <div className="sticky top-0 z-10 flex min-w-[420px] items-center border-b bg-background px-4 py-2 text-xs text-muted-foreground sm:min-w-[500px]">
-        <div className="w-[120px] shrink-0 sm:w-[180px] md:w-[280px]">Span Name</div>
-        <div className="flex flex-1 justify-between">
-          <span>{formatTimestamp(new Date(traceStart).toISOString())}</span>
-          <span>{formatDuration(traceDuration)}</span>
-          <span>{formatTimestamp(new Date(traceEnd).toISOString())}</span>
-        </div>
-      </div>
-      {flatSpans.map((node) => {
-        const spanStart = new Date(node.span.start_time).getTime() - traceStart
-        const spanDuration =
-          new Date(node.span.end_time).getTime() -
-          new Date(node.span.start_time).getTime()
-        const maxBarPct = 92
-        const leftPct = traceDuration > 0 ? (spanStart / traceDuration) * maxBarPct : 0
-        const widthPct =
-          traceDuration > 0
-            ? Math.max((spanDuration / traceDuration) * maxBarPct, 0.5)
-            : maxBarPct
-        const isError = node.span.status_code?.toUpperCase() === 'ERROR'
-        const isSelected = selectedSpanId === node.span.span_id
-        const svc = node.span.resource?.service_name
-        const barColor =
-          colorBy === 'service' && !isError ? serviceColor(svc) : undefined
-        return (
-          <TooltipProvider key={node.span.span_id}>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <button
-                  type="button"
-                  onClick={() => onSelect(isSelected ? null : node.span.span_id)}
-                  className={cn(
-                    'flex w-full min-w-[420px] items-center border-b px-4 py-1.5 text-left transition-colors hover:bg-accent/50 sm:min-w-[500px]',
-                    isSelected && 'bg-accent'
-                  )}
-                >
-                  <div
-                    className="flex w-[120px] shrink-0 items-center gap-1.5 sm:w-[180px] md:w-[280px]"
-                    style={{ paddingLeft: `${node.depth * 16}px` }}
-                  >
-                    {node.children.length > 0 ? (
-                      <ChevronDown className="h-3 w-3 shrink-0 text-muted-foreground" />
-                    ) : (
-                      <span className="w-3 shrink-0" />
-                    )}
-                    {colorBy === 'service' ? (
-                      <span
-                        className="h-2.5 w-2.5 shrink-0 rounded-full"
-                        style={{ backgroundColor: serviceColor(svc) }}
-                      />
-                    ) : (
-                      statusIcon(node.span.status_code)
-                    )}
-                    <span className="truncate text-xs">{node.span.name}</span>
-                  </div>
-                  <div className="relative h-6 flex-1">
-                    <div
-                      className={cn(
-                        'absolute top-1 h-4 min-w-[2px] rounded-sm',
-                        isError ? 'bg-red-500/80' : !barColor && 'bg-primary/70'
-                      )}
-                      style={{
-                        left: `${leftPct}%`,
-                        width: `${widthPct}%`,
-                        backgroundColor: barColor,
-                      }}
-                    />
-                    <span
-                      className="absolute top-0.5 whitespace-nowrap text-[10px] text-muted-foreground"
-                      style={{ left: `${leftPct + widthPct + 0.5}%` }}
-                    >
-                      {formatDuration(spanDuration)}
-                    </span>
-                  </div>
-                </button>
-              </TooltipTrigger>
-              <TooltipContent side="top" className="max-w-xs">
-                <div className="space-y-1">
-                  <p className="font-medium">{node.span.name}</p>
-                  {svc && <p className="text-xs">Service: {svc}</p>}
-                  <p className="text-xs">Duration: {formatDuration(spanDuration)}</p>
-                  <p className="text-xs">Kind: {kindLabel(node.span.kind)}</p>
-                </div>
-              </TooltipContent>
-            </Tooltip>
-          </TooltipProvider>
-        )
-      })}
-    </div>
-  )
-}
-
 interface LayoutProps {
   flatSpans: SpanTreeNode[]
   traceStart: number
   traceEnd: number
   traceDuration: number
   correlatedLogs: LogRecord[]
+  /** Cross-project unified view: tag each span with its owning project. */
+  renderRowBadge?: (span: SpanRecord) => ReactNode
+  /** Cross-project unified view: accent/dim rows (e.g. de-emphasise other projects). */
+  rowClassName?: (span: SpanRecord) => string | undefined
 }
 
 /** Shared selection hook for the layout variants. */
 function useSpanSelection(flatSpans: SpanTreeNode[], correlatedLogs: LogRecord[]) {
-  const [selectedSpanId, setSelectedSpanId] = useState<string | null>(null)
+  // Keep the selected span in the URL (`?span=<id>`) so a specific span is
+  // shareable/linkable — but write it with `replace` (not push) so clicking
+  // through spans never stacks history entries. The Back button then returns to
+  // the previous page (e.g. the trace list), it doesn't undo span selections.
+  const [searchParams, setSearchParams] = useSearchParams()
+  const selectedSpanId = searchParams.get('span')
+  const setSelectedSpanId = useCallback(
+    (id: string | null) => {
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev)
+          if (id) next.set('span', id)
+          else next.delete('span')
+          return next
+        },
+        { replace: true }
+      )
+    },
+    [setSearchParams]
+  )
   const span = useMemo(
     () =>
       selectedSpanId
@@ -522,7 +324,15 @@ function useSpanSelection(flatSpans: SpanTreeNode[], correlatedLogs: LogRecord[]
 /** The trace Spans view: a service-coloured waterfall on the left and the
  *  selected span's detail on the right (full width when none is selected). */
 function SpansView(props: LayoutProps) {
-  const { flatSpans, traceStart, traceEnd, traceDuration, correlatedLogs } = props
+  const {
+    flatSpans,
+    traceStart,
+    traceEnd,
+    traceDuration,
+    correlatedLogs,
+    renderRowBadge,
+    rowClassName,
+  } = props
   const { selectedSpanId, setSelectedSpanId, span, logs } = useSpanSelection(
     flatSpans,
     correlatedLogs
@@ -549,6 +359,8 @@ function SpansView(props: LayoutProps) {
             selectedSpanId={selectedSpanId}
             onSelect={setSelectedSpanId}
             colorBy="service"
+            renderRowBadge={renderRowBadge}
+            rowClassName={rowClassName}
             className="h-[400px] sm:h-[600px]"
           />
         </CardContent>
@@ -596,6 +408,66 @@ function SpansView(props: LayoutProps) {
   )
 }
 
+/** ADR-027: a trace that spans multiple projects. Surfaces the sibling projects
+ *  and an inline switch between "this project only" and the whole merged trace —
+ *  no navigation to a separate page; the choice lives in the `?view` param. */
+function CrossProjectBar({
+  siblings,
+  traceId,
+  showUnified,
+  onSetView,
+}: {
+  siblings: CrossProjectSiblingRef[]
+  traceId: string
+  showUnified: boolean
+  onSetView: (v: 'project' | 'unified') => void
+}) {
+  return (
+    <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5 rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-blue-900 dark:border-blue-900/50 dark:bg-blue-900/10 dark:text-blue-200">
+      <Info className="h-4 w-4 shrink-0" />
+      <span className="font-medium">This trace also has spans in:</span>
+      {siblings.map((s) => (
+        <Link
+          key={s.project_id}
+          to={`/projects/${s.project_slug}/traces/${traceId}`}
+          className="rounded bg-blue-100 px-1.5 py-0.5 font-medium underline-offset-2 hover:underline dark:bg-blue-900/40"
+        >
+          {s.project_name}
+        </Link>
+      ))}
+      <div className="ml-auto inline-flex rounded-md border border-blue-300/60 bg-white/70 p-0.5 dark:border-blue-800 dark:bg-blue-950/40">
+        <button
+          type="button"
+          onClick={() => onSetView('project')}
+          aria-pressed={!showUnified}
+          className={cn(
+            'rounded px-2.5 py-1 text-xs font-medium transition-colors',
+            !showUnified
+              ? 'bg-blue-600 text-white'
+              : 'hover:bg-blue-100 dark:hover:bg-blue-900/50'
+          )}
+        >
+          This project
+        </button>
+        <button
+          type="button"
+          onClick={() => onSetView('unified')}
+          aria-pressed={showUnified}
+          className={cn(
+            'inline-flex items-center gap-1 rounded px-2.5 py-1 text-xs font-medium transition-colors',
+            showUnified
+              ? 'bg-blue-600 text-white'
+              : 'hover:bg-blue-100 dark:hover:bg-blue-900/50'
+          )}
+        >
+          <Layers className="h-3.5 w-3.5" />
+          Whole trace
+        </button>
+      </div>
+    </div>
+  )
+}
+
 export default function TraceDetail({ project }: TraceDetailProps) {
   const { traceId } = useParams()
   const navigate = useNavigate()
@@ -632,29 +504,100 @@ export default function TraceDetail({ project }: TraceDetailProps) {
     return []
   }, [data])
 
-  const tree = useMemo(() => buildSpanTree(spans), [spans])
+  // Phase 1 cross-project discovery: does this same trace_id have spans in OTHER
+  // projects? Fired only once the primary spans have loaded so it never delays
+  // the waterfall. `retry: false` + swallowed errors mean a failure renders
+  // nothing (the banner is purely additive, never blocking).
+  const { data: siblingsData } = useQuery({
+    ...getCrossProjectTraceSiblingsOptions({
+      path: { trace_id: traceId || '' },
+      query: { exclude_project_id: project.id },
+    }),
+    enabled: !!traceId && spans.length > 0,
+    retry: false,
+  })
+  const siblings: CrossProjectSiblingRef[] = siblingsData?.siblings ?? []
+
+  // Cross-project "whole trace" view. When this trace_id also has spans in other
+  // projects we default to the merged trace inline; `?view=project` collapses to
+  // just this project. The param keeps the view shareable and is written with
+  // `replace` so it never stacks history.
+  const [searchParams, setSearchParams] = useSearchParams()
+  const isCrossProject = siblings.length > 0
+  const showUnified = isCrossProject && searchParams.get('view') !== 'project'
+  const setView = useCallback(
+    (v: 'project' | 'unified') => {
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev)
+          next.set('view', v)
+          return next
+        },
+        { replace: true }
+      )
+    },
+    [setSearchParams]
+  )
+
+  const { data: unifiedData } = useQuery({
+    ...getUnifiedTraceOptions({ path: { trace_id: traceId || '' } }),
+    enabled: !!traceId && showUnified,
+    retry: false,
+  })
+  const usingUnified = showUnified && !!unifiedData
+
+  // Spans actually rendered: the whole cross-project trace when unified,
+  // otherwise just this project's spans.
+  const displaySpans: SpanRecord[] = usingUnified
+    ? (unifiedData?.spans ?? []).map((a) => a.span)
+    : spans
+
+  const projectById = useMemo(() => {
+    const m = new Map<number, ProjectRef>()
+    unifiedData?.projects.forEach((p) => m.set(p.project_id, p))
+    return m
+  }, [unifiedData])
+
+  const tree = useMemo(() => buildSpanTree(displaySpans), [displaySpans])
   const flatSpans = useMemo(() => flattenTree(tree), [tree])
 
   // Calculate trace-level timing for waterfall positioning
   const traceStart = useMemo(() => {
-    if (spans.length === 0) return 0
-    return Math.min(...spans.map((s) => new Date(s.start_time).getTime()))
-  }, [spans])
+    if (displaySpans.length === 0) return 0
+    return Math.min(...displaySpans.map((s) => new Date(s.start_time).getTime()))
+  }, [displaySpans])
 
   const traceEnd = useMemo(() => {
-    if (spans.length === 0) return 0
-    return Math.max(...spans.map((s) => new Date(s.end_time).getTime()))
-  }, [spans])
+    if (displaySpans.length === 0) return 0
+    return Math.max(...displaySpans.map((s) => new Date(s.end_time).getTime()))
+  }, [displaySpans])
 
   const traceDuration = traceEnd - traceStart
 
   // Shared props for every trace-detail layout variant (ui.sh picker below).
+  // In the unified view, tag each span with its project and de-emphasise spans
+  // that belong to other projects so the entry-point project stays legible.
   const layoutProps: LayoutProps = {
     flatSpans,
     traceStart,
     traceEnd,
     traceDuration,
     correlatedLogs,
+    renderRowBadge: usingUnified
+      ? (span) => (
+          <ProjectBadge
+            projectId={span.project_id}
+            name={
+              projectById.get(span.project_id)?.project_name ??
+              `Project ${span.project_id}`
+            }
+            className="shrink-0"
+          />
+        )
+      : undefined,
+    rowClassName: usingUnified
+      ? (span) => (span.project_id === project.id ? undefined : 'opacity-70')
+      : undefined,
   }
 
   // Services involved
@@ -666,12 +609,24 @@ export default function TraceDetail({ project }: TraceDetailProps) {
     return Array.from(set)
   }, [spans])
 
-  // Trace-level status: error if any span has ERROR, otherwise OK
+  // Trace-level status: error if any displayed span has ERROR, otherwise OK
   const hasError = useMemo(
-    () => spans.some((s) => s.status_code?.toUpperCase() === 'ERROR'),
-    [spans]
+    () => displaySpans.some((s) => s.status_code?.toUpperCase() === 'ERROR'),
+    [displaySpans]
   )
   const traceStatus = hasError ? 'ERROR' : 'OK'
+
+  // Count spans that carry OpenTelemetry GenAI semantic-convention attributes
+  // (`gen_ai.*`). When present, this trace has LLM calls whose prompts and
+  // responses read far better in the dedicated AI conversation view than in the
+  // raw waterfall — so we surface a jump to it.
+  const genAiSpanCount = useMemo(
+    () =>
+      spans.filter((s) =>
+        Object.keys(s.attributes ?? {}).some((k) => k.startsWith('gen_ai.'))
+      ).length,
+    [spans]
+  )
 
   // Tell the assistant what the user is looking at, so "this trace"/"these
   // logs" resolve without restating. Ephemeral framing — see the chat dock.
@@ -740,8 +695,8 @@ export default function TraceDetail({ project }: TraceDetailProps) {
           Back to Traces
         </Button>
         <Card>
-          <CardContent className="flex items-center justify-center p-12 text-muted-foreground">
-            No spans found for this trace.
+          <CardContent className="flex items-center justify-center p-12 text-center text-muted-foreground">
+            Spans for this trace are not available or have expired.
           </CardContent>
         </Card>
       </div>
@@ -782,47 +737,71 @@ export default function TraceDetail({ project }: TraceDetailProps) {
         </Button>
       </div>
 
-      {/* Summary cards */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-        <Card>
-          <CardContent className="p-3 sm:p-4">
-            <p className="text-xs text-muted-foreground mb-1">Duration</p>
-            <p className="text-lg font-semibold">
-              {formatDuration(traceDuration)}
+      {/* Summary badges (compact metric row instead of a heavy card grid). */}
+      <TraceStatBadges
+        durationMs={traceDuration}
+        spanCount={displaySpans.length}
+        projectCount={usingUnified ? unifiedData?.projects.length : undefined}
+        serviceCount={usingUnified ? undefined : services.length}
+        status={traceStatus}
+        errorCount={usingUnified ? unifiedData?.error_count : undefined}
+        redacted={usingUnified ? unifiedData?.has_redacted_spans : false}
+        truncated={usingUnified ? unifiedData?.truncated : false}
+      />
+
+      {/* Cross-project view switch (ADR-027): this trace has spans in other
+          projects — toggle between this project and the whole merged trace,
+          inline (no navigation). The choice is in the shareable `?view` param. */}
+      {isCrossProject && (
+        <CrossProjectBar
+          siblings={siblings}
+          traceId={traceId || ''}
+          showUnified={showUnified}
+          onSetView={setView}
+        />
+      )}
+
+      {/* AI conversation jump — when this trace has GenAI (LLM) spans, the
+          prompts/responses read far better in the dedicated AI view than in the
+          raw waterfall below. One click, trace pre-selected. */}
+      {genAiSpanCount > 0 && (
+        <button
+          type="button"
+          onClick={() =>
+            navigate(
+              `/projects/${project.slug}/ai-gateway?tab=activity&trace=${traceId}`
+            )
+          }
+          className="group flex w-full items-center gap-3 rounded-lg border border-primary/30 bg-primary/5 p-3 text-left transition-colors hover:bg-primary/10"
+        >
+          <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-primary/10 text-primary">
+            <Bot className="h-4 w-4" />
+          </span>
+          <div className="min-w-0 flex-1">
+            <p className="text-sm font-medium">
+              This trace has {genAiSpanCount} AI invocation
+              {genAiSpanCount === 1 ? '' : 's'}
             </p>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="p-3 sm:p-4">
-            <p className="text-xs text-muted-foreground mb-1">Spans</p>
-            <p className="text-lg font-semibold">{spans.length}</p>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="p-3 sm:p-4">
-            <p className="text-xs text-muted-foreground mb-1">Services</p>
-            <p className="text-lg font-semibold">{services.length}</p>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="p-3 sm:p-4">
-            <p className="text-xs text-muted-foreground mb-1">Status</p>
-            <div className="flex items-center gap-2">
-              {statusIcon(traceStatus)}
-              <span className="text-lg font-semibold">
-                {hasError ? 'Error' : 'OK'}
-              </span>
-            </div>
-          </CardContent>
-        </Card>
-      </div>
+            <p className="text-xs text-muted-foreground">
+              See the prompts, responses, tokens, and tool calls as a conversation.
+            </p>
+          </div>
+          <span className="hidden items-center gap-1 text-xs font-medium text-primary sm:flex">
+            View AI conversation
+            <ChevronRight className="h-4 w-4 transition-transform group-hover:translate-x-0.5" />
+          </span>
+          <ChevronRight className="h-4 w-4 shrink-0 text-primary sm:hidden" />
+        </button>
+      )}
 
       {/* Spans / Logs tabs */}
       <Tabs defaultValue="spans" className="w-full">
         <TabsList>
           <TabsTrigger value="spans" className="gap-1.5">
             Spans
-            <span className="text-xs text-muted-foreground">{spans.length}</span>
+            <span className="text-xs text-muted-foreground">
+              {displaySpans.length}
+            </span>
           </TabsTrigger>
           <TabsTrigger value="logs" className="gap-1.5">
             Logs

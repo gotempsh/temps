@@ -29,6 +29,8 @@ use temps_entities::postgres_major_upgrades;
 use temps_logs::LogService;
 use thiserror::Error;
 
+use super::postgres::{shell_escape, validate_pg_username};
+
 /// Pre-upgrade backup provider trait.
 ///
 /// Implemented by `temps-backup::BackupService` to avoid a circular dep
@@ -221,13 +223,6 @@ pub enum PostgresUpgradeError {
     Database(#[from] sea_orm::DbErr),
 }
 
-/// POSIX-safe shell escaping used when interpolating user-controlled
-/// strings into `sh -c` invocations. Single-quotes the value and escapes
-/// any embedded single quotes.
-fn shell_escape(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
 /// Escape a string for safe interpolation into a `sed` BRE/ERE pattern.
 /// Used when the dumped service username is baked into a regex that
 /// filters out the dump's `DROP ROLE` statements for the connected user.
@@ -418,6 +413,14 @@ pub mod status {
     pub const FAILED: &str = "failed";
     pub const COMPLETED: &str = "completed";
     pub const CANCELLED: &str = "cancelled";
+    /// A completed upgrade is actively being rolled back: the live volume
+    /// has been (or is about to be) deleted and is being replaced by a copy
+    /// of the rollback volume. Active for `ensure_no_active_upgrade`
+    /// purposes, same as PENDING/RUNNING — a concurrent start must not
+    /// recreate the container against a volume mid-restore. Retryable: a
+    /// `rollback()` call is idempotent, so a row stuck here after a failed
+    /// attempt can simply be re-rolled-back.
+    pub const ROLLING_BACK: &str = "rolling_back";
     /// Upgrade was completed, then rolled back to the pre-upgrade PGDATA
     /// volume and old image. Terminal — a new upgrade must be started
     /// separately to re-attempt.
@@ -662,8 +665,15 @@ impl PostgresUpgradeOrchestrator {
 
         self.copy_volume(row, &source_volume, &rollback_volume)
             .await?;
-        // Remove the original — new_container phase will recreate it empty.
-        self.remove_volume_best_effort(&source_volume).await;
+        // Remove the original. The new_container phase must start from an
+        // empty live volume; reusing old-version PGDATA breaks Postgres 18+.
+        self.remove_volume_or_fail(&source_volume)
+            .await
+            .map_err(|reason| PostgresUpgradeError::SnapshotFailed {
+                upgrade_id: row.id,
+                service_id: row.service_id,
+                reason: format!("remove old live volume '{}': {}", source_volume, reason),
+            })?;
 
         let expires_at = chrono::Utc::now() + chrono::Duration::days(ROLLBACK_RETENTION_DAYS);
         let current = self.load_upgrade(row.id).await?;
@@ -979,10 +989,30 @@ impl PostgresUpgradeOrchestrator {
         //   CREATE ROLE {user};
         //   ALTER ROLE {user} WITH ...
         // The role name appears after an optional "IF EXISTS " for DROP.
-        let sed_filter = format!(
-            "sed -E '/^(DROP ROLE (IF EXISTS )?|CREATE ROLE |ALTER ROLE ){user}($| |;)/d'",
+        // Defense-in-depth: reject any username outside a plain identifier
+        // charset before it is baked into the sed program below. The sed
+        // argument is fully shell-escaped, so this is not the primary guard —
+        // it just ensures a crafted username can never reach the shell or the
+        // sed program in the first place.
+        validate_pg_username(&conn.username).map_err(|reason| {
+            PostgresUpgradeError::RestoreFailed {
+                upgrade_id: row.id,
+                service_id: row.service_id,
+                reason,
+            }
+        })?;
+
+        // Build the sed role-filter program, then shell-escape the ENTIRE sed
+        // argument. `regex_escape_for_sed` neutralizes regex metacharacters but
+        // NOT the single quotes that wrap the program, so the sed string must
+        // still pass through `shell_escape` before interpolation — the
+        // `-U {user}` arg below already does; this one previously did not, so a
+        // `'` in the username could break out of the sed quotes into the shell.
+        let sed_program = format!(
+            "/^(DROP ROLE (IF EXISTS )?|CREATE ROLE |ALTER ROLE ){user}($| |;)/d",
             user = regex_escape_for_sed(&conn.username),
         );
+        let sed_filter = format!("sed -E {}", shell_escape(&sed_program));
         let psql_cmd = format!(
             "set -eu; export PGPASSWORD={pw}; {sed} /dump/data.sql | psql -v ON_ERROR_STOP=1 -h {host} -U {user} -d postgres",
             pw = shell_escape(&conn.password),
@@ -1500,6 +1530,8 @@ impl PostgresUpgradeOrchestrator {
         dest: &str,
     ) -> Result<(), PostgresUpgradeError> {
         use futures::TryStreamExt;
+        use std::time::{Duration, Instant};
+
         let copy_container_name = format!(
             "temps_pg_upgrade_{}_copy_{}",
             row.id,
@@ -1529,7 +1561,10 @@ impl PostgresUpgradeOrchestrator {
                         ..Default::default()
                     },
                 ]),
-                auto_remove: Some(true),
+                // We remove manually below (with an exit-code check and a
+                // wait-for-removal poll) so a lost race against Docker's own
+                // auto-remove can't be mistaken for a hard failure.
+                auto_remove: Some(false),
                 ..Default::default()
             }),
             ..Default::default()
@@ -1564,18 +1599,109 @@ impl PostgresUpgradeOrchestrator {
                 reason: format!("start copy container: {}", e),
             })?;
 
-        self.docker
+        // Capture the wait outcome instead of propagating it immediately:
+        // `auto_remove` is disabled above, so an early `?` return here would
+        // skip the removal below and leak the sidecar holding a reference to
+        // both volumes, wedging any retry's volume removal ("volume is in
+        // use") forever. Every exit path from here must still try to remove
+        // the container.
+        let wait_outcome = self
+            .docker
             .wait_container(
                 &created.id,
                 None::<bollard::query_parameters::WaitContainerOptions>,
             )
             .try_collect::<Vec<_>>()
             .await
-            .map_err(|e| PostgresUpgradeError::SnapshotFailed {
+            .map_err(|e| format!("wait copy container: {}", e));
+
+        let remove_result = self
+            .docker
+            .remove_container(
+                &created.id,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    v: true,
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+
+        if let Err(e) = remove_result {
+            let msg = e.to_string();
+            let already_gone = msg.contains("No such container")
+                || msg.contains("no such container")
+                || msg.contains("not found")
+                || msg.contains("404");
+            let already_removing =
+                msg.contains("removal of container") && msg.contains("is already in progress");
+            if !already_gone && !already_removing {
+                return Err(PostgresUpgradeError::SnapshotFailed {
+                    upgrade_id: row.id,
+                    service_id: row.service_id,
+                    reason: format!("remove copy container: {}", msg),
+                });
+            }
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match self
+                .docker
+                .inspect_container(
+                    &created.id,
+                    None::<bollard::query_parameters::InspectContainerOptions>,
+                )
+                .await
+            {
+                Ok(_) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                Ok(_) => {
+                    return Err(PostgresUpgradeError::SnapshotFailed {
+                        upgrade_id: row.id,
+                        service_id: row.service_id,
+                        reason: format!(
+                            "copy container '{}' still exists after removal timeout",
+                            created.id
+                        ),
+                    });
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("No such container")
+                        || msg.contains("no such container")
+                        || msg.contains("not found")
+                        || msg.contains("404")
+                    {
+                        break;
+                    }
+                    return Err(PostgresUpgradeError::SnapshotFailed {
+                        upgrade_id: row.id,
+                        service_id: row.service_id,
+                        reason: format!("inspect copy container after removal: {}", msg),
+                    });
+                }
+            }
+        }
+
+        let wait_result = wait_outcome.map_err(|reason| PostgresUpgradeError::SnapshotFailed {
+            upgrade_id: row.id,
+            service_id: row.service_id,
+            reason,
+        })?;
+
+        if let Some(nonzero) = wait_result
+            .iter()
+            .map(|status| status.status_code)
+            .find(|status_code| *status_code != 0)
+        {
+            return Err(PostgresUpgradeError::SnapshotFailed {
                 upgrade_id: row.id,
                 service_id: row.service_id,
-                reason: format!("wait copy container: {}", e),
-            })?;
+                reason: format!("copy container exited with status {}", nonzero),
+            });
+        }
 
         Ok(())
     }
@@ -1591,6 +1717,26 @@ impl PostgresUpgradeOrchestrator {
                 None::<bollard::query_parameters::RemoveVolumeOptions>,
             )
             .await;
+    }
+
+    async fn remove_volume_or_fail(&self, volume_name: &str) -> Result<(), String> {
+        self.docker
+            .remove_volume(
+                volume_name,
+                Some(bollard::query_parameters::RemoveVolumeOptions { force: true }),
+            )
+            .await
+            .map_err(|e| e.to_string())
+            .or_else(|reason| {
+                if reason.contains("No such volume")
+                    || reason.contains("not found")
+                    || reason.contains("404")
+                {
+                    Ok(())
+                } else {
+                    Err(reason)
+                }
+            })
     }
 
     // ---- Rollback volume retention -------------------------------------
@@ -1713,12 +1859,15 @@ impl PostgresUpgradeOrchestrator {
     ) -> Result<postgres_major_upgrades::Model, PostgresUpgradeError> {
         let row = self.load_upgrade(upgrade_id).await?;
 
-        // Preconditions
-        if row.status != status::COMPLETED {
+        // Preconditions. ROLLING_BACK is accepted alongside COMPLETED so a
+        // rollback that failed partway (leaving the row stuck in
+        // ROLLING_BACK) can be retried through this same entry point —
+        // every step below tolerates "already in that state".
+        if row.status != status::COMPLETED && row.status != status::ROLLING_BACK {
             return Err(PostgresUpgradeError::NotRollbackable {
                 upgrade_id,
                 reason: format!(
-                    "only completed upgrades can be rolled back; current status is '{}'",
+                    "only completed (or a previously interrupted rollback) can be rolled back; current status is '{}'",
                     row.status
                 ),
             });
@@ -1740,6 +1889,14 @@ impl PostgresUpgradeOrchestrator {
                 });
             }
         }
+
+        // Mark the row actively rolling back *before* touching any
+        // container or volume, so `ensure_no_active_upgrade` blocks a
+        // concurrent start for the entire multi-step restore below, not
+        // just while status was PENDING/RUNNING during the original
+        // upgrade. Idempotent if already ROLLING_BACK (a retry).
+        self.set_status(upgrade_id, status::ROLLING_BACK, None)
+            .await?;
 
         self.log_service
             .log_warning(
@@ -1770,8 +1927,15 @@ impl PostgresUpgradeOrchestrator {
 
         // 2. Remove the live volume so the copy produces a clean replica of
         //    the rollback volume (any lingering new-version WAL/catalog is
-        //    discarded). `remove_volume_best_effort` tolerates absence.
-        self.remove_volume_best_effort(&live_volume).await;
+        //    discarded). This is required; overlaying rollback data onto a
+        //    dirty live volume can leave incompatible catalog/WAL files.
+        self.remove_volume_or_fail(&live_volume)
+            .await
+            .map_err(|reason| PostgresUpgradeError::RollbackFailed {
+                upgrade_id,
+                service_id: row.service_id,
+                reason: format!("remove live volume '{}': {}", live_volume, reason),
+            })?;
         self.create_volume_if_missing(&row, &live_volume).await?;
         self.copy_volume(&row, &rollback_volume, &live_volume)
             .await
@@ -2085,6 +2249,9 @@ mod tests {
     ///   3. The shell-escape + command construction used by the orchestrator
     ///      survives round-trip through `sh -c` with real user/password/db
     ///      values containing typical characters.
+    ///   4. `pg_dumpall` carries the WHOLE cluster: several databases (not just
+    ///      the default one) all survive the restore, and every database's
+    ///      table count is identical before and after.
     ///
     /// This validates the failure-prone shell/Docker-exec plumbing without
     /// having to stand up the full control-plane database, the encryption
@@ -2361,6 +2528,89 @@ mod tests {
             );
             run_exec_ok(&docker, &old_container, &seed_cmd, None).await?;
 
+            // --- Whole-cluster coverage --------------------------------------
+            // `pg_dumpall` dumps the ENTIRE cluster (every database + globals),
+            // which is the whole reason the orchestrator uses it. Prove that:
+            // create two databases besides the default one, give each a DISTINCT
+            // set of tables, then after the restore assert (a) every database
+            // came back and (b) each database's table count is identical before
+            // vs after. The single-table probe above only proves one table in
+            // one database survived — it would not catch a restore that silently
+            // dropped a database or some of its tables.
+            let extra_dbs = ["upgrade_extra_a", "upgrade_extra_b"];
+            let all_dbs = [db, extra_dbs[0], extra_dbs[1]];
+
+            // Each CREATE DATABASE must be its own statement: it cannot run
+            // inside a transaction block, so it can't share a multi-statement -c.
+            for extra in extra_dbs {
+                let create_db = format!(
+                    "export PGPASSWORD={pw}; psql -v ON_ERROR_STOP=1 -U {u} -d postgres -c {sql}",
+                    pw = shell_escape(password),
+                    u = shell_escape(user),
+                    sql = shell_escape(&format!("CREATE DATABASE {extra}")),
+                );
+                run_exec_ok(&docker, &old_container, &create_db, Some(password)).await?;
+            }
+
+            // Seed a distinct number of tables (each with a row) per database.
+            // The default `upgradetest` already has `upgrade_probe`, so +1 => 2
+            // tables; extra_a gets 3; extra_b gets 5 — all distinct, so a
+            // per-database comparison is a real signal, not a coincidence.
+            let seed_plan = [(db, 1usize), (extra_dbs[0], 3), (extra_dbs[1], 5)];
+            for (dbname, n) in seed_plan {
+                let mut stmts = String::new();
+                for i in 0..n {
+                    stmts.push_str(&format!(
+                        "CREATE TABLE seed_{i}(id INT PRIMARY KEY, note TEXT NOT NULL); \
+                         INSERT INTO seed_{i}(id, note) VALUES ({i}, 'r{i}'); "
+                    ));
+                }
+                let seed_more = format!(
+                    "export PGPASSWORD={pw}; psql -v ON_ERROR_STOP=1 -U {u} -d {d} -c {sql}",
+                    pw = shell_escape(password),
+                    u = shell_escape(user),
+                    d = shell_escape(dbname),
+                    sql = shell_escape(&stmts),
+                );
+                run_exec_ok(&docker, &old_container, &seed_more, Some(password)).await?;
+            }
+
+            // Count base tables in a database of a given container. Parses the
+            // first integer line so an incidental psql notice on stderr can't
+            // corrupt the result. Mirrors the `wait_ready` closure's shape:
+            // owned copies moved into the future so there are no borrow snags.
+            let count_tables = |container: &str, dbname: &str| {
+                let docker = Arc::clone(&docker);
+                let container = container.to_string();
+                let dbname = dbname.to_string();
+                let user = user.to_string();
+                let password = password.to_string();
+                async move {
+                    let sql = "SELECT count(*) FROM information_schema.tables \
+                               WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
+                               AND table_type = 'BASE TABLE'";
+                    let cmd = format!(
+                        "export PGPASSWORD={pw}; psql -v ON_ERROR_STOP=1 -U {u} -d {d} -tAc {sql}",
+                        pw = shell_escape(&password),
+                        u = shell_escape(&user),
+                        d = shell_escape(&dbname),
+                        sql = shell_escape(sql),
+                    );
+                    let out =
+                        run_exec_capture(&docker, &container, &cmd, Some(password.as_str())).await?;
+                    out.lines()
+                        .filter_map(|l| l.trim().parse::<i64>().ok())
+                        .next()
+                        .ok_or_else(|| format!("no table count for {dbname} (raw output: {out:?})"))
+                }
+            };
+
+            // Snapshot every database's table count BEFORE the dump.
+            let mut before_counts: Vec<(&str, i64)> = Vec::new();
+            for dbname in all_dbs {
+                before_counts.push((dbname, count_tables(&old_container, dbname).await?));
+            }
+
             // Dump — mirrors exactly what `phase_dump` shells out, including
             // the atomic marker file write.
             let dump_cmd = format!(
@@ -2476,10 +2726,11 @@ mod tests {
             wait_ready(&new_container).await?;
 
             // Restore via throwaway psql sidecar — same shape as `phase_restore`.
-            let sed_filter = format!(
-                "sed -E '/^(DROP ROLE (IF EXISTS )?|CREATE ROLE |ALTER ROLE ){u}($| |;)/d'",
+            let sed_program = format!(
+                "/^(DROP ROLE (IF EXISTS )?|CREATE ROLE |ALTER ROLE ){u}($| |;)/d",
                 u = regex_escape_for_sed(user),
             );
+            let sed_filter = format!("sed -E {}", shell_escape(&sed_program));
             let psql_cmd = format!(
                 "set -eu; export PGPASSWORD={pw}; {sed} /dump/data.sql | psql -v ON_ERROR_STOP=1 -h {host} -U {u} -d postgres",
                 pw = shell_escape(password),
@@ -2587,6 +2838,47 @@ mod tests {
                 "restored data did not match. got: {:?}",
                 got
             );
+
+            // Every database in the cluster must have come back.
+            let db_list_sql = "SELECT datname FROM pg_database \
+                               WHERE datistemplate = false AND datname <> 'postgres' \
+                               ORDER BY datname";
+            let db_list_cmd = format!(
+                "export PGPASSWORD={pw}; psql -v ON_ERROR_STOP=1 -U {u} -d postgres -tAc {sql}",
+                pw = shell_escape(password),
+                u = shell_escape(user),
+                sql = shell_escape(db_list_sql),
+            );
+            let db_list_out =
+                run_exec_capture(&docker, &new_container, &db_list_cmd, Some(password)).await?;
+            let restored_dbs: std::collections::HashSet<String> = db_list_out
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect();
+            for dbname in all_dbs {
+                if !restored_dbs.contains(dbname) {
+                    return Err(format!(
+                        "database {dbname:?} missing after restore; restored databases = {restored_dbs:?}"
+                    ));
+                }
+            }
+
+            // Each database must have exactly as many tables as before the dump.
+            for (dbname, before) in before_counts {
+                let after = count_tables(&new_container, dbname).await?;
+                if before <= 0 {
+                    return Err(format!(
+                        "precondition failed: {dbname:?} had no seeded tables before the dump"
+                    ));
+                }
+                if before != after {
+                    return Err(format!(
+                        "table count for database {dbname:?} changed across the upgrade: \
+                         before={before} after={after}"
+                    ));
+                }
+            }
 
             // Run ANALYZE (same shape as phase_analyze) to confirm planner
             // stats refresh works on the restored DB.
@@ -2790,14 +3082,16 @@ mod tests {
         use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection, EntityTrait};
         use serde_json::json;
         use std::sync::{
-            atomic::{AtomicU64, Ordering},
+            atomic::{AtomicI32, AtomicU64, Ordering},
             Arc, Mutex,
         };
         use std::time::{Duration, Instant};
         use tempfile::TempDir;
         use temps_core::EncryptionService;
         use temps_database::test_utils::TestDatabase;
-        use temps_entities::{external_services, postgres_major_upgrades, users};
+        use temps_entities::{
+            backups, external_services, postgres_major_upgrades, s3_sources, users,
+        };
         use temps_logs::LogService;
 
         use crate::postgres_lifecycle::PostgresLifecycleAdapter;
@@ -3105,35 +3399,167 @@ mod tests {
             }
         }
 
-        /// Stub `PreUpgradeBackupProvider` — always returns a synthetic
-        /// backup id (42) without touching S3. The orchestrator only reads
-        /// this id back onto the row; no downstream check validates it.
+        /// Stub `PreUpgradeBackupProvider` — creates a real control-plane
+        /// backup row without touching S3. The orchestrator stores the
+        /// returned id on `postgres_major_upgrades.pre_upgrade_backup_id`,
+        /// which has a real FK to `backups.id` in the test database.
         pub struct StubBackupProvider {
+            db: Arc<DatabaseConnection>,
             pub calls: Arc<AtomicU64>,
+            pub last_backup_id: Arc<AtomicI32>,
         }
 
         impl StubBackupProvider {
-            pub fn new() -> Self {
+            pub fn new(db: Arc<DatabaseConnection>) -> Self {
                 Self {
+                    db,
                     calls: Arc::new(AtomicU64::new(0)),
+                    last_backup_id: Arc::new(AtomicI32::new(0)),
                 }
             }
         }
 
         #[async_trait]
         impl PreUpgradeBackupProvider for StubBackupProvider {
-            async fn default_s3_source_id(&self, _service_id: i32) -> Result<Option<i32>, String> {
-                Ok(Some(1))
+            async fn default_s3_source_id(&self, service_id: i32) -> Result<Option<i32>, String> {
+                let now = chrono::Utc::now();
+                let source = s3_sources::ActiveModel {
+                    id: sea_orm::NotSet,
+                    name: Set(format!(
+                        "upgrade-test-s3-{}-{}",
+                        service_id,
+                        now.timestamp_nanos_opt().unwrap_or(0)
+                    )),
+                    bucket_name: Set("upgrade-test-bucket".to_string()),
+                    region: Set("us-east-1".to_string()),
+                    endpoint: Set(Some("http://127.0.0.1:9000".to_string())),
+                    bucket_path: Set("postgres-upgrade-tests".to_string()),
+                    access_key_id: Set("test-access-key".to_string()),
+                    secret_key: Set("test-secret-key".to_string()),
+                    force_path_style: Set(Some(true)),
+                    is_default: Set(true),
+                    created_at: Set(now),
+                    updated_at: Set(now),
+                }
+                .insert(self.db.as_ref())
+                .await
+                .map_err(|e| format!("insert test s3 source: {}", e))?;
+
+                Ok(Some(source.id))
             }
 
             async fn create_pre_upgrade_backup(
                 &self,
-                _service_id: i32,
-                _s3_source_id: i32,
-                _created_by: i32,
+                service_id: i32,
+                s3_source_id: i32,
+                created_by: i32,
             ) -> Result<i32, String> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
-                Ok(42)
+                let now = chrono::Utc::now();
+                let backup_uuid = format!(
+                    "upgrade-pre-backup-{}-{}",
+                    service_id,
+                    now.timestamp_nanos_opt().unwrap_or(0)
+                );
+                let backup = backups::ActiveModel {
+                    id: sea_orm::NotSet,
+                    name: Set(format!("Pre-upgrade backup {}", service_id)),
+                    backup_id: Set(backup_uuid.clone()),
+                    schedule_id: Set(None),
+                    backup_type: Set("pre_upgrade".to_string()),
+                    state: Set("completed".to_string()),
+                    started_at: Set(now),
+                    finished_at: Set(Some(now)),
+                    size_bytes: Set(Some(0)),
+                    file_count: Set(Some(0)),
+                    s3_source_id: Set(s3_source_id),
+                    s3_location: Set(format!("s3://upgrade-test-bucket/{}", backup_uuid)),
+                    error_message: Set(None),
+                    metadata: Set(serde_json::json!({
+                        "test": true,
+                        "service_id": service_id,
+                        "purpose": "postgres_major_upgrade_pre_backup"
+                    })
+                    .to_string()),
+                    checksum: Set(None),
+                    compression_type: Set("none".to_string()),
+                    created_by: Set(created_by),
+                    expires_at: Set(None),
+                    tags: Set("[]".to_string()),
+                    schedule_run_id: sea_orm::NotSet,
+                }
+                .insert(self.db.as_ref())
+                .await
+                .map_err(|e| format!("insert test backup: {}", e))?;
+
+                self.last_backup_id.store(backup.id, Ordering::SeqCst);
+                Ok(backup.id)
+            }
+        }
+
+        /// A `PreUpgradeBackupProvider` that routes the pre-upgrade backup
+        /// through the REAL `exec_util::run_exec` (against the service's own
+        /// running container) before recording the backup row like
+        /// `StubBackupProvider`.
+        ///
+        /// The production pre-upgrade backup shells `pg_dumpall … > file` via
+        /// `run_exec`, whose exec stdout is empty — the exact shape that
+        /// regressed into a 100% CPU busy loop that never returned. The stub
+        /// providers bypass `run_exec` entirely, which is why that hang shipped
+        /// despite a green orchestrator happy-path test. This provider closes
+        /// the gap: a `run_exec` regression makes the whole `orchestrator.run()`
+        /// hang, caught by the test's bounded `tokio::time::timeout`.
+        pub struct RunExecBackupProvider {
+            inner: StubBackupProvider,
+            docker: Arc<Docker>,
+            container: String,
+        }
+
+        impl RunExecBackupProvider {
+            pub fn new(
+                db: Arc<DatabaseConnection>,
+                docker: Arc<Docker>,
+                container: String,
+            ) -> Self {
+                Self {
+                    inner: StubBackupProvider::new(db),
+                    docker,
+                    container,
+                }
+            }
+            pub fn calls(&self) -> u64 {
+                self.inner.calls.load(Ordering::SeqCst)
+            }
+        }
+
+        #[async_trait]
+        impl PreUpgradeBackupProvider for RunExecBackupProvider {
+            async fn default_s3_source_id(&self, service_id: i32) -> Result<Option<i32>, String> {
+                self.inner.default_s3_source_id(service_id).await
+            }
+
+            async fn create_pre_upgrade_backup(
+                &self,
+                service_id: i32,
+                s3_source_id: i32,
+                created_by: i32,
+            ) -> Result<i32, String> {
+                // Exercise the real run_exec with a no-stdout command — the
+                // production backup's `pg_dumpall … > file` shape. Bounded so a
+                // regression fails rather than hangs the whole run.
+                crate::externalsvc::exec_util::run_exec(
+                    self.docker.as_ref(),
+                    &self.container,
+                    vec!["sh".to_string(), "-c".to_string(), "true".to_string()],
+                    None,
+                    std::time::Duration::from_secs(120),
+                )
+                .await
+                .map_err(|e| format!("pre-upgrade backup run_exec failed: {}", e))?;
+
+                self.inner
+                    .create_pre_upgrade_backup(service_id, s3_source_id, created_by)
+                    .await
             }
         }
 
@@ -3278,7 +3704,7 @@ mod tests {
 
         let ctx = UpgradeTestCtx::new("rollback").await;
         let backup_provider: Arc<dyn PreUpgradeBackupProvider> =
-            Arc::new(StubBackupProvider::new());
+            Arc::new(StubBackupProvider::new(ctx.test_db.db.clone()));
         let lifecycle: Arc<dyn PostgresContainerLifecycle> = ctx.lifecycle_adapter.clone();
 
         // Seed pre-upgrade data on v17.
@@ -3439,7 +3865,7 @@ mod tests {
         }
 
         let ctx = UpgradeTestCtx::new("happy").await;
-        let backup_provider = Arc::new(StubBackupProvider::new());
+        let backup_provider = Arc::new(StubBackupProvider::new(ctx.test_db.db.clone()));
         let backup_provider_trait: Arc<dyn PreUpgradeBackupProvider> = backup_provider.clone();
         let lifecycle: Arc<dyn PostgresContainerLifecycle> = ctx.lifecycle_adapter.clone();
 
@@ -3478,7 +3904,11 @@ mod tests {
             assert!(row.finished_at.is_some(), "finished_at unset");
             assert_eq!(
                 row.pre_upgrade_backup_id,
-                Some(42),
+                Some(
+                    backup_provider
+                        .last_backup_id
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                ),
                 "pre_upgrade_backup_id not persisted"
             );
             assert!(
@@ -3552,6 +3982,110 @@ mod tests {
         }
     }
 
+    /// Full-orchestrator regression test that drives `pre_backup` through the
+    /// REAL `exec_util::run_exec` (via `RunExecBackupProvider`) rather than a
+    /// stub. This is the coverage gap that let the `run_exec` 100% CPU hang
+    /// ship: the happy-path test above runs the whole orchestrator to
+    /// `completed`, but stubs the backup, so it never touches `run_exec`. Here
+    /// `orchestrator.run()` actually invokes `run_exec` during `pre_backup`, so
+    /// a regression makes the run hang — caught in bounded time by the
+    /// `tokio::time::timeout` wrapper instead of hanging CI forever.
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn orchestrator_full_run_exercises_backup_exec_v17_to_v18() {
+        use harness::*;
+        use std::sync::Arc;
+
+        if docker_or_skip("orchestrator_full_run_exercises_backup_exec_v17_to_v18")
+            .await
+            .is_none()
+        {
+            return;
+        }
+
+        let ctx = UpgradeTestCtx::new("bkexec").await;
+        let container = format!("postgres-{}", ctx.service_name);
+        let provider = Arc::new(RunExecBackupProvider::new(
+            ctx.test_db.db.clone(),
+            ctx.docker.clone(),
+            container,
+        ));
+        let provider_trait: Arc<dyn PreUpgradeBackupProvider> = provider.clone();
+        let lifecycle: Arc<dyn PostgresContainerLifecycle> = ctx.lifecycle_adapter.clone();
+
+        let result = async {
+            ctx.psql_exec("CREATE TABLE bkexec_probe(id SERIAL PRIMARY KEY, payload TEXT)")
+                .await?;
+            ctx.psql_exec(
+                "INSERT INTO bkexec_probe(payload) SELECT 'row_' || g FROM generate_series(1,300) g",
+            )
+            .await?;
+
+            let upgrade_id = ctx.insert_upgrade_row(phase::PRE_BACKUP).await;
+            let orch = ctx.orchestrator(provider_trait, lifecycle);
+
+            // Run on a SEPARATE task and time out the JoinHandle. A run_exec
+            // regression is a synchronous busy loop that never yields, so a
+            // plain `timeout(_, orch.run())` could never fire; spawned, the spin
+            // occupies one worker while the timeout fires on another -> the test
+            // FAILS instead of hanging CI.
+            let run_handle = tokio::spawn(async move { orch.run(upgrade_id).await });
+            tokio::time::timeout(std::time::Duration::from_secs(600), run_handle)
+                .await
+                .map_err(|_| {
+                    "orchestrator.run() did not finish within 600s — likely a \
+                     run_exec / exec hang"
+                        .to_string()
+                })?
+                .map_err(|e| format!("orchestrator.run task panicked: {}", e))?
+                .map_err(|e| format!("run: {}", e))?;
+
+            let row = load_upgrade(ctx.test_db.db.as_ref(), upgrade_id).await;
+            if row.status != status::COMPLETED {
+                return Err(format!("expected COMPLETED, got {}", row.status));
+            }
+            if provider.calls() != 1 {
+                return Err(format!(
+                    "pre-upgrade backup (run_exec path) should run exactly once, ran {}",
+                    provider.calls()
+                ));
+            }
+            let after = ctx
+                .psql_query("SELECT count(*) FROM bkexec_probe")
+                .await?
+                .trim()
+                .parse::<i64>()
+                .map_err(|e| e.to_string())?;
+            if after != 300 {
+                return Err(format!("expected 300 rows after upgrade, got {}", after));
+            }
+            Ok::<_, String>(upgrade_id)
+        }
+        .await;
+
+        let upgrade_id_for_cleanup = result.as_ref().ok().copied().unwrap_or(-1);
+        let extras: Vec<String> = if upgrade_id_for_cleanup > 0 {
+            vec![
+                format!(
+                    "postgres-{}_data_rollback_{}",
+                    ctx.service_name, upgrade_id_for_cleanup
+                ),
+                format!(
+                    "postgres-{}_pgdump_{}",
+                    ctx.service_name, upgrade_id_for_cleanup
+                ),
+            ]
+        } else {
+            vec![]
+        };
+        ctx.cleanup().await;
+        remove_volumes(ctx.docker.as_ref(), &extras).await;
+
+        if let Err(e) = result {
+            panic!("full-run backup-exec integration test failed: {}", e);
+        }
+    }
+
     // ========================================================================
     // Test #31: phase_snapshot_stops_container_before_copy_volume
     // ========================================================================
@@ -3585,7 +4119,7 @@ mod tests {
 
         let ctx = UpgradeTestCtx::new("snap-order").await;
         let backup_provider: Arc<dyn PreUpgradeBackupProvider> =
-            Arc::new(StubBackupProvider::new());
+            Arc::new(StubBackupProvider::new(ctx.test_db.db.clone()));
 
         // Wrap the real adapter in a recorder so we can observe call order.
         let recorder = RecordingLifecycle::new(ctx.lifecycle_adapter.clone());
@@ -3744,7 +4278,7 @@ mod tests {
 
         let ctx = UpgradeTestCtx::new("stream-drain").await;
         let backup_provider: Arc<dyn PreUpgradeBackupProvider> =
-            Arc::new(StubBackupProvider::new());
+            Arc::new(StubBackupProvider::new(ctx.test_db.db.clone()));
         let lifecycle: Arc<dyn PostgresContainerLifecycle> = ctx.lifecycle_adapter.clone();
 
         let result = async {
@@ -3843,7 +4377,7 @@ mod tests {
 
         let ctx = UpgradeTestCtx::new("dump-idem").await;
         let backup_provider: Arc<dyn PreUpgradeBackupProvider> =
-            Arc::new(StubBackupProvider::new());
+            Arc::new(StubBackupProvider::new(ctx.test_db.db.clone()));
         let lifecycle: Arc<dyn PostgresContainerLifecycle> = ctx.lifecycle_adapter.clone();
 
         let result = async {
@@ -3913,7 +4447,7 @@ mod tests {
             // state, the whole retry should complete FAST (< 60s typ).
             let retry_start = std::time::Instant::now();
             let orch2 = ctx.orchestrator(
-                Arc::new(StubBackupProvider::new()),
+                Arc::new(StubBackupProvider::new(ctx.test_db.db.clone())),
                 ctx.lifecycle_adapter.clone(),
             );
             orch2

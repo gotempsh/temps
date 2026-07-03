@@ -111,6 +111,7 @@ mod tests {
             bitbucket_webhook_token: None,
             bitbucket_webhook_hook_id: None,
             generic_webhook_token: None,
+            cross_project_trace_sharing: true,
         }
     }
 

@@ -37,6 +37,9 @@ const MAX_NAME_LEN: usize = 200;
 const MAX_SECTIONS: usize = 50;
 const MAX_TILES_PER_SECTION: usize = 50;
 const MAX_METRIC_NAME_LEN: usize = 256;
+const MAX_TILE_LABEL_FILTERS: usize = 10;
+const MAX_TILE_LABEL_VALUE_LEN: usize = 500;
+const MAX_TILE_GROUP_BY: usize = 2;
 
 /// A single metric tile within a dashboard section.
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema, PartialEq)]
@@ -50,6 +53,20 @@ pub struct DashboardTile {
     pub aggregation: String,
     /// Optional display title; falls back to the metric name in the UI.
     pub title: Option<String>,
+    /// AND-combined label equality filters: `[["key","value"],…]`. Empty = no
+    /// filtering. Max 10 pairs; keys must match `[a-zA-Z0-9_.:-]`; values
+    /// capped at 500 characters. Not yet wired into the tile query path
+    /// (Phase 1 ADR-026 — field round-trips and validates; query wiring is
+    /// a separate frontend task).
+    #[serde(default)]
+    pub label_filters: Vec<(String, String)>,
+    /// Label keys to break the metric down by (group-by / multi-series view).
+    /// Empty = single aggregated series (current behavior). Max 2 keys — more
+    /// dimensions are unreadable in a chart (ADR-026 Phase 2). Each key must
+    /// match `[a-zA-Z0-9_.:-]`. Wired directly to `MetricQuery.group_by` by
+    /// the tile query path (separate frontend task).
+    #[serde(default)]
+    pub group_by: Vec<String>,
 }
 
 /// A titled group of tiles within a dashboard.
@@ -109,6 +126,52 @@ impl DashboardLayout {
                             ALLOWED_AGGREGATIONS.join(", ")
                         ),
                     });
+                }
+                if tile.label_filters.len() > MAX_TILE_LABEL_FILTERS {
+                    return Err(OtelError::Validation {
+                        message: format!(
+                            "Tile '{}' has too many label filters ({}, max {MAX_TILE_LABEL_FILTERS})",
+                            tile.id,
+                            tile.label_filters.len()
+                        ),
+                    });
+                }
+                for (key, value) in &tile.label_filters {
+                    if temps_metrics::validate_metric_name(key).is_err() {
+                        return Err(OtelError::Validation {
+                            message: format!(
+                                "Tile '{}' label filter key '{key}' contains characters outside the allowed set [a-zA-Z0-9_.:-]",
+                                tile.id
+                            ),
+                        });
+                    }
+                    if value.len() > MAX_TILE_LABEL_VALUE_LEN {
+                        return Err(OtelError::Validation {
+                            message: format!(
+                                "Tile '{}' label filter value for key '{key}' exceeds {MAX_TILE_LABEL_VALUE_LEN} characters",
+                                tile.id
+                            ),
+                        });
+                    }
+                }
+                if tile.group_by.len() > MAX_TILE_GROUP_BY {
+                    return Err(OtelError::Validation {
+                        message: format!(
+                            "Tile '{}' has too many group_by keys ({}, max {MAX_TILE_GROUP_BY})",
+                            tile.id,
+                            tile.group_by.len()
+                        ),
+                    });
+                }
+                for key in &tile.group_by {
+                    if temps_metrics::validate_metric_name(key).is_err() {
+                        return Err(OtelError::Validation {
+                            message: format!(
+                                "Tile '{}' group_by key '{key}' contains characters outside the allowed set [a-zA-Z0-9_.:-]",
+                                tile.id
+                            ),
+                        });
+                    }
                 }
             }
         }
@@ -266,6 +329,8 @@ mod tests {
                     metric_name: "http.server.duration".to_string(),
                     aggregation: "p95".to_string(),
                     title: Some("Latency".to_string()),
+                    label_filters: vec![],
+                    group_by: vec![],
                 }],
             }],
         }
@@ -399,5 +464,99 @@ mod tests {
         let (items, total) = result.unwrap();
         assert_eq!(total, 2);
         assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn test_tile_label_filters_valid_passes() {
+        let mut layout = sample_layout();
+        layout.sections[0].tiles[0].label_filters = vec![
+            ("region".to_string(), "eu-west".to_string()),
+            ("endpoint".to_string(), "/checkout".to_string()),
+        ];
+        assert!(layout.validate().is_ok());
+    }
+
+    #[test]
+    fn test_tile_label_filters_too_many_rejected() {
+        let mut layout = sample_layout();
+        layout.sections[0].tiles[0].label_filters = (0..11)
+            .map(|i| (format!("key{i}"), format!("val{i}")))
+            .collect();
+        assert!(matches!(
+            layout.validate(),
+            Err(OtelError::Validation { .. })
+        ));
+    }
+
+    #[test]
+    fn test_tile_label_filters_invalid_key_rejected() {
+        let mut layout = sample_layout();
+        layout.sections[0].tiles[0].label_filters =
+            vec![("bad key!".to_string(), "value".to_string())];
+        assert!(matches!(
+            layout.validate(),
+            Err(OtelError::Validation { .. })
+        ));
+    }
+
+    #[test]
+    fn test_tile_label_filters_value_too_long_rejected() {
+        let mut layout = sample_layout();
+        layout.sections[0].tiles[0].label_filters = vec![("region".to_string(), "x".repeat(501))];
+        assert!(matches!(
+            layout.validate(),
+            Err(OtelError::Validation { .. })
+        ));
+    }
+
+    #[test]
+    fn test_tile_label_filters_deserializes_with_serde_default() {
+        // A tile JSON without `label_filters` should deserialize to empty vec.
+        let json = r#"{"id":"t1","metric_name":"foo","aggregation":"avg"}"#;
+        let tile: DashboardTile = serde_json::from_str(json).unwrap();
+        assert!(tile.label_filters.is_empty());
+    }
+
+    // --- group_by validation tests (Phase 2 ADR-026) ---
+
+    #[test]
+    fn test_tile_group_by_valid_passes() {
+        let mut layout = sample_layout();
+        layout.sections[0].tiles[0].group_by = vec!["region".to_string(), "endpoint".to_string()];
+        assert!(layout.validate().is_ok());
+    }
+
+    #[test]
+    fn test_tile_group_by_too_many_rejected() {
+        let mut layout = sample_layout();
+        // 3 keys exceeds the max of 2.
+        layout.sections[0].tiles[0].group_by = vec![
+            "region".to_string(),
+            "endpoint".to_string(),
+            "status_code".to_string(),
+        ];
+        assert!(matches!(
+            layout.validate(),
+            Err(OtelError::Validation { .. })
+        ));
+    }
+
+    #[test]
+    fn test_tile_group_by_invalid_key_rejected() {
+        let mut layout = sample_layout();
+        layout.sections[0].tiles[0].group_by = vec!["bad key!".to_string()];
+        assert!(matches!(
+            layout.validate(),
+            Err(OtelError::Validation { .. })
+        ));
+    }
+
+    #[test]
+    fn test_tile_group_by_deserializes_with_serde_default() {
+        // A tile JSON without `group_by` should deserialize to an empty vec —
+        // existing persisted tiles must round-trip without modification.
+        let json = r#"{"id":"t1","metric_name":"foo","aggregation":"avg"}"#;
+        let tile: DashboardTile = serde_json::from_str(json).unwrap();
+        assert!(tile.group_by.is_empty());
     }
 }

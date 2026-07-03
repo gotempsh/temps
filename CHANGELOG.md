@@ -180,6 +180,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **multi-node:** Real container deploy over mTLS (gated live test)
 - **dev-cluster:** From-scratch multi-node e2e harness (mTLS join + deploy)
 - **providers:** Isolate lifecycle tests' ports and container names ([#171](https://github.com/gotempsh/temps/issues/171))
+- **Postgres lifecycle waits for usable databases**: managed Postgres
+  container startup now waits for real `psql SELECT 1` connectivity, creates
+  the configured database if the cluster is alive but it is absent, and
+  includes container logs on readiness failures. This prevents major-upgrade
+  restores from treating `pg_isready` as sufficient before the target database
+  exists.
+- **Postgres major upgrades require a clean live volume**: the upgrade
+  snapshot and rollback phases now remove the temporary copy sidecar before
+  deleting the old live data volume, fail if Docker still cannot remove that
+  volume, and wait for the final healthy Postgres container before creating
+  the target database, preventing Postgres 18+ containers from reopening stale
+  17-era PGDATA after a supposedly clean handoff.
+
+### Tests
+- **Postgres upgrade Docker tests use real backup FK rows**:
+  `postgres_upgrade` integration fixtures now insert a matching `backups` row
+  for the fake pre-upgrade backup id, keeping the existing rollback/upgrade
+  assertions valid after FK enforcement.
 
 ## [0.1.0-beta.39] - 2026-06-25
 

@@ -197,6 +197,8 @@ export default function DashboardView({ project }: DashboardViewProps) {
                       metricName={tile.metric_name}
                       aggregation={tile.aggregation}
                       title={tile.title}
+                      labelFilters={tile.label_filters}
+                      groupBy={tile.group_by}
                       fromIso={fromIso}
                       toIso={toIso}
                       bucketInterval={bucketInterval}

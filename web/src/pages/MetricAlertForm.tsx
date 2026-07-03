@@ -17,6 +17,7 @@ import {
   queryMetricsOptions,
   updateAlertMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -24,6 +25,11 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible'
 import {
   Form,
   FormControl,
@@ -44,9 +50,25 @@ import {
 import { SearchableSelect } from '@/components/ui/searchable-select'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table'
 import { DebugChat } from '@/components/ai/DebugChat'
-import { AGGREGATIONS } from '@/components/metrics/metric-format'
+import { AGGREGATIONS, formatMetricValue } from '@/components/metrics/metric-format'
+import { cn } from '@/lib/utils'
 import { AnomalyBacktest } from '@/components/metrics/AnomalyBacktest'
+import {
+  GroupByBuilder,
+  LabelFilterBuilder,
+  labelFiltersToTuples,
+  MAX_GROUP_BY_KEYS,
+  tuplesToLabelFilters,
+} from '@/components/metrics/LabelFilterBuilder'
 import {
   AlertStateBadge,
   ANOMALY_ALGORITHMS,
@@ -61,10 +83,16 @@ import {
 } from '@/components/metrics/alert-format'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { AlertTriangle, ArrowLeft, CheckCircle2 } from 'lucide-react'
-import { useMemo } from 'react'
+import {
+  AlertTriangle,
+  ArrowLeft,
+  CheckCircle2,
+  ChevronDown,
+  SlidersHorizontal,
+} from 'lucide-react'
+import { useEffect, useMemo, useState } from 'react'
 import { useForm } from 'react-hook-form'
-import { useNavigate, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams } from 'react-router-dom'
 import { toast } from 'sonner'
 import { z } from 'zod'
 
@@ -117,6 +145,19 @@ const alertSchema = z.object({
     .positive('Duration must be greater than 0'),
   severity: z.enum(SEVERITY_VALUES),
   enabled: z.boolean(),
+  label_filters: z.array(z.object({ key: z.string(), value: z.string() })),
+  group_by: z.array(z.string()).max(MAX_GROUP_BY_KEYS),
+  dynamic_alerts: z.boolean(),
+  max_series: z
+    .number({ message: 'Max series must be a number' })
+    .int()
+    .min(1, 'Max series must be at least 1')
+    .max(100, 'Max series cannot exceed 100'),
+  grouped_notification_threshold: z
+    .number({ message: 'Threshold must be a number' })
+    .int()
+    .min(1, 'Threshold must be at least 1')
+    .max(1000, 'Threshold cannot exceed 1000'),
 })
 
 type AlertFormData = z.infer<typeof alertSchema>
@@ -149,6 +190,11 @@ function emptyDefaults(): AlertFormData {
     for_duration_secs: 60,
     severity: 'warning',
     enabled: true,
+    label_filters: [],
+    group_by: [],
+    dynamic_alerts: false,
+    max_series: 20,
+    grouped_notification_threshold: 5,
   }
 }
 
@@ -221,6 +267,11 @@ function AlertFormBody({ project, isEditing, id, existing }: AlertFormBodyProps)
         for_duration_secs: existing.for_duration_secs,
         severity: coerce(SEVERITY_VALUES, existing.severity, 'warning'),
         enabled: existing.enabled,
+        label_filters: tuplesToLabelFilters(existing.label_filters),
+        group_by: existing.group_by,
+        dynamic_alerts: existing.dynamic_alerts,
+        max_series: existing.max_series,
+        grouped_notification_threshold: existing.grouped_notification_threshold,
       }
     }
     return emptyDefaults()
@@ -237,6 +288,65 @@ function AlertFormBody({ project, isEditing, id, existing }: AlertFormBodyProps)
   const detectionKind = form.watch('detection_kind')
   const watchedMetric = form.watch('metric_name')
   const isAnomaly = detectionKind === 'anomaly'
+  const groupBy = form.watch('group_by')
+  const dynamicAlerts = form.watch('dynamic_alerts')
+  const maxSeries = form.watch('max_series')
+  const hasGroupBy = groupBy.length > 0
+  const labelFilters = form.watch('label_filters')
+  const alarmsBasePath = '/monitoring/alarms'
+
+  // "Scope" (label filters + break-down/per-series settings) is the least
+  // commonly needed section — most alerts just watch the whole metric — so it
+  // starts collapsed. It starts OPEN when editing a rule that already has
+  // something configured there, so nobody loses sight of their own settings.
+  // Computed once at mount (not reactive) so opening/closing it afterward
+  // isn't fought by a value the user is actively changing.
+  const [scopeOpen, setScopeOpen] = useState(
+    () => defaultValues.label_filters.length > 0 || defaultValues.group_by.length > 0,
+  )
+  const scopeSummary = useMemo(() => {
+    const parts: string[] = []
+    if (labelFilters.length > 0) {
+      parts.push(`${labelFilters.length} filter${labelFilters.length === 1 ? '' : 's'}`)
+    }
+    if (hasGroupBy) parts.push(`by ${groupBy.join(', ')}`)
+    if (dynamicAlerts) parts.push('per series')
+    return parts.length > 0 ? parts.join(' · ') : 'Whole metric'
+  }, [labelFilters, hasGroupBy, groupBy, dynamicAlerts])
+  // Full per-series snapshot (firing AND ok) for a dynamic rule, decoded from
+  // the persisted `series_states` column and keyed by the human-readable series
+  // label. Firing series sort first, then by breach magnitude, so the most
+  // urgent rows lead.
+  const seriesEntries = useMemo(
+    () =>
+      Object.entries(existing?.series_states ?? {})
+        .map(([label, s]) => ({ label, ...s }))
+        .sort((a, b) => {
+          const af = a.state === 'firing' ? 0 : 1
+          const bf = b.state === 'firing' ? 0 : 1
+          return af - bf || Math.abs(b.value) - Math.abs(a.value)
+        }),
+    [existing],
+  )
+
+  // Per-series alerting needs a group_by to split the metric into series. The
+  // "Alert per series" toggle only renders while a group_by is set, so if the
+  // user clears every break-down key, reset the now-meaningless flag rather than
+  // carrying a stale `true` into submit. (Anomaly + dynamic is now supported, so
+  // detector kind no longer gates this.)
+  useEffect(() => {
+    if (dynamicAlerts && !hasGroupBy) {
+      form.setValue('dynamic_alerts', false)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasGroupBy, dynamicAlerts])
+
+  // Same mount-once-open logic as `scopeOpen`: don't hide a non-default
+  // algorithm/seasonality the user already configured behind a collapsed
+  // "Advanced" section when they open the form to edit this rule.
+  const [anomalyAdvancedOpen, setAnomalyAdvancedOpen] = useState(
+    () => defaultValues.algorithm !== 'robust' || defaultValues.seasonality !== 'none',
+  )
 
   // History/eligibility for anomaly rules: a metric needs enough past data for a
   // trustworthy baseline, otherwise the rule sits at "unknown" and never alerts.
@@ -270,6 +380,18 @@ function AlertFormBody({ project, isEditing, id, existing }: AlertFormBodyProps)
     return Math.max(0, Math.round((Date.now() - earliest) / 86_400_000))
   }, [historyQuery.data])
   const enoughHistory = historyDays >= ANOMALY_MIN_HISTORY_DAYS
+
+  // Bounds for the label-filter autocomplete — mirrors LabelFilterBuilder's own
+  // "last 24h" observed-attributes window. Computed once via the `useState`
+  // lazy-initializer form (not `useMemo`) so reading the current time happens
+  // during mount, not on every render pass, keeping the query key stable.
+  const [labelFilterRange] = useState(() => {
+    const now = Date.now()
+    return {
+      start: new Date(now - 24 * 60 * 60 * 1000).toISOString(),
+      end: new Date(now).toISOString(),
+    }
+  })
 
   const createMutation = useMutation({
     ...createAlertMutation(),
@@ -319,6 +441,12 @@ function AlertFormBody({ project, isEditing, id, existing }: AlertFormBodyProps)
             comparator: data.comparator as Comparator,
             threshold: data.threshold,
           }
+    const label_filters = labelFiltersToTuples(data.label_filters)
+    // Defensive re-derivation, not just a UI nicety: dynamic_alerts only means
+    // anything with a group_by set, so never submit it true otherwise even if a
+    // stale toggle value slipped through. (Detector kind no longer matters — the
+    // backend now supports per-series anomaly detection too.)
+    const dynamic_alerts = data.dynamic_alerts && data.group_by.length > 0
     if (isEditing) {
       await updateMutation.mutateAsync({
         path: { id },
@@ -332,6 +460,11 @@ function AlertFormBody({ project, isEditing, id, existing }: AlertFormBodyProps)
           for_duration_secs: data.for_duration_secs,
           severity: data.severity,
           enabled: data.enabled,
+          label_filters,
+          group_by: data.group_by,
+          dynamic_alerts,
+          max_series: data.max_series,
+          grouped_notification_threshold: data.grouped_notification_threshold,
         },
       })
     } else {
@@ -346,6 +479,11 @@ function AlertFormBody({ project, isEditing, id, existing }: AlertFormBodyProps)
           for_duration_secs: data.for_duration_secs,
           severity: data.severity,
           enabled: data.enabled,
+          label_filters,
+          group_by: data.group_by,
+          dynamic_alerts,
+          max_series: data.max_series,
+          grouped_notification_threshold: data.grouped_notification_threshold,
         },
       })
     }
@@ -362,7 +500,16 @@ function AlertFormBody({ project, isEditing, id, existing }: AlertFormBodyProps)
             <h1 className="text-lg font-semibold">
               {isEditing ? 'Edit alert' : 'New alert'}
             </h1>
-            {existing && <AlertStateBadge state={existing.last_state} />}
+            {existing && (
+              <AlertStateBadge
+                state={existing.last_state}
+                firingSeriesCount={
+                  existing.dynamic_alerts
+                    ? (existing.firing_series ?? []).length
+                    : undefined
+                }
+              />
+            )}
           </div>
           <p className="text-sm text-muted-foreground">
             {isEditing
@@ -371,6 +518,84 @@ function AlertFormBody({ project, isEditing, id, existing }: AlertFormBodyProps)
           </p>
         </div>
       </div>
+
+      {isEditing && existing?.dynamic_alerts && seriesEntries.length > 0 && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">
+              Series ({seriesEntries.length})
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {existing.last_dropped_series_count > 0 && (
+              <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-xs text-amber-700 dark:text-amber-400">
+                <AlertTriangle className="mt-0.5 size-4 shrink-0" />
+                <span>
+                  {existing.last_dropped_series_count} series{' '}
+                  {existing.last_dropped_series_count === 1 ? 'was' : 'were'}{' '}
+                  dropped by the cardinality cap on the last evaluation — consider
+                  raising <strong>Max series to track</strong>.
+                </span>
+              </div>
+            )}
+            {/* Every tracked series (firing AND ok), bounded by max_series
+                server-side (100 max), so a plain scroll container is enough —
+                no separate "N of M" cap note. */}
+            <div className="max-h-72 overflow-y-auto rounded-md border border-border/60">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead className="w-[90px]">Status</TableHead>
+                    <TableHead>Series</TableHead>
+                    <TableHead className="w-[100px] text-right">Value</TableHead>
+                    <TableHead className="w-[90px] text-right">Alarm</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {seriesEntries.map((series, i) => {
+                    const isFiring = series.state === 'firing'
+                    return (
+                      <TableRow key={`${series.label}-${i}`}>
+                        <TableCell>
+                          <span className="flex items-center gap-1.5 text-xs">
+                            <span
+                              className={cn(
+                                'inline-block size-2 shrink-0 rounded-full',
+                                isFiring ? 'bg-destructive' : 'bg-emerald-500',
+                              )}
+                            />
+                            {isFiring ? 'Firing' : 'OK'}
+                          </span>
+                        </TableCell>
+                        <TableCell className="font-mono text-xs">
+                          {series.label || '(no labels)'}
+                        </TableCell>
+                        <TableCell className="text-right font-mono text-xs tabular-nums">
+                          {formatMetricValue(series.value)}
+                        </TableCell>
+                        <TableCell className="text-right">
+                          {isFiring && series.alarm_id != null ? (
+                            <Link
+                              to={`${alarmsBasePath}?project_id=${project.id}&alarm_id=${series.alarm_id}`}
+                              className="text-xs underline underline-offset-2 hover:no-underline"
+                            >
+                              View
+                            </Link>
+                          ) : (
+                            <span className="text-xs text-muted-foreground">
+                              —
+                            </span>
+                          )}
+                        </TableCell>
+                      </TableRow>
+                    )
+                  })}
+                </TableBody>
+              </Table>
+            </div>
+          </CardContent>
+        </Card>
+      )}
 
       {isEditing &&
         (project.ai_debug_chat_enabled === true ||
@@ -392,7 +617,7 @@ function AlertFormBody({ project, isEditing, id, existing }: AlertFormBodyProps)
         <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-6">
           <Card>
             <CardHeader>
-              <CardTitle>Rule</CardTitle>
+              <CardTitle>Basics</CardTitle>
             </CardHeader>
             <CardContent className="space-y-6">
               <FormField
@@ -465,7 +690,204 @@ function AlertFormBody({ project, isEditing, id, existing }: AlertFormBodyProps)
                   )}
                 />
               </div>
+            </CardContent>
+          </Card>
 
+          {/* Scope: label filters + break-down/per-series settings. Collapsed
+              by default — most alerts watch the whole metric and never touch
+              this — but starts open when editing a rule that already has
+              something configured here (see `scopeOpen`'s initializer). */}
+          <Collapsible
+            open={scopeOpen}
+            onOpenChange={setScopeOpen}
+            className="rounded-lg border border-border bg-card"
+          >
+            <CollapsibleTrigger
+              type="button"
+              className="flex w-full items-center justify-between gap-2 px-4 py-3 text-left text-sm transition-colors hover:bg-muted/40"
+            >
+              <span className="flex min-w-0 items-center gap-2">
+                <SlidersHorizontal className="size-4 shrink-0 text-muted-foreground" />
+                <span className="font-medium">Scope</span>
+                <Badge variant="secondary" className="ml-1 shrink-0 font-normal">
+                  {scopeSummary}
+                </Badge>
+              </span>
+              <ChevronDown
+                className={cn(
+                  'size-4 shrink-0 text-muted-foreground transition-transform',
+                  scopeOpen && 'rotate-180',
+                )}
+              />
+            </CollapsibleTrigger>
+            <CollapsibleContent className="flex flex-col gap-6 border-t border-border p-4">
+              {/* Label filters — scopes this rule to one label value (e.g.
+                  endpoint=/checkout) instead of the whole metric. Needs a
+                  metric selected first: there's nothing to autocomplete
+                  against otherwise, matching MetricsExplorer's gating of the
+                  same autocomplete queries. */}
+              {watchedMetric ? (
+                <FormField
+                  control={form.control}
+                  name="label_filters"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormControl>
+                        <LabelFilterBuilder
+                          value={field.value}
+                          onChange={field.onChange}
+                          projectId={project.id}
+                          metricName={watchedMetric}
+                          fromIso={labelFilterRange.start}
+                          toIso={labelFilterRange.end}
+                        />
+                      </FormControl>
+                      <FormDescription>
+                        Scope this alert to a specific label value instead of
+                        the whole metric. Leave empty to alert on the full
+                        aggregate.
+                      </FormDescription>
+                    </FormItem>
+                  )}
+                />
+              ) : (
+                <p className="text-xs text-muted-foreground">
+                  Pick a metric above to optionally scope this alert to a
+                  specific label value.
+                </p>
+              )}
+
+              {/* Group by / Alert per series (ADR-026 Phase 3/4) — pick up to 2
+                  label keys to break the metric into per-series alarms instead
+                  of one aggregate alarm. Same metric gating as label filters:
+                  there's nothing to autocomplete without a metric. */}
+              {watchedMetric && (
+                <div className="flex flex-col gap-4 border-t border-border/60 pt-6">
+                  <FormField
+                    control={form.control}
+                    name="group_by"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormControl>
+                          <GroupByBuilder
+                            value={field.value}
+                            onChange={field.onChange}
+                            projectId={project.id}
+                            metricName={watchedMetric}
+                            fromIso={labelFilterRange.start}
+                            toIso={labelFilterRange.end}
+                            cardinalityHint={`only the top ${maxSeries} series are tracked once "Alert per series" is on; the rest are dropped for that evaluation tick.`}
+                          />
+                        </FormControl>
+                        <FormDescription>
+                          Break this alert down by label so it can fire
+                          independently per series (e.g. one alarm per{' '}
+                          <span className="font-mono">endpoint</span>) instead
+                          of a single aggregate alarm.
+                        </FormDescription>
+                      </FormItem>
+                    )}
+                  />
+
+                  {hasGroupBy && (
+                    <FormField
+                      control={form.control}
+                      name="dynamic_alerts"
+                      render={({ field }) => (
+                        <FormItem className="flex flex-row items-center justify-between gap-4 rounded-md border border-border/60 p-3">
+                          <div className="space-y-0.5">
+                            <FormLabel>Alert per series</FormLabel>
+                            <FormDescription>
+                              Fire one independent alarm per breaching{' '}
+                              {groupBy.join('/')} instead of a single alarm for
+                              the whole metric.
+                            </FormDescription>
+                          </div>
+                          <FormControl>
+                            <Switch
+                              checked={field.value}
+                              onCheckedChange={field.onChange}
+                            />
+                          </FormControl>
+                        </FormItem>
+                      )}
+                    />
+                  )}
+
+                  {hasGroupBy && dynamicAlerts && (
+                    <div className="grid gap-4 sm:grid-cols-2">
+                      <FormField
+                        control={form.control}
+                        name="max_series"
+                        render={({ field }) => (
+                          <FormItem>
+                            <FormLabel>Max series to track</FormLabel>
+                            <FormControl>
+                              <Input
+                                type="number"
+                                min={1}
+                                max={100}
+                                {...field}
+                                onChange={(e) =>
+                                  field.onChange(
+                                    e.target.value === ''
+                                      ? undefined
+                                      : e.target.valueAsNumber,
+                                  )
+                                }
+                              />
+                            </FormControl>
+                            <FormDescription>
+                              Cardinality cap (1–100). Only the top series by
+                              breach magnitude are tracked each tick; the rest
+                              are dropped rather than creating unbounded alarms.
+                            </FormDescription>
+                            <FormMessage />
+                          </FormItem>
+                        )}
+                      />
+                      <FormField
+                        control={form.control}
+                        name="grouped_notification_threshold"
+                        render={({ field }) => (
+                          <FormItem>
+                            <FormLabel>Notification grouping threshold</FormLabel>
+                            <FormControl>
+                              <Input
+                                type="number"
+                                min={1}
+                                max={1000}
+                                {...field}
+                                onChange={(e) =>
+                                  field.onChange(
+                                    e.target.value === ''
+                                      ? undefined
+                                      : e.target.valueAsNumber,
+                                  )
+                                }
+                              />
+                            </FormControl>
+                            <FormDescription>
+                              When more than this many series fire in the same
+                              tick, you&apos;ll get one combined notification
+                              instead of one per series.
+                            </FormDescription>
+                            <FormMessage />
+                          </FormItem>
+                        )}
+                      />
+                    </div>
+                  )}
+                </div>
+              )}
+            </CollapsibleContent>
+          </Collapsible>
+
+          <Card>
+            <CardHeader>
+              <CardTitle>Detection</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-6">
               {/* Detector type */}
               <FormField
                 control={form.control}
@@ -615,71 +1037,86 @@ function AlertFormBody({ project, isEditing, id, existing }: AlertFormBodyProps)
                   </div>
 
                   {/* Advanced: algorithm + seasonality (sensible defaults). */}
-                  <details className="rounded-md border border-border/60 px-3 py-2 [&_summary]:cursor-pointer">
-                    <summary className="text-sm font-medium text-muted-foreground">
+                  <Collapsible
+                    open={anomalyAdvancedOpen}
+                    onOpenChange={setAnomalyAdvancedOpen}
+                    className="rounded-md border border-border/60"
+                  >
+                    <CollapsibleTrigger
+                      type="button"
+                      className="flex w-full items-center justify-between gap-2 px-3 py-2 text-left text-sm font-medium text-muted-foreground transition-colors hover:bg-muted/40"
+                    >
                       Advanced
-                    </summary>
-                    <div className="mt-3 grid gap-4 sm:grid-cols-2">
-                      <FormField
-                        control={form.control}
-                        name="algorithm"
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel>Algorithm</FormLabel>
-                            <Select
-                              onValueChange={field.onChange}
-                              value={field.value}
-                            >
-                              <FormControl>
-                                <SelectTrigger>
-                                  <SelectValue />
-                                </SelectTrigger>
-                              </FormControl>
-                              <SelectContent>
-                                {ANOMALY_ALGORITHMS.map((a) => (
-                                  <SelectItem key={a.value} value={a.value}>
-                                    {a.label}
-                                  </SelectItem>
-                                ))}
-                              </SelectContent>
-                            </Select>
-                            <FormMessage />
-                          </FormItem>
+                      <ChevronDown
+                        className={cn(
+                          'size-4 shrink-0 transition-transform',
+                          anomalyAdvancedOpen && 'rotate-180',
                         )}
                       />
-                      <FormField
-                        control={form.control}
-                        name="seasonality"
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel>Seasonality</FormLabel>
-                            <Select
-                              onValueChange={field.onChange}
-                              value={field.value}
-                            >
-                              <FormControl>
-                                <SelectTrigger>
-                                  <SelectValue />
-                                </SelectTrigger>
-                              </FormControl>
-                              <SelectContent>
-                                {SEASONALITIES.map((s) => (
-                                  <SelectItem key={s.value} value={s.value}>
-                                    {s.label}
-                                  </SelectItem>
-                                ))}
-                              </SelectContent>
-                            </Select>
-                            <FormDescription>
-                              Compare like-for-like times (e.g. weekly = same
-                              weekday &amp; hour). Needs more history.
-                            </FormDescription>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-                    </div>
-                  </details>
+                    </CollapsibleTrigger>
+                    <CollapsibleContent className="border-t border-border/60 p-3">
+                      <div className="grid gap-4 sm:grid-cols-2">
+                        <FormField
+                          control={form.control}
+                          name="algorithm"
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>Algorithm</FormLabel>
+                              <Select
+                                onValueChange={field.onChange}
+                                value={field.value}
+                              >
+                                <FormControl>
+                                  <SelectTrigger>
+                                    <SelectValue />
+                                  </SelectTrigger>
+                                </FormControl>
+                                <SelectContent>
+                                  {ANOMALY_ALGORITHMS.map((a) => (
+                                    <SelectItem key={a.value} value={a.value}>
+                                      {a.label}
+                                    </SelectItem>
+                                  ))}
+                                </SelectContent>
+                              </Select>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+                        <FormField
+                          control={form.control}
+                          name="seasonality"
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>Seasonality</FormLabel>
+                              <Select
+                                onValueChange={field.onChange}
+                                value={field.value}
+                              >
+                                <FormControl>
+                                  <SelectTrigger>
+                                    <SelectValue />
+                                  </SelectTrigger>
+                                </FormControl>
+                                <SelectContent>
+                                  {SEASONALITIES.map((s) => (
+                                    <SelectItem key={s.value} value={s.value}>
+                                      {s.label}
+                                    </SelectItem>
+                                  ))}
+                                </SelectContent>
+                              </Select>
+                              <FormDescription>
+                                Compare like-for-like times (e.g. weekly = same
+                                weekday &amp; hour). Needs more history.
+                              </FormDescription>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+                      </div>
+                    </CollapsibleContent>
+                  </Collapsible>
 
                   {/* "Would this have fired?" — only meaningful with a metric. */}
                   {watchedMetric && (
@@ -754,7 +1191,14 @@ function AlertFormBody({ project, isEditing, id, existing }: AlertFormBodyProps)
                   />
                 </div>
               )}
+            </CardContent>
+          </Card>
 
+          <Card>
+            <CardHeader>
+              <CardTitle>Timing &amp; notifications</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-6">
               {/* Timing: window + for-duration */}
               <div className="grid gap-4 sm:grid-cols-2">
                 <FormField
@@ -838,7 +1282,8 @@ function AlertFormBody({ project, isEditing, id, existing }: AlertFormBodyProps)
                     </Select>
                     <FormDescription>
                       Maps to the notification severity. Alerts are delivered
-                      through this project's configured notification channels.
+                      through the notification channels configured for this
+                      project.
                     </FormDescription>
                     <FormMessage />
                   </FormItem>

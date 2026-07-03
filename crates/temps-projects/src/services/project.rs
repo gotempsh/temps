@@ -874,6 +874,7 @@ impl ProjectService {
         ai_alert_summaries_enabled: Option<bool>,
         ai_debug_chat_enabled: Option<bool>,
         ai_write_actions_enabled: Option<bool>,
+        cross_project_trace_sharing: Option<bool>,
     ) -> Result<Project, ProjectError> {
         // Validate preview env on-demand timeouts before touching the DB.
         // Mirrors DeploymentConfig::validate so the project-level defaults are
@@ -1027,6 +1028,20 @@ impl ProjectService {
             if let Some(v) = ai_write_actions_enabled {
                 active_project.ai_write_actions_enabled = Set(v);
             }
+            active_project.update(self.db.as_ref()).await?;
+        }
+
+        // Update cross_project_trace_sharing if provided (ADR-027 Phase 3 opt-out).
+        if let Some(sharing) = cross_project_trace_sharing {
+            let project = projects::Entity::find_by_id(project_id)
+                .one(self.db.as_ref())
+                .await?
+                .ok_or(ProjectError::NotFound(format!(
+                    "Project {} not found",
+                    project_id
+                )))?;
+            let mut active_project: projects::ActiveModel = project.into();
+            active_project.cross_project_trace_sharing = Set(sharing);
             active_project.update(self.db.as_ref()).await?;
         }
 
@@ -2494,6 +2509,7 @@ impl ProjectService {
             preview_envs_wake_timeout_seconds: db_project.preview_envs_wake_timeout_seconds,
             source_type: db_project.source_type,
             gitlab_webhook_id: db_project.gitlab_webhook_id,
+            cross_project_trace_sharing: db_project.cross_project_trace_sharing,
         }
     }
 
@@ -3031,6 +3047,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // cross_project_trace_sharing
             )
             .await;
 

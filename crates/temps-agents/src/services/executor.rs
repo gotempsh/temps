@@ -4089,6 +4089,7 @@ mod tests {
             preview_envs_idle_timeout_seconds: 300,
             preview_envs_wake_timeout_seconds: 30,
             source_type: temps_entities::source_type::SourceType::Git,
+            cross_project_trace_sharing: true,
         }
     }
 

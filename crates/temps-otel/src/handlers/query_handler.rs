@@ -4,18 +4,24 @@
 //! (JWT/session) since they are accessed by the Temps dashboard, not by
 //! OTel collectors.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use tracing::warn;
 use utoipa::ToSchema;
 
+use crate::handlers::audit::{CrossProjectTraceSiblingsReadAudit, UnifiedTraceReadAudit};
+use crate::services::cross_project::is_valid_trace_id;
+use crate::services::{CrossProjectTraceError, SiblingRef, UnifiedTrace};
 use crate::types::*;
 use crate::OtelAppState;
-use temps_auth::{permission_guard, project_scope_guard, RequireAuth};
-use temps_core::problemdetails::Problem;
-use temps_core::ProblemDetails;
+use temps_auth::{deny_deployment_token, permission_guard, project_scope_guard, RequireAuth};
+use temps_core::problemdetails::{self, Problem};
+use temps_core::{AuditContext, ProblemDetails, RequestMetadata};
 
 // ── Request DTOs ────────────────────────────────────────────────────
 
@@ -610,8 +616,39 @@ pub async fn query_trace_summaries(
         ..query.clone()
     };
 
-    let data = state.otel_service.query_trace_summaries(query).await?;
+    let mut data = state.otel_service.query_trace_summaries(query).await?;
     let total = state.otel_service.count_traces(count_query).await?;
+
+    // Name cross-project trace rows whose root span lives in a sibling project:
+    // when this project holds only child spans, the summary has no root and would
+    // render as "(unnamed)". Backfill the root name/service from the root-owning
+    // (sharing) project. Best-effort — a failure leaves the rows as-is.
+    let unnamed: Vec<String> = data
+        .iter()
+        .filter(|s| s.root_span_name.trim().is_empty())
+        .map(|s| s.trace_id.clone())
+        .collect();
+    if !unnamed.is_empty() {
+        match state
+            .cross_project_service
+            .resolve_root_names(&unnamed)
+            .await
+        {
+            Ok(names) => {
+                for s in data.iter_mut() {
+                    if let Some((name, svc)) = names.get(&s.trace_id) {
+                        if s.root_span_name.trim().is_empty() {
+                            s.root_span_name = name.clone();
+                        }
+                        if s.service_name.trim().is_empty() {
+                            s.service_name = svc.clone();
+                        }
+                    }
+                }
+            }
+            Err(e) => warn!("cross-project trace name backfill failed: {e}"),
+        }
+    }
 
     Ok(Json(TraceSummariesResponse { data, total }))
 }
@@ -969,6 +1006,231 @@ pub async fn get_genai_trace(
         events,
         event_count,
     }))
+}
+
+// ── Cross-project trace endpoints (ADR-027) ─────────────────────────
+
+/// Convert `CrossProjectTraceError` into an RFC-7807 Problem response.
+///
+/// `InvalidTraceId` → 400; all database/storage errors → 500.
+/// The match is exhaustive with no catch-all arm per CLAUDE.md rules.
+impl From<CrossProjectTraceError> for Problem {
+    fn from(error: CrossProjectTraceError) -> Self {
+        let detail = error.to_string();
+        match error {
+            CrossProjectTraceError::InvalidTraceId { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Invalid Trace ID")
+                    .with_detail(detail)
+            }
+            CrossProjectTraceError::RecordHint { .. }
+            | CrossProjectTraceError::QuerySiblings { .. }
+            | CrossProjectTraceError::QueryProjects { .. }
+            | CrossProjectTraceError::Database(_)
+            | CrossProjectTraceError::Storage(_) => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Internal Server Error")
+                    .with_detail(detail)
+            }
+        }
+    }
+}
+
+// ── Response DTOs ───────────────────────────────────────────────────
+
+/// A sibling project that shares the same `trace_id`, returned by the
+/// Phase 1 cross-project banner endpoint.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CrossProjectSiblingRef {
+    pub project_id: i32,
+    pub project_name: String,
+    /// URL slug used to link into the sibling project's single-project trace view.
+    pub project_slug: String,
+    /// ISO 8601 timestamp (UTC, `Z` suffix) of first span ingest for this
+    /// `(trace_id, project_id)` pair.
+    #[schema(value_type = String, format = DateTime)]
+    pub first_seen: DateTime<Utc>,
+}
+
+impl From<SiblingRef> for CrossProjectSiblingRef {
+    fn from(s: SiblingRef) -> Self {
+        Self {
+            project_id: s.project_id,
+            project_name: s.project_name,
+            project_slug: s.project_slug,
+            first_seen: s.first_seen,
+        }
+    }
+}
+
+/// Response body for `GET /otel/traces/cross-project/{trace_id}`.
+///
+/// An empty `siblings` vec is the normal single-project case — never 404.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CrossProjectTraceResponse {
+    /// The trace_id that was queried (echoed back for client convenience).
+    pub trace_id: String,
+    /// Projects other than the caller's that hold spans for this trace,
+    /// ordered by `first_seen ASC`.
+    pub siblings: Vec<CrossProjectSiblingRef>,
+}
+
+/// Query parameters for `GET /otel/traces/cross-project/{trace_id}`.
+#[derive(Debug, Deserialize)]
+pub struct CrossProjectSiblingsParams {
+    /// The caller's own project ID — excluded from the sibling list so the
+    /// UI does not render a self-link.
+    pub exclude_project_id: Option<i32>,
+}
+
+// ── Handlers ────────────────────────────────────────────────────────
+
+/// Discover sibling projects that share the same `trace_id` (Phase 1 banner).
+///
+/// Returns an empty `siblings` list when the trace is single-project — never
+/// 404. Project names are included so the UI can render navigation links
+/// without a second round-trip.  See ADR-027 §3 for the full auth model and
+/// topology-disclosure trade-offs.
+#[utoipa::path(
+    tag = "Traces",
+    get,
+    path = "/otel/traces/cross-project/{trace_id}",
+    operation_id = "getCrossProjectTraceSiblings",
+    params(
+        ("trace_id" = String, Path, description = "Trace ID (32 lowercase hex characters)"),
+        ("exclude_project_id" = Option<i32>, Query,
+         description = "Project ID to exclude (the caller's own project) so the UI \
+                        does not render a self-link"),
+    ),
+    responses(
+        (status = 200, description = "Sibling projects sharing this trace",
+         body = CrossProjectTraceResponse),
+        (status = 400, description = "trace_id is not 32 lowercase hex characters",
+         body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions or deployment token",
+         body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_cross_project_trace_siblings(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<OtelAppState>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(trace_id): Path<String>,
+    Query(params): Query<CrossProjectSiblingsParams>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, OtelRead);
+    deny_deployment_token!(auth);
+
+    if !is_valid_trace_id(&trace_id) {
+        return Err(CrossProjectTraceError::InvalidTraceId {
+            trace_id: trace_id.clone(),
+        }
+        .into());
+    }
+
+    // Emit audit log before any database access (ADR-027 §1).
+    // Failure is warn!-logged and never propagates to the caller.
+    let audit = CrossProjectTraceSiblingsReadAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        trace_id: trace_id.clone(),
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        warn!(
+            error = %e,
+            trace_id = %trace_id,
+            "Failed to write cross-project trace siblings audit log (non-fatal)"
+        );
+    }
+
+    let siblings = state
+        .cross_project_service
+        .find_sibling_projects(&trace_id, params.exclude_project_id)
+        .await
+        .map_err(Problem::from)?;
+
+    let siblings: Vec<CrossProjectSiblingRef> = siblings
+        .into_iter()
+        .map(CrossProjectSiblingRef::from)
+        .collect();
+
+    Ok(Json(CrossProjectTraceResponse { trace_id, siblings }))
+}
+
+/// Assemble a unified cross-project span waterfall (Phase 2).
+///
+/// Fans out to every project that holds spans for `trace_id` (up to 20
+/// projects, 10,000 total spans).  Spans are annotated with
+/// `project_id`/`project_name` and sorted by `start_time ASC`.
+/// `truncated: true` signals a hit on either cap; `truncated_projects`
+/// lists the dropped project IDs.  See ADR-027 §4 for the full design.
+#[utoipa::path(
+    tag = "Traces",
+    get,
+    path = "/otel/global/traces/{trace_id}",
+    operation_id = "getUnifiedTrace",
+    params(
+        ("trace_id" = String, Path, description = "Trace ID (32 lowercase hex characters)"),
+    ),
+    responses(
+        (status = 200, description = "Unified cross-project trace waterfall",
+         body = UnifiedTrace),
+        (status = 400, description = "trace_id is not 32 lowercase hex characters",
+         body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions or deployment token",
+         body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_unified_trace(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<OtelAppState>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(trace_id): Path<String>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, OtelRead);
+    deny_deployment_token!(auth);
+
+    if !is_valid_trace_id(&trace_id) {
+        return Err(CrossProjectTraceError::InvalidTraceId {
+            trace_id: trace_id.clone(),
+        }
+        .into());
+    }
+
+    // Emit audit log before fan-out begins (ADR-027 §1).
+    // Failure is warn!-logged and never propagates to the caller.
+    let audit = UnifiedTraceReadAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        trace_id: trace_id.clone(),
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        warn!(
+            error = %e,
+            trace_id = %trace_id,
+            "Failed to write unified trace audit log (non-fatal)"
+        );
+    }
+
+    let unified: UnifiedTrace = state
+        .cross_project_service
+        .get_unified_trace(&trace_id)
+        .await
+        .map_err(Problem::from)?;
+
+    Ok(Json(unified))
 }
 
 #[cfg(test)]

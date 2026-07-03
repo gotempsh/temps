@@ -102,7 +102,15 @@ pub async fn run_exec(
             tokio::select! {
                 biased;
 
-                chunk = output.next() => {
+                // `if !output_done` is load-bearing: once the stream hits
+                // EOF, `output.next()` returns `Ready(None)` immediately on
+                // every poll. Without this guard, the `biased` select would
+                // always take this branch and starve the `inspect_exec`
+                // branch below — spinning at 100% CPU and never detecting that
+                // the exec finished (the exact hang that wedged pre-upgrade
+                // backups until the 6h timeout). Disabling the branch once
+                // drained lets the poll branch observe `running == false`.
+                chunk = output.next(), if !output_done => {
                     match chunk {
                         Some(Ok(msg)) => {
                             captured.push_str(&msg.to_string());
@@ -238,5 +246,112 @@ mod tests {
         let result = tail(&big, 100);
         assert!(result.contains("earlier bytes elided"));
         assert!(result.ends_with(&"x".repeat(100)));
+    }
+
+    /// Regression guard for the `biased`-select busy loop. Once the exec's
+    /// output stream hits EOF, `output.next()` returns `Ready(None)` on every
+    /// poll; without the `if !output_done` guard the biased select always
+    /// takes that branch and starves the `inspect_exec` branch — spinning at
+    /// 100% CPU forever, never returning and never even hitting `run_exec`'s
+    /// own timeout. A command that writes only to a file (empty exec stdout)
+    /// is the exact trigger — and the shape every backup's
+    /// `pg_dumpall … > file` uses, which is how the hang shipped.
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_exec_returns_for_a_command_with_no_stdout() {
+        use bollard::models::ContainerCreateBody;
+        use bollard::query_parameters::{
+            CreateContainerOptionsBuilder, CreateImageOptions, RemoveContainerOptions,
+            StartContainerOptions,
+        };
+        use futures::TryStreamExt;
+
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => d,
+            Err(e) => {
+                println!("Docker unavailable, skipping: {e}");
+                return;
+            }
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker daemon not responding, skipping");
+            return;
+        }
+
+        let _ = docker
+            .create_image(
+                Some(CreateImageOptions {
+                    from_image: Some("busybox".to_string()),
+                    tag: Some("latest".to_string()),
+                    ..Default::default()
+                }),
+                None,
+                None,
+            )
+            .try_collect::<Vec<_>>()
+            .await;
+
+        let name = format!("temps_run_exec_nostdout_{}", rand::random::<u32>());
+        docker
+            .create_container(
+                Some(CreateContainerOptionsBuilder::new().name(&name).build()),
+                ContainerCreateBody {
+                    image: Some("busybox:latest".to_string()),
+                    entrypoint: Some(vec!["sleep".to_string()]),
+                    cmd: Some(vec!["120".to_string()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create sidecar");
+        docker
+            .start_container(&name, None::<StartContainerOptions>)
+            .await
+            .expect("start sidecar");
+
+        // Exits 0 and writes only to files -> the exec's stdout/stderr are
+        // empty, so the output stream EOFs immediately.
+        //
+        // Run `run_exec` on a SEPARATE task (multi_thread runtime) and time out
+        // the JoinHandle. A regression re-introduces a synchronous busy loop
+        // that never yields `Pending`, so a `timeout` wrapping the future
+        // directly could never fire — but as a spawned task the spin occupies
+        // one worker while the timeout fires on another, so the test FAILS
+        // instead of hanging CI.
+        let docker_task = docker.clone();
+        let name_task = name.clone();
+        let handle = tokio::spawn(async move {
+            run_exec(
+                &docker_task,
+                &name_task,
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "echo hi > /tmp/out 2>/tmp/err".to_string(),
+                ],
+                None,
+                Duration::from_secs(30),
+            )
+            .await
+        });
+        let outcome = tokio::time::timeout(Duration::from_secs(60), handle).await;
+
+        let _ = docker
+            .remove_container(
+                &name,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+
+        let joined = outcome.expect(
+            "run_exec must return for a no-stdout command instead of spinning \
+             forever (regression: biased-select busy loop on a drained stream)",
+        );
+        let result = joined.expect("run_exec task panicked");
+        let exec = result.expect("run_exec should succeed");
+        assert_eq!(exec.exit_code, 0, "expected exit 0, got {}", exec.exit_code);
     }
 }

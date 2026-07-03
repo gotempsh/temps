@@ -100,6 +100,13 @@ pub struct Model {
     /// Never serialized in API responses (MUST-FIX 5).
     #[serde(skip_serializing)]
     pub generic_webhook_token: Option<String>,
+    /// ADR-027 Phase 3: whether this project's traces appear in cross-project
+    /// discovery results. TRUE (the default) is consistent with the OSS
+    /// global-observability model where any OtelRead holder can query any
+    /// project's telemetry. Operators who want private-by-default can set this
+    /// to FALSE; cross-project links to this project will then be suppressed.
+    #[sea_orm(default_value = "true")]
+    pub cross_project_trace_sharing: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

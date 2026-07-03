@@ -1,6 +1,8 @@
 //! Core OTel services.
 
 pub mod anomaly_preview;
+/// Cross-project trace discovery service (ADR-027 Phases 0 and 2).
+pub mod cross_project;
 pub mod dashboard_service;
 pub mod health_service;
 pub mod metric_alert_evaluator;
@@ -9,6 +11,10 @@ pub mod otel_service;
 /// `temps_core::TraceReader` impl for `OtelService` (storage-agnostic read API).
 pub mod trace_reader;
 
+pub use cross_project::{
+    AnnotatedSpan, CrossProjectTraceError, CrossProjectTraceService, ProjectRef, SiblingRef,
+    TraceHintMsg, TraceProjectRef, UnifiedTrace,
+};
 pub use dashboard_service::MetricDashboardService;
 pub use health_service::HealthComputeService;
 pub use metric_alert_evaluator::MetricAlertEvaluator;

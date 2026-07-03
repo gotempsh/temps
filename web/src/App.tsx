@@ -192,6 +192,9 @@ const CliLogin = lazy(() =>
 const ProxyLogs = lazy(() => import('./pages/ProxyLogs'))
 const ProxyLogDetail = lazy(() => import('./pages/ProxyLogDetail'))
 const IpGeolocationDetail = lazy(() => import('./pages/IpGeolocationDetail'))
+const CrossProjectTraceDetail = lazy(
+  () => import('./pages/CrossProjectTraceDetail')
+)
 const ApiKeys = lazy(() => import('./pages/ApiKeys'))
 const ApiKeyCreate = lazy(() => import('./pages/ApiKeyCreate'))
 const ApiKeyEdit = lazy(() => import('./pages/ApiKeyEdit'))
@@ -445,6 +448,11 @@ const FullAppRoutes = () => {
                   <Route path=":section" element={<MonitoringSettings />} />
                 </Route>
                 {/* Observe section */}
+                {/* ADR-027 Phase 2: global cross-project unified trace waterfall */}
+                <Route
+                  path="/traces/global/:traceId"
+                  element={<CrossProjectTraceDetail />}
+                />
                 <Route path="/proxy-logs" element={<ProxyLogs />} />
                 <Route path="/proxy-logs/:id" element={<ProxyLogDetail />} />
                 <Route path="/audit-logs" element={<AuditLogs />} />

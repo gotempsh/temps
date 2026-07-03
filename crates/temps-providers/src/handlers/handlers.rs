@@ -12,7 +12,9 @@ use axum::{
 use temps_auth::RequireAuth;
 use temps_auth::{deny_deployment_token, permission_guard, project_scope_guard};
 use temps_core::{
-    error_builder::{bad_request, forbidden, internal_server_error, not_found, ErrorBuilder},
+    error_builder::{
+        bad_request, conflict, forbidden, internal_server_error, not_found, ErrorBuilder,
+    },
     problemdetails::Problem,
 };
 use tracing::{error, info};
@@ -579,6 +581,7 @@ async fn create_service(
         (status = 200, description = "Service updated successfully", body = ExternalServiceInfo),
         (status = 400, description = "Invalid request"),
         (status = 404, description = "Service not found"),
+        (status = 409, description = "A major upgrade is in progress for this service"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -642,15 +645,33 @@ async fn update_service(
 
             Ok((StatusCode::OK, Json(service)))
         }
-        Err(e) => match e.to_string().as_str() {
-            "Service not found" => Err(not_found().detail("Service not found").build()),
-            _ if e.to_string().contains("validation failed") => {
-                Err(bad_request().detail(e.to_string()).build())
+        Err(e) => {
+            if let Some(problem) = upgrade_error_problem(&e) {
+                return Err(problem);
             }
-            _ => Err(internal_server_error()
-                .detail(format!("Failed to update service: {}", e))
-                .build()),
-        },
+            if e.to_string().contains("validation failed") {
+                Err(bad_request().detail(e.to_string()).build())
+            } else {
+                Err(internal_server_error()
+                    .detail(format!("Failed to update service: {}", e))
+                    .build())
+            }
+        }
+    }
+}
+
+/// Canonical HTTP mapping for the upgrade/guard-related `ExternalServiceError`
+/// variants, shared by `update_service`, `upgrade_service`, and `start_service`
+/// so the same condition can't map to different status codes across handlers
+/// (notably `UpgradeInProgress` must be 409 everywhere, not 500 on some).
+/// Returns `None` for variants each handler should classify itself.
+fn upgrade_error_problem(e: &crate::services::ExternalServiceError) -> Option<Problem> {
+    use crate::services::ExternalServiceError as E;
+    match e {
+        E::UpgradeRejected { .. } => Some(bad_request().detail(e.to_string()).build()),
+        E::ServiceNotFound { .. } => Some(not_found().detail(e.to_string()).build()),
+        E::UpgradeInProgress { .. } => Some(conflict().detail(e.to_string()).build()),
+        _ => None,
     }
 }
 
@@ -665,6 +686,7 @@ async fn update_service(
         (status = 200, description = "Service upgraded successfully", body = ExternalServiceInfo),
         (status = 400, description = "Invalid request or upgrade not supported"),
         (status = 404, description = "Service not found"),
+        (status = 409, description = "A major upgrade is already in progress for this service"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -709,15 +731,20 @@ async fn upgrade_service(
 
             Ok((StatusCode::OK, Json(service)))
         }
-        Err(e) => match e.to_string().as_str() {
-            "Service not found" => Err(not_found().detail("Service not found").build()),
-            msg if msg.contains("Upgrade not implemented") => {
-                Err(bad_request().detail(msg).build())
+        // Shared typed mapping first (UpgradeRejected->400, ServiceNotFound->404,
+        // UpgradeInProgress->409), then upgrade-specific fallthrough.
+        Err(e) => {
+            if let Some(problem) = upgrade_error_problem(&e) {
+                return Err(problem);
             }
-            _ => Err(internal_server_error()
-                .detail(format!("Failed to upgrade service: {}", e))
-                .build()),
-        },
+            if e.to_string().contains("Upgrade not implemented") {
+                Err(bad_request().detail(e.to_string()).build())
+            } else {
+                Err(internal_server_error()
+                    .detail(format!("Failed to upgrade service: {}", e))
+                    .build())
+            }
+        }
     }
 }
 
@@ -1155,6 +1182,7 @@ async fn list_service_health_statuses(
     responses(
         (status = 200, description = "Service started successfully", body = ExternalServiceInfo),
         (status = 404, description = "Service not found"),
+        (status = 409, description = "A Postgres major upgrade is in progress for this service"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -1202,12 +1230,12 @@ async fn start_service(
                 }
                 Err(e) => {
                     error!("Failed to start service: {}", e);
-                    match e.to_string().as_str() {
-                        "Service not found" => Err(not_found().detail("Service not found").build()),
-                        _ => Err(internal_server_error()
-                            .detail(format!("Failed to start service: {}", e))
-                            .build()),
+                    if let Some(problem) = upgrade_error_problem(&e) {
+                        return Err(problem);
                     }
+                    Err(internal_server_error()
+                        .detail(format!("Failed to start service: {}", e))
+                        .build())
                 }
             }
         }
@@ -2449,3 +2477,50 @@ async fn update_service_resources(
     )
 )]
 pub struct ExternalServiceApiDoc;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::response::IntoResponse;
+
+    // Guards the shared error->status mapping used by update_service /
+    // upgrade_service / start_service. The exact bug this class of test exists
+    // for (a dead `e.to_string() == "Service not found"` arm returning 500
+    // instead of 404) shipped precisely because no test asserted the status.
+    #[test]
+    fn upgrade_error_problem_maps_shared_variants_to_canonical_status() {
+        use crate::services::ExternalServiceError as E;
+        let cases = [
+            (
+                E::UpgradeRejected {
+                    id: 1,
+                    reason: "nope".to_string(),
+                },
+                StatusCode::BAD_REQUEST,
+            ),
+            (E::ServiceNotFound { id: 1 }, StatusCode::NOT_FOUND),
+            (
+                E::UpgradeInProgress {
+                    id: 1,
+                    upgrade_id: 2,
+                    phase: "dump".to_string(),
+                },
+                StatusCode::CONFLICT,
+            ),
+        ];
+        for (err, want) in cases {
+            let problem = upgrade_error_problem(&err)
+                .unwrap_or_else(|| panic!("variant should map to a Problem: {err}"));
+            assert_eq!(
+                problem.into_response().status(),
+                want,
+                "wrong status for {err}"
+            );
+        }
+        // Variants outside the shared set are left for the handler to classify.
+        assert!(upgrade_error_problem(&E::ServiceNotFoundByName {
+            name: "n".to_string()
+        })
+        .is_none());
+    }
+}

@@ -820,6 +820,25 @@ export type AnalyticsSessionEventsResponse = {
 };
 
 /**
+ * A single span annotated with the project that originally stored it.
+ * Used in `UnifiedTrace` to let the UI colour-code spans by project.
+ */
+export type AnnotatedSpan = {
+    /**
+     * The project that stored this span (same as `span.project_id`).
+     */
+    project_id: number;
+    /**
+     * Human-readable project name for waterfall colour-coding and legend.
+     */
+    project_name: string;
+    /**
+     * Original span data verbatim from storage.
+     */
+    span: SpanRecord;
+};
+
+/**
  * Anomaly baseline algorithm. Adding one (e.g. a new robust variant) is a
  * code-only enum addition — no migration, since it lives inside the blob.
  */
@@ -3031,8 +3050,38 @@ export type CreateMetricAlertRequest = {
      * `{ "kind": "static", "comparator": "gt", "threshold": 500 }` is evaluable.
      */
     detection_config: DetectionConfig;
+    /**
+     * When true (and `group_by` is set) fire one independent alarm per breaching
+     * series. Static detectors only. Default false.
+     */
+    dynamic_alerts?: boolean;
     enabled: boolean;
     for_duration_secs: number;
+    /**
+     * Label keys to break the metric down by, e.g. `["endpoint","region"]`. Empty
+     * (the default) = one aggregate stream. Max 2 keys; keys must match
+     * `[a-zA-Z0-9_.:-]`.
+     */
+    group_by?: Array<string>;
+    /**
+     * When more than this many series transition to firing in the same tick, only
+     * the first gets the expensive chart/AI enrichment. Range 1–1000, default 5.
+     */
+    grouped_notification_threshold?: number;
+    /**
+     * AND-combined label equality filters: `[["key","value"],…]`. Empty = no
+     * filtering (the default). Max 10 pairs; keys must match `[a-zA-Z0-9_.:-]`;
+     * values capped at 500 characters.
+     */
+    label_filters?: Array<[
+        string,
+        string
+    ]>;
+    /**
+     * Cardinality cap for dynamic alerting: at most this many series (top by
+     * `|value|`). Range 1–100, default 20.
+     */
+    max_series?: number;
     metric_name: string;
     name: string;
     project_id: number;
@@ -3483,6 +3532,41 @@ export type CronInfo = {
     updated_at: string;
 };
 
+/**
+ * A sibling project that shares the same `trace_id`, returned by the
+ * Phase 1 cross-project banner endpoint.
+ */
+export type CrossProjectSiblingRef = {
+    /**
+     * ISO 8601 timestamp (UTC, `Z` suffix) of first span ingest for this
+     * `(trace_id, project_id)` pair.
+     */
+    first_seen: string;
+    project_id: number;
+    project_name: string;
+    /**
+     * URL slug used to link into the sibling project's single-project trace view.
+     */
+    project_slug: string;
+};
+
+/**
+ * Response body for `GET /otel/traces/cross-project/{trace_id}`.
+ *
+ * An empty `siblings` vec is the normal single-project case — never 404.
+ */
+export type CrossProjectTraceResponse = {
+    /**
+     * Projects other than the caller's that hold spans for this trace,
+     * ordered by `first_seen ASC`.
+     */
+    siblings: Array<CrossProjectSiblingRef>;
+    /**
+     * The trace_id that was queried (echoed back for client convenience).
+     */
+    trace_id: string;
+};
+
 export type CurrentStatusResponse = {
     avg_response_time_ms?: number | null;
     current_status: string;
@@ -3598,9 +3682,28 @@ export type DashboardTile = {
      */
     aggregation: string;
     /**
+     * Label keys to break the metric down by (group-by / multi-series view).
+     * Empty = single aggregated series (current behavior). Max 2 keys — more
+     * dimensions are unreadable in a chart (ADR-026 Phase 2). Each key must
+     * match `[a-zA-Z0-9_.:-]`. Wired directly to `MetricQuery.group_by` by
+     * the tile query path (separate frontend task).
+     */
+    group_by?: Array<string>;
+    /**
      * Stable client-generated tile id (used as a React key / for reordering).
      */
     id: string;
+    /**
+     * AND-combined label equality filters: `[["key","value"],…]`. Empty = no
+     * filtering. Max 10 pairs; keys must match `[a-zA-Z0-9_.:-]`; values
+     * capped at 500 characters. Not yet wired into the tile query path
+     * (Phase 1 ADR-026 — field round-trips and validates; query wiring is
+     * a separate frontend task).
+     */
+    label_filters?: Array<[
+        string,
+        string
+    ]>;
     /**
      * The metric name to chart (e.g. `http.server.duration`).
      */
@@ -6223,6 +6326,28 @@ export type FieldResponse = {
      * Whether the field is nullable
      */
     nullable: boolean;
+};
+
+/**
+ * A single currently-firing series for a dynamic alert rule, snapshotted from
+ * the evaluator's in-memory per-series firing map at read time (ADR-026 Phase 3).
+ */
+export type FiringSeriesEntry = {
+    /**
+     * The open alarm's id, when one was created (absent if suppressed).
+     */
+    alarm_id?: number | null;
+    /**
+     * The series' label pairs, e.g. `[["endpoint","/checkout"],["region","eu-west"]]`.
+     */
+    series_key: Array<[
+        string,
+        string
+    ]>;
+    /**
+     * The human-readable joined label, e.g. `endpoint=/checkout, region=eu-west`.
+     */
+    series_label: string;
 };
 
 /**
@@ -9471,18 +9596,65 @@ export type OtelMetricAlertRuleResponse = {
      * Coarse detector discriminator: `static|anomaly|forecast|outlier|auto_watch`.
      */
     detection_kind: string;
+    /**
+     * Whether per-series ("dynamic") alerting is enabled for this rule.
+     */
+    dynamic_alerts: boolean;
     enabled: boolean;
+    /**
+     * Currently-firing series for a dynamic rule, snapshotted from the evaluator's
+     * in-memory firing map at read time. Empty for static/aggregate rules or when
+     * nothing is firing.
+     */
+    firing_series?: Array<FiringSeriesEntry>;
     for_duration_secs: number;
+    /**
+     * Label keys the rule breaks the metric down by. Empty = one aggregate stream.
+     */
+    group_by: Array<string>;
+    /**
+     * Notification-grouping threshold: when more than this many series fire in the
+     * same tick, only the first gets chart/AI enrichment (1–1000).
+     */
+    grouped_notification_threshold: number;
     id: number;
+    /**
+     * AND-combined label equality filters applied when evaluating this rule.
+     * Empty = no filtering (matches all series).
+     */
+    label_filters: Array<[
+        string,
+        string
+    ]>;
+    /**
+     * Number of series dropped by the cardinality cap on the latest dynamic tick
+     * (0 when nothing was dropped or for static/aggregate rules). Lets a UI warn
+     * "N series were dropped this tick" without reading server logs.
+     */
+    last_dropped_series_count: number;
     last_evaluated_at?: string | null;
     /**
      * One of `ok|firing|unknown`.
      */
     last_state: string;
     last_value?: number | null;
+    /**
+     * Cardinality cap for dynamic alerting (1–100).
+     */
+    max_series: number;
     metric_name: string;
     name: string;
     project_id: number;
+    /**
+     * Full per-series state snapshot persisted after the latest dynamic-rule tick,
+     * keyed by the human-readable series label (`endpoint=/checkout`). Empty for
+     * static/aggregate rules. Unlike `firing_series` (a live in-memory snapshot),
+     * this is decoded from the persisted `series_states` jsonb column, so an
+     * external consumer that only reads the rule row still sees per-series detail.
+     */
+    series_states: {
+        [key: string]: SeriesStateEntry;
+    };
     severity: string;
     updated_at: string;
     window_secs: number;
@@ -10792,6 +10964,18 @@ export type ProjectQuery = {
     project_id: number;
 };
 
+/**
+ * A lightweight project descriptor included in `UnifiedTrace`.
+ */
+export type ProjectRef = {
+    project_id: number;
+    project_name: string;
+    /**
+     * URL slug used to link a span back into its owning project's trace view.
+     */
+    project_slug: string;
+};
+
 export type ProjectResponse = {
     /**
      * Opt-in to AI summarization of metric alert notifications (NULL/false = off).
@@ -10810,6 +10994,13 @@ export type ProjectResponse = {
      */
     attack_mode: boolean;
     created_at: number;
+    /**
+     * ADR-027 Phase 3 opt-out: when false, this project's traces are suppressed
+     * from cross-project discovery results. Default true (consistent with the
+     * OSS global-observability model where any OtelRead holder can query any
+     * project's telemetry).
+     */
+    cross_project_trace_sharing: boolean;
     /**
      * Deployment configuration (resources, autoscaling, features)
      */
@@ -12955,6 +13146,27 @@ export type SentryReleaseResponse = {
 };
 
 /**
+ * One series' persisted state snapshot for a dynamic rule (ADR-026 follow-up):
+ * the state after the latest tick, the value evaluated this tick, and the open
+ * alarm id (when firing). Serialized into the `series_states` jsonb column keyed
+ * by the human-readable [`series_label`]; the alert response decodes it back.
+ */
+export type SeriesStateEntry = {
+    /**
+     * The open alarm's id when the series is firing; `null` when ok.
+     */
+    alarm_id?: number | null;
+    /**
+     * `firing` or `ok` for this series after the latest tick.
+     */
+    state: string;
+    /**
+     * The value the rule evaluated for this series this tick.
+     */
+    value: number;
+};
+
+/**
  * Response containing information about how the service is being accessed
  */
 export type ServiceAccessInfo = {
@@ -13665,6 +13877,23 @@ export type SetupDnsResponse = {
      * Total number of records attempted
      */
     total_records: number;
+};
+
+/**
+ * A sibling project that shares the same `trace_id` and has opted in to
+ * cross-project trace sharing (`cross_project_trace_sharing = TRUE`).
+ *
+ * Returned by `CrossProjectTraceService::find_sibling_projects` and exposed
+ * by the Phase 1 `GET /otel/traces/cross-project/{trace_id}` endpoint.
+ */
+export type SiblingRef = {
+    first_seen: string;
+    project_id: number;
+    project_name: string;
+    /**
+     * URL slug used to link into the sibling project's single-project trace view.
+     */
+    project_slug: string;
 };
 
 export type SkillDefinitionResponse = {
@@ -14767,6 +14996,25 @@ export type TopModelsQueryParams = {
     user_id?: number | null;
 };
 
+/**
+ * All projects that contributed spans to a trace, including their sharing flag.
+ *
+ * Returned by `CrossProjectTraceService::find_trace_projects`.
+ */
+export type TraceProjectRef = {
+    first_seen: string;
+    project_id: number;
+    project_name: string;
+    /**
+     * URL slug used to link into the project's single-project trace view.
+     */
+    project_slug: string;
+    /**
+     * Whether this project has `cross_project_trace_sharing = true`.
+     */
+    sharing: boolean;
+};
+
 export type TraceSummariesResponse = {
     data: Array<TraceSummary>;
     total: number;
@@ -14934,6 +15182,46 @@ export type UndrainNodeResponse = {
     message: string;
     name: string;
     status: string;
+};
+
+/**
+ * Merged cross-project trace result (Phase 2 unified waterfall).
+ *
+ * Spans are sorted by `start_time ASC`.  At most 20 projects and 10,000
+ * spans total are included; `truncated` / `truncated_projects` signal when
+ * the caps were hit.
+ */
+export type UnifiedTrace = {
+    end_time: string;
+    error_count: number;
+    /**
+     * `true` when at least one project has `cross_project_trace_sharing = false`
+     * and its spans were therefore excluded from the result set.
+     */
+    has_redacted_spans: boolean;
+    /**
+     * Projects that contributed spans to this result set.
+     */
+    projects: Array<ProjectRef>;
+    span_count: number;
+    /**
+     * Annotated, merged span list sorted by `start_time ASC`.
+     */
+    spans: Array<AnnotatedSpan>;
+    start_time: string;
+    /**
+     * Trace wall-clock duration in milliseconds (`end_time – start_time`).
+     */
+    total_duration_ms: number;
+    trace_id: string;
+    /**
+     * `true` when the 20-project or 10,000-span cap was hit.
+     */
+    truncated: boolean;
+    /**
+     * project_ids excluded due to truncation (most-recent first_seen dropped first).
+     */
+    truncated_projects: Array<number>;
 };
 
 /**
@@ -15421,8 +15709,31 @@ export type UpdateMcpRequest = {
 export type UpdateMetricAlertRequest = {
     aggregation?: string | null;
     detection_config?: null | DetectionConfig;
+    /**
+     * Toggles per-series ("dynamic") alerting (absent = leave unchanged).
+     */
+    dynamic_alerts?: boolean | null;
     enabled?: boolean | null;
     for_duration_secs?: number | null;
+    /**
+     * Replaces the group_by keys wholesale when present (absent = leave unchanged).
+     */
+    group_by?: Array<string> | null;
+    /**
+     * Updates the notification-grouping threshold (absent = leave unchanged).
+     */
+    grouped_notification_threshold?: number | null;
+    /**
+     * Replaces the label filters wholesale when present (absent = leave unchanged).
+     */
+    label_filters?: Array<[
+        string,
+        string
+    ]> | null;
+    /**
+     * Updates the dynamic-alerting cardinality cap (absent = leave unchanged).
+     */
+    max_series?: number | null;
     metric_name?: string | null;
     name?: string | null;
     severity?: string | null;
@@ -15485,6 +15796,12 @@ export type UpdateProjectSettingsRequest = {
      * Enable/disable attack mode (CAPTCHA protection) for all project environments
      */
     attack_mode?: boolean | null;
+    /**
+     * ADR-027 Phase 3 opt-out: set to false to suppress this project's traces
+     * from appearing in cross-project discovery results. Default true (consistent
+     * with the OSS global-observability model). Omit to leave unchanged.
+     */
+    cross_project_trace_sharing?: boolean | null;
     directory?: string | null;
     /**
      * Enable automatic preview environment creation for each branch
@@ -30455,6 +30772,48 @@ export type GetGenaiTraceResponses = {
 
 export type GetGenaiTraceResponse = GetGenaiTraceResponses[keyof GetGenaiTraceResponses];
 
+export type GetUnifiedTraceData = {
+    body?: never;
+    path: {
+        /**
+         * Trace ID (32 lowercase hex characters)
+         */
+        trace_id: string;
+    };
+    query?: never;
+    url: '/otel/global/traces/{trace_id}';
+};
+
+export type GetUnifiedTraceErrors = {
+    /**
+     * trace_id is not 32 lowercase hex characters
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions or deployment token
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetUnifiedTraceError = GetUnifiedTraceErrors[keyof GetUnifiedTraceErrors];
+
+export type GetUnifiedTraceResponses = {
+    /**
+     * Unified cross-project trace waterfall
+     */
+    200: UnifiedTrace;
+};
+
+export type GetUnifiedTraceResponse = GetUnifiedTraceResponses[keyof GetUnifiedTraceResponses];
+
 export type GetHealthData = {
     body?: never;
     path: {
@@ -31081,6 +31440,53 @@ export type QueryTracesResponses = {
 };
 
 export type QueryTracesResponse = QueryTracesResponses[keyof QueryTracesResponses];
+
+export type GetCrossProjectTraceSiblingsData = {
+    body?: never;
+    path: {
+        /**
+         * Trace ID (32 lowercase hex characters)
+         */
+        trace_id: string;
+    };
+    query?: {
+        /**
+         * Project ID to exclude (the caller's own project) so the UI does not render a self-link
+         */
+        exclude_project_id?: number;
+    };
+    url: '/otel/traces/cross-project/{trace_id}';
+};
+
+export type GetCrossProjectTraceSiblingsErrors = {
+    /**
+     * trace_id is not 32 lowercase hex characters
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions or deployment token
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetCrossProjectTraceSiblingsError = GetCrossProjectTraceSiblingsErrors[keyof GetCrossProjectTraceSiblingsErrors];
+
+export type GetCrossProjectTraceSiblingsResponses = {
+    /**
+     * Sibling projects sharing this trace
+     */
+    200: CrossProjectTraceResponse;
+};
+
+export type GetCrossProjectTraceSiblingsResponse = GetCrossProjectTraceSiblingsResponses[keyof GetCrossProjectTraceSiblingsResponses];
 
 export type GetTraceData = {
     body?: never;
