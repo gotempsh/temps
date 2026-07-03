@@ -3497,6 +3497,72 @@ mod tests {
             }
         }
 
+        /// A `PreUpgradeBackupProvider` that routes the pre-upgrade backup
+        /// through the REAL `exec_util::run_exec` (against the service's own
+        /// running container) before recording the backup row like
+        /// `StubBackupProvider`.
+        ///
+        /// The production pre-upgrade backup shells `pg_dumpall … > file` via
+        /// `run_exec`, whose exec stdout is empty — the exact shape that
+        /// regressed into a 100% CPU busy loop that never returned. The stub
+        /// providers bypass `run_exec` entirely, which is why that hang shipped
+        /// despite a green orchestrator happy-path test. This provider closes
+        /// the gap: a `run_exec` regression makes the whole `orchestrator.run()`
+        /// hang, caught by the test's bounded `tokio::time::timeout`.
+        pub struct RunExecBackupProvider {
+            inner: StubBackupProvider,
+            docker: Arc<Docker>,
+            container: String,
+        }
+
+        impl RunExecBackupProvider {
+            pub fn new(
+                db: Arc<DatabaseConnection>,
+                docker: Arc<Docker>,
+                container: String,
+            ) -> Self {
+                Self {
+                    inner: StubBackupProvider::new(db),
+                    docker,
+                    container,
+                }
+            }
+            pub fn calls(&self) -> u64 {
+                self.inner.calls.load(Ordering::SeqCst)
+            }
+        }
+
+        #[async_trait]
+        impl PreUpgradeBackupProvider for RunExecBackupProvider {
+            async fn default_s3_source_id(&self, service_id: i32) -> Result<Option<i32>, String> {
+                self.inner.default_s3_source_id(service_id).await
+            }
+
+            async fn create_pre_upgrade_backup(
+                &self,
+                service_id: i32,
+                s3_source_id: i32,
+                created_by: i32,
+            ) -> Result<i32, String> {
+                // Exercise the real run_exec with a no-stdout command — the
+                // production backup's `pg_dumpall … > file` shape. Bounded so a
+                // regression fails rather than hangs the whole run.
+                crate::externalsvc::exec_util::run_exec(
+                    self.docker.as_ref(),
+                    &self.container,
+                    vec!["sh".to_string(), "-c".to_string(), "true".to_string()],
+                    None,
+                    std::time::Duration::from_secs(120),
+                )
+                .await
+                .map_err(|e| format!("pre-upgrade backup run_exec failed: {}", e))?;
+
+                self.inner
+                    .create_pre_upgrade_backup(service_id, s3_source_id, created_by)
+                    .await
+            }
+        }
+
         /// Recording wrapper around `PostgresLifecycleAdapter`. Captures an
         /// ordered event log of each trait method call, with monotonic
         /// timestamps, so tests can assert on call ordering (e.g.,
@@ -3913,6 +3979,105 @@ mod tests {
 
         if let Err(e) = result {
             panic!("happy-path integration test failed: {}", e);
+        }
+    }
+
+    /// Full-orchestrator regression test that drives `pre_backup` through the
+    /// REAL `exec_util::run_exec` (via `RunExecBackupProvider`) rather than a
+    /// stub. This is the coverage gap that let the `run_exec` 100% CPU hang
+    /// ship: the happy-path test above runs the whole orchestrator to
+    /// `completed`, but stubs the backup, so it never touches `run_exec`. Here
+    /// `orchestrator.run()` actually invokes `run_exec` during `pre_backup`, so
+    /// a regression makes the run hang — caught in bounded time by the
+    /// `tokio::time::timeout` wrapper instead of hanging CI forever.
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn orchestrator_full_run_exercises_backup_exec_v17_to_v18() {
+        use harness::*;
+        use std::sync::Arc;
+
+        if docker_or_skip("orchestrator_full_run_exercises_backup_exec_v17_to_v18")
+            .await
+            .is_none()
+        {
+            return;
+        }
+
+        let ctx = UpgradeTestCtx::new("bkexec").await;
+        let container = format!("postgres-{}", ctx.service_name);
+        let provider = Arc::new(RunExecBackupProvider::new(
+            ctx.test_db.db.clone(),
+            ctx.docker.clone(),
+            container,
+        ));
+        let provider_trait: Arc<dyn PreUpgradeBackupProvider> = provider.clone();
+        let lifecycle: Arc<dyn PostgresContainerLifecycle> = ctx.lifecycle_adapter.clone();
+
+        let result = async {
+            ctx.psql_exec("CREATE TABLE bkexec_probe(id SERIAL PRIMARY KEY, payload TEXT)")
+                .await?;
+            ctx.psql_exec(
+                "INSERT INTO bkexec_probe(payload) SELECT 'row_' || g FROM generate_series(1,300) g",
+            )
+            .await?;
+
+            let upgrade_id = ctx.insert_upgrade_row(phase::PRE_BACKUP).await;
+            let orch = ctx.orchestrator(provider_trait, lifecycle);
+
+            // Bounded so a run_exec regression (100% CPU spin that never
+            // returns) fails the test instead of hanging CI indefinitely.
+            tokio::time::timeout(std::time::Duration::from_secs(600), orch.run(upgrade_id))
+                .await
+                .map_err(|_| {
+                    "orchestrator.run() did not finish within 600s — likely a \
+                     run_exec / exec hang"
+                        .to_string()
+                })?
+                .map_err(|e| format!("run: {}", e))?;
+
+            let row = load_upgrade(ctx.test_db.db.as_ref(), upgrade_id).await;
+            if row.status != status::COMPLETED {
+                return Err(format!("expected COMPLETED, got {}", row.status));
+            }
+            if provider.calls() != 1 {
+                return Err(format!(
+                    "pre-upgrade backup (run_exec path) should run exactly once, ran {}",
+                    provider.calls()
+                ));
+            }
+            let after = ctx
+                .psql_query("SELECT count(*) FROM bkexec_probe")
+                .await?
+                .trim()
+                .parse::<i64>()
+                .map_err(|e| e.to_string())?;
+            if after != 300 {
+                return Err(format!("expected 300 rows after upgrade, got {}", after));
+            }
+            Ok::<_, String>(upgrade_id)
+        }
+        .await;
+
+        let upgrade_id_for_cleanup = result.as_ref().ok().copied().unwrap_or(-1);
+        let extras: Vec<String> = if upgrade_id_for_cleanup > 0 {
+            vec![
+                format!(
+                    "postgres-{}_data_rollback_{}",
+                    ctx.service_name, upgrade_id_for_cleanup
+                ),
+                format!(
+                    "postgres-{}_pgdump_{}",
+                    ctx.service_name, upgrade_id_for_cleanup
+                ),
+            ]
+        } else {
+            vec![]
+        };
+        ctx.cleanup().await;
+        remove_volumes(ctx.docker.as_ref(), &extras).await;
+
+        if let Err(e) = result {
+            panic!("full-run backup-exec integration test failed: {}", e);
         }
     }
 
