@@ -142,11 +142,24 @@ export function StatusDot({
 }
 
 /** Firing-state badge derived from `rule.last_state` (ok|firing|unknown). */
-export function AlertStateBadge({ state }: { state: string }) {
+export function AlertStateBadge({
+  state,
+  firingSeriesCount,
+}: {
+  state: string
+  /**
+   * For a dynamic (per-series) rule with open series, renders "N series
+   * firing" instead of a flat "Firing" badge — pass `rule.firing_series.length`
+   * only when `rule.dynamic_alerts` is true, so a static rule never shows this.
+   */
+  firingSeriesCount?: number
+}) {
   if (state === 'firing') {
     return (
       <Badge variant="destructive" className="shrink-0">
-        Firing
+        {firingSeriesCount
+          ? `${firingSeriesCount} series firing`
+          : 'Firing'}
       </Badge>
     )
   }

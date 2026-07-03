@@ -6,8 +6,6 @@ import {
 import {
   getEnvironmentsOptions,
   listMetricNamesOptions,
-  listMetricLabelKeysOptions,
-  listMetricLabelValuesOptions,
   queryMetricsOptions,
   listAlertsOptions,
   // Backtests an anomaly rule's band over the visible range to shade it.
@@ -24,18 +22,6 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import {
-  Command,
-  CommandEmpty,
-  CommandInput,
-  CommandItem,
-  CommandList,
-} from '@/components/ui/command'
-import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from '@/components/ui/popover'
-import {
   Select,
   SelectContent,
   SelectItem,
@@ -49,6 +35,20 @@ import { ThresholdLineChart } from '@/components/charts/threshold-line-chart'
 import { comparatorSymbol, StatusDot } from '@/components/metrics/alert-format'
 import { MetricCorrelations } from '@/components/metrics/MetricCorrelations'
 import {
+  GroupByBuilder,
+  LabelFilterBuilder,
+  LabelFilterChips,
+  labelFiltersToTuples,
+  MAX_GROUP_BY_KEYS,
+  serializeLabelFilters,
+  type LabelFilter,
+} from '@/components/metrics/LabelFilterBuilder'
+import {
+  buildBreakdownData,
+  type BreakdownModel,
+} from '@/components/metrics/metric-format'
+import {
+  dynamicFiringSeriesCount,
   STATUS_META,
   statusRank,
   useAlertStatus,
@@ -60,17 +60,12 @@ import { format } from 'date-fns'
 import {
   ArrowLeft,
   BarChart3,
-  Check,
   ChevronDown,
-  ChevronsUpDown,
   Gauge,
   LineChart as LineChartIcon,
-  Plus,
   RefreshCw,
   Search,
   SlidersHorizontal,
-  Tag,
-  X,
 } from 'lucide-react'
 import {
   Collapsible,
@@ -173,19 +168,11 @@ const AGGREGATIONS: { value: AggKind; label: string }[] = [
 ]
 
 // ── Label filters ────────────────────────────────────────────────────────────
-
-interface LabelFilter {
-  key: string
-  value: string
-}
-
-/** Serialize label filters to a compact, regen-ready URL string: `k=v,k2=v2`. */
-function serializeLabelFilters(filters: LabelFilter[]): string {
-  return filters
-    .filter((f) => f.key.trim().length > 0)
-    .map((f) => `${f.key.trim()}=${f.value.trim()}`)
-    .join(',')
-}
+//
+// The `LabelFilter` type and the shared filter-building UI live in
+// `@/components/metrics/LabelFilterBuilder` (extracted for reuse by
+// MetricAlertForm and the dashboard tile editor). `parseLabelFilters` stays
+// here — it's specific to this page's URL persistence format.
 
 function parseLabelFilters(raw: string | null): LabelFilter[] {
   if (!raw) return []
@@ -198,6 +185,18 @@ function parseLabelFilters(raw: string | null): LabelFilter[] {
       if (idx === -1) return { key: pair, value: '' }
       return { key: pair.slice(0, idx), value: pair.slice(idx + 1) }
     })
+}
+
+// Group-by breakdown keys, URL-persisted as a comma-joined list under `group_by`
+// (the same format the backend's `group_by` query param takes), capped at the
+// shared 2-key max so a shared link can't smuggle in an over-wide breakdown.
+function parseGroupBy(raw: string | null): string[] {
+  if (!raw) return []
+  return raw
+    .split(',')
+    .map((k) => k.trim())
+    .filter(Boolean)
+    .slice(0, MAX_GROUP_BY_KEYS)
 }
 
 // ── Page ─────────────────────────────────────────────────────────────────────
@@ -245,6 +244,10 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
   })()
   const labelFilters = useMemo(
     () => parseLabelFilters(searchParams.get('labels')),
+    [searchParams]
+  )
+  const groupBy = useMemo(
+    () => parseGroupBy(searchParams.get('group_by')),
     [searchParams]
   )
   // Custom absolute date range — overrides the relative preset when both bounds
@@ -301,7 +304,20 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
   const setLabelFilters = (next: LabelFilter[]) =>
     patchParams((p) => {
       const s = serializeLabelFilters(next)
-      s ? p.set('labels', s) : p.delete('labels')
+      if (s) {
+        p.set('labels', s)
+      } else {
+        p.delete('labels')
+      }
+    })
+  const setGroupBy = (next: string[]) =>
+    patchParams((p) => {
+      const s = next.join(',')
+      if (s) {
+        p.set('group_by', s)
+      } else {
+        p.delete('group_by')
+      }
     })
 
   // ── Environments (for the env selector, mirrors TracesList) ──
@@ -359,6 +375,9 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
         // the backend's `MetricAggregation::parse`.
         aggregation,
         label_filters: serializeLabelFilters(labelFilters) || undefined,
+        // Comma-joined `key1,key2`, same format MetricTile sends — one series
+        // per distinct value combination instead of a single aggregate line.
+        group_by: groupBy.length > 0 ? groupBy.join(',') : undefined,
         limit: 1000,
       },
     }),
@@ -484,6 +503,19 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
         }
       }),
     [buckets, isPercentile, aggregation]
+  )
+
+  // When a group_by is set the query returns per-`series_key` buckets; pivot
+  // them into one line per distinct label combination via the shared pivot the
+  // dashboard tiles use. Anomaly bands / thresholds are per-metric aggregates
+  // and don't compose with a breakdown, so the grouped path skips them.
+  const isGrouped = groupBy.length > 0
+  const breakdown = useMemo<BreakdownModel | undefined>(
+    () =>
+      isGrouped
+        ? buildBreakdownData(buckets, isPercentile, aggregation)
+        : undefined,
+    [isGrouped, buckets, isPercentile, aggregation]
   )
 
   // Merge the anomaly band onto each chart bucket. The backtest buckets by the
@@ -804,6 +836,20 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
               fromIso={fromIso}
               toIso={toIso}
             />
+
+            {/* Break down by — one line per distinct value of up to 2 label
+                keys. Needs a metric selected (nothing to autocomplete without
+                one), matching the alert form / dashboard tile gating. */}
+            {metricName && (
+              <GroupByBuilder
+                value={groupBy}
+                onChange={setGroupBy}
+                projectId={project.id}
+                metricName={metricName}
+                fromIso={fromIso}
+                toIso={toIso}
+              />
+            )}
           </div>
         </CollapsibleContent>
       </Collapsible>
@@ -824,6 +870,8 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
             <MetricChart
               metricName={metricName}
               aggLabel={aggLabel}
+              labelFilters={labelFiltersToTuples(labelFilters)}
+              groupBy={groupBy}
               isPending={metricsQuery.isPending && metricName.length > 0}
               isError={metricsQuery.isError}
               errorMessage={
@@ -832,6 +880,7 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
                   : 'Failed to load metric series.'
               }
               chartData={chartDataWithBand}
+              breakdown={breakdown}
               thresholds={thresholds}
               bandSeries={bandSeries}
               markers={deployMarkers}
@@ -949,6 +998,9 @@ function MetricsOverview({
             bucketInterval={bucketInterval}
             aggregation={aggregation}
             status={alerts.statusFor(n, aggregation)}
+            dynamicFiringCount={dynamicFiringSeriesCount(
+              alerts.rulesFor(n, aggregation),
+            )}
             onSelect={onSelect}
           />
         ))}
@@ -963,6 +1015,21 @@ function MetricsOverview({
   )
 }
 
+/**
+ * Status-dot tooltip: "N series breaching" for a dynamic rule with open
+ * series, else the flat status label. No "of M" — the frontend only knows
+ * how many series are currently firing, not how many were evaluated.
+ */
+function alertStatusTooltip(
+  status: AlertStatusLevel,
+  dynamicFiringCount: number | null,
+): string {
+  if (dynamicFiringCount != null) {
+    return `${dynamicFiringCount} series breaching`
+  }
+  return `Alert rule: ${STATUS_META[status].label}`
+}
+
 function MetricCard({
   project,
   metricName,
@@ -971,6 +1038,7 @@ function MetricCard({
   bucketInterval,
   aggregation,
   status,
+  dynamicFiringCount,
   onSelect,
 }: {
   project: ProjectResponse
@@ -980,6 +1048,8 @@ function MetricCard({
   bucketInterval: string
   aggregation: AggKind
   status: AlertStatusLevel | null
+  /** Open-series count when the backing rule is dynamic; see `dynamicFiringSeriesCount`. */
+  dynamicFiringCount: number | null
   onSelect: (name: string) => void
 }) {
   // Tone the line only for active problems; OK/no-data/unwatched stay neutral.
@@ -1031,7 +1101,7 @@ function MetricCard({
             <StatusDot
               level={status}
               pulse
-              title={`Alert rule: ${STATUS_META[status].label}`}
+              title={alertStatusTooltip(status, dynamicFiringCount)}
             />
           )}
           <span
@@ -1073,301 +1143,6 @@ function MetricCard({
   )
 }
 
-// ── Label filter builder ─────────────────────────────────────────────────────
-
-function LabelFilterBuilder({
-  value,
-  onChange,
-  projectId,
-  metricName,
-  fromIso,
-  toIso,
-}: {
-  value: LabelFilter[]
-  onChange: (next: LabelFilter[]) => void
-  projectId: number
-  /** The selected metric whose attributes drive autocomplete; '' in overview. */
-  metricName: string
-  fromIso: string
-  toIso: string
-}) {
-  // Draft rows live in LOCAL state so an incomplete/empty row can exist while
-  // you type. The URL (via onChange → serializeLabelFilters) only ever keeps the
-  // COMPLETE pairs, so a freshly-added blank row would otherwise round-trip back
-  // out of existence and the "Add" button would appear to do nothing.
-  const [rows, setRows] = useState<LabelFilter[]>(value)
-
-  // Re-seed only on an EXTERNAL change (back/forward, shared link) — i.e. when
-  // the URL's complete set diverges from ours. Our own edits echo back equal, so
-  // the in-progress drafts survive instead of being clobbered.
-  const valueKey = serializeLabelFilters(value)
-  useEffect(() => {
-    if (valueKey !== serializeLabelFilters(rows)) setRows(value)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [valueKey])
-
-  const commit = (next: LabelFilter[]) => {
-    setRows(next)
-    onChange(next)
-  }
-  const add = () => commit([...rows, { key: '', value: '' }])
-  const update = (i: number, patch: Partial<LabelFilter>) =>
-    commit(rows.map((f, idx) => (idx === i ? { ...f, ...patch } : f)))
-  const remove = (i: number) => commit(rows.filter((_, idx) => idx !== i))
-
-  // Discover the attribute keys present on the selected metric. Disabled in the
-  // all-metrics overview (no single metric to inspect) — rows fall back to free
-  // text there.
-  const keysQuery = useQuery({
-    ...listMetricLabelKeysOptions({
-      query: {
-        project_id: projectId,
-        metric_name: metricName,
-        start_time: fromIso,
-        end_time: toIso,
-      },
-    }),
-    enabled: !!projectId && metricName.length > 0,
-  })
-  const allKeys = keysQuery.data?.keys ?? []
-
-  return (
-    <div className="flex flex-col gap-2">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
-          <Tag className="size-3.5" />
-          Label filters
-        </div>
-        <Button
-          type="button"
-          variant="ghost"
-          size="sm"
-          onClick={add}
-          className="h-7 gap-1 px-2 text-xs"
-        >
-          <Plus className="size-3" />
-          Add
-        </Button>
-      </div>
-      {rows.length === 0 ? (
-        <p className="text-xs text-muted-foreground">
-          No label filters. Add key/value pairs to narrow the series by
-          attribute (e.g. <span className="font-mono">http.method = GET</span>).
-        </p>
-      ) : (
-        <div className="flex flex-col gap-1.5">
-          {rows.map((f, i) => (
-            <LabelFilterRow
-              // Index key is stable here — rows are only appended/removed, never
-              // reordered — so the per-row value query keeps its identity.
-              key={i}
-              row={f}
-              // Suggest only keys not already used by another row.
-              availableKeys={allKeys.filter(
-                (k) => k === f.key || !rows.some((r) => r.key === k)
-              )}
-              keysLoading={keysQuery.isFetching}
-              projectId={projectId}
-              metricName={metricName}
-              fromIso={fromIso}
-              toIso={toIso}
-              onUpdate={(patch) => update(i, patch)}
-              onRemove={() => remove(i)}
-            />
-          ))}
-          <p className="text-[11px] text-muted-foreground">
-            Keys and values autocomplete from the metric&apos;s observed
-            attributes (last 24h). Free text is still accepted for values not in
-            the recent sample. Filters are URL-persisted so the view stays
-            shareable.
-          </p>
-        </div>
-      )}
-    </div>
-  )
-}
-
-/** One key=value row with autocomplete on both sides. */
-function LabelFilterRow({
-  row,
-  availableKeys,
-  keysLoading,
-  projectId,
-  metricName,
-  fromIso,
-  toIso,
-  onUpdate,
-  onRemove,
-}: {
-  row: LabelFilter
-  availableKeys: string[]
-  keysLoading: boolean
-  projectId: number
-  metricName: string
-  fromIso: string
-  toIso: string
-  onUpdate: (patch: Partial<LabelFilter>) => void
-  onRemove: () => void
-}) {
-  // Values for THIS row's key — fetched only once a key is chosen on a metric.
-  const valuesQuery = useQuery({
-    ...listMetricLabelValuesOptions({
-      query: {
-        project_id: projectId,
-        metric_name: metricName,
-        label_key: row.key,
-        start_time: fromIso,
-        end_time: toIso,
-      },
-    }),
-    enabled: !!projectId && metricName.length > 0 && row.key.trim().length > 0,
-  })
-
-  return (
-    <div className="flex items-center gap-1.5">
-      <SuggestCombobox
-        value={row.key}
-        options={availableKeys}
-        loading={keysLoading}
-        placeholder="label.key"
-        searchPlaceholder="Search keys…"
-        ariaLabel="Label key"
-        widthClass="w-full sm:w-[200px]"
-        // Changing the key invalidates the previously chosen value.
-        onChange={(next) => onUpdate({ key: next, value: '' })}
-      />
-      <span className="text-muted-foreground">=</span>
-      <SuggestCombobox
-        value={row.value}
-        options={valuesQuery.data?.values ?? []}
-        loading={valuesQuery.isFetching}
-        placeholder="value"
-        searchPlaceholder="Search values…"
-        ariaLabel="Label value"
-        widthClass="flex-1"
-        disabled={row.key.trim().length === 0}
-        onChange={(next) => onUpdate({ value: next })}
-      />
-      <Button
-        type="button"
-        variant="ghost"
-        size="icon"
-        onClick={onRemove}
-        className="h-8 w-8 shrink-0"
-        aria-label="Remove label filter"
-      >
-        <X className="size-3.5" />
-      </Button>
-    </div>
-  )
-}
-
-/**
- * A combobox that suggests discovered options but still accepts free text — the
- * sampled discovery may miss a rare key/value, so typing anything commits it via
- * the "Use …" affordance (or Enter).
- */
-function SuggestCombobox({
-  value,
-  options,
-  loading,
-  placeholder,
-  searchPlaceholder,
-  ariaLabel,
-  widthClass,
-  disabled,
-  onChange,
-}: {
-  value: string
-  options: string[]
-  loading?: boolean
-  placeholder: string
-  searchPlaceholder: string
-  ariaLabel: string
-  widthClass?: string
-  disabled?: boolean
-  onChange: (next: string) => void
-}) {
-  const [open, setOpen] = useState(false)
-  const [query, setQuery] = useState('')
-  const typed = query.trim()
-  const hasExactOption = options.includes(typed)
-
-  const choose = (next: string) => {
-    onChange(next)
-    setQuery('')
-    setOpen(false)
-  }
-
-  return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <Button
-          type="button"
-          variant="outline"
-          role="combobox"
-          aria-expanded={open}
-          aria-label={ariaLabel}
-          disabled={disabled}
-          className={[
-            'h-8 justify-between gap-1.5 px-2.5 font-mono text-xs font-normal',
-            widthClass ?? '',
-            value ? '' : 'text-muted-foreground',
-          ].join(' ')}
-        >
-          <span className="truncate">{value || placeholder}</span>
-          <ChevronsUpDown className="size-3.5 shrink-0 opacity-50" />
-        </Button>
-      </PopoverTrigger>
-      <PopoverContent align="start" className="w-[240px] p-0">
-        <Command>
-          <CommandInput
-            value={query}
-            onValueChange={setQuery}
-            placeholder={searchPlaceholder}
-            className="text-xs"
-          />
-          <CommandList className="max-h-[240px]">
-            {loading ? (
-              <div className="py-4 text-center text-xs text-muted-foreground">
-                Loading…
-              </div>
-            ) : (
-              <>
-                {typed && !hasExactOption && (
-                  <CommandItem value={typed} onSelect={() => choose(typed)}>
-                    <Check className="size-3.5 shrink-0 opacity-0" />
-                    <span className="truncate font-mono text-xs">
-                      Use “{typed}”
-                    </span>
-                  </CommandItem>
-                )}
-                <CommandEmpty>No matches.</CommandEmpty>
-                {options.map((o) => (
-                  <CommandItem
-                    key={o}
-                    value={o}
-                    onSelect={() => choose(o)}
-                    className="gap-2"
-                  >
-                    <Check
-                      className={[
-                        'size-3.5 shrink-0',
-                        o === value ? 'opacity-100' : 'opacity-0',
-                      ].join(' ')}
-                    />
-                    <span className="truncate font-mono text-xs">{o}</span>
-                  </CommandItem>
-                ))}
-              </>
-            )}
-          </CommandList>
-        </Command>
-      </PopoverContent>
-    </Popover>
-  )
-}
-
 // ── Chart + states ───────────────────────────────────────────────────────────
 
 interface ChartPoint {
@@ -1382,24 +1157,47 @@ interface ChartPoint {
 function MetricChart({
   metricName,
   aggLabel,
+  labelFilters,
+  groupBy,
   isPending,
   isError,
   errorMessage,
   chartData,
+  breakdown,
   thresholds,
   bandSeries,
   markers,
 }: {
   metricName: string
   aggLabel: string
+  labelFilters: [string, string][]
+  groupBy: string[]
   isPending: boolean
   isError: boolean
   errorMessage: string
   chartData: ChartPoint[]
+  /** Wide-format per-series model when a group_by is set; else undefined. */
+  breakdown?: BreakdownModel
   thresholds?: ThresholdBand[]
   bandSeries?: ThresholdBandSeries
   markers?: ThresholdMarker[]
 }) {
+  // Shown above every body state (loading/error/empty/chart) — active filters
+  // explain a "no data" result just as much as they explain a chart, so this
+  // header is hoisted above the early returns rather than only rendering
+  // alongside a successful chart.
+  const header = metricName && (
+    <div className="flex flex-wrap items-center justify-between gap-2">
+      <div className="flex flex-wrap items-center gap-2">
+        <Badge variant="secondary" className="font-mono text-xs">
+          {metricName}
+        </Badge>
+        <LabelFilterChips filters={labelFilters} groupBy={groupBy} />
+      </div>
+      <span className="text-xs text-muted-foreground">{aggLabel}</span>
+    </div>
+  )
+
   if (!metricName) {
     return (
       <EmptyState
@@ -1411,27 +1209,74 @@ function MetricChart({
   }
 
   if (isPending) {
-    return <Skeleton className="h-[300px] w-full" />
+    return (
+      <div className="flex flex-col gap-2">
+        {header}
+        <Skeleton className="h-[300px] w-full" />
+      </div>
+    )
   }
 
   if (isError) {
     return (
-      <div className="flex h-[300px] flex-col items-center justify-center gap-2 text-center">
-        <p className="text-sm font-medium text-rose-500">
-          Failed to load metric series
-        </p>
-        <p className="text-xs text-muted-foreground">{errorMessage}</p>
+      <div className="flex flex-col gap-2">
+        {header}
+        <div className="flex h-[300px] flex-col items-center justify-center gap-2 text-center">
+          <p className="text-sm font-medium text-rose-500">
+            Failed to load metric series
+          </p>
+          <p className="text-xs text-muted-foreground">{errorMessage}</p>
+        </div>
+      </div>
+    )
+  }
+
+  // Grouped path: one line per distinct series_key (threshold/anomaly overlays
+  // are per-metric aggregates and don't compose with a breakdown, so skip them).
+  if (breakdown) {
+    if (breakdown.data.length === 0) {
+      return (
+        <div className="flex flex-col gap-2">
+          {header}
+          <EmptyState
+            icon={LineChartIcon}
+            title="No data in range"
+            description="This metric has no samples in the selected time range. Try widening the range or clearing filters."
+          />
+        </div>
+      )
+    }
+    return (
+      <div className="flex flex-col gap-2">
+        {header}
+        <ThresholdLineChart
+          data={breakdown.data}
+          xKey="label"
+          series={breakdown.series}
+          markers={markers}
+          height={320}
+          tooltipValueFormatter={(v) => formatMetricValue(v)}
+          yTickFormatter={(v) => formatMetricValue(v)}
+        />
+        {breakdown.droppedCount > 0 && (
+          <p className="text-[11px] text-muted-foreground">
+            {breakdown.droppedCount} more series not shown
+          </p>
+        )}
       </div>
     )
   }
 
   if (chartData.length === 0) {
     return (
-      <EmptyState
-        icon={LineChartIcon}
-        title="No data in range"
-        description="This metric has no samples in the selected time range. Try widening the range or clearing filters."
-      />
+      <div className="flex flex-col gap-2">
+        {header}
+        <EmptyState
+          icon={LineChartIcon}
+          title="No data in range"
+          description="This metric has no samples in the selected time range. Try widening the range or clearing filters."
+        />
+      </div>
     )
   }
 
@@ -1444,12 +1289,7 @@ function MetricChart({
 
   return (
     <div className="flex flex-col gap-2">
-      <div className="flex items-center justify-between">
-        <Badge variant="secondary" className="font-mono text-xs">
-          {metricName}
-        </Badge>
-        <span className="text-xs text-muted-foreground">{aggLabel}</span>
-      </div>
+      {header}
       <ThresholdLineChart
         data={xData}
         xKey="label"

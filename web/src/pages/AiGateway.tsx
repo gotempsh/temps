@@ -84,6 +84,8 @@ import {
   Bot,
   ChevronLeft,
   ChevronRight,
+  ChevronDown,
+  ListTree,
   ArrowLeft,
   SlidersHorizontal,
   X,
@@ -1779,6 +1781,306 @@ function SpanDetailSheet({
   )
 }
 
+// ── Invocations & conversation view ─────────────────────────────────
+//
+// The trace's LLM calls surfaced directly — each "invocation" (chat /
+// generate / agent / embeddings span) rendered as an expanded card with its
+// conversation inline, so the messages are readable without hunting through
+// the span tree and opening a span sheet.
+
+const LLM_OPS = new Set([
+  'chat',
+  'generate_content',
+  'text_completion',
+  'completion',
+  'generate',
+  'invoke_agent',
+  'create_agent',
+  'embeddings',
+])
+
+function isToolSpan(s: GenAiSpanDetail): boolean {
+  return s.gen_ai_operation === 'execute_tool' || !!s.tool_name
+}
+
+function spanHasContent(s: GenAiSpanDetail): boolean {
+  return !!(s.system_instructions || s.input_messages || s.output_messages)
+}
+
+// A span worth showing as its own conversation card: an LLM/agent call, not a
+// tool execution (those nest under their parent call).
+function isInvocationSpan(s: GenAiSpanDetail): boolean {
+  if (isToolSpan(s)) return false
+  return (
+    spanHasContent(s) ||
+    s.gen_ai_model != null ||
+    s.input_tokens != null ||
+    s.output_tokens != null ||
+    (!!s.gen_ai_operation && LLM_OPS.has(s.gen_ai_operation))
+  )
+}
+
+interface InvocationSet {
+  invocations: GenAiSpanDetail[]
+  toolByInvocation: Map<string, ToolSpanInfo[]>
+  hasAnyContent: boolean
+}
+
+// Pick the invocation spans and attach each tool execution to its call.
+//
+// Instrumentations often emit a parent + child pair for one logical call
+// (e.g. the Vercel AI SDK's `ai.streamText` wrapping `ai.streamText.doStream`).
+// We prefer the span that actually carries the messages and drop token-only
+// spans that sit in the same ancestry chain, so one LLM call renders as one
+// card instead of two near-duplicates.
+function computeInvocations(spans: GenAiSpanDetail[]): InvocationSet {
+  const byId = new Map(spans.map((s) => [s.span_id, s]))
+  const isAncestor = (ancestorId: string, node: GenAiSpanDetail): boolean => {
+    let cur = node.parent_span_id ?? null
+    let guard = 0
+    while (cur && guard++ < 1000) {
+      if (cur === ancestorId) return true
+      cur = byId.get(cur)?.parent_span_id ?? null
+    }
+    return false
+  }
+
+  const candidates = spans.filter(isInvocationSpan)
+  const contentSpans = candidates.filter(spanHasContent)
+  const contentIds = new Set(contentSpans.map((s) => s.span_id))
+
+  // Content-bearing calls are always shown. Then add token/model-only calls
+  // that aren't part of a content call's chain (so we never hide a real call,
+  // but also never double up on one that's already represented).
+  const chosen: GenAiSpanDetail[] = [...contentSpans]
+  for (const c of candidates) {
+    if (contentIds.has(c.span_id)) continue
+    const overlapsContent = contentSpans.some(
+      (cs) => isAncestor(cs.span_id, c) || isAncestor(c.span_id, cs)
+    )
+    if (overlapsContent) continue
+    chosen.push(c)
+  }
+  // Among token-only calls, keep the topmost of any parent/child pair.
+  const deduped = chosen.filter((s) => {
+    if (contentIds.has(s.span_id)) return true
+    return !chosen.some((o) => o.span_id !== s.span_id && isAncestor(o.span_id, s))
+  })
+  deduped.sort(
+    (a, b) => new Date(a.start_time).getTime() - new Date(b.start_time).getTime()
+  )
+
+  // Attach each tool-execution span to the call it belongs to (its parent, or a
+  // call it shares a parent with), assigning each tool span only once.
+  const toolSpans = spans.filter(isToolSpan)
+  const used = new Set<string>()
+  const toolByInvocation = new Map<string, ToolSpanInfo[]>()
+  for (const inv of deduped) {
+    const list: ToolSpanInfo[] = []
+    for (const t of toolSpans) {
+      if (used.has(t.span_id)) continue
+      if (
+        t.parent_span_id === inv.span_id ||
+        (inv.parent_span_id != null && t.parent_span_id === inv.parent_span_id)
+      ) {
+        used.add(t.span_id)
+        list.push({
+          tool_name: t.tool_name,
+          tool_call_id: t.tool_call_id,
+          tool_call_arguments: t.tool_call_arguments,
+          tool_call_result: t.tool_call_result,
+          duration_ms: t.duration_ms,
+        })
+      }
+    }
+    if (list.length) toolByInvocation.set(inv.span_id, list)
+  }
+
+  return { invocations: deduped, toolByInvocation, hasAnyContent: contentSpans.length > 0 }
+}
+
+function fmtSpanDuration(ms: number): string {
+  return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms.toFixed(0)}ms`
+}
+
+// One LLM call: header (model, provider, tokens, duration, finish reason) plus
+// its conversation expanded inline. Clicking the header collapses it; "Details"
+// opens the full span sheet for raw attributes.
+function InvocationCard({
+  span,
+  index,
+  toolSpans,
+  onOpenSpan,
+}: {
+  span: GenAiSpanDetail
+  index: number
+  toolSpans: ToolSpanInfo[]
+  onOpenSpan: (span: GenAiSpanDetail) => void
+}) {
+  const [open, setOpen] = useState(true)
+  const Icon = spanIcon(span)
+  const isError = span.status_code === 'ERROR'
+  const hasContent = spanHasContent(span)
+  const model = span.gen_ai_response_model || span.gen_ai_model
+  const cacheRead = span.cache_read_input_tokens ?? 0
+
+  return (
+    <Card className={`overflow-hidden ${isError ? 'border-destructive/40' : ''}`}>
+      <Collapsible open={open} onOpenChange={setOpen}>
+        <div className="flex items-start gap-2 p-3">
+          <CollapsibleTrigger asChild>
+            <button className="flex min-w-0 flex-1 items-start gap-2 text-left">
+              <ChevronDown
+                className={`mt-1 h-4 w-4 shrink-0 text-muted-foreground transition-transform ${open ? '' : '-rotate-90'}`}
+              />
+              <span
+                className={`mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-md ${
+                  isError ? 'bg-destructive/10 text-destructive' : 'bg-primary/10 text-primary'
+                }`}
+              >
+                <Icon className="h-3.5 w-3.5" />
+              </span>
+              <div className="min-w-0 flex-1 space-y-1">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-[10px] font-semibold tabular-nums text-muted-foreground">
+                    #{index + 1}
+                  </span>
+                  <span className="truncate font-mono text-xs font-medium">
+                    {spanLabel(span)}
+                  </span>
+                  {span.gen_ai_operation && (
+                    <Badge variant="outline" className="h-4 px-1 text-[9px]">
+                      {span.gen_ai_operation}
+                    </Badge>
+                  )}
+                  {span.gen_ai_system && (
+                    <Badge variant="secondary" className="h-4 px-1 text-[9px]">
+                      {span.gen_ai_system}
+                    </Badge>
+                  )}
+                  {model && (
+                    <Badge variant="secondary" className="h-4 px-1 font-mono text-[9px]">
+                      {model}
+                    </Badge>
+                  )}
+                  {isError && (
+                    <Badge variant="destructive" className="h-4 px-1 text-[9px]">
+                      {span.error_type || 'error'}
+                    </Badge>
+                  )}
+                </div>
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[10px] tabular-nums text-muted-foreground">
+                  <span className="inline-flex items-center gap-1">
+                    <Clock className="h-3 w-3" />
+                    {fmtSpanDuration(span.duration_ms)}
+                  </span>
+                  {(span.input_tokens != null || span.output_tokens != null) && (
+                    <span>
+                      {span.input_tokens != null ? formatTokenCount(span.input_tokens) : '—'} in
+                      {' / '}
+                      {span.output_tokens != null ? formatTokenCount(span.output_tokens) : '—'} out
+                    </span>
+                  )}
+                  {cacheRead > 0 && (
+                    <span className="text-blue-500">{formatTokenCount(cacheRead)} cached</span>
+                  )}
+                  {span.response_finish_reasons && span.response_finish_reasons.length > 0 && (
+                    <span>finish: {span.response_finish_reasons.join(', ')}</span>
+                  )}
+                </div>
+              </div>
+            </button>
+          </CollapsibleTrigger>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-7 shrink-0 gap-1 px-2 text-xs text-muted-foreground"
+            onClick={() => onOpenSpan(span)}
+          >
+            <Info className="h-3.5 w-3.5" />
+            <span className="hidden sm:inline">Details</span>
+          </Button>
+        </div>
+        <CollapsibleContent>
+          <div className="border-t bg-muted/20 p-3">
+            {hasContent ? (
+              <FullConversationView
+                systemInstructions={span.system_instructions}
+                inputMessages={span.input_messages}
+                outputMessages={span.output_messages}
+                toolSpans={toolSpans}
+              />
+            ) : (
+              <p className="text-xs text-muted-foreground">
+                No message content was captured for this call. Enable it by exporting{' '}
+                <code className="font-mono text-[11px]">gen_ai.input.messages</code> /{' '}
+                <code className="font-mono text-[11px]">gen_ai.output.messages</code> (opt-in in the
+                OpenTelemetry GenAI semantic conventions), or open{' '}
+                <button
+                  type="button"
+                  className="underline underline-offset-2 hover:text-foreground"
+                  onClick={() => onOpenSpan(span)}
+                >
+                  span details
+                </button>
+                .
+              </p>
+            )}
+          </div>
+        </CollapsibleContent>
+      </Collapsible>
+    </Card>
+  )
+}
+
+// The default tab of a trace: its AI invocations, each with its conversation
+// expanded inline. Reads top-to-bottom like a transcript.
+function TraceConversationView({
+  spans,
+  onOpenSpan,
+}: {
+  spans: GenAiSpanDetail[]
+  onOpenSpan: (span: GenAiSpanDetail) => void
+}) {
+  const { invocations, toolByInvocation, hasAnyContent } = useMemo(
+    () => computeInvocations(spans),
+    [spans]
+  )
+
+  if (invocations.length === 0) {
+    return (
+      <EmptyState
+        icon={MessageSquare}
+        title="No AI invocations in this trace"
+        description="This trace has no spans with gen_ai.* attributes. Open the Span tree tab to inspect all spans."
+      />
+    )
+  }
+
+  return (
+    <div className="space-y-3">
+      {!hasAnyContent && (
+        <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-xs text-muted-foreground">
+          Message content isn&apos;t captured for these calls. You can see each call&apos;s model,
+          tokens, and timing below — to read the actual prompts and responses, export{' '}
+          <code className="font-mono text-[11px]">gen_ai.input.messages</code> and{' '}
+          <code className="font-mono text-[11px]">gen_ai.output.messages</code> (opt-in content
+          capture).
+        </div>
+      )}
+      {invocations.map((span, i) => (
+        <InvocationCard
+          key={span.span_id}
+          span={span}
+          index={i}
+          toolSpans={toolByInvocation.get(span.span_id) ?? []}
+          onOpenSpan={onOpenSpan}
+        />
+      ))}
+    </div>
+  )
+}
+
 // ── Trace Detail View ───────────────────────────────────────────────
 
 function TraceDetailView({
@@ -1822,6 +2124,12 @@ function TraceDetailView({
     const rootDuration = tree[0]?.span.duration_ms ?? 0
     return { genAiSpans, totalInput, totalOutput, totalCacheRead, totalCacheCreate, errors, tools, agents, rootDuration }
   }, [traceDetail, tree])
+
+  // Count of AI invocations for the Conversation tab label.
+  const invocationCount = useMemo(
+    () => (traceDetail ? computeInvocations(traceDetail.spans).invocations.length : 0),
+    [traceDetail]
+  )
 
   const handleSelect = (span: GenAiSpanDetail) => {
     setSelectedSpan(span)
@@ -1893,30 +2201,49 @@ function TraceDetailView({
             </div>
           )}
 
-          {/* Span tree */}
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-base flex items-center gap-2">
-                Span Tree
-                <span className="text-xs text-muted-foreground font-normal">Click any span for details</span>
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="p-0">
-              <ScrollArea className="max-h-[600px]">
-                <div className="py-1">
-                  {tree.map((node) => (
-                    <SpanTreeRow
-                      key={node.span.span_id}
-                      node={node}
-                      depth={0}
-                      maxDuration={maxDuration}
-                      onSelect={handleSelect}
-                    />
-                  ))}
-                </div>
-              </ScrollArea>
-            </CardContent>
-          </Card>
+          {/* Invocations (default) + raw span tree */}
+          <Tabs defaultValue="conversation" className="w-full">
+            <TabsList>
+              <TabsTrigger value="conversation" className="gap-1.5">
+                <MessageSquare className="h-3.5 w-3.5" />
+                Conversation
+                {invocationCount > 0 && (
+                  <span className="text-xs text-muted-foreground">{invocationCount}</span>
+                )}
+              </TabsTrigger>
+              <TabsTrigger value="tree" className="gap-1.5">
+                <ListTree className="h-3.5 w-3.5" />
+                Span tree
+                <span className="text-xs text-muted-foreground">{traceDetail.span_count}</span>
+              </TabsTrigger>
+            </TabsList>
+
+            {/* Default: the AI invocations, each with its conversation inline. */}
+            <TabsContent value="conversation" className="mt-4">
+              <TraceConversationView spans={traceDetail.spans} onOpenSpan={handleSelect} />
+            </TabsContent>
+
+            {/* Raw span tree — click any span for full details. */}
+            <TabsContent value="tree" className="mt-4">
+              <Card>
+                <CardContent className="p-0">
+                  <ScrollArea className="max-h-[600px]">
+                    <div className="py-1">
+                      {tree.map((node) => (
+                        <SpanTreeRow
+                          key={node.span.span_id}
+                          node={node}
+                          depth={0}
+                          maxDuration={maxDuration}
+                          onSelect={handleSelect}
+                        />
+                      ))}
+                    </div>
+                  </ScrollArea>
+                </CardContent>
+              </Card>
+            </TabsContent>
+          </Tabs>
 
           {/* Events */}
           {events.length > 0 && (

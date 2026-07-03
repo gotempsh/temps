@@ -19,6 +19,7 @@ use crate::handlers::audit::{
     OtelMetricAlertCreatedAudit, OtelMetricAlertDeletedAudit, OtelMetricAlertUpdatedAudit,
 };
 use crate::services::anomaly_preview::compute_anomaly_preview;
+use crate::services::metric_alert_evaluator::SeriesStateEntry;
 use crate::OtelAppState;
 use temps_auth::{permission_guard, RequireAuth};
 use temps_core::problemdetails::Problem;
@@ -26,6 +27,17 @@ use temps_core::{AuditContext, ProblemDetails, RequestMetadata};
 use temps_entities::metric_alert_rules::Model;
 
 // ── Request DTOs ────────────────────────────────────────────────────
+
+/// Default for `max_series` when a create request omits it (ADR-026 Phase 3).
+fn default_max_series() -> i32 {
+    20
+}
+
+/// Default for `grouped_notification_threshold` when a create request omits it.
+/// Matches the value that was previously a hardcoded evaluator constant.
+fn default_grouped_notification_threshold() -> i32 {
+    5
+}
 
 #[derive(Debug, Deserialize)]
 pub struct ListMetricAlertsParams {
@@ -49,6 +61,28 @@ pub struct CreateMetricAlertRequest {
     /// One of `info|warning|critical`.
     pub severity: String,
     pub enabled: bool,
+    /// AND-combined label equality filters: `[["key","value"],…]`. Empty = no
+    /// filtering (the default). Max 10 pairs; keys must match `[a-zA-Z0-9_.:-]`;
+    /// values capped at 500 characters.
+    #[serde(default)]
+    pub label_filters: Vec<(String, String)>,
+    /// Label keys to break the metric down by, e.g. `["endpoint","region"]`. Empty
+    /// (the default) = one aggregate stream. Max 2 keys; keys must match
+    /// `[a-zA-Z0-9_.:-]`.
+    #[serde(default)]
+    pub group_by: Vec<String>,
+    /// When true (and `group_by` is set) fire one independent alarm per breaching
+    /// series. Static detectors only. Default false.
+    #[serde(default)]
+    pub dynamic_alerts: bool,
+    /// Cardinality cap for dynamic alerting: at most this many series (top by
+    /// `|value|`). Range 1–100, default 20.
+    #[serde(default = "default_max_series")]
+    pub max_series: i32,
+    /// When more than this many series transition to firing in the same tick, only
+    /// the first gets the expensive chart/AI enrichment. Range 1–1000, default 5.
+    #[serde(default = "default_grouped_notification_threshold")]
+    pub grouped_notification_threshold: i32,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -62,6 +96,16 @@ pub struct UpdateMetricAlertRequest {
     pub for_duration_secs: Option<i32>,
     pub severity: Option<String>,
     pub enabled: Option<bool>,
+    /// Replaces the label filters wholesale when present (absent = leave unchanged).
+    pub label_filters: Option<Vec<(String, String)>>,
+    /// Replaces the group_by keys wholesale when present (absent = leave unchanged).
+    pub group_by: Option<Vec<String>>,
+    /// Toggles per-series ("dynamic") alerting (absent = leave unchanged).
+    pub dynamic_alerts: Option<bool>,
+    /// Updates the dynamic-alerting cardinality cap (absent = leave unchanged).
+    pub max_series: Option<i32>,
+    /// Updates the notification-grouping threshold (absent = leave unchanged).
+    pub grouped_notification_threshold: Option<i32>,
 }
 
 /// Query params scoping a by-id alert operation to a project. Required on
@@ -73,6 +117,18 @@ pub struct MetricAlertScopeParams {
 }
 
 // ── Response DTOs ───────────────────────────────────────────────────
+
+/// A single currently-firing series for a dynamic alert rule, snapshotted from
+/// the evaluator's in-memory per-series firing map at read time (ADR-026 Phase 3).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct FiringSeriesEntry {
+    /// The series' label pairs, e.g. `[["endpoint","/checkout"],["region","eu-west"]]`.
+    pub series_key: Vec<(String, String)>,
+    /// The human-readable joined label, e.g. `endpoint=/checkout, region=eu-west`.
+    pub series_label: String,
+    /// The open alarm's id, when one was created (absent if suppressed).
+    pub alarm_id: Option<i32>,
+}
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct OtelMetricAlertRuleResponse {
@@ -92,6 +148,33 @@ pub struct OtelMetricAlertRuleResponse {
     /// One of `ok|firing|unknown`.
     pub last_state: String,
     pub last_value: Option<f64>,
+    /// AND-combined label equality filters applied when evaluating this rule.
+    /// Empty = no filtering (matches all series).
+    pub label_filters: Vec<(String, String)>,
+    /// Label keys the rule breaks the metric down by. Empty = one aggregate stream.
+    pub group_by: Vec<String>,
+    /// Whether per-series ("dynamic") alerting is enabled for this rule.
+    pub dynamic_alerts: bool,
+    /// Cardinality cap for dynamic alerting (1–100).
+    pub max_series: i32,
+    /// Notification-grouping threshold: when more than this many series fire in the
+    /// same tick, only the first gets chart/AI enrichment (1–1000).
+    pub grouped_notification_threshold: i32,
+    /// Number of series dropped by the cardinality cap on the latest dynamic tick
+    /// (0 when nothing was dropped or for static/aggregate rules). Lets a UI warn
+    /// "N series were dropped this tick" without reading server logs.
+    pub last_dropped_series_count: i32,
+    /// Full per-series state snapshot persisted after the latest dynamic-rule tick,
+    /// keyed by the human-readable series label (`endpoint=/checkout`). Empty for
+    /// static/aggregate rules. Unlike `firing_series` (a live in-memory snapshot),
+    /// this is decoded from the persisted `series_states` jsonb column, so an
+    /// external consumer that only reads the rule row still sees per-series detail.
+    pub series_states: std::collections::HashMap<String, SeriesStateEntry>,
+    /// Currently-firing series for a dynamic rule, snapshotted from the evaluator's
+    /// in-memory firing map at read time. Empty for static/aggregate rules or when
+    /// nothing is firing.
+    #[serde(default)]
+    pub firing_series: Vec<FiringSeriesEntry>,
     #[schema(example = "2025-10-12T12:15:47.609192Z")]
     pub last_evaluated_at: Option<String>,
     #[schema(example = "2025-10-12T12:15:47.609192Z")]
@@ -114,6 +197,13 @@ impl From<Model> for OtelMetricAlertRuleResponse {
                 );
                 DetectionConfig::default_static()
             });
+        let label_filters: Vec<(String, String)> =
+            serde_json::from_value(model.label_filters).unwrap_or_default();
+        let group_by: Vec<String> = serde_json::from_value(model.group_by).unwrap_or_default();
+        // Decoded from the persisted jsonb the same way as label_filters/group_by;
+        // malformed/legacy jsonb decodes to an empty map rather than failing.
+        let series_states: std::collections::HashMap<String, SeriesStateEntry> =
+            serde_json::from_value(model.series_states).unwrap_or_default();
         Self {
             id: model.id,
             project_id: model.project_id,
@@ -128,6 +218,17 @@ impl From<Model> for OtelMetricAlertRuleResponse {
             enabled: model.enabled,
             last_state: model.last_state,
             last_value: model.last_value,
+            label_filters,
+            group_by,
+            dynamic_alerts: model.dynamic_alerts,
+            max_series: model.max_series,
+            grouped_notification_threshold: model.grouped_notification_threshold,
+            last_dropped_series_count: model.last_dropped_series_count,
+            series_states,
+            // Populated by the read handlers from the evaluator's in-memory
+            // snapshot (`firing_series_for`); empty by default so create/update
+            // (which just mutated config) don't imply a firing state.
+            firing_series: Vec::new(),
             last_evaluated_at: model.last_evaluated_at.map(|d| d.to_rfc3339()),
             created_at: model.created_at.to_rfc3339(),
             updated_at: model.updated_at.to_rfc3339(),
@@ -189,6 +290,32 @@ fn parse_rfc3339(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
         .map(|dt| dt.with_timezone(&chrono::Utc))
 }
 
+/// Snapshot the evaluator's in-memory per-series firing map for `rule_id` into
+/// response DTOs. Reads an in-memory map (no DB), so it is cheap to call per rule.
+/// Labels are sorted by key so they match the per-series alarm titles.
+async fn firing_series_entries(state: &OtelAppState, rule_id: i32) -> Vec<FiringSeriesEntry> {
+    state
+        .metric_alert_evaluator
+        .firing_series_for(rule_id)
+        .await
+        .into_iter()
+        .map(|(series_key, alarm_id)| {
+            let mut pairs: Vec<&(String, String)> = series_key.iter().collect();
+            pairs.sort_by(|a, b| a.0.cmp(&b.0));
+            let series_label = pairs
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            FiringSeriesEntry {
+                series_key,
+                series_label,
+                alarm_id: Some(alarm_id),
+            }
+        })
+        .collect()
+}
+
 // ── Handlers ────────────────────────────────────────────────────────
 
 /// List alert rules for a project (newest first, paginated).
@@ -221,10 +348,13 @@ pub async fn list_alerts(
         .list(params.project_id, params.page, params.page_size)
         .await?;
 
-    let data = items
-        .into_iter()
-        .map(OtelMetricAlertRuleResponse::from)
-        .collect();
+    let mut data = Vec::with_capacity(items.len());
+    for item in items {
+        let rule_id = item.id;
+        let mut resp = OtelMetricAlertRuleResponse::from(item);
+        resp.firing_series = firing_series_entries(&state, rule_id).await;
+        data.push(resp);
+    }
     Ok(Json(OtelMetricAlertsResponse { data, total }))
 }
 
@@ -263,6 +393,11 @@ pub async fn create_alert(
             request.for_duration_secs,
             request.severity,
             request.enabled,
+            request.label_filters,
+            request.group_by,
+            request.dynamic_alerts,
+            request.max_series,
+            request.grouped_notification_threshold,
         )
         .await?;
 
@@ -313,7 +448,9 @@ pub async fn get_alert(
     permission_guard!(auth, OtelRead);
 
     let model = state.metric_alert_service.get(scope.project_id, id).await?;
-    Ok(Json(OtelMetricAlertRuleResponse::from(model)))
+    let mut resp = OtelMetricAlertRuleResponse::from(model);
+    resp.firing_series = firing_series_entries(&state, id).await;
+    Ok(Json(resp))
 }
 
 /// Update an alert rule's fields.
@@ -359,6 +496,11 @@ pub async fn update_alert(
             request.for_duration_secs,
             request.severity,
             request.enabled,
+            request.label_filters,
+            request.group_by,
+            request.dynamic_alerts,
+            request.max_series,
+            request.grouped_notification_threshold,
         )
         .await?;
 
@@ -375,7 +517,10 @@ pub async fn update_alert(
         error!("Failed to create audit log: {}", e);
     }
 
-    Ok(Json(OtelMetricAlertRuleResponse::from(model)))
+    let rule_id = model.id;
+    let mut resp = OtelMetricAlertRuleResponse::from(model);
+    resp.firing_series = firing_series_entries(&state, rule_id).await;
+    Ok(Json(resp))
 }
 
 /// Delete an alert rule.
@@ -404,6 +549,22 @@ pub async fn delete_alert(
     Query(scope): Query<MetricAlertScopeParams>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, OtelWrite);
+
+    // Verify ownership FIRST (404s if `id` isn't in `scope.project_id`): the
+    // evaluator's in-memory maps below are keyed only by `rule_id`, not
+    // `project_id`, so calling resolve_all_for_rule before this check would let
+    // a caller with OtelWrite on their own project wipe another project's
+    // per-series firing state just by guessing a foreign rule_id.
+    let rule = state.metric_alert_service.get(scope.project_id, id).await?;
+
+    // Resolve any open alarms (aggregate or per-series) and drop the evaluator's
+    // in-memory state for this rule BEFORE removing the row: once the row is gone
+    // the evaluator never runs for it again, so an open alarm would be orphaned as
+    // permanently `firing`. Fire-and-forget — never blocks or fails the delete.
+    state
+        .metric_alert_evaluator
+        .resolve_all_for_rule(rule.id, rule.project_id)
+        .await;
 
     state
         .metric_alert_service

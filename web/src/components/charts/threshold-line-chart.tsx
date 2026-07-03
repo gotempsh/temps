@@ -71,7 +71,12 @@ export type ThresholdBandSeries = {
 interface ThresholdLineChartProps {
   data: any[]
   xKey: string
-  series: ThresholdLineSeries
+  /**
+   * A single line (unchanged single-series behavior), or an array to render a
+   * breakdown — one `<Line>` per entry, each reading its own `dataKey` off the
+   * same wide-format `data` rows.
+   */
+  series: ThresholdLineSeries | ThresholdLineSeries[]
   /** Horizontal reference lines drawn across the chart for pass/fail bands. */
   thresholds?: ThresholdBand[]
   /** Shaded horizontal bands (e.g. an anomaly rule's expected range). */
@@ -104,6 +109,18 @@ const SERIES_STROKE: Record<NonNullable<ThresholdLineSeries['tone']>, string> = 
   primary: 'var(--chart-1)',
 }
 
+// Breakdown lines don't carry good/warn/poor semantics — cycle the same five
+// theme chart vars every other chart in the app rotates through (see
+// AiAgentsTimelineChart's SERIES_COLORS) so a breakdown looks native in both
+// light and dark mode instead of inventing new hex colors.
+const BREAKDOWN_STROKES = [
+  'var(--chart-1)',
+  'var(--chart-2)',
+  'var(--chart-3)',
+  'var(--chart-4)',
+  'var(--chart-5)',
+]
+
 const THRESHOLD_STROKE: Record<MetricTone, string> = {
   good: 'var(--chart-2)',
   warn: 'var(--chart-3)',
@@ -112,8 +129,10 @@ const THRESHOLD_STROKE: Record<MetricTone, string> = {
 }
 
 /**
- * Themed single-series line chart with optional horizontal threshold
- * reference lines (e.g. Core Web Vitals "Good" / "Poor" bands).
+ * Themed line chart with optional horizontal threshold reference lines (e.g.
+ * Core Web Vitals "Good" / "Poor" bands). `series` is either a single line
+ * (today's shape) or an array to render a label breakdown as one line per
+ * entry, all reading their own `dataKey` off the same wide-format `data` rows.
  *
  * Built on `ChartContainer` so grid, axis, and tooltip automatically follow
  * the app theme in both light and dark mode.
@@ -133,22 +152,30 @@ export function ThresholdLineChart({
   emptyMessage,
   className,
 }: ThresholdLineChartProps) {
-  const tone = series.tone ?? 'primary'
-  const stroke = SERIES_STROKE[tone]
+  const isMulti = Array.isArray(series)
+  const seriesList = isMulti ? series : [series]
 
-  const config: ChartConfig = {
-    [series.dataKey]: {
-      label: series.label,
-      color: stroke,
-    },
-  }
+  const config: ChartConfig = {}
+  seriesList.forEach((s, i) => {
+    config[s.dataKey] = {
+      label: s.label,
+      color: s.tone
+        ? SERIES_STROKE[s.tone]
+        : isMulti
+          ? BREAKDOWN_STROKES[i % BREAKDOWN_STROKES.length]
+          : SERIES_STROKE.primary,
+    }
+  })
 
-  const validCount = data.reduce((n, p) => {
-    const v = p?.[series.dataKey]
-    return v === null || v === undefined ? n : n + 1
-  }, 0)
+  const validCounts = seriesList.map((s) =>
+    data.reduce((n, p) => {
+      const v = p?.[s.dataKey]
+      return v === null || v === undefined ? n : n + 1
+    }, 0),
+  )
+  const maxValidCount = Math.max(0, ...validCounts)
 
-  if (validCount < 2) {
+  if (maxValidCount < 2) {
     return (
       <div
         className={cn(
@@ -163,7 +190,7 @@ export function ThresholdLineChart({
               Not enough data to chart
             </span>
             <span className="text-xs">
-              {validCount === 0
+              {maxValidCount === 0
                 ? 'No samples in this range.'
                 : 'Only one sample recorded — a trend needs at least two.'}
             </span>
@@ -176,9 +203,11 @@ export function ThresholdLineChart({
   // Include threshold lines in the Y-axis domain so they're always visible.
   // Recharts auto-fits to data, which pushes out-of-range threshold lines
   // off the chart — e.g. a 488ms LCP never reveals the 2500ms/4000ms bands.
-  const numericValues = data
-    .map((p) => p?.[series.dataKey])
-    .filter((v): v is number => typeof v === 'number')
+  const numericValues = data.flatMap((p) =>
+    seriesList
+      .map((s) => p?.[s.dataKey])
+      .filter((v): v is number => typeof v === 'number'),
+  )
   const dataMax = numericValues.length ? Math.max(...numericValues) : 0
   const dataMin = numericValues.length ? Math.min(...numericValues) : 0
   const thresholdMax = thresholds.reduce(
@@ -279,10 +308,22 @@ export function ThresholdLineChart({
           content={
             <ChartTooltipContent
               indicator="line"
-              formatter={(value) => {
+              formatter={(value, _name, item) => {
                 const num = value as number
+                // Only the breakdown case needs a per-line label — a single
+                // series already conveys "what" via the tile title.
+                const seriesLabel = isMulti
+                  ? (config[String(item?.dataKey)]?.label as
+                      | string
+                      | undefined)
+                  : undefined
                 return (
                   <div className="flex flex-col gap-0.5">
+                    {seriesLabel && (
+                      <span className="font-mono text-[10px] text-muted-foreground">
+                        {seriesLabel}
+                      </span>
+                    )}
                     <span className="font-mono font-medium text-foreground">
                       {tooltipValueFormatter
                         ? tooltipValueFormatter(num)
@@ -357,23 +398,31 @@ export function ThresholdLineChart({
             }
           />
         ))}
-        <Line
-          type="monotone"
-          dataKey={series.dataKey}
-          stroke={`var(--color-${series.dataKey})`}
-          strokeWidth={2}
-          dot={validCount <= 8 ? { r: 3, strokeWidth: 0 } : false}
-          activeDot={{ r: 4, strokeWidth: 0 }}
-          connectNulls
-          isAnimationActive={false}
-        />
+        {seriesList.map((s, i) => (
+          <Line
+            key={s.dataKey}
+            type="monotone"
+            dataKey={s.dataKey}
+            stroke={`var(--color-${s.dataKey})`}
+            strokeWidth={2}
+            // A breakdown can have many overlapping lines — per-point dots
+            // just add clutter there; the single-series dot-when-sparse
+            // behavior is unchanged.
+            dot={!isMulti && validCounts[i] <= 8 ? { r: 3, strokeWidth: 0 } : false}
+            activeDot={{ r: 4, strokeWidth: 0 }}
+            connectNulls
+            isAnimationActive={false}
+          />
+        ))}
         {/* Breach markers: dots at the points that left the band — the anomaly
             itself. A stroke-less Line over the VALUE series with a custom dot
             that renders only where `breachKey` is set (recharts' Scatter plots
-            null points at the top, so it can't be used to mark a sparse subset). */}
+            null points at the top, so it can't be used to mark a sparse subset).
+            Bands are only ever paired with the single-series path, so the
+            first (only) series is the right one to key the overlay off. */}
         {bandSeries?.breachKey && (
           <Line
-            dataKey={series.dataKey}
+            dataKey={seriesList[0].dataKey}
             stroke="none"
             legendType="none"
             tooltipType="none"

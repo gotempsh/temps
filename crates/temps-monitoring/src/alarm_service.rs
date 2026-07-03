@@ -213,7 +213,37 @@ impl AlarmService {
 
     /// Fire a new alarm. Checks cooldown to avoid spam.
     /// Returns the alarm ID if created, None if suppressed by cooldown.
+    ///
+    /// Sends the alarm's individual notification (Slack/email/webhook). To persist
+    /// an alarm row + emit `Job::AlarmFired` WITHOUT the individual notification
+    /// (e.g. when a caller sends one combined digest instead), use
+    /// [`Self::fire_alarm_silent`].
     pub async fn fire_alarm(&self, request: FireAlarmRequest) -> Result<Option<i32>, AlarmError> {
+        self.fire_alarm_internal(request, true).await
+    }
+
+    /// Fire a new alarm WITHOUT sending its individual notification, but otherwise
+    /// identical to [`Self::fire_alarm`] (same cooldown check, same alarm-row
+    /// insert, same `Job::AlarmFired` emission — job consumers like dashboards and
+    /// webhooks still react per-alarm). Used when the caller suppresses the N
+    /// per-alarm notifications in favour of a single combined digest
+    /// ([`Self::send_digest_notification`]).
+    pub async fn fire_alarm_silent(
+        &self,
+        request: FireAlarmRequest,
+    ) -> Result<Option<i32>, AlarmError> {
+        self.fire_alarm_internal(request, false).await
+    }
+
+    /// Shared fire path for [`Self::fire_alarm`] (`notify = true`) and
+    /// [`Self::fire_alarm_silent`] (`notify = false`). `notify` gates ONLY the
+    /// human-facing individual notification; the cooldown check, alarm-row insert,
+    /// and `Job::AlarmFired` emission happen identically in both cases.
+    async fn fire_alarm_internal(
+        &self,
+        request: FireAlarmRequest,
+        notify: bool,
+    ) -> Result<Option<i32>, AlarmError> {
         // Check cooldown: is there a recent firing alarm of the same type for the same deployment+container?
         if self.is_in_cooldown(&request).await? {
             info!(
@@ -267,8 +297,11 @@ impl AlarmService {
             request.deployment_id,
         );
 
-        // Send notification via existing notification system
-        self.send_alarm_notification(&request, alarm_id).await;
+        // Send the individual notification via the existing notification system,
+        // unless the caller suppressed it (e.g. to send one combined digest).
+        if notify {
+            self.send_alarm_notification(&request, alarm_id).await;
+        }
 
         // Emit job to queue so webhooks, dashboard, etc. can react
         let job = Job::AlarmFired(AlarmFiredJob {
@@ -783,6 +816,62 @@ impl AlarmService {
         }
     }
 
+    /// Send one ad-hoc digest notification not tied to a single alarm row.
+    ///
+    /// Used to collapse a burst of alarms (e.g. a per-series cardinality spike
+    /// where every series still gets its own alarm via [`Self::fire_alarm_silent`])
+    /// into ONE combined notification. Builds the same project-context metadata as
+    /// [`Self::send_alarm_notification`] (via [`Self::build_notification_metadata`],
+    /// no service/environment scope) and merges caller-supplied `metadata` on top,
+    /// applies the same `Critical`-bypasses-throttling rule, and best-effort sends:
+    /// a failure is logged, never propagated, so it cannot fail the caller.
+    pub async fn send_digest_notification(
+        &self,
+        project_id: i32,
+        severity: AlarmSeverity,
+        title: String,
+        message: String,
+        metadata: Option<serde_json::Value>,
+    ) {
+        let mut notification_metadata = self
+            .build_notification_metadata(project_id, None, None)
+            .await;
+        // Merge caller-supplied detail (e.g. the digest's fired-series list) so the
+        // channels can render it — same mapping as `send_alarm_notification`.
+        if let Some(serde_json::Value::Object(extra)) = &metadata {
+            for (k, v) in extra {
+                let s = match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                notification_metadata.insert(k.clone(), s);
+            }
+        }
+
+        let notification = NotificationData {
+            id: uuid::Uuid::new_v4().to_string(),
+            title,
+            message,
+            notification_type: severity.to_notification_type(),
+            priority: severity.to_notification_priority(),
+            severity: Some(severity.as_str().to_string()),
+            timestamp: Utc::now(),
+            metadata: notification_metadata,
+            bypass_throttling: severity == AlarmSeverity::Critical,
+        };
+
+        if let Err(e) = self
+            .notification_service
+            .send_notification(notification)
+            .await
+        {
+            error!(
+                "Failed to send digest notification for project {}: {}",
+                project_id, e
+            );
+        }
+    }
+
     /// Send recovery notification when an alarm resolves (failure is logged, not propagated)
     async fn send_resolved_notification(&self, alarm: &alarms::Model) {
         let mut metadata = self
@@ -1251,6 +1340,88 @@ mod tests {
                 "metadata must not contain raw id key '{forbidden}': {metadata:?}"
             );
         }
+    }
+
+    // ── AlarmService.fire_alarm_silent / send_digest_notification ─────
+
+    #[tokio::test]
+    async fn test_fire_alarm_silent_persists_alarm_and_job_but_no_notification() {
+        let alarm = sample_alarm(1, "deployment_metric_threshold", "warning", "firing");
+
+        // Mock: cooldown check (0) + insert. No project/service lookups occur
+        // because the individual notification (which would resolve them) is
+        // suppressed by the silent path.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[maplit::btreemap! {
+                "num_items" => sea_orm::Value::BigInt(Some(0)),
+            }]])
+            .append_query_results(vec![vec![alarm]])
+            .into_connection();
+
+        let notification_service = Arc::new(TrackingNotificationService::new());
+        let job_queue = Arc::new(TrackingJobQueue::new());
+
+        let service = AlarmService::new(
+            Arc::new(db),
+            notification_service.clone(),
+            job_queue.clone(),
+        );
+
+        let result = service.fire_alarm_silent(sample_fire_request()).await;
+        assert_eq!(result.unwrap(), Some(1));
+
+        // The alarm row + AlarmFired job still happen (dashboards/webhooks react),
+        // but NO individual human notification is sent.
+        assert_eq!(
+            notification_service.send_count(),
+            0,
+            "silent fire must not notify"
+        );
+        assert_eq!(job_queue.send_count(), 1, "AlarmFired job still emitted");
+    }
+
+    #[tokio::test]
+    async fn test_send_digest_notification_sends_single_merged_notification() {
+        // build_notification_metadata does one project lookup; an empty result
+        // means it gracefully skips the "project" row. The caller-supplied digest
+        // metadata is then merged on top and stringified.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<temps_entities::projects::Model>::new()])
+            .into_connection();
+
+        let notification_service = Arc::new(TrackingNotificationService::new());
+        let job_queue = Arc::new(TrackingJobQueue::new());
+
+        let service = AlarmService::new(
+            Arc::new(db),
+            notification_service.clone(),
+            job_queue.clone(),
+        );
+
+        service
+            .send_digest_notification(
+                4,
+                AlarmSeverity::Warning,
+                "12 series of http.latency breached".to_string(),
+                "endpoint=/checkout (500)\nand 2 more".to_string(),
+                Some(serde_json::json!({
+                    "rule_id": 9,
+                    "source": "otel_metric_alert_digest",
+                })),
+            )
+            .await;
+
+        // Exactly one notification; no AlarmFired job (a digest isn't one alarm).
+        assert_eq!(notification_service.send_count(), 1);
+        assert_eq!(job_queue.send_count(), 0);
+
+        let metadata = notification_service.last_metadata();
+        assert_eq!(
+            metadata.get("source").map(String::as_str),
+            Some("otel_metric_alert_digest"),
+            "digest metadata must be merged into the notification: {metadata:?}"
+        );
+        assert_eq!(metadata.get("rule_id").map(String::as_str), Some("9"));
     }
 
     // ── AlarmService.resolve_alarm tests ──────────────────────────────

@@ -44,6 +44,29 @@ pub struct Model {
     /// are fully typed. For a static rule this is `{kind:static,comparator,threshold}`.
     #[sea_orm(column_type = "JsonBinary")]
     pub detection_config: serde_json::Value,
+    /// AND-combined label equality filters as `[["key","value"],…]`. Empty array
+    /// means no filtering (today's behaviour). Stored as jsonb; the service/DTO
+    /// layers convert through `Vec<(String,String)>` so the entity stays raw.
+    #[sea_orm(column_type = "JsonBinary")]
+    pub label_filters: serde_json::Value,
+    /// Label keys to break the metric down by as `["endpoint","region"]` (ADR-026
+    /// Phase 3). Empty array = one aggregate stream (today's behaviour). Stored as
+    /// jsonb; the service/DTO layers convert through `Vec<String>`.
+    #[sea_orm(column_type = "JsonBinary")]
+    pub group_by: serde_json::Value,
+    /// When true (and `group_by` is set), the evaluator fires one independent
+    /// alarm per breaching series keyed by `(rule_id, series_key)`. When false
+    /// (the default) a set `group_by` collapses to a single "any series breaches"
+    /// aggregate alarm. Dynamic mode is static-detector-only in this phase.
+    pub dynamic_alerts: bool,
+    /// Cardinality cap for dynamic alerting: at most this many series (top by
+    /// `|value|`) are evaluated/tracked per tick. Hard-capped at 100 by the service.
+    pub max_series: i32,
+    /// Notification-grouping threshold for dynamic alerting: when more than this
+    /// many series transition to firing in the same tick, only the first gets the
+    /// expensive chart/AI enrichment. Range 1–1000, default 5 (validated by the
+    /// service). A per-rule column so operators can tune it without a rebuild.
+    pub grouped_notification_threshold: i32,
     /// Aggregation/eval window in seconds (e.g. 300).
     pub window_secs: i32,
     /// How long (seconds) a breach must persist before the rule fires.
@@ -56,6 +79,18 @@ pub struct Model {
     pub last_state: String,
     /// Last aggregated value the evaluator computed, when available.
     pub last_value: Option<f64>,
+    /// Full per-series state snapshot persisted after every dynamic-rule tick,
+    /// keyed by the human-readable series label. Shape:
+    /// `{"method=GET": {"state":"firing","value":12.5,"alarm_id":259}}`. Only kept
+    /// (evaluated) series appear; dropped/disappeared series don't linger. Stored
+    /// as jsonb; the DTO layer decodes through `HashMap<String, SeriesStateEntry>`.
+    /// Stays `{}` for static/aggregate rules, which never populate it.
+    #[sea_orm(column_type = "JsonBinary")]
+    pub series_states: serde_json::Value,
+    /// Number of series dropped by the cardinality cap on the LATEST dynamic tick
+    /// (0 when nothing was dropped or for static/aggregate rules). Lets a UI warn
+    /// "N series were dropped this tick" without reading server logs.
+    pub last_dropped_series_count: i32,
     /// When the evaluator last evaluated this rule.
     pub last_evaluated_at: Option<DBDateTime>,
     pub created_at: DBDateTime,
