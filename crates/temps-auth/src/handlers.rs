@@ -212,20 +212,17 @@ pub async fn verify_mfa_challenge(
             // deleted by `verify_mfa_challenge` above, so this only reflects
             // pre-existing real sessions). Purely observational -- see
             // bherila/temps#24; a lookup failure must never block the login.
-            let existing_active_sessions = match auth_state
-                .auth_service
-                .count_active_sessions(user.id)
-                .await
-            {
-                Ok(count) => count,
-                Err(e) => {
-                    error!(
-                        "Failed to count active sessions for user {} after MFA verification: {}",
-                        user.id, e
-                    );
-                    0
-                }
-            };
+            let existing_active_sessions =
+                match auth_state.auth_service.count_active_sessions(user.id).await {
+                    Ok(count) => count,
+                    Err(e) => {
+                        error!(
+                            "Failed to count active sessions for user {} after MFA verification: {}",
+                            user.id, e
+                        );
+                        0
+                    }
+                };
 
             let session_token = auth_state
                 .auth_service
