@@ -525,7 +525,7 @@ impl CrossProjectTraceService {
         }
 
         // 8. Sort by start_time ASC for waterfall rendering.
-        all_spans.sort_by(|a, b| a.span.start_time.cmp(&b.span.start_time));
+        all_spans.sort_by_key(|a| a.span.start_time);
 
         // 9. Compute trace-level stats.
         let start_time = all_spans.iter().map(|a| a.span.start_time).min();
