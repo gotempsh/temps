@@ -90,6 +90,12 @@ pub struct PeerListResponse {
     pub alloc: Option<AllocEntry>,
     /// All other nodes with a `compute_cidr` set, excluding the caller.
     pub peers: Vec<PeerEntry>,
+    /// Whether the cluster-DNS resolver is enabled on this control plane
+    /// (`AppSettings.cluster_dns.enabled`). Workers should start their
+    /// per-node resolver and write `overlay_bridge_address` only when this
+    /// is `true`. Always serialized (never `skip_serializing_if`) so older
+    /// and newer version skew degrades to the safe default of `false`.
+    pub cluster_dns_enabled: bool,
 }
 
 /// `GET /internal/nodes/{node_id}/network/peers`
@@ -159,7 +165,26 @@ pub async fn list_peers(
         .map(PeerEntry::from)
         .collect();
 
-    Ok(Json(PeerListResponse { alloc, peers }))
+    // Reflect the cluster-DNS feature flag into the wire response so workers
+    // can gate their per-node resolver consistently with the control plane.
+    // Best-effort: when settings can't be read (transient DB hiccup), default
+    // to `false` — the safe side that never accidentally enables DNS injection.
+    let cluster_dns_enabled = match app_state.config_service.get_settings().await {
+        Ok(settings) => settings.cluster_dns.enabled,
+        Err(e) => {
+            warn!(
+                node_id,
+                "could not read cluster_dns setting: {}; defaulting to disabled", e
+            );
+            false
+        }
+    };
+
+    Ok(Json(PeerListResponse {
+        alloc,
+        peers,
+        cluster_dns_enabled,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -250,6 +275,7 @@ mod tests {
         let resp = PeerListResponse {
             alloc: None,
             peers: vec![],
+            cluster_dns_enabled: false,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(!json.contains("alloc"), "alloc should be omitted: {}", json);
@@ -266,10 +292,40 @@ mod tests {
                 underlay_address: "10.0.0.1".into(),
             }),
             peers: vec![],
+            cluster_dns_enabled: false,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"alloc\""));
         assert!(json.contains("172.20.1.0/24"));
+    }
+
+    #[test]
+    fn response_always_serializes_cluster_dns_enabled() {
+        // The field must always be present in the JSON (never skip_serializing_if)
+        // so older workers that don't know about it default to `false` safely.
+        let resp_disabled = PeerListResponse {
+            alloc: None,
+            peers: vec![],
+            cluster_dns_enabled: false,
+        };
+        let json = serde_json::to_string(&resp_disabled).unwrap();
+        assert!(
+            json.contains("\"cluster_dns_enabled\":false"),
+            "cluster_dns_enabled:false must be serialized, got: {}",
+            json
+        );
+
+        let resp_enabled = PeerListResponse {
+            alloc: None,
+            peers: vec![],
+            cluster_dns_enabled: true,
+        };
+        let json = serde_json::to_string(&resp_enabled).unwrap();
+        assert!(
+            json.contains("\"cluster_dns_enabled\":true"),
+            "cluster_dns_enabled:true must be serialized, got: {}",
+            json
+        );
     }
 
     #[test]

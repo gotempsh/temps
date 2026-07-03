@@ -70,6 +70,12 @@ pub struct AppSettings {
     /// hardware that already has its own per-host headroom).
     pub build_limits: BuildLimitsSettings,
 
+    /// Cluster-DNS resolver settings (ADR-024, experimental beta). Off by
+    /// default — see `ClusterDnsSettings` for the incident background and
+    /// trade-offs. Must be explicitly enabled by operators who need
+    /// `*.temps.local` service-to-service resolution inside containers.
+    pub cluster_dns: ClusterDnsSettings,
+
     /// Metrics observability settings. Controls the MetricsStore backend,
     /// scrape interval, and tiered retention windows.
     pub monitoring: MonitoringSettings,
@@ -93,6 +99,40 @@ pub struct AppSettings {
     /// accidentally overwrite the self-recorded value.
     #[serde(default)]
     pub console_version: Option<String>,
+}
+
+/// Cluster-DNS resolver settings (ADR-024, experimental beta).
+///
+/// When `enabled`, the Temps control plane starts a Hickory DNS resolver and
+/// injects it as the first nameserver into every deployed container via
+/// `HostConfig.Dns` — giving containers the ability to resolve `*.temps.local`
+/// FQDNs for service-to-service communication. Worker nodes pick this flag up
+/// from the `/api/internal/nodes/{id}/network/peers` wire response and gate
+/// their own per-node resolver the same way.
+///
+/// **Default: `false` (disabled).**
+///
+/// Why disabled by default: a production incident showed that when the injected
+/// Hickory resolver was slow or transiently unresponsive for a non-`*.temps.local`
+/// (external) hostname, glibc's resolver cycled through all three nameservers
+/// (`172.20.0.1`, `1.1.1.1`, `8.8.8.8`) at ~5 s timeout × 2 attempts each,
+/// causing 22–27 s delays for outbound TCP connections. Disabling the injection
+/// restores Docker's embedded DNS as the sole resolver, eliminating that failure
+/// mode. Operators running single/multi-node installs that depend on
+/// `*.temps.local` resolution must explicitly opt in by setting `enabled: true`.
+///
+/// `bool` defaults to `false` in Rust and JSON (`#[serde(default)]`), so the
+/// safe-off behaviour is automatic for new installs and legacy settings rows.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct ClusterDnsSettings {
+    /// Master switch. When `false` (default), no custom DNS is injected into
+    /// containers — they use Docker's embedded DNS which forwards to the host's
+    /// own `resolv.conf`. When `true`, the control-plane Hickory resolver is
+    /// started and its bridge IP is injected as the first nameserver so
+    /// `*.temps.local` FQDNs resolve inside containers.
+    #[schema(example = false)]
+    pub enabled: bool,
 }
 
 /// Control-plane build resource limits.
@@ -675,6 +715,7 @@ impl Default for AppSettings {
             ai_config: AiConfigSettings::default(),
             insecure_tls: false,
             build_limits: BuildLimitsSettings::default(),
+            cluster_dns: ClusterDnsSettings::default(),
             monitoring: MonitoringSettings::default(),
             setup_complete: false,
             console_version: None,
@@ -863,6 +904,56 @@ impl AppSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ADR-024: cluster-DNS injection is experimental/beta and defaults OFF
+    // to avoid the DNS-timeout-cascade failure mode (22-27 s TCP delays when
+    // the injected resolver is transiently slow for external hostnames).
+    #[test]
+    fn cluster_dns_defaults_disabled() {
+        let s = ClusterDnsSettings::default();
+        assert!(
+            !s.enabled,
+            "cluster DNS must be opt-in (off by default) to avoid DNS cascade delays"
+        );
+    }
+
+    #[test]
+    fn app_settings_default_has_cluster_dns_disabled() {
+        let s = AppSettings::default();
+        assert!(
+            !s.cluster_dns.enabled,
+            "AppSettings::default() must have cluster_dns.enabled = false"
+        );
+    }
+
+    #[test]
+    fn cluster_dns_round_trips_through_json() {
+        let mut s = AppSettings::default();
+        s.cluster_dns.enabled = true;
+
+        let json = s.to_json();
+        let back = AppSettings::from_json(json);
+        assert!(
+            back.cluster_dns.enabled,
+            "cluster_dns.enabled must survive JSON round-trip"
+        );
+    }
+
+    #[test]
+    fn legacy_settings_json_without_cluster_dns_deserializes_as_disabled() {
+        // Old `settings.data` rows have no `cluster_dns` key. `#[serde(default)]`
+        // must fill it in with the disabled default so pre-ADR-024 rows keep
+        // loading and the feature stays off.
+        let legacy = serde_json::json!({
+            "external_url": "https://paas.example.com",
+            "preview_domain": "localho.st"
+        });
+        let parsed = AppSettings::from_json(legacy);
+        assert!(
+            !parsed.cluster_dns.enabled,
+            "cluster_dns must default to disabled when deserializing a legacy settings row"
+        );
+    }
 
     #[test]
     fn on_demand_tls_defaults_are_off_and_sensible() {

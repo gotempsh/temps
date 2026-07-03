@@ -15,8 +15,8 @@ use temps_auth::{permission_guard, RequireAuth};
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::{
     problemdetails::Problem, AiConfigSettings, AppSettings, AuditContext, AuditLogger,
-    AuditOperation, ContainerLogSettings, DiskSpaceAlertSettings, LetsEncryptSettings,
-    MetricsStoreKind, RateLimitSettings, RequestMetadata, ScreenshotSettings,
+    AuditOperation, ClusterDnsSettings, ContainerLogSettings, DiskSpaceAlertSettings,
+    LetsEncryptSettings, MetricsStoreKind, RateLimitSettings, RequestMetadata, ScreenshotSettings,
     SecurityHeadersSettings,
 };
 use tracing::{error, info};
@@ -135,6 +135,11 @@ pub struct AppSettingsResponse {
     /// Whether `temps setup` has been run at least once. The web onboarding
     /// wizard checks this field on load and skips itself when true.
     pub setup_complete: bool,
+
+    /// Cluster-DNS resolver settings (ADR-024, experimental beta). No masking
+    /// needed — `enabled` is a plain bool with no sensitive content. Passed
+    /// through as-is so the settings UI can read and toggle the flag.
+    pub cluster_dns: ClusterDnsSettings,
 }
 
 /// Monitoring settings with the ClickHouse DSN masked.
@@ -333,6 +338,7 @@ impl From<AppSettings> for AppSettingsResponse {
             monitoring: MonitoringSettingsMasked::from(settings.monitoring),
             insecure_tls: settings.insecure_tls,
             setup_complete: settings.setup_complete,
+            cluster_dns: settings.cluster_dns,
         }
     }
 }
@@ -376,6 +382,7 @@ impl AppSettingsResponse {
         crate::disk_status::DiskSpaceAlert,
         crate::disk_status::DiskSpaceCheckResult,
         ContainerLogSettings,
+        ClusterDnsSettings,
         DnsProviderSettingsMasked,
         DockerRegistrySettingsMasked,
         AgentSandboxSettingsMasked,
@@ -1439,6 +1446,37 @@ mod tests {
             Some("v0.1.0"),
             "the API must not be able to overwrite the self-recorded console_version"
         );
+    }
+
+    // ADR-024: cluster_dns must be visible in the GET /settings response so
+    // operators can read and toggle the feature flag. No masking — it's a
+    // plain bool with no sensitive content.
+    #[test]
+    fn response_surfaces_cluster_dns_disabled_by_default() {
+        let settings = AppSettings::default();
+        let response = AppSettingsResponse::from(settings);
+        assert!(
+            !response.cluster_dns.enabled,
+            "cluster_dns.enabled must be false in the default response"
+        );
+    }
+
+    #[test]
+    fn response_surfaces_cluster_dns_when_enabled() {
+        let mut settings = AppSettings::default();
+        settings.cluster_dns.enabled = true;
+        let response = AppSettingsResponse::from(settings);
+        assert!(
+            response.cluster_dns.enabled,
+            "cluster_dns.enabled=true must survive the AppSettings->AppSettingsResponse conversion"
+        );
+        // Confirm it serializes into the JSON response body
+        let json = serde_json::to_string(&response).expect("serialize response");
+        assert!(
+            json.contains("\"cluster_dns\""),
+            "cluster_dns must appear in the settings response JSON"
+        );
+        assert!(json.contains("\"enabled\":true"));
     }
 
     // The precondition that makes the preserve step necessary: the GET response
