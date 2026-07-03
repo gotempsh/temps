@@ -240,6 +240,14 @@ impl ScreenshotProvider for LocalScreenshotProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::LazyLock;
+    use tokio::sync::Mutex as AsyncMutex;
+
+    // headless_chrome's `fetch` feature races on a shared cached Chrome binary
+    // when two tests launch a browser concurrently, causing an intermittent
+    // "Text file busy" exec error. Serialize the tests that launch a real
+    // browser so only one Chrome instance starts up at a time.
+    static CHROME_LAUNCH_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
 
     #[tokio::test]
     async fn test_local_provider_creation() {
@@ -272,6 +280,7 @@ mod tests {
     async fn test_capture_screenshot_example_com() {
         use std::fs;
 
+        let _guard = CHROME_LAUNCH_LOCK.lock().await;
         let provider = LocalScreenshotProvider::new();
         let result = provider.capture_screenshot("https://example.com").await;
 
@@ -302,6 +311,7 @@ mod tests {
     async fn test_capture_screenshot_github() {
         use std::fs;
 
+        let _guard = CHROME_LAUNCH_LOCK.lock().await;
         let provider = LocalScreenshotProvider::with_config(30, 1920, 1080);
         let result = provider.capture_screenshot("https://github.com").await;
 
@@ -335,6 +345,7 @@ mod tests {
     async fn test_capture_screenshot_mobile_viewport() {
         use std::fs;
 
+        let _guard = CHROME_LAUNCH_LOCK.lock().await;
         // Test with mobile viewport dimensions
         let provider = LocalScreenshotProvider::with_config(30, 375, 812); // iPhone X dimensions
         let result = provider.capture_screenshot("https://example.com").await;
