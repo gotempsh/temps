@@ -4924,6 +4924,31 @@ mod tests {
     // ── Database Name SQL Injection Prevention Tests ─────────────────
 
     #[test]
+    fn postgres_upgrade_rejected_roundtrips_through_anyhow() {
+        // `ExternalServiceManager::upgrade_service` downcasts the anyhow error
+        // back to this typed variant to map it to HTTP 400. Guard that the type
+        // stays downcastable (a 'static std::error::Error) through the
+        // `?`/`.into()` path — if it stopped being downcastable the response
+        // would silently degrade to 500.
+        let mv: anyhow::Error =
+            PostgresUpgradeRejected::MajorVersionChange { from: 17, to: 18 }.into();
+        assert!(matches!(
+            mv.downcast_ref::<PostgresUpgradeRejected>(),
+            Some(PostgresUpgradeRejected::MajorVersionChange { from: 17, to: 18 })
+        ));
+        assert!(mv
+            .to_string()
+            .contains("Cannot change PostgreSQL major version"));
+
+        let dg: anyhow::Error = PostgresUpgradeRejected::Downgrade { from: 18, to: 17 }.into();
+        assert!(matches!(
+            dg.downcast_ref::<PostgresUpgradeRejected>(),
+            Some(PostgresUpgradeRejected::Downgrade { .. })
+        ));
+        assert!(dg.to_string().contains("Cannot downgrade PostgreSQL"));
+    }
+
+    #[test]
     fn test_validate_pg_username_accepts_realistic_names() {
         assert!(validate_pg_username("postgres").is_ok());
         assert!(validate_pg_username("appuser").is_ok());

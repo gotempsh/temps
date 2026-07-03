@@ -3991,7 +3991,7 @@ mod tests {
     /// a regression makes the run hang — caught in bounded time by the
     /// `tokio::time::timeout` wrapper instead of hanging CI forever.
     #[cfg(feature = "docker-tests")]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn orchestrator_full_run_exercises_backup_exec_v17_to_v18() {
         use harness::*;
         use std::sync::Arc;
@@ -4024,15 +4024,20 @@ mod tests {
             let upgrade_id = ctx.insert_upgrade_row(phase::PRE_BACKUP).await;
             let orch = ctx.orchestrator(provider_trait, lifecycle);
 
-            // Bounded so a run_exec regression (100% CPU spin that never
-            // returns) fails the test instead of hanging CI indefinitely.
-            tokio::time::timeout(std::time::Duration::from_secs(600), orch.run(upgrade_id))
+            // Run on a SEPARATE task and time out the JoinHandle. A run_exec
+            // regression is a synchronous busy loop that never yields, so a
+            // plain `timeout(_, orch.run())` could never fire; spawned, the spin
+            // occupies one worker while the timeout fires on another -> the test
+            // FAILS instead of hanging CI.
+            let run_handle = tokio::spawn(async move { orch.run(upgrade_id).await });
+            tokio::time::timeout(std::time::Duration::from_secs(600), run_handle)
                 .await
                 .map_err(|_| {
                     "orchestrator.run() did not finish within 600s — likely a \
                      run_exec / exec hang"
                         .to_string()
                 })?
+                .map_err(|e| format!("orchestrator.run task panicked: {}", e))?
                 .map_err(|e| format!("run: {}", e))?;
 
             let row = load_upgrade(ctx.test_db.db.as_ref(), upgrade_id).await;

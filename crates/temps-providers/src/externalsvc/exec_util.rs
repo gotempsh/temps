@@ -257,7 +257,7 @@ mod tests {
     /// is the exact trigger — and the shape every backup's
     /// `pg_dumpall … > file` uses, which is how the hang shipped.
     #[cfg(feature = "docker-tests")]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_exec_returns_for_a_command_with_no_stdout() {
         use bollard::models::ContainerCreateBody;
         use bollard::query_parameters::{
@@ -311,11 +311,19 @@ mod tests {
 
         // Exits 0 and writes only to files -> the exec's stdout/stderr are
         // empty, so the output stream EOFs immediately.
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(60),
+        //
+        // Run `run_exec` on a SEPARATE task (multi_thread runtime) and time out
+        // the JoinHandle. A regression re-introduces a synchronous busy loop
+        // that never yields `Pending`, so a `timeout` wrapping the future
+        // directly could never fire — but as a spawned task the spin occupies
+        // one worker while the timeout fires on another, so the test FAILS
+        // instead of hanging CI.
+        let docker_task = docker.clone();
+        let name_task = name.clone();
+        let handle = tokio::spawn(async move {
             run_exec(
-                &docker,
-                &name,
+                &docker_task,
+                &name_task,
                 vec![
                     "sh".to_string(),
                     "-c".to_string(),
@@ -323,9 +331,10 @@ mod tests {
                 ],
                 None,
                 Duration::from_secs(30),
-            ),
-        )
-        .await;
+            )
+            .await
+        });
+        let outcome = tokio::time::timeout(Duration::from_secs(60), handle).await;
 
         let _ = docker
             .remove_container(
@@ -337,10 +346,11 @@ mod tests {
             )
             .await;
 
-        let result = outcome.expect(
+        let joined = outcome.expect(
             "run_exec must return for a no-stdout command instead of spinning \
              forever (regression: biased-select busy loop on a drained stream)",
         );
+        let result = joined.expect("run_exec task panicked");
         let exec = result.expect("run_exec should succeed");
         assert_eq!(exec.exit_code, 0, "expected exit 0, got {}", exec.exit_code);
     }
