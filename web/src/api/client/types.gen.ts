@@ -820,6 +820,25 @@ export type AnalyticsSessionEventsResponse = {
 };
 
 /**
+ * A single span annotated with the project that originally stored it.
+ * Used in `UnifiedTrace` to let the UI colour-code spans by project.
+ */
+export type AnnotatedSpan = {
+    /**
+     * The project that stored this span (same as `span.project_id`).
+     */
+    project_id: number;
+    /**
+     * Human-readable project name for waterfall colour-coding and legend.
+     */
+    project_name: string;
+    /**
+     * Original span data verbatim from storage.
+     */
+    span: SpanRecord;
+};
+
+/**
  * Anomaly baseline algorithm. Adding one (e.g. a new robust variant) is a
  * code-only enum addition — no migration, since it lives inside the blob.
  */
@@ -3481,6 +3500,41 @@ export type CronInfo = {
     project_id: number;
     schedule: string;
     updated_at: string;
+};
+
+/**
+ * A sibling project that shares the same `trace_id`, returned by the
+ * Phase 1 cross-project banner endpoint.
+ */
+export type CrossProjectSiblingRef = {
+    /**
+     * ISO 8601 timestamp (UTC, `Z` suffix) of first span ingest for this
+     * `(trace_id, project_id)` pair.
+     */
+    first_seen: string;
+    project_id: number;
+    project_name: string;
+    /**
+     * URL slug used to link into the sibling project's single-project trace view.
+     */
+    project_slug: string;
+};
+
+/**
+ * Response body for `GET /otel/traces/cross-project/{trace_id}`.
+ *
+ * An empty `siblings` vec is the normal single-project case — never 404.
+ */
+export type CrossProjectTraceResponse = {
+    /**
+     * Projects other than the caller's that hold spans for this trace,
+     * ordered by `first_seen ASC`.
+     */
+    siblings: Array<CrossProjectSiblingRef>;
+    /**
+     * The trace_id that was queried (echoed back for client convenience).
+     */
+    trace_id: string;
 };
 
 export type CurrentStatusResponse = {
@@ -10792,6 +10846,18 @@ export type ProjectQuery = {
     project_id: number;
 };
 
+/**
+ * A lightweight project descriptor included in `UnifiedTrace`.
+ */
+export type ProjectRef = {
+    project_id: number;
+    project_name: string;
+    /**
+     * URL slug used to link a span back into its owning project's trace view.
+     */
+    project_slug: string;
+};
+
 export type ProjectResponse = {
     /**
      * Opt-in to AI summarization of metric alert notifications (NULL/false = off).
@@ -10810,6 +10876,13 @@ export type ProjectResponse = {
      */
     attack_mode: boolean;
     created_at: number;
+    /**
+     * ADR-027 Phase 3 opt-out: when false, this project's traces are suppressed
+     * from cross-project discovery results. Default true (consistent with the
+     * OSS global-observability model where any OtelRead holder can query any
+     * project's telemetry).
+     */
+    cross_project_trace_sharing: boolean;
     /**
      * Deployment configuration (resources, autoscaling, features)
      */
@@ -13667,6 +13740,23 @@ export type SetupDnsResponse = {
     total_records: number;
 };
 
+/**
+ * A sibling project that shares the same `trace_id` and has opted in to
+ * cross-project trace sharing (`cross_project_trace_sharing = TRUE`).
+ *
+ * Returned by `CrossProjectTraceService::find_sibling_projects` and exposed
+ * by the Phase 1 `GET /otel/traces/cross-project/{trace_id}` endpoint.
+ */
+export type SiblingRef = {
+    first_seen: string;
+    project_id: number;
+    project_name: string;
+    /**
+     * URL slug used to link into the sibling project's single-project trace view.
+     */
+    project_slug: string;
+};
+
 export type SkillDefinitionResponse = {
     content: string;
     created_at: string;
@@ -14767,6 +14857,25 @@ export type TopModelsQueryParams = {
     user_id?: number | null;
 };
 
+/**
+ * All projects that contributed spans to a trace, including their sharing flag.
+ *
+ * Returned by `CrossProjectTraceService::find_trace_projects`.
+ */
+export type TraceProjectRef = {
+    first_seen: string;
+    project_id: number;
+    project_name: string;
+    /**
+     * URL slug used to link into the project's single-project trace view.
+     */
+    project_slug: string;
+    /**
+     * Whether this project has `cross_project_trace_sharing = true`.
+     */
+    sharing: boolean;
+};
+
 export type TraceSummariesResponse = {
     data: Array<TraceSummary>;
     total: number;
@@ -14934,6 +15043,46 @@ export type UndrainNodeResponse = {
     message: string;
     name: string;
     status: string;
+};
+
+/**
+ * Merged cross-project trace result (Phase 2 unified waterfall).
+ *
+ * Spans are sorted by `start_time ASC`.  At most 20 projects and 10,000
+ * spans total are included; `truncated` / `truncated_projects` signal when
+ * the caps were hit.
+ */
+export type UnifiedTrace = {
+    end_time: string;
+    error_count: number;
+    /**
+     * `true` when at least one project has `cross_project_trace_sharing = false`
+     * and its spans were therefore excluded from the result set.
+     */
+    has_redacted_spans: boolean;
+    /**
+     * Projects that contributed spans to this result set.
+     */
+    projects: Array<ProjectRef>;
+    span_count: number;
+    /**
+     * Annotated, merged span list sorted by `start_time ASC`.
+     */
+    spans: Array<AnnotatedSpan>;
+    start_time: string;
+    /**
+     * Trace wall-clock duration in milliseconds (`end_time – start_time`).
+     */
+    total_duration_ms: number;
+    trace_id: string;
+    /**
+     * `true` when the 20-project or 10,000-span cap was hit.
+     */
+    truncated: boolean;
+    /**
+     * project_ids excluded due to truncation (most-recent first_seen dropped first).
+     */
+    truncated_projects: Array<number>;
 };
 
 /**
@@ -15485,6 +15634,12 @@ export type UpdateProjectSettingsRequest = {
      * Enable/disable attack mode (CAPTCHA protection) for all project environments
      */
     attack_mode?: boolean | null;
+    /**
+     * ADR-027 Phase 3 opt-out: set to false to suppress this project's traces
+     * from appearing in cross-project discovery results. Default true (consistent
+     * with the OSS global-observability model). Omit to leave unchanged.
+     */
+    cross_project_trace_sharing?: boolean | null;
     directory?: string | null;
     /**
      * Enable automatic preview environment creation for each branch
@@ -30455,6 +30610,48 @@ export type GetGenaiTraceResponses = {
 
 export type GetGenaiTraceResponse = GetGenaiTraceResponses[keyof GetGenaiTraceResponses];
 
+export type GetUnifiedTraceData = {
+    body?: never;
+    path: {
+        /**
+         * Trace ID (32 lowercase hex characters)
+         */
+        trace_id: string;
+    };
+    query?: never;
+    url: '/otel/global/traces/{trace_id}';
+};
+
+export type GetUnifiedTraceErrors = {
+    /**
+     * trace_id is not 32 lowercase hex characters
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions or deployment token
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetUnifiedTraceError = GetUnifiedTraceErrors[keyof GetUnifiedTraceErrors];
+
+export type GetUnifiedTraceResponses = {
+    /**
+     * Unified cross-project trace waterfall
+     */
+    200: UnifiedTrace;
+};
+
+export type GetUnifiedTraceResponse = GetUnifiedTraceResponses[keyof GetUnifiedTraceResponses];
+
 export type GetHealthData = {
     body?: never;
     path: {
@@ -31081,6 +31278,53 @@ export type QueryTracesResponses = {
 };
 
 export type QueryTracesResponse = QueryTracesResponses[keyof QueryTracesResponses];
+
+export type GetCrossProjectTraceSiblingsData = {
+    body?: never;
+    path: {
+        /**
+         * Trace ID (32 lowercase hex characters)
+         */
+        trace_id: string;
+    };
+    query?: {
+        /**
+         * Project ID to exclude (the caller's own project) so the UI does not render a self-link
+         */
+        exclude_project_id?: number;
+    };
+    url: '/otel/traces/cross-project/{trace_id}';
+};
+
+export type GetCrossProjectTraceSiblingsErrors = {
+    /**
+     * trace_id is not 32 lowercase hex characters
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions or deployment token
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetCrossProjectTraceSiblingsError = GetCrossProjectTraceSiblingsErrors[keyof GetCrossProjectTraceSiblingsErrors];
+
+export type GetCrossProjectTraceSiblingsResponses = {
+    /**
+     * Sibling projects sharing this trace
+     */
+    200: CrossProjectTraceResponse;
+};
+
+export type GetCrossProjectTraceSiblingsResponse = GetCrossProjectTraceSiblingsResponses[keyof GetCrossProjectTraceSiblingsResponses];
 
 export type GetTraceData = {
     body?: never;

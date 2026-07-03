@@ -80,4 +80,20 @@ pub struct OtelAppState {
     pub metric_alert_service: std::sync::Arc<crate::services::MetricAlertService>,
     /// Audit logger for dashboard/alert write operations (best-effort, non-fatal).
     pub audit_service: std::sync::Arc<dyn temps_core::AuditLogger>,
+    /// Bounded sender for ADR-027 Phase 0 cross-project trace hint writes.
+    ///
+    /// After a successful span ingest, `do_ingest_traces` fires a
+    /// `TraceHintMsg` here (non-blocking `try_send`).  A dedicated background
+    /// consumer calls `CrossProjectTraceService::record_hint` to persist the
+    /// `(trace_id, project_id)` discovery rows.  When the channel is full the
+    /// hint is silently dropped — hint loss is non-fatal because a subsequent
+    /// ingest batch for the same pair will re-insert via `ON CONFLICT DO NOTHING`.
+    pub trace_hint_tx:
+        Option<tokio::sync::mpsc::Sender<crate::services::cross_project::TraceHintMsg>>,
+    /// Cross-project trace discovery service (ADR-027 Phases 1 & 2).
+    ///
+    /// Backs the `GET /otel/traces/cross-project/{trace_id}` (Phase 1 sibling
+    /// banner) and `GET /otel/global/traces/{trace_id}` (Phase 2 unified
+    /// waterfall) query handlers.
+    pub cross_project_service: std::sync::Arc<crate::services::CrossProjectTraceService>,
 }

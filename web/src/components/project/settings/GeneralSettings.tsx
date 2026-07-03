@@ -259,6 +259,25 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
     refetch()
   }
 
+  const handleToggleCrossProjectTraceSharing = async (enabled: boolean) => {
+    if (!project?.id) return
+
+    await toast.promise(
+      updateProjectSettings.mutateAsync({
+        path: { project_id: project.id! },
+        body: {
+          cross_project_trace_sharing: enabled,
+        },
+      }),
+      {
+        loading: 'Updating cross-project trace sharing...',
+        success: 'Cross-project trace sharing updated',
+        error: 'Failed to update cross-project trace sharing',
+      }
+    )
+    refetch()
+  }
+
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false)
   const [deleteConfirmName, setDeleteConfirmName] = useState('')
   const deleteProjectMutationM = useMutation({
@@ -694,6 +713,34 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
           </Card>
         </form>
       </Form>
+
+      {/* Cross-Project Trace Sharing Card */}
+      <Card className="bg-background text-foreground">
+        <CardHeader>
+          <CardTitle>Cross-Project Trace Sharing</CardTitle>
+          <CardDescription>
+            Control whether this project's spans can appear in other projects'
+            unified cross-project traces.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="flex flex-row items-center justify-between rounded-lg border p-4">
+            <div className="space-y-0.5 pr-4">
+              <Label className="text-base">Cross-project trace sharing</Label>
+              <p className="text-sm text-muted-foreground">
+                When on, this project's spans appear in other projects' unified
+                cross-project traces. Turn off to keep this project's spans
+                private to itself.
+              </p>
+            </div>
+            <Switch
+              checked={project?.cross_project_trace_sharing ?? true}
+              onCheckedChange={handleToggleCrossProjectTraceSharing}
+              disabled={updateProjectSettings.isPending}
+            />
+          </div>
+        </CardContent>
+      </Card>
 
       {/* Danger Zone */}
       <div className="border-t pt-6">

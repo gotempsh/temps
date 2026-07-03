@@ -138,6 +138,10 @@ async fn setup_e2e() -> Option<(
         db.clone(),
     ));
     let metric_alert_service = Arc::new(temps_otel::services::MetricAlertService::new(db.clone()));
+    let cross_project_service = Arc::new(temps_otel::services::CrossProjectTraceService::new(
+        db.clone(),
+        Arc::new(TimescaleDbStorage::new(db.clone(), None)),
+    ));
     let app_state = OtelAppState {
         otel_service,
         metrics_store: None,
@@ -145,6 +149,8 @@ async fn setup_e2e() -> Option<(
         dashboard_service,
         metric_alert_service,
         audit_service: Arc::new(NoOpAuditLogger),
+        cross_project_service,
+        trace_hint_tx: None,
     };
 
     // Create auth middleware that injects AuthContext into request extensions.

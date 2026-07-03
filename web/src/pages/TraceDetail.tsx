@@ -1,9 +1,14 @@
 import { LogSeverity, ProjectResponse } from '@/api/client'
 import {
+  getCrossProjectTraceSiblingsOptions,
   getTraceOptions,
   queryLogsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
-import type { LogRecord, SpanRecord } from '@/api/client/types.gen'
+import type {
+  CrossProjectSiblingRef,
+  LogRecord,
+  SpanRecord,
+} from '@/api/client/types.gen'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -28,97 +33,32 @@ import {
 } from '@/components/ui/tabs'
 import { useAssistantPageContext } from '@/components/ai/AiAssistantContext'
 import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from '@/components/ui/tooltip'
+  SpanWaterfall,
+  formatDuration,
+  formatTimestamp,
+  kindLabel,
+  serviceColor,
+  statusIcon,
+} from '@/components/traces/SpanWaterfall'
+import { buildSpanTree, flattenTree } from '@/utils/spanTree'
+import type { SpanTreeNode } from '@/utils/spanTree'
 import { cn } from '@/lib/utils'
 import { useQuery } from '@tanstack/react-query'
 import {
   ArrowLeft,
-  ChevronDown,
   ChevronRight,
   Clock,
   AlertCircle,
-  CheckCircle2,
-  XCircle,
+  Info,
+  Layers,
   RefreshCw,
+  X,
 } from 'lucide-react'
 import { useMemo, useState } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams } from 'react-router-dom'
 
 interface TraceDetailProps {
   project: ProjectResponse
-}
-
-interface SpanTreeNode {
-  span: SpanRecord
-  children: SpanTreeNode[]
-  depth: number
-}
-
-// Build a tree of spans from flat list using parent_span_id
-function buildSpanTree(spans: SpanRecord[]): SpanTreeNode[] {
-  const spanMap = new Map<string, SpanTreeNode>()
-  const roots: SpanTreeNode[] = []
-
-  // Create nodes
-  for (const span of spans) {
-    spanMap.set(span.span_id, { span, children: [], depth: 0 })
-  }
-
-  // Build tree
-  for (const span of spans) {
-    const node = spanMap.get(span.span_id)!
-    if (span.parent_span_id && spanMap.has(span.parent_span_id)) {
-      const parent = spanMap.get(span.parent_span_id)!
-      node.depth = parent.depth + 1
-      parent.children.push(node)
-    } else {
-      roots.push(node)
-    }
-  }
-
-  // Sort children by start_time
-  function sortChildren(node: SpanTreeNode) {
-    node.children.sort(
-      (a, b) =>
-        new Date(a.span.start_time).getTime() -
-        new Date(b.span.start_time).getTime()
-    )
-    node.children.forEach(sortChildren)
-  }
-  roots.sort(
-    (a, b) =>
-      new Date(a.span.start_time).getTime() -
-      new Date(b.span.start_time).getTime()
-  )
-  roots.forEach(sortChildren)
-
-  return roots
-}
-
-// Flatten tree into ordered list for rendering
-function flattenTree(nodes: SpanTreeNode[]): SpanTreeNode[] {
-  const result: SpanTreeNode[] = []
-  function walk(node: SpanTreeNode) {
-    result.push(node)
-    node.children.forEach(walk)
-  }
-  nodes.forEach(walk)
-  return result
-}
-
-function statusIcon(status?: string) {
-  switch (status?.toUpperCase()) {
-    case 'ERROR':
-      return <XCircle className="h-3.5 w-3.5 text-red-500" />
-    case 'OK':
-      return <CheckCircle2 className="h-3.5 w-3.5 text-green-500" />
-    default:
-      return null
-  }
 }
 
 function logSeverityBadge(severity: LogSeverity, text?: string) {
@@ -151,56 +91,6 @@ function statusBadgeVariant(
     default:
       return 'secondary'
   }
-}
-
-function kindLabel(kind?: string): string {
-  switch (kind) {
-    case 'Server':
-      return 'SERVER'
-    case 'Client':
-      return 'CLIENT'
-    case 'Producer':
-      return 'PRODUCER'
-    case 'Consumer':
-      return 'CONSUMER'
-    case 'Internal':
-      return 'INTERNAL'
-    default:
-      return kind || 'UNSPECIFIED'
-  }
-}
-
-function formatDuration(ms: number): string {
-  if (ms < 1) return `${(ms * 1000).toFixed(0)}µs`
-  if (ms < 1000) return `${ms.toFixed(1)}ms`
-  return `${(ms / 1000).toFixed(2)}s`
-}
-
-function formatTimestamp(ts: string): string {
-  const d = new Date(ts)
-  return d.toLocaleString(undefined, {
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-  })
-}
-
-// Stable per-service colour (Datadog/OpenObserve colour-code spans by service).
-const SERVICE_COLORS = [
-  '#6366f1', // indigo
-  '#10b981', // emerald
-  '#f59e0b', // amber
-  '#ec4899', // pink
-  '#06b6d4', // cyan
-  '#8b5cf6', // violet
-  '#ef4444', // red
-  '#14b8a6', // teal
-]
-function serviceColor(name?: string): string {
-  if (!name) return '#94a3b8'
-  let h = 0
-  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) | 0
-  return SERVICE_COLORS[Math.abs(h) % SERVICE_COLORS.length]
 }
 
 /** Full detail for one span — reused by every layout (drawer, side panel, or
@@ -376,121 +266,6 @@ function SpanDetailBody({
   )
 }
 
-/** Shared span waterfall (tree + timeline bars). `colorBy="service"` colours each
- *  bar by its service and shows a service dot, like OpenObserve/Datadog. */
-function SpanWaterfall({
-  flatSpans,
-  traceStart,
-  traceEnd,
-  traceDuration,
-  selectedSpanId,
-  onSelect,
-  colorBy = 'status',
-  className,
-}: {
-  flatSpans: SpanTreeNode[]
-  traceStart: number
-  traceEnd: number
-  traceDuration: number
-  selectedSpanId: string | null
-  onSelect: (spanId: string | null) => void
-  colorBy?: 'status' | 'service'
-  className?: string
-}) {
-  return (
-    <div className={cn('overflow-auto', className)}>
-      <div className="sticky top-0 z-10 flex min-w-[420px] items-center border-b bg-background px-4 py-2 text-xs text-muted-foreground sm:min-w-[500px]">
-        <div className="w-[120px] shrink-0 sm:w-[180px] md:w-[280px]">Span Name</div>
-        <div className="flex flex-1 justify-between">
-          <span>{formatTimestamp(new Date(traceStart).toISOString())}</span>
-          <span>{formatDuration(traceDuration)}</span>
-          <span>{formatTimestamp(new Date(traceEnd).toISOString())}</span>
-        </div>
-      </div>
-      {flatSpans.map((node) => {
-        const spanStart = new Date(node.span.start_time).getTime() - traceStart
-        const spanDuration =
-          new Date(node.span.end_time).getTime() -
-          new Date(node.span.start_time).getTime()
-        const maxBarPct = 92
-        const leftPct = traceDuration > 0 ? (spanStart / traceDuration) * maxBarPct : 0
-        const widthPct =
-          traceDuration > 0
-            ? Math.max((spanDuration / traceDuration) * maxBarPct, 0.5)
-            : maxBarPct
-        const isError = node.span.status_code?.toUpperCase() === 'ERROR'
-        const isSelected = selectedSpanId === node.span.span_id
-        const svc = node.span.resource?.service_name
-        const barColor =
-          colorBy === 'service' && !isError ? serviceColor(svc) : undefined
-        return (
-          <TooltipProvider key={node.span.span_id}>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <button
-                  type="button"
-                  onClick={() => onSelect(isSelected ? null : node.span.span_id)}
-                  className={cn(
-                    'flex w-full min-w-[420px] items-center border-b px-4 py-1.5 text-left transition-colors hover:bg-accent/50 sm:min-w-[500px]',
-                    isSelected && 'bg-accent'
-                  )}
-                >
-                  <div
-                    className="flex w-[120px] shrink-0 items-center gap-1.5 sm:w-[180px] md:w-[280px]"
-                    style={{ paddingLeft: `${node.depth * 16}px` }}
-                  >
-                    {node.children.length > 0 ? (
-                      <ChevronDown className="h-3 w-3 shrink-0 text-muted-foreground" />
-                    ) : (
-                      <span className="w-3 shrink-0" />
-                    )}
-                    {colorBy === 'service' ? (
-                      <span
-                        className="h-2.5 w-2.5 shrink-0 rounded-full"
-                        style={{ backgroundColor: serviceColor(svc) }}
-                      />
-                    ) : (
-                      statusIcon(node.span.status_code)
-                    )}
-                    <span className="truncate text-xs">{node.span.name}</span>
-                  </div>
-                  <div className="relative h-6 flex-1">
-                    <div
-                      className={cn(
-                        'absolute top-1 h-4 min-w-[2px] rounded-sm',
-                        isError ? 'bg-red-500/80' : !barColor && 'bg-primary/70'
-                      )}
-                      style={{
-                        left: `${leftPct}%`,
-                        width: `${widthPct}%`,
-                        backgroundColor: barColor,
-                      }}
-                    />
-                    <span
-                      className="absolute top-0.5 whitespace-nowrap text-[10px] text-muted-foreground"
-                      style={{ left: `${leftPct + widthPct + 0.5}%` }}
-                    >
-                      {formatDuration(spanDuration)}
-                    </span>
-                  </div>
-                </button>
-              </TooltipTrigger>
-              <TooltipContent side="top" className="max-w-xs">
-                <div className="space-y-1">
-                  <p className="font-medium">{node.span.name}</p>
-                  {svc && <p className="text-xs">Service: {svc}</p>}
-                  <p className="text-xs">Duration: {formatDuration(spanDuration)}</p>
-                  <p className="text-xs">Kind: {kindLabel(node.span.kind)}</p>
-                </div>
-              </TooltipContent>
-            </Tooltip>
-          </TooltipProvider>
-        )
-      })}
-    </div>
-  )
-}
-
 interface LayoutProps {
   flatSpans: SpanTreeNode[]
   traceStart: number
@@ -596,6 +371,51 @@ function SpansView(props: LayoutProps) {
   )
 }
 
+/** ADR-027 Phase 1/2 banner: surfaces sibling projects that share this
+ *  trace_id, plus a prominent link into the unified cross-project waterfall. */
+function CrossProjectBanner({
+  siblings,
+  traceId,
+  onDismiss,
+}: {
+  siblings: CrossProjectSiblingRef[]
+  traceId: string
+  onDismiss: () => void
+}) {
+  return (
+    <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5 rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-blue-900 dark:border-blue-900/50 dark:bg-blue-900/10 dark:text-blue-200">
+      <Info className="h-4 w-4 shrink-0" />
+      <span className="font-medium">This trace also has spans in:</span>
+      {siblings.map((s) => (
+        <Link
+          key={s.project_id}
+          to={`/projects/${s.project_slug}/traces/${traceId}`}
+          className="rounded bg-blue-100 px-1.5 py-0.5 font-medium underline-offset-2 hover:underline dark:bg-blue-900/40"
+        >
+          {s.project_name}
+        </Link>
+      ))}
+      <div className="ml-auto flex items-center gap-1">
+        <Button asChild variant="outline" size="sm" className="gap-1.5">
+          <Link to={`/traces/global/${traceId}`}>
+            <Layers className="h-3.5 w-3.5" />
+            View unified trace
+          </Link>
+        </Button>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-7 w-7 shrink-0"
+          onClick={onDismiss}
+          aria-label="Dismiss cross-project banner"
+        >
+          <X className="h-3.5 w-3.5" />
+        </Button>
+      </div>
+    </div>
+  )
+}
+
 export default function TraceDetail({ project }: TraceDetailProps) {
   const { traceId } = useParams()
   const navigate = useNavigate()
@@ -631,6 +451,21 @@ export default function TraceDetail({ project }: TraceDetailProps) {
     if (data.data) return data.data
     return []
   }, [data])
+
+  // Phase 1 cross-project discovery: does this same trace_id have spans in OTHER
+  // projects? Fired only once the primary spans have loaded so it never delays
+  // the waterfall. `retry: false` + swallowed errors mean a failure renders
+  // nothing (the banner is purely additive, never blocking).
+  const { data: siblingsData } = useQuery({
+    ...getCrossProjectTraceSiblingsOptions({
+      path: { trace_id: traceId || '' },
+      query: { exclude_project_id: project.id },
+    }),
+    enabled: !!traceId && spans.length > 0,
+    retry: false,
+  })
+  const siblings: CrossProjectSiblingRef[] = siblingsData?.siblings ?? []
+  const [bannerDismissed, setBannerDismissed] = useState(false)
 
   const tree = useMemo(() => buildSpanTree(spans), [spans])
   const flatSpans = useMemo(() => flattenTree(tree), [tree])
@@ -740,8 +575,8 @@ export default function TraceDetail({ project }: TraceDetailProps) {
           Back to Traces
         </Button>
         <Card>
-          <CardContent className="flex items-center justify-center p-12 text-muted-foreground">
-            No spans found for this trace.
+          <CardContent className="flex items-center justify-center p-12 text-center text-muted-foreground">
+            Spans for this trace are not available or have expired.
           </CardContent>
         </Card>
       </div>
@@ -816,6 +651,16 @@ export default function TraceDetail({ project }: TraceDetailProps) {
           </CardContent>
         </Card>
       </div>
+
+      {/* Cross-project follow banner (ADR-027 Phase 1): this same trace_id has
+          spans in other projects. Purely additive; dismissible. */}
+      {siblings.length > 0 && !bannerDismissed && (
+        <CrossProjectBanner
+          siblings={siblings}
+          traceId={traceId || ''}
+          onDismiss={() => setBannerDismissed(true)}
+        />
+      )}
 
       {/* Spans / Logs tabs */}
       <Tabs defaultValue="spans" className="w-full">

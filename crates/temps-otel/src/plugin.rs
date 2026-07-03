@@ -20,6 +20,7 @@ use crate::handlers::metric_alert_handler;
 use crate::handlers::query_handler;
 use crate::ingest::auth::OtelAuthService;
 use crate::ingest::rate_limit::RateLimiter;
+use crate::services::cross_project::{prune_stale_hints, CrossProjectTraceService, TraceHintMsg};
 use crate::services::health_service::HealthComputeService;
 use crate::services::OtelService;
 use crate::storage::clickhouse::{ClickHouseOtelConfig, ClickHouseOtelStorage};
@@ -165,6 +166,8 @@ impl OtelConfig {
         query_handler::get_pipeline_stats,
         query_handler::query_genai_traces,
         query_handler::get_genai_trace,
+        query_handler::get_cross_project_trace_siblings,
+        query_handler::get_unified_trace,
         dashboard_handler::list_dashboards,
         dashboard_handler::create_dashboard,
         dashboard_handler::get_dashboard,
@@ -215,6 +218,13 @@ impl OtelConfig {
             crate::types::GenAiTraceSummary,
             crate::types::GenAiSpanDetail,
             crate::types::GenAiEvent,
+            query_handler::CrossProjectSiblingRef,
+            query_handler::CrossProjectTraceResponse,
+            crate::services::cross_project::UnifiedTrace,
+            crate::services::cross_project::AnnotatedSpan,
+            crate::services::cross_project::ProjectRef,
+            crate::services::cross_project::SiblingRef,
+            crate::services::cross_project::TraceProjectRef,
             dashboard_handler::CreateDashboardRequest,
             dashboard_handler::UpdateDashboardRequest,
             dashboard_handler::OtelDashboardResponse,
@@ -430,6 +440,21 @@ impl TempsPlugin for OtelPlugin {
             let (metrics_write_tx, mut metrics_write_rx) =
                 tokio::sync::mpsc::channel::<Vec<temps_metrics::MetricPoint>>(512);
 
+            // ── ADR-027 Phase 0: Cross-project trace hint pipeline ───────────
+            //
+            // A bounded mpsc channel (capacity 1,000) decouples span ingest
+            // latency from the Postgres hint write.  When the channel is full,
+            // `do_ingest_traces` drops the hint (non-blocking try_send) and
+            // warns.  The background consumer below drains the channel and
+            // calls `record_hint`, which issues a single multi-row
+            // `INSERT … ON CONFLICT DO NOTHING`.
+            let (trace_hint_tx, mut trace_hint_rx) =
+                tokio::sync::mpsc::channel::<TraceHintMsg>(1000);
+
+            let cross_project_service =
+                Arc::new(CrossProjectTraceService::new(db.clone(), storage.clone()));
+            context.register_service(cross_project_service.clone());
+
             // Metric dashboards + alert rules: Postgres-backed config/metadata
             // services plus the global audit logger for write operations.
             let dashboard_service =
@@ -446,6 +471,8 @@ impl TempsPlugin for OtelPlugin {
                 dashboard_service: dashboard_service.clone(),
                 metric_alert_service: metric_alert_service.clone(),
                 audit_service: audit_service.clone(),
+                trace_hint_tx: Some(trace_hint_tx),
+                cross_project_service: cross_project_service.clone(),
             };
             context.register_service(Arc::new(app_state.clone()));
 
@@ -494,6 +521,58 @@ impl TempsPlugin for OtelPlugin {
                         }
                     }
                     info!("OTLP metrics write consumer stopped (channel closed)");
+                });
+            }
+
+            // 1c. ADR-027 Phase 0: cross-project trace hint writer consumer.
+            //
+            // Drains `trace_hint_rx` and calls `CrossProjectTraceService::record_hint`
+            // for each message, issuing a single multi-row INSERT ON CONFLICT DO NOTHING.
+            // Errors are warned and the loop continues — hint loss is tolerable.
+            {
+                let hint_svc = cross_project_service.clone();
+                tokio::spawn(async move {
+                    info!("Cross-project trace hint writer consumer started");
+                    while let Some(msg) = trace_hint_rx.recv().await {
+                        if let Err(e) = hint_svc.record_hint(msg.trace_ids, msg.project_id).await {
+                            tracing::warn!(
+                                project_id = msg.project_id,
+                                error = %e,
+                                "Cross-project trace hint write failed (non-fatal); \
+                                 subsequent ingests will re-populate via ON CONFLICT DO NOTHING"
+                            );
+                        }
+                    }
+                    info!("Cross-project trace hint writer consumer stopped (channel closed)");
+                });
+            }
+
+            // 1d. ADR-027 Phase 0: daily prune of cross_project_trace_refs rows
+            //     older than 90 days (matching the OTel span TTL on both backends).
+            //
+            // Deliberately uses a periodic tokio::spawn loop rather than a
+            // Job enum variant to keep the scheduler dependency minimal.
+            // First run is after a 24-hour delay so it doesn't compete with
+            // startup DB activity.
+            {
+                let prune_db = db.clone();
+                tokio::spawn(async move {
+                    let interval = Duration::from_secs(24 * 60 * 60); // 24 hours
+                    loop {
+                        tokio::time::sleep(interval).await;
+                        match prune_stale_hints(&prune_db).await {
+                            Ok(deleted) => info!(
+                                deleted,
+                                "Cross-project trace hint prune completed \
+                                 (rows older than 90 days removed)"
+                            ),
+                            Err(e) => tracing::warn!(
+                                error = %e,
+                                "Cross-project trace hint prune failed (non-fatal); \
+                                 will retry in 24 hours"
+                            ),
+                        }
+                    }
                 });
             }
 

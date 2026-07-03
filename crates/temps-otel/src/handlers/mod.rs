@@ -92,6 +92,17 @@ pub fn configure_routes() -> Router<OtelAppState> {
             "/otel/genai/traces/{project_id}/{trace_id}",
             get(query_handler::get_genai_trace),
         )
+        // ADR-027: cross-project trace endpoints
+        // Phase 1 – sibling banner discovery
+        .route(
+            "/otel/traces/cross-project/{trace_id}",
+            get(query_handler::get_cross_project_trace_siblings),
+        )
+        // Phase 2 – unified cross-project waterfall
+        .route(
+            "/otel/global/traces/{trace_id}",
+            get(query_handler::get_unified_trace),
+        )
         // Metric dashboards (per-project saved dashboard CRUD)
         .route(
             "/otel/dashboards",

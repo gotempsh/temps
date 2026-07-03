@@ -297,6 +297,11 @@ pub struct ProjectResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = 42)]
     pub gitlab_webhook_id: Option<i32>,
+    /// ADR-027 Phase 3 opt-out: when false, this project's traces are suppressed
+    /// from cross-project discovery results. Default true (consistent with the
+    /// OSS global-observability model where any OtelRead holder can query any
+    /// project's telemetry).
+    pub cross_project_trace_sharing: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -333,6 +338,7 @@ impl ProjectResponse {
             preview_envs_wake_timeout_seconds: project.preview_envs_wake_timeout_seconds,
             source_type: project.source_type,
             gitlab_webhook_id: project.gitlab_webhook_id,
+            cross_project_trace_sharing: project.cross_project_trace_sharing,
             deployment_config: DeploymentConfig {
                 cpu_request: project
                     .deployment_config
@@ -568,6 +574,10 @@ pub struct UpdateProjectSettingsRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<PresetConfigSchema>)]
     pub preset_config: Option<serde_json::Value>,
+    /// ADR-027 Phase 3 opt-out: set to false to suppress this project's traces
+    /// from appearing in cross-project discovery results. Default true (consistent
+    /// with the OSS global-observability model). Omit to leave unchanged.
+    pub cross_project_trace_sharing: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]

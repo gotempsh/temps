@@ -135,6 +135,7 @@ mod m20260630_000001_add_ai_pending_actions_and_write_toggle;
 mod m20260701_000001_add_ai_action_plans;
 mod m20260701_000001_add_provider_webhook_tokens;
 mod m20260701_000002_add_bitbucket_webhook_hook_id;
+mod m20260703_000001_cross_project_trace_refs;
 
 pub struct Migrator;
 
@@ -273,6 +274,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260701_000001_add_ai_action_plans::Migration),
             Box::new(m20260701_000001_add_provider_webhook_tokens::Migration),
             Box::new(m20260701_000002_add_bitbucket_webhook_hook_id::Migration),
+            Box::new(m20260703_000001_cross_project_trace_refs::Migration),
         ]
     }
 }

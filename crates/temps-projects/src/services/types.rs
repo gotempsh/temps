@@ -77,6 +77,11 @@ pub struct Project {
     pub source_type: SourceType,
     /// GitLab webhook ID installed on the connected repository, if any.
     pub gitlab_webhook_id: Option<i32>,
+    /// ADR-027 Phase 3: whether this project's traces appear in cross-project
+    /// discovery results. Default true (consistent with OSS global-observability
+    /// model). Operators can set false to suppress cross-project links to this
+    /// project.
+    pub cross_project_trace_sharing: bool,
 }
 
 #[derive(Deserialize)]
