@@ -958,8 +958,10 @@ mod tests {
 
     #[test]
     fn require_mfa_for_admins_round_trips_through_json() {
-        let mut s = AppSettings::default();
-        s.require_mfa_for_admins = true;
+        let s = AppSettings {
+            require_mfa_for_admins: true,
+            ..AppSettings::default()
+        };
 
         let json = s.to_json();
         let back = AppSettings::from_json(json);

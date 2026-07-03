@@ -951,8 +951,8 @@ mod tests {
     use axum::http::HeaderMap;
     use chrono::{Duration, Utc};
     use temps_database::test_utils::TestDatabase;
-    use temps_entities::{magic_link_tokens, sessions, settings, users};
     use temps_entities::types::RoleType;
+    use temps_entities::{magic_link_tokens, sessions, settings, users};
 
     struct MockEmailService {
         verification_emails_sent: std::sync::Mutex<Vec<(String, String, String)>>,
@@ -2066,10 +2066,7 @@ mod tests {
             })
             .await;
 
-        assert!(matches!(
-            result,
-            Err(UserAuthError::EmailAlreadyRegistered)
-        ));
+        assert!(matches!(result, Err(UserAuthError::EmailAlreadyRegistered)));
     }
 
     // --- Concurrent-session detection (bherila/temps#24) ---
@@ -2119,11 +2116,17 @@ mod tests {
         let other_user = create_test_user(&db.db, "other@example.com", "Password123!").await;
 
         // No sessions yet.
-        assert_eq!(auth_service.count_active_sessions(user.id).await.unwrap(), 0);
+        assert_eq!(
+            auth_service.count_active_sessions(user.id).await.unwrap(),
+            0
+        );
 
         // One active session for our user.
         auth_service.create_session(user.id).await.unwrap();
-        assert_eq!(auth_service.count_active_sessions(user.id).await.unwrap(), 1);
+        assert_eq!(
+            auth_service.count_active_sessions(user.id).await.unwrap(),
+            1
+        );
 
         // An expired session for our user must not be counted.
         let expired_session = sessions::ActiveModel {
@@ -2133,13 +2136,22 @@ mod tests {
             ..Default::default()
         };
         expired_session.insert(db.db.as_ref()).await.unwrap();
-        assert_eq!(auth_service.count_active_sessions(user.id).await.unwrap(), 1);
+        assert_eq!(
+            auth_service.count_active_sessions(user.id).await.unwrap(),
+            1
+        );
 
         // A session belonging to a different user must not be counted.
         auth_service.create_session(other_user.id).await.unwrap();
-        assert_eq!(auth_service.count_active_sessions(user.id).await.unwrap(), 1);
         assert_eq!(
-            auth_service.count_active_sessions(other_user.id).await.unwrap(),
+            auth_service.count_active_sessions(user.id).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            auth_service
+                .count_active_sessions(other_user.id)
+                .await
+                .unwrap(),
             1
         );
     }
