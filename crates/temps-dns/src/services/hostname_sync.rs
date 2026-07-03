@@ -316,7 +316,7 @@ pub async fn reconcile_zone_records(
         if !dry_run {
             let name = relative_name(&record.fqdn, &suffix);
             provider
-                .remove_record(base_domain, &name, record_type.clone())
+                .remove_record(base_domain, &name, record_type)
                 .await?;
         }
     }
