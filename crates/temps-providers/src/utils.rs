@@ -106,9 +106,11 @@ mod tests {
 
     #[test]
     fn test_local_port_binding_never_binds_to_all_interfaces() {
-        for (container_port, host_port) in
-            [("5432/tcp", "5432"), ("6379/tcp", "6379"), ("9000/tcp", "9000")]
-        {
+        for (container_port, host_port) in [
+            ("5432/tcp", "5432"),
+            ("6379/tcp", "6379"),
+            ("9000/tcp", "9000"),
+        ] {
             let bindings = local_port_binding(container_port, host_port);
             let host_ip = bindings
                 .get(container_port)
