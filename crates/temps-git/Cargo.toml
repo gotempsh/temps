@@ -51,7 +51,7 @@ serde_derive = { workspace = true }
 jsonwebtoken = "10.3.0"
 uuid = { workspace = true }
 http-body-util = { workspace = true }
-git2 = "0.20.4"
+git2 = { version = "0.21.0", features = ["https", "ssh"] }
 anyhow = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }

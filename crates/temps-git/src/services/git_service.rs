@@ -518,7 +518,7 @@ impl GitService {
             let branch_ref = branch
                 .get()
                 .name()
-                .ok_or_else(|| anyhow!("Invalid branch reference"))?;
+                .map_err(|e| anyhow!("Invalid branch reference: {}", e))?;
             repo.set_head(branch_ref)?;
             repo.checkout_head(None)?;
 
