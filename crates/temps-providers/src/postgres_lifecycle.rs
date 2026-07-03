@@ -452,13 +452,7 @@ impl PostgresContainerLifecycle for PostgresLifecycleAdapter {
         ];
 
         let host_config = bollard::models::HostConfig {
-            port_bindings: Some(HashMap::from([(
-                "5432/tcp".to_string(),
-                Some(vec![bollard::models::PortBinding {
-                    host_ip: Some("0.0.0.0".to_string()),
-                    host_port: Some(cfg.port.clone()),
-                }]),
-            )])),
+            port_bindings: Some(crate::utils::local_port_binding("5432/tcp", &cfg.port)),
             mounts: Some(vec![bollard::models::Mount {
                 target: Some("/var/lib/postgresql".to_string()),
                 source: Some(volume_name.clone()),
