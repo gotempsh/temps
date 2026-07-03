@@ -5,6 +5,8 @@
 // explorer's local copies (the explorer predates this module and still inlines
 // them; both compute the same thing).
 
+import type { MetricBucket } from '@/api/client'
+import type { ThresholdLineSeries } from '@/components/charts/threshold-line-chart'
 import { format } from 'date-fns'
 
 /** The aggregation tokens the backend's `MetricAggregation::parse` accepts. */
@@ -117,4 +119,107 @@ export function histogramQuantile(
     cumulative = next
   }
   return max ?? bounds[bounds.length - 1] ?? 0
+}
+
+// ── Group-by breakdown pivot ─────────────────────────────────────────────────
+
+/** Chart readability cap from ADR-026 Phase 2 — beyond this, rank by summed
+ * value over the window and drop the tail (surfaced as a "N more" note). Shared
+ * by the dashboard tile (MetricTile) and the ad-hoc explorer (MetricsExplorer)
+ * so a breakdown renders identically in both. */
+export const MAX_BREAKDOWN_SERIES = 20
+
+export type BreakdownModel = {
+  kind: 'grouped'
+  data: Record<string, unknown>[]
+  series: ThresholdLineSeries[]
+  droppedCount: number
+}
+
+/**
+ * Pivot flat, per-`series_key` buckets into wide-format rows (one row per
+ * timestamp, one column per distinct label combination) for the chart.
+ *
+ * `dataKey` is an index-based id (`s0`, `s1`, …), NOT the raw `series_key`
+ * JSON — recharts/ChartContainer turn `dataKey` into a CSS custom-property
+ * name (`--color-s0`), and a JSON string's quotes/brackets would corrupt that
+ * generated stylesheet. The human-readable `key=value` join only ever appears
+ * in the `label` shown to users.
+ */
+export function buildBreakdownData(
+  buckets: MetricBucket[],
+  isPercentile: boolean,
+  aggregation: string,
+): BreakdownModel {
+  const rowsByBucket = new Map<string, Record<string, unknown>>()
+  const totalByGroupKey = new Map<string, number>()
+  const labelByGroupKey = new Map<string, string>()
+  const valuesByGroupKey = new Map<string, Map<string, number>>()
+
+  for (const b of buckets) {
+    const hs = b.histogram_summary
+    const value =
+      isPercentile && hs && hs.bounds.length > 0
+        ? histogramQuantile(
+            hs.bounds,
+            hs.bucket_counts,
+            percentileFromAgg(aggregation),
+            hs.min,
+            hs.max,
+          )
+        : (b.value ?? b.avg_value)
+
+    const pairs = [...(b.series_key ?? [])].sort(([a], [b2]) =>
+      a.localeCompare(b2),
+    )
+    const groupKey = JSON.stringify(pairs)
+    labelByGroupKey.set(
+      groupKey,
+      pairs.length > 0
+        ? pairs.map(([k, v]) => `${k}=${v}`).join(', ')
+        : '(no labels)',
+    )
+    totalByGroupKey.set(
+      groupKey,
+      (totalByGroupKey.get(groupKey) ?? 0) + (value ?? 0),
+    )
+
+    let byBucket = valuesByGroupKey.get(groupKey)
+    if (!byBucket) {
+      byBucket = new Map()
+      valuesByGroupKey.set(groupKey, byBucket)
+    }
+    byBucket.set(b.bucket, value ?? 0)
+
+    if (!rowsByBucket.has(b.bucket)) {
+      rowsByBucket.set(b.bucket, {
+        bucket: b.bucket,
+        label: formatBucketLabel(b.bucket),
+      })
+    }
+  }
+
+  const rankedGroupKeys = Array.from(totalByGroupKey.entries())
+    .sort((a, b) => b[1] - a[1])
+    .map(([k]) => k)
+  const keptGroupKeys = rankedGroupKeys.slice(0, MAX_BREAKDOWN_SERIES)
+  const droppedCount = rankedGroupKeys.length - keptGroupKeys.length
+
+  const series: ThresholdLineSeries[] = keptGroupKeys.map((groupKey, i) => ({
+    dataKey: `s${i}`,
+    label: labelByGroupKey.get(groupKey) ?? groupKey,
+  }))
+
+  const rows = Array.from(rowsByBucket.entries())
+    .sort((a, b) => new Date(a[0]).getTime() - new Date(b[0]).getTime())
+    .map(([bucket, baseRow]) => {
+      const row = { ...baseRow }
+      keptGroupKeys.forEach((groupKey, i) => {
+        const v = valuesByGroupKey.get(groupKey)?.get(bucket)
+        if (v !== undefined) row[`s${i}`] = v
+      })
+      return row
+    })
+
+  return { kind: 'grouped', data: rows, series, droppedCount }
 }

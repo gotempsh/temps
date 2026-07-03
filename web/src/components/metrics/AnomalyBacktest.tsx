@@ -17,7 +17,6 @@ import {
   ComposedChart,
   Line,
   ResponsiveContainer,
-  Scatter,
   Tooltip,
   XAxis,
   YAxis,
@@ -85,6 +84,22 @@ export function AnomalyBacktest({
     }))
   }, [preview.data])
 
+  // A raw breach COUNT reads the same whether it's one sustained regime shift
+  // (the metric stepped to a new level and never came back) or dozens of
+  // separate spikes — those call for very different fixes (widen the band /
+  // add seasonality vs. the rule is working as intended). Count contiguous
+  // breaching runs so the copy can tell them apart.
+  const episodeCount = useMemo(() => {
+    const points = preview.data?.points ?? []
+    let episodes = 0
+    let wasBreaching = false
+    for (const p of points) {
+      if (p.breaching && !wasBreaching) episodes += 1
+      wasBreaching = p.breaching
+    }
+    return episodes
+  }, [preview.data])
+
   const header = (
     <div className="flex items-center gap-2 text-sm font-medium">
       Backtest — last 7 days
@@ -132,13 +147,25 @@ export function AnomalyBacktest({
               Would <span className="font-medium text-emerald-600">not</span>{' '}
               have fired — no points left the band.
             </>
+          ) : episodeCount === 1 ? (
+            <>
+              Would have fired{' '}
+              <span className="font-medium text-foreground">once</span> and
+              stayed breaching for{' '}
+              <span className="font-medium text-foreground">
+                {breach_count}
+              </span>{' '}
+              of the {chartData.length} evaluated points — the metric shifted
+              to a new level and never returned to the band, not a series of
+              separate spikes.
+            </>
           ) : (
             <>
               Would have fired{' '}
               <span className="font-medium text-foreground">
-                {breach_count}×
+                {episodeCount} separate times
               </span>{' '}
-              ({chartData.length} points evaluated).
+              ({breach_count} of {chartData.length} points breaching).
             </>
           )}
         </p>
@@ -190,8 +217,19 @@ export function AnomalyBacktest({
                 dot={false}
                 isAnimationActive={false}
               />
-              {/* Breach markers. */}
-              <Scatter dataKey="breach" fill="var(--destructive)" />
+              {/* Breach overlay: same stroke width as the value line so a
+                  long breaching run reads as "the line turned red", not a
+                  thick blob of overlapping dots (the previous Scatter marker
+                  visually dominated the chart once more than a few adjacent
+                  points breached). Nulls on non-breaching points leave gaps. */}
+              <Line
+                dataKey="breach"
+                stroke="var(--destructive)"
+                strokeWidth={1.5}
+                dot={false}
+                connectNulls={false}
+                isAnimationActive={false}
+              />
               <Tooltip
                 contentStyle={{ fontSize: 11 }}
                 labelFormatter={(l) => formatBucketLabel(String(l))}

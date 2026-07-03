@@ -227,7 +227,12 @@ function AlertRow({
         </div>
       </button>
 
-      <AlertStateBadge state={rule.last_state} />
+      <AlertStateBadge
+        state={rule.last_state}
+        firingSeriesCount={
+          rule.dynamic_alerts ? (rule.firing_series ?? []).length : undefined
+        }
+      />
 
       <DropdownMenu>
         <DropdownMenuTrigger asChild>

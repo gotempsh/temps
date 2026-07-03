@@ -35,13 +35,20 @@ import {
 import { SearchableSelect } from '@/components/ui/searchable-select'
 import { Skeleton } from '@/components/ui/skeleton'
 import { AGGREGATIONS } from '@/components/metrics/metric-format'
+import {
+  GroupByBuilder,
+  LabelFilterBuilder,
+  labelFiltersToTuples,
+  tuplesToLabelFilters,
+} from '@/components/metrics/LabelFilterBuilder'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowLeft, GripVertical, Plus, Trash2 } from 'lucide-react'
-import { useMemo } from 'react'
+import { useMemo, useState } from 'react'
 import {
   useFieldArray,
   useForm,
+  useWatch,
   type Control,
 } from 'react-hook-form'
 import { useNavigate, useParams } from 'react-router-dom'
@@ -62,6 +69,8 @@ const tileSchema = z.object({
   metric_name: z.string().min(1, 'Pick a metric'),
   aggregation: z.enum(AGGREGATION_VALUES),
   title: z.string().optional(),
+  label_filters: z.array(z.object({ key: z.string(), value: z.string() })),
+  group_by: z.array(z.string()).max(2),
 })
 
 const sectionSchema = z.object({
@@ -131,6 +140,18 @@ export default function DashboardBuilder({ project }: DashboardBuilderProps) {
     [namesQuery.data],
   )
 
+  // Bounds for the label-filter autocomplete — mirrors LabelFilterBuilder's own
+  // "last 24h" observed-attributes window. Computed once via the `useState`
+  // lazy-initializer form (not `useMemo`) so reading the current time happens
+  // during mount, not on every render pass, keeping the query key stable.
+  const [labelFilterRange] = useState(() => {
+    const now = Date.now()
+    return {
+      from: new Date(now - 24 * 60 * 60 * 1000).toISOString(),
+      to: new Date(now).toISOString(),
+    }
+  })
+
   const defaultValues = useMemo<DashboardFormData>(() => {
     const existing = existingQuery.data
     if (existing) {
@@ -147,6 +168,8 @@ export default function DashboardBuilder({ project }: DashboardBuilderProps) {
                   metric_name: t.metric_name,
                   aggregation: coerceAggregation(t.aggregation),
                   title: t.title ?? '',
+                  label_filters: tuplesToLabelFilters(t.label_filters),
+                  group_by: t.group_by ?? [],
                 })),
               }))
             : emptyDefaults().sections,
@@ -206,6 +229,8 @@ export default function DashboardBuilder({ project }: DashboardBuilderProps) {
           metric_name: t.metric_name,
           aggregation: t.aggregation,
           title: t.title?.trim() ? t.title.trim() : null,
+          label_filters: labelFiltersToTuples(t.label_filters),
+          group_by: t.group_by,
         })),
       })),
     }
@@ -284,6 +309,9 @@ export default function DashboardBuilder({ project }: DashboardBuilderProps) {
                 sectionIndex={sectionIndex}
                 metricOptions={metricOptions}
                 metricsLoading={namesQuery.isPending}
+                projectId={project.id}
+                labelFilterFromIso={labelFilterRange.from}
+                labelFilterToIso={labelFilterRange.to}
                 onRemoveSection={() => sectionsArray.remove(sectionIndex)}
                 canRemoveSection={sectionsArray.fields.length > 1}
               />
@@ -333,6 +361,9 @@ function SectionEditor({
   sectionIndex,
   metricOptions,
   metricsLoading,
+  projectId,
+  labelFilterFromIso,
+  labelFilterToIso,
   onRemoveSection,
   canRemoveSection,
 }: {
@@ -340,6 +371,9 @@ function SectionEditor({
   sectionIndex: number
   metricOptions: { value: string; label: string }[]
   metricsLoading: boolean
+  projectId: number
+  labelFilterFromIso: string
+  labelFilterToIso: string
   onRemoveSection: () => void
   canRemoveSection: boolean
 }) {
@@ -389,87 +423,18 @@ function SectionEditor({
           </p>
         ) : (
           tilesArray.fields.map((tileField, tileIndex) => (
-            <div
+            <TileEditor
               key={tileField.id}
-              className="flex flex-col gap-2 rounded-md border border-border/60 p-3 sm:flex-row sm:items-start"
-            >
-              <FormField
-                control={control}
-                name={`sections.${sectionIndex}.tiles.${tileIndex}.metric_name`}
-                render={({ field }) => (
-                  <FormItem className="min-w-0 flex-1">
-                    <FormLabel className="text-xs">Metric</FormLabel>
-                    <FormControl>
-                      <SearchableSelect
-                        value={field.value}
-                        onValueChange={field.onChange}
-                        options={metricOptions}
-                        placeholder={
-                          metricsLoading ? 'Loading metrics…' : 'Select a metric…'
-                        }
-                        searchPlaceholder="Filter metrics…"
-                        emptyText="No metrics ingested yet."
-                        disabled={metricsLoading}
-                        className="font-mono text-xs"
-                      />
-                    </FormControl>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
-              <FormField
-                control={control}
-                name={`sections.${sectionIndex}.tiles.${tileIndex}.aggregation`}
-                render={({ field }) => (
-                  <FormItem className="sm:w-[140px]">
-                    <FormLabel className="text-xs">Aggregation</FormLabel>
-                    <Select onValueChange={field.onChange} value={field.value}>
-                      <FormControl>
-                        <SelectTrigger className="font-mono text-xs">
-                          <SelectValue />
-                        </SelectTrigger>
-                      </FormControl>
-                      <SelectContent>
-                        {AGGREGATIONS.map((a) => (
-                          <SelectItem key={a.value} value={a.value}>
-                            {a.label}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
-              <FormField
-                control={control}
-                name={`sections.${sectionIndex}.tiles.${tileIndex}.title`}
-                render={({ field }) => (
-                  <FormItem className="min-w-0 flex-1">
-                    <FormLabel className="text-xs">Title (optional)</FormLabel>
-                    <FormControl>
-                      <Input
-                        placeholder="Override tile title"
-                        className="text-xs"
-                        {...field}
-                        value={field.value ?? ''}
-                      />
-                    </FormControl>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                className="size-8 shrink-0 self-end text-muted-foreground sm:mt-6"
-                onClick={() => tilesArray.remove(tileIndex)}
-                aria-label="Remove tile"
-              >
-                <Trash2 className="size-4" />
-              </Button>
-            </div>
+              control={control}
+              sectionIndex={sectionIndex}
+              tileIndex={tileIndex}
+              metricOptions={metricOptions}
+              metricsLoading={metricsLoading}
+              projectId={projectId}
+              labelFilterFromIso={labelFilterFromIso}
+              labelFilterToIso={labelFilterToIso}
+              onRemove={() => tilesArray.remove(tileIndex)}
+            />
           ))
         )}
         <Button
@@ -483,6 +448,8 @@ function SectionEditor({
               metric_name: '',
               aggregation: 'avg',
               title: '',
+              label_filters: [],
+              group_by: [],
             })
           }
         >
@@ -491,5 +458,164 @@ function SectionEditor({
         </Button>
       </CardContent>
     </Card>
+  )
+}
+
+function TileEditor({
+  control,
+  sectionIndex,
+  tileIndex,
+  metricOptions,
+  metricsLoading,
+  projectId,
+  labelFilterFromIso,
+  labelFilterToIso,
+  onRemove,
+}: {
+  control: Control<DashboardFormData>
+  sectionIndex: number
+  tileIndex: number
+  metricOptions: { value: string; label: string }[]
+  metricsLoading: boolean
+  projectId: number
+  labelFilterFromIso: string
+  labelFilterToIso: string
+  onRemove: () => void
+}) {
+  // Watched independently of the field-array snapshot so the label-filter
+  // section below reacts as soon as a metric is picked on THIS row.
+  const metricName = useWatch({
+    control,
+    name: `sections.${sectionIndex}.tiles.${tileIndex}.metric_name`,
+  })
+
+  return (
+    <div className="flex flex-col gap-2 rounded-md border border-border/60 p-3">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-start">
+        <FormField
+          control={control}
+          name={`sections.${sectionIndex}.tiles.${tileIndex}.metric_name`}
+          render={({ field }) => (
+            <FormItem className="min-w-0 flex-1">
+              <FormLabel className="text-xs">Metric</FormLabel>
+              <FormControl>
+                <SearchableSelect
+                  value={field.value}
+                  onValueChange={field.onChange}
+                  options={metricOptions}
+                  placeholder={
+                    metricsLoading ? 'Loading metrics…' : 'Select a metric…'
+                  }
+                  searchPlaceholder="Filter metrics…"
+                  emptyText="No metrics ingested yet."
+                  disabled={metricsLoading}
+                  className="font-mono text-xs"
+                />
+              </FormControl>
+              <FormMessage />
+            </FormItem>
+          )}
+        />
+        <FormField
+          control={control}
+          name={`sections.${sectionIndex}.tiles.${tileIndex}.aggregation`}
+          render={({ field }) => (
+            <FormItem className="sm:w-[140px]">
+              <FormLabel className="text-xs">Aggregation</FormLabel>
+              <Select onValueChange={field.onChange} value={field.value}>
+                <FormControl>
+                  <SelectTrigger className="font-mono text-xs">
+                    <SelectValue />
+                  </SelectTrigger>
+                </FormControl>
+                <SelectContent>
+                  {AGGREGATIONS.map((a) => (
+                    <SelectItem key={a.value} value={a.value}>
+                      {a.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <FormMessage />
+            </FormItem>
+          )}
+        />
+        <FormField
+          control={control}
+          name={`sections.${sectionIndex}.tiles.${tileIndex}.title`}
+          render={({ field }) => (
+            <FormItem className="min-w-0 flex-1">
+              <FormLabel className="text-xs">Title (optional)</FormLabel>
+              <FormControl>
+                <Input
+                  placeholder="Override tile title"
+                  className="text-xs"
+                  {...field}
+                  value={field.value ?? ''}
+                />
+              </FormControl>
+              <FormMessage />
+            </FormItem>
+          )}
+        />
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          className="size-8 shrink-0 self-end text-muted-foreground sm:mt-6"
+          onClick={onRemove}
+          aria-label="Remove tile"
+        >
+          <Trash2 className="size-4" />
+        </Button>
+      </div>
+
+      {/* Label filters — scopes this tile's chart to one label value. Needs a
+          metric selected first, matching the alert form's gating. */}
+      {metricName ? (
+        <>
+          <FormField
+            control={control}
+            name={`sections.${sectionIndex}.tiles.${tileIndex}.label_filters`}
+            render={({ field }) => (
+              <FormItem>
+                <FormControl>
+                  <LabelFilterBuilder
+                    value={field.value}
+                    onChange={field.onChange}
+                    projectId={projectId}
+                    metricName={metricName}
+                    fromIso={labelFilterFromIso}
+                    toIso={labelFilterToIso}
+                  />
+                </FormControl>
+              </FormItem>
+            )}
+          />
+          <FormField
+            control={control}
+            name={`sections.${sectionIndex}.tiles.${tileIndex}.group_by`}
+            render={({ field }) => (
+              <FormItem>
+                <FormControl>
+                  <GroupByBuilder
+                    value={field.value}
+                    onChange={field.onChange}
+                    projectId={projectId}
+                    metricName={metricName}
+                    fromIso={labelFilterFromIso}
+                    toIso={labelFilterToIso}
+                  />
+                </FormControl>
+              </FormItem>
+            )}
+          />
+        </>
+      ) : (
+        <p className="text-xs text-muted-foreground">
+          Pick a metric to optionally scope this tile by label.
+        </p>
+      )}
+    </div>
   )
 }

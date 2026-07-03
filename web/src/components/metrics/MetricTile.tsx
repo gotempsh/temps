@@ -2,19 +2,32 @@ import { ProjectResponse } from '@/api/client'
 import { queryMetricsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { Badge } from '@/components/ui/badge'
 import { Skeleton } from '@/components/ui/skeleton'
-import { ThresholdLineChart } from '@/components/charts/threshold-line-chart'
+import {
+  ThresholdLineChart,
+  ThresholdLineSeries,
+} from '@/components/charts/threshold-line-chart'
 import { useQuery } from '@tanstack/react-query'
 import { useMemo } from 'react'
 import {
   aggregationLabel,
+  buildBreakdownData,
   formatBucketLabel,
   formatMetricValue,
   histogramQuantile,
   percentileFromAgg,
 } from './metric-format'
 import { StatusDot } from './alert-format'
-import { STATUS_META, useAlertStatus } from './alert-status'
+import {
+  dynamicFiringSeriesCount,
+  STATUS_META,
+  useAlertStatus,
+} from './alert-status'
 import { useAnomalyBand } from './use-anomaly-band'
+import {
+  LabelFilterChips,
+  serializeLabelFilters,
+  tuplesToLabelFilters,
+} from './LabelFilterBuilder'
 
 interface MetricTileProps {
   project: ProjectResponse
@@ -23,6 +36,18 @@ interface MetricTileProps {
   aggregation: string
   /** Optional display title; falls back to the metric name. */
   title?: string | null
+  /**
+   * AND-combined label equality filters scoping this tile's chart, in the
+   * `DashboardTile.label_filters` ordered-tuple shape. Empty/absent = no
+   * filtering (the whole metric, today's behavior).
+   */
+  labelFilters?: [string, string][]
+  /**
+   * Up to 2 label keys to break the chart down by, in `DashboardTile.
+   * group_by` order — renders one line per distinct value combination
+   * instead of a single aggregate line. Empty/absent = today's behavior.
+   */
+  groupBy?: string[]
   /** ISO start bound — memoize upstream so the query key stays stable. */
   fromIso: string
   /** ISO end bound — memoize upstream so the query key stays stable. */
@@ -49,6 +74,8 @@ export function MetricTile({
   metricName,
   aggregation,
   title,
+  labelFilters,
+  groupBy,
   fromIso,
   toIso,
   bucketInterval,
@@ -56,9 +83,22 @@ export function MetricTile({
 }: MetricTileProps) {
   const isPercentile = aggregation.startsWith('p')
 
+  // The query param is a comma-separated `key=value` string (same format
+  // MetricsExplorer's ad-hoc filter builder sends) — recomputed from the
+  // ordered-tuple prop, not memoized, since it's a cheap derived string and
+  // its VALUE (not the array reference) is what matters for the query key.
+  const labelFiltersParam =
+    serializeLabelFilters(tuplesToLabelFilters(labelFilters ?? [])) || undefined
+  const groupByParam =
+    groupBy && groupBy.length > 0 ? groupBy.join(',') : undefined
+
   // Datadog-style: a status dot + a toned line when a rule on this exact
   // (metric, aggregation) is firing. Cached `listAlerts` — no extra fetch.
-  const status = useAlertStatus(project.id).statusFor(metricName, aggregation)
+  const alertStatus = useAlertStatus(project.id)
+  const status = alertStatus.statusFor(metricName, aggregation)
+  const dynamicFiringCount = dynamicFiringSeriesCount(
+    alertStatus.rulesFor(metricName, aggregation),
+  )
   const lineTone =
     status === 'alert' ? 'poor' : status === 'warn' ? 'warn' : 'primary'
 
@@ -84,6 +124,8 @@ export function MetricTile({
         bucket_interval: bucketInterval,
         // AggKind strings map directly to the backend's MetricAggregation::parse.
         aggregation,
+        label_filters: labelFiltersParam,
+        group_by: groupByParam,
         limit: 500,
       },
     }),
@@ -92,10 +134,17 @@ export function MetricTile({
 
   const buckets = q.data?.data ?? []
   const isHistogram = buckets.some((b) => b.histogram_summary)
+  const isGrouped = !!groupByParam
 
-  const data = useMemo(
-    () =>
-      mergeBand(
+  // Anomaly bands are per-metric aggregates, not per-series — they don't
+  // compose with a breakdown (same reason ADR-026 keeps dynamic alerting and
+  // anomaly detection apart), so a grouped tile skips the overlay entirely
+  // rather than merging it into the wrong series.
+  const chartModel = useMemo(() => {
+    if (isGrouped) return buildBreakdownData(buckets, isPercentile, aggregation)
+    return {
+      kind: 'single' as const,
+      data: mergeBand(
         buckets.map((b) => {
           const hs = b.histogram_summary
           const value =
@@ -111,10 +160,20 @@ export function MetricTile({
           return { bucket: b.bucket, label: formatBucketLabel(b.bucket), value }
         }),
       ),
-    [buckets, isPercentile, aggregation, mergeBand],
-  )
+    }
+  }, [buckets, isPercentile, aggregation, mergeBand, isGrouped])
 
-  const latest = data.length ? data[data.length - 1].value : null
+  const data = chartModel.data
+  const series: ThresholdLineSeries | ThresholdLineSeries[] =
+    chartModel.kind === 'grouped'
+      ? chartModel.series
+      : { dataKey: 'value', label: aggregationLabel(aggregation), tone: lineTone }
+  const droppedSeriesCount =
+    chartModel.kind === 'grouped' ? chartModel.droppedCount : 0
+  const latest =
+    chartModel.kind === 'single' && data.length
+      ? (data[data.length - 1].value as number | null)
+      : null
   const displayTitle = title?.trim() ? title : metricName
 
   return (
@@ -125,7 +184,11 @@ export function MetricTile({
             <StatusDot
               level={status}
               pulse
-              title={`Alert rule: ${STATUS_META[status].label}`}
+              title={
+                dynamicFiringCount != null
+                  ? `${dynamicFiringCount} series breaching`
+                  : `Alert rule: ${STATUS_META[status].label}`
+              }
             />
           )}
           <span
@@ -147,6 +210,8 @@ export function MetricTile({
         </div>
       </div>
 
+      <LabelFilterChips filters={labelFilters ?? []} groupBy={groupBy} />
+
       {q.isPending ? (
         <Skeleton className="w-full" style={{ height }} />
       ) : q.isError ? (
@@ -167,24 +232,28 @@ export function MetricTile({
         <ThresholdLineChart
           data={data}
           xKey="label"
-          series={{
-            dataKey: 'value',
-            label: aggregationLabel(aggregation),
-            tone: lineTone,
-          }}
-          bandSeries={bandSeries}
+          series={series}
+          bandSeries={isGrouped ? undefined : bandSeries}
           height={height}
           tooltipValueFormatter={(v) => formatMetricValue(v)}
           yTickFormatter={(v) => formatMetricValue(v)}
         />
       )}
 
-      <div className="flex items-center justify-between text-xs text-muted-foreground">
-        <span className="text-[10px] uppercase tracking-wide">latest</span>
-        <span className="font-mono tabular-nums">
-          {latest != null ? formatMetricValue(latest) : '—'}
-        </span>
-      </div>
+      {isGrouped ? (
+        droppedSeriesCount > 0 && (
+          <p className="text-[11px] text-muted-foreground">
+            {droppedSeriesCount} more series not shown
+          </p>
+        )
+      ) : (
+        <div className="flex items-center justify-between text-xs text-muted-foreground">
+          <span className="text-[10px] uppercase tracking-wide">latest</span>
+          <span className="font-mono tabular-nums">
+            {latest != null ? formatMetricValue(latest) : '—'}
+          </span>
+        </div>
+      )}
     </div>
   )
 }

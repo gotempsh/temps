@@ -3031,8 +3031,38 @@ export type CreateMetricAlertRequest = {
      * `{ "kind": "static", "comparator": "gt", "threshold": 500 }` is evaluable.
      */
     detection_config: DetectionConfig;
+    /**
+     * When true (and `group_by` is set) fire one independent alarm per breaching
+     * series. Static detectors only. Default false.
+     */
+    dynamic_alerts?: boolean;
     enabled: boolean;
     for_duration_secs: number;
+    /**
+     * Label keys to break the metric down by, e.g. `["endpoint","region"]`. Empty
+     * (the default) = one aggregate stream. Max 2 keys; keys must match
+     * `[a-zA-Z0-9_.:-]`.
+     */
+    group_by?: Array<string>;
+    /**
+     * When more than this many series transition to firing in the same tick, only
+     * the first gets the expensive chart/AI enrichment. Range 1–1000, default 5.
+     */
+    grouped_notification_threshold?: number;
+    /**
+     * AND-combined label equality filters: `[["key","value"],…]`. Empty = no
+     * filtering (the default). Max 10 pairs; keys must match `[a-zA-Z0-9_.:-]`;
+     * values capped at 500 characters.
+     */
+    label_filters?: Array<[
+        string,
+        string
+    ]>;
+    /**
+     * Cardinality cap for dynamic alerting: at most this many series (top by
+     * `|value|`). Range 1–100, default 20.
+     */
+    max_series?: number;
     metric_name: string;
     name: string;
     project_id: number;
@@ -3598,9 +3628,28 @@ export type DashboardTile = {
      */
     aggregation: string;
     /**
+     * Label keys to break the metric down by (group-by / multi-series view).
+     * Empty = single aggregated series (current behavior). Max 2 keys — more
+     * dimensions are unreadable in a chart (ADR-026 Phase 2). Each key must
+     * match `[a-zA-Z0-9_.:-]`. Wired directly to `MetricQuery.group_by` by
+     * the tile query path (separate frontend task).
+     */
+    group_by?: Array<string>;
+    /**
      * Stable client-generated tile id (used as a React key / for reordering).
      */
     id: string;
+    /**
+     * AND-combined label equality filters: `[["key","value"],…]`. Empty = no
+     * filtering. Max 10 pairs; keys must match `[a-zA-Z0-9_.:-]`; values
+     * capped at 500 characters. Not yet wired into the tile query path
+     * (Phase 1 ADR-026 — field round-trips and validates; query wiring is
+     * a separate frontend task).
+     */
+    label_filters?: Array<[
+        string,
+        string
+    ]>;
     /**
      * The metric name to chart (e.g. `http.server.duration`).
      */
@@ -6223,6 +6272,28 @@ export type FieldResponse = {
      * Whether the field is nullable
      */
     nullable: boolean;
+};
+
+/**
+ * A single currently-firing series for a dynamic alert rule, snapshotted from
+ * the evaluator's in-memory per-series firing map at read time (ADR-026 Phase 3).
+ */
+export type FiringSeriesEntry = {
+    /**
+     * The open alarm's id, when one was created (absent if suppressed).
+     */
+    alarm_id?: number | null;
+    /**
+     * The series' label pairs, e.g. `[["endpoint","/checkout"],["region","eu-west"]]`.
+     */
+    series_key: Array<[
+        string,
+        string
+    ]>;
+    /**
+     * The human-readable joined label, e.g. `endpoint=/checkout, region=eu-west`.
+     */
+    series_label: string;
 };
 
 /**
@@ -9471,18 +9542,65 @@ export type OtelMetricAlertRuleResponse = {
      * Coarse detector discriminator: `static|anomaly|forecast|outlier|auto_watch`.
      */
     detection_kind: string;
+    /**
+     * Whether per-series ("dynamic") alerting is enabled for this rule.
+     */
+    dynamic_alerts: boolean;
     enabled: boolean;
+    /**
+     * Currently-firing series for a dynamic rule, snapshotted from the evaluator's
+     * in-memory firing map at read time. Empty for static/aggregate rules or when
+     * nothing is firing.
+     */
+    firing_series?: Array<FiringSeriesEntry>;
     for_duration_secs: number;
+    /**
+     * Label keys the rule breaks the metric down by. Empty = one aggregate stream.
+     */
+    group_by: Array<string>;
+    /**
+     * Notification-grouping threshold: when more than this many series fire in the
+     * same tick, only the first gets chart/AI enrichment (1–1000).
+     */
+    grouped_notification_threshold: number;
     id: number;
+    /**
+     * AND-combined label equality filters applied when evaluating this rule.
+     * Empty = no filtering (matches all series).
+     */
+    label_filters: Array<[
+        string,
+        string
+    ]>;
+    /**
+     * Number of series dropped by the cardinality cap on the latest dynamic tick
+     * (0 when nothing was dropped or for static/aggregate rules). Lets a UI warn
+     * "N series were dropped this tick" without reading server logs.
+     */
+    last_dropped_series_count: number;
     last_evaluated_at?: string | null;
     /**
      * One of `ok|firing|unknown`.
      */
     last_state: string;
     last_value?: number | null;
+    /**
+     * Cardinality cap for dynamic alerting (1–100).
+     */
+    max_series: number;
     metric_name: string;
     name: string;
     project_id: number;
+    /**
+     * Full per-series state snapshot persisted after the latest dynamic-rule tick,
+     * keyed by the human-readable series label (`endpoint=/checkout`). Empty for
+     * static/aggregate rules. Unlike `firing_series` (a live in-memory snapshot),
+     * this is decoded from the persisted `series_states` jsonb column, so an
+     * external consumer that only reads the rule row still sees per-series detail.
+     */
+    series_states: {
+        [key: string]: SeriesStateEntry;
+    };
     severity: string;
     updated_at: string;
     window_secs: number;
@@ -12955,6 +13073,27 @@ export type SentryReleaseResponse = {
 };
 
 /**
+ * One series' persisted state snapshot for a dynamic rule (ADR-026 follow-up):
+ * the state after the latest tick, the value evaluated this tick, and the open
+ * alarm id (when firing). Serialized into the `series_states` jsonb column keyed
+ * by the human-readable [`series_label`]; the alert response decodes it back.
+ */
+export type SeriesStateEntry = {
+    /**
+     * The open alarm's id when the series is firing; `null` when ok.
+     */
+    alarm_id?: number | null;
+    /**
+     * `firing` or `ok` for this series after the latest tick.
+     */
+    state: string;
+    /**
+     * The value the rule evaluated for this series this tick.
+     */
+    value: number;
+};
+
+/**
  * Response containing information about how the service is being accessed
  */
 export type ServiceAccessInfo = {
@@ -15421,8 +15560,31 @@ export type UpdateMcpRequest = {
 export type UpdateMetricAlertRequest = {
     aggregation?: string | null;
     detection_config?: null | DetectionConfig;
+    /**
+     * Toggles per-series ("dynamic") alerting (absent = leave unchanged).
+     */
+    dynamic_alerts?: boolean | null;
     enabled?: boolean | null;
     for_duration_secs?: number | null;
+    /**
+     * Replaces the group_by keys wholesale when present (absent = leave unchanged).
+     */
+    group_by?: Array<string> | null;
+    /**
+     * Updates the notification-grouping threshold (absent = leave unchanged).
+     */
+    grouped_notification_threshold?: number | null;
+    /**
+     * Replaces the label filters wholesale when present (absent = leave unchanged).
+     */
+    label_filters?: Array<[
+        string,
+        string
+    ]> | null;
+    /**
+     * Updates the dynamic-alerting cardinality cap (absent = leave unchanged).
+     */
+    max_series?: number | null;
     metric_name?: string | null;
     name?: string | null;
     severity?: string | null;
