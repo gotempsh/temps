@@ -296,6 +296,15 @@ Response type `UnifiedTrace` carries: `trace_id`, `projects: Vec<ProjectRef>`, `
 2. **Phase 3 opt-out default.** Should `cross_project_trace_sharing` default `true` (all projects visible, opt-out) or `false` (private by default, opt-in)? `true` is consistent with the current OSS global-observability model; `false` is safer for future multi-team deployments. Recommendation: `true` for Phase 3 with documentation, revisit when EE RBAC lands.
 3. **Phase 2 fan-out cap configurability.** Should the 20-project and 10,000-span caps be configurable per-installation via `server_config` before Phase 2 ships, or added post-Phase 2 based on real-world usage patterns? Recommendation: add post-Phase 2; hard-code for initial release, then instrument the drop counter to drive the decision.
 
+## Security review (2026-07-03)
+
+A `security-auditor` pass on the implementation returned **APPROVED-WITH-NITS** (no Critical/High). The auth model was confirmed correct: both endpoints enforce `permission_guard!(OtelRead)` then `deny_deployment_token!` before any DB access, all SQL is parameterized, and the ingest hint channel is bounded/`try_send` (DoS-safe). Outcomes:
+
+- **Existence disclosure via `has_redacted_spans` (MEDIUM — accepted, documented here).** When any contributing project has `cross_project_trace_sharing = false`, its name and spans are fully suppressed, but the response's `has_redacted_spans: true` flag reveals that *some* opted-out project participated in the trace. This is an accepted trade-off: the flag is required for the "some spans are hidden" UX, and existence-without-identity is consistent with the OSS global-observability posture (§1). Opt-out guarantees *identity + data* privacy, not *existence* privacy. A future EE RBAC mode may gate the flag behind org-admin.
+- **Fan-out amplification (MEDIUM — follow-up).** `get_unified_trace` issues up to 20 parallel `get_trace` calls with no per-user/endpoint rate limit beyond global middleware, so a looping `OtelRead` caller can cause 20× query amplification. Tracked as a follow-up: add per-user rate limiting on `/otel/global/traces/{trace_id}` (and the sibling endpoint) before it is exposed on a public listener. The amplification is bounded (≤20 projects/≤10k spans per request).
+- **Ingest hint validation (LOW — fixed in this change).** `do_ingest_traces` now `filter`s hint `trace_id`s through `is_valid_trace_id` before they reach `cross_project_trace_refs`, eliminating a storage-pollution vector.
+- **Audit-failure observability (LOW — follow-up).** Cross-project read audit failures are `warn!`-logged and non-fatal (standard pattern); add a counter-metric so unaudited windows can alert.
+
 ## References
 
 - [ADR-016: ClickHouse as the OTel telemetry backend](016-clickhouse-traces-backend.md) — spans schema `ORDER BY (project_id, trace_id, span_id)`, `trace_summaries_mv`, control-state-in-Postgres principle; ClickHouse `spans` `TTL toDateTime(start_time) + INTERVAL 90 DAY`.
