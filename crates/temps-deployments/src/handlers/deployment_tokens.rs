@@ -10,13 +10,15 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
     routing::get,
-    Json, Router,
+    Extension, Json, Router,
 };
 use temps_auth::permission_guard;
 use temps_auth::RequireAuth;
+use temps_core::{AuditContext, RequestMetadata};
 use tracing::error;
 use utoipa::OpenApi;
 
+use super::audit::DeploymentTokenRotatedAudit;
 use crate::services::deployment_token_service::{
     CreateDeploymentTokenRequest, CreateDeploymentTokenResponse, DeploymentTokenListResponse,
     DeploymentTokenResponse, DeploymentTokenService, UpdateDeploymentTokenRequest,
@@ -29,6 +31,8 @@ use utoipa::ToSchema;
 /// App state for deployment token handlers
 pub struct DeploymentTokenAppState {
     pub deployment_token_service: Arc<DeploymentTokenService>,
+    /// Audit logger for write operations (e.g. token rotation)
+    pub audit_service: Arc<dyn temps_core::AuditLogger>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -47,6 +51,7 @@ pub struct ListDeploymentTokensQuery {
         get_deployment_token,
         update_deployment_token,
         delete_deployment_token,
+        rotate_deployment_token,
     ),
     components(schemas(
         DeploymentTokenResponse,
@@ -79,6 +84,10 @@ pub fn configure_routes() -> Router<Arc<DeploymentTokenAppState>> {
             get(get_deployment_token)
                 .patch(update_deployment_token)
                 .delete(delete_deployment_token),
+        )
+        .route(
+            "/projects/{project_id}/deployment-tokens/{token_id}/rotate",
+            axum::routing::post(rotate_deployment_token),
         )
 }
 
@@ -275,4 +284,59 @@ async fn delete_deployment_token(
         })?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Rotate a deployment token, invalidating its old secret and issuing a new one
+#[utoipa::path(
+    tag = "Deployment Tokens",
+    post,
+    path = "/projects/{project_id}/deployment-tokens/{token_id}/rotate",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("token_id" = i32, Path, description = "Deployment token ID")
+    ),
+    responses(
+        (status = 200, description = "Deployment token rotated successfully; the response contains the new plaintext token, shown only once", body = CreateDeploymentTokenResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Deployment token not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn rotate_deployment_token(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<DeploymentTokenAppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path((project_id, token_id)): Path<(i32, i32)>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, DeploymentTokensWrite);
+
+    let rotated = app_state
+        .deployment_token_service
+        .rotate_token(project_id, token_id)
+        .await
+        .map_err(|e| {
+            error!("Failed to rotate deployment token: {}", e);
+            e.to_problem()
+        })?;
+
+    let audit = DeploymentTokenRotatedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        project_id,
+        token_id: rotated.id,
+        token_name: rotated.name.clone(),
+    };
+    if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
+        error!(
+            "Failed to create audit log for deployment token {} rotation: {}",
+            token_id, e
+        );
+    }
+
+    Ok(Json(rotated))
 }

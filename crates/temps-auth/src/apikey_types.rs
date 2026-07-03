@@ -94,6 +94,9 @@ impl RoleInfo {
     pub fn from_role(role: &Role) -> Self {
         let description = match role {
             Role::Admin => "Full administrative access to all resources",
+            Role::PlatformAdmin => {
+                "Platform administration (users, settings, system) without deploy access to projects or deployments"
+            }
             Role::User => "Standard user access with ability to manage own resources",
             Role::Reader => "Read-only access to resources",
             Role::Mcp => "Access for MCP service operations",

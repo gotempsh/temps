@@ -81,6 +81,16 @@ pub struct AppSettings {
     #[serde(default)]
     pub setup_complete: bool,
 
+    /// Production kill-switch for MCP-role API access (issue #19). When
+    /// `false`, the auth middleware rejects every request authenticated with
+    /// an API key whose role is `Role::Mcp`, regardless of that key's
+    /// permissions. Defaults to `true` so existing installs that already
+    /// issued MCP keys are not locked out until an operator explicitly opts
+    /// out. Mirrored into a process-wide cache (`temps_core::mcp_access`) so
+    /// the hot auth-middleware path never needs a DB round-trip.
+    #[serde(default = "default_mcp_access_enabled")]
+    pub mcp_access_enabled: bool,
+
     /// Binary version tag (e.g. "v0.1.0") of the *console* process
     /// (`temps serve`, role=all or role=console) that last started. Written
     /// on console startup; read by the standalone `temps proxy` to detect
@@ -278,6 +288,10 @@ fn default_auth_type() -> String {
 }
 
 fn default_sandbox_enabled() -> bool {
+    true
+}
+
+fn default_mcp_access_enabled() -> bool {
     true
 }
 
@@ -677,6 +691,7 @@ impl Default for AppSettings {
             build_limits: BuildLimitsSettings::default(),
             monitoring: MonitoringSettings::default(),
             setup_complete: false,
+            mcp_access_enabled: true,
             console_version: None,
         }
     }

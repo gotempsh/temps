@@ -604,6 +604,10 @@ impl ConfigService {
         // callsites (deployer, agent, providers) see the latest value
         // without an explicit init step at startup.
         temps_core::tls::set_insecure_tls(settings.insecure_tls);
+        // Republish the MCP-access kill switch (issue #19) so the auth
+        // middleware's hot-path check sees the latest value without an
+        // explicit init step at startup.
+        temps_core::mcp_access::set_mcp_access_enabled(settings.mcp_access_enabled);
 
         *self.settings_cache.write().await = Some((settings.clone(), std::time::Instant::now()));
         Ok(settings)
@@ -616,6 +620,10 @@ impl ConfigService {
         // in the settings UI; otherwise the change wouldn't take effect
         // until the next get_settings() call.
         temps_core::tls::set_insecure_tls(settings.insecure_tls);
+        // Refresh the MCP-access kill switch cache as soon as the operator
+        // toggles it in the settings UI; otherwise the change wouldn't take
+        // effect until the next get_settings() call.
+        temps_core::mcp_access::set_mcp_access_enabled(settings.mcp_access_enabled);
 
         // Check if record exists
         let existing = settings::Entity::find_by_id(1)

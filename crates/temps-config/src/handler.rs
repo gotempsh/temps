@@ -135,6 +135,12 @@ pub struct AppSettingsResponse {
     /// Whether `temps setup` has been run at least once. The web onboarding
     /// wizard checks this field on load and skips itself when true.
     pub setup_complete: bool,
+
+    /// Production kill-switch for MCP-role API access (issue #19). When
+    /// `false`, every request authenticated with an MCP-role API key is
+    /// rejected with 403 regardless of that key's permissions. Not
+    /// sensitive, so it round-trips unmasked like `insecure_tls`.
+    pub mcp_access_enabled: bool,
 }
 
 /// Monitoring settings with the ClickHouse DSN masked.
@@ -333,6 +339,7 @@ impl From<AppSettings> for AppSettingsResponse {
             monitoring: MonitoringSettingsMasked::from(settings.monitoring),
             insecure_tls: settings.insecure_tls,
             setup_complete: settings.setup_complete,
+            mcp_access_enabled: settings.mcp_access_enabled,
         }
     }
 }
