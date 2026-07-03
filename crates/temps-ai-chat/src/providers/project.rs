@@ -79,6 +79,7 @@ mod tests {
         let now = chrono::Utc::now();
         projects::Model {
             id,
+            image_retention_hours: None,
             name: name.to_string(),
             repo_name: "repo".to_string(),
             repo_owner: "owner".to_string(),
