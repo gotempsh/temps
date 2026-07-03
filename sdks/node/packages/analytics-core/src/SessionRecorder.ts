@@ -1,6 +1,6 @@
 import { record, type eventWithTime } from "rrweb";
 import { pack } from "@rrweb/packer";
-import { SESSION_RECORDER_ENDPOINT, DEFAULT_BASE_PATH } from "./constants";
+import { SESSION_RECORDER_ENDPOINT, DEFAULT_BASE_PATH, DEFAULT_EXCLUDED_PATHS } from "./constants";
 import type { SessionRecordingConfig } from "./types";
 
 export interface SessionRecorderOptions extends SessionRecordingConfig {
@@ -31,6 +31,13 @@ function generateVisitorId(): string {
     return visitorId;
   }
   return `visitor_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
+}
+
+function matchesAnyPath(currentPath: string, paths: string[]): boolean {
+  return paths.some((path) => {
+    const regex = new RegExp(`^${path.replace(/\*/g, ".*")}$`);
+    return regex.test(currentPath);
+  });
 }
 
 function getSessionMetadata(): Record<string, unknown> {
@@ -96,7 +103,10 @@ export class SessionRecorder {
 
   constructor(options: SessionRecorderOptions = {}) {
     this.basePath = options.basePath || DEFAULT_BASE_PATH;
-    this.excludedPaths = options.excludedPaths || [];
+    this.excludedPaths =
+      options.useDefaultExcludedPaths === false
+        ? options.excludedPaths || []
+        : [...DEFAULT_EXCLUDED_PATHS, ...(options.excludedPaths || [])];
     this.sessionSampleRate = options.sessionSampleRate ?? 1.0;
     this.maskAllInputs = options.maskAllInputs ?? true;
     this.maskTextSelector = options.maskTextSelector || "[data-mask]";
@@ -150,10 +160,7 @@ export class SessionRecorder {
   private shouldRecord(): boolean {
     if (!this.enabled || typeof window === "undefined") return false;
     const currentPath = window.location.pathname;
-    const isExcluded = this.excludedPaths.some((path) => {
-      const regex = new RegExp(`^${path.replace(/\*/g, ".*")}$`);
-      return regex.test(currentPath);
-    });
+    const isExcluded = matchesAnyPath(currentPath, this.excludedPaths);
     if (isExcluded) return false;
     if (this.sessionSampleRate < 1.0 && Math.random() > this.sessionSampleRate) return false;
     return true;
@@ -395,10 +402,7 @@ export class SessionRecorder {
       return;
     }
     const currentPath = window.location.pathname;
-    const isExcluded = this.excludedPaths.some((path) => {
-      const regex = new RegExp(`^${path.replace(/\*/g, ".*")}$`);
-      return regex.test(currentPath);
-    });
+    const isExcluded = matchesAnyPath(currentPath, this.excludedPaths);
     const isRecording = this.stopFn !== null;
     if (isExcluded && isRecording) {
       this.stopRecording();
