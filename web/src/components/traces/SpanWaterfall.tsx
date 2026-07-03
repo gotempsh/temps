@@ -81,7 +81,12 @@ export function serviceColor(name?: string): string {
  *  `renderRowBadge` is an optional, backward-compatible hook that lets a caller
  *  (e.g. the cross-project unified view) render an extra badge in each span's
  *  name column — used to tag which project a span belongs to. Single-project
- *  callers omit it and render exactly as before. */
+ *  callers omit it and render exactly as before.
+ *
+ *  `rowClassName` is an optional per-span class hook: a caller can emphasise or
+ *  de-emphasise individual rows (e.g. accent the current project's spans and dim
+ *  the rest inside a merged cross-project waterfall). Applied via `cn` so it can
+ *  layer on/override the row's base classes. Omitting it renders as before. */
 export function SpanWaterfall({
   flatSpans,
   traceStart,
@@ -91,6 +96,7 @@ export function SpanWaterfall({
   onSelect,
   colorBy = 'status',
   renderRowBadge,
+  rowClassName,
   className,
 }: {
   flatSpans: SpanTreeNode[]
@@ -101,6 +107,7 @@ export function SpanWaterfall({
   onSelect: (spanId: string | null) => void
   colorBy?: 'status' | 'service'
   renderRowBadge?: (span: SpanTreeNode['span']) => ReactNode
+  rowClassName?: (span: SpanTreeNode['span']) => string | undefined
   className?: string
 }) {
   return (
@@ -138,6 +145,7 @@ export function SpanWaterfall({
                   onClick={() => onSelect(isSelected ? null : node.span.span_id)}
                   className={cn(
                     'flex w-full min-w-[420px] items-center border-b px-4 py-1.5 text-left transition-colors hover:bg-accent/50 sm:min-w-[500px]',
+                    rowClassName?.(node.span),
                     isSelected && 'bg-accent'
                   )}
                 >

@@ -2,11 +2,13 @@ import { LogSeverity, ProjectResponse } from '@/api/client'
 import {
   getCrossProjectTraceSiblingsOptions,
   getTraceOptions,
+  getUnifiedTraceOptions,
   queryLogsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import type {
   CrossProjectSiblingRef,
   LogRecord,
+  ProjectRef,
   SpanRecord,
 } from '@/api/client/types.gen'
 import { Badge } from '@/components/ui/badge'
@@ -40,6 +42,8 @@ import {
   serviceColor,
   statusIcon,
 } from '@/components/traces/SpanWaterfall'
+import { ProjectBadge } from '@/components/traces/ProjectBadge'
+import { TraceStatBadges } from '@/components/traces/TraceStatBadges'
 import { buildSpanTree, flattenTree } from '@/utils/spanTree'
 import type { SpanTreeNode } from '@/utils/spanTree'
 import { cn } from '@/lib/utils'
@@ -52,10 +56,9 @@ import {
   Info,
   Layers,
   RefreshCw,
-  X,
 } from 'lucide-react'
-import { useMemo, useState } from 'react'
-import { Link, useNavigate, useParams } from 'react-router-dom'
+import { useCallback, useMemo, type ReactNode } from 'react'
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 
 interface TraceDetailProps {
   project: ProjectResponse
@@ -272,11 +275,34 @@ interface LayoutProps {
   traceEnd: number
   traceDuration: number
   correlatedLogs: LogRecord[]
+  /** Cross-project unified view: tag each span with its owning project. */
+  renderRowBadge?: (span: SpanRecord) => ReactNode
+  /** Cross-project unified view: accent/dim rows (e.g. de-emphasise other projects). */
+  rowClassName?: (span: SpanRecord) => string | undefined
 }
 
 /** Shared selection hook for the layout variants. */
 function useSpanSelection(flatSpans: SpanTreeNode[], correlatedLogs: LogRecord[]) {
-  const [selectedSpanId, setSelectedSpanId] = useState<string | null>(null)
+  // Keep the selected span in the URL (`?span=<id>`) so a specific span is
+  // shareable/linkable — but write it with `replace` (not push) so clicking
+  // through spans never stacks history entries. The Back button then returns to
+  // the previous page (e.g. the trace list), it doesn't undo span selections.
+  const [searchParams, setSearchParams] = useSearchParams()
+  const selectedSpanId = searchParams.get('span')
+  const setSelectedSpanId = useCallback(
+    (id: string | null) => {
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev)
+          if (id) next.set('span', id)
+          else next.delete('span')
+          return next
+        },
+        { replace: true }
+      )
+    },
+    [setSearchParams]
+  )
   const span = useMemo(
     () =>
       selectedSpanId
@@ -297,7 +323,15 @@ function useSpanSelection(flatSpans: SpanTreeNode[], correlatedLogs: LogRecord[]
 /** The trace Spans view: a service-coloured waterfall on the left and the
  *  selected span's detail on the right (full width when none is selected). */
 function SpansView(props: LayoutProps) {
-  const { flatSpans, traceStart, traceEnd, traceDuration, correlatedLogs } = props
+  const {
+    flatSpans,
+    traceStart,
+    traceEnd,
+    traceDuration,
+    correlatedLogs,
+    renderRowBadge,
+    rowClassName,
+  } = props
   const { selectedSpanId, setSelectedSpanId, span, logs } = useSpanSelection(
     flatSpans,
     correlatedLogs
@@ -324,6 +358,8 @@ function SpansView(props: LayoutProps) {
             selectedSpanId={selectedSpanId}
             onSelect={setSelectedSpanId}
             colorBy="service"
+            renderRowBadge={renderRowBadge}
+            rowClassName={rowClassName}
             className="h-[400px] sm:h-[600px]"
           />
         </CardContent>
@@ -371,16 +407,19 @@ function SpansView(props: LayoutProps) {
   )
 }
 
-/** ADR-027 Phase 1/2 banner: surfaces sibling projects that share this
- *  trace_id, plus a prominent link into the unified cross-project waterfall. */
-function CrossProjectBanner({
+/** ADR-027: a trace that spans multiple projects. Surfaces the sibling projects
+ *  and an inline switch between "this project only" and the whole merged trace —
+ *  no navigation to a separate page; the choice lives in the `?view` param. */
+function CrossProjectBar({
   siblings,
   traceId,
-  onDismiss,
+  showUnified,
+  onSetView,
 }: {
   siblings: CrossProjectSiblingRef[]
   traceId: string
-  onDismiss: () => void
+  showUnified: boolean
+  onSetView: (v: 'project' | 'unified') => void
 }) {
   return (
     <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5 rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-blue-900 dark:border-blue-900/50 dark:bg-blue-900/10 dark:text-blue-200">
@@ -395,22 +434,34 @@ function CrossProjectBanner({
           {s.project_name}
         </Link>
       ))}
-      <div className="ml-auto flex items-center gap-1">
-        <Button asChild variant="outline" size="sm" className="gap-1.5">
-          <Link to={`/traces/global/${traceId}`}>
-            <Layers className="h-3.5 w-3.5" />
-            View unified trace
-          </Link>
-        </Button>
-        <Button
-          variant="ghost"
-          size="icon"
-          className="h-7 w-7 shrink-0"
-          onClick={onDismiss}
-          aria-label="Dismiss cross-project banner"
+      <div className="ml-auto inline-flex rounded-md border border-blue-300/60 bg-white/70 p-0.5 dark:border-blue-800 dark:bg-blue-950/40">
+        <button
+          type="button"
+          onClick={() => onSetView('project')}
+          aria-pressed={!showUnified}
+          className={cn(
+            'rounded px-2.5 py-1 text-xs font-medium transition-colors',
+            !showUnified
+              ? 'bg-blue-600 text-white'
+              : 'hover:bg-blue-100 dark:hover:bg-blue-900/50'
+          )}
         >
-          <X className="h-3.5 w-3.5" />
-        </Button>
+          This project
+        </button>
+        <button
+          type="button"
+          onClick={() => onSetView('unified')}
+          aria-pressed={showUnified}
+          className={cn(
+            'inline-flex items-center gap-1 rounded px-2.5 py-1 text-xs font-medium transition-colors',
+            showUnified
+              ? 'bg-blue-600 text-white'
+              : 'hover:bg-blue-100 dark:hover:bg-blue-900/50'
+          )}
+        >
+          <Layers className="h-3.5 w-3.5" />
+          Whole trace
+        </button>
       </div>
     </div>
   )
@@ -465,31 +516,87 @@ export default function TraceDetail({ project }: TraceDetailProps) {
     retry: false,
   })
   const siblings: CrossProjectSiblingRef[] = siblingsData?.siblings ?? []
-  const [bannerDismissed, setBannerDismissed] = useState(false)
 
-  const tree = useMemo(() => buildSpanTree(spans), [spans])
+  // Cross-project "whole trace" view. When this trace_id also has spans in other
+  // projects we default to the merged trace inline; `?view=project` collapses to
+  // just this project. The param keeps the view shareable and is written with
+  // `replace` so it never stacks history.
+  const [searchParams, setSearchParams] = useSearchParams()
+  const isCrossProject = siblings.length > 0
+  const showUnified = isCrossProject && searchParams.get('view') !== 'project'
+  const setView = useCallback(
+    (v: 'project' | 'unified') => {
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev)
+          next.set('view', v)
+          return next
+        },
+        { replace: true }
+      )
+    },
+    [setSearchParams]
+  )
+
+  const { data: unifiedData } = useQuery({
+    ...getUnifiedTraceOptions({ path: { trace_id: traceId || '' } }),
+    enabled: !!traceId && showUnified,
+    retry: false,
+  })
+  const usingUnified = showUnified && !!unifiedData
+
+  // Spans actually rendered: the whole cross-project trace when unified,
+  // otherwise just this project's spans.
+  const displaySpans: SpanRecord[] = usingUnified
+    ? (unifiedData?.spans ?? []).map((a) => a.span)
+    : spans
+
+  const projectById = useMemo(() => {
+    const m = new Map<number, ProjectRef>()
+    unifiedData?.projects.forEach((p) => m.set(p.project_id, p))
+    return m
+  }, [unifiedData])
+
+  const tree = useMemo(() => buildSpanTree(displaySpans), [displaySpans])
   const flatSpans = useMemo(() => flattenTree(tree), [tree])
 
   // Calculate trace-level timing for waterfall positioning
   const traceStart = useMemo(() => {
-    if (spans.length === 0) return 0
-    return Math.min(...spans.map((s) => new Date(s.start_time).getTime()))
-  }, [spans])
+    if (displaySpans.length === 0) return 0
+    return Math.min(...displaySpans.map((s) => new Date(s.start_time).getTime()))
+  }, [displaySpans])
 
   const traceEnd = useMemo(() => {
-    if (spans.length === 0) return 0
-    return Math.max(...spans.map((s) => new Date(s.end_time).getTime()))
-  }, [spans])
+    if (displaySpans.length === 0) return 0
+    return Math.max(...displaySpans.map((s) => new Date(s.end_time).getTime()))
+  }, [displaySpans])
 
   const traceDuration = traceEnd - traceStart
 
   // Shared props for every trace-detail layout variant (ui.sh picker below).
+  // In the unified view, tag each span with its project and de-emphasise spans
+  // that belong to other projects so the entry-point project stays legible.
   const layoutProps: LayoutProps = {
     flatSpans,
     traceStart,
     traceEnd,
     traceDuration,
     correlatedLogs,
+    renderRowBadge: usingUnified
+      ? (span) => (
+          <ProjectBadge
+            projectId={span.project_id}
+            name={
+              projectById.get(span.project_id)?.project_name ??
+              `Project ${span.project_id}`
+            }
+            className="shrink-0"
+          />
+        )
+      : undefined,
+    rowClassName: usingUnified
+      ? (span) => (span.project_id === project.id ? undefined : 'opacity-70')
+      : undefined,
   }
 
   // Services involved
@@ -501,10 +608,10 @@ export default function TraceDetail({ project }: TraceDetailProps) {
     return Array.from(set)
   }, [spans])
 
-  // Trace-level status: error if any span has ERROR, otherwise OK
+  // Trace-level status: error if any displayed span has ERROR, otherwise OK
   const hasError = useMemo(
-    () => spans.some((s) => s.status_code?.toUpperCase() === 'ERROR'),
-    [spans]
+    () => displaySpans.some((s) => s.status_code?.toUpperCase() === 'ERROR'),
+    [displaySpans]
   )
   const traceStatus = hasError ? 'ERROR' : 'OK'
 
@@ -617,48 +724,27 @@ export default function TraceDetail({ project }: TraceDetailProps) {
         </Button>
       </div>
 
-      {/* Summary cards */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-        <Card>
-          <CardContent className="p-3 sm:p-4">
-            <p className="text-xs text-muted-foreground mb-1">Duration</p>
-            <p className="text-lg font-semibold">
-              {formatDuration(traceDuration)}
-            </p>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="p-3 sm:p-4">
-            <p className="text-xs text-muted-foreground mb-1">Spans</p>
-            <p className="text-lg font-semibold">{spans.length}</p>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="p-3 sm:p-4">
-            <p className="text-xs text-muted-foreground mb-1">Services</p>
-            <p className="text-lg font-semibold">{services.length}</p>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="p-3 sm:p-4">
-            <p className="text-xs text-muted-foreground mb-1">Status</p>
-            <div className="flex items-center gap-2">
-              {statusIcon(traceStatus)}
-              <span className="text-lg font-semibold">
-                {hasError ? 'Error' : 'OK'}
-              </span>
-            </div>
-          </CardContent>
-        </Card>
-      </div>
+      {/* Summary badges (compact metric row instead of a heavy card grid). */}
+      <TraceStatBadges
+        durationMs={traceDuration}
+        spanCount={displaySpans.length}
+        projectCount={usingUnified ? unifiedData?.projects.length : undefined}
+        serviceCount={usingUnified ? undefined : services.length}
+        status={traceStatus}
+        errorCount={usingUnified ? unifiedData?.error_count : undefined}
+        redacted={usingUnified ? unifiedData?.has_redacted_spans : false}
+        truncated={usingUnified ? unifiedData?.truncated : false}
+      />
 
-      {/* Cross-project follow banner (ADR-027 Phase 1): this same trace_id has
-          spans in other projects. Purely additive; dismissible. */}
-      {siblings.length > 0 && !bannerDismissed && (
-        <CrossProjectBanner
+      {/* Cross-project view switch (ADR-027): this trace has spans in other
+          projects — toggle between this project and the whole merged trace,
+          inline (no navigation). The choice is in the shareable `?view` param. */}
+      {isCrossProject && (
+        <CrossProjectBar
           siblings={siblings}
           traceId={traceId || ''}
-          onDismiss={() => setBannerDismissed(true)}
+          showUnified={showUnified}
+          onSetView={setView}
         />
       )}
 
@@ -667,7 +753,9 @@ export default function TraceDetail({ project }: TraceDetailProps) {
         <TabsList>
           <TabsTrigger value="spans" className="gap-1.5">
             Spans
-            <span className="text-xs text-muted-foreground">{spans.length}</span>
+            <span className="text-xs text-muted-foreground">
+              {displaySpans.length}
+            </span>
           </TabsTrigger>
           <TabsTrigger value="logs" className="gap-1.5">
             Logs
