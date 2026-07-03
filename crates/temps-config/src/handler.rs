@@ -135,6 +135,10 @@ pub struct AppSettingsResponse {
     /// Whether `temps setup` has been run at least once. The web onboarding
     /// wizard checks this field on load and skips itself when true.
     pub setup_complete: bool,
+
+    /// When enabled, Admin-role accounts without MFA enrolled are rejected
+    /// at password login (bherila/temps#32). SSO/OIDC logins are unaffected.
+    pub require_mfa_for_admins: bool,
 }
 
 /// Monitoring settings with the ClickHouse DSN masked.
@@ -333,6 +337,7 @@ impl From<AppSettings> for AppSettingsResponse {
             monitoring: MonitoringSettingsMasked::from(settings.monitoring),
             insecure_tls: settings.insecure_tls,
             setup_complete: settings.setup_complete,
+            require_mfa_for_admins: settings.require_mfa_for_admins,
         }
     }
 }

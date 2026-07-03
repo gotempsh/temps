@@ -10,6 +10,20 @@ pub struct LoginAudit {
     pub login_method: String,
 }
 
+/// Recorded when a user completes a successful login while at least one
+/// other session for their account is already active (non-expired). This is
+/// purely observational -- it does NOT block the login (bherila/temps#24) --
+/// but gives an auditor/operator a trail to spot suspicious concurrent
+/// access (e.g. a stolen session token being used from a second location).
+#[derive(Debug, Clone, Serialize)]
+pub struct ConcurrentSessionDetectedAudit {
+    pub context: AuditContext,
+    pub login_method: String,
+    /// Number of other active sessions that already existed for this user
+    /// at the moment this login completed (not counting the new session).
+    pub existing_active_session_count: u64,
+}
+
 // User management audits
 #[derive(Debug, Clone, Serialize)]
 pub struct UserCreatedAudit {
@@ -198,6 +212,29 @@ impl AuditOperation for LoginAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+impl AuditOperation for ConcurrentSessionDetectedAudit {
+    fn operation_type(&self) -> String {
+        "CONCURRENT_SESSION_DETECTED".to_string()
+    }
+
+    fn user_id(&self) -> i32 {
+        self.context.user_id
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
     fn serialize(&self) -> Result<String> {
         serde_json::to_string(self)
             .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))

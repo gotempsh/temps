@@ -81,6 +81,20 @@ pub struct AppSettings {
     #[serde(default)]
     pub setup_complete: bool,
 
+    /// When `true`, any user holding the `Admin` role must have MFA enrolled
+    /// (`users.mfa_enabled = true`) to complete a **password** login. Users
+    /// without MFA enrolled are rejected with a typed error instructing them
+    /// to enroll before retrying. This only gates the password-login path
+    /// (`AuthService::login`) -- SSO/OIDC logins are handled by a separate
+    /// code path (`OidcService::resolve_user` + `oidc_handler`) and are
+    /// intentionally unaffected, since federating identity to a
+    /// properly-hardened IdP is itself an acceptable alternative to local
+    /// TOTP MFA. Modeled as a settings row (not an env var) per CLAUDE.md so
+    /// an operator can flip it at runtime via the Settings API without
+    /// restarting the binary.
+    #[serde(default)]
+    pub require_mfa_for_admins: bool,
+
     /// Binary version tag (e.g. "v0.1.0") of the *console* process
     /// (`temps serve`, role=all or role=console) that last started. Written
     /// on console startup; read by the standalone `temps proxy` to detect
@@ -677,6 +691,7 @@ impl Default for AppSettings {
             build_limits: BuildLimitsSettings::default(),
             monitoring: MonitoringSettings::default(),
             setup_complete: false,
+            require_mfa_for_admins: false,
             console_version: None,
         }
     }
@@ -916,5 +931,38 @@ mod tests {
         assert_eq!(back.on_demand_tls.max_concurrent, 5);
         assert_eq!(back.on_demand_tls.hourly_cap, 25);
         assert_eq!(back.on_demand_tls.deployment_url_mode, "redirect_to_env");
+    }
+
+    #[test]
+    fn require_mfa_for_admins_defaults_to_false() {
+        // MFA enforcement must be opt-in: an operator upgrading Temps should
+        // never suddenly get locked out of their own Admin account because a
+        // new default flipped a login-blocking setting on.
+        let s = AppSettings::default();
+        assert!(!s.require_mfa_for_admins);
+    }
+
+    #[test]
+    fn legacy_settings_json_without_require_mfa_for_admins_deserializes() {
+        // A `settings.data` row written before this feature shipped has no
+        // `require_mfa_for_admins` key. `#[serde(default)]` must fill it in
+        // with `false` so pre-migration rows keep loading and don't
+        // retroactively lock out admins who never enrolled MFA.
+        let legacy = serde_json::json!({
+            "external_url": "https://paas.example.com",
+            "preview_domain": "localho.st"
+        });
+        let parsed = AppSettings::from_json(legacy);
+        assert!(!parsed.require_mfa_for_admins);
+    }
+
+    #[test]
+    fn require_mfa_for_admins_round_trips_through_json() {
+        let mut s = AppSettings::default();
+        s.require_mfa_for_admins = true;
+
+        let json = s.to_json();
+        let back = AppSettings::from_json(json);
+        assert!(back.require_mfa_for_admins);
     }
 }
