@@ -1085,7 +1085,9 @@ mod tests {
         assert!(rotated.api_key.starts_with("tk_"));
 
         // The old secret must no longer authenticate ...
-        let old_result = api_key_service.validate_api_key(&create_response.api_key).await;
+        let old_result = api_key_service
+            .validate_api_key(&create_response.api_key)
+            .await;
         assert!(old_result.is_err());
         assert!(matches!(
             old_result.unwrap_err(),

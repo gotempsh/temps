@@ -151,11 +151,8 @@ impl AuthMiddleware {
                                     key_name,
                                     key_id
                                 );
-                                let problem: Problem = McpAccessError::Disabled {
-                                    key_name,
-                                    key_id,
-                                }
-                                .into();
+                                let problem: Problem =
+                                    McpAccessError::Disabled { key_name, key_id }.into();
                                 return Ok(problem.into_response());
                             }
 
