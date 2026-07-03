@@ -357,11 +357,16 @@ fn html_escape(s: &str) -> String {
 }
 
 /// Escape Slack mrkdwn special characters so user-controlled text cannot inject
-/// hyperlinks (`<url|text>`), `<!channel>` mention floods, or `&entity;` refs.
+/// hyperlinks (`<url|text>`), `<!channel>` mention floods, `&entity;` refs, or
+/// forge bold/italic/code/strikethrough formatting.
 fn slack_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+        .replace('*', "\\*")
+        .replace('_', "\\_")
+        .replace('`', "\\`")
+        .replace('~', "\\~")
 }
 
 #[async_trait]
@@ -2990,6 +2995,12 @@ mod tests {
             "&lt;https://evil.example|Click here&gt;"
         );
         assert_eq!(slack_escape("&amp;"), "&amp;amp;");
+        // mrkdwn formatting characters must not let user text forge emphasis or
+        // code blocks (e.g. a bolded fake severity, or a `DROP TABLE` code block).
+        assert_eq!(slack_escape("*bold*"), "\\*bold\\*");
+        assert_eq!(slack_escape("_italic_"), "\\_italic\\_");
+        assert_eq!(slack_escape("`code`"), "\\`code\\`");
+        assert_eq!(slack_escape("~strike~"), "\\~strike\\~");
     }
 
     #[test]

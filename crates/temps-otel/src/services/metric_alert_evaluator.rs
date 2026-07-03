@@ -341,7 +341,10 @@ fn fmt_compact(v: f64) -> String {
     }
 }
 
-/// Escape text for inline SVG `<text>` content.
+/// Escape text for inline SVG `<text>` element content only — `"`/`'` are
+/// intentionally left unescaped since only `&`/`<`/`>` are special in element
+/// content. Do not reuse this for an SVG attribute value (e.g. `<text x="...">`),
+/// which also needs quotes escaped.
 fn svg_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")

@@ -550,13 +550,20 @@ pub async fn delete_alert(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, OtelWrite);
 
+    // Verify ownership FIRST (404s if `id` isn't in `scope.project_id`): the
+    // evaluator's in-memory maps below are keyed only by `rule_id`, not
+    // `project_id`, so calling resolve_all_for_rule before this check would let
+    // a caller with OtelWrite on their own project wipe another project's
+    // per-series firing state just by guessing a foreign rule_id.
+    let rule = state.metric_alert_service.get(scope.project_id, id).await?;
+
     // Resolve any open alarms (aggregate or per-series) and drop the evaluator's
     // in-memory state for this rule BEFORE removing the row: once the row is gone
     // the evaluator never runs for it again, so an open alarm would be orphaned as
     // permanently `firing`. Fire-and-forget — never blocks or fails the delete.
     state
         .metric_alert_evaluator
-        .resolve_all_for_rule(id, scope.project_id)
+        .resolve_all_for_rule(rule.id, rule.project_id)
         .await;
 
     state

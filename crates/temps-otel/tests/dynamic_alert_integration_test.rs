@@ -14,17 +14,25 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::extract::{Extension, Path, Query, State};
+use axum::http::{HeaderMap, StatusCode};
 use chrono::Utc;
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
 
+use temps_auth::{AuthContext, RequireAuth, Role};
+use temps_core::RequestMetadata;
 use temps_monitoring::{AlarmService, AlarmStatus};
 use temps_otel::detectors::{Comparator, DetectionConfig, StaticParams};
+use temps_otel::handlers::metric_alert_handler::{delete_alert, MetricAlertScopeParams};
 use temps_otel::ingest::auth::OtelAuthService;
 use temps_otel::ingest::rate_limit::RateLimiter;
-use temps_otel::services::{MetricAlertEvaluator, MetricAlertService, OtelService};
+use temps_otel::services::{
+    MetricAlertEvaluator, MetricAlertService, MetricDashboardService, OtelService,
+};
 use temps_otel::storage::timescaledb::TimescaleDbStorage;
 use temps_otel::storage::OtelStorage;
 use temps_otel::types::{MetricPoint, MetricType, ResourceInfo};
+use temps_otel::OtelAppState;
 
 /// The per-series breach must persist for `for_duration_secs` before firing. With
 /// `for_duration_secs == 1`, the first `run_cycle` only arms the breach timer
@@ -85,6 +93,20 @@ impl temps_core::jobs::JobReceiver for NoOpJobReceiver {
     }
 }
 
+/// No-op audit logger so `OtelAppState` can be built for the handler-level
+/// regression test below without a real audit service.
+struct NoOpAuditLogger;
+
+#[async_trait::async_trait]
+impl temps_core::AuditLogger for NoOpAuditLogger {
+    async fn create_audit_log(
+        &self,
+        _operation: &dyn temps_core::AuditOperation,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
 /// Everything an evaluator test needs: the live DB (kept alive for schema
 /// cleanup on drop), the evaluator under test, the alert service for rule CRUD,
 /// the storage for seeding metrics, and the project the rows are scoped to.
@@ -93,6 +115,7 @@ struct EvaluatorTestCtx {
     db: Arc<sea_orm::DatabaseConnection>,
     evaluator: Arc<MetricAlertEvaluator>,
     alert_service: Arc<MetricAlertService>,
+    otel_service: Arc<OtelService>,
     storage: Arc<TimescaleDbStorage>,
     project_id: i32,
 }
@@ -173,7 +196,7 @@ async fn setup_evaluator() -> Option<EvaluatorTestCtx> {
 
     let evaluator = Arc::new(MetricAlertEvaluator::new(
         alert_service.clone(),
-        otel_service,
+        otel_service.clone(),
         alarm_service,
         alarm_service_dynamic,
         db.clone(),
@@ -185,6 +208,7 @@ async fn setup_evaluator() -> Option<EvaluatorTestCtx> {
         db,
         evaluator,
         alert_service,
+        otel_service,
         storage,
         project_id: project.id,
     })
@@ -526,5 +550,196 @@ async fn test_grouped_non_dynamic_fires_single_aggregate_alarm() {
         Some(true),
         "collapse path must not flag the alarm is_dynamic: {:?}",
         alarm.metadata
+    );
+}
+
+// ── delete_alert cross-project ownership check ──────────────────────────
+
+/// Bare-bones `RequestMetadata` for a direct handler call — the delete path
+/// doesn't read any field beyond what's needed for the audit log.
+fn test_request_metadata() -> RequestMetadata {
+    RequestMetadata {
+        ip_address: "127.0.0.1".to_string(),
+        user_agent: "integration-test".to_string(),
+        headers: HeaderMap::new(),
+        visitor_id_cookie: None,
+        session_id_cookie: None,
+        base_url: "http://localhost".to_string(),
+        scheme: "http".to_string(),
+        host: "localhost".to_string(),
+        is_secure: false,
+    }
+}
+
+/// Regression test for the cross-project IDOR fixed in `delete_alert`
+/// (`crates/temps-otel/src/handlers/metric_alert_handler.rs`): the handler used
+/// to call `metric_alert_evaluator.resolve_all_for_rule(id, scope.project_id)`
+/// BEFORE verifying `id` belongs to `scope.project_id`. Since the evaluator's
+/// in-memory firing maps are keyed only by `rule_id` (never `project_id`), an
+/// attacker with `OtelWrite` on their OWN project could clear another
+/// project's dynamic rule's per-series firing state just by passing that
+/// rule's id with their own project_id in the query string — before the
+/// service-layer delete ever got a chance to 404. Calls the handler directly
+/// (bypassing HTTP/axum routing, which axum's tuple-struct extractors allow)
+/// so the exact fixed code path runs.
+#[tokio::test]
+async fn test_delete_alert_rejects_cross_project_rule_id_before_touching_evaluator_state() {
+    let Some(ctx) = setup_evaluator().await else {
+        return;
+    };
+    let metric = "http.request.latency";
+
+    // A second, unrelated project — the "attacker's own" project in this
+    // scenario, distinct from `ctx.project_id` which owns the rule under attack.
+    let attacker_project = temps_entities::projects::ActiveModel {
+        name: Set("Attacker Project".into()),
+        repo_name: Set("attacker-repo".into()),
+        repo_owner: Set("attacker-org".into()),
+        directory: Set("/".into()),
+        main_branch: Set("main".into()),
+        preset: Set(temps_entities::preset::Preset::Dockerfile),
+        slug: Set("attacker-project".into()),
+        is_deleted: Set(false),
+        is_public_repo: Set(false),
+        attack_mode: Set(false),
+        enable_preview_environments: Set(false),
+        ..Default::default()
+    }
+    .insert(ctx.db.as_ref())
+    .await
+    .expect("insert attacker project");
+
+    let attacker_user = temps_entities::users::ActiveModel {
+        name: Set("Attacker".into()),
+        email: Set("attacker@test.local".into()),
+        password_hash: Set(Some("not_real".into())),
+        email_verified: Set(true),
+        mfa_enabled: Set(false),
+        ..Default::default()
+    }
+    .insert(ctx.db.as_ref())
+    .await
+    .expect("insert attacker user");
+
+    // A dynamic rule owned by `ctx.project_id`, driven to a real firing state
+    // exactly like `test_dynamic_alert_fires_then_resolves_per_series`.
+    ctx.storage
+        .store_metrics(vec![method_gauge(ctx.project_id, metric, "GET", 100.0)])
+        .await
+        .expect("seed metrics");
+
+    let rule = ctx
+        .alert_service
+        .create(
+            ctx.project_id,
+            "Victim per-series rule".to_string(),
+            metric.to_string(),
+            "avg".to_string(),
+            static_gt(50.0),
+            120,
+            1,
+            "warning".to_string(),
+            true,
+            vec![],
+            vec!["method".to_string()],
+            true,
+            20,
+            5,
+        )
+        .await
+        .expect("create victim rule");
+
+    ctx.evaluator.run_cycle().await.expect("cycle 1");
+    tokio::time::sleep(BREACH_PERSIST_WAIT).await;
+    ctx.evaluator.run_cycle().await.expect("cycle 2");
+
+    let firing_before = ctx.evaluator.firing_series_for(rule.id).await;
+    assert_eq!(
+        firing_before.len(),
+        1,
+        "victim rule must be firing before the attack"
+    );
+    let alarm_before = alarms_for(&ctx.db, ctx.project_id)
+        .await
+        .into_iter()
+        .find(|a| series_label_of(a).as_deref() == Some("method=GET"))
+        .expect("victim alarm exists");
+    assert_eq!(alarm_before.status, AlarmStatus::Firing.as_str());
+
+    // Build the same `OtelAppState` the real router constructs, so the handler
+    // runs exactly as it does in production.
+    let dashboard_service = Arc::new(MetricDashboardService::new(ctx.db.clone()));
+    let app_state = OtelAppState {
+        otel_service: ctx.otel_service.clone(),
+        metrics_store: None,
+        metrics_write_tx: None,
+        dashboard_service,
+        metric_alert_service: ctx.alert_service.clone(),
+        metric_alert_evaluator: ctx.evaluator.clone(),
+        audit_service: Arc::new(NoOpAuditLogger),
+    };
+
+    let attacker_auth = AuthContext::new_session(attacker_user, Role::Admin);
+
+    // The attack: DELETE the victim's rule_id, scoped to the attacker's own
+    // (different) project_id.
+    let result = delete_alert(
+        RequireAuth(attacker_auth),
+        State(app_state),
+        Extension(test_request_metadata()),
+        Path(rule.id),
+        Query(MetricAlertScopeParams {
+            project_id: attacker_project.id,
+        }),
+    )
+    .await;
+
+    // `delete_alert` returns `Result<impl IntoResponse, Problem>` — the Ok type
+    // is opaque to callers (no `Debug`), so match instead of `.expect_err()`.
+    let err = match result {
+        Ok(_) => panic!("cross-project delete must be rejected, not silently succeed"),
+        Err(e) => e,
+    };
+    assert_eq!(
+        err.status_code,
+        StatusCode::NOT_FOUND,
+        "cross-project delete must 404, not leak whether the rule exists"
+    );
+
+    // The critical assertion: the victim's evaluator state and DB alarm must be
+    // completely untouched by the rejected attempt.
+    let firing_after = ctx.evaluator.firing_series_for(rule.id).await;
+    assert_eq!(
+        firing_after.len(),
+        1,
+        "rejected cross-project delete must NOT clear the victim rule's firing state"
+    );
+    let rule_after = ctx
+        .alert_service
+        .get(ctx.project_id, rule.id)
+        .await
+        .expect("victim rule must still exist");
+    assert_eq!(rule_after.last_state, "firing");
+    let db_alarm_after = alarms_for(&ctx.db, ctx.project_id)
+        .await
+        .into_iter()
+        .find(|a| series_label_of(a).as_deref() == Some("method=GET"))
+        .expect("victim alarm must still exist");
+    assert_eq!(
+        db_alarm_after.status,
+        AlarmStatus::Firing.as_str(),
+        "rejected cross-project delete must NOT resolve the victim's alarm"
+    );
+
+    // Sanity check: the real owner (correct project_id) can still delete it via
+    // the exact same handler — proving the 404 above was a genuine ownership
+    // check, not a bug that blocks deletes outright.
+    ctx.evaluator
+        .resolve_all_for_rule(rule.id, ctx.project_id)
+        .await;
+    let legit_result = ctx.alert_service.delete(ctx.project_id, rule.id).await;
+    assert!(
+        legit_result.is_ok(),
+        "the rule's real owner must still be able to delete it: {legit_result:?}"
     );
 }
