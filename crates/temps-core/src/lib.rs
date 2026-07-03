@@ -92,3 +92,11 @@ pub use workflow_memory::{
 
 // Re-export standard datetime type for use across all crates
 pub use types::UtcDateTime;
+
+#[cfg(test)]
+mod ci_pipeline_fail_on_test_verification {
+    #[test]
+    fn deliberately_fails_to_verify_ci_catches_it() {
+        panic!("intentional failure to verify CI fails the pipeline");
+    }
+}
