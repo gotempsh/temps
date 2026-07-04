@@ -1714,6 +1714,30 @@ impl ExternalServiceManager {
         let mut service_update: external_services::ActiveModel = service.clone().into();
         service_update.config = Set(Some(encrypted_config));
         if let Some(new_name) = request.name {
+            if new_name != service.name {
+                // The running container is identified by the service's
+                // current (pre-rename) name (see create_service_instance).
+                // initialize_service() below rebuilds its stop-then-recreate
+                // instance from whatever name is in the DB at that point --
+                // if we persist the rename first, it looks for a container
+                // under the *new* name, finds nothing, and the still-running
+                // old container is left holding the host port, so the new
+                // container's start fails with "port is already allocated".
+                // Stop the old container by its pre-rename identity first.
+                let service_type_enum = ServiceType::from_str(&service.service_type)
+                    .map_err(|_| ExternalServiceError::InvalidServiceType {
+                        id: service_id,
+                        service_type: service.service_type.clone(),
+                    })?;
+                let old_instance =
+                    self.create_service_instance(service.name.clone(), service_type_enum);
+                if let Err(e) = old_instance.stop().await {
+                    info!(
+                        "Could not stop pre-rename container for service {} (may not exist): {}",
+                        service_id, e
+                    );
+                }
+            }
             let new_slug = Self::generate_slug(&new_name);
             service_update.name = Set(new_name);
             service_update.slug = Set(Some(new_slug));
