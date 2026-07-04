@@ -125,6 +125,7 @@ impl SharedContainer {
             .with_env_var("POSTGRES_USER", username)
             .with_env_var("POSTGRES_PASSWORD", password)
             .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+            .with_cmd(TIMESCALEDB_NO_BACKGROUND_WORKERS_CMD)
             .start()
             .await?;
 
@@ -145,6 +146,25 @@ impl SharedContainer {
         })
     }
 }
+
+/// Every migration-driven test creates its own hypertables/continuous
+/// aggregates (with refresh policies) in a fresh, short-lived schema.
+/// TimescaleDB's background worker launcher polls for due jobs every
+/// ~60s (`timescaledb.bgw_launcher_poll_time`) and, if its scan happens to
+/// land while one of those schemas is still alive, launches a real
+/// background worker to refresh it -- a second Postgres backend racing the
+/// test's own foreground transaction. That's a plausible root cause of the
+/// Postgres deadlocks (40P01) observed even under full test serialization
+/// (confirmed: a background job did execute mid-test-run against a fresh
+/// container). Tests never rely on a background refresh actually firing
+/// (job timing isn't something a test could deterministically wait on
+/// anyway), so disabling the launcher entirely removes the race with no
+/// loss of coverage. This only affects test containers, not migrations
+/// themselves -- `max_background_workers=0` still allows `CREATE
+/// EXTENSION`/`create_hypertable`/`add_continuous_aggregate_policy` to
+/// succeed, it just means no worker ever executes the scheduled jobs.
+const TIMESCALEDB_NO_BACKGROUND_WORKERS_CMD: [&str; 3] =
+    ["postgres", "-c", "timescaledb.max_background_workers=0"];
 
 /// Test database setup with TimescaleDB container
 pub struct TestDatabase {
@@ -496,6 +516,7 @@ impl TestDatabase {
             .with_env_var("POSTGRES_USER", username)
             .with_env_var("POSTGRES_PASSWORD", password)
             .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+            .with_cmd(TIMESCALEDB_NO_BACKGROUND_WORKERS_CMD)
             .start()
             .await?;
 
