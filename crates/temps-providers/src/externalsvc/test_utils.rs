@@ -49,6 +49,17 @@ mod docker_utils {
 
             println!("Starting MinIO container on port {}...", port);
 
+            // Join the same app network the real Postgres/Redis/S3/MongoDB
+            // service containers use (see `ensure_network_exists`) so
+            // `S3Credentials::resolve_endpoint_for_container` can find this
+            // container by name and resolve a proper container-to-container
+            // address, instead of falling back to `host.docker.internal`
+            // (unreliable/unset on Linux without an explicit host-gateway
+            // mapping, which is exactly what caused backup tests to hang).
+            crate::utils::ensure_network_exists(&docker)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to ensure network exists: {:?}", e))?;
+
             // Pull MinIO image
             let mut pull_stream = docker.create_image(
                 Some(CreateImageOptions {
@@ -84,6 +95,12 @@ mod docker_utils {
                         }]),
                     )])),
                     ..Default::default()
+                }),
+                networking_config: Some(bollard::models::NetworkingConfig {
+                    endpoints_config: Some(HashMap::from([(
+                        temps_core::NETWORK_NAME.to_string(),
+                        bollard::models::EndpointSettings::default(),
+                    )])),
                 }),
                 ..Default::default()
             };
@@ -195,16 +212,24 @@ mod docker_utils {
         /// Build S3Credentials from the test container's configuration.
         /// In tests, credentials are plaintext (not encrypted).
         ///
-        /// Uses `host.docker.internal` instead of `localhost` because these credentials
-        /// are passed as environment variables to WAL-G running *inside* Docker containers.
-        /// From inside a container, `localhost` refers to the container itself, not the host
-        /// where MinIO is exposed. `host.docker.internal` resolves to the host on Docker Desktop.
+        /// Uses `localhost`, matching `s3_source.endpoint` above — these
+        /// credentials are passed to WAL-G running *inside* a Docker
+        /// container, and `run_walg_backup_push` resolves the endpoint via
+        /// `S3Credentials::resolve_endpoint_for_container` before use. That
+        /// resolver specifically detects `localhost`/`127.0.0.1` and looks up
+        /// this MinIO container by name on the shared app network (see
+        /// `ensure_network_exists` above), only falling back to
+        /// `host.docker.internal` if it can't find it. Hardcoding
+        /// `host.docker.internal` here bypassed that lookup entirely and
+        /// relied on a hostname that isn't reliably resolvable on Linux
+        /// without an explicit host-gateway mapping — the root cause of
+        /// backup tests hanging indefinitely on CI.
         pub fn s3_credentials(&self) -> super::super::S3Credentials {
             super::super::S3Credentials {
                 access_key_id: self.access_key.clone(),
                 secret_key: self.secret_key.clone(),
                 region: "us-east-1".to_string(),
-                endpoint: Some(format!("http://host.docker.internal:{}", self.port)),
+                endpoint: Some(format!("http://localhost:{}", self.port)),
                 bucket_name: self.bucket_name.clone(),
                 bucket_path: "".to_string(),
                 force_path_style: true,

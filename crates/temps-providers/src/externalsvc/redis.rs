@@ -148,7 +148,7 @@ fn example_docker_image() -> &'static str {
     "gotempsh/redis-walg:8-bookworm"
 }
 
-use super::port_util::find_available_port;
+use super::port_util::{find_available_port, find_available_port_async, is_port_conflict_error};
 
 pub struct RedisService {
     name: String,
@@ -227,7 +227,55 @@ impl RedisService {
         format!("redis-{}", self.name)
     }
 
+    /// Creates and starts the Redis container, retrying with a fresh host
+    /// port if the chosen one lost the race described in `port_util` docs
+    /// (bindable when we checked, but taken by the time Docker actually binds
+    /// it). The container name is deterministic, so a failed attempt must be
+    /// removed before retrying or the next attempt's "already exists" check
+    /// short-circuits without picking a new port.
     async fn create_container(
+        &self,
+        docker: &Docker,
+        config: &RedisConfig,
+        password: &str,
+        resource_limits: &ServiceResourceLimits,
+    ) -> Result<()> {
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut attempt_config = config.clone();
+        for attempt in 1..=MAX_ATTEMPTS {
+            match self
+                .create_container_once(docker, &attempt_config, password, resource_limits)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) if attempt < MAX_ATTEMPTS && is_port_conflict_error(&e.to_string()) => {
+                    warn!(
+                        "Port {} for Redis container was already allocated (attempt {}/{}), retrying with a fresh port: {}",
+                        attempt_config.port, attempt, MAX_ATTEMPTS, e
+                    );
+                    let _ = docker
+                        .remove_container(
+                            &self.get_container_name(),
+                            Some(bollard::query_parameters::RemoveContainerOptions {
+                                force: true,
+                                ..Default::default()
+                            }),
+                        )
+                        .await;
+                    let base_port: u16 = attempt_config.port.parse().unwrap_or(6379);
+                    if let Some(new_port) =
+                        find_available_port_async(docker, base_port.wrapping_add(1)).await
+                    {
+                        attempt_config.port = new_port.to_string();
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        unreachable!("loop always returns Ok or Err before exhausting MAX_ATTEMPTS")
+    }
+
+    async fn create_container_once(
         &self,
         docker: &Docker,
         config: &RedisConfig,
@@ -733,6 +781,16 @@ impl RedisService {
             "chown -R redis:redis /data/appendonlydir && ",
             "echo 'Restore helper completed successfully'"
         );
+        // Join the same app network the original Redis container uses (see
+        // `create_container_once`/`ensure_network_exists`). Without this the
+        // helper only gets Docker's default bridge network, so the S3
+        // endpoint we just resolved via `resolve_endpoint_for_container`
+        // (relative to the *original* container's network) is unreachable
+        // from inside it — wal-g's fetch then hangs indefinitely trying to
+        // resolve/connect to a host it has no network path to.
+        ensure_network_exists(&self.docker)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to ensure network exists: {:?}", e))?;
         let helper_config = ContainerCreateBody {
             image: Some(redis_image),
             cmd: Some(vec![
@@ -744,6 +802,12 @@ impl RedisService {
             host_config: Some(HostConfig {
                 volumes_from: Some(vec![container_name.clone()]),
                 ..Default::default()
+            }),
+            networking_config: Some(bollard::models::NetworkingConfig {
+                endpoints_config: Some(HashMap::from([(
+                    temps_core::NETWORK_NAME.to_string(),
+                    bollard::models::EndpointSettings::default(),
+                )])),
             }),
             ..Default::default()
         };
@@ -769,16 +833,43 @@ impl RedisService {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to start restore helper container: {}", e))?;
 
-        // Wait for helper to finish
+        // Wait for helper to finish. Bounded — unlike `run_exec`'s exec-based
+        // path, this waits on the container-level Docker API directly with no
+        // other timeout backstop; leaving it unbounded means a stuck helper
+        // container hangs until the *caller's* outer timeout eventually
+        // fires, with none of the diagnostics `run_exec` provides.
         use futures::StreamExt;
-        let wait_result = self
-            .docker
-            .wait_container(
-                &helper.id,
-                None::<bollard::query_parameters::WaitContainerOptions>,
-            )
-            .next()
-            .await;
+        let wait_result = match tokio::time::timeout(
+            REDIS_BACKUP_EXEC_TIMEOUT,
+            self.docker
+                .wait_container(
+                    &helper.id,
+                    None::<bollard::query_parameters::WaitContainerOptions>,
+                )
+                .next(),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                let _ = self
+                    .docker
+                    .remove_container(
+                        &helper.id,
+                        Some(bollard::query_parameters::RemoveContainerOptions {
+                            force: true,
+                            v: false,
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
+                return Err(anyhow::anyhow!(
+                    "WAL-G backup-fetch helper for container '{}' did not exit within {:?}",
+                    container_name,
+                    REDIS_BACKUP_EXEC_TIMEOUT
+                ));
+            }
+        };
 
         // Capture helper container logs before cleanup for diagnostics
         let log_output = {
@@ -2311,14 +2402,18 @@ mod tests {
         // loudly with a diagnostic instead of stalling the CI runner for 90 min.
         // See incident: GitHub run 25806816492 (PR #89) burned 90 min on this
         // test because blocking redis APIs starved the tokio worker pool.
-        const TEST_TIMEOUT: Duration = Duration::from_secs(180);
+        // 300s to match the sibling postgres/mongodb backup-and-restore tests,
+        // which do the same MinIO + container-lifecycle + WAL-G/dump work —
+        // 180s was too tight and flaked under normal CI load (see GitHub run
+        // 28684634260), not an actual hang.
+        const TEST_TIMEOUT: Duration = Duration::from_secs(300);
         // Per-Redis-operation timeout. ConnectionManager retries internally,
         // so this needs only cover the cold-start window of the container.
         const REDIS_OP_TIMEOUT: Duration = Duration::from_secs(30);
 
         tokio::time::timeout(TEST_TIMEOUT, run_redis_backup_and_restore_to_s3(REDIS_OP_TIMEOUT))
             .await
-            .expect("test_redis_backup_and_restore_to_s3 exceeded 180s — likely hung on Redis/Docker/S3 wait");
+            .expect("test_redis_backup_and_restore_to_s3 exceeded 300s — likely hung on Redis/Docker/S3 wait");
     }
 
     /// Body of `test_redis_backup_and_restore_to_s3`, extracted so the outer

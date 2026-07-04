@@ -775,6 +775,10 @@ test(providers): add Redis connection timeout tests
 
 Types: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `revert`
 
+**Every commit on a PR branch is checked**, not just the final one — the `Changelog` workflow validates the full `base..HEAD` range and fails the whole PR if any single commit's subject doesn't conform.
+
+`git revert` defaults to a non-conventional subject (`Revert "original message"`). Never accept that default — always pass an explicit conventional message, e.g. `git revert --no-edit` then `git commit --amend -m "test: drop temporary failing test"`, or better, pass `-m` directly on the revert itself.
+
 ---
 
 ## Workspace Structure

@@ -2146,8 +2146,12 @@ mod tests {
     //
     // Containers required:
     //   - ghcr.io/letsencrypt/pebble-challtestsrv — DNS sidecar; we program it
-    //     to return the Docker host IP (192.168.65.254 on macOS Docker Desktop)
-    //     for the test hostname so Pebble's VA finds our responder.
+    //     to return Docker's `host-gateway` address (resolved at runtime via
+    //     `resolve_host_gateway_ip`, NOT hardcoded — it's a macOS/Windows
+    //     Docker Desktop VM address on those platforms but a native Linux
+    //     bridge gateway in CI, and hardcoding the macOS value broke this
+    //     test on Linux CI) for the test hostname so Pebble's VA finds our
+    //     responder.
     //   - ghcr.io/letsencrypt/pebble — ACME CA; configured with a custom config
     //     that points httpPort at the port our axum responder binds on, and uses
     //     challtestsrv as its DNS resolver.
@@ -2160,6 +2164,117 @@ mod tests {
         let docker = bollard::Docker::connect_with_defaults().ok()?;
         docker.ping().await.ok()?;
         Some(docker)
+    }
+
+    /// Resolve what Docker's `host-gateway` special value (used by the
+    /// Pebble container's `with_host` call below) actually resolves to on
+    /// this platform, by asking Docker itself instead of guessing. Docker
+    /// Desktop's macOS/Windows VM gateway is a different address than a
+    /// native Linux bridge network's own gateway — a plain
+    /// `inspect_network`/IPAM lookup gives the latter, which is only
+    /// reachable from the host on native Linux, not through the VM on
+    /// macOS/Windows. Docker bakes the resolved `host-gateway` address
+    /// straight into a new container's `/etc/hosts` at creation time — the
+    /// same mechanism Pebble uses — so a disposable helper container that
+    /// reads its own `/etc/hosts` back gets the exact address, on any
+    /// platform.
+    async fn resolve_host_gateway_ip(docker: &bollard::Docker, network_name: &str) -> String {
+        use futures_util::stream::StreamExt;
+
+        let image = "busybox";
+        let tag = "stable";
+        docker
+            .create_image(
+                Some(bollard::query_parameters::CreateImageOptions {
+                    from_image: Some(image.to_string()),
+                    tag: Some(tag.to_string()),
+                    ..Default::default()
+                }),
+                None,
+                None,
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("Failed to pull busybox image for host-gateway probe");
+
+        let container_name = format!("host-gateway-probe-{}", uuid::Uuid::new_v4().simple());
+        let container = docker
+            .create_container(
+                Some(
+                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                        .name(&container_name)
+                        .build(),
+                ),
+                bollard::models::ContainerCreateBody {
+                    image: Some(format!("{image}:{tag}")),
+                    cmd: Some(vec!["cat".to_string(), "/etc/hosts".to_string()]),
+                    host_config: Some(bollard::models::HostConfig {
+                        extra_hosts: Some(vec!["host.docker.internal:host-gateway".to_string()]),
+                        network_mode: Some(network_name.to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("Failed to create host-gateway probe container");
+
+        docker
+            .start_container(
+                &container.id,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await
+            .expect("Failed to start host-gateway probe container");
+
+        docker
+            .wait_container(
+                &container.id,
+                None::<bollard::query_parameters::WaitContainerOptions>,
+            )
+            .next()
+            .await
+            .expect("host-gateway probe container produced no exit event")
+            .expect("host-gateway probe container wait failed");
+
+        let mut logs_stream = docker.logs(
+            &container.id,
+            Some(bollard::query_parameters::LogsOptions {
+                stdout: true,
+                stderr: true,
+                ..Default::default()
+            }),
+        );
+        let mut logs = String::new();
+        while let Some(chunk) = logs_stream.next().await {
+            logs.push_str(&chunk.expect("host-gateway probe logs error").to_string());
+        }
+
+        // Remove only after logs are captured — `auto_remove` races the
+        // subsequent `logs()` call and can make Docker respond with "dead or
+        // marked for removal" before we've read the output.
+        let _ = docker
+            .remove_container(
+                &container.id,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+
+        logs.lines()
+            .find_map(|line| {
+                let mut parts = line.split_whitespace();
+                let ip = parts.next()?;
+                parts.find(|host| *host == "host.docker.internal")?;
+                Some(ip.to_string())
+            })
+            .unwrap_or_else(|| {
+                panic!("host.docker.internal not found in probe container's /etc/hosts: {logs}")
+            })
     }
 
     /// Build a Pebble JSON config that sets httpPort to `http_port` and
@@ -2175,8 +2290,9 @@ mod tests {
                 "privateKey": "test/certs/localhost/key.pem",
                 // httpPort: where Pebble's VA sends HTTP-01 GET requests.
                 // Must match the port our axum responder listens on (as seen
-                // from inside the Pebble container, so it's the host port
-                // exposed via host-gateway / 192.168.65.254).
+                // from inside the Pebble container via the resolved
+                // `resolve_host_gateway_ip` address, i.e. Docker's
+                // host-gateway address).
                 "httpPort": http_port,
                 "tlsPort": 5001,
                 "ocspResponderURL": "",
@@ -2286,9 +2402,6 @@ mod tests {
         let responder_listener =
             std::net::TcpListener::bind("0.0.0.0:0").expect("Cannot bind challenge responder");
         let responder_port = responder_listener.local_addr().unwrap().port();
-        // The host-gateway IP as seen from Docker containers on macOS Docker Desktop.
-        // Pebble's VA will connect to this IP:responder_port to validate the challenge.
-        let host_gateway_ip = "192.168.65.254";
 
         // ── 1b. Shared Docker network for Pebble ↔ challtestsrv DNS ───────────
         // Pebble's VA resolves the challenge hostname through challtestsrv's DNS
@@ -2340,6 +2453,13 @@ mod tests {
             "challtestsrv mgmt port: {} (DNS reached via network '{}' alias '{}:8053')",
             challtestsrv_mgmt_port, network_name, challtestsrv_alias
         );
+
+        // Now that challtestsrv has started (creating the shared bridge
+        // network), resolve what Docker's host-gateway address actually is
+        // on this platform — see `resolve_host_gateway_ip` docs for why this
+        // can't be hardcoded or derived from the network's own IPAM gateway.
+        let host_gateway_ip = resolve_host_gateway_ip(&docker, &network_name).await;
+        println!("Resolved Docker host-gateway IP: {}", host_gateway_ip);
 
         // ── 3. Register test hostname DNS A-record in challtestsrv ────────────
         // Pebble will ask challtestsrv for the A record of our test hostname.
@@ -2510,8 +2630,10 @@ mod tests {
             responder_actual_port
         );
 
-        // Give the axum server time to start accepting connections.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Give the axum server time to start accepting connections. Best-effort
+        // only (there's no readiness signal to poll here) — kept generous since
+        // a loaded CI runner can be slow to schedule the spawned task.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
         // ── 8. Build DomainService and call provision_on_demand ───────────────
         let service =

@@ -2491,6 +2491,28 @@ mod docker_tests {
 
     async fn create_test_docker_runtime() -> Result<DockerRuntime, Box<dyn std::error::Error>> {
         let docker = Docker::connect_with_local_defaults()?;
+
+        // Every test using this runtime deploys `alpine:latest`, but
+        // `create_container` doesn't auto-pull a missing image -- it 404s.
+        // These tests only ever worked by luck, relying on some other test
+        // happening to pull it first; under parallel test execution (this
+        // job doesn't set --test-threads=1) that ordering isn't guaranteed
+        // and a test run first hits "No such image". Pull once, up front.
+        use bollard::query_parameters::CreateImageOptions;
+        use futures::StreamExt;
+        let mut pull_stream = docker.create_image(
+            Some(CreateImageOptions {
+                from_image: Some("alpine".to_string()),
+                tag: Some("latest".to_string()),
+                ..Default::default()
+            }),
+            None,
+            None,
+        );
+        while let Some(result) = pull_stream.next().await {
+            result?;
+        }
+
         Ok(DockerRuntime::new(
             Arc::new(docker),
             false,

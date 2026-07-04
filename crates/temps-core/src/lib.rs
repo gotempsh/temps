@@ -60,7 +60,7 @@ pub use utils::*;
 // Re-export external dependencies
 pub use anyhow;
 pub use app_settings::{
-    AgentSandboxSettings, AiConfigSettings, AppSettings, ContainerLogSettings,
+    AgentSandboxSettings, AiConfigSettings, AppSettings, ClusterDnsSettings, ContainerLogSettings,
     DiskSpaceAlertSettings, DnsProviderSettings, DockerRegistrySettings, LetsEncryptSettings,
     MetricsStoreKind, MonitoringSettings, MultiNodeSettings, PreviewGatewaySettings,
     ProviderConfig, RateLimitSettings, ScreenshotSettings, SecurityHeadersSettings,

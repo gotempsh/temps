@@ -9,8 +9,19 @@ export interface AnalyticsEventBase {
 }
 
 export interface SessionRecordingConfig {
-  /** Paths to exclude from recording. Supports `*` wildcards. */
+  /**
+   * Paths to exclude from recording. Supports `*` wildcards. Merged with the
+   * built-in `DEFAULT_EXCLUDED_PATHS` (login, checkout, payment, etc.) unless
+   * `useDefaultExcludedPaths` is set to `false`.
+   */
   excludedPaths?: string[];
+  /**
+   * Whether to merge the built-in default excluded paths (see
+   * `DEFAULT_EXCLUDED_PATHS`) with `excludedPaths`. Defaults to `true`. Set to
+   * `false` to record every path except the ones you explicitly list in
+   * `excludedPaths`.
+   */
+  useDefaultExcludedPaths?: boolean;
   /** Sample rate for recording sessions (0.0 to 1.0). Defaults to 1.0. */
   sessionSampleRate?: number;
   /** Mask all inputs. Defaults to true. */

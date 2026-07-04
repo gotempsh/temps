@@ -250,44 +250,19 @@ jobs:
         env:
           RUST_BACKTRACE: 1
           CARGO_INCREMENTAL: 0
-        run: |
-          # Run tests, capturing the names of any failures for targeted retry
-          if cargo test --no-fail-fast --lib ${{ matrix.crates }} 2>&1 | tee /tmp/test-output.txt; then
-            echo "All tests passed on first attempt"
-            exit 0
-          fi
-
-          # Extract failed test names from output
-          failed_tests=$(grep '^test .* FAILED$' /tmp/test-output.txt | sed 's/^test \(.*\) \.\.\..*FAILED$/\1/' | tr '\n' ' ')
-          if [ -z "$failed_tests" ]; then
-            echo "Could not parse failed test names, re-running all tests"
-            cargo test --no-fail-fast --lib ${{ matrix.crates }}
-            exit $?
-          fi
-
-          echo ""
-          echo "=========================================="
-          echo "Retrying only failed tests: $failed_tests"
-          echo "=========================================="
-          echo ""
-          sleep 5
-
-          # Retry only the failed tests (up to 2 more attempts)
-          attempt=2
-          max_attempts=3
-          for test_name in $failed_tests; do
-            echo "--- Retrying: $test_name (attempt $attempt/$max_attempts) ---"
-            if ! cargo test --no-fail-fast --lib ${{ matrix.crates }} -- "$test_name" --exact; then
-              if [ $attempt -lt $max_attempts ]; then
-                attempt=$((attempt + 1))
-                echo "--- Retrying: $test_name (attempt $attempt/$max_attempts) ---"
-                sleep 5
-                cargo test --no-fail-fast --lib ${{ matrix.crates }} -- "$test_name" --exact || exit 1
-              else
-                exit 1
-              fi
-            fi
-          done
+        # Many crates' tests spin up a real Postgres/TimescaleDB-backed
+        # TestDatabase, and their DDL/DML against the one shared TimescaleDB
+        # instance can genuinely deadlock (Postgres error 40P01) -- confirmed
+        # across multiple CI runs hitting different tests in different crates
+        # each time. `-- --test-threads=1` alone wasn't enough: cargo runs
+        # *each crate's* test binary as its own process and doesn't fully
+        # serialize them by default, so separate crates' binaries were still
+        # racing each other even with each individually single-threaded.
+        # `--jobs 1` forces cargo to run one test binary at a time too.
+        # Matches the trade-off already made for the docker-backups/
+        # postgres-upgrades integration-test groups: slower, but eliminates
+        # cross-test DB contention instead of chasing it test-by-test.
+        run: cargo test --no-fail-fast --jobs 1 --lib ${{ matrix.crates }} -- --test-threads=1
 
   # ---------------------------------------------------------------------------
   # Phase 2: Integration tests (Docker + Database required)
@@ -308,15 +283,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Each entry splits the test command into three parts so the retry
-        # logic can append `<test_name> --exact` *after* the libtest `--`
-        # separator without producing a second stray `--` (which silently
-        # disables the filter and reruns the whole binary). See the
-        # retry block at the bottom of this job — it assembles:
+        # Each entry splits the test command into cargo-level args
+        # (crate, features, filters) and libtest-level args (--skip,
+        # --nocapture, --test-threads), assembled as:
         #
-        #   <cargo_args> -- <test_args> <test_name> --exact
-        #
-        # so all post-`--` flags live in `test_args`, never in `cargo_args`.
+        #   <cargo_args> -- <test_args>
         include:
           - group: docker-providers
             # temps-providers with Docker tests enabled.
@@ -447,50 +418,4 @@ jobs:
           RUST_BACKTRACE: 1
           CARGO_INCREMENTAL: 0
           TEMPS_TEST_DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db
-        run: |
-          # Run tests, capturing the names of any failures for targeted retry.
-          # `cargo_args` covers everything cargo cares about (crate, features,
-          # filters); `test_args` is everything after `--` that libtest cares
-          # about (--skip, --nocapture, --test-threads). The retry block
-          # below assembles `<cargo_args> -- <test_args> <test_name> --exact`
-          # so the post-`--` flags don't collide with the per-test filter.
-          if cargo ${{ matrix.cargo_args }} -- ${{ matrix.test_args }} 2>&1 | tee /tmp/test-output.txt; then
-            echo "All tests passed on first attempt"
-            exit 0
-          fi
-
-          # Extract failed test names from output
-          failed_tests=$(grep '^test .* FAILED$' /tmp/test-output.txt | sed 's/^test \(.*\) \.\.\..*FAILED$/\1/' | tr '\n' ' ')
-          if [ -z "$failed_tests" ]; then
-            echo "Could not parse failed test names, re-running all tests"
-            cargo ${{ matrix.cargo_args }} -- ${{ matrix.test_args }}
-            exit $?
-          fi
-
-          echo ""
-          echo "=========================================="
-          echo "Retrying only failed tests: $failed_tests"
-          echo "=========================================="
-          echo ""
-          sleep 10
-
-          # Retry only the failed tests (up to 2 more attempts each).
-          # Each retry passes a single libtest separator: `--` then test_args
-          # then the test filter and --exact. Crucially, cargo_args never
-          # contains its own `--`, so there's never a second separator.
-          max_attempts=3
-          for test_name in $failed_tests; do
-            attempt=2
-            while [ $attempt -le $max_attempts ]; do
-              echo "--- Retrying: $test_name (attempt $attempt/$max_attempts) ---"
-              if cargo ${{ matrix.cargo_args }} -- ${{ matrix.test_args }} "$test_name" --exact; then
-                break
-              fi
-              if [ $attempt -eq $max_attempts ]; then
-                echo "❌ $test_name failed after $max_attempts attempts"
-                exit 1
-              fi
-              attempt=$((attempt + 1))
-              sleep 10
-            done
-          done
+        run: cargo ${{ matrix.cargo_args }} -- ${{ matrix.test_args }}

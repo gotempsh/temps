@@ -99,6 +99,12 @@ Already in CLAUDE.md, but reinforced here because it's a hard rule:
 `revert`. Scope is the affected crate or area (`backup`, `web`,
 `deployments`, etc.).
 
+The `Changelog` CI check validates *every* commit in the PR's
+`base..HEAD` range, not just the tip — one bad commit fails the whole
+check. `git revert` defaults to `Revert "original message"`, which is
+not conventional. Never use `git revert --no-edit` and leave it —
+either pass an explicit conventional `-m`, or amend right after.
+
 ## Per-record config columns, not env vars
 
 When adding a new runtime knob, default to a column on the relevant

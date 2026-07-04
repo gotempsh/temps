@@ -296,7 +296,7 @@ fn example_docker_image() -> &'static str {
     "gotempsh/postgres-walg:18-bookworm"
 }
 
-use super::port_util::find_available_port;
+use super::port_util::{find_available_port, find_available_port_async, is_port_conflict_error};
 
 pub struct PostgresService {
     name: String,
@@ -332,7 +332,55 @@ impl PostgresService {
         format!("postgres-{}", self.name)
     }
 
+    /// Creates and starts the PostgreSQL container, retrying with a fresh host
+    /// port if the chosen one lost the race described in `port_util` docs
+    /// (bindable when we checked, but taken by the time Docker actually binds
+    /// it). The container name is deterministic, so a failed attempt must be
+    /// removed before retrying or the next attempt's "already exists" check
+    /// short-circuits without picking a new port.
     async fn create_container(
+        &self,
+        docker: &Docker,
+        config: &PostgresConfig,
+        resource_limits: &ServiceResourceLimits,
+        enable_archiving: bool,
+    ) -> Result<()> {
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut attempt_config = config.clone();
+        for attempt in 1..=MAX_ATTEMPTS {
+            match self
+                .create_container_once(docker, &attempt_config, resource_limits, enable_archiving)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) if attempt < MAX_ATTEMPTS && is_port_conflict_error(&e.to_string()) => {
+                    warn!(
+                        "Port {} for PostgreSQL container was already allocated (attempt {}/{}), retrying with a fresh port: {}",
+                        attempt_config.port, attempt, MAX_ATTEMPTS, e
+                    );
+                    let _ = docker
+                        .remove_container(
+                            &self.get_container_name(),
+                            Some(bollard::query_parameters::RemoveContainerOptions {
+                                force: true,
+                                ..Default::default()
+                            }),
+                        )
+                        .await;
+                    let base_port: u16 = attempt_config.port.parse().unwrap_or(5432);
+                    if let Some(new_port) =
+                        find_available_port_async(docker, base_port.wrapping_add(1)).await
+                    {
+                        attempt_config.port = new_port.to_string();
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        unreachable!("loop always returns Ok or Err before exhausting MAX_ATTEMPTS")
+    }
+
+    async fn create_container_once(
         &self,
         docker: &Docker,
         config: &PostgresConfig,
