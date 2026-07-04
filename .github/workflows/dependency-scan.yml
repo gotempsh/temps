@@ -67,12 +67,31 @@ jobs:
       #   separately, not a drop-in version bump.
       # - RUSTSEC-2018-0017 (tempdir): transitive via nixpacks, no newer
       #   nixpacks release drops it yet.
+      #
+      # The three below are real vulnerabilities (not just "unmaintained"
+      # notices), blocked on upstream fixes with no non-forking workaround.
+      # Full reachability analysis for each lives in the root Cargo.toml
+      # under "Dependency Overrides - Security Fixes" -- re-verify that
+      # analysis before removing/renewing these on advisory-db updates:
+      # - RUSTSEC-2024-0437 (protobuf 2.28.0 via prometheus 0.13 <- pingora
+      #   0.8.x): recursion-crash-on-parse; pingora only ever *emits*
+      #   metrics via TextEncoder, never parses protobuf-encoded input, so
+      #   the vulnerable parse path is compiled in but unreachable.
+      # - RUSTSEC-2023-0018 (remove_dir_all 0.5.3 via tempdir <- nixpacks
+      #   1.41.0, crates.io latest): TOCTOU race lives in a nixpacks code
+      #   path (implicit output dir) that temps-presets never takes (it
+      #   always passes an explicit out_dir).
+      # - RUSTSEC-2023-0071 (rsa 0.9.10 via jsonwebtoken <- octocrab /
+      #   openidconnect): Marvin Attack targets private-key ops; our usage
+      #   is RS256 JWT sign/verify with no remote timing oracle exposed to
+      #   the signing key, and OIDC token verification is public-key only.
+      #   No fixed `rsa` release exists upstream yet.
       # Remove an entry once its upstream is fixed/replaced.
       - name: Run cargo-audit
         uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          ignore: RUSTSEC-2024-0370,RUSTSEC-2025-0134,RUSTSEC-2018-0017
+          ignore: RUSTSEC-2024-0370,RUSTSEC-2025-0134,RUSTSEC-2018-0017,RUSTSEC-2024-0437,RUSTSEC-2023-0018,RUSTSEC-2023-0071
 
   web-audit:
     name: Web Dependency Audit (bun audit)
