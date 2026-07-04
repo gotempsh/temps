@@ -441,7 +441,13 @@ impl AuthService {
         // `oidc_handler::complete_oidc_login`, which never call this method,
         // so federated logins are unaffected by design (see doc comment on
         // `AppSettings::require_mfa_for_admins`).
-        let settings = self.get_settings().await?;
+        //
+        // A settings-lookup failure must never block login for the whole
+        // instance (this runs on every successful password login, not just
+        // admins) -- degrade to the default (`require_mfa_for_admins: false`)
+        // and let the login proceed, same graceful-degradation contract as
+        // `count_active_sessions` below.
+        let settings = self.get_settings().await.unwrap_or_default();
         if settings.require_mfa_for_admins && !user.mfa_enabled {
             let user_service = crate::user_service::UserService::new(self.db.clone());
             let is_admin = match user_service.is_admin(user.id).await {
@@ -865,9 +871,11 @@ pub enum UserAuthError {
     // Deliberately NOT `#[from]` -- see the manual `From<sea_orm::DbErr>` impl
     // below, which detects a unique-constraint violation on `users.email`
     // (raised by the DB-level `idx_users_email_unique` index) and maps it to
-    // `EmailAlreadyRegistered` instead of a generic database error.
+    // `EmailAlreadyRegistered` instead of a generic database error. `#[source]`
+    // is kept (independent of `#[from]`) so this variant still participates
+    // in `Error::source()` error-chain tooling.
     #[error("Database error: {0}")]
-    DatabaseError(sea_orm::DbErr),
+    DatabaseError(#[source] sea_orm::DbErr),
     #[error("Invalid credentials")]
     InvalidCredentials,
     #[error("User not found")]
@@ -907,8 +915,13 @@ fn is_unique_violation(error: &sea_orm::DbErr) -> bool {
     if matches!(error, sea_orm::DbErr::RecordNotInserted) {
         return true;
     }
-    let msg = error.to_string();
-    msg.contains("23505") || msg.contains("duplicate key") || msg.contains("UNIQUE constraint")
+    // Match the specific constraint name rather than a generic "duplicate
+    // key"/"23505" substring: this crate has other unique-constrained
+    // columns reachable through `UserAuthError` (e.g.
+    // `magic_link_tokens.token`), and a generic substring match would
+    // misreport an unrelated collision on one of those as
+    // `EmailAlreadyRegistered`.
+    error.to_string().contains("idx_users_email_unique")
 }
 
 impl From<sea_orm::DbErr> for UserAuthError {
@@ -2022,6 +2035,17 @@ mod tests {
     }
 
     #[test]
+    fn is_unique_violation_false_for_unrelated_unique_constraint() {
+        // A collision on a *different* unique-constrained column (e.g.
+        // magic_link_tokens.token) must not be misreported as a duplicate
+        // email -- only `idx_users_email_unique` should match.
+        let err = sea_orm::DbErr::Custom(
+            "error returned from database: duplicate key value violates unique constraint \"magic_link_tokens_token_key\" (SQLSTATE 23505)".to_string(),
+        );
+        assert!(!is_unique_violation(&err));
+    }
+
+    #[test]
     fn user_auth_error_from_dberr_maps_unique_violation_to_email_already_registered() {
         let err = sea_orm::DbErr::Custom(
             "duplicate key value violates unique constraint \"idx_users_email_unique\"".to_string(),
@@ -2277,6 +2301,69 @@ mod tests {
         assert!(
             result.is_ok(),
             "non-admin users must never be blocked by require_mfa_for_admins"
+        );
+    }
+
+    /// A transient failure reading the settings row must never block login
+    /// for the whole instance -- it must degrade to the default
+    /// (`require_mfa_for_admins: false`) and let a correct-password login
+    /// through, exactly like a `count_active_sessions` lookup failure does.
+    #[tokio::test]
+    async fn login_succeeds_when_settings_lookup_fails() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        let password = "Password123!";
+        let argon2 = argon2::Argon2::default();
+        let salt = argon2::password_hash::SaltString::generate(
+            &mut argon2::password_hash::rand_core::OsRng,
+        );
+        let password_hash = argon2
+            .hash_password(password.as_bytes(), &salt)
+            .unwrap()
+            .to_string();
+
+        let user = users::Model {
+            id: 7,
+            name: "Settings Outage User".to_string(),
+            email: "settings-outage@example.com".to_string(),
+            password_hash: Some(password_hash),
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // 1) `find().filter(email...)` in login() -> the user above
+            .append_query_results(vec![vec![user]])
+            // 2) `get_settings()`'s `settings::Entity::find_by_id(1)` -> DB error
+            .append_query_errors(vec![sea_orm::DbErr::Custom(
+                "connection reset by peer".to_string(),
+            )])
+            .into_connection();
+
+        let notification_service = Arc::new(MockEmailService::new());
+        let auth_service = AuthService::new(Arc::new(db), notification_service);
+
+        let result = auth_service
+            .login(LoginRequest {
+                email: "settings-outage@example.com".to_string(),
+                password: password.to_string(),
+            })
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "a settings-lookup failure must not block a correct-password login"
         );
     }
 }

@@ -603,8 +603,7 @@ pub async fn register(
     request_body = LoginRequest,
     responses(
         (status = 200, description = "Login successful, session cookie set", body = AuthResponse),
-        (status = 401, description = "Invalid credentials"),
-        (status = 403, description = "MFA enrollment required for this account's role"),
+        (status = 401, description = "Invalid credentials, or the account's role requires MFA enrollment that has not been completed"),
         (status = 500, description = "Internal server error")
     ),
     tag = "Authentication"
@@ -772,17 +771,23 @@ pub async fn login(
                     .with_detail("Invalid email or password."))
             }
             crate::auth_service::UserAuthError::MfaRequiredForRole { user_id, role } => {
+                // Deliberately the *same* status/title/detail as
+                // InvalidCredentials above -- this error is only reachable
+                // after the password has already been verified correct, so
+                // a distinguishable response here would let an attacker use
+                // login attempts as an oracle to confirm a guessed admin
+                // password (and that the account holds the Admin role)
+                // without ever completing a login. The real reason is only
+                // ever surfaced server-side via this log line.
                 warn!(
                     user_id,
                     role = %role,
                     email = %login_email,
                     "Login blocked: MFA is required for this role but is not enrolled"
                 );
-                Err(problem_new(StatusCode::FORBIDDEN)
-                    .with_title("MFA Required")
-                    .with_detail(format!(
-                        "Your account's '{role}' role requires multi-factor authentication. Please contact an administrator or enroll MFA before logging in."
-                    )))
+                Err(problem_new(StatusCode::UNAUTHORIZED)
+                    .with_title("Invalid Credentials")
+                    .with_detail("Invalid email or password."))
             }
             _ => {
                 // Log the real error server-side (email is PII but legitimate
@@ -2071,6 +2076,42 @@ mod tests {
         assert_eq!(
             detail_c, detail_n,
             "detail must be identical to prevent enumeration"
+        );
+    }
+
+    /// `MfaRequiredForRole` must produce the exact same response as
+    /// `InvalidCredentials`/`UserNotFound` -- it's only reachable *after* the
+    /// password has already been verified correct, so a distinguishable
+    /// response would let an attacker use login attempts as an oracle to
+    /// confirm a guessed admin password (and that the account is Admin)
+    /// without completing a login.
+    #[test]
+    fn test_login_error_mapping_mfa_required_same_as_invalid_credentials() {
+        let map = |e: UserAuthError| match e {
+            UserAuthError::InvalidCredentials | UserAuthError::UserNotFound => {
+                (401u16, "Invalid Credentials", "Invalid email or password.")
+            }
+            UserAuthError::MfaRequiredForRole { .. } => {
+                (401u16, "Invalid Credentials", "Invalid email or password.")
+            }
+            _ => (
+                500u16,
+                "Authentication Error",
+                "Authentication system error. Please try again later.",
+            ),
+        };
+
+        let (status_c, title_c, detail_c) = map(UserAuthError::InvalidCredentials);
+        let (status_m, title_m, detail_m) = map(UserAuthError::MfaRequiredForRole {
+            user_id: 42,
+            role: "Admin".to_string(),
+        });
+
+        assert_eq!(status_c, status_m, "HTTP status must be identical");
+        assert_eq!(title_c, title_m, "title must be identical");
+        assert_eq!(
+            detail_c, detail_m,
+            "detail must be identical to prevent an MFA-enforcement oracle"
         );
     }
 
