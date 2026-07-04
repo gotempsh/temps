@@ -81,11 +81,15 @@ jobs:
       #   1.41.0, crates.io latest): TOCTOU race lives in a nixpacks code
       #   path (implicit output dir) that temps-presets never takes (it
       #   always passes an explicit out_dir).
-      # - RUSTSEC-2023-0071 (rsa 0.9.10 via jsonwebtoken <- octocrab /
-      #   openidconnect): Marvin Attack targets private-key ops; our usage
-      #   is RS256 JWT sign/verify with no remote timing oracle exposed to
-      #   the signing key, and OIDC token verification is public-key only.
-      #   No fixed `rsa` release exists upstream yet.
+      # - RUSTSEC-2023-0071 (rsa 0.9.10 via jsonwebtoken <- octocrab, and
+      #   direct in temps-dns/gcp.rs): Marvin Attack is a chosen-ciphertext
+      #   *decryption* oracle attack; temps has zero RSA decryption, only
+      #   RSA signing (GitHub App JWTs, GCP DNS service-account JWTs). The
+      #   signing timing side-channel isn't remotely exploitable here
+      #   (signing latency is buried in 100-500ms of network I/O, and the
+      #   signed payload isn't attacker-controlled). Keys are per-customer,
+      #   not a shared temps secret. No fixed `rsa` release exists upstream
+      #   yet -- tracked for a ring/aws-lc-rs-backed signing migration.
       # Remove an entry once its upstream is fixed/replaced.
       - name: Run cargo-audit
         uses: rustsec/audit-check@v2.0.0

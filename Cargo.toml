@@ -429,14 +429,28 @@ debug = false
 #
 # 5. RUSTSEC-2023-0071: rsa 0.9.10 (MEDIUM severity)
 #    - Title: Marvin Attack: potential key recovery through timing sidechannels
-#    - Path: jsonwebtoken 10.4.0 → { octocrab (GitHub App JWT signing),
-#      openidconnect (OIDC id_token verification) }
+#    - Dependency paths:
+#        jsonwebtoken 10.4.0 <- octocrab      (GitHub App JWT signing;
+#          crates/temps-git/src/services/github.rs,
+#          crates/temps-git/src/services/git_provider_manager.rs)
+#        jsonwebtoken 10.4.0 <- openidconnect (OIDC id_token verification)
+#        rsa direct usage in crates/temps-dns/src/providers/gcp.rs
+#          (GCP Cloud DNS service-account JWT signing, sign_rs256())
 #    - Status: no fixed version exists upstream (the rsa crate has no constant-time
 #      release yet). Tracked.
-#    - Mitigation: used for RS256 JWT sign/verify, NOT for RSA decryption of
-#      attacker-supplied ciphertext. The Marvin side-channel targets PKCS#1v1.5
-#      private-key ops; our JWT signing key is not exposed to a remote timing
-#      oracle, and OIDC token verification is a public-key op (unaffected).
+#    - Assessment: the Marvin Attack is an adaptive chosen-ciphertext attack against
+#      RSA-PKCS#1v1.5 *decryption*. Temps has zero RSA decryption usage -- all three
+#      paths above are RSA *signing* only (OIDC verification is a separate,
+#      unaffected public-key op). Signing uses a non-constant-time modexp, which is
+#      a real but much narrower timing side-channel than Marvin's decryption
+#      oracle: exploiting it needs millions of samples at nanosecond precision, the
+#      signing op itself (~10-50us) is buried inside git/DNS operations dominated
+#      by 100-500ms of network I/O, and the signed payload (app_id/iat/exp or
+#      service-account claims) isn't attacker-controlled. Blast radius if ever
+#      exploited is per-customer only: each org supplies its own GitHub App or GCP
+#      service-account private key, not a shared temps platform secret.
+#    - Follow-up: monitor upstream `rsa` for a constant-time release; evaluate
+#      ring/aws-lc-rs-backed signing as a replacement for both paths.
 #
 # All remaining items are transitive dependencies from third-party crates that we
 # cannot directly patch without forking. Monitoring upstream for updates.
