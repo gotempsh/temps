@@ -217,9 +217,9 @@ pub async fn verify_mfa_challenge(
                     Ok(count) => count,
                     Err(e) => {
                         error!(
-                            "Failed to count active sessions for user {} after MFA verification: {}",
-                            user.id, e
-                        );
+                        "Failed to count active sessions for user {} after MFA verification: {}",
+                        user.id, e
+                    );
                         0
                     }
                 };
