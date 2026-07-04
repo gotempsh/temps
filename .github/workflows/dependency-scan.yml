@@ -57,10 +57,22 @@ jobs:
       # just a severity subset -- cargo-audit's advisory-db entries don't
       # uniformly carry CVSS severity, so "any match" is the safer default
       # for a supply-chain gate). See PR body for rationale on fail-vs-warn.
+      #
+      # Ignored below are "unmaintained crate" notices (not exploitable
+      # CVEs) for deps we don't control directly:
+      # - RUSTSEC-2024-0370 (proc-macro-error2): transitive via pingora's
+      #   tracing stack (cf-rustracing-jaeger -> neli -> local-ip-address).
+      # - RUSTSEC-2025-0134 (rustls-pemfile): used directly across several
+      #   crates; migrating to rustls-pki-types' PemObject API is tracked
+      #   separately, not a drop-in version bump.
+      # - RUSTSEC-2018-0017 (tempdir): transitive via nixpacks, no newer
+      #   nixpacks release drops it yet.
+      # Remove an entry once its upstream is fixed/replaced.
       - name: Run cargo-audit
         uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          ignore: RUSTSEC-2024-0370,RUSTSEC-2025-0134,RUSTSEC-2018-0017
 
   web-audit:
     name: Web Dependency Audit (bun audit)
@@ -93,6 +105,11 @@ jobs:
       # web/'s dependency tree. `bun audit` exits non-zero when findings meet
       # or exceed --audit-level. Lower severities (low/moderate) are still
       # printed by the command's own output but do not fail the build.
+      #
+      # Note: `bun audit --ignore` is silently non-functional in bun 1.3.14
+      # (confirmed against both GHSA slugs and bun's own internal advisory
+      # ids -- neither suppresses the finding). Transitive advisories here
+      # are fixed via package.json `overrides` instead of ignored.
       - name: Run bun audit
         run: |
           cd web

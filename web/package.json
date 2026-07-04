@@ -122,6 +122,10 @@
     "d3-color": "^3.1.0",
     "flatted": "^3.4.2",
     "handlebars": "^4.7.9",
-    "picomatch": "^2.3.2"
+    "picomatch": "^2.3.2",
+    "minimatch": "^9.0.7",
+    "tar": "^7.5.7",
+    "lodash": "^4.17.24",
+    "defu": "^6.1.5"
   }
 }
