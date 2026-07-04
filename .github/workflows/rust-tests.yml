@@ -250,17 +250,19 @@ jobs:
         env:
           RUST_BACKTRACE: 1
           CARGO_INCREMENTAL: 0
-        # --test-threads=1: many crates' tests spin up a real Postgres/
-        # TimescaleDB-backed TestDatabase. cargo already runs each crate's
-        # test binary sequentially, but *within* one binary the default
-        # thread pool runs many #[test] fns concurrently, and their DDL/DML
-        # against the one shared TimescaleDB instance can genuinely deadlock
-        # (Postgres error 40P01) -- confirmed across multiple CI runs hitting
-        # different tests in different crates each time. Matches the same
-        # trade-off already made for the docker-backups/postgres-upgrades
-        # integration-test groups: slower, but eliminates cross-test DB
-        # contention instead of chasing it test-by-test.
-        run: cargo test --no-fail-fast --lib ${{ matrix.crates }} -- --test-threads=1
+        # Many crates' tests spin up a real Postgres/TimescaleDB-backed
+        # TestDatabase, and their DDL/DML against the one shared TimescaleDB
+        # instance can genuinely deadlock (Postgres error 40P01) -- confirmed
+        # across multiple CI runs hitting different tests in different crates
+        # each time. `-- --test-threads=1` alone wasn't enough: cargo runs
+        # *each crate's* test binary as its own process and doesn't fully
+        # serialize them by default, so separate crates' binaries were still
+        # racing each other even with each individually single-threaded.
+        # `--jobs 1` forces cargo to run one test binary at a time too.
+        # Matches the trade-off already made for the docker-backups/
+        # postgres-upgrades integration-test groups: slower, but eliminates
+        # cross-test DB contention instead of chasing it test-by-test.
+        run: cargo test --no-fail-fast --jobs 1 --lib ${{ matrix.crates }} -- --test-threads=1
 
   # ---------------------------------------------------------------------------
   # Phase 2: Integration tests (Docker + Database required)
