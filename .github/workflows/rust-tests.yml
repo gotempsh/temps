@@ -328,9 +328,18 @@ jobs:
               --nocapture
               --test-threads=1
           - group: docker-deployments
-            # Crates that use TestDatabase and/or Docker
+            # Crates that use TestDatabase and/or Docker. Like unit-tests
+            # above, this fans out across many crates in one `cargo test`
+            # invocation against the single shared `services: timescaledb`
+            # container below -- same shape that made cross-binary/cross-test
+            # Postgres deadlocks (40P01) show up in unit-tests, just missing
+            # the same fix here. Reproduced locally: without --test-threads=1,
+            # a plain INSERT in temps-deployments' test setup deadlocked
+            # against a concurrently-running test in the same shared DB within
+            # a couple of runs; with --jobs 1 --test-threads=1 the full
+            # 18-crate suite ran clean.
             cargo_args: >-
-              test --no-fail-fast
+              test --no-fail-fast --jobs 1
               -p temps-deployments
               -p temps-backup
               -p temps-vulnerability-scanner
@@ -349,7 +358,8 @@ jobs:
               -p temps-logs
               -p temps-domains
               -p temps-projects
-            test_args: ""
+            test_args: >-
+              --test-threads=1
 
     services:
       timescaledb:

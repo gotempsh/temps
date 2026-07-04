@@ -361,13 +361,7 @@ impl S3Service {
             )])),
         });
         let mut host_config = bollard::models::HostConfig {
-            port_bindings: Some(HashMap::from([(
-                "9000/tcp".to_string(),
-                Some(vec![bollard::models::PortBinding {
-                    host_ip: Some("0.0.0.0".to_string()),
-                    host_port: Some(config.port.to_string()),
-                }]),
-            )])),
+            port_bindings: Some(crate::utils::local_port_binding("9000/tcp", &config.port)),
             // Add volume mount
             mounts: Some(vec![bollard::models::Mount {
                 target: Some("/data".to_string()),

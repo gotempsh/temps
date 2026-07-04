@@ -422,13 +422,7 @@ impl MongodbService {
         }
 
         let mut host_config = bollard::models::HostConfig {
-            port_bindings: Some(HashMap::from([(
-                "27017/tcp".to_string(),
-                Some(vec![bollard::models::PortBinding {
-                    host_ip: Some("0.0.0.0".to_string()),
-                    host_port: Some(config.port.clone()),
-                }]),
-            )])),
+            port_bindings: Some(crate::utils::local_port_binding("27017/tcp", &config.port)),
             mounts: Some(vec![bollard::models::Mount {
                 target: Some("/data/db".to_string()),
                 source: Some(volume_name),

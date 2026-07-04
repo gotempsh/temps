@@ -99,102 +99,22 @@ const response = await fetch('/api/users/assign-role', {
 
 ## Firewall Configuration {{ anchor: true, id: 'firewall' }}
 
-Temps includes built-in firewall features to control access and prevent abuse through IP filtering and rate limiting.
+<Note>
+  **Planned, not yet implemented.** Temps does not currently ship a
+  general-purpose, platform-wide IP allow/block-list firewall — there is no
+  `temps firewall` CLI and no `config/settings.yml` file. A dedicated CLI and
+  a persisted, per-record IP allow/block list (configurable via the
+  API/dashboard) are on the roadmap.
+</Note>
 
-### IP Address Management
+For IP-based access control today, use the [Admin Listener](/docs/admin-listener),
+which restricts the admin/dashboard surface to specific CIDR ranges and `Host`
+headers via `TEMPS_ADMIN_ALLOWED_IPS` / `TEMPS_ADMIN_ALLOWED_HOSTS`. For
+broader protection, layer your own network-level firewall (iptables, cloud
+security groups) in front of the server.
 
-Control access to your Temps instance and deployments using IP allowlists and blocklists.
-
-#### Blocked IP Addresses
-
-Block specific IP addresses or CIDR ranges from accessing your platform:
-
-<CodeGroup title="Configure Blocked IPs">
-```yaml {{ title: 'Config File' }}
-# config/settings.yml
-security:
-  firewall:
-    enabled: true
-    blocked_ips:
-      - "192.168.1.100"
-      - "10.0.0.0/8"
-      - "172.16.0.0/12"
-      - "203.0.113.0/24"
-```
-
-```bash {{ title: 'CLI' }}
-# Block a single IP address
-temps firewall block --ip 192.168.1.100
-
-# Block a CIDR range
-temps firewall block --ip 10.0.0.0/8
-
-# List all blocked IPs
-temps firewall list-blocked
-
-# Unblock an IP
-temps firewall unblock --ip 192.168.1.100
-```
-
-```typescript {{ title: 'API' }}
-// Block an IP address via API
-await fetch('/api/firewall/blocked-ips', {
-  method: 'POST',
-  headers: {
-    'Authorization': `Bearer ${API_KEY}`,
-    'Content-Type': 'application/json'
-  },
-  body: JSON.stringify({
-    ip: '192.168.1.100',
-    reason: 'Suspicious activity detected'
-  })
-});
-```
-</CodeGroup>
-
-#### Allowed IP Addresses
-
-Restrict access to specific IP addresses (whitelist mode):
-
-<CodeGroup title="Configure Allowed IPs">
-```yaml {{ title: 'Config File' }}
-# config/settings.yml
-security:
-  firewall:
-    enabled: true
-    whitelist_mode: true
-    allowed_ips:
-      - "203.0.113.0/24"  # Office network
-      - "198.51.100.10"    # VPN gateway
-      - "192.0.2.50"       # Admin workstation
-```
-
-```bash {{ title: 'CLI' }}
-# Add IP to allowlist
-temps firewall allow --ip 203.0.113.0/24
-
-# Enable whitelist mode (blocks all IPs not on allowlist)
-temps firewall whitelist-mode --enable
-
-# List allowed IPs
-temps firewall list-allowed
-```
-
-```typescript {{ title: 'API' }}
-// Add IP to allowlist
-await fetch('/api/firewall/allowed-ips', {
-  method: 'POST',
-  headers: {
-    'Authorization': `Bearer ${API_KEY}`,
-    'Content-Type': 'application/json'
-  },
-  body: JSON.stringify({
-    ip: '203.0.113.0/24',
-    description: 'Office network'
-  })
-});
-```
-</CodeGroup>
+Temps does include configurable rate limiting per project and path to protect
+against abuse — see below.
 
 ### Rate Limiting
 
@@ -555,7 +475,7 @@ Temps maintains comprehensive audit logs of all security-relevant events for com
     Project/deployment/domain create/update/delete operations
   </Property>
   <Property name="Security Events">
-    API key creation/rotation/revocation, secret access, firewall rule changes
+    API key creation/rotation/revocation, secret access
   </Property>
   <Property name="Settings Changes">
     Configuration updates, security policy changes
@@ -790,7 +710,7 @@ Follow these security best practices for production deployments:
   **Production Deployment Checklist:**
 
   - [ ] Enable MFA for all admin accounts
-  - [ ] Configure firewall rules (IP allowlist/blocklist)
+  - [ ] Configure network-level firewall rules and/or the Admin Listener IP allowlist
   - [ ] Enable rate limiting
   - [ ] Apply strict security headers preset
   - [ ] Enable automatic TLS with HSTS
