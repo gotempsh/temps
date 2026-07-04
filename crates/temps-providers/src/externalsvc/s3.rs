@@ -2774,11 +2774,15 @@ mod tests {
             }
         }
 
-        // Verify object was deleted
+        // Verify object was deleted. Scoped to the `test-file-` prefix: the
+        // backup destination above writes to the SAME bucket under
+        // `backups/s3/...`, so an unscoped list also counts backup copies
+        // and no longer reflects just the three original test objects.
         match minio
             .s3_client
             .list_objects_v2()
             .bucket(&minio.bucket_name)
+            .prefix("test-file-")
             .send()
             .await
         {
@@ -2814,11 +2818,12 @@ mod tests {
             }
         }
 
-        // Verify all objects are restored
+        // Verify all objects are restored (same prefix scoping as above)
         match minio
             .s3_client
             .list_objects_v2()
             .bucket(&minio.bucket_name)
+            .prefix("test-file-")
             .send()
             .await
         {

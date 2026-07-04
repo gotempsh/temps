@@ -2506,64 +2506,87 @@ mod tests {
                 }),
                 ..Default::default()
             };
-            let restorer_name = format!("temps_upgrade_test_restorer_{}", run_id);
-            let restorer = docker
-                .create_container(
-                    Some(
-                        CreateContainerOptionsBuilder::new()
-                            .name(&restorer_name)
-                            .build(),
-                    ),
-                    restorer_cfg,
-                )
-                .await
-                .map_err(|e| format!("create restorer: {}", e))?;
-            docker
-                .start_container(&restorer.id, None::<StartContainerOptions>)
-                .await
-                .map_err(|e| format!("start restorer: {}", e))?;
-
-            // Poll until exit rather than using wait_container — the wait API
-            // sometimes returns early with an empty error on fast-exiting
-            // containers on macOS Docker Desktop.
-            let exit_deadline = Instant::now() + Duration::from_secs(120);
-            let restore_exit = loop {
-                if Instant::now() > exit_deadline {
-                    return Err("restorer exit wait timeout".into());
-                }
-                match docker
-                    .inspect_container(&restorer.id, None::<InspectContainerOptions>)
+            // `wait_ready` above confirms `pg_isready` succeeds via `docker
+            // exec` inside the new container, but that doesn't guarantee the
+            // container's network-facing TCP listener is attached yet — under
+            // heavy concurrent Docker load (this test's CI job runs many
+            // containers in parallel) the restorer, a *separate* container
+            // connecting over the network, can still hit "Connection
+            // refused" in that brief window. Retry with a fresh restorer
+            // container on that specific failure rather than failing outright.
+            const MAX_RESTORER_ATTEMPTS: u32 = 3;
+            let mut restore_exit;
+            let mut restorer_logs;
+            let mut attempt = 1;
+            loop {
+                let restorer_name = format!("temps_upgrade_test_restorer_{}_{}", run_id, attempt);
+                let restorer = docker
+                    .create_container(
+                        Some(
+                            CreateContainerOptionsBuilder::new()
+                                .name(&restorer_name)
+                                .build(),
+                        ),
+                        restorer_cfg.clone(),
+                    )
                     .await
-                {
-                    Ok(insp) => {
-                        if let Some(state) = insp.state.as_ref() {
-                            if state.running == Some(false) {
-                                break state.exit_code.unwrap_or(-1);
+                    .map_err(|e| format!("create restorer: {}", e))?;
+                docker
+                    .start_container(&restorer.id, None::<StartContainerOptions>)
+                    .await
+                    .map_err(|e| format!("start restorer: {}", e))?;
+
+                // Poll until exit rather than using wait_container — the wait
+                // API sometimes returns early with an empty error on
+                // fast-exiting containers on macOS Docker Desktop.
+                let exit_deadline = Instant::now() + Duration::from_secs(120);
+                restore_exit = loop {
+                    if Instant::now() > exit_deadline {
+                        return Err("restorer exit wait timeout".into());
+                    }
+                    match docker
+                        .inspect_container(&restorer.id, None::<InspectContainerOptions>)
+                        .await
+                    {
+                        Ok(insp) => {
+                            if let Some(state) = insp.state.as_ref() {
+                                if state.running == Some(false) {
+                                    break state.exit_code.unwrap_or(-1);
+                                }
                             }
                         }
+                        Err(e) => return Err(format!("inspect restorer: {}", e)),
                     }
-                    Err(e) => return Err(format!("inspect restorer: {}", e)),
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                };
+                restorer_logs = docker
+                    .logs(
+                        &restorer.id,
+                        Some(LogsOptionsBuilder::new().stdout(true).stderr(true).build()),
+                    )
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .map(|v| v.into_iter().map(|c| c.to_string()).collect::<String>())
+                    .unwrap_or_default();
+                let _ = docker
+                    .remove_container(
+                        &restorer.id,
+                        Some(RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
+
+                if restore_exit == 0
+                    || attempt >= MAX_RESTORER_ATTEMPTS
+                    || !restorer_logs.contains("Connection refused")
+                {
+                    break;
                 }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            };
-            let restorer_logs = docker
-                .logs(
-                    &restorer.id,
-                    Some(LogsOptionsBuilder::new().stdout(true).stderr(true).build()),
-                )
-                .try_collect::<Vec<_>>()
-                .await
-                .map(|v| v.into_iter().map(|c| c.to_string()).collect::<String>())
-                .unwrap_or_default();
-            let _ = docker
-                .remove_container(
-                    &restorer.id,
-                    Some(RemoveContainerOptions {
-                        force: true,
-                        ..Default::default()
-                    }),
-                )
-                .await;
+                attempt += 1;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
             if restore_exit != 0 {
                 return Err(format!(
                     "restorer exited with {}, logs:\n{}",

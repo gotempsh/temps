@@ -781,6 +781,16 @@ impl RedisService {
             "chown -R redis:redis /data/appendonlydir && ",
             "echo 'Restore helper completed successfully'"
         );
+        // Join the same app network the original Redis container uses (see
+        // `create_container_once`/`ensure_network_exists`). Without this the
+        // helper only gets Docker's default bridge network, so the S3
+        // endpoint we just resolved via `resolve_endpoint_for_container`
+        // (relative to the *original* container's network) is unreachable
+        // from inside it — wal-g's fetch then hangs indefinitely trying to
+        // resolve/connect to a host it has no network path to.
+        ensure_network_exists(&self.docker)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to ensure network exists: {:?}", e))?;
         let helper_config = ContainerCreateBody {
             image: Some(redis_image),
             cmd: Some(vec![
@@ -792,6 +802,12 @@ impl RedisService {
             host_config: Some(HostConfig {
                 volumes_from: Some(vec![container_name.clone()]),
                 ..Default::default()
+            }),
+            networking_config: Some(bollard::models::NetworkingConfig {
+                endpoints_config: Some(HashMap::from([(
+                    temps_core::NETWORK_NAME.to_string(),
+                    bollard::models::EndpointSettings::default(),
+                )])),
             }),
             ..Default::default()
         };
@@ -817,16 +833,43 @@ impl RedisService {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to start restore helper container: {}", e))?;
 
-        // Wait for helper to finish
+        // Wait for helper to finish. Bounded — unlike `run_exec`'s exec-based
+        // path, this waits on the container-level Docker API directly with no
+        // other timeout backstop; leaving it unbounded means a stuck helper
+        // container hangs until the *caller's* outer timeout eventually
+        // fires, with none of the diagnostics `run_exec` provides.
         use futures::StreamExt;
-        let wait_result = self
-            .docker
-            .wait_container(
-                &helper.id,
-                None::<bollard::query_parameters::WaitContainerOptions>,
-            )
-            .next()
-            .await;
+        let wait_result = match tokio::time::timeout(
+            REDIS_BACKUP_EXEC_TIMEOUT,
+            self.docker
+                .wait_container(
+                    &helper.id,
+                    None::<bollard::query_parameters::WaitContainerOptions>,
+                )
+                .next(),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                let _ = self
+                    .docker
+                    .remove_container(
+                        &helper.id,
+                        Some(bollard::query_parameters::RemoveContainerOptions {
+                            force: true,
+                            v: false,
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
+                return Err(anyhow::anyhow!(
+                    "WAL-G backup-fetch helper for container '{}' did not exit within {:?}",
+                    container_name,
+                    REDIS_BACKUP_EXEC_TIMEOUT
+                ));
+            }
+        };
 
         // Capture helper container logs before cleanup for diagnostics
         let log_output = {

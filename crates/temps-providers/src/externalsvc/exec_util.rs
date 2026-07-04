@@ -102,7 +102,17 @@ pub async fn run_exec(
             tokio::select! {
                 biased;
 
-                chunk = output.next() => {
+                // `if !output_done` is load-bearing: once the stream is
+                // exhausted, `output.next()` resolves to `None` instantly on
+                // every poll. Without this guard, `biased` selection means
+                // that instantly-ready branch wins every single iteration,
+                // starving the timer branch below forever — the loop spins
+                // "reading" a dead stream and never reaches the
+                // `inspect_exec`/deadline check that's the only place exec
+                // completion or timeout is actually detected. This is what
+                // caused backup execs to silently exceed their caller's
+                // outer timeout with zero diagnostic output.
+                chunk = output.next(), if !output_done => {
                     match chunk {
                         Some(Ok(msg)) => {
                             captured.push_str(&msg.to_string());
