@@ -1583,14 +1583,37 @@ impl PostgresUpgradeOrchestrator {
     /// Best-effort volume removal — swallows errors; the retention sweeper
     /// will retry for rollback volumes, and for transient workspaces a
     /// leaked volume is benign.
+    /// Remove a Docker volume, retrying on transient failures. Docker can
+    /// briefly report a volume as still in use for a moment after its
+    /// container is removed (the detach isn't perfectly synchronous with
+    /// `stop_and_remove`) — a single attempt can silently fail and leave the
+    /// old volume in place. That matters here specifically: `phase_new_container`
+    /// creates its volume with "create if missing", so a volume this call
+    /// fails to remove gets *reused* by the next version's container,
+    /// carrying over the previous major version's on-disk data layout. New
+    /// Postgres images (18+) detect that as an incompatible upgrade and
+    /// refuse to start, crash-looping instead of coming up empty as intended.
+    /// Still best-effort overall: gives up (silently) after retries exhaust,
+    /// same as before, just with a real chance to succeed first.
     async fn remove_volume_best_effort(&self, volume_name: &str) {
-        let _ = self
-            .docker
-            .remove_volume(
-                volume_name,
-                None::<bollard::query_parameters::RemoveVolumeOptions>,
-            )
-            .await;
+        const MAX_ATTEMPTS: u32 = 5;
+        for attempt in 1..=MAX_ATTEMPTS {
+            match self
+                .docker
+                .remove_volume(
+                    volume_name,
+                    None::<bollard::query_parameters::RemoveVolumeOptions>,
+                )
+                .await
+            {
+                Ok(()) => return,
+                Err(_) if attempt < MAX_ATTEMPTS => {
+                    tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64))
+                        .await;
+                }
+                Err(_) => return,
+            }
+        }
     }
 
     // ---- Rollback volume retention -------------------------------------
@@ -2878,6 +2901,11 @@ mod tests {
             pub password: String,
             pub database: String,
             _log_dir: TempDir,
+            /// Every `postgres_major_upgrades.id` created via
+            /// `insert_upgrade_row`, so `cleanup()` can remove the
+            /// per-upgrade dumper/restorer containers and dump/rollback
+            /// volumes those phases name with the upgrade row's id.
+            created_upgrade_ids: std::sync::Mutex<Vec<i32>>,
         }
 
         impl UpgradeTestCtx {
@@ -2998,6 +3026,7 @@ mod tests {
                     password,
                     database,
                     _log_dir: log_dir,
+                    created_upgrade_ids: std::sync::Mutex::new(Vec::new()),
                 }
             }
 
@@ -3032,6 +3061,10 @@ mod tests {
                 .insert(self.test_db.db.as_ref())
                 .await
                 .expect("insert upgrade row");
+                self.created_upgrade_ids
+                    .lock()
+                    .expect("created_upgrade_ids mutex poisoned")
+                    .push(row.id);
                 row.id
             }
 
@@ -3088,15 +3121,37 @@ mod tests {
                 .await
             }
 
-            /// Remove the service container, its data volumes, and any
-            /// orchestrator-managed volumes (rollback / dump). Best-effort.
+            /// Remove the service container, its data volume, and every
+            /// per-upgrade dumper/restorer container and dump/rollback
+            /// volume the orchestrator created for the upgrade ids this ctx
+            /// tracked via `insert_upgrade_row`. Best-effort.
             pub async fn cleanup(&self) {
                 use bollard::query_parameters::{RemoveContainerOptions, RemoveVolumeOptions};
                 let container = self.container_name();
-                for c in [
-                    container.clone(),
-                    format!("temps_pg_upgrade_{}_dumper", self.service_id),
-                ] {
+
+                let upgrade_ids: Vec<i32> = self
+                    .created_upgrade_ids
+                    .lock()
+                    .expect("created_upgrade_ids mutex poisoned")
+                    .clone();
+
+                let mut containers = vec![container.clone()];
+                let mut volumes = vec![format!("{}_data", container)];
+                for id in upgrade_ids {
+                    containers.push(format!("temps_pg_upgrade_{}_dumper", id));
+                    containers.push(format!("temps_pg_upgrade_{}_restorer", id));
+                    // Restore-phase retries can create attempt-suffixed
+                    // restorer containers too (see phase_restore's retry
+                    // loop); MAX_RESTORER_ATTEMPTS is small, so just try them
+                    // all rather than tracking which attempt actually ran.
+                    for attempt in 1..=3 {
+                        containers.push(format!("temps_upgrade_test_restorer_{}_{}", id, attempt));
+                    }
+                    volumes.push(format!("{}_pgdump_{}", container, id));
+                    volumes.push(format!("{}_data_rollback_{}", container, id));
+                }
+
+                for c in containers {
                     let _ = self
                         .docker
                         .remove_container(
@@ -3108,15 +3163,12 @@ mod tests {
                         )
                         .await;
                 }
-                // Volumes we know about. The orchestrator-derived names
-                // (rollback_volume_{upgrade_id}, pgdump_{upgrade_id}) are
-                // unknown here without a DB query; caller lists them in
-                // `extra_volumes` when needed.
-                let live_volume = format!("{}_data", container);
-                let _ = self
-                    .docker
-                    .remove_volume(&live_volume, None::<RemoveVolumeOptions>)
-                    .await;
+                for v in volumes {
+                    let _ = self
+                        .docker
+                        .remove_volume(&v, None::<RemoveVolumeOptions>)
+                        .await;
+                }
             }
         }
 
@@ -3128,17 +3180,30 @@ mod tests {
             }
         }
 
-        /// Stub `PreUpgradeBackupProvider` — always returns a synthetic
-        /// backup id (42) without touching S3. The orchestrator only reads
-        /// this id back onto the row; no downstream check validates it.
+        /// Stub `PreUpgradeBackupProvider` — inserts a minimal real `backups`
+        /// row instead of touching S3, and returns its genuine id.
+        ///
+        /// This must be a real row: `postgres_major_upgrades.pre_upgrade_backup_id`
+        /// has `REFERENCES backups(id)`, so writing back a synthetic id that
+        /// was never inserted violates that foreign key at the database
+        /// level — the orchestrator doesn't need to validate it for Postgres
+        /// to reject it.
         pub struct StubBackupProvider {
             pub calls: Arc<AtomicU64>,
+            db: Arc<temps_database::DbConnection>,
+            /// Lazily-created real `s3_sources` row id. `backups.s3_source_id`
+            /// has its own `REFERENCES s3_sources(id)` constraint, so
+            /// `default_s3_source_id` can't return a synthetic id either —
+            /// same class of issue as the backup row itself.
+            s3_source_id: tokio::sync::OnceCell<i32>,
         }
 
         impl StubBackupProvider {
-            pub fn new() -> Self {
+            pub fn new(db: Arc<temps_database::DbConnection>) -> Self {
                 Self {
                     calls: Arc::new(AtomicU64::new(0)),
+                    db,
+                    s3_source_id: tokio::sync::OnceCell::new(),
                 }
             }
         }
@@ -3146,17 +3211,73 @@ mod tests {
         #[async_trait]
         impl PreUpgradeBackupProvider for StubBackupProvider {
             async fn default_s3_source_id(&self, _service_id: i32) -> Result<Option<i32>, String> {
-                Ok(Some(1))
+                use sea_orm::{ActiveModelTrait, Set};
+
+                let id = self
+                    .s3_source_id
+                    .get_or_try_init(|| async {
+                        temps_entities::s3_sources::ActiveModel {
+                            name: Set("stub-pre-upgrade-s3-source".to_string()),
+                            bucket_name: Set("stub-bucket".to_string()),
+                            region: Set("us-east-1".to_string()),
+                            endpoint: Set(None),
+                            bucket_path: Set("".to_string()),
+                            access_key_id: Set("stub".to_string()),
+                            secret_key: Set("stub".to_string()),
+                            force_path_style: Set(Some(true)),
+                            is_default: Set(false),
+                            created_at: Set(chrono::Utc::now()),
+                            updated_at: Set(chrono::Utc::now()),
+                            ..Default::default()
+                        }
+                        .insert(self.db.as_ref())
+                        .await
+                        .map(|model| model.id)
+                    })
+                    .await
+                    .map_err(|e: sea_orm::DbErr| {
+                        format!("StubBackupProvider: failed to insert s3_sources row: {}", e)
+                    })?;
+                Ok(Some(*id))
             }
 
             async fn create_pre_upgrade_backup(
                 &self,
                 _service_id: i32,
-                _s3_source_id: i32,
-                _created_by: i32,
+                s3_source_id: i32,
+                created_by: i32,
             ) -> Result<i32, String> {
+                use sea_orm::{ActiveModelTrait, Set};
+
                 self.calls.fetch_add(1, Ordering::SeqCst);
-                Ok(42)
+
+                let model = temps_entities::backups::ActiveModel {
+                    name: Set("stub-pre-upgrade-backup".to_string()),
+                    backup_id: Set(uuid::Uuid::new_v4().to_string()),
+                    schedule_id: Set(None),
+                    schedule_run_id: Set(None),
+                    backup_type: Set("external_service".to_string()),
+                    state: Set("completed".to_string()),
+                    started_at: Set(chrono::Utc::now()),
+                    finished_at: Set(Some(chrono::Utc::now())),
+                    size_bytes: Set(None),
+                    file_count: Set(None),
+                    s3_source_id: Set(s3_source_id),
+                    s3_location: Set("stub://pre-upgrade-backup".to_string()),
+                    error_message: Set(None),
+                    metadata: Set("{}".to_string()),
+                    checksum: Set(None),
+                    compression_type: Set("gzip".to_string()),
+                    created_by: Set(created_by),
+                    expires_at: Set(None),
+                    tags: Set("".to_string()),
+                    ..Default::default()
+                }
+                .insert(self.db.as_ref())
+                .await
+                .map_err(|e| format!("StubBackupProvider: failed to insert backups row: {}", e))?;
+
+                Ok(model.id)
             }
         }
 
@@ -3301,7 +3422,7 @@ mod tests {
 
         let ctx = UpgradeTestCtx::new("rollback").await;
         let backup_provider: Arc<dyn PreUpgradeBackupProvider> =
-            Arc::new(StubBackupProvider::new());
+            Arc::new(StubBackupProvider::new(ctx.test_db.db.clone()));
         let lifecycle: Arc<dyn PostgresContainerLifecycle> = ctx.lifecycle_adapter.clone();
 
         // Seed pre-upgrade data on v17.
@@ -3462,7 +3583,7 @@ mod tests {
         }
 
         let ctx = UpgradeTestCtx::new("happy").await;
-        let backup_provider = Arc::new(StubBackupProvider::new());
+        let backup_provider = Arc::new(StubBackupProvider::new(ctx.test_db.db.clone()));
         let backup_provider_trait: Arc<dyn PreUpgradeBackupProvider> = backup_provider.clone();
         let lifecycle: Arc<dyn PostgresContainerLifecycle> = ctx.lifecycle_adapter.clone();
 
@@ -3499,9 +3620,8 @@ mod tests {
             assert_eq!(row.phase, phase::COMPLETED, "expected phase=completed");
             assert!(row.started_at.is_some(), "started_at unset");
             assert!(row.finished_at.is_some(), "finished_at unset");
-            assert_eq!(
-                row.pre_upgrade_backup_id,
-                Some(42),
+            assert!(
+                row.pre_upgrade_backup_id.is_some(),
                 "pre_upgrade_backup_id not persisted"
             );
             assert!(
@@ -3608,7 +3728,7 @@ mod tests {
 
         let ctx = UpgradeTestCtx::new("snap-order").await;
         let backup_provider: Arc<dyn PreUpgradeBackupProvider> =
-            Arc::new(StubBackupProvider::new());
+            Arc::new(StubBackupProvider::new(ctx.test_db.db.clone()));
 
         // Wrap the real adapter in a recorder so we can observe call order.
         let recorder = RecordingLifecycle::new(ctx.lifecycle_adapter.clone());
@@ -3767,7 +3887,7 @@ mod tests {
 
         let ctx = UpgradeTestCtx::new("stream-drain").await;
         let backup_provider: Arc<dyn PreUpgradeBackupProvider> =
-            Arc::new(StubBackupProvider::new());
+            Arc::new(StubBackupProvider::new(ctx.test_db.db.clone()));
         let lifecycle: Arc<dyn PostgresContainerLifecycle> = ctx.lifecycle_adapter.clone();
 
         let result = async {
@@ -3866,7 +3986,7 @@ mod tests {
 
         let ctx = UpgradeTestCtx::new("dump-idem").await;
         let backup_provider: Arc<dyn PreUpgradeBackupProvider> =
-            Arc::new(StubBackupProvider::new());
+            Arc::new(StubBackupProvider::new(ctx.test_db.db.clone()));
         let lifecycle: Arc<dyn PostgresContainerLifecycle> = ctx.lifecycle_adapter.clone();
 
         let result = async {
@@ -3936,7 +4056,7 @@ mod tests {
             // state, the whole retry should complete FAST (< 60s typ).
             let retry_start = std::time::Instant::now();
             let orch2 = ctx.orchestrator(
-                Arc::new(StubBackupProvider::new()),
+                Arc::new(StubBackupProvider::new(ctx.test_db.db.clone())),
                 ctx.lifecycle_adapter.clone(),
             );
             orch2
