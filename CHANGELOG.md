@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-beta.42] - 2026-07-04
+
+### Added
+
+- **web:** Surface AI invocations inline in trace views ([#185](https://github.com/gotempsh/temps/issues/185))
+- **otel:** Label filters and per-series dynamic alerting for metric alerts
+- **otel:** Cross-project trace linking (ADR-027) ([#186](https://github.com/gotempsh/temps/issues/186))
+
+### Fixed
+
+- **analytics:** Exclude zero-visitor groups from property breakdown
+- **analytics:** Exclude zero-visitor groups from ClickHouse breakdown
+- **domains:** Stop ACME TXT records from stacking across renewals ([#182](https://github.com/gotempsh/temps/issues/182))
+- **analytics:** Stop fabricating +/-100% dashboard trend when there's no baseline
+- **providers:** Harden postgres major upgrades ([#151](https://github.com/gotempsh/temps/issues/151))
+- **deployer:** Make cluster DNS injection opt-in (experimental beta) ([#194](https://github.com/gotempsh/temps/issues/194))
+
 ## [0.1.0-beta.41] - 2026-07-02
 
 ### CI

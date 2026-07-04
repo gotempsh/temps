@@ -118,25 +118,27 @@ impl TempsPlugin for DeployerPlugin {
             let use_buildkit = Self::detect_buildkit().await;
             tracing::debug!("Using buildkit: {}", use_buildkit);
 
-            // Load build limits from settings. Only the control plane has
-            // a ConfigService registered (workers run DockerRuntime through
-            // `temps cli agent` which never reaches this plugin), so this
-            // is naturally scoped to control-plane builds. On the rare
-            // path where settings can't be read (fresh install before
-            // first save, DB hiccup), we log a warning and fall back to
-            // the legacy unbounded behaviour rather than fail plugin
-            // startup — builds must keep working.
+            // Load build limits and cluster-DNS settings. Only the control plane
+            // has a ConfigService registered (workers run DockerRuntime through
+            // `temps cli agent` which never reaches this plugin), so this is
+            // naturally scoped to control-plane builds. On the rare path where
+            // settings can't be read (fresh install before first save, DB
+            // hiccup), we log a warning and fall back to safe defaults: legacy
+            // unbounded build behaviour AND cluster DNS disabled — builds must
+            // keep working and we must never accidentally enable the DNS
+            // injection when we can't confirm the operator opted in.
             let config_service = context.require_service::<temps_config::ConfigService>();
-            let build_limits = match config_service.get_settings().await {
-                Ok(settings) => Some(settings.build_limits),
+            let (build_limits, cluster_dns_enabled) = match config_service.get_settings().await {
+                Ok(settings) => (Some(settings.build_limits), settings.cluster_dns.enabled),
                 Err(e) => {
                     tracing::warn!(
-                        "Could not read build_limits from settings ({}). \
+                        "Could not read settings ({}). \
                          Builds will run with the legacy unbounded behaviour \
+                         and cluster DNS resolver will not be started \
                          until settings are saved.",
                         e
                     );
-                    None
+                    (None, false)
                 }
             };
 
@@ -166,41 +168,59 @@ impl TempsPlugin for DeployerPlugin {
                 );
             }
 
-            // ADR-024: start the control-plane DNS resolver so containers
-            // deployed locally on the control plane — and every single-node
-            // install — can resolve `*.temps.local`. This plugin only runs on
-            // the control plane (workers build DockerRuntime via `temps agent`),
-            // so it is the right home. Best-effort: any failure (Docker down,
-            // :53 already bound, no gateway) leaves containers on Docker's
-            // embedded DNS, exactly as before this change.
+            // ADR-024: optionally start the control-plane DNS resolver so
+            // containers deployed locally on the control plane — and every
+            // single-node install — can resolve `*.temps.local`.
+            //
+            // Gated behind `AppSettings.cluster_dns.enabled` (experimental
+            // beta, **off by default**). The default-off guards against the
+            // DNS-timeout-cascade incident: glibc cycles through all nameserver
+            // lines at ~5 s × 2 attempts each when the injected resolver is
+            // transiently slow for external hostnames, causing 22–27 s TCP
+            // connect delays. When disabled, containers get NO custom
+            // `HostConfig.Dns` and fall back to Docker's embedded DNS
+            // (which forwards to the host's own resolv.conf), exactly as
+            // before ADR-024 was introduced.
             //
             // `get_service` (not `require_service`) is deliberate: the DB is an
             // optional dependency for this best-effort enhancement. A missing
             // DB (e.g. an embedded/test configuration) must skip DNS startup,
             // never fail the deployer plugin — do not promote this to
             // `require_service`.
-            if let Some(db) = context.get_service::<sea_orm::DatabaseConnection>() {
-                match docker_runtime.ensure_network_exists().await {
-                    Ok(()) => match docker_runtime.inspect_app_network_gateway().await {
-                        Some(gateway) => {
-                            let snapshot_dir =
-                                config_service.get_server_config().data_dir.join("dns");
-                            if let Some(slot) =
-                                temps_dns::start_control_plane_resolver(db, gateway, snapshot_dir)
-                                    .await
-                            {
-                                docker_runtime = docker_runtime.with_overlay_dns_slot(slot);
+            if cluster_dns_enabled {
+                tracing::info!(
+                    "cluster DNS resolver enabled (AppSettings.cluster_dns.enabled=true); \
+                     starting control-plane Hickory resolver"
+                );
+                if let Some(db) = context.get_service::<sea_orm::DatabaseConnection>() {
+                    match docker_runtime.ensure_network_exists().await {
+                        Ok(()) => match docker_runtime.inspect_app_network_gateway().await {
+                            Some(gateway) => {
+                                let snapshot_dir =
+                                    config_service.get_server_config().data_dir.join("dns");
+                                if let Some(slot) =
+                                    temps_dns::start_control_plane_resolver(db, gateway, snapshot_dir)
+                                        .await
+                                {
+                                    docker_runtime = docker_runtime.with_overlay_dns_slot(slot);
+                                }
                             }
-                        }
-                        None => tracing::warn!(
-                            "app-network gateway not found; control-plane DNS resolver not started"
+                            None => tracing::warn!(
+                                "app-network gateway not found; control-plane DNS resolver not started"
+                            ),
+                        },
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "could not ensure app network; control-plane DNS resolver not started"
                         ),
-                    },
-                    Err(e) => tracing::warn!(
-                        error = %e,
-                        "could not ensure app network; control-plane DNS resolver not started"
-                    ),
+                    }
                 }
+            } else {
+                tracing::info!(
+                    "cluster DNS resolver disabled (experimental beta, off by default — \
+                     set AppSettings.cluster_dns.enabled=true to enable *.temps.local resolution); \
+                     containers will use Docker's embedded DNS"
+                );
             }
 
             let docker_runtime = Arc::new(docker_runtime);
