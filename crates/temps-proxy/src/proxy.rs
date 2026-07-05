@@ -405,6 +405,13 @@ pub struct LoadBalancer {
     /// `deployment_url_mode` handling (serves HTTP as before).
     route_table: Option<Arc<temps_routes::CachedPeerTable>>,
     file_store: Option<Arc<dyn temps_file_store::FileStore>>,
+    /// In-memory moka cache for `static_asset_cache` DB lookups. Keyed on
+    /// `(project_id, url_path)`; values are `Option<content_hash>` so that
+    /// **negative results (no row found) are cached too** — the miss case is
+    /// the common path for container deployments where most assets are served
+    /// by upstream, not the fallback store. TTL 60 s, max ~50 k entries. See
+    /// `service/static_asset_lookup.rs` and WS4 in IMPLEMENTATION_PLAN.md.
+    static_asset_lookup: Arc<crate::service::static_asset_lookup::StaticAssetLookup>,
     preview_auth_limiter: Arc<PreviewAuthLimiter>,
     /// Shared admin-gate snapshot. When set and non-noop, requests for
     /// hosts that aren't in the route table are gated before falling back
@@ -435,6 +442,9 @@ impl LoadBalancer {
             project_context_resolver,
             cookie_config: CookieConfig::default(),
             crypto,
+            static_asset_lookup: Arc::new(
+                crate::service::static_asset_lookup::StaticAssetLookup::new(Arc::clone(&db)),
+            ),
             db,
             config_service,
             ip_access_control_service,
@@ -1853,40 +1863,36 @@ impl LoadBalancer {
         }
     }
 
-    /// Serve a static asset from CAS via database lookup.
-    /// Queries static_asset_cache for URL→hash, then reads blob from CAS.
-    /// Returns Ok(true) if served, Ok(false) if not found.
+    /// Serve a static asset from CAS via the in-memory lookup cache.
+    ///
+    /// `static_asset_lookup` resolves `(project_id, url_path) → content_hash`
+    /// using a moka TTL cache (60 s) so the `static_asset_cache` table is not
+    /// queried on every cacheable-asset request. Both hits and misses are cached;
+    /// the miss case (no fallback row — the common path for container deployments)
+    /// is the most important one to protect. See WS4 / `static_asset_lookup.rs`.
+    ///
+    /// Returns `Ok(true)` if the asset was served, `Ok(false)` if not found.
     async fn serve_asset_from_store(
         &self,
         session: &mut PingoraSession,
         ctx: &mut ProxyContext,
         url_path: &str,
     ) -> Result<bool> {
-        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
-        use temps_entities::static_asset_cache;
-
         let file_store = match &self.file_store {
             Some(fs) => fs,
             None => return Ok(false),
         };
 
-        // Look up content hash from database (most recent deployment first)
-        let project_id = ctx.project.as_ref().map(|p| p.id);
-        let cache_entry = if let Some(pid) = project_id {
-            static_asset_cache::Entity::find()
-                .filter(static_asset_cache::Column::ProjectId.eq(pid))
-                .filter(static_asset_cache::Column::UrlPath.eq(url_path))
-                .order_by_desc(static_asset_cache::Column::DeploymentId)
-                .one(self.db.as_ref())
+        // Resolve project_id, then look up the content hash via cache (no DB on hit/cached-miss).
+        let content_hash = match ctx.project.as_ref().map(|p| p.id) {
+            Some(pid) => match self
+                .static_asset_lookup
+                .get_content_hash(pid, url_path)
                 .await
-                .ok()
-                .flatten()
-        } else {
-            None
-        };
-
-        let content_hash = match cache_entry {
-            Some(entry) => entry.content_hash,
+            {
+                Some(hash) => hash,
+                None => return Ok(false),
+            },
             None => return Ok(false),
         };
 
