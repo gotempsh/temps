@@ -1709,14 +1709,37 @@ impl PostgresUpgradeOrchestrator {
     /// Best-effort volume removal — swallows errors; the retention sweeper
     /// will retry for rollback volumes, and for transient workspaces a
     /// leaked volume is benign.
+    /// Remove a Docker volume, retrying on transient failures. Docker can
+    /// briefly report a volume as still in use for a moment after its
+    /// container is removed (the detach isn't perfectly synchronous with
+    /// `stop_and_remove`) — a single attempt can silently fail and leave the
+    /// old volume in place. That matters here specifically: `phase_new_container`
+    /// creates its volume with "create if missing", so a volume this call
+    /// fails to remove gets *reused* by the next version's container,
+    /// carrying over the previous major version's on-disk data layout. New
+    /// Postgres images (18+) detect that as an incompatible upgrade and
+    /// refuse to start, crash-looping instead of coming up empty as intended.
+    /// Still best-effort overall: gives up (silently) after retries exhaust,
+    /// same as before, just with a real chance to succeed first.
     async fn remove_volume_best_effort(&self, volume_name: &str) {
-        let _ = self
-            .docker
-            .remove_volume(
-                volume_name,
-                None::<bollard::query_parameters::RemoveVolumeOptions>,
-            )
-            .await;
+        const MAX_ATTEMPTS: u32 = 5;
+        for attempt in 1..=MAX_ATTEMPTS {
+            match self
+                .docker
+                .remove_volume(
+                    volume_name,
+                    None::<bollard::query_parameters::RemoveVolumeOptions>,
+                )
+                .await
+            {
+                Ok(()) => return,
+                Err(_) if attempt < MAX_ATTEMPTS => {
+                    tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64))
+                        .await;
+                }
+                Err(_) => return,
+            }
+        }
     }
 
     async fn remove_volume_or_fail(&self, volume_name: &str) -> Result<(), String> {
@@ -2757,64 +2780,87 @@ mod tests {
                 }),
                 ..Default::default()
             };
-            let restorer_name = format!("temps_upgrade_test_restorer_{}", run_id);
-            let restorer = docker
-                .create_container(
-                    Some(
-                        CreateContainerOptionsBuilder::new()
-                            .name(&restorer_name)
-                            .build(),
-                    ),
-                    restorer_cfg,
-                )
-                .await
-                .map_err(|e| format!("create restorer: {}", e))?;
-            docker
-                .start_container(&restorer.id, None::<StartContainerOptions>)
-                .await
-                .map_err(|e| format!("start restorer: {}", e))?;
-
-            // Poll until exit rather than using wait_container — the wait API
-            // sometimes returns early with an empty error on fast-exiting
-            // containers on macOS Docker Desktop.
-            let exit_deadline = Instant::now() + Duration::from_secs(120);
-            let restore_exit = loop {
-                if Instant::now() > exit_deadline {
-                    return Err("restorer exit wait timeout".into());
-                }
-                match docker
-                    .inspect_container(&restorer.id, None::<InspectContainerOptions>)
+            // `wait_ready` above confirms `pg_isready` succeeds via `docker
+            // exec` inside the new container, but that doesn't guarantee the
+            // container's network-facing TCP listener is attached yet — under
+            // heavy concurrent Docker load (this test's CI job runs many
+            // containers in parallel) the restorer, a *separate* container
+            // connecting over the network, can still hit "Connection
+            // refused" in that brief window. Retry with a fresh restorer
+            // container on that specific failure rather than failing outright.
+            const MAX_RESTORER_ATTEMPTS: u32 = 3;
+            let mut restore_exit;
+            let mut restorer_logs;
+            let mut attempt = 1;
+            loop {
+                let restorer_name = format!("temps_upgrade_test_restorer_{}_{}", run_id, attempt);
+                let restorer = docker
+                    .create_container(
+                        Some(
+                            CreateContainerOptionsBuilder::new()
+                                .name(&restorer_name)
+                                .build(),
+                        ),
+                        restorer_cfg.clone(),
+                    )
                     .await
-                {
-                    Ok(insp) => {
-                        if let Some(state) = insp.state.as_ref() {
-                            if state.running == Some(false) {
-                                break state.exit_code.unwrap_or(-1);
+                    .map_err(|e| format!("create restorer: {}", e))?;
+                docker
+                    .start_container(&restorer.id, None::<StartContainerOptions>)
+                    .await
+                    .map_err(|e| format!("start restorer: {}", e))?;
+
+                // Poll until exit rather than using wait_container — the wait
+                // API sometimes returns early with an empty error on
+                // fast-exiting containers on macOS Docker Desktop.
+                let exit_deadline = Instant::now() + Duration::from_secs(120);
+                restore_exit = loop {
+                    if Instant::now() > exit_deadline {
+                        return Err("restorer exit wait timeout".into());
+                    }
+                    match docker
+                        .inspect_container(&restorer.id, None::<InspectContainerOptions>)
+                        .await
+                    {
+                        Ok(insp) => {
+                            if let Some(state) = insp.state.as_ref() {
+                                if state.running == Some(false) {
+                                    break state.exit_code.unwrap_or(-1);
+                                }
                             }
                         }
+                        Err(e) => return Err(format!("inspect restorer: {}", e)),
                     }
-                    Err(e) => return Err(format!("inspect restorer: {}", e)),
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                };
+                restorer_logs = docker
+                    .logs(
+                        &restorer.id,
+                        Some(LogsOptionsBuilder::new().stdout(true).stderr(true).build()),
+                    )
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .map(|v| v.into_iter().map(|c| c.to_string()).collect::<String>())
+                    .unwrap_or_default();
+                let _ = docker
+                    .remove_container(
+                        &restorer.id,
+                        Some(RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
+
+                if restore_exit == 0
+                    || attempt >= MAX_RESTORER_ATTEMPTS
+                    || !restorer_logs.contains("Connection refused")
+                {
+                    break;
                 }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            };
-            let restorer_logs = docker
-                .logs(
-                    &restorer.id,
-                    Some(LogsOptionsBuilder::new().stdout(true).stderr(true).build()),
-                )
-                .try_collect::<Vec<_>>()
-                .await
-                .map(|v| v.into_iter().map(|c| c.to_string()).collect::<String>())
-                .unwrap_or_default();
-            let _ = docker
-                .remove_container(
-                    &restorer.id,
-                    Some(RemoveContainerOptions {
-                        force: true,
-                        ..Default::default()
-                    }),
-                )
-                .await;
+                attempt += 1;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
             if restore_exit != 0 {
                 return Err(format!(
                     "restorer exited with {}, logs:\n{}",
@@ -3149,6 +3195,11 @@ mod tests {
             pub password: String,
             pub database: String,
             _log_dir: TempDir,
+            /// Every `postgres_major_upgrades.id` created via
+            /// `insert_upgrade_row`, so `cleanup()` can remove the
+            /// per-upgrade dumper/restorer containers and dump/rollback
+            /// volumes those phases name with the upgrade row's id.
+            created_upgrade_ids: std::sync::Mutex<Vec<i32>>,
         }
 
         impl UpgradeTestCtx {
@@ -3269,6 +3320,7 @@ mod tests {
                     password,
                     database,
                     _log_dir: log_dir,
+                    created_upgrade_ids: std::sync::Mutex::new(Vec::new()),
                 }
             }
 
@@ -3303,6 +3355,10 @@ mod tests {
                 .insert(self.test_db.db.as_ref())
                 .await
                 .expect("insert upgrade row");
+                self.created_upgrade_ids
+                    .lock()
+                    .expect("created_upgrade_ids mutex poisoned")
+                    .push(row.id);
                 row.id
             }
 
@@ -3359,15 +3415,37 @@ mod tests {
                 .await
             }
 
-            /// Remove the service container, its data volumes, and any
-            /// orchestrator-managed volumes (rollback / dump). Best-effort.
+            /// Remove the service container, its data volume, and every
+            /// per-upgrade dumper/restorer container and dump/rollback
+            /// volume the orchestrator created for the upgrade ids this ctx
+            /// tracked via `insert_upgrade_row`. Best-effort.
             pub async fn cleanup(&self) {
                 use bollard::query_parameters::{RemoveContainerOptions, RemoveVolumeOptions};
                 let container = self.container_name();
-                for c in [
-                    container.clone(),
-                    format!("temps_pg_upgrade_{}_dumper", self.service_id),
-                ] {
+
+                let upgrade_ids: Vec<i32> = self
+                    .created_upgrade_ids
+                    .lock()
+                    .expect("created_upgrade_ids mutex poisoned")
+                    .clone();
+
+                let mut containers = vec![container.clone()];
+                let mut volumes = vec![format!("{}_data", container)];
+                for id in upgrade_ids {
+                    containers.push(format!("temps_pg_upgrade_{}_dumper", id));
+                    containers.push(format!("temps_pg_upgrade_{}_restorer", id));
+                    // Restore-phase retries can create attempt-suffixed
+                    // restorer containers too (see phase_restore's retry
+                    // loop); MAX_RESTORER_ATTEMPTS is small, so just try them
+                    // all rather than tracking which attempt actually ran.
+                    for attempt in 1..=3 {
+                        containers.push(format!("temps_upgrade_test_restorer_{}_{}", id, attempt));
+                    }
+                    volumes.push(format!("{}_pgdump_{}", container, id));
+                    volumes.push(format!("{}_data_rollback_{}", container, id));
+                }
+
+                for c in containers {
                     let _ = self
                         .docker
                         .remove_container(
@@ -3379,15 +3457,12 @@ mod tests {
                         )
                         .await;
                 }
-                // Volumes we know about. The orchestrator-derived names
-                // (rollback_volume_{upgrade_id}, pgdump_{upgrade_id}) are
-                // unknown here without a DB query; caller lists them in
-                // `extra_volumes` when needed.
-                let live_volume = format!("{}_data", container);
-                let _ = self
-                    .docker
-                    .remove_volume(&live_volume, None::<RemoveVolumeOptions>)
-                    .await;
+                for v in volumes {
+                    let _ = self
+                        .docker
+                        .remove_volume(&v, None::<RemoveVolumeOptions>)
+                        .await;
+                }
             }
         }
 

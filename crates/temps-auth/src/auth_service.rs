@@ -6,8 +6,8 @@ use chrono::{Duration, Utc};
 use cookie::Cookie;
 use rand::Rng;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set,
-    TransactionTrait,
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
+    Set, TransactionTrait,
 };
 use serde::Serialize;
 use std::sync::Arc;
@@ -107,6 +107,24 @@ impl AuthService {
         new_session.insert(self.db.as_ref()).await?;
 
         Ok(session_token)
+    }
+
+    /// Count this user's currently active (non-expired) sessions.
+    ///
+    /// Used by the login handlers to detect and audit-log concurrent
+    /// sessions (bherila/temps#24) -- e.g. a second device/browser logging
+    /// in while an earlier session for the same account is still live. This
+    /// is purely observational: callers MUST call it *before* creating the
+    /// new session (otherwise the session being created would always count
+    /// itself), and a non-zero result must never block the login, only be
+    /// recorded in the audit trail.
+    pub async fn count_active_sessions(&self, user_id: i32) -> Result<u64, AuthError> {
+        let count = temps_entities::sessions::Entity::find()
+            .filter(temps_entities::sessions::Column::UserId.eq(user_id))
+            .filter(temps_entities::sessions::Column::ExpiresAt.gt(Utc::now()))
+            .count(self.db.as_ref())
+            .await?;
+        Ok(count)
     }
 
     pub async fn verify_session(
@@ -414,6 +432,44 @@ impl AuthService {
         if !password_valid {
             warn!("Invalid password attempt for user {}", user.id);
             return Err(UserAuthError::InvalidCredentials);
+        }
+
+        // SOC2 hardening (bherila/temps#32): operators can require MFA
+        // enrollment for Admin-role accounts via the `require_mfa_for_admins`
+        // setting. This check only runs in the password-login path -- SSO/OIDC
+        // logins go through `OidcService::resolve_user` +
+        // `oidc_handler::complete_oidc_login`, which never call this method,
+        // so federated logins are unaffected by design (see doc comment on
+        // `AppSettings::require_mfa_for_admins`).
+        //
+        // A settings-lookup failure must never block login for the whole
+        // instance (this runs on every successful password login, not just
+        // admins) -- degrade to the default (`require_mfa_for_admins: false`)
+        // and let the login proceed, same graceful-degradation contract as
+        // `count_active_sessions` below.
+        let settings = self.get_settings().await.unwrap_or_default();
+        if settings.require_mfa_for_admins && !user.mfa_enabled {
+            let user_service = crate::user_service::UserService::new(self.db.clone());
+            let is_admin = match user_service.is_admin(user.id).await {
+                Ok(is_admin) => is_admin,
+                Err(e) => {
+                    error!(
+                        "Failed to determine admin status for user {} while enforcing require_mfa_for_admins: {}",
+                        user.id, e
+                    );
+                    false
+                }
+            };
+            if is_admin {
+                warn!(
+                    "Blocking login for admin user {}: require_mfa_for_admins is enabled and MFA is not enrolled",
+                    user.id
+                );
+                return Err(UserAuthError::MfaRequiredForRole {
+                    user_id: user.id,
+                    role: "Admin".to_string(),
+                });
+            }
         }
 
         debug!("Successful login for user {}", user.id);
@@ -812,8 +868,14 @@ pub fn validate_password_complexity(password: &str) -> Result<(), UserAuthError>
 
 #[derive(Error, Debug)]
 pub enum UserAuthError {
+    // Deliberately NOT `#[from]` -- see the manual `From<sea_orm::DbErr>` impl
+    // below, which detects a unique-constraint violation on `users.email`
+    // (raised by the DB-level `idx_users_email_unique` index) and maps it to
+    // `EmailAlreadyRegistered` instead of a generic database error. `#[source]`
+    // is kept (independent of `#[from]`) so this variant still participates
+    // in `Error::source()` error-chain tooling.
     #[error("Database error: {0}")]
-    DatabaseError(#[from] sea_orm::DbErr),
+    DatabaseError(#[source] sea_orm::DbErr),
     #[error("Invalid credentials")]
     InvalidCredentials,
     #[error("User not found")]
@@ -832,6 +894,43 @@ pub enum UserAuthError {
     EmailServiceError(String),
     #[error("Encryption error: {0}")]
     EncryptionError(String),
+    /// Raised at login when `require_mfa_for_admins` is enabled, the user
+    /// holds the `role` (elevated) role, and they have not enrolled MFA.
+    /// (bherila/temps#32.)
+    #[error(
+        "MFA is required for the '{role}' role but user {user_id} has not enrolled multi-factor authentication"
+    )]
+    MfaRequiredForRole { user_id: i32, role: String },
+}
+
+/// Detect a Postgres unique-constraint violation regardless of the specific
+/// `DbErr` variant Sea-ORM wraps it in. The `users` table has exactly one
+/// unique constraint (`idx_users_email_unique` on `email`, see
+/// `m20250127_000001_add_unique_email_constraint.rs`), so within this crate
+/// any unique-violation surfacing through a `UserAuthError` conversion can
+/// only be a duplicate email -- this backstops the application-level
+/// pre-check in `register_user` against a race between the SELECT and the
+/// INSERT (bherila/temps#24).
+fn is_unique_violation(error: &sea_orm::DbErr) -> bool {
+    if matches!(error, sea_orm::DbErr::RecordNotInserted) {
+        return true;
+    }
+    // Match the specific constraint name rather than a generic "duplicate
+    // key"/"23505" substring: this crate has other unique-constrained
+    // columns reachable through `UserAuthError` (e.g.
+    // `magic_link_tokens.token`), and a generic substring match would
+    // misreport an unrelated collision on one of those as
+    // `EmailAlreadyRegistered`.
+    error.to_string().contains("idx_users_email_unique")
+}
+
+impl From<sea_orm::DbErr> for UserAuthError {
+    fn from(error: sea_orm::DbErr) -> Self {
+        if is_unique_violation(&error) {
+            return UserAuthError::EmailAlreadyRegistered;
+        }
+        UserAuthError::DatabaseError(error)
+    }
 }
 
 // Request DTOs
@@ -865,6 +964,7 @@ mod tests {
     use axum::http::HeaderMap;
     use chrono::{Duration, Utc};
     use temps_database::test_utils::TestDatabase;
+    use temps_entities::types::RoleType;
     use temps_entities::{magic_link_tokens, sessions, settings, users};
 
     struct MockEmailService {
@@ -1012,6 +1112,69 @@ mod tests {
             ..Default::default()
         };
         user.insert(db.as_ref()).await.unwrap()
+    }
+
+    async fn create_test_user_with_mfa(
+        db: &Arc<DatabaseConnection>,
+        email: &str,
+        password: &str,
+        mfa_enabled: bool,
+    ) -> users::Model {
+        use argon2::password_hash::{rand_core::OsRng, SaltString};
+        let argon2 = argon2::Argon2::default();
+        let salt = SaltString::generate(&mut OsRng);
+        let password_hash = argon2
+            .hash_password(password.as_bytes(), &salt)
+            .unwrap()
+            .to_string();
+
+        let user = users::ActiveModel {
+            email: Set(email.to_lowercase()),
+            name: Set(format!("Test User {}", email)),
+            password_hash: Set(Some(password_hash)),
+            email_verified: Set(true),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            mfa_enabled: Set(mfa_enabled),
+            mfa_secret: if mfa_enabled {
+                Set(Some("JBSWY3DPEHPK3PXP".to_string()))
+            } else {
+                Set(None)
+            },
+            ..Default::default()
+        };
+        user.insert(db.as_ref()).await.unwrap()
+    }
+
+    /// Like `setup_test_env`, but (a) lets the caller control
+    /// `require_mfa_for_admins`, and (b) skips gracefully instead of
+    /// panicking when Docker is unavailable (CLAUDE.md: Docker-dependent
+    /// tests must never use `#[ignore]` or otherwise fail the run when the
+    /// daemon simply isn't present in this environment).
+    async fn setup_test_env_with_mfa_setting(
+        require_mfa_for_admins: bool,
+    ) -> Option<(TestDatabase, AuthService)> {
+        let db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Docker not available, skipping test: {}", e);
+                return None;
+            }
+        };
+
+        let settings_row = settings::ActiveModel {
+            id: Set(1),
+            data: Set(serde_json::json!({
+                "external_url": "https://test.example.com",
+                "require_mfa_for_admins": require_mfa_for_admins,
+            })),
+            ..Default::default()
+        };
+        settings_row.insert(db.db.as_ref()).await.unwrap();
+
+        let notification_service = Arc::new(MockEmailService::new());
+        let auth_service = AuthService::new(db.db.clone(), notification_service);
+        Some((db, auth_service))
     }
 
     // Session Management Tests
@@ -1840,5 +2003,367 @@ mod tests {
         assert!(validate_password_complexity("12345678").is_err()); // no uppercase, lowercase, special
         assert!(validate_password_complexity("Password").is_err()); // no digit, special
         assert!(validate_password_complexity("Password1").is_err()); // no special
+    }
+
+    // --- Unique email enforcement (bherila/temps#24) ---
+    //
+    // The DB-level constraint itself (`idx_users_email_unique`, added by
+    // `m20250127_000001_add_unique_email_constraint.rs`) already exists and
+    // is registered in the `Migrator`. These tests cover the part that was
+    // actually missing: mapping the raw `DbErr` a real unique-violation
+    // produces back into the friendly, typed `UserAuthError::EmailAlreadyRegistered`
+    // instead of leaking a generic `DatabaseError` (which handlers currently
+    // turn into an opaque 500).
+
+    #[test]
+    fn is_unique_violation_detects_postgres_sqlstate_23505() {
+        let err = sea_orm::DbErr::Custom(
+            "error returned from database: duplicate key value violates unique constraint \"idx_users_email_unique\" (SQLSTATE 23505)".to_string(),
+        );
+        assert!(is_unique_violation(&err));
+    }
+
+    #[test]
+    fn is_unique_violation_detects_record_not_inserted() {
+        assert!(is_unique_violation(&sea_orm::DbErr::RecordNotInserted));
+    }
+
+    #[test]
+    fn is_unique_violation_false_for_unrelated_errors() {
+        let err = sea_orm::DbErr::Custom("connection reset by peer".to_string());
+        assert!(!is_unique_violation(&err));
+    }
+
+    #[test]
+    fn is_unique_violation_false_for_unrelated_unique_constraint() {
+        // A collision on a *different* unique-constrained column (e.g.
+        // magic_link_tokens.token) must not be misreported as a duplicate
+        // email -- only `idx_users_email_unique` should match.
+        let err = sea_orm::DbErr::Custom(
+            "error returned from database: duplicate key value violates unique constraint \"magic_link_tokens_token_key\" (SQLSTATE 23505)".to_string(),
+        );
+        assert!(!is_unique_violation(&err));
+    }
+
+    #[test]
+    fn user_auth_error_from_dberr_maps_unique_violation_to_email_already_registered() {
+        let err = sea_orm::DbErr::Custom(
+            "duplicate key value violates unique constraint \"idx_users_email_unique\"".to_string(),
+        );
+        let mapped: UserAuthError = err.into();
+        assert!(matches!(mapped, UserAuthError::EmailAlreadyRegistered));
+    }
+
+    #[test]
+    fn user_auth_error_from_dberr_preserves_other_errors_as_database_error() {
+        let err = sea_orm::DbErr::Custom("connection reset by peer".to_string());
+        let mapped: UserAuthError = err.into();
+        assert!(matches!(mapped, UserAuthError::DatabaseError(_)));
+    }
+
+    #[tokio::test]
+    async fn register_user_maps_concurrent_duplicate_insert_to_email_already_registered() {
+        // Simulates the race register_user's app-level pre-check can't fully
+        // close: the SELECT sees no existing user, but a concurrent request
+        // wins the INSERT race first and the DB-level unique index rejects
+        // this one. `register_user` must surface a friendly
+        // `EmailAlreadyRegistered`, not a raw `DatabaseError`.
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // 1) `find().filter(email...)` in register_user -> no existing user
+            .append_query_results::<users::Model, Vec<_>, _>(vec![vec![]])
+            // 2) `new_user.insert(...)` -> unique-violation from the DB
+            .append_query_errors(vec![sea_orm::DbErr::Custom(
+                "error returned from database: duplicate key value violates unique constraint \"idx_users_email_unique\" (SQLSTATE 23505)".to_string(),
+            )])
+            .into_connection();
+
+        let notification_service = Arc::new(MockEmailService::new());
+        let auth_service = AuthService::new(Arc::new(db), notification_service);
+
+        let result = auth_service
+            .register_user(RegisterRequest {
+                email: "racer@example.com".to_string(),
+                password: "ValidPass123!".to_string(),
+                name: "Racer".to_string(),
+            })
+            .await;
+
+        assert!(matches!(result, Err(UserAuthError::EmailAlreadyRegistered)));
+    }
+
+    // --- Concurrent-session detection (bherila/temps#24) ---
+
+    #[tokio::test]
+    async fn count_active_sessions_returns_current_count() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        use std::collections::BTreeMap;
+
+        let mut row: BTreeMap<&str, sea_orm::Value> = BTreeMap::new();
+        row.insert("num_items", sea_orm::Value::BigInt(Some(2)));
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![row]])
+            .into_connection();
+
+        let notification_service = Arc::new(MockEmailService::new());
+        let auth_service = AuthService::new(Arc::new(db), notification_service);
+
+        let count = auth_service.count_active_sessions(42).await.unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[tokio::test]
+    async fn count_active_sessions_propagates_database_error() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors(vec![sea_orm::DbErr::Custom(
+                "connection reset by peer".to_string(),
+            )])
+            .into_connection();
+
+        let notification_service = Arc::new(MockEmailService::new());
+        let auth_service = AuthService::new(Arc::new(db), notification_service);
+
+        let result = auth_service.count_active_sessions(42).await;
+        assert!(matches!(result, Err(AuthError::DatabaseError { .. })));
+    }
+
+    #[tokio::test]
+    async fn count_active_sessions_ignores_expired_and_other_users_sessions() {
+        let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+            return;
+        };
+        let user = create_test_user(&db.db, "concurrent@example.com", "Password123!").await;
+        let other_user = create_test_user(&db.db, "other@example.com", "Password123!").await;
+
+        // No sessions yet.
+        assert_eq!(
+            auth_service.count_active_sessions(user.id).await.unwrap(),
+            0
+        );
+
+        // One active session for our user.
+        auth_service.create_session(user.id).await.unwrap();
+        assert_eq!(
+            auth_service.count_active_sessions(user.id).await.unwrap(),
+            1
+        );
+
+        // An expired session for our user must not be counted.
+        let expired_session = sessions::ActiveModel {
+            user_id: Set(user.id),
+            session_token: Set("expired-token".to_string()),
+            expires_at: Set(Utc::now() - Duration::hours(1)),
+            ..Default::default()
+        };
+        expired_session.insert(db.db.as_ref()).await.unwrap();
+        assert_eq!(
+            auth_service.count_active_sessions(user.id).await.unwrap(),
+            1
+        );
+
+        // A session belonging to a different user must not be counted.
+        auth_service.create_session(other_user.id).await.unwrap();
+        assert_eq!(
+            auth_service.count_active_sessions(user.id).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            auth_service
+                .count_active_sessions(other_user.id)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    // --- MFA-required-for-admins (bherila/temps#32) ---
+
+    #[tokio::test]
+    async fn login_allows_mfa_enrolled_admin_when_required() {
+        let Some((db, auth_service)) = setup_test_env_with_mfa_setting(true).await else {
+            return;
+        };
+        let user =
+            create_test_user_with_mfa(&db.db, "admin-mfa@example.com", "Password123!", true).await;
+
+        let user_service = crate::user_service::UserService::new(db.db.clone());
+        user_service.initialize_roles().await.unwrap();
+        let admin_role = temps_entities::roles::Entity::find()
+            .filter(temps_entities::roles::Column::Name.eq(RoleType::Admin.as_str()))
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        user_service
+            .assign_role_to_user(user.id, admin_role.id)
+            .await
+            .unwrap();
+
+        let result = auth_service
+            .login(LoginRequest {
+                email: "admin-mfa@example.com".to_string(),
+                password: "Password123!".to_string(),
+            })
+            .await;
+
+        assert!(result.is_ok(), "MFA-enrolled admin must be able to log in");
+    }
+
+    #[tokio::test]
+    async fn login_blocks_admin_without_mfa_when_required() {
+        let Some((db, auth_service)) = setup_test_env_with_mfa_setting(true).await else {
+            return;
+        };
+        let user =
+            create_test_user_with_mfa(&db.db, "admin-nomfa@example.com", "Password123!", false)
+                .await;
+
+        let user_service = crate::user_service::UserService::new(db.db.clone());
+        user_service.initialize_roles().await.unwrap();
+        let admin_role = temps_entities::roles::Entity::find()
+            .filter(temps_entities::roles::Column::Name.eq(RoleType::Admin.as_str()))
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        user_service
+            .assign_role_to_user(user.id, admin_role.id)
+            .await
+            .unwrap();
+
+        let result = auth_service
+            .login(LoginRequest {
+                email: "admin-nomfa@example.com".to_string(),
+                password: "Password123!".to_string(),
+            })
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(UserAuthError::MfaRequiredForRole { user_id, .. }) if user_id == user.id
+        ));
+    }
+
+    #[tokio::test]
+    async fn login_allows_admin_without_mfa_when_setting_disabled() {
+        let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+            return;
+        };
+        let user =
+            create_test_user_with_mfa(&db.db, "admin-nomfa2@example.com", "Password123!", false)
+                .await;
+
+        let user_service = crate::user_service::UserService::new(db.db.clone());
+        user_service.initialize_roles().await.unwrap();
+        let admin_role = temps_entities::roles::Entity::find()
+            .filter(temps_entities::roles::Column::Name.eq(RoleType::Admin.as_str()))
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        user_service
+            .assign_role_to_user(user.id, admin_role.id)
+            .await
+            .unwrap();
+
+        let result = auth_service
+            .login(LoginRequest {
+                email: "admin-nomfa2@example.com".to_string(),
+                password: "Password123!".to_string(),
+            })
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "admin without MFA must be allowed to log in when require_mfa_for_admins is disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn login_never_blocks_non_admin_without_mfa_when_required() {
+        let Some((db, auth_service)) = setup_test_env_with_mfa_setting(true).await else {
+            return;
+        };
+        // Deliberately NOT assigned any role -- a plain user account.
+        create_test_user_with_mfa(&db.db, "plain-user@example.com", "Password123!", false).await;
+
+        let result = auth_service
+            .login(LoginRequest {
+                email: "plain-user@example.com".to_string(),
+                password: "Password123!".to_string(),
+            })
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "non-admin users must never be blocked by require_mfa_for_admins"
+        );
+    }
+
+    /// A transient failure reading the settings row must never block login
+    /// for the whole instance -- it must degrade to the default
+    /// (`require_mfa_for_admins: false`) and let a correct-password login
+    /// through, exactly like a `count_active_sessions` lookup failure does.
+    #[tokio::test]
+    async fn login_succeeds_when_settings_lookup_fails() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        let password = "Password123!";
+        let argon2 = argon2::Argon2::default();
+        let salt = argon2::password_hash::SaltString::generate(
+            &mut argon2::password_hash::rand_core::OsRng,
+        );
+        let password_hash = argon2
+            .hash_password(password.as_bytes(), &salt)
+            .unwrap()
+            .to_string();
+
+        let user = users::Model {
+            id: 7,
+            name: "Settings Outage User".to_string(),
+            email: "settings-outage@example.com".to_string(),
+            password_hash: Some(password_hash),
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // 1) `find().filter(email...)` in login() -> the user above
+            .append_query_results(vec![vec![user]])
+            // 2) `get_settings()`'s `settings::Entity::find_by_id(1)` -> DB error
+            .append_query_errors(vec![sea_orm::DbErr::Custom(
+                "connection reset by peer".to_string(),
+            )])
+            .into_connection();
+
+        let notification_service = Arc::new(MockEmailService::new());
+        let auth_service = AuthService::new(Arc::new(db), notification_service);
+
+        let result = auth_service
+            .login(LoginRequest {
+                email: "settings-outage@example.com".to_string(),
+                password: password.to_string(),
+            })
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "a settings-lookup failure must not block a correct-password login"
+        );
     }
 }

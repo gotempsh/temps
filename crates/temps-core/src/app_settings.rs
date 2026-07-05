@@ -70,6 +70,12 @@ pub struct AppSettings {
     /// hardware that already has its own per-host headroom).
     pub build_limits: BuildLimitsSettings,
 
+    /// Cluster-DNS resolver settings (ADR-024, experimental beta). Off by
+    /// default — see `ClusterDnsSettings` for the incident background and
+    /// trade-offs. Must be explicitly enabled by operators who need
+    /// `*.temps.local` service-to-service resolution inside containers.
+    pub cluster_dns: ClusterDnsSettings,
+
     /// Metrics observability settings. Controls the MetricsStore backend,
     /// scrape interval, and tiered retention windows.
     pub monitoring: MonitoringSettings,
@@ -81,15 +87,19 @@ pub struct AppSettings {
     #[serde(default)]
     pub setup_complete: bool,
 
-    /// Production kill-switch for MCP-role API access (issue #19). When
-    /// `false`, the auth middleware rejects every request authenticated with
-    /// an API key whose role is `Role::Mcp`, regardless of that key's
-    /// permissions. Defaults to `true` so existing installs that already
-    /// issued MCP keys are not locked out until an operator explicitly opts
-    /// out. Mirrored into a process-wide cache (`temps_core::mcp_access`) so
-    /// the hot auth-middleware path never needs a DB round-trip.
-    #[serde(default = "default_mcp_access_enabled")]
-    pub mcp_access_enabled: bool,
+    /// When `true`, any user holding the `Admin` role must have MFA enrolled
+    /// (`users.mfa_enabled = true`) to complete a **password** login. Users
+    /// without MFA enrolled are rejected with a typed error instructing them
+    /// to enroll before retrying. This only gates the password-login path
+    /// (`AuthService::login`) -- SSO/OIDC logins are handled by a separate
+    /// code path (`OidcService::resolve_user` + `oidc_handler`) and are
+    /// intentionally unaffected, since federating identity to a
+    /// properly-hardened IdP is itself an acceptable alternative to local
+    /// TOTP MFA. Modeled as a settings row (not an env var) per CLAUDE.md so
+    /// an operator can flip it at runtime via the Settings API without
+    /// restarting the binary.
+    #[serde(default)]
+    pub require_mfa_for_admins: bool,
 
     /// Binary version tag (e.g. "v0.1.0") of the *console* process
     /// (`temps serve`, role=all or role=console) that last started. Written
@@ -103,6 +113,40 @@ pub struct AppSettings {
     /// accidentally overwrite the self-recorded value.
     #[serde(default)]
     pub console_version: Option<String>,
+}
+
+/// Cluster-DNS resolver settings (ADR-024, experimental beta).
+///
+/// When `enabled`, the Temps control plane starts a Hickory DNS resolver and
+/// injects it as the first nameserver into every deployed container via
+/// `HostConfig.Dns` — giving containers the ability to resolve `*.temps.local`
+/// FQDNs for service-to-service communication. Worker nodes pick this flag up
+/// from the `/api/internal/nodes/{id}/network/peers` wire response and gate
+/// their own per-node resolver the same way.
+///
+/// **Default: `false` (disabled).**
+///
+/// Why disabled by default: a production incident showed that when the injected
+/// Hickory resolver was slow or transiently unresponsive for a non-`*.temps.local`
+/// (external) hostname, glibc's resolver cycled through all three nameservers
+/// (`172.20.0.1`, `1.1.1.1`, `8.8.8.8`) at ~5 s timeout × 2 attempts each,
+/// causing 22–27 s delays for outbound TCP connections. Disabling the injection
+/// restores Docker's embedded DNS as the sole resolver, eliminating that failure
+/// mode. Operators running single/multi-node installs that depend on
+/// `*.temps.local` resolution must explicitly opt in by setting `enabled: true`.
+///
+/// `bool` defaults to `false` in Rust and JSON (`#[serde(default)]`), so the
+/// safe-off behaviour is automatic for new installs and legacy settings rows.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct ClusterDnsSettings {
+    /// Master switch. When `false` (default), no custom DNS is injected into
+    /// containers — they use Docker's embedded DNS which forwards to the host's
+    /// own `resolv.conf`. When `true`, the control-plane Hickory resolver is
+    /// started and its bridge IP is injected as the first nameserver so
+    /// `*.temps.local` FQDNs resolve inside containers.
+    #[schema(example = false)]
+    pub enabled: bool,
 }
 
 /// Control-plane build resource limits.
@@ -288,10 +332,6 @@ fn default_auth_type() -> String {
 }
 
 fn default_sandbox_enabled() -> bool {
-    true
-}
-
-fn default_mcp_access_enabled() -> bool {
     true
 }
 
@@ -689,9 +729,10 @@ impl Default for AppSettings {
             ai_config: AiConfigSettings::default(),
             insecure_tls: false,
             build_limits: BuildLimitsSettings::default(),
+            cluster_dns: ClusterDnsSettings::default(),
             monitoring: MonitoringSettings::default(),
             setup_complete: false,
-            mcp_access_enabled: true,
+            require_mfa_for_admins: false,
             console_version: None,
         }
     }
@@ -879,6 +920,56 @@ impl AppSettings {
 mod tests {
     use super::*;
 
+    // ADR-024: cluster-DNS injection is experimental/beta and defaults OFF
+    // to avoid the DNS-timeout-cascade failure mode (22-27 s TCP delays when
+    // the injected resolver is transiently slow for external hostnames).
+    #[test]
+    fn cluster_dns_defaults_disabled() {
+        let s = ClusterDnsSettings::default();
+        assert!(
+            !s.enabled,
+            "cluster DNS must be opt-in (off by default) to avoid DNS cascade delays"
+        );
+    }
+
+    #[test]
+    fn app_settings_default_has_cluster_dns_disabled() {
+        let s = AppSettings::default();
+        assert!(
+            !s.cluster_dns.enabled,
+            "AppSettings::default() must have cluster_dns.enabled = false"
+        );
+    }
+
+    #[test]
+    fn cluster_dns_round_trips_through_json() {
+        let mut s = AppSettings::default();
+        s.cluster_dns.enabled = true;
+
+        let json = s.to_json();
+        let back = AppSettings::from_json(json);
+        assert!(
+            back.cluster_dns.enabled,
+            "cluster_dns.enabled must survive JSON round-trip"
+        );
+    }
+
+    #[test]
+    fn legacy_settings_json_without_cluster_dns_deserializes_as_disabled() {
+        // Old `settings.data` rows have no `cluster_dns` key. `#[serde(default)]`
+        // must fill it in with the disabled default so pre-ADR-024 rows keep
+        // loading and the feature stays off.
+        let legacy = serde_json::json!({
+            "external_url": "https://paas.example.com",
+            "preview_domain": "localho.st"
+        });
+        let parsed = AppSettings::from_json(legacy);
+        assert!(
+            !parsed.cluster_dns.enabled,
+            "cluster_dns must default to disabled when deserializing a legacy settings row"
+        );
+    }
+
     #[test]
     fn on_demand_tls_defaults_are_off_and_sensible() {
         let s = OnDemandTlsSettings::default();
@@ -931,5 +1022,40 @@ mod tests {
         assert_eq!(back.on_demand_tls.max_concurrent, 5);
         assert_eq!(back.on_demand_tls.hourly_cap, 25);
         assert_eq!(back.on_demand_tls.deployment_url_mode, "redirect_to_env");
+    }
+
+    #[test]
+    fn require_mfa_for_admins_defaults_to_false() {
+        // MFA enforcement must be opt-in: an operator upgrading Temps should
+        // never suddenly get locked out of their own Admin account because a
+        // new default flipped a login-blocking setting on.
+        let s = AppSettings::default();
+        assert!(!s.require_mfa_for_admins);
+    }
+
+    #[test]
+    fn legacy_settings_json_without_require_mfa_for_admins_deserializes() {
+        // A `settings.data` row written before this feature shipped has no
+        // `require_mfa_for_admins` key. `#[serde(default)]` must fill it in
+        // with `false` so pre-migration rows keep loading and don't
+        // retroactively lock out admins who never enrolled MFA.
+        let legacy = serde_json::json!({
+            "external_url": "https://paas.example.com",
+            "preview_domain": "localho.st"
+        });
+        let parsed = AppSettings::from_json(legacy);
+        assert!(!parsed.require_mfa_for_admins);
+    }
+
+    #[test]
+    fn require_mfa_for_admins_round_trips_through_json() {
+        let s = AppSettings {
+            require_mfa_for_admins: true,
+            ..AppSettings::default()
+        };
+
+        let json = s.to_json();
+        let back = AppSettings::from_json(json);
+        assert!(back.require_mfa_for_admins);
     }
 }

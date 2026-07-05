@@ -71,6 +71,15 @@ pub async fn find_available_port_async(docker: &Docker, start_port: u16) -> Opti
         })
 }
 
+/// Returns true if a Docker container create/start error indicates the
+/// requested host port lost the race described in the module docs — i.e. the
+/// port was bindable when we checked but Docker's own bind failed because
+/// another allocator grabbed it first. Safe to retry with a fresh port when
+/// this returns true; any other error should propagate as-is.
+pub fn is_port_conflict_error(message: &str) -> bool {
+    message.contains("port is already allocated") || message.contains("address already in use")
+}
+
 /// Collect every host port currently published by a Docker container. Returns
 /// an empty set (treat all ports as free) if Docker can't be listed, so callers
 /// degrade to the OS-only check instead of failing.

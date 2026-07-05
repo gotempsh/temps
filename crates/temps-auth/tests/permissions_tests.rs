@@ -7,7 +7,6 @@ fn test_permission_display() {
     assert_eq!(Permission::ProjectsDelete.to_string(), "projects:delete");
     assert_eq!(Permission::ProjectsCreate.to_string(), "projects:create");
     assert_eq!(Permission::SystemAdmin.to_string(), "system:admin");
-    assert_eq!(Permission::McpConnect.to_string(), "mcp:connect");
 }
 
 #[test]
@@ -24,10 +23,8 @@ fn test_permission_from_str() {
         Permission::from_str("system:admin"),
         Some(Permission::SystemAdmin)
     );
-    assert_eq!(
-        Permission::from_str("mcp:connect"),
-        Some(Permission::McpConnect)
-    );
+    // `mcp:connect` was removed with the MCP feature; it must no longer parse.
+    assert_eq!(Permission::from_str("mcp:connect"), None);
     assert_eq!(Permission::from_str("invalid:permission"), None);
     assert_eq!(Permission::from_str(""), None);
 }
@@ -54,7 +51,6 @@ fn test_permission_all() {
     assert!(!permissions.is_empty());
     assert!(permissions.contains(&Permission::ProjectsRead));
     assert!(permissions.contains(&Permission::SystemAdmin));
-    assert!(permissions.contains(&Permission::McpConnect));
 
     // Check that we have the expected number of permissions (should match enum variants)
     // This test will fail if new permissions are added but not included in all()
@@ -70,7 +66,6 @@ fn test_role_display() {
     assert_eq!(Role::Admin.to_string(), "admin");
     assert_eq!(Role::User.to_string(), "user");
     assert_eq!(Role::Reader.to_string(), "reader");
-    assert_eq!(Role::Mcp.to_string(), "mcp");
     assert_eq!(Role::ApiReader.to_string(), "api_reader");
     assert_eq!(Role::Custom.to_string(), "custom");
 }
@@ -80,7 +75,8 @@ fn test_role_from_str() {
     assert_eq!(Role::from_str("admin"), Some(Role::Admin));
     assert_eq!(Role::from_str("user"), Some(Role::User));
     assert_eq!(Role::from_str("reader"), Some(Role::Reader));
-    assert_eq!(Role::from_str("mcp"), Some(Role::Mcp));
+    // `mcp` role was removed with the MCP feature; it must no longer parse.
+    assert_eq!(Role::from_str("mcp"), None);
     assert_eq!(Role::from_str("api_reader"), Some(Role::ApiReader));
     assert_eq!(Role::from_str("custom"), Some(Role::Custom));
     assert_eq!(Role::from_str("invalid_role"), None);
@@ -106,13 +102,16 @@ fn test_role_from_str_roundtrip() {
 #[test]
 fn test_role_all() {
     let roles = Role::all();
-    assert_eq!(roles.len(), 6);
+    assert_eq!(roles.len(), 7);
     assert!(roles.contains(&Role::Admin));
+    assert!(roles.contains(&Role::PlatformAdmin));
     assert!(roles.contains(&Role::User));
     assert!(roles.contains(&Role::Reader));
-    assert!(roles.contains(&Role::Mcp));
     assert!(roles.contains(&Role::ApiReader));
     assert!(roles.contains(&Role::Custom));
+    assert!(roles.contains(&Role::MetricsIngest));
+    // The `mcp` role was removed with the MCP feature.
+    assert!(!roles.iter().any(|r| r.to_string() == "mcp"));
 }
 
 #[test]
@@ -139,13 +138,6 @@ fn test_role_permissions() {
     assert!(!reader_permissions.contains(&Permission::ProjectsWrite));
     assert!(!reader_permissions.contains(&Permission::SystemAdmin));
 
-    // MCP should have specific MCP permissions
-    let mcp_permissions = Role::Mcp.permissions();
-    assert!(!mcp_permissions.is_empty());
-    assert!(mcp_permissions.contains(&Permission::McpConnect));
-    assert!(mcp_permissions.contains(&Permission::McpExecute));
-    assert!(mcp_permissions.contains(&Permission::ProjectsRead));
-
     // ApiReader should have limited read permissions
     let api_reader_permissions = Role::ApiReader.permissions();
     assert!(!api_reader_permissions.is_empty());
@@ -170,10 +162,6 @@ fn test_role_has_permission() {
     assert!(Role::Reader.has_permission(&Permission::ProjectsRead));
     assert!(!Role::Reader.has_permission(&Permission::ProjectsWrite));
     assert!(!Role::Reader.has_permission(&Permission::SystemAdmin));
-
-    assert!(Role::Mcp.has_permission(&Permission::McpConnect));
-    assert!(Role::Mcp.has_permission(&Permission::ProjectsRead));
-    assert!(!Role::Mcp.has_permission(&Permission::SystemAdmin));
 
     assert!(Role::ApiReader.has_permission(&Permission::ProjectsRead));
     assert!(!Role::ApiReader.has_permission(&Permission::ProjectsWrite));

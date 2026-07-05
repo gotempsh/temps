@@ -80,7 +80,7 @@
     "react-icons": "^5.5.0",
     "react-markdown": "^10.1.0",
     "react-resizable-panels": "^3.0.6",
-    "react-router-dom": "^7.9.1",
+    "react-router-dom": "^7.18.1",
     "react-simple-maps": "^3.0.0",
     "recharts": "2.15.4",
     "rehype-highlight": "^7.0.2",
@@ -117,5 +117,15 @@
     "prettier": "^3.6.2",
     "typescript": "^5.9.2",
     "typescript-eslint": "^8.46.0"
+  },
+  "overrides": {
+    "d3-color": "^3.1.0",
+    "flatted": "^3.4.2",
+    "handlebars": "^4.7.9",
+    "picomatch": "^2.3.2",
+    "minimatch": "^9.0.7",
+    "tar": "^7.5.7",
+    "lodash": "^4.17.24",
+    "defu": "^6.1.5"
   }
 }

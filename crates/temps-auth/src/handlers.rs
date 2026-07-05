@@ -1,8 +1,8 @@
 use super::AuthState;
 use crate::audit::{
-    EmailVerifiedAudit, LoginAudit, LogoutAudit, MfaDisabledAudit, MfaEnabledAudit,
-    MfaVerifiedAudit, PasswordResetAudit, RoleAssignedAudit, RoleRemovedAudit, UpdatedFields,
-    UserCreatedAudit, UserDeletedAudit, UserRestoredAudit, UserUpdatedAudit,
+    ConcurrentSessionDetectedAudit, EmailVerifiedAudit, LoginAudit, LogoutAudit, MfaDisabledAudit,
+    MfaEnabledAudit, MfaVerifiedAudit, PasswordResetAudit, RoleAssignedAudit, RoleRemovedAudit,
+    UpdatedFields, UserCreatedAudit, UserDeletedAudit, UserRestoredAudit, UserUpdatedAudit,
 };
 use crate::avatar::generate_avatar_data_url;
 use crate::user_service::UserServiceError;
@@ -199,13 +199,30 @@ pub async fn verify_mfa_challenge(
             };
 
             let audit = MfaVerifiedAudit {
-                context: audit_context,
+                context: audit_context.clone(),
                 username: user.email.clone(),
             };
 
             if let Err(e) = auth_state.audit_service.create_audit_log(&audit).await {
                 error!("Failed to create audit log: {}", e);
             }
+
+            // Count this user's already-active sessions *before* creating a
+            // new one (the temporary MFA-challenge session was already
+            // deleted by `verify_mfa_challenge` above, so this only reflects
+            // pre-existing real sessions). Purely observational -- see
+            // bherila/temps#24; a lookup failure must never block the login.
+            let existing_active_sessions =
+                match auth_state.auth_service.count_active_sessions(user.id).await {
+                    Ok(count) => count,
+                    Err(e) => {
+                        error!(
+                        "Failed to count active sessions for user {} after MFA verification: {}",
+                        user.id, e
+                    );
+                        0
+                    }
+                };
 
             let session_token = auth_state
                 .auth_service
@@ -217,6 +234,23 @@ pub async fn verify_mfa_challenge(
                         .with_title("Session Creation Failed")
                         .with_detail("Could not create session. Please try logging in again.")
                 })?;
+
+            if existing_active_sessions > 0 {
+                if let Err(e) = auth_state
+                    .audit_service
+                    .create_audit_log(&ConcurrentSessionDetectedAudit {
+                        context: audit_context,
+                        login_method: "password-mfa".to_string(),
+                        existing_active_session_count: existing_active_sessions,
+                    })
+                    .await
+                {
+                    error!(
+                        "Failed to create concurrent-session audit log for user {}: {}",
+                        user.id, e
+                    );
+                }
+            }
 
             let session_token_encrypted = match auth_state.cookie_crypto.encrypt(&session_token) {
                 Ok(enc) => enc,
@@ -569,7 +603,7 @@ pub async fn register(
     request_body = LoginRequest,
     responses(
         (status = 200, description = "Login successful, session cookie set", body = AuthResponse),
-        (status = 401, description = "Invalid credentials"),
+        (status = 401, description = "Invalid credentials, or the account's role requires MFA enrollment that has not been completed"),
         (status = 500, description = "Internal server error")
     ),
     tag = "Authentication"
@@ -629,6 +663,22 @@ pub async fn login(
                     }
                 }
             } else {
+                // Count this user's already-active sessions *before* creating
+                // a new one, so we can flag concurrent logins in the audit
+                // trail (bherila/temps#24). A lookup failure here must not
+                // block the login -- graceful degradation per CLAUDE.md.
+                let existing_active_sessions =
+                    match state.auth_service.count_active_sessions(user.id).await {
+                        Ok(count) => count,
+                        Err(e) => {
+                            error!(
+                                "Failed to count active sessions for user {} before login: {}",
+                                user.id, e
+                            );
+                            0
+                        }
+                    };
+
                 // Create regular session
                 match state.auth_service.create_session(user.id).await {
                     Ok(session_token) => {
@@ -647,20 +697,37 @@ pub async fn login(
                         let headers = state
                             .auth_service
                             .create_session_cookie(&encrypted_token, metadata.is_secure);
+                        let audit_context = AuditContext {
+                            user_id: user.id,
+                            ip_address: Some(metadata.ip_address.to_string()),
+                            user_agent: metadata.user_agent.as_str().to_string(),
+                        };
                         if let Err(e) = state
                             .audit_service
                             .create_audit_log(&LoginAudit {
-                                context: AuditContext {
-                                    user_id: user.id,
-                                    ip_address: Some(metadata.ip_address.to_string()),
-                                    user_agent: metadata.user_agent.as_str().to_string(),
-                                },
+                                context: audit_context.clone(),
                                 success: true,
                                 login_method: "password".to_string(),
                             })
                             .await
                         {
                             error!("Failed to create audit log: {}", e);
+                        }
+                        if existing_active_sessions > 0 {
+                            if let Err(e) = state
+                                .audit_service
+                                .create_audit_log(&ConcurrentSessionDetectedAudit {
+                                    context: audit_context,
+                                    login_method: "password".to_string(),
+                                    existing_active_session_count: existing_active_sessions,
+                                })
+                                .await
+                            {
+                                error!(
+                                    "Failed to create concurrent-session audit log for user {}: {}",
+                                    user.id, e
+                                );
+                            }
                         }
                         Ok((
                             headers,
@@ -699,6 +766,25 @@ pub async fn login(
         Err(e) => match e {
             crate::auth_service::UserAuthError::InvalidCredentials
             | crate::auth_service::UserAuthError::UserNotFound => {
+                Err(problem_new(StatusCode::UNAUTHORIZED)
+                    .with_title("Invalid Credentials")
+                    .with_detail("Invalid email or password."))
+            }
+            crate::auth_service::UserAuthError::MfaRequiredForRole { user_id, role } => {
+                // Deliberately the *same* status/title/detail as
+                // InvalidCredentials above -- this error is only reachable
+                // after the password has already been verified correct, so
+                // a distinguishable response here would let an attacker use
+                // login attempts as an oracle to confirm a guessed admin
+                // password (and that the account holds the Admin role)
+                // without ever completing a login. The real reason is only
+                // ever surfaced server-side via this log line.
+                warn!(
+                    user_id,
+                    role = %role,
+                    email = %login_email,
+                    "Login blocked: MFA is required for this role but is not enrolled"
+                );
                 Err(problem_new(StatusCode::UNAUTHORIZED)
                     .with_title("Invalid Credentials")
                     .with_detail("Invalid email or password."))
@@ -1990,6 +2076,42 @@ mod tests {
         assert_eq!(
             detail_c, detail_n,
             "detail must be identical to prevent enumeration"
+        );
+    }
+
+    /// `MfaRequiredForRole` must produce the exact same response as
+    /// `InvalidCredentials`/`UserNotFound` -- it's only reachable *after* the
+    /// password has already been verified correct, so a distinguishable
+    /// response would let an attacker use login attempts as an oracle to
+    /// confirm a guessed admin password (and that the account is Admin)
+    /// without completing a login.
+    #[test]
+    fn test_login_error_mapping_mfa_required_same_as_invalid_credentials() {
+        let map = |e: UserAuthError| match e {
+            UserAuthError::InvalidCredentials | UserAuthError::UserNotFound => {
+                (401u16, "Invalid Credentials", "Invalid email or password.")
+            }
+            UserAuthError::MfaRequiredForRole { .. } => {
+                (401u16, "Invalid Credentials", "Invalid email or password.")
+            }
+            _ => (
+                500u16,
+                "Authentication Error",
+                "Authentication system error. Please try again later.",
+            ),
+        };
+
+        let (status_c, title_c, detail_c) = map(UserAuthError::InvalidCredentials);
+        let (status_m, title_m, detail_m) = map(UserAuthError::MfaRequiredForRole {
+            user_id: 42,
+            role: "Admin".to_string(),
+        });
+
+        assert_eq!(status_c, status_m, "HTTP status must be identical");
+        assert_eq!(title_c, title_m, "title must be identical");
+        assert_eq!(
+            detail_c, detail_m,
+            "detail must be identical to prevent an MFA-enforcement oracle"
         );
     }
 

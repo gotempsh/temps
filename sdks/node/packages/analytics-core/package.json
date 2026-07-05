@@ -1,6 +1,6 @@
 {
 	"name": "@temps-sdk/analytics-core",
-	"version": "0.0.1",
+	"version": "0.0.2",
 	"description": "Framework-agnostic core for Temps analytics, engagement, Web Vitals, and session replay.",
 	"private": false,
 	"type": "module",

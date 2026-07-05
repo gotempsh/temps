@@ -42,12 +42,6 @@ pub enum Permission {
     SystemAdmin,
     SystemRead,
 
-    // MCP specific permissions
-    McpConnect,
-    McpExecute,
-    McpRead,
-    McpWrite,
-
     // API Key management
     ApiKeysRead,
     ApiKeysWrite,
@@ -259,10 +253,6 @@ impl fmt::Display for Permission {
             Permission::UsersCreate => "users:create",
             Permission::SystemAdmin => "system:admin",
             Permission::SystemRead => "system:read",
-            Permission::McpConnect => "mcp:connect",
-            Permission::McpExecute => "mcp:execute",
-            Permission::McpRead => "mcp:read",
-            Permission::McpWrite => "mcp:write",
             Permission::ApiKeysRead => "api_keys:read",
             Permission::ApiKeysWrite => "api_keys:write",
             Permission::ApiKeysDelete => "api_keys:delete",
@@ -407,10 +397,6 @@ impl Permission {
             "users:create" => Some(Permission::UsersCreate),
             "system:admin" => Some(Permission::SystemAdmin),
             "system:read" => Some(Permission::SystemRead),
-            "mcp:connect" => Some(Permission::McpConnect),
-            "mcp:execute" => Some(Permission::McpExecute),
-            "mcp:read" => Some(Permission::McpRead),
-            "mcp:write" => Some(Permission::McpWrite),
             "api_keys:read" => Some(Permission::ApiKeysRead),
             "api_keys:write" => Some(Permission::ApiKeysWrite),
             "api_keys:delete" => Some(Permission::ApiKeysDelete),
@@ -552,10 +538,6 @@ impl Permission {
             Permission::UsersCreate,
             Permission::SystemAdmin,
             Permission::SystemRead,
-            Permission::McpConnect,
-            Permission::McpExecute,
-            Permission::McpRead,
-            Permission::McpWrite,
             Permission::ApiKeysRead,
             Permission::ApiKeysWrite,
             Permission::ApiKeysDelete,
@@ -680,7 +662,6 @@ pub enum Role {
     PlatformAdmin,
     User,
     Reader,
-    Mcp,
     ApiReader,
     Custom, // For API keys with custom permissions
     MetricsIngest,
@@ -693,7 +674,6 @@ impl fmt::Display for Role {
             Role::PlatformAdmin => "platform_admin",
             Role::User => "user",
             Role::Reader => "reader",
-            Role::Mcp => "mcp",
             Role::ApiReader => "api_reader",
             Role::Custom => "custom",
             Role::MetricsIngest => "metrics_ingest",
@@ -710,7 +690,6 @@ impl Role {
             "platform_admin" => Some(Role::PlatformAdmin),
             "user" => Some(Role::User),
             "reader" => Some(Role::Reader),
-            "mcp" => Some(Role::Mcp),
             "api_reader" => Some(Role::ApiReader),
             "custom" => Some(Role::Custom),
             "metrics_ingest" => Some(Role::MetricsIngest),
@@ -724,7 +703,6 @@ impl Role {
             Role::PlatformAdmin,
             Role::User,
             Role::Reader,
-            Role::Mcp,
             Role::ApiReader,
             Role::Custom,
             Role::MetricsIngest,
@@ -778,10 +756,6 @@ impl Role {
                 Permission::LoadBalancerWrite,
                 Permission::LogsRead,
                 Permission::LogsDelete,
-                Permission::McpConnect,
-                Permission::McpExecute,
-                Permission::McpRead,
-                Permission::McpWrite,
                 Permission::MetricsRead,
                 Permission::NotificationsRead,
                 Permission::NotificationsWrite,
@@ -921,10 +895,6 @@ impl Role {
                 Permission::LoadBalancerWrite,
                 Permission::LogsRead,
                 Permission::LogsDelete,
-                Permission::McpConnect,
-                Permission::McpExecute,
-                Permission::McpRead,
-                Permission::McpWrite,
                 Permission::MetricsRead,
                 Permission::NotificationsRead,
                 Permission::NotificationsWrite,
@@ -1159,18 +1129,6 @@ impl Role {
                 Permission::StacksRead,
                 Permission::SandboxesRead,
             ],
-            Role::Mcp => &[
-                Permission::ProjectsRead,
-                Permission::ProjectsWrite,
-                Permission::ProjectsCreate,
-                Permission::DeploymentsRead,
-                Permission::DeploymentsWrite,
-                Permission::DeploymentsCreate,
-                Permission::McpConnect,
-                Permission::McpExecute,
-                Permission::McpRead,
-                Permission::McpWrite,
-            ],
             Role::ApiReader => &[
                 Permission::ProjectsRead,
                 Permission::DeploymentsRead,
@@ -1357,8 +1315,6 @@ mod tests {
         assert!(Role::User.has_permission(&Permission::EmailsSend));
         // Reader does NOT have email send permission
         assert!(!Role::Reader.has_permission(&Permission::EmailsSend));
-        // MCP does NOT have email permissions
-        assert!(!Role::Mcp.has_permission(&Permission::EmailsSend));
     }
 
     // Deployment token permission tests

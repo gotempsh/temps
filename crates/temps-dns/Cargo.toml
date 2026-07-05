@@ -44,7 +44,7 @@ rsa = "0.9"
 base64 = "0.22"
 
 # XML parsing for Route53
-quick-xml = { version = "0.37", features = ["serialize"] }
+quick-xml = { version = "0.41", features = ["serialize"] }
 
 # URL encoding
 urlencoding = "2.1"

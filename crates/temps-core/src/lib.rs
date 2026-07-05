@@ -9,7 +9,6 @@ pub mod error;
 pub mod error_builder;
 pub mod external_plugin;
 pub mod jobs;
-pub mod mcp_access;
 pub mod node_pki;
 pub mod notifications;
 pub mod on_demand;
@@ -61,7 +60,7 @@ pub use utils::*;
 // Re-export external dependencies
 pub use anyhow;
 pub use app_settings::{
-    AgentSandboxSettings, AiConfigSettings, AppSettings, ContainerLogSettings,
+    AgentSandboxSettings, AiConfigSettings, AppSettings, ClusterDnsSettings, ContainerLogSettings,
     DiskSpaceAlertSettings, DnsProviderSettings, DockerRegistrySettings, LetsEncryptSettings,
     MetricsStoreKind, MonitoringSettings, MultiNodeSettings, PreviewGatewaySettings,
     ProviderConfig, RateLimitSettings, ScreenshotSettings, SecurityHeadersSettings,

@@ -8,44 +8,16 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use axum::{
-    extract::Request,
-    http::StatusCode,
-    middleware::Next,
-    response::{IntoResponse, Response},
-};
+use axum::{extract::Request, http::StatusCode, middleware::Next, response::Response};
 use temps_core::plugin::{
     MiddlewareCondition, MiddlewarePriority, PluginContext, PluginError, TempsMiddleware,
 };
-use temps_core::problemdetails::{self, Problem};
-use thiserror::Error;
 
 use crate::{
     apikey_service::ApiKeyService, auth_service::AuthService,
     deployment_token_service::DeploymentTokenValidationService, user_service::UserService,
 };
 use temps_core::CookieCrypto;
-
-/// Emitted when an MCP-role API key attempts to authenticate while the
-/// `mcp_access_enabled` production kill switch (issue #19) is off.
-#[derive(Debug, Error)]
-pub enum McpAccessError {
-    #[error(
-        "MCP API access is disabled by platform settings (mcp_access_enabled = false); \
-         rejected API key '{key_name}' (id {key_id})"
-    )]
-    Disabled { key_name: String, key_id: i32 },
-}
-
-impl From<McpAccessError> for Problem {
-    fn from(error: McpAccessError) -> Self {
-        match error {
-            McpAccessError::Disabled { .. } => problemdetails::new(StatusCode::FORBIDDEN)
-                .with_title("MCP Access Disabled")
-                .with_detail(error.to_string()),
-        }
-    }
-}
 
 /// Authentication middleware that implements TempsMiddleware
 pub struct AuthMiddleware {
@@ -138,24 +110,6 @@ impl AuthMiddleware {
                         if let Ok((api_user, role, permissions, key_name, key_id)) =
                             self.api_key_service.validate_api_key(token).await
                         {
-                            // Production kill switch (issue #19): an operator can
-                            // disable all MCP-role API access at runtime without a
-                            // restart. Reject with a typed 403 before the key is
-                            // ever attached to the request, regardless of what
-                            // permissions the key otherwise carries.
-                            if role == Some(crate::permissions::Role::Mcp)
-                                && !temps_core::mcp_access::mcp_access_enabled()
-                            {
-                                tracing::warn!(
-                                    "Rejected MCP API key '{}' (id {}): mcp_access_enabled is disabled",
-                                    key_name,
-                                    key_id
-                                );
-                                let problem: Problem =
-                                    McpAccessError::Disabled { key_name, key_id }.into();
-                                return Ok(problem.into_response());
-                            }
-
                             user = Some(api_user.clone());
                             Some(crate::context::AuthContext::new_api_key(
                                 api_user,

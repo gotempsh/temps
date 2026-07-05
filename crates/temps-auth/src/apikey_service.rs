@@ -204,7 +204,7 @@ impl ApiKeyService {
             // For predefined roles, validate the role exists
             if Role::from_str(&request.role_type).is_none() {
                 return Err(ApiKeyServiceError::ValidationError(
-                    format!("Invalid role type: {}. Valid roles are: admin, platform_admin, user, reader, mcp, api_reader, or custom", request.role_type)
+                    format!("Invalid role type: {}. Valid roles are: admin, platform_admin, user, reader, api_reader, or custom", request.role_type)
                 ));
             }
             None

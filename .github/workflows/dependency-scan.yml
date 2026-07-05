@@ -1,0 +1,180 @@
+name: Dependency & Container Scan
+
+# Supply-chain scanning for Temps' own code (tracked as bherila/temps#23).
+# This is distinct from crates/temps-vulnerability-scanner, which only scans
+# *deployed customer application images* -- nothing here previously checked
+# Temps' own crates, its own web dependencies, or its own build images.
+#
+# - `cargo-audit` scans the Rust workspace's Cargo.lock against the RustSec
+#   Advisory Database.
+# - `web-audit` scans web/ (bun) dependencies against the same class of
+#   advisory data via `bun audit`.
+# - `container-scan` (best-effort, schedule/dispatch only) scans the latest
+#   published release image with Trivy. It intentionally does not run on
+#   pull_request: a PR has no fresh image to scan (release.yml only builds
+#   images for pushed `v*.*.*` tags), so scanning the last published
+#   `:latest` tag weekly is the meaningful signal here.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - "web/package.json"
+      - "web/bun.lock"
+      - ".github/workflows/dependency-scan.yml"
+  schedule:
+    # Every Monday at 06:00 UTC.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  cargo-audit:
+    name: Rust Dependency Audit (cargo-audit)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # rustsec/audit-check publishes results as a GitHub check run.
+      checks: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: dependency-scan-cargo-audit
+
+      # Runs `cargo audit` against Cargo.lock and fails the job if any
+      # RUSTSEC advisory matches a resolved dependency (all advisories, not
+      # just a severity subset -- cargo-audit's advisory-db entries don't
+      # uniformly carry CVSS severity, so "any match" is the safer default
+      # for a supply-chain gate). See PR body for rationale on fail-vs-warn.
+      #
+      # Ignored below are "unmaintained crate" notices (not exploitable
+      # CVEs) for deps we don't control directly:
+      # - RUSTSEC-2024-0370 (proc-macro-error2): transitive via pingora's
+      #   tracing stack (cf-rustracing-jaeger -> neli -> local-ip-address).
+      # - RUSTSEC-2025-0134 (rustls-pemfile): used directly across several
+      #   crates; migrating to rustls-pki-types' PemObject API is tracked
+      #   separately, not a drop-in version bump.
+      # - RUSTSEC-2018-0017 (tempdir): transitive via nixpacks, no newer
+      #   nixpacks release drops it yet.
+      #
+      # The three below are real vulnerabilities (not just "unmaintained"
+      # notices), blocked on upstream fixes with no non-forking workaround.
+      # Full reachability analysis for each lives in the root Cargo.toml
+      # under "Dependency Overrides - Security Fixes" -- re-verify that
+      # analysis before removing/renewing these on advisory-db updates:
+      # - RUSTSEC-2024-0437 (protobuf 2.28.0 via prometheus 0.13 <- pingora
+      #   0.8.x): recursion-crash-on-parse; pingora only ever *emits*
+      #   metrics via TextEncoder, never parses protobuf-encoded input, so
+      #   the vulnerable parse path is compiled in but unreachable.
+      # - RUSTSEC-2023-0018 (remove_dir_all 0.5.3 via tempdir <- nixpacks
+      #   1.41.0, crates.io latest): TOCTOU race lives in a nixpacks code
+      #   path (implicit output dir) that temps-presets never takes (it
+      #   always passes an explicit out_dir).
+      # - RUSTSEC-2023-0071 (rsa 0.9.10 via jsonwebtoken <- octocrab, and
+      #   direct in temps-dns/gcp.rs): Marvin Attack is a chosen-ciphertext
+      #   *decryption* oracle attack; temps has zero RSA decryption, only
+      #   RSA signing (GitHub App JWTs, GCP DNS service-account JWTs). The
+      #   signing timing side-channel isn't remotely exploitable here
+      #   (signing latency is buried in 100-500ms of network I/O, and the
+      #   signed payload isn't attacker-controlled). Keys are per-customer,
+      #   not a shared temps secret. No fixed `rsa` release exists upstream
+      #   yet -- tracked for a ring/aws-lc-rs-backed signing migration.
+      # Remove an entry once its upstream is fixed/replaced.
+      - name: Run cargo-audit
+        uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ignore: RUSTSEC-2024-0370,RUSTSEC-2025-0134,RUSTSEC-2018-0017,RUSTSEC-2024-0437,RUSTSEC-2023-0018,RUSTSEC-2023-0071
+
+  web-audit:
+    name: Web Dependency Audit (bun audit)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Cache Bun dependencies
+        uses: actions/cache@v4
+        with:
+          path: web/node_modules
+          key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      - name: Install web dependencies
+        run: |
+          cd web
+          bun install
+
+      # Fails the job if any high or critical severity advisory is found in
+      # web/'s dependency tree. `bun audit` exits non-zero when findings meet
+      # or exceed --audit-level. Lower severities (low/moderate) are still
+      # printed by the command's own output but do not fail the build.
+      #
+      # Note: `bun audit --ignore` is silently non-functional in bun 1.3.14
+      # (confirmed against both GHSA slugs and bun's own internal advisory
+      # ids -- neither suppresses the finding). Transitive advisories here
+      # are fixed via package.json `overrides` instead of ignored.
+      - name: Run bun audit
+        run: |
+          cd web
+          bun audit --audit-level=high
+
+  container-scan:
+    name: Container Image Scan (Trivy, best-effort)
+    # Only meaningful on a schedule/manual run: PRs don't produce a fresh
+    # published image to scan (release.yml only builds+pushes on `v*.*.*`
+    # tags). This job scans whatever is currently published as `:latest`.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner on published image
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          # Matches the tag naming release.yml publishes for stable releases
+          # (ghcr.io/${{ github.repository_owner }}/temps:<channel_tag>) --
+          # dynamic owner so this also resolves correctly if run from a fork
+          # that publishes its own images under the same convention.
+          image-ref: ghcr.io/${{ github.repository_owner }}/temps:latest
+          format: sarif
+          output: trivy-results.sarif
+          severity: "CRITICAL,HIGH"
+          # Report all findings in the SARIF/table output, but only fail the
+          # job (exit-code 1) on CRITICAL/HIGH -- matches the fail threshold
+          # used for cargo-audit/bun audit above.
+          exit-code: "1"
+          ignore-unfixed: true
+
+      # Best-effort: only succeeds if the repo has GitHub code scanning
+      # (Advanced Security / public repo) enabled. Non-fatal if not, so it
+      # never masks or replaces the pass/fail signal from the step above.
+      - name: Upload Trivy results to GitHub code scanning
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif

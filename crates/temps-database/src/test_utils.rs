@@ -70,6 +70,40 @@ static ACTIVE_INSTANCES: OnceCell<Arc<Mutex<usize>>> = OnceCell::const_new();
 /// continuous aggregates and internal types simultaneously
 static MIGRATION_LOCK: OnceCell<Arc<Mutex<()>>> = OnceCell::const_new();
 
+/// Retries a migration-apply closure on transient Postgres concurrency errors
+/// (deadlock_detected `40P01`, serialization_failure `40001`). `MIGRATION_LOCK`
+/// above only serializes migrations within one test *process* — CI runs many
+/// crates' test binaries as separate OS processes against the same shared
+/// TimescaleDB instance, so their hypertable/continuous-aggregate DDL can
+/// still race across processes and get killed by Postgres's deadlock
+/// detector. That's expected and safe to retry: the losing transaction was
+/// cleanly aborted, not left in a bad state.
+async fn run_migrations_with_retry<F, Fut>(mut run: F) -> anyhow::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), sea_orm::DbErr>>,
+{
+    const MAX_ATTEMPTS: u32 = 5;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match run().await {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt < MAX_ATTEMPTS && is_transient_migration_error(&e.to_string()) => {
+                let backoff = std::time::Duration::from_millis(100 * attempt as u64);
+                tokio::time::sleep(backoff).await;
+            }
+            Err(e) => return Err(anyhow::anyhow!("Failed to run migrations: {}", e)),
+        }
+    }
+    unreachable!("loop always returns Ok or Err before exhausting MAX_ATTEMPTS")
+}
+
+fn is_transient_migration_error(message: &str) -> bool {
+    message.contains("deadlock detected")
+        || message.contains("40P01")
+        || message.contains("could not serialize access")
+        || message.contains("40001")
+}
+
 /// Shared container wrapper that holds the database container and connection details
 struct SharedContainer {
     #[allow(dead_code)]
@@ -91,6 +125,7 @@ impl SharedContainer {
             .with_env_var("POSTGRES_USER", username)
             .with_env_var("POSTGRES_PASSWORD", password)
             .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+            .with_cmd(TIMESCALEDB_NO_BACKGROUND_WORKERS_CMD)
             .start()
             .await?;
 
@@ -111,6 +146,25 @@ impl SharedContainer {
         })
     }
 }
+
+/// Every migration-driven test creates its own hypertables/continuous
+/// aggregates (with refresh policies) in a fresh, short-lived schema.
+/// TimescaleDB's background worker launcher polls for due jobs every
+/// ~60s (`timescaledb.bgw_launcher_poll_time`) and, if its scan happens to
+/// land while one of those schemas is still alive, launches a real
+/// background worker to refresh it -- a second Postgres backend racing the
+/// test's own foreground transaction. That's a plausible root cause of the
+/// Postgres deadlocks (40P01) observed even under full test serialization
+/// (confirmed: a background job did execute mid-test-run against a fresh
+/// container). Tests never rely on a background refresh actually firing
+/// (job timing isn't something a test could deterministically wait on
+/// anyway), so disabling the launcher entirely removes the race with no
+/// loss of coverage. This only affects test containers, not migrations
+/// themselves -- `max_background_workers=0` still allows `CREATE
+/// EXTENSION`/`create_hypertable`/`add_continuous_aggregate_policy` to
+/// succeed, it just means no worker ever executes the scheduled jobs.
+const TIMESCALEDB_NO_BACKGROUND_WORKERS_CMD: [&str; 3] =
+    ["postgres", "-c", "timescaledb.max_background_workers=0"];
 
 /// Test database setup with TimescaleDB container
 pub struct TestDatabase {
@@ -462,6 +516,7 @@ impl TestDatabase {
             .with_env_var("POSTGRES_USER", username)
             .with_env_var("POSTGRES_PASSWORD", password)
             .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+            .with_cmd(TIMESCALEDB_NO_BACKGROUND_WORKERS_CMD)
             .start()
             .await?;
 
@@ -493,9 +548,7 @@ impl TestDatabase {
             .map_err(|e| anyhow::anyhow!("Initial connection test failed: {}", e))?;
         // Run migrations after creating the isolated test database
         use sea_orm_migration::MigratorTrait;
-        if let Err(e) = temps_migrations::Migrator::up(&*test_db.db, None).await {
-            return Err(anyhow::anyhow!("Failed to run migrations: {}", e));
-        }
+        run_migrations_with_retry(|| temps_migrations::Migrator::up(&*test_db.db, None)).await?;
         Ok(test_db)
     }
 
@@ -549,9 +602,7 @@ impl TestDatabase {
 
         // Run migrations in this test's unique schema
         // Since each test has its own schema, migrations always run, but only one at a time
-        Migrator::up(&*test_db.db, None)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to run migrations: {}", e))?;
+        run_migrations_with_retry(|| Migrator::up(&*test_db.db, None)).await?;
 
         // Verify migrations were successful by checking a known table in current schema
         let check_sql = "SELECT EXISTS (
@@ -612,9 +663,7 @@ impl TestDatabase {
             .ok();
 
         // Run migrations in this test's unique schema
-        M::up(&*test_db.db, None)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to run custom migrations: {}", e))?;
+        run_migrations_with_retry(|| M::up(&*test_db.db, None)).await?;
 
         // Lock is automatically released when _lock goes out of scope
 

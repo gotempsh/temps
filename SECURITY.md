@@ -37,7 +37,7 @@ When deploying Temps, please ensure:
 
 1. **Use HTTPS** — Always configure TLS certificates for your deployment.
 2. **Strong passwords** — Use strong passwords for admin accounts and database connections.
-3. **Firewall rules** — Restrict access to management ports (see `docs/server-firewall-setup.md`).
+3. **Firewall rules** — Restrict access to management ports at the network/OS level, and use the [Admin Listener](https://temps.sh/docs/admin-listener) to bind the admin/dashboard surface to a private interface with CIDR + Host allowlists.
 4. **Keep updated** — Run `temps upgrade` regularly to get the latest security patches.
 5. **Database security** — Use strong PostgreSQL credentials and restrict network access.
 6. **API keys** — Rotate API keys periodically and use the minimum required permissions.
