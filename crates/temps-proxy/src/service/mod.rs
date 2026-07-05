@@ -1,3 +1,4 @@
+pub mod cert_host_cache;
 pub mod challenge_service;
 pub mod connection_filter_service;
 pub mod cookie_codec;

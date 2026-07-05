@@ -8,6 +8,7 @@ use crate::preview_auth::{
     parse_preview_host, verify_argon2, PreviewAuthLimiter, PreviewAuthOutcome, PreviewHost,
     PreviewSandboxLookup, PREVIEW_GATEWAY_PEER,
 };
+use crate::service::cert_host_cache::CertHostCache;
 use crate::service::challenge_service::ChallengeService;
 use crate::service::cookie_codec::{
     make_v2_session_payload, parse_session_cookie, parse_visitor_cookie,
@@ -385,6 +386,10 @@ pub struct LoadBalancer {
     config_service: Arc<temps_config::ConfigService>,
     ip_access_control_service: Arc<IpAccessControlService>,
     challenge_service: Arc<ChallengeService>,
+    /// In-memory snapshot of domains that have a TLS certificate. Used by the
+    /// HTTP→HTTPS redirect check instead of issuing 2 DB queries per request.
+    /// Refreshed every 30 s by `CertHostCache::run_refresh_loop`. See WS3.
+    cert_host_cache: Arc<CertHostCache>,
     disable_https_redirect: bool,
     on_demand_manager: Option<Arc<OnDemandManager>>,
     /// On-demand HTTP-01 TLS cert manager (ADR-018). When set, the port-80
@@ -420,6 +425,7 @@ impl LoadBalancer {
         config_service: Arc<temps_config::ConfigService>,
         ip_access_control_service: Arc<IpAccessControlService>,
         challenge_service: Arc<ChallengeService>,
+        cert_host_cache: Arc<CertHostCache>,
         disable_https_redirect: bool,
     ) -> Self {
         Self {
@@ -433,6 +439,7 @@ impl LoadBalancer {
             config_service,
             ip_access_control_service,
             challenge_service,
+            cert_host_cache,
             disable_https_redirect,
             on_demand_manager: None,
             on_demand_cert_manager: None,
@@ -2030,45 +2037,6 @@ impl LoadBalancer {
     }
 }
 
-/// Returns true when `host` (or its wildcard parent) has an active TLS
-/// certificate stored in the database. Used to make the HTTP→HTTPS redirect
-/// per-domain rather than a global toggle: redirect only when a cert exists,
-/// serve plain HTTP otherwise. Mirrors the wildcard lookup in `tls_cert_loader`.
-async fn host_has_active_cert(db: &DbConnection, host: &str) -> bool {
-    // Exact match
-    let exact = domains::Entity::find()
-        .filter(domains::Column::Domain.eq(host))
-        // "active_renewal_failed" still serves a valid cert, so it counts here too.
-        .filter(domains::Column::Status.is_in(domains::CERT_SERVING_STATUSES))
-        .filter(domains::Column::Certificate.is_not_null())
-        .one(db)
-        .await
-        .ok()
-        .flatten();
-    if exact.is_some() {
-        return true;
-    }
-
-    // Wildcard match: api.example.com → *.example.com
-    let parts: Vec<&str> = host.split('.').collect();
-    if parts.len() >= 2 {
-        let wildcard = format!("*.{}", parts[1..].join("."));
-        let wc = domains::Entity::find()
-            .filter(domains::Column::Domain.eq(&wildcard))
-            .filter(domains::Column::Status.is_in(domains::CERT_SERVING_STATUSES))
-            .filter(domains::Column::Certificate.is_not_null())
-            .one(db)
-            .await
-            .ok()
-            .flatten();
-        if wc.is_some() {
-            return true;
-        }
-    }
-
-    false
-}
-
 /// Map an on-demand cert in-process state to the port-80 503 response the end
 /// user sees while the TLS handshake fast-fails (ADR-018 §5). Pure so the
 /// status/body contract is unit-tested without a Pingora session.
@@ -3262,9 +3230,11 @@ impl ProxyHttp for LoadBalancer {
         //
         // `disable_https_redirect` is a global escape hatch (set by the service
         // unit in local/testing mode) that bypasses the check entirely.
+        // WS3: cert-host check is now a lock-free ArcSwap snapshot read; the
+        // background `CertHostCache::run_refresh_loop` keeps it current (±30 s).
         let needs_redirect = !self.disable_https_redirect
             && !self.is_tls_connection(session)
-            && host_has_active_cert(self.db.as_ref(), &ctx.host).await;
+            && self.cert_host_cache.has_cert_for_host(&ctx.host);
         if needs_redirect {
             // Build the HTTPS redirect URL preserving path and query string
             let redirect_url = if let Some(query) = &ctx.query_string {

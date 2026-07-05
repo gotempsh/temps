@@ -301,13 +301,7 @@ impl CertificateLoader {
     /// e.g. `"api.example.com"` → `"*.example.com"`.
     /// Returns `None` for single-label hostnames like `"localhost"`.
     fn get_wildcard_domain(&self, domain: &str) -> Option<String> {
-        let parts: Vec<&str> = domain.split('.').collect();
-        if parts.len() >= 2 {
-            let base_domain = parts[1..].join(".");
-            Some(format!("*.{}", base_domain))
-        } else {
-            None
-        }
+        wildcard_for(domain)
     }
 
     /// Parse PEM-encoded certificates, returning raw DER bytes for each cert in
@@ -351,6 +345,26 @@ impl CertificateLoader {
         }
 
         Err(anyhow::anyhow!("No valid private key found in PEM"))
+    }
+}
+
+/// Derive the wildcard parent domain from a subdomain.
+///
+/// Examples:
+/// - `"api.example.com"` → `Some("*.example.com")`
+/// - `"www.sub.example.com"` → `Some("*.sub.example.com")`
+/// - `"localhost"` → `None` (single-label; no parent zone)
+///
+/// Used by both [`CertificateLoader`] (TLS SNI resolution) and
+/// [`crate::service::cert_host_cache::CertHostCache`] (HTTP→HTTPS redirect check)
+/// so that both are consistent about what constitutes a wildcard match.
+pub(crate) fn wildcard_for(domain: &str) -> Option<String> {
+    let parts: Vec<&str> = domain.split('.').collect();
+    if parts.len() >= 2 {
+        let base_domain = parts[1..].join(".");
+        Some(format!("*.{}", base_domain))
+    } else {
+        None
     }
 }
 

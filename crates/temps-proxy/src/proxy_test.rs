@@ -262,6 +262,11 @@ pub mod proxy_tests {
             test_db.db.clone(),
         ));
 
+        // Create cert-host cache (WS3; starts empty, populated on first refresh)
+        let cert_host_cache = Arc::new(crate::service::cert_host_cache::CertHostCache::new(
+            test_db.db.clone(),
+        ));
+
         let lb = ProxyLoadBalancer::new(
             upstream_resolver,
             proxy_log_handle,
@@ -272,6 +277,7 @@ pub mod proxy_tests {
             config_service,
             ip_access_control_service,
             challenge_service,
+            cert_host_cache,
             false,
         );
 
@@ -756,6 +762,11 @@ pub mod proxy_tests {
             crate::service::challenge_service::ChallengeService::new(db.clone()),
         );
 
+        // Create cert-host cache (WS3; starts empty, populated on first refresh)
+        let cert_host_cache = Arc::new(
+            crate::service::cert_host_cache::CertHostCache::new(db.clone()),
+        );
+
         let lb = ProxyLoadBalancer::new(
             upstream_resolver,
             proxy_log_handle,
@@ -766,6 +777,7 @@ pub mod proxy_tests {
             config_service,
             ip_access_control_service,
             challenge_service,
+            cert_host_cache,
             false,
         );
 

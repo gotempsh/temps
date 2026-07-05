@@ -1,5 +1,6 @@
 use crate::config::*;
 use crate::proxy::LoadBalancer;
+use crate::service::cert_host_cache::CertHostCache;
 use crate::service::connection_filter_service::TcpConnectionFilter;
 use crate::service::lb_service::LbService;
 use crate::services::*;
@@ -286,6 +287,22 @@ pub fn setup_proxy_server(
         });
     }
 
+    let cert_host_cache = Arc::new(CertHostCache::new(db.clone()));
+
+    // Keep the cert-host set in memory so the HTTP→HTTPS redirect check never
+    // queries Postgres on the request hot path (WS3). A dedicated thread owns the
+    // periodic refresh, mirroring the IP block-list loop above.
+    {
+        let cert_host_refresher = cert_host_cache.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create tokio runtime for cert-host refresh");
+            rt.block_on(cert_host_refresher.run_refresh_loop());
+        });
+    }
+
     let challenge_service = Arc::new(crate::service::challenge_service::ChallengeService::new(
         db.clone(),
     ));
@@ -309,6 +326,7 @@ pub fn setup_proxy_server(
         config_service,
         ip_access_control_service,
         challenge_service,
+        cert_host_cache,
         proxy_config.disable_https_redirect,
     );
     if let Some(gate) = admin_gate {
@@ -478,6 +496,22 @@ pub fn create_proxy_service(
         });
     }
 
+    let cert_host_cache = Arc::new(CertHostCache::new(db.clone()));
+
+    // Keep the cert-host set in memory so the HTTP→HTTPS redirect check never
+    // queries Postgres on the request hot path (WS3). A dedicated thread owns the
+    // periodic refresh, mirroring the IP block-list loop above.
+    {
+        let cert_host_refresher = cert_host_cache.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create tokio runtime for cert-host refresh");
+            rt.block_on(cert_host_refresher.run_refresh_loop());
+        });
+    }
+
     let challenge_service = Arc::new(crate::service::challenge_service::ChallengeService::new(
         db.clone(),
     ));
@@ -496,6 +530,7 @@ pub fn create_proxy_service(
         config_service,
         ip_access_control_service,
         challenge_service,
+        cert_host_cache,
         proxy_config.disable_https_redirect,
     );
 
