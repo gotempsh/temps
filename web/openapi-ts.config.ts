@@ -15,7 +15,14 @@ export default {
         ? { Authorization: `Bearer ${env.TEMPS_API_KEY}` }
         : undefined,
     },
+  },
+  output: 'src/api/client',
+  parser: {
     filters: {
+      // Excluding the SSE operations below shouldn't cascade into dropping
+      // unrelated schemas that become "orphaned" only because openapi-ts
+      // recomputes the whole referenced-schema graph after the exclusion.
+      orphans: true,
       operations: {
         // Server-Sent Events endpoints: the @tanstack/react-query plugin
         // generates a `const { data } = await ...` mutation wrapper for
@@ -31,6 +38,5 @@ export default {
       },
     },
   },
-  output: 'src/api/client',
   plugins: ['@tanstack/react-query'],
 }

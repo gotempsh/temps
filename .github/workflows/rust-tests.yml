@@ -66,12 +66,8 @@ jobs:
         run: cargo fmt --all -- --check
 
   web-typecheck:
-    name: Web TypeScript Check (advisory)
+    name: Web TypeScript Check
     runs-on: ubuntu-latest
-    # Non-blocking: web/ currently has pre-existing type errors (stale generated
-    # SDK types, drifted component props) unrelated to any single PR. Flip to
-    # blocking once that backlog is cleared.
-    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
