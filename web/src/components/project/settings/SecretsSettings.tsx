@@ -186,7 +186,7 @@ function SecretRow({ secret, projectId, onDeleted }: SecretRowProps) {
       toast.success(`Secret ${secret.key} deleted. Redeploy to take effect.`)
       onDeleted()
     },
-    onError: (err: unknown) => {
+    onError: (err: Error) => {
       toast.error(
         err instanceof Error ? err.message : 'Failed to delete secret',
       )
@@ -308,7 +308,7 @@ function CreateSecretDialog({
       setValueError(null)
       onOpenChange(false)
     },
-    onError: (err: unknown) => {
+    onError: (err: Error) => {
       toast.error(
         err instanceof Error ? err.message : 'Failed to create secret',
       )

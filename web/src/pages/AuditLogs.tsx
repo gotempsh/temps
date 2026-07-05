@@ -23,7 +23,6 @@ import {
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useQuery } from '@tanstack/react-query'
-import { format } from 'date-fns'
 import { ScrollText, X } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { DateRange } from 'react-day-picker'
@@ -322,12 +321,8 @@ export function AuditLogs() {
       query: {
         limit: ITEMS_PER_PAGE,
         offset: (page - 1) * ITEMS_PER_PAGE,
-        from: dateRange?.from
-          ? Number(format(dateRange.from, 'yyyyMMdd'))
-          : undefined,
-        to: dateRange?.to
-          ? Number(format(dateRange.to, 'yyyyMMdd'))
-          : undefined,
+        from: dateRange?.from ? dateRange.from.toISOString() : undefined,
+        to: dateRange?.to ? dateRange.to.toISOString() : undefined,
         operation_type: operation !== ALL_FILTER ? operation : undefined,
         user_id:
           selectedUserId !== ALL_FILTER ? Number(selectedUserId) : undefined,

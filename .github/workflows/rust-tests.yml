@@ -65,6 +65,36 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+  web-typecheck:
+    name: Web TypeScript Check (advisory)
+    runs-on: ubuntu-latest
+    # Non-blocking: web/ currently has pre-existing type errors (stale generated
+    # SDK types, drifted component props) unrelated to any single PR. Flip to
+    # blocking once that backlog is cleared.
+    continue-on-error: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Cache Bun dependencies
+        uses: actions/cache@v4
+        with:
+          path: web/node_modules
+          key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      - name: Install dependencies
+        run: cd web && bun install
+
+      - name: Type check
+        run: cd web && bunx tsc --noEmit
+
   clippy:
     name: Clippy (advisory)
     runs-on: ubuntu-latest

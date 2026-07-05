@@ -249,15 +249,15 @@ export function EnvironmentHeaderBar({
                 >
                   <span
                     className={`size-1.5 rounded-full ${
-                      deployment.state === 'success'
+                      deployment.status === 'completed'
                         ? 'bg-emerald-500'
-                        : deployment.state === 'failed'
+                        : deployment.status === 'failed'
                           ? 'bg-red-500'
                           : 'bg-neutral-400'
                     }`}
                     aria-hidden="true"
                   />
-                  <span className="capitalize">{deployment.state}</span>
+                  <span className="capitalize">{deployment.status}</span>
                   <span className="text-neutral-500 dark:text-neutral-400">
                     deployment
                   </span>

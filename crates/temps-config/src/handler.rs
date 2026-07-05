@@ -15,9 +15,9 @@ use temps_auth::{permission_guard, RequireAuth};
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::{
     problemdetails::Problem, AiConfigSettings, AppSettings, AuditContext, AuditLogger,
-    AuditOperation, ClusterDnsSettings, ContainerLogSettings, DiskSpaceAlertSettings,
-    LetsEncryptSettings, MetricsStoreKind, RateLimitSettings, RequestMetadata, ScreenshotSettings,
-    SecurityHeadersSettings,
+    AuditOperation, BuildLimitsSettings, ClusterDnsSettings, ContainerLogSettings,
+    DiskSpaceAlertSettings, LetsEncryptSettings, MetricsStoreKind, RateLimitSettings,
+    RequestMetadata, ScreenshotSettings, SecurityHeadersSettings,
 };
 use tracing::{error, info};
 use utoipa::{OpenApi, ToSchema};
@@ -144,6 +144,10 @@ pub struct AppSettingsResponse {
     /// needed — `enabled` is a plain bool with no sensitive content. Passed
     /// through as-is so the settings UI can read and toggle the flag.
     pub cluster_dns: ClusterDnsSettings,
+
+    /// Build-time resource limits (control-plane only). No sensitive content,
+    /// passed through as-is.
+    pub build_limits: BuildLimitsSettings,
 }
 
 /// Monitoring settings with the ClickHouse DSN masked.
@@ -344,6 +348,7 @@ impl From<AppSettings> for AppSettingsResponse {
             setup_complete: settings.setup_complete,
             require_mfa_for_admins: settings.require_mfa_for_admins,
             cluster_dns: settings.cluster_dns,
+            build_limits: settings.build_limits,
         }
     }
 }

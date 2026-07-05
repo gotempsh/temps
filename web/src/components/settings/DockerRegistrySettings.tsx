@@ -1,4 +1,3 @@
-import { Button } from '@/components/ui/button'
 import {
   Card,
   CardContent,
@@ -12,12 +11,7 @@ import { Separator } from '@/components/ui/separator'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import { AlertCircle, Key, Lock } from 'lucide-react'
-import {
-  Control,
-  Controller,
-  UseFormRegister,
-  UseFormSetValue,
-} from 'react-hook-form'
+import { Control, UseFormRegister, UseFormSetValue } from 'react-hook-form'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 
 export interface DockerRegistrySettings {
@@ -37,7 +31,6 @@ interface DockerRegistrySettingsProps {
 }
 
 export function DockerRegistrySettings({
-  control,
   register,
   setValue,
   dockerRegistry,

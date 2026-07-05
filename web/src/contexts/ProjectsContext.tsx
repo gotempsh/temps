@@ -1,10 +1,10 @@
-import { Project } from '@/api/client'
+import { ProjectResponse } from '@/api/client'
 import { getProjectsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { useQuery } from '@tanstack/react-query'
 import { createContext, useContext } from 'react'
 
 interface ProjectsContextType {
-  projects: Project[]
+  projects: ProjectResponse[]
   isLoading: boolean
 }
 

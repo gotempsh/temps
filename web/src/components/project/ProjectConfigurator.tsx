@@ -15,7 +15,6 @@ import {
 import { ImportEnvDialog } from '@/components/ui/import-env-dialog'
 import { CreateServiceDialog } from '@/components/storage/CreateServiceDialog'
 import { Alert, AlertDescription } from '@/components/ui/alert'
-import { Badge } from '@/components/ui/badge'
 import { BranchSelector } from '@/components/deployments/BranchSelector'
 import { Button } from '@/components/ui/button'
 import {
@@ -57,7 +56,6 @@ import {
   GitBranch,
   Loader2,
   Plus,
-  Server,
   Settings,
   Upload,
   X,
@@ -271,29 +269,6 @@ function ComposeFileSelector({
 
 // Step definitions for different modes
 type WizardStep = 'repo-config' | 'services' | 'env-vars' | 'review'
-
-const _STEP_CONFIG = {
-  'repo-config': {
-    title: 'Repository & Configuration',
-    description: 'Configure basic project settings',
-    icon: Folder,
-  },
-  services: {
-    title: 'Services',
-    description: 'Select and configure storage services',
-    icon: Server,
-  },
-  'env-vars': {
-    title: 'Environment Variables',
-    description: 'Set up environment variables',
-    icon: Settings,
-  },
-  review: {
-    title: 'Review & Create',
-    description: 'Review and submit your configuration',
-    icon: CheckCircle2,
-  },
-}
 
 // Main component props
 interface ProjectConfiguratorProps {
@@ -1204,131 +1179,6 @@ export function ProjectConfigurator({
             </p>
           </div>
         )}
-      </div>
-    )
-  }
-
-  // Render review step
-  const _renderReview = () => {
-    const formData = form.getValues()
-
-    return (
-      <div className="space-y-4">
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-lg flex items-center gap-2">
-              <Folder className="h-5 w-5" />
-              Project Configuration
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-2">
-            <div className="flex justify-between text-sm">
-              <span className="text-muted-foreground">Name:</span>
-              <span className="font-medium">{formData.name}</span>
-            </div>
-            <div className="flex justify-between text-sm">
-              <span className="text-muted-foreground">Repository:</span>
-              <span className="font-medium">{repository.full_name}</span>
-            </div>
-            <div className="flex justify-between text-sm">
-              <span className="text-muted-foreground">Branch:</span>
-              <span className="font-medium">{formData.branch}</span>
-            </div>
-            <div className="flex justify-between text-sm">
-              <span className="text-muted-foreground">Framework:</span>
-              <span className="font-medium">{formData.preset}</span>
-            </div>
-            <div className="flex justify-between text-sm">
-              <span className="text-muted-foreground">Directory:</span>
-              <span className="font-medium">{formData.rootDirectory}</span>
-            </div>
-            <div className="flex justify-between text-sm">
-              <span className="text-muted-foreground">Auto Deploy:</span>
-              <span className="font-medium">
-                {formData.autoDeploy ? 'Enabled' : 'Disabled'}
-              </span>
-            </div>
-            {formData.dockerfilePath && (
-              <div className="flex justify-between text-sm">
-                <span className="text-muted-foreground">Dockerfile:</span>
-                <span className="font-medium">{formData.dockerfilePath}</span>
-              </div>
-            )}
-            {formData.port && (
-              <div className="flex justify-between text-sm">
-                <span className="text-muted-foreground">Port:</span>
-                <span className="font-medium">{formData.port}</span>
-              </div>
-            )}
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-lg flex items-center gap-2">
-              <Database className="h-5 w-5" />
-              Services
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            {(formData.storageServices?.length || 0) +
-              newlyCreatedServiceIds.length >
-            0 ? (
-              <div className="space-y-2">
-                <p className="text-sm text-muted-foreground">
-                  {(formData.storageServices?.length || 0) +
-                    newlyCreatedServiceIds.length}{' '}
-                  service(s) will be linked
-                </p>
-                {newlyCreatedServiceIds.length > 0 && (
-                  <p className="text-xs text-muted-foreground">
-                    Including {newlyCreatedServiceIds.length} new service(s)
-                  </p>
-                )}
-              </div>
-            ) : (
-              <p className="text-sm text-muted-foreground">
-                No services configured
-              </p>
-            )}
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-lg flex items-center gap-2">
-              <Settings className="h-5 w-5" />
-              Environment Variables
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            {formData.environmentVariables?.length ? (
-              <div className="space-y-2">
-                <p className="text-sm text-muted-foreground">
-                  {formData.environmentVariables.length} variable(s) configured
-                </p>
-                <div className="space-y-1">
-                  {formData.environmentVariables.map((env, i) => (
-                    <div key={i} className="flex items-center gap-2 text-xs">
-                      <code className="px-1 py-0.5 bg-muted rounded">
-                        {env.key}
-                      </code>
-                      {env.isSecret && (
-                        <Badge variant="outline" className="text-xs">
-                          Secret
-                        </Badge>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              </div>
-            ) : (
-              <p className="text-sm text-muted-foreground">
-                No environment variables configured
-              </p>
-            )}
-          </CardContent>
-        </Card>
       </div>
     )
   }

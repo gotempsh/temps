@@ -631,8 +631,7 @@ function WeeklyDigest({
         deployments: defaultValues?.digestSections?.deployments ?? true,
         errors: defaultValues?.digestSections?.errors ?? true,
         funnels: defaultValues?.digestSections?.funnels ?? true,
-        security: defaultValues?.digestSections?.security ?? true,
-        resources: defaultValues?.digestSections?.resources ?? true,
+        projects: defaultValues?.digestSections?.projects ?? true,
       },
     },
   })
@@ -812,29 +811,11 @@ function WeeklyDigest({
 
                   <FormField
                     control={form.control}
-                    name="digestSections.security"
+                    name="digestSections.projects"
                     render={({ field }) => (
                       <FormItem className="flex flex-row items-center justify-between rounded-lg border p-3">
                         <FormLabel className="font-normal">
-                          Security Insights
-                        </FormLabel>
-                        <FormControl>
-                          <Switch
-                            checked={field.value}
-                            onCheckedChange={field.onChange}
-                          />
-                        </FormControl>
-                      </FormItem>
-                    )}
-                  />
-
-                  <FormField
-                    control={form.control}
-                    name="digestSections.resources"
-                    render={({ field }) => (
-                      <FormItem className="flex flex-row items-center justify-between rounded-lg border p-3">
-                        <FormLabel className="font-normal">
-                          Resource Usage
+                          Project Updates
                         </FormLabel>
                         <FormControl>
                           <Switch
@@ -1023,8 +1004,7 @@ export function MonitoringSettings() {
         deployments: data.digestSections.deployments,
         errors: data.digestSections.errors,
         funnels: data.digestSections.funnels,
-        security: data.digestSections.security,
-        resources: data.digestSections.resources,
+        projects: data.digestSections.projects,
       },
     }
 
@@ -1120,8 +1100,7 @@ export function MonitoringSettings() {
         deployments: preferences.digest_sections?.deployments ?? true,
         errors: preferences.digest_sections?.errors ?? true,
         funnels: preferences.digest_sections?.funnels ?? true,
-        security: preferences.digest_sections?.security ?? true,
-        resources: preferences.digest_sections?.resources ?? true,
+        projects: preferences.digest_sections?.projects ?? true,
       },
     }
 
