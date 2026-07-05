@@ -235,7 +235,7 @@ jobs:
           echo "  $REPO:$SHA"
 
       - name: Build and push sandbox image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: ./build-context
           platforms: linux/amd64,linux/arm64
@@ -295,7 +295,7 @@ jobs:
           } >> $GITHUB_OUTPUT
 
       - name: Build and push preview gateway image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: ./crates/temps-preview-gateway
           platforms: linux/amd64,linux/arm64
