@@ -1241,16 +1241,6 @@ impl ExternalServiceManager {
         }
     }
 
-    /// Get the container name for a service (used for remote operations).
-    fn get_container_name_for_service(
-        &self,
-        service_name: &str,
-        service_type: &ServiceType,
-    ) -> String {
-        self.create_service_instance(service_name.to_string(), *service_type)
-            .get_name()
-    }
-
     pub async fn get_service_by_name(
         &self,
         name_param: &str,
