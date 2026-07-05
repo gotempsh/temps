@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Deployment token routes**: Mount `deployment_tokens::configure_routes()` and merge `DeploymentTokensApiDoc` in `DeploymentsPlugin` so deployment-token API paths are reachable at runtime and visible in the generated OpenAPI schema.
+
 ### Tests
 
 - **MinIO restore coverage**: Extend `test_s3_backup_and_restore_to_s3` to create 100 MinIO buckets with synthetic files, back them up through the production S3 mirror path, restore into a second service, and verify all restored objects so managed S3 compatibility regressions are caught in the Docker backup suite.

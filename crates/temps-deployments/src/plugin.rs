@@ -374,6 +374,10 @@ impl TempsPlugin for DeploymentsPlugin {
         // Get WorkflowExecutionService
         let workflow_executor = context.require_service::<WorkflowExecutionService>();
 
+        // Get DeploymentTokenService for deployment-token management routes
+        let deployment_token_service =
+            context.require_service::<crate::services::deployment_token_service::DeploymentTokenService>();
+
         // Get ImageBuilder for uploading Docker image tarballs
         let image_builder = context.require_service::<dyn temps_deployer::ImageBuilder>();
 
@@ -424,13 +428,19 @@ impl TempsPlugin for DeploymentsPlugin {
         let external_images_routes = handlers::external_images::configure_routes();
         let remote_deployments_routes = handlers::remote_deployments::configure_routes();
         let admin_node_routes = handlers::nodes::configure_admin_routes();
+        let deployment_token_routes = handlers::deployment_tokens::configure_routes().with_state(
+            Arc::new(handlers::deployment_tokens::DeploymentTokenAppState {
+                deployment_token_service,
+            }),
+        );
 
         let routes = deployments_routes
             .merge(cron_routes)
             .merge(external_images_routes)
             .merge(remote_deployments_routes)
             .merge(admin_node_routes)
-            .with_state(app_state);
+            .with_state(app_state)
+            .merge(deployment_token_routes);
 
         Some(PluginRoutes::new(routes))
     }
@@ -444,6 +454,8 @@ impl TempsPlugin for DeploymentsPlugin {
         let remote_deployments_schema =
             <handlers::remote_deployments::RemoteDeploymentsApiDoc as UtoimaOpenApi>::openapi();
         let nodes_schema = <handlers::nodes::NodesApiDoc as UtoimaOpenApi>::openapi();
+        let deployment_tokens_schema =
+            <handlers::deployment_tokens::DeploymentTokensApiDoc as UtoimaOpenApi>::openapi();
 
         Some(temps_core::openapi::merge_openapi_schemas(
             deployments_schema,
@@ -452,6 +464,7 @@ impl TempsPlugin for DeploymentsPlugin {
                 external_images_schema,
                 remote_deployments_schema,
                 nodes_schema,
+                deployment_tokens_schema,
             ],
         ))
     }
@@ -482,5 +495,23 @@ mod tests {
 
         // The actual job processor functionality is tested separately
         // This test just verifies the plugin structure is correct
+    }
+
+    #[test]
+    fn test_openapi_schema_includes_deployment_token_routes() {
+        let plugin = DeploymentsPlugin::new();
+        let schema = plugin
+            .openapi_schema()
+            .expect("deployments plugin should expose OpenAPI schema");
+        let paths = schema.paths.paths;
+
+        assert!(
+            paths.contains_key("/projects/{project_id}/deployment-tokens"),
+            "deployment token collection route should be exposed in plugin OpenAPI schema"
+        );
+        assert!(
+            paths.contains_key("/projects/{project_id}/deployment-tokens/{token_id}"),
+            "deployment token item route should be exposed in plugin OpenAPI schema"
+        );
     }
 }
