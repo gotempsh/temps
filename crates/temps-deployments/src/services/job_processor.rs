@@ -42,6 +42,11 @@ struct CommitInfo {
     commit_json: serde_json::Value,
 }
 
+/// Shared slot for the optional [`temps_core::DeploymentGate`] — see the
+/// `deployment_gate` field doc on [`JobProcessorService`] for why this is
+/// a lock instead of a plain `Option`.
+pub type DeploymentGateSlot = Arc<tokio::sync::RwLock<Option<Arc<dyn temps_core::DeploymentGate>>>>;
+
 pub struct JobProcessorService {
     db: Arc<DbConnection>,
     job_receiver: Box<dyn JobReceiver>,
@@ -49,6 +54,21 @@ pub struct JobProcessorService {
     workflow_planner: Arc<WorkflowPlanner>,
     workflow_executor: Arc<WorkflowExecutionService>,
     git_provider_manager: Arc<temps_git::GitProviderManager>,
+    /// Optional gate checked before a deployment transitions to `Running`
+    /// (e.g. a plugin implementing manual approvals). Defaults to
+    /// `None` — a no-op — so deploys never depend on it. See
+    /// [`temps_core::DeploymentGate`].
+    ///
+    /// Held behind a shared lock rather than a plain `Option` because it
+    /// must be settable *after* this service is constructed (and even
+    /// after `run()` has been spawned): `DeploymentsPlugin::register_services`
+    /// runs, and starts this processor, before later-registered plugins get
+    /// a chance to register a gate. `DeploymentsPlugin::initialize_plugin_services`
+    /// — which runs only after every plugin has registered — writes into
+    /// the same slot via a clone taken before `run()` was spawned. `run()`'s
+    /// dispatch loop re-reads it per job, so a gate registered after
+    /// startup still protects every job dispatched from that point on.
+    deployment_gate: DeploymentGateSlot,
 }
 
 impl JobProcessorService {
@@ -67,6 +87,7 @@ impl JobProcessorService {
             workflow_planner,
             workflow_executor,
             git_provider_manager,
+            deployment_gate: Arc::new(tokio::sync::RwLock::new(None)),
         }
     }
 
@@ -85,7 +106,18 @@ impl JobProcessorService {
             workflow_planner,
             workflow_executor,
             git_provider_manager,
+            deployment_gate: Arc::new(tokio::sync::RwLock::new(None)),
         }
+    }
+
+    /// Returns a clone of the shared gate slot. Call this *before* moving
+    /// `self` into the spawned `run()` task, so the caller retains a handle
+    /// it can write into later (from `DeploymentsPlugin::initialize_plugin_services`,
+    /// which runs after every plugin has registered its services). See the
+    /// field doc on `deployment_gate` for why a direct
+    /// `set_deployment_gate(&mut self, ...)` setter doesn't work here.
+    pub fn deployment_gate_handle(&self) -> DeploymentGateSlot {
+        self.deployment_gate.clone()
     }
 
     pub async fn run(&mut self) -> Result<(), JobProcessorError> {
@@ -111,6 +143,7 @@ impl JobProcessorService {
                             let db = Arc::clone(&self.db);
                             let git_provider_manager = Arc::clone(&self.git_provider_manager);
                             let queue = Arc::clone(&self.queue);
+                            let deployment_gate = self.deployment_gate.read().await.clone();
 
                             // Spawn a task to handle the job asynchronously
                             tokio::spawn(async move {
@@ -121,6 +154,7 @@ impl JobProcessorService {
                                     db,
                                     git_provider_manager,
                                     queue,
+                                    deployment_gate,
                                     git_push_job,
                                 )
                                 .await;
@@ -136,6 +170,7 @@ impl JobProcessorService {
                             let workflow_executor = Arc::clone(&self.workflow_executor);
                             let db = Arc::clone(&self.db);
                             let queue = Arc::clone(&self.queue);
+                            let deployment_gate = self.deployment_gate.read().await.clone();
 
                             tokio::spawn(async move {
                                 Self::process_deploy_image_requested_job(
@@ -143,7 +178,27 @@ impl JobProcessorService {
                                     workflow_executor,
                                     db,
                                     queue,
+                                    deployment_gate,
                                     image_job,
+                                )
+                                .await;
+                            });
+                        }
+                        Job::DeploymentGateRecheck(recheck_job) => {
+                            debug!(
+                                "🔥 Handling DeploymentGateRecheck job - deployment: {}",
+                                recheck_job.deployment_id
+                            );
+                            let workflow_executor = Arc::clone(&self.workflow_executor);
+                            let db = Arc::clone(&self.db);
+                            let deployment_gate = self.deployment_gate.read().await.clone();
+
+                            tokio::spawn(async move {
+                                Self::process_deployment_gate_recheck_job(
+                                    db,
+                                    workflow_executor,
+                                    deployment_gate,
+                                    recheck_job,
                                 )
                                 .await;
                             });
@@ -180,6 +235,7 @@ impl JobProcessorService {
         workflow_executor: Arc<WorkflowExecutionService>,
         db: Arc<DbConnection>,
         queue: Arc<dyn JobQueue>,
+        deployment_gate: Option<Arc<dyn temps_core::DeploymentGate>>,
         job: temps_core::DeployImageRequestedJob,
     ) {
         use chrono::Utc;
@@ -314,52 +370,18 @@ impl JobProcessorService {
                         created_jobs.len(),
                         deployment.id
                     );
-                    if let Err(e) = JobProcessorService::update_deployment_status(
-                        &db,
-                        deployment.id,
-                        PipelineStatus::Running,
-                    )
-                    .await
-                    {
-                        error!(
-                            "Failed to update deployment {} status to Running: {}",
-                            deployment.id, e
-                        );
-                        continue;
-                    }
 
-                    // Kick off the workflow (pull image → deploy container). Jobs
-                    // sit pending until the executor runs them, same as the
-                    // git-push path.
-                    info!("Executing workflow for image deployment {}", deployment.id);
-                    if let Err(e) = workflow_executor
-                        .execute_deployment_workflow(deployment.id)
-                        .await
-                    {
-                        let msg = format!("{}", e);
-                        error!(
-                            "Workflow execution failed for image deployment {}: {}",
-                            deployment.id, msg
-                        );
-                        if let Err(e2) = JobProcessorService::update_deployment_status_with_message(
-                            &db,
-                            deployment.id,
-                            PipelineStatus::Failed,
-                            Some(msg),
-                        )
-                        .await
-                        {
-                            error!(
-                                "Failed to mark image deployment {} failed: {}",
-                                deployment.id, e2
-                            );
-                        }
-                    } else {
-                        info!(
-                            "Workflow execution completed for image deployment {}",
-                            deployment.id
-                        );
-                    }
+                    // Gate check (optional — no-op when no gate is registered),
+                    // then transition to Running and execute the workflow.
+                    Self::gate_check_then_run(
+                        &db,
+                        &workflow_executor,
+                        &deployment_gate,
+                        project.id,
+                        &environment.name,
+                        deployment.id,
+                    )
+                    .await;
                 }
                 Err(e) => {
                     error!(
@@ -483,12 +505,179 @@ impl JobProcessorService {
         Ok(())
     }
 
+    /// Check the optional [`temps_core::DeploymentGate`] and, if allowed,
+    /// transition the deployment to `Running` and execute its workflow.
+    ///
+    /// If a gate blocks the deployment (or errors — fail-closed), this
+    /// leaves the deployment in whatever status it already had. The jobs
+    /// `create_deployment_jobs` already created are untouched, so a later
+    /// [`temps_core::DeploymentGateRecheckJob`] can call this same helper
+    /// again once conditions change, without recreating anything.
+    ///
+    /// `pub(crate)` — also called directly by the manual-deploy HTTP
+    /// handlers (`handlers::remote_deployments::{deploy_from_image,
+    /// deploy_from_image_upload, deploy_from_static}`), which run outside
+    /// the job-queue dispatch loop and would otherwise skip the gate
+    /// entirely.
+    pub(crate) async fn gate_check_then_run(
+        db: &Arc<DbConnection>,
+        workflow_executor: &Arc<WorkflowExecutionService>,
+        deployment_gate: &Option<Arc<dyn temps_core::DeploymentGate>>,
+        project_id: i32,
+        environment_name: &str,
+        deployment_id: i32,
+    ) {
+        if let Some(gate) = deployment_gate {
+            match gate
+                .check(project_id, environment_name, &deployment_id.to_string())
+                .await
+            {
+                Ok(temps_core::GateDecision::Allow) => {}
+                Ok(temps_core::GateDecision::Block { reason }) => {
+                    info!(
+                        "Deployment {} blocked pending an external gate: {}",
+                        deployment_id, reason
+                    );
+                    return;
+                }
+                Err(e) => {
+                    // Fail-closed: a broken gate must never fail open.
+                    error!(
+                        "Deployment gate check errored for deployment {} — blocking (fail-closed): {}",
+                        deployment_id, e
+                    );
+                    return;
+                }
+            }
+        }
+
+        if let Err(e) = JobProcessorService::update_deployment_status(
+            db,
+            deployment_id,
+            PipelineStatus::Running,
+        )
+        .await
+        {
+            error!(
+                "Failed to update deployment {} status to Running: {}",
+                deployment_id, e
+            );
+            return;
+        }
+        info!("Updated deployment {} status to Running", deployment_id);
+
+        info!("Executing workflow for deployment {}", deployment_id);
+        if let Err(e) = workflow_executor
+            .execute_deployment_workflow(deployment_id)
+            .await
+        {
+            let error_message = format!("{}", e);
+            error!(
+                "Workflow execution failed for deployment {}: {}",
+                deployment_id, error_message
+            );
+            if let Err(update_err) = JobProcessorService::update_deployment_status_with_message(
+                db,
+                deployment_id,
+                PipelineStatus::Failed,
+                Some(error_message),
+            )
+            .await
+            {
+                error!("Failed to update deployment status: {}", update_err);
+            }
+        } else {
+            info!(
+                "Workflow execution completed for deployment {}",
+                deployment_id
+            );
+        }
+    }
+
+    /// Handle a [`temps_core::DeploymentGateRecheckJob`] — re-evaluate the
+    /// gate for a deployment that a previous check blocked. Looks the
+    /// deployment up to recover its project id and environment name (the
+    /// recheck job carries only the deployment id, deliberately —
+    /// gate-agnostic, no plugin-specific fields).
+    ///
+    /// No-ops (with a log line) if the deployment is no longer `Pending`
+    /// (e.g. it was cancelled while waiting, or a race already processed
+    /// it) — recheck jobs must never resurrect a deployment that moved on.
+    async fn process_deployment_gate_recheck_job(
+        db: Arc<DbConnection>,
+        workflow_executor: Arc<WorkflowExecutionService>,
+        deployment_gate: Option<Arc<dyn temps_core::DeploymentGate>>,
+        job: temps_core::DeploymentGateRecheckJob,
+    ) {
+        let deployment = match deployments::Entity::find_by_id(job.deployment_id)
+            .one(db.as_ref())
+            .await
+        {
+            Ok(Some(d)) => d,
+            Ok(None) => {
+                error!(
+                    "DeploymentGateRecheck: deployment {} not found",
+                    job.deployment_id
+                );
+                return;
+            }
+            Err(e) => {
+                error!(
+                    "DeploymentGateRecheck: db error loading deployment {}: {}",
+                    job.deployment_id, e
+                );
+                return;
+            }
+        };
+
+        if deployment.state != "pending" {
+            info!(
+                "DeploymentGateRecheck: deployment {} is no longer pending (state={}), ignoring",
+                deployment.id, deployment.state
+            );
+            return;
+        }
+
+        let environment =
+            match temps_entities::environments::Entity::find_by_id(deployment.environment_id)
+                .one(db.as_ref())
+                .await
+            {
+                Ok(Some(e)) => e,
+                Ok(None) => {
+                    error!(
+                        "DeploymentGateRecheck: environment {} for deployment {} not found",
+                        deployment.environment_id, deployment.id
+                    );
+                    return;
+                }
+                Err(e) => {
+                    error!(
+                    "DeploymentGateRecheck: db error loading environment {} for deployment {}: {}",
+                    deployment.environment_id, deployment.id, e
+                );
+                    return;
+                }
+            };
+
+        Self::gate_check_then_run(
+            &db,
+            &workflow_executor,
+            &deployment_gate,
+            deployment.project_id,
+            &environment.name,
+            deployment.id,
+        )
+        .await;
+    }
+
     async fn process_git_push_event_job(
         workflow_planner: Arc<WorkflowPlanner>,
         workflow_executor: Arc<WorkflowExecutionService>,
         db: Arc<DbConnection>,
         git_provider_manager: Arc<temps_git::GitProviderManager>,
         queue: Arc<dyn JobQueue>,
+        deployment_gate: Option<Arc<dyn temps_core::DeploymentGate>>,
         job: temps_core::GitPushEventJob,
     ) {
         process_git_push_event(
@@ -497,6 +686,7 @@ impl JobProcessorService {
             db,
             git_provider_manager,
             queue,
+            deployment_gate,
             job,
         )
         .await;
@@ -899,6 +1089,7 @@ async fn process_git_push_event(
     db: Arc<DbConnection>,
     git_provider_manager: Arc<temps_git::GitProviderManager>,
     queue: Arc<dyn JobQueue>,
+    deployment_gate: Option<Arc<dyn temps_core::DeploymentGate>>,
     job: temps_core::GitPushEventJob,
 ) {
     info!(
@@ -1198,50 +1389,17 @@ async fn process_git_push_event(
                     deployment_id
                 );
 
-                match JobProcessorService::update_deployment_status(
+                // Gate check (optional — no-op when no gate is registered),
+                // then transition to Running and execute the workflow.
+                JobProcessorService::gate_check_then_run(
                     &db,
+                    &workflow_executor,
+                    &deployment_gate,
+                    project.id,
+                    &environment.name,
                     deployment_id,
-                    PipelineStatus::Running,
                 )
-                .await
-                {
-                    Ok(_) => info!("Updated deployment {} status to Running", deployment_id),
-                    Err(e) => {
-                        error!("Failed to update deployment status to Running: {}", e);
-                        continue;
-                    }
-                }
-
-                info!("Executing workflow for deployment {}", deployment_id);
-                match workflow_executor
-                    .execute_deployment_workflow(deployment_id)
-                    .await
-                {
-                    Ok(_) => {
-                        info!(
-                            "Workflow execution completed for deployment {}",
-                            deployment_id
-                        );
-                    }
-                    Err(e) => {
-                        let error_message = format!("{}", e);
-                        error!(
-                            "Workflow execution failed for deployment {}: {}",
-                            deployment_id, error_message
-                        );
-                        if let Err(update_err) =
-                            JobProcessorService::update_deployment_status_with_message(
-                                &db,
-                                deployment_id,
-                                PipelineStatus::Failed,
-                                Some(error_message),
-                            )
-                            .await
-                        {
-                            error!("Failed to update deployment status: {}", update_err);
-                        }
-                    }
-                }
+                .await;
             }
             Err(job_error) => {
                 let error_message = format!("{}", job_error);

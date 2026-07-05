@@ -9,16 +9,30 @@ use utoipa::{openapi::OpenApi, OpenApi as UtoimaOpenApi};
 
 use crate::{
     handlers,
-    services::{DeploymentService, JobProcessorService, WorkflowExecutionService},
+    services::{
+        DeploymentGateSlot, DeploymentService, JobProcessorService, WorkflowExecutionService,
+    },
     WorkflowPlanner,
 };
 
 /// Deployments Plugin for managing deployment operations
-pub struct DeploymentsPlugin;
+pub struct DeploymentsPlugin {
+    /// Handle to the job processor's `deployment_gate` slot, captured in
+    /// `register_services` (before the processor is moved into its spawned
+    /// task) and written into from `initialize_plugin_services`, which runs
+    /// only after every plugin has registered its services. See
+    /// `JobProcessorService::deployment_gate` for why this two-phase
+    /// handoff is needed: `register_services` runs in plugin-registration
+    /// order, and this plugin registers (and starts its processor) before
+    /// any later-registered plugin gets a chance to provide a gate.
+    deployment_gate_slot: tokio::sync::OnceCell<DeploymentGateSlot>,
+}
 
 impl DeploymentsPlugin {
     pub fn new() -> Self {
-        Self
+        Self {
+            deployment_gate_slot: tokio::sync::OnceCell::new(),
+        }
     }
 }
 
@@ -260,6 +274,20 @@ impl TempsPlugin for DeploymentsPlugin {
                 git_provider_manager,
             );
 
+            // Capture a handle to the job processor's gate slot before it's
+            // moved into the spawned task below. Any plugin that registers
+            // after this one would still be unregistered at this point, so
+            // looking the gate up here with get_service would always find
+            // nothing — initialize_plugin_services (below) does the actual
+            // lookup once every plugin has registered.
+            if self
+                .deployment_gate_slot
+                .set(job_processor.deployment_gate_handle())
+                .is_err()
+            {
+                unreachable!("register_services runs exactly once per plugin instance");
+            }
+
             // Start the job processor in a background task
             tokio::spawn(async move {
                 tracing::debug!("Starting deployment job processor");
@@ -286,10 +314,35 @@ impl TempsPlugin for DeploymentsPlugin {
         })
     }
 
+    fn initialize_plugin_services<'a>(
+        &'a self,
+        context: &'a PluginContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
+        Box::pin(async move {
+            // Runs after every plugin has registered its services, so this
+            // is the first point at which an optional DeploymentGate (e.g.
+            // from a plugin implementing manual approvals) can actually be
+            // found.
+            if let Some(slot) = self.deployment_gate_slot.get() {
+                if let Some(gate) = context.get_service::<dyn temps_core::DeploymentGate>() {
+                    *slot.write().await = Some(gate);
+                    tracing::debug!("Deployment gate wired into job processor");
+                }
+            }
+            Ok(())
+        })
+    }
+
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         let deployment_service = context.require_service::<DeploymentService>();
         let log_service = context.require_service::<temps_logs::LogService>();
         let cron_service = context.require_service::<crate::services::DatabaseCronConfigService>();
+
+        // Optional. configure_routes runs only after every plugin's
+        // initialize_plugin_services has completed (see PluginManager::initialize_plugins),
+        // so unlike register_services this get_service call reliably finds
+        // a gate registered by any plugin.
+        let deployment_gate = context.get_service::<dyn temps_core::DeploymentGate>();
 
         // Create external deployment manager for handling external images and operations
         let external_deployment_manager =
@@ -363,6 +416,7 @@ impl TempsPlugin for DeploymentsPlugin {
             encryption_service,
             config_service: config_service.clone(),
             docker: docker_for_exec,
+            deployment_gate,
         });
 
         let deployments_routes = handlers::deployments::configure_routes();
@@ -415,7 +469,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_deployments_plugin_default() {
-        let deployments_plugin = DeploymentsPlugin;
+        let deployments_plugin = DeploymentsPlugin::default();
         assert_eq!(deployments_plugin.name(), "deployments");
     }
 

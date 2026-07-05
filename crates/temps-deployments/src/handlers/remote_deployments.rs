@@ -500,47 +500,26 @@ pub async fn deploy_from_image(
                 deployment.id
             );
 
-            // Update deployment status to Running
-            if let Err(e) =
-                crate::services::job_processor::JobProcessorService::update_deployment_status(
-                    &state.db,
-                    deployment.id,
-                    PipelineStatus::Running,
-                )
-                .await
-            {
-                error!("Failed to update deployment status: {}", e);
-            }
-
-            // Execute the workflow in background
+            // Gate check (if a plugin registered one), then transition to
+            // Running and execute the workflow. Delegates to the same
+            // helper the job-queue dispatch loop uses so this manual-deploy
+            // path can't bypass a gate that the git-push / deploy-image job
+            // paths honor.
             let workflow_executor = state.workflow_executor.clone();
+            let deployment_gate = state.deployment_gate.clone();
             let deployment_id = deployment.id;
             let db = state.db.clone();
+            let environment_name = environment.name.clone();
             tokio::spawn(async move {
-                match workflow_executor
-                    .execute_deployment_workflow(deployment_id)
-                    .await
-                {
-                    Ok(_) => {
-                        info!(
-                            "Workflow execution completed for deployment {}",
-                            deployment_id
-                        );
-                    }
-                    Err(e) => {
-                        error!(
-                            "Workflow execution failed for deployment {}: {}",
-                            deployment_id, e
-                        );
-                        let _ = crate::services::job_processor::JobProcessorService::update_deployment_status_with_message(
-                            &db,
-                            deployment_id,
-                            PipelineStatus::Failed,
-                            Some(e.to_string()),
-                        )
-                        .await;
-                    }
-                }
+                crate::services::job_processor::JobProcessorService::gate_check_then_run(
+                    &db,
+                    &workflow_executor,
+                    &deployment_gate,
+                    project_id,
+                    &environment_name,
+                    deployment_id,
+                )
+                .await;
             });
         }
         Err(e) => {
@@ -785,47 +764,26 @@ pub async fn deploy_from_static(
                 deployment.id
             );
 
-            // Update deployment status to Running
-            if let Err(e) =
-                crate::services::job_processor::JobProcessorService::update_deployment_status(
-                    &state.db,
-                    deployment.id,
-                    PipelineStatus::Running,
-                )
-                .await
-            {
-                error!("Failed to update deployment status: {}", e);
-            }
-
-            // Execute the workflow in background
+            // Gate check (if a plugin registered one), then transition to
+            // Running and execute the workflow. Delegates to the same
+            // helper the job-queue dispatch loop uses so this manual-deploy
+            // path can't bypass a gate that the git-push / deploy-image job
+            // paths honor.
             let workflow_executor = state.workflow_executor.clone();
+            let deployment_gate = state.deployment_gate.clone();
             let deployment_id = deployment.id;
             let db = state.db.clone();
+            let environment_name = environment.name.clone();
             tokio::spawn(async move {
-                match workflow_executor
-                    .execute_deployment_workflow(deployment_id)
-                    .await
-                {
-                    Ok(_) => {
-                        info!(
-                            "Workflow execution completed for deployment {}",
-                            deployment_id
-                        );
-                    }
-                    Err(e) => {
-                        error!(
-                            "Workflow execution failed for deployment {}: {}",
-                            deployment_id, e
-                        );
-                        let _ = crate::services::job_processor::JobProcessorService::update_deployment_status_with_message(
-                            &db,
-                            deployment_id,
-                            PipelineStatus::Failed,
-                            Some(e.to_string()),
-                        )
-                        .await;
-                    }
-                }
+                crate::services::job_processor::JobProcessorService::gate_check_then_run(
+                    &db,
+                    &workflow_executor,
+                    &deployment_gate,
+                    project_id,
+                    &environment_name,
+                    deployment_id,
+                )
+                .await;
             });
         }
         Err(e) => {
@@ -1201,51 +1159,26 @@ pub async fn deploy_from_image_upload(
                 deployment.id
             );
 
-            // Update deployment status to Running
-            if let Err(e) =
-                crate::services::job_processor::JobProcessorService::update_deployment_status(
-                    &state.db,
-                    deployment.id,
-                    PipelineStatus::Running,
-                )
-                .await
-            {
-                error!("Failed to update deployment status: {}", e);
-            }
-
-            // Execute the workflow in background
+            // Gate check (if a plugin registered one), then transition to
+            // Running and execute the workflow. Delegates to the same
+            // helper the job-queue dispatch loop uses so this manual-deploy
+            // path can't bypass a gate that the git-push / deploy-image job
+            // paths honor.
             let workflow_executor = state.workflow_executor.clone();
+            let deployment_gate = state.deployment_gate.clone();
             let deployment_id = deployment.id;
             let db = state.db.clone();
+            let environment_name = environment.name.clone();
             tokio::spawn(async move {
-                match workflow_executor
-                    .execute_deployment_workflow(deployment_id)
-                    .await
-                {
-                    Ok(_) => {
-                        info!(
-                            "Workflow execution completed for deployment {}",
-                            deployment_id
-                        );
-                    }
-                    Err(e) => {
-                        error!(
-                            "Workflow execution failed for deployment {}: {}",
-                            deployment_id, e
-                        );
-                        // Update deployment status to Failed
-                        if let Err(e) =
-                            crate::services::job_processor::JobProcessorService::update_deployment_status(
-                                &db,
-                                deployment_id,
-                                PipelineStatus::Failed,
-                            )
-                            .await
-                        {
-                            error!("Failed to update deployment status: {}", e);
-                        }
-                    }
-                }
+                crate::services::job_processor::JobProcessorService::gate_check_then_run(
+                    &db,
+                    &workflow_executor,
+                    &deployment_gate,
+                    project_id,
+                    &environment_name,
+                    deployment_id,
+                )
+                .await;
             });
         }
         Err(e) => {
