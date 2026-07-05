@@ -1911,6 +1911,12 @@ impl ExternalServiceManager {
             .await?;
         let is_cluster = !members.is_empty();
 
+        // Fetch parameters BEFORE deleting the DB row -- they're needed below to
+        // reconstruct the service instance for container removal, and
+        // get_service_parameters looks the service up by ID, which would fail
+        // once the row is gone.
+        let parameters = self.get_service_parameters(service_id).await?;
+
         // Delete from database first
         self.db
             .transaction::<_, (), ExternalServiceError>(|txn| {
@@ -2059,7 +2065,6 @@ impl ExternalServiceManager {
         } else {
             // Standalone: remove single container
             info!("Removing service {} container", service_id);
-            let parameters = self.get_service_parameters(service_id).await?;
             if let Some(node_id) = service.node_id {
                 let client = self.get_remote_client(node_id).await?;
                 let container_name = self
