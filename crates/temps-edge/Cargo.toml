@@ -19,7 +19,7 @@ bytes = { workspace = true }
 chrono = { workspace = true }
 dirs = "5.0"
 flate2 = { workspace = true }
-gethostname = "0.5"
+gethostname = "1.1"
 hkdf = { workspace = true }
 http = { workspace = true }
 pingora = { workspace = true }
