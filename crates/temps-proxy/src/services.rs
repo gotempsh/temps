@@ -176,22 +176,27 @@ impl UpstreamResolver for UpstreamResolverImpl {
     }
 
     async fn has_custom_route(&self, host: &str) -> bool {
-        self.lb_service.get_route(host).await.is_ok()
+        // Lock-free snapshot lookup — never queries the database.
+        // The snapshot is kept current by `LbService::run_refresh_loop` (60s)
+        // and is updated write-through after every create/update/delete.
+        self.lb_service.has_route_in_snapshot(host)
     }
 
     async fn has_route_for_host(&self, host: &str) -> bool {
         // Project deployment hosts live in the in-memory route table
         // (HTTP host map, SNI/TLS map, legacy lookup, wildcards). Operator
-        // overrides live in the `custom_routes` table. The admin gate must
+        // overrides live in the `custom_routes` snapshot. The admin gate must
         // recognize a host as "known" if any of these match — otherwise it
         // 404s real project traffic the moment an admin host is configured.
+        // Neither branch queries the database on the request hot path.
         if self.route_table.get_route_by_host(host).is_some()
             || self.route_table.get_route_by_sni(host).is_some()
             || self.route_table.get_route(host).is_some()
         {
             return true;
         }
-        self.lb_service.get_route(host).await.is_ok()
+        // Lock-free snapshot lookup for operator-defined custom routes.
+        self.lb_service.has_route_in_snapshot(host)
     }
 
     async fn get_lb_strategy(&self, _host: &str) -> Option<String> {

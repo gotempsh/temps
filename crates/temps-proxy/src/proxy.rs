@@ -4,9 +4,9 @@ use crate::handler::preview_wall::{
 };
 use crate::on_demand::OnDemandManager;
 use crate::preview_auth::{
-    build_set_cookie_sandbox, check_preview_auth, encode_preview_cookie_subject, lookup_sandbox,
+    build_set_cookie_sandbox, check_preview_auth, encode_preview_cookie_subject,
     parse_preview_host, verify_argon2, PreviewAuthLimiter, PreviewAuthOutcome, PreviewHost,
-    PreviewSandboxLookup, PREVIEW_GATEWAY_PEER,
+    PreviewSandboxLookup, SandboxLookupCache, PREVIEW_GATEWAY_PEER,
 };
 use crate::service::cert_host_cache::CertHostCache;
 use crate::service::challenge_service::ChallengeService;
@@ -413,6 +413,16 @@ pub struct LoadBalancer {
     /// `service/static_asset_lookup.rs` and WS4 in IMPLEMENTATION_PLAN.md.
     static_asset_lookup: Arc<crate::service::static_asset_lookup::StaticAssetLookup>,
     preview_auth_limiter: Arc<PreviewAuthLimiter>,
+    /// In-memory moka cache for sandbox preview lookups. Keyed by sandbox
+    /// hex suffix; values are `PreviewSandboxLookup` (both `Protected` and
+    /// `NotFound` are cached). TTL 30 s. See `preview_auth.rs` and WS6 in
+    /// IMPLEMENTATION_PLAN.md.
+    ///
+    /// Password rotation invalidates preview cookies cryptographically (the
+    /// cookie binds a SHA-256 fingerprint of the argon2 PHC hash), so a
+    /// ≤30 s stale cache window only affects brand-new login attempts
+    /// immediately after a password change — existing cookies are unaffected.
+    sandbox_lookup_cache: Arc<SandboxLookupCache>,
     /// Shared admin-gate snapshot. When set and non-noop, requests for
     /// hosts that aren't in the route table are gated before falling back
     /// to the console — see `request_filter`. When `None`, gate enforcement
@@ -445,6 +455,7 @@ impl LoadBalancer {
             static_asset_lookup: Arc::new(
                 crate::service::static_asset_lookup::StaticAssetLookup::new(Arc::clone(&db)),
             ),
+            sandbox_lookup_cache: Arc::new(SandboxLookupCache::new(Arc::clone(&db))),
             db,
             config_service,
             ip_access_control_service,
@@ -2403,7 +2414,7 @@ impl ProxyHttp for LoadBalancer {
                         return Ok(true);
                     }
 
-                    let stored_hash = match lookup_sandbox(&self.db, &hex).await {
+                    let stored_hash = match self.sandbox_lookup_cache.lookup(&hex).await {
                         PreviewSandboxLookup::Protected { password_hash } => password_hash,
                         PreviewSandboxLookup::Open => {
                             // No password configured — nothing to verify. Redirect to `/`.
@@ -2593,7 +2604,7 @@ impl ProxyHttp for LoadBalancer {
                     .map(|s| s.to_string());
 
                 let outcome = check_preview_auth(
-                    &self.db,
+                    &self.sandbox_lookup_cache,
                     &self.crypto,
                     &self.preview_auth_limiter,
                     preview_host,

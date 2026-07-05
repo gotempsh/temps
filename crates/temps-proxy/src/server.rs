@@ -234,6 +234,23 @@ pub fn setup_proxy_server(
 
     // Create service implementations
     let lb_service = Arc::new(LbService::new(db.clone()));
+
+    // Keep the custom-route snapshot in memory so `has_custom_route` and
+    // `has_route_for_host` never query Postgres on the request hot path (WS6-G).
+    // A dedicated thread owns the periodic 60 s refresh; write paths in LbService
+    // also refresh immediately (write-through) so newly-created routes are visible
+    // before the next scheduled refresh.
+    {
+        let lb_refresher = lb_service.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create tokio runtime for custom-route snapshot refresh");
+            rt.block_on(lb_refresher.run_refresh_loop());
+        });
+    }
+
     let upstream_resolver = Arc::new(UpstreamResolverImpl::new(
         Arc::new(proxy_config.clone()),
         lb_service,
@@ -443,6 +460,20 @@ pub fn create_proxy_service(
 
     // Create service implementations
     let lb_service = Arc::new(LbService::new(db.clone()));
+
+    // Keep the custom-route snapshot in memory so `has_custom_route` and
+    // `has_route_for_host` never query Postgres on the request hot path (WS6-G).
+    {
+        let lb_refresher = lb_service.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create tokio runtime for custom-route snapshot refresh");
+            rt.block_on(lb_refresher.run_refresh_loop());
+        });
+    }
+
     let upstream_resolver = Arc::new(UpstreamResolverImpl::new(
         Arc::new(proxy_config.clone()),
         lb_service,
