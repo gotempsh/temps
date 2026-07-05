@@ -79,7 +79,7 @@ tokio-util = { workspace = true }
 
 # CLI and runtime dependencies - reference from crates workspace
 clap = "4.4"
-colored = "2.0"
+colored = "3.1"
 chrono = { workspace = true }
 # ClickHouse client for the `temps backfill clickhouse --domain ...` data copy.
 # Same version/features as the domain crates so the row structs line up.
