@@ -57,8 +57,13 @@ pub enum LbServiceError {
 ///
 /// `custom_routes` is a tiny operator-curated table that changes only when an
 /// admin explicitly adds, edits, or removes a route override. Write paths in
-/// `LbService` refresh the snapshot immediately (write-through), so in practice
-/// the periodic loop is a safety net rather than the primary propagation mechanism.
+/// `LbService` refresh the snapshot on the instance that received the write
+/// (write-through), but in the current process topology admin-API writes are
+/// handled by the console-owned `LbService`, which is a separate object from the
+/// instance the Pingora traffic-serving proxy reads. As a result, this 60-second
+/// periodic loop is the primary (and only) propagation mechanism for route changes
+/// to reach the hot-path reader; a newly-created or deleted route becomes visible
+/// to real traffic within at most 60 seconds.
 const CUSTOM_ROUTE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// In-memory snapshot of all *enabled* custom routes.
@@ -77,9 +82,14 @@ pub struct CustomRouteSnapshot {
 
 pub struct LbService {
     db: Arc<DatabaseConnection>,
-    /// Lock-free in-memory snapshot of all enabled custom routes. Updated
-    /// immediately on every write (write-through) and re-synced from the DB
-    /// every [`CUSTOM_ROUTE_REFRESH_INTERVAL`] seconds as a safety net.
+    /// Lock-free in-memory snapshot of all enabled custom routes. Re-synced
+    /// from the DB every [`CUSTOM_ROUTE_REFRESH_INTERVAL`] seconds (the primary
+    /// propagation path), and also refreshed on this instance after every write
+    /// (write-through). Write-through is only useful when the instance that
+    /// processes writes is also the one serving hot-path reads; in the current
+    /// process topology the hot-path instance never receives admin-API writes
+    /// directly, so the periodic loop is the sole propagation mechanism for
+    /// route changes reaching real traffic (worst-case staleness: 60 seconds).
     snapshot: Arc<ArcSwap<CustomRouteSnapshot>>,
 }
 
@@ -222,8 +232,12 @@ impl LbService {
             .await
             .map_err(LbServiceError::DatabaseError)?;
 
-        // Write-through: refresh the snapshot so the newly created route is
-        // visible immediately, without waiting for the next periodic reload.
+        // Write-through: refresh the snapshot on this instance after the DB
+        // write. This is immediately visible to any hot-path reads on the SAME
+        // instance, but in the current process topology admin-API writes are
+        // handled by the console-owned LbService, which is a separate object
+        // from the Pingora hot-path instance. The 60-second periodic loop in
+        // that instance is what propagates this change to real traffic.
         if let Err(e) = self.refresh_snapshot().await {
             warn!(
                 "Failed to refresh custom-route snapshot after create: {}",
@@ -317,8 +331,12 @@ impl LbService {
             .map_err(LbServiceError::DatabaseError)?
             .ok_or_else(|| anyhow::anyhow!("Route not found after update"))?;
 
-        // Write-through: refresh the snapshot so the updated route is visible
-        // immediately, without waiting for the next periodic reload.
+        // Write-through: refresh the snapshot on this instance after the DB
+        // write. This is immediately visible to hot-path reads on the SAME
+        // instance, but in the current process topology admin-API writes are
+        // handled by the console-owned LbService, which is a separate object
+        // from the Pingora hot-path instance. The 60-second periodic loop in
+        // that instance is what propagates this change to real traffic.
         if let Err(e) = self.refresh_snapshot().await {
             warn!(
                 "Failed to refresh custom-route snapshot after update: {}",
@@ -338,8 +356,12 @@ impl LbService {
             .await
             .context("Failed to delete custom route")?;
 
-        // Write-through: refresh the snapshot so the deleted route is removed
-        // immediately, without waiting for the next periodic reload.
+        // Write-through: refresh the snapshot on this instance after the DB
+        // write. This is immediately visible to hot-path reads on the SAME
+        // instance, but in the current process topology admin-API writes are
+        // handled by the console-owned LbService, which is a separate object
+        // from the Pingora hot-path instance. The 60-second periodic loop in
+        // that instance is what propagates this deletion to real traffic.
         if let Err(e) = self.refresh_snapshot().await {
             warn!(
                 "Failed to refresh custom-route snapshot after delete: {}",

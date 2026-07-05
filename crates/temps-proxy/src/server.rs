@@ -237,9 +237,11 @@ pub fn setup_proxy_server(
 
     // Keep the custom-route snapshot in memory so `has_custom_route` and
     // `has_route_for_host` never query Postgres on the request hot path (WS6-G).
-    // A dedicated thread owns the periodic 60 s refresh; write paths in LbService
-    // also refresh immediately (write-through) so newly-created routes are visible
-    // before the next scheduled refresh.
+    // A dedicated thread owns the periodic 60-second refresh, which is the sole
+    // propagation mechanism for this instance: admin-API writes (create/update/
+    // delete) are handled by the separate console-owned LbService and never reach
+    // this object directly. Route changes become visible to real traffic within at
+    // most 60 seconds via the loop below.
     {
         let lb_refresher = lb_service.clone();
         std::thread::spawn(move || {

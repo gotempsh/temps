@@ -177,8 +177,11 @@ impl UpstreamResolver for UpstreamResolverImpl {
 
     async fn has_custom_route(&self, host: &str) -> bool {
         // Lock-free snapshot lookup — never queries the database.
-        // The snapshot is kept current by `LbService::run_refresh_loop` (60s)
-        // and is updated write-through after every create/update/delete.
+        // The snapshot is kept current by `LbService::run_refresh_loop` (60s).
+        // Write-through on LbService only updates the instance that processed the
+        // write; this resolver holds the hot-path instance, which never receives
+        // admin-API writes directly. The 60-second periodic loop is the sole
+        // propagation mechanism here (worst-case staleness: 60 seconds).
         self.lb_service.has_route_in_snapshot(host)
     }
 

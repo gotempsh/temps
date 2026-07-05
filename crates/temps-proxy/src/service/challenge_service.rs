@@ -13,7 +13,13 @@ use tracing::debug;
 /// A 5-second negative TTL collapses a flood of requests from one attacker into at most
 /// 0.2 QPS of DB checks, while still letting a legitimate user who just solved the
 /// challenge get through within 5 seconds. The write-through path in
-/// `mark_challenge_completed` reduces this wait to zero for legitimate solvers.
+/// `mark_challenge_completed` inserts a positive cache entry on the instance that
+/// processed the completion, which is only visible immediately if that instance is
+/// also the one serving the hot-path `is_challenge_completed` check. In the current
+/// process topology the captcha verify endpoint and the Pingora hot-path reader are
+/// separate `ChallengeService` objects, so the 5-second negative TTL expiry is the
+/// actual bound a real request experiences: after the TTL elapses, the next
+/// `is_challenge_completed` call re-queries the DB and finds the completed session.
 const NEGATIVE_CACHE_TTL: StdDuration = StdDuration::from_secs(5);
 
 /// Maximum TTL cap for positive cache entries (challenge completed), in seconds.
@@ -103,9 +109,11 @@ pub struct ChallengeService {
     ///   fingerprint collapses to at most 0.2 QPS of Postgres queries instead of one
     ///   query per request.
     ///
-    /// `mark_challenge_completed` writes a positive entry immediately (write-through) so
-    /// that a legitimate user who just solved the challenge isn't blocked by the 5-second
-    /// negative TTL.
+    /// `mark_challenge_completed` writes a positive entry to this instance's cache
+    /// (write-through). This is immediately visible to `is_challenge_completed` calls
+    /// on the same instance, but the Pingora hot-path reader is a separate
+    /// `ChallengeService` object: for it, the 5-second negative TTL expiry followed
+    /// by a DB re-check is the actual propagation mechanism after a challenge is solved.
     cache: Cache<(i32, String, String), ChallengeEntry>,
 }
 
@@ -191,10 +199,13 @@ impl ChallengeService {
     /// Challenge sessions expire after `ttl_hours`.
     ///
     /// **Write-through cache update:** after persisting to the DB, this method inserts a
-    /// positive cache entry immediately. This removes the up-to-5-second wait for the
-    /// legitimate user who just solved the challenge — they don't have to wait out the
-    /// negative TTL; their very next request will see `is_challenge_completed` return
-    /// `true` directly from the cache.
+    /// positive cache entry into this instance's in-memory cache. If the same
+    /// `ChallengeService` instance also serves the hot-path `is_challenge_completed`
+    /// check, the user's next request will see `true` immediately without waiting out
+    /// the negative TTL. In the current process topology the captcha verify endpoint
+    /// and the Pingora hot path use separate `ChallengeService` instances, so the
+    /// hot-path reader observes the change only after its 5-second negative TTL entry
+    /// expires and the subsequent DB re-check finds the completed session.
     pub async fn mark_challenge_completed(
         &self,
         environment_id: i32,
@@ -235,8 +246,11 @@ impl ChallengeService {
             .await?
         };
 
-        // Write-through: insert a positive cache entry immediately so the user who just
-        // completed the challenge doesn't have to wait out the 5-second negative TTL.
+        // Write-through: insert a positive cache entry into this instance's cache.
+        // Reads on the SAME instance see the completion immediately; the Pingora
+        // hot-path instance is a separate object and still experiences up to 5 seconds
+        // of staleness until its negative TTL entry expires and a DB re-check confirms
+        // the completed session.
         let key = (
             environment_id,
             identifier.to_string(),
