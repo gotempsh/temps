@@ -47,10 +47,11 @@ mod tests {
         assert_eq!(visitor.project_id, project.id);
         assert!(!visitor.is_crawler);
 
-        // Convert to trait objects
+        // Convert to trait object — note: DB id is no longer in Visitor; UUID→i32
+        // resolution is now done asynchronously in the batch writer.
         let visitor_trait = create_test_visitor_trait(visitor.clone());
 
-        assert_eq!(visitor_trait.visitor_id_i32, visitor.id);
+        assert_eq!(visitor_trait.visitor_id, visitor.visitor_id);
         assert_eq!(visitor_trait.is_crawler, visitor.is_crawler);
 
         test_db.cleanup().await?;

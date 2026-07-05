@@ -27,13 +27,6 @@ pub mod proxy_tests {
         result.map_err(|e| anyhow::anyhow!("{}", e))
     }
 
-    // Helper to convert Send+Sync errors to anyhow
-    fn convert_send_sync_error<T>(
-        result: Result<T, Box<dyn std::error::Error + Send + Sync>>,
-    ) -> Result<T> {
-        result.map_err(|e| anyhow::anyhow!("{}", e))
-    }
-
     static NEXT_PORT: AtomicU16 = AtomicU16::new(9000);
 
     fn get_next_port() -> u16 {
@@ -244,7 +237,7 @@ pub mod proxy_tests {
         let proxy_log_storage: Arc<dyn crate::storage::ProxyLogStorage> = Arc::new(
             crate::storage::TimescaleDbProxyLogStore::new(test_db.db.clone(), ip_service.clone()),
         );
-        let (proxy_log_handle, _proxy_log_writer) =
+        let (proxy_log_handle, tracking_handle, _proxy_log_writer) =
             crate::service::proxy_log_batch_writer::ProxyLogBatchWriter::new(
                 test_db.db.clone(),
                 ip_service.clone(),
@@ -253,15 +246,6 @@ pub mod proxy_tests {
 
         let project_context_resolver = Arc::new(ProjectContextResolverImpl::new(mock_route_table))
             as Arc<dyn ProjectContextResolver>;
-
-        let visitor_manager = Arc::new(VisitorManagerImpl::new(
-            test_db.db.clone(),
-            crypto.clone(),
-            ip_service,
-        )) as Arc<dyn VisitorManager>;
-
-        let session_manager = Arc::new(SessionManagerImpl::new(test_db.db.clone(), crypto.clone()))
-            as Arc<dyn SessionManager>;
 
         // Create config service for static file serving
         let config_service = create_test_config_service(test_db.db.clone());
@@ -281,9 +265,8 @@ pub mod proxy_tests {
         let lb = ProxyLoadBalancer::new(
             upstream_resolver,
             proxy_log_handle,
+            tracking_handle,
             project_context_resolver,
-            visitor_manager,
-            session_manager,
             crypto,
             test_db.db.clone(),
             config_service,
@@ -390,266 +373,139 @@ pub mod proxy_tests {
     }
 
     #[tokio::test]
-    async fn test_proxy_visitor_management() -> Result<()> {
-        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
-        use temps_entities::{deployments, environments, projects};
+    async fn test_proxy_visitor_cookie_codec() -> Result<()> {
+        // Visitor tracking is now fully stateless via cookie codec.
+        // No DB round-trip on the hot path.
+        use crate::crawler_detector::CrawlerDetector;
+        use crate::service::cookie_codec::parse_visitor_cookie;
 
-        let test_db_mock = TestDatabase::with_migrations().await.unwrap();
-        let test_db = TestDBMockOperations::new(test_db_mock.connection_arc().clone())
-            .await
-            .unwrap();
-
-        let _server_config = ProxyConfig::default();
         let crypto = create_crypto_cookie_crypto();
 
-        let ip_service = create_mock_ip_service(test_db.db.clone());
-        let visitor_manager =
-            VisitorManagerImpl::new(test_db.db.clone(), crypto.clone(), ip_service);
-
-        // A visitor row has non-nullable project_id / environment_id, so
-        // get_or_create_visitor requires a real ProjectContext — create one.
-        let project = projects::ActiveModel {
-            slug: Set("visitor-mgmt-test".to_string()),
-            name: Set("Visitor Mgmt Test".to_string()),
-            repo_name: Set("visitor-app".to_string()),
-            repo_owner: Set("test-org".to_string()),
-            directory: Set("".to_string()),
-            main_branch: Set("main".to_string()),
-            preset: Set(temps_entities::preset::Preset::Vite),
-            ..Default::default()
-        }
-        .insert(test_db.db.as_ref())
-        .await?;
-
-        let environment = environments::ActiveModel {
-            project_id: Set(project.id),
-            slug: Set("production".to_string()),
-            name: Set("Production".to_string()),
-            subdomain: Set("visitor-app".to_string()),
-            host: Set("visitor-app.example.com".to_string()),
-            upstreams: Set(temps_entities::upstream_config::UpstreamList::default()),
-            ..Default::default()
-        }
-        .insert(test_db.db.as_ref())
-        .await?;
-
-        let deployment = deployments::ActiveModel {
-            project_id: Set(project.id),
-            environment_id: Set(environment.id),
-            slug: Set("deploy-visitor-test".to_string()),
-            state: Set("deployed".to_string()),
-            metadata: Set(Some(Default::default())),
-            ..Default::default()
-        }
-        .insert(test_db.db.as_ref())
-        .await?;
-
-        let context = ProjectContext {
-            project: Arc::new(project),
-            environment: Arc::new(environment),
-            deployment: Arc::new(deployment),
-        };
-
-        // Test visitor creation
-        let attribution = crate::traits::FirstVisitAttribution::default();
-        let visitor = visitor_manager
-            .get_or_create_visitor(
-                None, // No existing cookie
-                Some(&context),
-                "Mozilla/5.0 (test)",
-                Some("127.0.0.1"),
-                &attribution,
-            )
-            .await
-            // Surface the real error instead of swallowing it, so a future
-            // failure here is diagnosable.
-            .map_err(|e| anyhow::anyhow!("Failed to get or create visitor: {e}"))?;
-
-        assert!(!visitor.visitor_id.is_empty());
-        assert!(!visitor.is_crawler);
-        assert!(visitor.crawler_name.is_none());
-
-        // Test visitor cookie generation
-        let cookie = convert_send_sync_error(
-            visitor_manager
-                .generate_visitor_cookie(&visitor, false, None)
-                .await,
-        )?;
-        assert!(cookie.contains("_temps_visitor_id"));
-        assert!(cookie.contains("Path=/"));
-        assert!(cookie.contains("HttpOnly"));
-
-        // Test bot detection
-        let bot_visitor = visitor_manager
-            .get_or_create_visitor(
-                None,
-                Some(&context),
-                "Googlebot/2.1",
-                Some("127.0.0.1"),
-                &attribution,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to get or create bot visitor: {e}"))?;
-
-        assert!(bot_visitor.is_crawler);
-        assert!(bot_visitor.crawler_name.is_some());
-
-        // A request with no project context must be rejected, not silently
-        // create an orphan visitor.
-        let no_context = visitor_manager
-            .get_or_create_visitor(
-                None,
-                None,
-                "Mozilla/5.0 (test)",
-                Some("127.0.0.1"),
-                &attribution,
-            )
-            .await;
+        // No cookie → generate new UUID
+        let visitor_id = parse_visitor_cookie(None, &crypto);
         assert!(
-            no_context.is_err(),
-            "visitor creation without project context must fail"
+            !visitor_id.is_empty(),
+            "should generate UUID when no cookie"
+        );
+        assert!(
+            uuid::Uuid::parse_str(&visitor_id).is_ok(),
+            "generated visitor_id must be a valid UUID"
         );
 
-        // Note: Using shared database, so we don't cleanup individual test data
+        // Valid encrypted cookie → reuse UUID
+        let original_uuid = uuid::Uuid::new_v4().to_string();
+        let encrypted = crypto.encrypt(&original_uuid).expect("encrypt");
+        let reused = parse_visitor_cookie(Some(&encrypted), &crypto);
+        assert_eq!(reused, original_uuid, "valid cookie must be reused");
+
+        // Tampered cookie → generate new UUID (not the original)
+        let tampered = "not-valid-ciphertext";
+        let new_id = parse_visitor_cookie(Some(tampered), &crypto);
+        assert_ne!(new_id, original_uuid, "tampered cookie must yield new UUID");
+        assert!(
+            uuid::Uuid::parse_str(&new_id).is_ok(),
+            "new visitor_id from tampered cookie must be valid UUID"
+        );
+
+        // Bot detection uses CrawlerDetector (not the visitor codec)
+        assert!(CrawlerDetector::is_bot(Some("Googlebot/2.1")));
+        assert!(!CrawlerDetector::is_bot(Some("Mozilla/5.0 (test)")));
+
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_proxy_session_management() -> Result<()> {
-        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
-        use temps_entities::{environments, projects, visitor as visitor_entity};
+    async fn test_proxy_session_cookie_codec() -> Result<()> {
+        // Session tracking is now fully stateless via timestamped cookie payload.
+        // No DB round-trip on the hot path.
+        use crate::service::cookie_codec::{make_v2_session_payload, parse_session_cookie};
 
-        let _server_config = ProxyConfig::default();
         let crypto = create_crypto_cookie_crypto();
-        let test_db_mock = TestDatabase::with_migrations().await.unwrap();
-        let db = test_db_mock.connection_arc().clone();
-        let session_manager = SessionManagerImpl::new(db.clone(), crypto.clone());
+        let max_age_minutes: i64 = 30;
 
-        // request_sessions.visitor_id has an FK to `visitor`, which in turn
-        // requires a project + environment — create the full chain so the
-        // session insert has a real visitor row to reference.
-        let project = projects::ActiveModel {
-            slug: Set("session-mgmt-test".to_string()),
-            name: Set("Session Mgmt Test".to_string()),
-            repo_name: Set("session-app".to_string()),
-            repo_owner: Set("test-org".to_string()),
-            directory: Set("".to_string()),
-            main_branch: Set("main".to_string()),
-            preset: Set(temps_entities::preset::Preset::Vite),
-            ..Default::default()
-        }
-        .insert(db.as_ref())
-        .await?;
+        // No cookie → new session
+        let decision = parse_session_cookie(None, &crypto, max_age_minutes);
+        assert!(decision.is_new_session, "no cookie means new session");
+        assert!(
+            uuid::Uuid::parse_str(&decision.session_uuid).is_ok(),
+            "generated session_uuid must be a valid UUID"
+        );
 
-        let environment = environments::ActiveModel {
-            project_id: Set(project.id),
-            slug: Set("production".to_string()),
-            name: Set("Production".to_string()),
-            subdomain: Set("session-app".to_string()),
-            host: Set("session-app.example.com".to_string()),
-            upstreams: Set(temps_entities::upstream_config::UpstreamList::default()),
-            ..Default::default()
-        }
-        .insert(db.as_ref())
-        .await?;
+        // Fresh v2 cookie → reuse session
+        let session_uuid = uuid::Uuid::new_v4().to_string();
+        let now_ts = chrono::Utc::now().timestamp();
+        let payload = make_v2_session_payload(&session_uuid, now_ts);
+        let encrypted = crypto.encrypt(&payload).expect("encrypt v2 payload");
+        let fresh = parse_session_cookie(Some(&encrypted), &crypto, max_age_minutes);
+        assert!(!fresh.is_new_session, "fresh v2 cookie must be reused");
+        assert_eq!(fresh.session_uuid, session_uuid);
 
-        let visitor_row = visitor_entity::ActiveModel {
-            visitor_id: Set("test-visitor-123".to_string()),
-            project_id: Set(project.id),
-            environment_id: Set(environment.id),
-            first_seen: Set(chrono::Utc::now()),
-            last_seen: Set(chrono::Utc::now()),
-            is_crawler: Set(false),
-            has_activity: Set(true),
-            ..Default::default()
-        }
-        .insert(db.as_ref())
-        .await?;
+        // Expired v2 cookie (31 minutes ago) → new session
+        let old_ts = now_ts - 31 * 60;
+        let old_payload = make_v2_session_payload(&session_uuid, old_ts);
+        let old_encrypted = crypto.encrypt(&old_payload).expect("encrypt old payload");
+        let expired = parse_session_cookie(Some(&old_encrypted), &crypto, max_age_minutes);
+        assert!(
+            expired.is_new_session,
+            "expired v2 cookie must start new session"
+        );
+        assert_ne!(
+            expired.session_uuid, session_uuid,
+            "expired session must get new UUID"
+        );
 
-        let visitor = Visitor {
-            visitor_id: visitor_row.visitor_id.clone(),
-            visitor_id_i32: visitor_row.id,
-            is_crawler: false,
-            crawler_name: None,
-        };
+        // Tampered cookie → new session
+        let tampered = parse_session_cookie(Some("garbage-ciphertext"), &crypto, max_age_minutes);
+        assert!(
+            tampered.is_new_session,
+            "tampered cookie must start new session"
+        );
 
-        // Test session creation
-        let session = session_manager
-            .get_or_create_session(
-                None, // No existing cookie
-                &visitor,
-                None, // No project context
-                Some("https://example.com"),
-                None, // No query string
-                None, // No current hostname
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to get or create session: {e}"))?;
-
-        assert!(!session.session_id.is_empty());
-        assert_eq!(session.visitor_id_i32, visitor.visitor_id_i32);
-        assert!(session.is_new_session);
-
-        // Test session cookie generation
-        let cookie = convert_send_sync_error(
-            session_manager
-                .generate_session_cookie(&session, true, None)
-                .await,
-        )?;
-        assert!(cookie.contains("_temps_sid"));
-        assert!(cookie.contains("Path=/"));
-        assert!(cookie.contains("HttpOnly"));
-        assert!(cookie.contains("Secure")); // Should be secure for HTTPS
+        // Legacy bare-UUID cookie → reuse without freshness check
+        let legacy_uuid = uuid::Uuid::new_v4().to_string();
+        let legacy_encrypted = crypto.encrypt(&legacy_uuid).expect("encrypt legacy");
+        let legacy = parse_session_cookie(Some(&legacy_encrypted), &crypto, max_age_minutes);
+        assert!(!legacy.is_new_session, "legacy UUID cookie must be reused");
+        assert_eq!(legacy.session_uuid, legacy_uuid);
 
         Ok(())
     }
 
     #[tokio::test]
     async fn test_proxy_visitor_tracking_decisions() -> Result<()> {
-        let test_db_mock = TestDatabase::with_migrations().await.unwrap();
-        let test_db = TestDBMockOperations::new(test_db_mock.connection_arc().clone())
-            .await
-            .unwrap();
+        use crate::proxy::LoadBalancer;
 
-        let _server_config = ProxyConfig::default();
-        let crypto = create_crypto_cookie_crypto();
+        // HTML page → track
+        assert!(LoadBalancer::should_track_page("/", Some("text/html"), 200));
 
-        let ip_service = create_mock_ip_service(test_db.db.clone());
-        let visitor_manager = VisitorManagerImpl::new(test_db.db.clone(), crypto, ip_service);
+        // Internal API → do not track
+        assert!(!LoadBalancer::should_track_page(
+            "/api/_temps/health",
+            Some("application/json"),
+            200
+        ));
 
-        // Test tracking decisions for different request types
-        assert!(
-            visitor_manager
-                .should_track_visitor("/", Some("text/html"), 200, None)
-                .await
-        );
+        // CSS static asset → do not track
+        assert!(!LoadBalancer::should_track_page(
+            "/assets/style.css",
+            Some("text/css"),
+            200
+        ));
 
-        assert!(
-            !visitor_manager
-                .should_track_visitor("/api/_temps/health", Some("application/json"), 200, None)
-                .await
-        );
+        // Error page (404) → track regardless of extension
+        assert!(LoadBalancer::should_track_page(
+            "/some-page",
+            Some("text/html"),
+            404
+        ));
 
-        assert!(
-            !visitor_manager
-                .should_track_visitor("/assets/style.css", Some("text/css"), 200, None)
-                .await
-        );
+        // PNG image → do not track
+        assert!(!LoadBalancer::should_track_page(
+            "/images/logo.png",
+            Some("image/png"),
+            200
+        ));
 
-        assert!(
-            visitor_manager
-                .should_track_visitor("/some-page", Some("text/html"), 404, None)
-                .await
-        );
-
-        // Test static asset detection
-        assert!(
-            !visitor_manager
-                .should_track_visitor("/images/logo.png", Some("image/png"), 200, None)
-                .await
-        );
-
-        // Note: Using shared database, so we don't cleanup individual test data
         Ok(())
     }
 
@@ -880,14 +736,12 @@ pub mod proxy_tests {
                 db.clone(),
                 ip_service.clone(),
             ));
-        let (proxy_log_handle, _proxy_log_writer) =
+        let (proxy_log_handle, tracking_handle, _proxy_log_writer) =
             crate::service::proxy_log_batch_writer::ProxyLogBatchWriter::new(
                 db.clone(),
                 ip_service,
                 proxy_log_storage,
             );
-        let visitor_manager = Arc::new(MockVisitorManager::default());
-        let session_manager = Arc::new(MockSessionManager::default());
 
         // Create config service for static file serving
         let config_service = create_test_config_service(db.clone());
@@ -905,9 +759,8 @@ pub mod proxy_tests {
         let lb = ProxyLoadBalancer::new(
             upstream_resolver,
             proxy_log_handle,
+            tracking_handle,
             project_context_resolver,
-            visitor_manager,
-            session_manager,
             crypto,
             db.clone(),
             config_service,

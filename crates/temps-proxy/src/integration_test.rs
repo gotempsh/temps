@@ -158,116 +158,54 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    #[ignore] // TODO: Fix runtime nesting error
     async fn test_visitor_tracking() -> Result<(), Box<dyn std::error::Error>> {
-        let test_db_mock = TestDatabase::with_migrations().await.unwrap();
-        let test_db = TestDBMockOperations::new(test_db_mock.connection_arc().clone())
-            .await
-            .unwrap();
-        let server_config = ProxyConfig::default();
-        let config = create_test_server_config();
-        // Create route table and load routes
-        let route_table = Arc::new(CachedPeerTable::new(test_db.db.clone()));
-        route_table.load_routes().await?;
+        // Visitor tracking decisions are now a pure static function — no DB needed.
+        use crate::proxy::LoadBalancer;
 
-        let proxy_service = create_proxy_service(
-            test_db.db.clone(),
-            server_config,
-            create_crypto_cookie_crypto(),
-            route_table,
-            config,
-        )?;
-
-        // Test visitor tracking decisions
-        assert!(
-            proxy_service
-                .visitor_manager()
-                .should_track_visitor("/", Some("text/html"), 200, None)
-                .await
-        );
-
-        assert!(
-            !proxy_service
-                .visitor_manager()
-                .should_track_visitor("/api/_temps/health", Some("application/json"), 200, None)
-                .await
-        );
-
-        assert!(
-            !proxy_service
-                .visitor_manager()
-                .should_track_visitor("/assets/style.css", Some("text/css"), 200, None)
-                .await
-        );
-
-        assert!(
-            proxy_service
-                .visitor_manager()
-                .should_track_visitor("/some-page", Some("text/html"), 404, None)
-                .await
-        );
-
-        test_db.cleanup().await?;
+        assert!(LoadBalancer::should_track_page("/", Some("text/html"), 200));
+        assert!(!LoadBalancer::should_track_page(
+            "/api/_temps/health",
+            Some("application/json"),
+            200
+        ));
+        assert!(!LoadBalancer::should_track_page(
+            "/assets/style.css",
+            Some("text/css"),
+            200
+        ));
+        assert!(LoadBalancer::should_track_page(
+            "/some-page",
+            Some("text/html"),
+            404
+        ));
         Ok(())
     }
 
     #[tokio::test]
-    #[ignore] // TODO: Fix runtime nesting error
     async fn test_cookie_generation() -> Result<(), Box<dyn std::error::Error>> {
-        let test_db_mock = TestDatabase::with_migrations().await.unwrap();
-        let test_db = TestDBMockOperations::new(test_db_mock.connection_arc().clone())
-            .await
-            .unwrap();
-        let server_config = ProxyConfig::default();
-        let config = create_test_server_config();
-        // Create route table and load routes
-        let route_table = Arc::new(CachedPeerTable::new(test_db.db.clone()));
-        route_table.load_routes().await?;
-
-        let proxy_service = create_proxy_service(
-            test_db.db.clone(),
-            server_config,
-            create_crypto_cookie_crypto(),
-            route_table,
-            config,
-        )?;
-
-        // Create test visitor
-        let visitor = Visitor {
-            visitor_id: "test-visitor".to_string(),
-            visitor_id_i32: 123,
-            is_crawler: false,
-            crawler_name: None,
+        // Cookie generation is now handled by the stateless codec — no DB needed.
+        use crate::service::cookie_codec::{
+            make_v2_session_payload, parse_session_cookie, parse_visitor_cookie,
         };
 
-        // Test visitor cookie generation
-        let visitor_cookie = proxy_service
-            .visitor_manager()
-            .generate_visitor_cookie(&visitor, false, None)
-            .await
-            .map_err(|e| format!("Failed to generate visitor cookie: {:?}", e))?;
-        assert!(visitor_cookie.contains("_temps_visitor_id"));
-        assert!(visitor_cookie.contains("Path=/"));
-        assert!(visitor_cookie.contains("HttpOnly"));
+        let crypto = create_crypto_cookie_crypto();
 
-        // Test session cookie generation
-        let session = crate::traits::Session {
-            session_id: "test-session".to_string(),
-            session_id_i32: 456,
-            visitor_id_i32: 123,
-            is_new_session: true,
-        };
+        // Visitor cookie: no cookie → new UUID, round-trips correctly
+        let new_uuid = parse_visitor_cookie(None, &crypto);
+        assert!(!new_uuid.is_empty());
+        let encrypted = crypto.encrypt(&new_uuid)?;
+        let reused = parse_visitor_cookie(Some(&encrypted), &crypto);
+        assert_eq!(reused, new_uuid);
 
-        let session_cookie = proxy_service
-            .session_manager()
-            .generate_session_cookie(&session, false, None)
-            .await
-            .map_err(|e| format!("Failed to generate session cookie: {:?}", e))?;
-        assert!(session_cookie.contains("_temps_sid"));
-        assert!(session_cookie.contains("Path=/"));
-        assert!(session_cookie.contains("HttpOnly"));
+        // Session cookie: fresh → reuse; expired → new session
+        let session_uuid = uuid::Uuid::new_v4().to_string();
+        let now_ts = chrono::Utc::now().timestamp();
+        let payload = make_v2_session_payload(&session_uuid, now_ts);
+        let enc_payload = crypto.encrypt(&payload)?;
+        let decision = parse_session_cookie(Some(&enc_payload), &crypto, 30);
+        assert!(!decision.is_new_session);
+        assert_eq!(decision.session_uuid, session_uuid);
 
-        test_db.cleanup().await?;
         Ok(())
     }
 }

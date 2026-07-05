@@ -1735,6 +1735,8 @@ mod tests {
             response_headers: None,
             trace_id: Some("abc123".to_string()),
             error_group_id: None,
+            visitor_uuid: None,
+            session_uuid: None,
         }
     }
 

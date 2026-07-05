@@ -9,8 +9,13 @@ use crate::preview_auth::{
     PreviewSandboxLookup, PREVIEW_GATEWAY_PEER,
 };
 use crate::service::challenge_service::ChallengeService;
+use crate::service::cookie_codec::{
+    make_v2_session_payload, parse_session_cookie, parse_visitor_cookie,
+};
 use crate::service::ip_access_control_service::IpAccessControlService;
-use crate::service::proxy_log_batch_writer::ProxyLogBatchHandle;
+use crate::service::proxy_log_batch_writer::{
+    ProxyLogBatchHandle, TrackingBatchHandle, TrackingEvent,
+};
 use crate::service::proxy_log_service::CreateProxyLogRequest;
 use crate::tls_fingerprint;
 use crate::traits::*;
@@ -334,9 +339,7 @@ pub struct ProxyContext {
     pub referrer: Option<String>,
     pub ip_address: Option<String>,
     pub visitor_id: Option<String>,
-    pub visitor_id_i32: Option<i32>,
     pub session_id: Option<String>,
-    pub session_id_i32: Option<i32>,
     pub is_new_session: bool,
     pub request_headers: Option<HashMap<String, String>>,
     pub response_headers: Option<HashMap<String, String>>,
@@ -370,30 +373,13 @@ pub struct ProxyContext {
     pub preview_route: Option<PreviewHost>,
 }
 
-impl ProxyContext {
-    /// Build a ProjectContext from the individual fields if all are present
-    fn get_project_context(&self) -> Option<ProjectContext> {
-        if let (Some(project), Some(environment), Some(deployment)) =
-            (&self.project, &self.environment, &self.deployment)
-        {
-            Some(ProjectContext {
-                project: project.clone(),
-                environment: environment.clone(),
-                deployment: deployment.clone(),
-            })
-        } else {
-            None
-        }
-    }
-}
-
 /// Main load balancer proxy implementation using traits
 pub struct LoadBalancer {
     upstream_resolver: Arc<dyn UpstreamResolver>,
     proxy_log_handle: ProxyLogBatchHandle,
+    tracking_handle: TrackingBatchHandle,
     project_context_resolver: Arc<dyn ProjectContextResolver>,
-    visitor_manager: Arc<dyn VisitorManager>,
-    session_manager: Arc<dyn SessionManager>,
+    cookie_config: CookieConfig,
     crypto: Arc<temps_core::CookieCrypto>,
     db: Arc<DbConnection>,
     config_service: Arc<temps_config::ConfigService>,
@@ -427,9 +413,8 @@ impl LoadBalancer {
     pub fn new(
         upstream_resolver: Arc<dyn UpstreamResolver>,
         proxy_log_handle: ProxyLogBatchHandle,
+        tracking_handle: TrackingBatchHandle,
         project_context_resolver: Arc<dyn ProjectContextResolver>,
-        visitor_manager: Arc<dyn VisitorManager>,
-        session_manager: Arc<dyn SessionManager>,
         crypto: Arc<temps_core::CookieCrypto>,
         db: Arc<DbConnection>,
         config_service: Arc<temps_config::ConfigService>,
@@ -440,9 +425,9 @@ impl LoadBalancer {
         Self {
             upstream_resolver,
             proxy_log_handle,
+            tracking_handle,
             project_context_resolver,
-            visitor_manager,
-            session_manager,
+            cookie_config: CookieConfig::default(),
             crypto,
             db,
             config_service,
@@ -504,16 +489,6 @@ impl LoadBalancer {
     #[cfg(test)]
     pub fn project_context_resolver(&self) -> &Arc<dyn ProjectContextResolver> {
         &self.project_context_resolver
-    }
-
-    #[cfg(test)]
-    pub fn visitor_manager(&self) -> &Arc<dyn VisitorManager> {
-        &self.visitor_manager
-    }
-
-    #[cfg(test)]
-    pub fn session_manager(&self) -> &Arc<dyn SessionManager> {
-        &self.session_manager
     }
 
     /// Pull the W3C `traceparent` trace_id (the 32-hex-char `<trace-id>` field)
@@ -700,40 +675,40 @@ impl LoadBalancer {
             .replace("{{IDENTIFIER_TYPE}}", identifier_type)
     }
 
-    async fn ensure_visitor_session(&self, ctx: &mut ProxyContext) -> Result<()> {
-        // Only create visitor/session if we don't already have one
+    /// Resolve visitor and session identifiers from cookies — entirely in-process,
+    /// no database round-trips. A [`TrackingEvent`] is enqueued for the background
+    /// batch writer, which upserts visitor/session rows asynchronously.
+    async fn ensure_visitor_session(&self, ctx: &mut ProxyContext) {
+        // Only resolve once per request
         if ctx.visitor_id.is_some() {
-            return Ok(());
+            return;
         }
 
-        // Project context is already resolved in request_filter, use it here
-        let project_context = if let (Some(project), Some(environment), Some(deployment)) =
-            (&ctx.project, &ctx.environment, &ctx.deployment)
-        {
-            Some(ProjectContext {
-                project: project.clone(),
-                environment: environment.clone(),
-                deployment: deployment.clone(),
-            })
-        } else {
-            None
-        };
-
-        // Skip visitor/session creation for crawlers - only track real humans
+        // Skip crawlers — only track real humans
         if let Some(crawler_name) =
             crate::crawler_detector::CrawlerDetector::get_crawler_name(Some(&ctx.user_agent))
         {
             debug!(
-                "Crawler detected: {} ({}), skipping visitor/session creation for project {}",
+                "Crawler detected: {} ({}), skipping visitor/session for project {}",
                 crawler_name,
                 ctx.user_agent,
-                project_context.as_ref().map(|p| p.project.id).unwrap_or(0)
+                ctx.project.as_ref().map(|p| p.id).unwrap_or(0)
             );
-            return Ok(());
+            return;
         }
 
-        // Compute first-visit attribution from referrer and query string
-        // These fields are only stored when creating a NEW visitor
+        // ── Stateless visitor decision (no DB) ──────────────────────────────
+        let visitor_uuid =
+            parse_visitor_cookie(ctx.request_visitor_cookie.as_deref(), &self.crypto);
+
+        // ── Stateless session decision (no DB) ──────────────────────────────
+        let session_decision = parse_session_cookie(
+            ctx.request_session_cookie.as_deref(),
+            &self.crypto,
+            self.cookie_config.session_max_age_minutes,
+        );
+
+        // ── Compute attribution (used only for new visitors) ─────────────────
         let utm = ctx
             .query_string
             .as_deref()
@@ -745,6 +720,7 @@ impl LoadBalancer {
             .and_then(temps_analytics::extract_referrer_hostname);
         let channel =
             temps_analytics::get_channel(&utm, referrer_hostname.as_deref(), Some(&ctx.host));
+
         let attribution = crate::traits::FirstVisitAttribution {
             referrer: ctx.referrer.clone(),
             referrer_hostname: referrer_hostname.clone(),
@@ -754,66 +730,69 @@ impl LoadBalancer {
             utm_campaign: utm.utm_campaign.clone(),
         };
 
-        // Pass the raw encrypted cookie to get_or_create_visitor — it handles
-        // decryption internally.  Previously the cookie was decrypted here and the
-        // plaintext UUID was forwarded, causing get_or_create_visitor to attempt a
-        // second decryption that always failed, creating a new visitor on every
-        // returning page load.
-        let visitor = match self
-            .visitor_manager
-            .get_or_create_visitor(
-                ctx.request_visitor_cookie.as_deref(),
-                project_context.as_ref(),
-                &ctx.user_agent,
-                ctx.ip_address.as_deref(),
-                &attribution,
-            )
-            .await
-        {
-            Ok(visitor) => visitor,
-            Err(e) => {
-                error!("Failed to get/create visitor: {:?}", e);
-                return Err(Error::new_str("Failed to get/create visitor"));
-            }
-        };
+        // ── Enqueue background upsert ─────────────────────────────────────────
+        self.tracking_handle.send(TrackingEvent {
+            visitor_uuid: visitor_uuid.clone(),
+            session_uuid: session_decision.session_uuid.clone(),
+            project_id: ctx.project.as_ref().map(|p| p.id).unwrap_or(0),
+            environment_id: ctx.environment.as_ref().map(|e| e.id).unwrap_or(0),
+            last_seen: chrono::Utc::now(),
+            client_ip: ctx.ip_address.clone(),
+            user_agent: Some(ctx.user_agent.clone()),
+            is_crawler: false,
+            crawler_name: None,
+            is_new_session: session_decision.is_new_session,
+            session_referrer: ctx.referrer.clone(),
+            session_referrer_hostname: referrer_hostname,
+            session_utm_source: utm.utm_source,
+            session_utm_medium: utm.utm_medium,
+            session_utm_campaign: utm.utm_campaign,
+            session_utm_content: utm.utm_content,
+            session_utm_term: utm.utm_term,
+            session_channel: Some(channel.to_string()),
+            attribution,
+        });
 
-        // Create session using the trait - pass encrypted cookie, not decrypted value
-        // Include query string for UTM parameter extraction and host for self-referral detection
-        let session = match self
-            .session_manager
-            .get_or_create_session(
-                ctx.request_session_cookie.as_deref(),
-                &visitor,
-                project_context.as_ref(),
-                ctx.referrer.as_deref(),
-                ctx.query_string.as_deref(),
-                Some(&ctx.host),
-            )
-            .await
-        {
-            Ok(session) => session,
-            Err(e) => {
-                error!("Failed to get/create session: {:?}", e);
-                return Err(Error::new_str("Failed to get/create session"));
-            }
-        };
+        // ── Set context fields ────────────────────────────────────────────────
+        ctx.visitor_id = Some(visitor_uuid.clone());
+        ctx.session_id = Some(session_decision.session_uuid.clone());
+        ctx.is_new_session = session_decision.is_new_session;
 
-        ctx.visitor_id = Some(visitor.visitor_id.clone());
-        ctx.visitor_id_i32 = Some(visitor.visitor_id_i32);
-        ctx.session_id = Some(session.session_id.clone());
-        ctx.session_id_i32 = Some(session.session_id_i32);
-        ctx.is_new_session = session.is_new_session;
-
-        // Log visitor debug
         debug!(
             "HTML request from visitor {} with session {} (new: {}) for project {}",
-            visitor.visitor_id,
-            session.session_id,
-            session.is_new_session,
-            project_context.as_ref().map(|p| p.project.id).unwrap_or(0)
+            visitor_uuid,
+            session_decision.session_uuid,
+            session_decision.is_new_session,
+            ctx.project.as_ref().map(|p| p.id).unwrap_or(0)
         );
+    }
 
-        Ok(())
+    /// Returns true when a page view should be tracked (visitor/session created).
+    /// This replaces the old `VisitorManager::should_track_visitor` trait method.
+    pub fn should_track_page(path: &str, content_type: Option<&str>, status_code: u16) -> bool {
+        // Don't track internal API calls
+        if path.starts_with(ROUTE_PREFIX_TEMPS) {
+            return false;
+        }
+
+        // Don't track static assets
+        if path.contains('.')
+            && (path.ends_with(".js")
+                || path.ends_with(".css")
+                || path.ends_with(".png")
+                || path.ends_with(".jpg")
+                || path.ends_with(".svg")
+                || path.ends_with(".ico"))
+        {
+            return false;
+        }
+
+        // Track HTML pages or error pages
+        let is_html = content_type
+            .map(|ct| ct.starts_with("text/html"))
+            .unwrap_or(false);
+
+        is_html || status_code >= 400
     }
 
     async fn finalize_response(
@@ -1334,8 +1313,10 @@ impl LoadBalancer {
                 project_id: ctx.project.as_ref().map(|p| p.id),
                 environment_id: ctx.environment.as_ref().map(|e| e.id),
                 deployment_id: ctx.deployment.as_ref().map(|d| d.id),
-                session_id: ctx.session_id_i32,
-                visitor_id: ctx.visitor_id_i32,
+                session_id: None,
+                visitor_id: None,
+                visitor_uuid: ctx.visitor_id.clone(),
+                session_uuid: ctx.session_id.clone(),
                 container_id: ctx.container_id.clone(),
                 upstream_host: ctx.upstream_host.clone(),
                 error_message: ctx.error_message.clone(),
@@ -1460,8 +1441,10 @@ impl LoadBalancer {
             project_id: ctx.project.as_ref().map(|p| p.id),
             environment_id: ctx.environment.as_ref().map(|e| e.id),
             deployment_id: ctx.deployment.as_ref().map(|d| d.id),
-            session_id: ctx.session_id_i32,
-            visitor_id: ctx.visitor_id_i32,
+            session_id: None,
+            visitor_id: None,
+            visitor_uuid: ctx.visitor_id.clone(),
+            session_uuid: ctx.session_id.clone(),
             container_id: None,
             upstream_host: Some(format!("static://{}", static_dir)),
             error_message,
@@ -1494,82 +1477,101 @@ impl LoadBalancer {
         }
     }
 
-    /// Set visitor and session cookies on the response
-    /// This can be called from both finalize_response and early_request_filter (for static files)
+    /// Set visitor and session cookies on the response.
+    ///
+    /// Visitor cookie: set only when the request doesn't already carry a valid one.
+    /// Session cookie: always re-issued with the current timestamp embedded in the
+    /// v2 payload so the server-side freshness check stays accurate.
     async fn set_tracking_cookies(
         &self,
         session: &mut PingoraSession,
         response: &mut ResponseHeader,
         ctx: &ProxyContext,
     ) -> Result<()> {
-        // Set visitor cookie using the trait
+        let is_https = self.is_https_request(session);
+        let project_id = ctx.project.as_ref().map(|p| p.id);
+
+        // ── Visitor cookie ──────────────────────────────────────────────────
         if let Some(visitor_id) = &ctx.visitor_id {
-            let project_id = ctx.project.as_ref().map(|p| p.id);
-            let expected_cookie_name = get_visitor_cookie_name(project_id);
+            let cookie_name = get_visitor_cookie_name(project_id);
 
             let has_valid_visitor_cookie = session
                 .req_header()
                 .headers
                 .get_all("Cookie")
                 .iter()
-                .filter_map(|cookie_header| cookie_header.to_str().ok())
-                .flat_map(|cookie_str| Cookie::split_parse(cookie_str).filter_map(Result::ok))
-                .any(|cookie| {
-                    cookie.name() == expected_cookie_name
-                        && self.crypto.decrypt(cookie.value()).is_ok()
-                });
+                .filter_map(|h| h.to_str().ok())
+                .flat_map(|s| Cookie::split_parse(s).filter_map(|c| c.ok()))
+                .any(|c| c.name() == cookie_name && self.crypto.decrypt(c.value()).is_ok());
 
             if !has_valid_visitor_cookie {
-                let visitor = Visitor {
-                    visitor_id: visitor_id.clone(),
-                    visitor_id_i32: ctx.visitor_id_i32.unwrap_or(0),
-                    is_crawler: false, // We'd need to track this properly
-                    crawler_name: None,
-                };
-
-                let is_https = self.is_https_request(session);
-                let visitor_cookie = match self
-                    .visitor_manager
-                    .generate_visitor_cookie(&visitor, is_https, ctx.get_project_context().as_ref())
-                    .await
-                {
-                    Ok(cookie) => cookie,
-                    Err(e) => {
-                        error!("Failed to generate visitor cookie: {:?}", e);
-                        return Err(Error::new_str("Failed to generate visitor cookie"));
+                let encrypted = match self.crypto.encrypt(visitor_id) {
+                    Ok(e) => e,
+                    Err(err) => {
+                        error!("Failed to encrypt visitor cookie: {:?}", err);
+                        return Err(Error::new_str("Failed to encrypt visitor cookie"));
                     }
                 };
-                response.append_header("Set-Cookie", visitor_cookie)?;
+                let cookie_value = self.build_cookie_string(
+                    &cookie_name,
+                    &encrypted,
+                    cookie::time::Duration::days(self.cookie_config.visitor_max_age_days),
+                    is_https,
+                );
+                response.append_header("Set-Cookie", cookie_value)?;
             }
         }
 
-        // Set session cookie using the trait
-        // IMPORTANT: Always regenerate the cookie to refresh the max_age expiration time
-        // This prevents the cookie from expiring after 30 minutes even though the session is still active
+        // ── Session cookie ──────────────────────────────────────────────────
+        // Always re-issue with the current timestamp to keep the sliding window fresh.
         if let Some(session_id) = &ctx.session_id {
-            let session_obj = crate::traits::Session {
-                session_id: session_id.clone(),
-                session_id_i32: ctx.session_id_i32.unwrap_or(0),
-                visitor_id_i32: ctx.visitor_id_i32.unwrap_or(0),
-                is_new_session: ctx.is_new_session,
-            };
-
-            let is_https = self.is_https_request(session);
-            let session_cookie = match self
-                .session_manager
-                .generate_session_cookie(&session_obj, is_https, ctx.get_project_context().as_ref())
-                .await
-            {
-                Ok(cookie) => cookie,
-                Err(e) => {
-                    error!("Failed to generate session cookie: {:?}", e);
-                    return Err(Error::new_str("Failed to generate session cookie"));
+            let cookie_name = get_session_cookie_name(project_id);
+            let now_secs = chrono::Utc::now().timestamp();
+            let payload = make_v2_session_payload(session_id, now_secs);
+            let encrypted = match self.crypto.encrypt(&payload) {
+                Ok(e) => e,
+                Err(err) => {
+                    error!("Failed to encrypt session cookie: {:?}", err);
+                    return Err(Error::new_str("Failed to encrypt session cookie"));
                 }
             };
-            response.append_header("Set-Cookie", session_cookie)?;
+            let cookie_value = self.build_cookie_string(
+                &cookie_name,
+                &encrypted,
+                cookie::time::Duration::minutes(self.cookie_config.session_max_age_minutes),
+                is_https,
+            );
+            response.append_header("Set-Cookie", cookie_value)?;
         }
 
         Ok(())
+    }
+
+    /// Build a `Set-Cookie` header value with the configured attributes.
+    fn build_cookie_string(
+        &self,
+        name: &str,
+        value: &str,
+        max_age: cookie::time::Duration,
+        is_https: bool,
+    ) -> String {
+        let mut builder = Cookie::build((name.to_owned(), value.to_owned()))
+            .path("/")
+            .max_age(max_age)
+            .http_only(self.cookie_config.http_only)
+            .secure(is_https && self.cookie_config.secure);
+
+        if let Some(ref same_site) = self.cookie_config.same_site {
+            let ss = match same_site.to_lowercase().as_str() {
+                "strict" => cookie::SameSite::Strict,
+                "lax" => cookie::SameSite::Lax,
+                "none" => cookie::SameSite::None,
+                _ => cookie::SameSite::Lax,
+            };
+            builder = builder.same_site(ss);
+        }
+
+        builder.build().to_string()
     }
 
     /// Serve a static file from the filesystem
@@ -2140,9 +2142,7 @@ impl ProxyHttp for LoadBalancer {
             referrer: None,
             ip_address: None,
             visitor_id: None,
-            visitor_id_i32: None,
             session_id: None,
-            session_id_i32: None,
             is_new_session: false,
             request_headers: None,
             response_headers: None,
@@ -3489,10 +3489,7 @@ impl ProxyHttp for LoadBalancer {
                         || ctx.path.ends_with(".txt"));
 
                 if !is_static_asset {
-                    if let Err(e) = self.ensure_visitor_session(ctx).await {
-                        error!("Failed to ensure visitor session for static file: {:?}", e);
-                        // Continue serving the file even if visitor/session creation fails
-                    }
+                    self.ensure_visitor_session(ctx).await;
                 }
 
                 // Serve static file
@@ -3953,16 +3950,9 @@ impl ProxyHttp for LoadBalancer {
 
         let is_api_endpoint = ctx.path.starts_with("/api/") || ctx.path.starts_with("/_temps/");
 
-        // Check if we should track this visitor using the trait
-        let should_track = self
-            .visitor_manager
-            .should_track_visitor(
-                &ctx.path,
-                ctx.content_type.as_deref(),
-                status_code,
-                None, // We'll pass project context if available
-            )
-            .await;
+        // Check if we should track this page view
+        let should_track =
+            Self::should_track_page(&ctx.path, ctx.content_type.as_deref(), status_code);
 
         // Only create visitor/session for appropriate requests (skip for SSE)
         if !ctx.skip_tracking
@@ -3971,9 +3961,7 @@ impl ProxyHttp for LoadBalancer {
             && !is_static_asset
             && !is_api_endpoint
         {
-            if let Err(e) = self.ensure_visitor_session(ctx).await {
-                error!("Failed to ensure visitor session: {:?}", e);
-            }
+            self.ensure_visitor_session(ctx).await;
         } else {
             debug!(
                 "Skipping visitor creation for: path={}, content_type={:?}, status={}, skip_tracking={}",
@@ -4194,8 +4182,10 @@ impl ProxyHttp for LoadBalancer {
                 project_id: ctx.project.as_ref().map(|p| p.id),
                 environment_id: ctx.environment.as_ref().map(|e| e.id),
                 deployment_id: ctx.deployment.as_ref().map(|d| d.id),
-                session_id: ctx.session_id_i32,
-                visitor_id: ctx.visitor_id_i32,
+                session_id: None,
+                visitor_id: None,
+                visitor_uuid: ctx.visitor_id.clone(),
+                session_uuid: ctx.session_id.clone(),
                 container_id: None,
                 upstream_host: None,
                 error_message: ctx.error_message.clone(),
@@ -4502,9 +4492,7 @@ mod markdown_tests {
             referrer: None,
             ip_address: Some("127.0.0.1".to_string()),
             visitor_id: None,
-            visitor_id_i32: None,
             session_id: None,
-            session_id_i32: None,
             is_new_session: false,
             request_headers: None,
             response_headers: None,
@@ -5043,9 +5031,7 @@ mod markdown_pipeline_tests {
             referrer: None,
             ip_address: Some("127.0.0.1".to_string()),
             visitor_id: None,
-            visitor_id_i32: None,
             session_id: None,
-            session_id_i32: None,
             is_new_session: false,
             request_headers: None,
             response_headers: None,

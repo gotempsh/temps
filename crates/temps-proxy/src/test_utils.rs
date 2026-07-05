@@ -184,11 +184,12 @@ pub fn create_test_project_context(
     }
 }
 
-/// Create test visitor
+/// Create test visitor trait object from a DB visitor model.
+/// Note: the DB id (i32) is no longer held in the Visitor struct — UUID→i32
+/// resolution now happens asynchronously in the batch writer.
 pub fn create_test_visitor_trait(visitor: visitor::Model) -> crate::traits::Visitor {
     crate::traits::Visitor {
         visitor_id: visitor.visitor_id,
-        visitor_id_i32: visitor.id,
         is_crawler: visitor.is_crawler,
         crawler_name: visitor.crawler_name,
     }

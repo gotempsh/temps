@@ -139,6 +139,7 @@ mod m20260702_000001_add_label_filters_to_metric_alert_rules;
 mod m20260702_000002_add_dynamic_alerting_to_metric_alert_rules;
 mod m20260702_000003_add_grouped_threshold_and_series_state_to_metric_alert_rules;
 mod m20260703_000001_cross_project_trace_refs;
+mod m20260705_000001_add_visitor_unique_index;
 
 pub struct Migrator;
 
@@ -283,6 +284,7 @@ impl MigratorTrait for Migrator {
                 m20260702_000003_add_grouped_threshold_and_series_state_to_metric_alert_rules::Migration,
             ),
             Box::new(m20260703_000001_cross_project_trace_refs::Migration),
+            Box::new(m20260705_000001_add_visitor_unique_index::Migration),
         ]
     }
 }

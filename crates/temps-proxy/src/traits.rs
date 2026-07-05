@@ -12,22 +12,13 @@ pub struct ProjectContext {
     pub deployment: Arc<deployments::Model>,
 }
 
-/// Visitor information
+/// Visitor information resolved from the stateless cookie codec.
+/// No i32 DB id — the background batch writer resolves UUIDs to IDs asynchronously.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Visitor {
     pub visitor_id: String,
-    pub visitor_id_i32: i32,
     pub is_crawler: bool,
     pub crawler_name: Option<String>,
-}
-
-/// Session information
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Session {
-    pub session_id: String,
-    pub session_id_i32: i32,
-    pub visitor_id_i32: i32,
-    pub is_new_session: bool,
 }
 
 /// Cookie configuration for visitor/session tracking
@@ -131,84 +122,6 @@ pub struct FirstVisitAttribution {
     pub utm_medium: Option<String>,
     /// UTM campaign parameter
     pub utm_campaign: Option<String>,
-}
-
-/// Trait for managing visitors
-#[async_trait]
-pub trait VisitorManager: Send + Sync {
-    /// Get or create a visitor from encrypted cookie
-    ///
-    /// The `attribution` parameter provides first-visit referrer/UTM/channel data.
-    /// These fields are only set when creating a NEW visitor and are never overwritten
-    /// for returning visitors.
-    async fn get_or_create_visitor(
-        &self,
-        visitor_cookie: Option<&str>,
-        context: Option<&ProjectContext>,
-        user_agent: &str,
-        ip_address: Option<&str>,
-        attribution: &FirstVisitAttribution,
-    ) -> Result<Visitor, Box<dyn std::error::Error + Send + Sync>>;
-
-    /// Generate encrypted visitor cookie
-    async fn generate_visitor_cookie(
-        &self,
-        visitor: &Visitor,
-        is_https: bool,
-        context: Option<&ProjectContext>,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>>; // Returns Set-Cookie header value
-
-    /// Check if visitor tracking should be enabled for this request
-    async fn should_track_visitor(
-        &self,
-        path: &str,
-        content_type: Option<&str>,
-        status_code: u16,
-        context: Option<&ProjectContext>,
-    ) -> bool;
-
-    /// Get visitor cookie configuration
-    fn get_visitor_cookie_config(&self) -> &CookieConfig;
-}
-
-/// Trait for managing sessions
-#[async_trait]
-pub trait SessionManager: Send + Sync {
-    /// Get or create a session from encrypted cookie
-    ///
-    /// # Arguments
-    /// * `session_cookie` - Encrypted session cookie value
-    /// * `visitor` - The visitor associated with this session
-    /// * `context` - Project context for the request
-    /// * `referrer` - The HTTP Referer header value
-    /// * `query_string` - The URL query string (for UTM parameter extraction)
-    /// * `current_hostname` - The current site's hostname (for self-referral detection)
-    async fn get_or_create_session(
-        &self,
-        session_cookie: Option<&str>,
-        visitor: &Visitor,
-        context: Option<&ProjectContext>,
-        referrer: Option<&str>,
-        query_string: Option<&str>,
-        current_hostname: Option<&str>,
-    ) -> Result<Session, Box<dyn std::error::Error + Send + Sync>>;
-
-    /// Generate encrypted session cookie
-    async fn generate_session_cookie(
-        &self,
-        session: &Session,
-        is_https: bool,
-        context: Option<&ProjectContext>,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>>; // Returns Set-Cookie header value
-
-    /// Extend session expiry time
-    async fn extend_session(
-        &self,
-        session: &Session,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-
-    /// Get session cookie configuration
-    fn get_session_cookie_config(&self) -> &CookieConfig;
 }
 
 /// Error types for proxy services

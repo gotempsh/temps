@@ -251,8 +251,8 @@ pub fn setup_proxy_server(
     let proxy_log_storage =
         crate::storage::build_proxy_log_storage(&config, db.clone(), ip_service.clone());
 
-    // Create batch writer for proxy logs (bounded channel + background batch write)
-    let (proxy_log_handle, proxy_log_writer) =
+    // Create batch writer for proxy logs and tracking events (bounded channels + background tasks)
+    let (proxy_log_handle, tracking_handle, proxy_log_writer) =
         crate::service::proxy_log_batch_writer::ProxyLogBatchWriter::new(
             db.clone(),
             ip_service.clone(),
@@ -293,15 +293,6 @@ pub fn setup_proxy_server(
     let project_context_resolver = Arc::new(ProjectContextResolverImpl::new(route_table.clone()))
         as Arc<dyn ProjectContextResolver>;
 
-    let visitor_manager = Arc::new(VisitorManagerImpl::new(
-        db.clone(),
-        crypto.clone(),
-        ip_service.clone(),
-    )) as Arc<dyn VisitorManager>;
-
-    let session_manager =
-        Arc::new(SessionManagerImpl::new(db.clone(), crypto.clone())) as Arc<dyn SessionManager>;
-
     // Create path-keyed file store for static asset serving
     let cas_file_store: Arc<dyn temps_file_store::FileStore> = Arc::new(
         temps_file_store::fs_store::FsFileStore::new(config_service.data_dir().join("cas")),
@@ -311,9 +302,8 @@ pub fn setup_proxy_server(
     let mut lb = LoadBalancer::new(
         upstream_resolver,
         proxy_log_handle,
+        tracking_handle,
         project_context_resolver,
-        visitor_manager,
-        session_manager,
         crypto,
         db.clone(),
         config_service,
@@ -453,8 +443,8 @@ pub fn create_proxy_service(
     let proxy_log_storage =
         crate::storage::build_proxy_log_storage(&config, db.clone(), ip_service.clone());
 
-    // Create batch writer for proxy logs (bounded channel + background batch write)
-    let (proxy_log_handle, proxy_log_writer) =
+    // Create batch writer for proxy logs and tracking events (bounded channels + background tasks)
+    let (proxy_log_handle, tracking_handle, proxy_log_writer) =
         crate::service::proxy_log_batch_writer::ProxyLogBatchWriter::new(
             db.clone(),
             ip_service.clone(),
@@ -495,22 +485,12 @@ pub fn create_proxy_service(
     let project_context_resolver = Arc::new(ProjectContextResolverImpl::new(route_table.clone()))
         as Arc<dyn ProjectContextResolver>;
 
-    let visitor_manager = Arc::new(VisitorManagerImpl::new(
-        db.clone(),
-        crypto.clone(),
-        ip_service.clone(),
-    )) as Arc<dyn VisitorManager>;
-
-    let session_manager =
-        Arc::new(SessionManagerImpl::new(db.clone(), crypto.clone())) as Arc<dyn SessionManager>;
-
     // Create the main load balancer
     let lb = LoadBalancer::new(
         upstream_resolver,
         proxy_log_handle,
+        tracking_handle,
         project_context_resolver,
-        visitor_manager,
-        session_manager,
         crypto,
         db,
         config_service,

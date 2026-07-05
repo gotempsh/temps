@@ -118,6 +118,11 @@ pub struct CreateProxyLogRequest {
     pub deployment_id: Option<i32>,
     pub session_id: Option<i32>,
     pub visitor_id: Option<i32>,
+    /// Visitor UUID from the stateless cookie codec; used by the batch writer
+    /// to resolve the UUID → i32 FK at flush time via the moka cache.
+    pub visitor_uuid: Option<String>,
+    /// Session UUID from the stateless cookie codec; used analogously.
+    pub session_uuid: Option<String>,
     pub container_id: Option<String>,
     pub upstream_host: Option<String>,
     pub error_message: Option<String>,
