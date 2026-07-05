@@ -110,7 +110,6 @@ function UnifiedSpanDetail({
 export default function CrossProjectTraceDetail() {
   const { traceId } = useParams()
   const navigate = useNavigate()
-  usePageTitle('Unified trace')
 
   const { data, isPending, isError, error } = useQuery({
     ...getUnifiedTraceOptions({ path: { trace_id: traceId || '' } }),
@@ -134,6 +133,7 @@ export default function CrossProjectTraceDetail() {
   )
   const tree = useMemo(() => buildSpanTree(spans), [spans])
   const flatSpans = useMemo(() => flattenTree(tree), [tree])
+  usePageTitle(tree[0]?.span?.name ?? 'Unified trace')
 
   const traceStart = useMemo(
     () => (data ? new Date(data.start_time).getTime() : 0),

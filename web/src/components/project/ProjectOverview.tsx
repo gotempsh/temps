@@ -26,7 +26,7 @@ import {
   TrendingUp,
   Users,
 } from 'lucide-react'
-import { ReactNode, useEffect, useMemo, useState } from 'react'
+import { ReactNode, useEffect, useMemo } from 'react'
 import { Link } from 'react-router-dom'
 import { MetricCard } from '../dashboard/MetricCard'
 import { DeploymentActivityGraph } from './DeploymentActivityGraph'
@@ -163,9 +163,6 @@ export function ProjectOverview({
       refetchDeployment()
     }
   }, [project?.id, refetchDeployment])
-
-  const [now] = useState(() => Date.now())
-  const [oneDayAgo] = useState(() => now - 24 * 60 * 60 * 1000)
 
   const isLoadingOnboarding = isCheckingAnalytics || isCheckingErrors
   const hasAnalytics = !!hasAnalyticsData?.has_events
@@ -320,10 +317,7 @@ export function ProjectOverview({
         <RevenueMetric project={project} />
 
 
-        <Link
-          to={`/projects/${project.slug}/analytics/requests?from=${oneDayAgo}&to=${now}&status_code=500`}
-          className="h-full w-full"
-        >
+        <Link to={`/projects/${project.slug}/errors`} className="h-full w-full">
           <MetricCard
             change={''}
             value={errorStats?.error_groups?.toFixed(2) || '0'}

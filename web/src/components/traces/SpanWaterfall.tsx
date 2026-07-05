@@ -1,5 +1,5 @@
-import type { ReactNode } from 'react'
-import { ChevronDown, CheckCircle2, XCircle } from 'lucide-react'
+import { useMemo, useState, type ReactNode } from 'react'
+import { ChevronDown, ChevronRight, CheckCircle2, XCircle } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import {
   Tooltip,
@@ -75,6 +75,13 @@ export function serviceColor(name?: string): string {
   return SERVICE_COLORS[Math.abs(h) % SERVICE_COLORS.length]
 }
 
+function countDescendants(node: SpanTreeNode): number {
+  return node.children.reduce(
+    (sum, child) => sum + 1 + countDescendants(child),
+    0
+  )
+}
+
 /** Shared span waterfall (tree + timeline bars). `colorBy="service"` colours each
  *  bar by its service and shows a service dot, like OpenObserve/Datadog.
  *
@@ -110,17 +117,44 @@ export function SpanWaterfall({
   rowClassName?: (span: SpanTreeNode['span']) => string | undefined
   className?: string
 }) {
+  const [collapsedIds, setCollapsedIds] = useState<Set<string>>(new Set())
+  const toggleCollapse = (spanId: string) => {
+    setCollapsedIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(spanId)) {
+        next.delete(spanId)
+      } else {
+        next.add(spanId)
+      }
+      return next
+    })
+  }
+  const visibleSpans = useMemo(() => {
+    const hiddenAncestors = new Set<string>()
+    return flatSpans.filter((node) => {
+      const parentId = node.span.parent_span_id
+      if (parentId && hiddenAncestors.has(parentId)) {
+        hiddenAncestors.add(node.span.span_id)
+        return false
+      }
+      if (collapsedIds.has(node.span.span_id)) {
+        hiddenAncestors.add(node.span.span_id)
+      }
+      return true
+    })
+  }, [flatSpans, collapsedIds])
+
   return (
     <div className={cn('overflow-auto', className)}>
       <div className="sticky top-0 z-10 flex min-w-[420px] items-center border-b bg-background px-4 py-2 text-xs text-muted-foreground sm:min-w-[500px]">
-        <div className="w-[120px] shrink-0 sm:w-[180px] md:w-[280px]">Span Name</div>
+        <div className="w-[120px] shrink-0 sm:w-[180px] md:w-[280px] lg:w-[340px]">Span Name</div>
         <div className="flex flex-1 justify-between">
           <span>{formatTimestamp(new Date(traceStart).toISOString())}</span>
           <span>{formatDuration(traceDuration)}</span>
           <span>{formatTimestamp(new Date(traceEnd).toISOString())}</span>
         </div>
       </div>
-      {flatSpans.map((node) => {
+      {visibleSpans.map((node) => {
         const spanStart = new Date(node.span.start_time).getTime() - traceStart
         const spanDuration =
           new Date(node.span.end_time).getTime() -
@@ -133,6 +167,7 @@ export function SpanWaterfall({
             : maxBarPct
         const isError = node.span.status_code?.toUpperCase() === 'ERROR'
         const isSelected = selectedSpanId === node.span.span_id
+        const isCollapsed = collapsedIds.has(node.span.span_id)
         const svc = node.span.resource?.service_name
         const barColor =
           colorBy === 'service' && !isError ? serviceColor(svc) : undefined
@@ -150,11 +185,33 @@ export function SpanWaterfall({
                   )}
                 >
                   <div
-                    className="flex w-[120px] shrink-0 items-center gap-1.5 sm:w-[180px] md:w-[280px]"
+                    className="flex w-[120px] shrink-0 items-center gap-1.5 sm:w-[180px] md:w-[280px] lg:w-[340px]"
                     style={{ paddingLeft: `${node.depth * 16}px` }}
                   >
                     {node.children.length > 0 ? (
-                      <ChevronDown className="h-3 w-3 shrink-0 text-muted-foreground" />
+                      <span
+                        role="button"
+                        tabIndex={0}
+                        aria-label={isCollapsed ? 'Expand span' : 'Collapse span'}
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          toggleCollapse(node.span.span_id)
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' || e.key === ' ') {
+                            e.preventDefault()
+                            e.stopPropagation()
+                            toggleCollapse(node.span.span_id)
+                          }
+                        }}
+                        className="flex h-3 w-3 shrink-0 items-center justify-center rounded-sm hover:bg-accent"
+                      >
+                        {isCollapsed ? (
+                          <ChevronRight className="h-3 w-3 text-muted-foreground" />
+                        ) : (
+                          <ChevronDown className="h-3 w-3 text-muted-foreground" />
+                        )}
+                      </span>
                     ) : (
                       <span className="w-3 shrink-0" />
                     )}
@@ -167,7 +224,14 @@ export function SpanWaterfall({
                       statusIcon(node.span.status_code)
                     )}
                     {renderRowBadge?.(node.span)}
-                    <span className="truncate text-xs">{node.span.name}</span>
+                    <span className="min-w-0 flex-1 truncate text-xs">
+                      {node.span.name}
+                    </span>
+                    {isCollapsed && (
+                      <span className="shrink-0 rounded-sm bg-muted px-1 text-[10px] text-muted-foreground">
+                        +{countDescendants(node)}
+                      </span>
+                    )}
                   </div>
                   <div className="relative h-6 flex-1">
                     <div
