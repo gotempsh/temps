@@ -1,3 +1,22 @@
+//! Proxy request pipeline for the Temps reverse proxy.
+//!
+//! # Hot-path invariant
+//!
+//! No function on the per-request path (`early_request_filter`, `request_filter`,
+//! `upstream_peer`, `upstream_response_filter`, `response_filter`, and every helper
+//! they call) may await a database query directly.
+//!
+//! - **Writes** go through the `ProxyLogBatchHandle` / `TrackingBatchHandle` mpsc
+//!   channels and are flushed by the background batch writer.
+//! - **Reads** go through ArcSwap snapshots (refreshed by background loops) or
+//!   moka TTL caches (populated on first miss, then served in-memory).
+//!
+//! The single intentional exception is the ACME HTTP-01 challenge lookup
+//! (`handle_acme_http_challenge`), which is path-gated to
+//! `/.well-known/acme-challenge/*` — a path that is rare by construction and never
+//! appears on normal traffic. Every other request-path DB call present before this
+//! branch was removed as part of `perf/remove-db-from-request-path` (WS1–WS6).
+
 use crate::handler::preview_wall::{
     build_logout_cookie_sandbox, generate_preview_form_html_labeled, sanitize_next,
     PREVIEW_LOGIN_PATH, PREVIEW_LOGOUT_PATH,
@@ -1132,6 +1151,12 @@ impl LoadBalancer {
             host, token
         );
 
+        // Direct DB query accepted here: this code path is reachable only for
+        // requests whose path starts with `/.well-known/acme-challenge/`, which
+        // is rare by construction (only Let's Encrypt validation requests hit
+        // it). See item H in IMPLEMENTATION_PLAN.md §2 — intentionally left
+        // as-is because caching transient challenge tokens would complicate the
+        // cert-provisioning flow with no meaningful throughput benefit.
         let domain_record = domains::Entity::find()
             .filter(domains::Column::Domain.eq(host))
             .filter(domains::Column::HttpChallengeToken.eq(token))
@@ -1195,9 +1220,9 @@ impl LoadBalancer {
     /// (`!is_tls_connection`) and that the manager is wired, so this function
     /// performs NO TLS check and NO settings fetch in the common path. Settings
     /// are loaded lazily only when an ephemeral host actually reaches the
-    /// `redirect_to_env` branch — see the HIGH finding in the ADR-018 security
-    /// review: `get_settings()` is an uncached DB query and must not run per
-    /// request.
+    /// `redirect_to_env` branch — `get_settings()` is TTL-cached in
+    /// `temps_config::ConfigService`, so even on that rare branch it is a
+    /// fast in-memory read rather than a Postgres round-trip.
     ///
     /// Returns `Ok(true)` when a response was written (caller must return early),
     /// `Ok(false)` when the request should continue down the normal path.
@@ -1242,8 +1267,8 @@ impl LoadBalancer {
         }
 
         // Only now — for an ephemeral routed host — do we need the setting that
-        // decides http-vs-redirect. This is the rare branch, so the DB read here
-        // does not amplify request floods the way a per-request fetch would.
+        // decides http-vs-redirect. This is the rare branch; get_settings() is
+        // TTL-cached so it is an in-memory read, not a Postgres round-trip.
         let settings = match self.config_service.get_settings().await {
             Ok(s) => s,
             Err(e) => {
@@ -3224,11 +3249,10 @@ impl ProxyHttp for LoadBalancer {
         // non-existent cert.
         // Gate on the cheap, in-memory checks FIRST so the common case (HTTPS
         // traffic, and HTTP hosts with no on-demand cert state) costs nothing.
-        // Critically, `get_settings()` is an uncached DB round-trip, so it must
-        // NOT run on every request: a request flood would otherwise amplify into
-        // a Postgres QPS flood. The on-demand UX only applies to plain-HTTP
-        // connections, and settings are needed solely for the rare ephemeral
-        // `redirect_to_env` branch — which `handle_on_demand_http` fetches lazily.
+        // `get_settings()` is TTL-cached (no Postgres round-trip), but the lazy
+        // fetch is still kept inside `handle_on_demand_http` so it only runs for
+        // the rare ephemeral `redirect_to_env` branch rather than for every
+        // plain-HTTP request.
         if self.on_demand_cert_manager.is_some()
             && !self.is_tls_connection(session)
             && self.handle_on_demand_http(session, ctx).await?
