@@ -52,7 +52,7 @@ hyper = { workspace = true }
 utoipa = { workspace = true }
 
 # Protobuf for OTLP
-prost = "0.13"
+prost = "0.14"
 
 # Compression
 flate2 = { workspace = true }
