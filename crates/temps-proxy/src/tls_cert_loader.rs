@@ -30,6 +30,19 @@ const CERT_CACHE_MAX_CAPACITY: u64 = 1_000;
 /// (one String key + unit value).
 const CERT_NEGATIVE_CACHE_MAX_CAPACITY: u64 = 10_000;
 
+/// TTL for the last-known-good fallback cache.
+///
+/// Entries in this cache are only consulted when `find_certificate_raw` returns
+/// a DB *error* (not a clean "no rows" response). Cert renewals happen weeks
+/// before expiry, so 24 hours is safely within any real-world Postgres outage
+/// while still ensuring the entry will eventually age out if the domain is truly
+/// decommissioned after a prolonged downtime.
+///
+/// A no-TTL (infinite) entry was considered but rejected: a 24-hour bound keeps
+/// memory usage predictable and ensures entries don't survive far beyond the
+/// cert's own validity window under catastrophic failure scenarios.
+const CERT_LKG_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Which variant of [`PrivateKeyDer`] was parsed from the PEM. Stored alongside
 /// the raw DER bytes so [`CachedCert::to_rustls`] can reconstruct the correct
 /// typed key without re-parsing the PEM.
@@ -99,6 +112,17 @@ impl CachedCert {
 ///   TTL so on-demand issuance (ADR-018) is picked up quickly — a newly-provisioned
 ///   cert is visible within ~30 s of the background job completing.
 ///
+/// - **Last-known-good fallback** (DB *error* only): every successful positive cache
+///   population also writes to `last_known_good` with a 24-hour TTL. When the
+///   5-minute `cert_cache` entry has expired *and* the DB call errors (e.g. Postgres
+///   is down), `load_certificate` checks `last_known_good` for the same key and
+///   serves the stale cert rather than failing the TLS handshake. This is the same
+///   resilience pattern used by [`crate::service::cert_host_cache::CertHostCache`]'s
+///   `ArcSwap` snapshot — we never go "blank" just because a refresh errored.
+///
+///   The fallback is only consulted on a DB *error*. A clean "no rows" response still
+///   populates the `negative_cache` and returns `None` exactly as today.
+///
 /// ## Key separation
 ///
 /// Exact-match hits are cached under the literal SNI key. Wildcard hits are cached
@@ -112,6 +136,11 @@ pub struct CertificateLoader {
     cert_cache: Cache<String, Arc<CachedCert>>,
     /// Negative cache: SNI → () (presence = no cert found). TTL 30 s.
     negative_cache: Cache<String, ()>,
+    /// Last-known-good fallback: resolved domain → Arc<cached cert+key bytes>.
+    /// TTL 24 h. Only consulted when `find_certificate_raw` returns a DB *error*
+    /// after the primary `cert_cache` entry has expired. Populated in parallel with
+    /// every `cert_cache` write so it always holds the most recently successful cert.
+    last_known_good: Cache<String, Arc<CachedCert>>,
 }
 
 impl CertificateLoader {
@@ -130,7 +159,10 @@ impl CertificateLoader {
     }
 
     /// Internal constructor that accepts explicit TTLs, used by tests to shorten
-    /// the negative-cache TTL to observable durations.
+    /// the negative-cache or positive-cache TTL to observable durations.
+    ///
+    /// The `last_known_good` cache always uses [`CERT_LKG_TTL`] (24 h) — it is not
+    /// configurable per-call because its whole purpose is a long-lived safety net.
     fn new_with_ttls(
         db: Arc<DbConnection>,
         encryption_service: Arc<temps_core::EncryptionService>,
@@ -145,24 +177,32 @@ impl CertificateLoader {
             .max_capacity(CERT_NEGATIVE_CACHE_MAX_CAPACITY)
             .time_to_live(negative_ttl)
             .build();
+        let last_known_good = Cache::builder()
+            .max_capacity(CERT_CACHE_MAX_CAPACITY)
+            .time_to_live(CERT_LKG_TTL)
+            .build();
         Self {
             db,
             encryption_service,
             cert_cache,
             negative_cache,
+            last_known_good,
         }
     }
 
     /// Explicitly invalidate cached data for `domain`. Call this at cert-provisioning
     /// and renewal sites to make newly-issued certs visible before the TTL expires.
     ///
-    /// Removes `domain` from both caches and also removes the wildcard form of
-    /// `domain` from the positive cache. Silently no-ops for entries not present.
+    /// Removes `domain` from all caches (primary, negative, and last-known-good) and
+    /// also removes the wildcard form of `domain` from the positive and
+    /// last-known-good caches. Silently no-ops for entries not present.
     pub async fn invalidate(&self, domain: &str) {
         self.cert_cache.invalidate(domain).await;
         self.negative_cache.invalidate(domain).await;
+        self.last_known_good.invalidate(domain).await;
         if let Some(wildcard) = self.get_wildcard_domain(domain) {
             self.cert_cache.invalidate(&wildcard).await;
+            self.last_known_good.invalidate(&wildcard).await;
         }
     }
 
@@ -173,6 +213,19 @@ impl CertificateLoader {
     ///
     /// - Positive hits (cert found): 5-minute TTL, keyed by resolved domain.
     /// - Negative hits (no cert): 30-second TTL, keyed by the SNI.
+    ///
+    /// ## DB-error resilience
+    ///
+    /// If the primary `cert_cache` entry has expired *and* the DB call errors (e.g.
+    /// Postgres is down or the connection pool times out), this method checks
+    /// `last_known_good` for the same key. If a previously-successful cert exists
+    /// there, it is returned with a `warn!` log — the TLS handshake succeeds at the
+    /// cost of serving a potentially-stale cert (still valid for weeks; renewals are
+    /// automatic). If no last-known-good entry exists for this SNI (it has never been
+    /// successfully cached before), the DB error is propagated unchanged.
+    ///
+    /// This behaviour mirrors [`crate::service::cert_host_cache::CertHostCache`]'s
+    /// `ArcSwap` snapshot: we never go dark just because a background refresh failed.
     pub async fn load_certificate(
         &self,
         sni: &str,
@@ -205,13 +258,39 @@ impl CertificateLoader {
         }
 
         // Cache miss: fall through to database. Exact match first (DB query 1).
-        if let Some((key_type, cert_ders, key_der)) = self.find_certificate_raw(sni).await? {
+        let exact_raw = match self.find_certificate_raw(sni).await {
+            Ok(opt) => opt,
+            Err(e) => {
+                // DB error (e.g. connection-pool timeout while Postgres is down).
+                // Check last_known_good before propagating so an existing cert can
+                // keep serving the TLS handshake even if Postgres is temporarily
+                // unavailable.
+                warn!(
+                    sni = sni,
+                    error = %e,
+                    "DB error during exact certificate lookup; checking last-known-good cache"
+                );
+                if let Some(lkg) = self.last_known_good.get(sni).await {
+                    warn!(
+                        sni = sni,
+                        "Serving stale last-known-good certificate for SNI due to DB error"
+                    );
+                    return lkg.to_rustls().map(Some);
+                }
+                // Nothing to fall back to — propagate the DB error.
+                return Err(e);
+            }
+        };
+        if let Some((key_type, cert_ders, key_der)) = exact_raw {
             let cached = Arc::new(CachedCert {
                 cert_ders,
                 key_der,
                 key_type,
             });
             self.cert_cache
+                .insert(sni.to_string(), Arc::clone(&cached))
+                .await;
+            self.last_known_good
                 .insert(sni.to_string(), Arc::clone(&cached))
                 .await;
             return cached.to_rustls().map(Some);
@@ -221,15 +300,40 @@ impl CertificateLoader {
         // lookups for any SNI with the same base domain benefit.
         if let Some(wildcard_domain) = self.get_wildcard_domain(sni) {
             debug!("Trying wildcard certificate for: {}", wildcard_domain);
-            if let Some((key_type, cert_ders, key_der)) =
-                self.find_certificate_raw(&wildcard_domain).await?
-            {
+            let wildcard_raw = match self.find_certificate_raw(&wildcard_domain).await {
+                Ok(opt) => opt,
+                Err(e) => {
+                    // DB error on wildcard lookup — same resilience pattern as the
+                    // exact-match path above: fall back to last_known_good if
+                    // available, otherwise propagate.
+                    warn!(
+                        sni = sni,
+                        wildcard_key = %wildcard_domain,
+                        error = %e,
+                        "DB error during wildcard certificate lookup; checking last-known-good cache"
+                    );
+                    if let Some(lkg) = self.last_known_good.get(&wildcard_domain).await {
+                        warn!(
+                            sni = sni,
+                            wildcard_key = %wildcard_domain,
+                            "Serving stale last-known-good wildcard certificate for SNI due to DB error"
+                        );
+                        return lkg.to_rustls().map(Some);
+                    }
+                    // Nothing to fall back to — propagate the DB error.
+                    return Err(e);
+                }
+            };
+            if let Some((key_type, cert_ders, key_der)) = wildcard_raw {
                 let cached = Arc::new(CachedCert {
                     cert_ders,
                     key_der,
                     key_type,
                 });
                 self.cert_cache
+                    .insert(wildcard_domain.clone(), Arc::clone(&cached))
+                    .await;
+                self.last_known_good
                     .insert(wildcard_domain, Arc::clone(&cached))
                     .await;
                 return cached.to_rustls().map(Some);
@@ -608,6 +712,132 @@ mod tests {
         assert!(
             second.is_some(),
             "www.example.com should get the cached wildcard cert"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Last-known-good (LKG) fallback tests
+    // -------------------------------------------------------------------------
+
+    /// After a successful load, once the 5-minute `cert_cache` TTL expires, a
+    /// subsequent DB *error* must return the stale cert from `last_known_good`
+    /// rather than failing the TLS handshake.
+    ///
+    /// This is the primary regression test for the fix introduced to guard against
+    /// Postgres-outage-induced TLS handshake failures.
+    ///
+    /// Queue layout:
+    ///  - Result 1: valid cert row (primes the cache on the first call)
+    ///  - Error  2: simulated DB error (returned when cert_cache has expired)
+    #[tokio::test]
+    async fn test_stale_cert_served_on_db_error_after_cache_expiry() {
+        let enc = test_enc();
+        let (cert_pem, enc_key) = make_test_cert("example.com", &enc);
+        let model = domain_model("example.com", &cert_pem, &enc_key);
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![model]]) // call 1: cert found, cached
+            .append_query_errors(vec![sea_orm::DbErr::Custom(
+                "simulated postgres outage".to_string(),
+            )]) // call 2: DB error after cert_cache expiry
+            .into_connection();
+
+        // Short cert TTL (1 ms) so we can expire it in the test. Negative TTL is
+        // irrelevant here (we never go negative), but keep it reasonable.
+        let loader = CertificateLoader::new_with_ttls(
+            Arc::new(db),
+            enc,
+            Duration::from_millis(1), // cert_ttl: expires quickly
+            Duration::from_secs(30),  // negative_ttl: irrelevant
+        );
+
+        // First call: cache miss → DB returns cert → populate cert_cache + last_known_good.
+        let first = loader
+            .load_certificate("example.com")
+            .await
+            .expect("first load should succeed");
+        assert!(first.is_some(), "first call must return a cert");
+
+        // Let the cert_cache entry expire (cert_ttl = 1 ms).
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Second call: cert_cache miss (expired) → DB errors → last_known_good hit →
+        // must return the stale cert rather than propagating the DB error.
+        let second = loader
+            .load_certificate("example.com")
+            .await
+            .expect("second call must return Ok even though DB errored");
+        assert!(
+            second.is_some(),
+            "stale last-known-good cert must be served when DB errors after cert_cache expiry"
+        );
+    }
+
+    /// A brand-new SNI that has never been successfully cached before must still
+    /// propagate a DB error (nothing to fall back to).
+    ///
+    /// Confirming that the LKG fallback does not silently swallow errors for
+    /// domains that have never been seen.
+    #[tokio::test]
+    async fn test_db_error_with_no_lkg_propagates_error() {
+        let enc = test_enc();
+
+        // Two DB errors: one for the exact lookup, one for the wildcard lookup.
+        // (The exact-match call will error first and propagate immediately.)
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors(vec![sea_orm::DbErr::Custom(
+                "simulated postgres outage on brand-new SNI".to_string(),
+            )])
+            .into_connection();
+
+        let loader = CertificateLoader::new(Arc::new(db), enc);
+
+        // No prior successful load → no last_known_good entry → error propagates.
+        let result = loader.load_certificate("brandnew.example.com").await;
+        assert!(
+            result.is_err(),
+            "DB error for an uncached SNI must propagate as an error (no LKG to fall back to)"
+        );
+    }
+
+    /// A genuine "no matching domain" DB response (zero rows, no error) must still
+    /// populate the negative cache and return `Ok(None)`.
+    ///
+    /// This is a regression guard: the LKG error-handling path must not interfere
+    /// with the normal zero-row (success) path.
+    #[tokio::test]
+    async fn test_genuine_no_cert_row_still_negative_caches_and_returns_none() {
+        let enc = test_enc();
+
+        // Two empty results: exact + wildcard → genuine "no cert" response.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![
+                Vec::<domains::Model>::new(), // exact lookup → no row
+                Vec::<domains::Model>::new(), // wildcard lookup → no row
+            ])
+            .into_connection();
+
+        let loader = CertificateLoader::new(Arc::new(db), enc);
+
+        // Must return Ok(None), not Err, when DB succeeds with zero rows.
+        let result = loader
+            .load_certificate("missing.example.com")
+            .await
+            .expect("zero-row DB response must return Ok, not Err");
+        assert!(
+            result.is_none(),
+            "zero-row DB response must return None (negative cache path)"
+        );
+
+        // A second call must hit the negative cache (no further DB queries).
+        // MockDatabase queue is empty — any DB access would panic here.
+        let result2 = loader
+            .load_certificate("missing.example.com")
+            .await
+            .expect("negative cache hit must return Ok");
+        assert!(
+            result2.is_none(),
+            "second call must return None from negative cache"
         );
     }
 
