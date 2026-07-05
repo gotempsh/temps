@@ -935,6 +935,280 @@ async fn test_dns_service_endpoints_migration() -> anyhow::Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Regression test: m20260705_000001_add_visitor_unique_index must repoint ALL
+// visitor FK tables before deleting duplicates.
+//
+// The original migration only handled proxy_logs and request_sessions.  The
+// six missing tables were:
+//   - session_replay_sessions (CASCADE delete — the critical one: the old code
+//     would silently CASCADE-DELETE recording rows instead of repointing them)
+//   - performance_metrics, request_logs, events, error_groups, error_events
+//     (SetNull — the old code would null out visitor associations that still
+//     had a live canonical row to point to)
+//
+// This test reproduces the CASCADE data-loss scenario by:
+//   1. Running every migration up to but not including the target.
+//   2. Inserting two visitor rows with the same (visitor_id, project_id).
+//      The row with the HIGHER serial id is the "duplicate"; the one with
+//      the LOWER id is the "canonical".
+//   3. Inserting a session_replay_sessions row whose visitor_id points at
+//      the DUPLICATE row (so the old code would have cascade-deleted it).
+//   4. Running the target migration.
+//   5. Asserting the session_replay_sessions row still exists and now
+//      points at the CANONICAL visitor id.
+//   6. Asserting the duplicate visitor row is gone and the unique index
+//      was created.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_visitor_dedup_migration_repoints_session_replay_sessions() -> anyhow::Result<()> {
+    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+        println!(
+            "⏭️  Skipping test_visitor_dedup_migration_repoints_session_replay_sessions: \
+             external database in use"
+        );
+        return Ok(());
+    }
+
+    let container = GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .start()
+        .await
+        .expect("Failed to start TimescaleDB container");
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db_url = format!("postgresql://postgres:postgres@localhost:{}/postgres", port);
+
+    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    let db = connect_with_retries(&db_url).await?;
+
+    // ── 1. Apply every migration up to but not including the target. ──────
+    let target = "m20260705_000001_add_visitor_unique_index";
+    let pre_target_count = Migrator::migrations()
+        .iter()
+        .position(|m| m.name() == target)
+        .unwrap_or_else(|| panic!("migration {} not found in Migrator", target));
+    Migrator::up(&db, Some(pre_target_count as u32)).await?;
+
+    // Sanity: the target should not be applied yet.
+    let pre_state = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT EXISTS (SELECT 1 FROM seaql_migrations WHERE version = '{}') AS applied",
+                target
+            ),
+        ))
+        .await?
+        .expect("query returns one row");
+    let applied: bool = pre_state.try_get("", "applied")?;
+    assert!(
+        !applied,
+        "target migration {} must not be applied before the test body runs",
+        target
+    );
+
+    // ── 2. Insert minimal prerequisite rows. ─────────────────────────────
+    // project
+    db.execute_unprepared(
+        "INSERT INTO projects (name, repo_name, repo_owner, directory, main_branch, preset, \
+         created_at, updated_at, slug) \
+         VALUES ('test-proj', 'repo', 'owner', '.', 'main', 'nodejs', now(), now(), 'test-proj-slug')",
+    )
+    .await?;
+    let proj_row = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT id FROM projects WHERE slug = 'test-proj-slug'".to_string(),
+        ))
+        .await?
+        .expect("project row");
+    let proj_id: i32 = proj_row.try_get("", "id")?;
+
+    // environment
+    db.execute_unprepared(&format!(
+        "INSERT INTO environments (name, slug, subdomain, host, upstreams, \
+         created_at, updated_at, project_id) \
+         VALUES ('production', 'prod', 'prod', 'prod.example.test', '[]', \
+                 now(), now(), {proj_id})"
+    ))
+    .await?;
+    let env_row = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("SELECT id FROM environments WHERE project_id = {proj_id}"),
+        ))
+        .await?
+        .expect("environment row");
+    let env_id: i32 = env_row.try_get("", "id")?;
+
+    // deployment
+    db.execute_unprepared(&format!(
+        "INSERT INTO deployments (project_id, environment_id, created_at, updated_at, \
+         slug, state, metadata) \
+         VALUES ({proj_id}, {env_id}, now(), now(), 'deploy-1', 'ready', '{{}}'::json)"
+    ))
+    .await?;
+    let dep_row = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("SELECT id FROM deployments WHERE project_id = {proj_id}"),
+        ))
+        .await?
+        .expect("deployment row");
+    let dep_id: i32 = dep_row.try_get("", "id")?;
+
+    // ── 3. Insert two visitor rows with the same (visitor_id, project_id). ─
+    // The first INSERT gets the lower serial id → that is the canonical row.
+    // The second INSERT gets the higher serial id → that is the duplicate.
+    let shared_visitor_uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+    db.execute_unprepared(&format!(
+        "INSERT INTO visitor (visitor_id, first_seen, last_seen, project_id, environment_id) \
+         VALUES ('{shared_visitor_uuid}', now(), now(), {proj_id}, {env_id})"
+    ))
+    .await?;
+    let canonical_row = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT id FROM visitor WHERE visitor_id = '{shared_visitor_uuid}' \
+                 ORDER BY id ASC LIMIT 1"
+            ),
+        ))
+        .await?
+        .expect("canonical visitor row");
+    let canonical_id: i32 = canonical_row.try_get("", "id")?;
+
+    db.execute_unprepared(&format!(
+        "INSERT INTO visitor (visitor_id, first_seen, last_seen, project_id, environment_id) \
+         VALUES ('{shared_visitor_uuid}', now(), now(), {proj_id}, {env_id})"
+    ))
+    .await?;
+    let duplicate_row = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT id FROM visitor WHERE visitor_id = '{shared_visitor_uuid}' \
+                 ORDER BY id DESC LIMIT 1"
+            ),
+        ))
+        .await?
+        .expect("duplicate visitor row");
+    let duplicate_id: i32 = duplicate_row.try_get("", "id")?;
+
+    assert!(
+        canonical_id < duplicate_id,
+        "test setup error: canonical id ({}) must be < duplicate id ({})",
+        canonical_id,
+        duplicate_id
+    );
+
+    // ── 4. Insert a session_replay_sessions row pointing at the DUPLICATE. ─
+    // With the unfixed migration this row would be CASCADE-DELETED when the
+    // duplicate visitor row is deleted.
+    db.execute_unprepared(&format!(
+        "INSERT INTO session_replay_sessions \
+         (session_replay_id, visitor_id, project_id, environment_id, deployment_id) \
+         VALUES ('replay-001', {duplicate_id}, {proj_id}, {env_id}, {dep_id})"
+    ))
+    .await?;
+
+    // ── 5. Apply the target migration. ───────────────────────────────────
+    Migrator::up(&db, None).await?;
+
+    // ── 6. The session_replay_sessions row must STILL EXIST. ─────────────
+    let srs_count_row = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*)::int AS c FROM session_replay_sessions \
+             WHERE session_replay_id = 'replay-001'"
+                .to_string(),
+        ))
+        .await?
+        .expect("count row");
+    let srs_count: i32 = srs_count_row.try_get("", "c")?;
+    assert_eq!(
+        srs_count, 1,
+        "session_replay_sessions row must survive the migration — \
+         CASCADE-DELETE via duplicate visitor deletion is the bug being fixed"
+    );
+
+    // ── 7. Its visitor_id must now point at the CANONICAL row. ───────────
+    let srs_row = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT visitor_id FROM session_replay_sessions \
+             WHERE session_replay_id = 'replay-001'"
+                .to_string(),
+        ))
+        .await?
+        .expect("session_replay_sessions row");
+    let repointed_visitor_id: i32 = srs_row.try_get("", "visitor_id")?;
+    assert_eq!(
+        repointed_visitor_id, canonical_id,
+        "session_replay_sessions.visitor_id must be repointed from \
+         duplicate ({}) to canonical ({}), got {}",
+        duplicate_id, canonical_id, repointed_visitor_id
+    );
+
+    // ── 8. The duplicate visitor row must be gone; canonical must remain. ─
+    let visitor_count_row = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT count(*)::int AS c FROM visitor \
+                 WHERE visitor_id = '{shared_visitor_uuid}'"
+            ),
+        ))
+        .await?
+        .expect("visitor count row");
+    let visitor_count: i32 = visitor_count_row.try_get("", "c")?;
+    assert_eq!(
+        visitor_count, 1,
+        "exactly one visitor row must remain after deduplication (got {})",
+        visitor_count
+    );
+
+    let remaining_row = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("SELECT id FROM visitor WHERE visitor_id = '{shared_visitor_uuid}'"),
+        ))
+        .await?
+        .expect("remaining visitor row");
+    let remaining_id: i32 = remaining_row.try_get("", "id")?;
+    assert_eq!(
+        remaining_id, canonical_id,
+        "the remaining visitor row must be the canonical (lowest-id) one"
+    );
+
+    // ── 9. The unique index must exist. ───────────────────────────────────
+    let idx_row = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT EXISTS (SELECT 1 FROM pg_indexes \
+             WHERE indexname = 'visitor_visitor_id_project_id_key') AS present"
+                .to_string(),
+        ))
+        .await?
+        .expect("index query");
+    let idx_present: bool = idx_row.try_get("", "present")?;
+    assert!(
+        idx_present,
+        "visitor_visitor_id_project_id_key unique index must exist after migration"
+    );
+
+    println!(
+        "✅ visitor dedup migration correctly repointed session_replay_sessions \
+         from duplicate visitor {} to canonical visitor {} and created unique index",
+        duplicate_id, canonical_id
+    );
+    Ok(())
+}
+
 async fn connect_with_retries(db_url: &str) -> anyhow::Result<DatabaseConnection> {
     let mut retries = 5;
     loop {

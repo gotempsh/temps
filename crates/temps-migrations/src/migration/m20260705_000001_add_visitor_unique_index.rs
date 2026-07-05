@@ -7,12 +7,24 @@ use sea_orm_migration::prelude::*;
 /// must be impossible. The migration:
 ///
 ///   1. Deduplicates any existing duplicate pairs: for each (visitor_id,
-///      project_id) group, retain the row with the smallest `id` and NULL out
-///      FK references in dependent tables (`proxy_logs.visitor_id`,
-///      `request_sessions.visitor_id`) that point to the rows that will be
-///      deleted, then delete those rows.
-///   2. Creates `UNIQUE INDEX CONCURRENTLY IF NOT EXISTS` so this works on
-///      production without blocking reads.
+///      project_id) group, retain the row with the smallest `id` (the
+///      canonical row) and re-point FK references in ALL dependent tables to
+///      the canonical row before deleting the duplicates. The eight tables
+///      whose `visitor_id` FK is re-pointed are:
+///        - `proxy_logs`             (ON DELETE SetNull)
+///        - `request_sessions`       (ON DELETE SetNull)
+///        - `session_replay_sessions` (ON DELETE Cascade — critical: without
+///          this repoint the duplicate-visitor DELETE would CASCADE-DELETE all
+///          associated session replay recordings, causing permanent data loss)
+///        - `performance_metrics`    (ON DELETE SetNull)
+///        - `request_logs`           (ON DELETE SetNull)
+///        - `events`                 (ON DELETE SetNull)
+///        - `error_groups`           (ON DELETE SetNull)
+///        - `error_events`           (ON DELETE SetNull)
+///   2. Creates `UNIQUE INDEX IF NOT EXISTS` so the upsert path is safe.
+///      (CONCURRENTLY cannot run inside a transaction block; on large
+///      production tables run this step manually outside a transaction after
+///      the migration if blocking reads is a concern.)
 ///
 /// Down removes the index (does NOT restore deleted rows).
 pub struct Migration;
@@ -69,6 +81,138 @@ impl MigrationTrait for Migration {
                    AND dup.project_id = canonical.project_id
                    AND dup.id <> canonical.id
                 WHERE rs.visitor_id = dup.id;
+                "#,
+            )
+            .await?;
+
+        manager
+            .get_connection()
+            .execute_unprepared(
+                r#"
+                -- Re-point session_replay_sessions.visitor_id to the canonical visitor row
+                UPDATE session_replay_sessions srs
+                SET visitor_id = canonical.id
+                FROM (
+                    SELECT visitor_id, project_id, MIN(id) AS id
+                    FROM visitor
+                    GROUP BY visitor_id, project_id
+                    HAVING COUNT(*) > 1
+                ) canonical
+                JOIN visitor dup
+                    ON dup.visitor_id = canonical.visitor_id
+                   AND dup.project_id = canonical.project_id
+                   AND dup.id <> canonical.id
+                WHERE srs.visitor_id = dup.id;
+                "#,
+            )
+            .await?;
+
+        manager
+            .get_connection()
+            .execute_unprepared(
+                r#"
+                -- Re-point performance_metrics.visitor_id to the canonical visitor row
+                UPDATE performance_metrics pm
+                SET visitor_id = canonical.id
+                FROM (
+                    SELECT visitor_id, project_id, MIN(id) AS id
+                    FROM visitor
+                    GROUP BY visitor_id, project_id
+                    HAVING COUNT(*) > 1
+                ) canonical
+                JOIN visitor dup
+                    ON dup.visitor_id = canonical.visitor_id
+                   AND dup.project_id = canonical.project_id
+                   AND dup.id <> canonical.id
+                WHERE pm.visitor_id = dup.id;
+                "#,
+            )
+            .await?;
+
+        manager
+            .get_connection()
+            .execute_unprepared(
+                r#"
+                -- Re-point request_logs.visitor_id to the canonical visitor row
+                UPDATE request_logs rl
+                SET visitor_id = canonical.id
+                FROM (
+                    SELECT visitor_id, project_id, MIN(id) AS id
+                    FROM visitor
+                    GROUP BY visitor_id, project_id
+                    HAVING COUNT(*) > 1
+                ) canonical
+                JOIN visitor dup
+                    ON dup.visitor_id = canonical.visitor_id
+                   AND dup.project_id = canonical.project_id
+                   AND dup.id <> canonical.id
+                WHERE rl.visitor_id = dup.id;
+                "#,
+            )
+            .await?;
+
+        manager
+            .get_connection()
+            .execute_unprepared(
+                r#"
+                -- Re-point events.visitor_id to the canonical visitor row
+                UPDATE events ev
+                SET visitor_id = canonical.id
+                FROM (
+                    SELECT visitor_id, project_id, MIN(id) AS id
+                    FROM visitor
+                    GROUP BY visitor_id, project_id
+                    HAVING COUNT(*) > 1
+                ) canonical
+                JOIN visitor dup
+                    ON dup.visitor_id = canonical.visitor_id
+                   AND dup.project_id = canonical.project_id
+                   AND dup.id <> canonical.id
+                WHERE ev.visitor_id = dup.id;
+                "#,
+            )
+            .await?;
+
+        manager
+            .get_connection()
+            .execute_unprepared(
+                r#"
+                -- Re-point error_groups.visitor_id to the canonical visitor row
+                UPDATE error_groups eg
+                SET visitor_id = canonical.id
+                FROM (
+                    SELECT visitor_id, project_id, MIN(id) AS id
+                    FROM visitor
+                    GROUP BY visitor_id, project_id
+                    HAVING COUNT(*) > 1
+                ) canonical
+                JOIN visitor dup
+                    ON dup.visitor_id = canonical.visitor_id
+                   AND dup.project_id = canonical.project_id
+                   AND dup.id <> canonical.id
+                WHERE eg.visitor_id = dup.id;
+                "#,
+            )
+            .await?;
+
+        manager
+            .get_connection()
+            .execute_unprepared(
+                r#"
+                -- Re-point error_events.visitor_id to the canonical visitor row
+                UPDATE error_events ee
+                SET visitor_id = canonical.id
+                FROM (
+                    SELECT visitor_id, project_id, MIN(id) AS id
+                    FROM visitor
+                    GROUP BY visitor_id, project_id
+                    HAVING COUNT(*) > 1
+                ) canonical
+                JOIN visitor dup
+                    ON dup.visitor_id = canonical.visitor_id
+                   AND dup.project_id = canonical.project_id
+                   AND dup.id <> canonical.id
+                WHERE ee.visitor_id = dup.id;
                 "#,
             )
             .await?;
