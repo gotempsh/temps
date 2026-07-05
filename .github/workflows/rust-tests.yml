@@ -31,7 +31,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Cache wasm-pack binary
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cargo/bin/wasm-pack
           key: ${{ runner.os }}-wasm-pack-0.13
@@ -88,7 +88,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Cache wasm-pack binary
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cargo/bin/wasm-pack
           key: ${{ runner.os }}-wasm-pack-0.13
@@ -139,7 +139,7 @@ jobs:
           save-if: true
 
       - name: Cache wasm-pack binary
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cargo/bin/wasm-pack
           key: ${{ runner.os }}-wasm-pack-0.13
@@ -230,7 +230,7 @@ jobs:
           save-if: false
 
       - name: Cache wasm-pack binary
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cargo/bin/wasm-pack
           key: ${{ runner.os }}-wasm-pack-0.13
@@ -413,7 +413,7 @@ jobs:
           save-if: false
 
       - name: Cache wasm-pack binary
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cargo/bin/wasm-pack
           key: ${{ runner.os }}-wasm-pack-0.13

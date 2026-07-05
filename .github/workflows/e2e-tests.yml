@@ -72,7 +72,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Cache Bun dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: web/node_modules
           key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
@@ -81,7 +81,7 @@ jobs:
 
       - name: Cache wasm-pack binary
         id: wasm-pack-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cargo/bin/wasm-pack
           key: ${{ runner.os }}-wasm-pack-0.13
