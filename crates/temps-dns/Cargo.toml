@@ -36,7 +36,7 @@ cloudflare = "0.14"
 
 # AWS Signature V4 signing for Route53
 hmac = "0.12"
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 
 # GCP service account authentication

@@ -192,7 +192,7 @@ aes-gcm = "0.10.3"
 hkdf = "0.12"
 totp-rs = "5.7.0"
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 base64 = "0.22"
 hex = "0.4.3"
 # openidconnect 4.x — bumped from 3.x to clear three transitive
