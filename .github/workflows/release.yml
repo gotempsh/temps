@@ -103,7 +103,7 @@ jobs:
           ./temps --version || echo "Note: Binary may require runtime dependencies"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: temps-linux-amd64
           path: |
@@ -187,7 +187,7 @@ jobs:
           ./temps --version || echo "Note: Binary may require runtime dependencies"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: temps-linux-arm64
           path: |
@@ -269,7 +269,7 @@ jobs:
           ./temps --version || echo "Note: Binary may require runtime dependencies"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: temps-darwin-amd64
           path: |
@@ -351,7 +351,7 @@ jobs:
           ./temps --version || echo "Note: Binary may require runtime dependencies"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: temps-darwin-arm64
           path: |
@@ -803,7 +803,7 @@ jobs:
           find sandbox-context/bundle -type f | sort
 
       - name: Upload sandbox build context
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sandbox-context
           path: sandbox-context/

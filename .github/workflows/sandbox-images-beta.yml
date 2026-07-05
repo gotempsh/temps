@@ -159,7 +159,7 @@ jobs:
           find sandbox-context/bundle -type f | sort
 
       - name: Upload sandbox build context
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sandbox-context
           path: sandbox-context/
