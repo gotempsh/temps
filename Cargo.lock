@@ -12505,6 +12505,7 @@ dependencies = [
  "pingora-openssl",
  "pingora-proxy",
  "rand 0.8.6",
+ "rcgen 0.13.2",
  "regex",
  "rustls",
  "rustls-pemfile",
