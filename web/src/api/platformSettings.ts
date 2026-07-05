@@ -1,7 +1,6 @@
 import { getSettings, updateSettings } from '@/api/client'
 import type {
-  AppSettings,
-  DnsProviderSettings,
+  AppSettingsResponse,
   LetsEncryptSettings,
   ScreenshotSettings,
 } from '@/api/client/types.gen'
@@ -115,7 +114,7 @@ export interface MonitoringSettings {
    * True when a ClickHouse DSN is stored. The GET response masks the DSN
    * itself (it may embed credentials), so reads only expose this boolean.
    */
-  clickhouse_url_set?: boolean
+  clickhouse_url_set: boolean
   /**
    * ClickHouse DSN — only sent on writes when configuring ClickHouse. Never
    * returned by the GET response (see `clickhouse_url_set`). The server
@@ -125,8 +124,7 @@ export interface MonitoringSettings {
 }
 
 // Re-export the types from the API for consistency
-export interface PlatformSettings extends AppSettings {
-  dns_provider: DnsProviderSettings
+export interface PlatformSettings extends AppSettingsResponse {
   external_url: string | null
   internal_url: string | null
   letsencrypt: LetsEncryptSettings
@@ -135,22 +133,10 @@ export interface PlatformSettings extends AppSettings {
   security_headers: SecurityHeadersSettings
   rate_limiting: RateLimitSettings
   disk_space_alert: DiskSpaceAlertSettings
-  agent_sandbox: AgentSandboxSettings
   ai_config: AiConfigSettings
-  preview_gateway: PreviewGatewaySettings
-  multi_node: MultiNodeSettings
   insecure_tls: boolean
   attack_mode?: boolean
   build_limits: BuildLimitsSettings
-  monitoring: MonitoringSettings
-  /**
-   * The storage backend the runtime is actually using for metrics, after
-   * reconciling `monitoring.store` with the server's `TEMPS_CLICKHOUSE_*`
-   * configuration. Differs from `monitoring.store` when ClickHouse is selected
-   * but its env vars aren't fully set (the runtime then falls back to
-   * TimescaleDB). Read-only — computed server-side.
-   */
-  effective_metrics_store?: MetricsStoreKind
   /** Set to true by `temps setup` once initial configuration has been applied.
    * The web onboarding wizard checks this and skips itself when true. */
   setup_complete: boolean

@@ -15,6 +15,21 @@ export default {
         ? { Authorization: `Bearer ${env.TEMPS_API_KEY}` }
         : undefined,
     },
+    filters: {
+      operations: {
+        // Server-Sent Events endpoints: the @tanstack/react-query plugin
+        // generates a `const { data } = await ...` mutation wrapper for
+        // every operation uniformly, but `client.sse.post()` returns a
+        // ServerSentEventsResult (stream), which has no `.data` field —
+        // that mismatch fails `tsc`. Neither endpoint has a frontend
+        // consumer yet; exclude until real SSE consumption is built and
+        // this can be revisited.
+        exclude: [
+          'POST /projects/{project_id}/ai/conversations/{public_id}/messages',
+          'POST /settings/sandbox-rebuild',
+        ],
+      },
+    },
   },
   output: 'src/api/client',
   plugins: ['@tanstack/react-query'],
