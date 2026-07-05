@@ -361,28 +361,39 @@ jobs:
             test_args: >-
               --test-threads=1
 
-    services:
-      timescaledb:
-        image: timescale/timescaledb-ha:pg18
-        env:
-          POSTGRES_DB: test_db
-          POSTGRES_USER: test_user
-          POSTGRES_PASSWORD: test_password
-          POSTGRES_HOST_AUTH_METHOD: trust
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U test_user -d test_db"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
     steps:
       - name: Free up disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force
           sudo apt-get autoremove -y && sudo apt-get clean
+
+      # Started as a plain `docker run` step (not a `services:` container)
+      # because GitHub Actions' `services:` block has no way to override a
+      # service image's CMD, and every migration-driven test here creates
+      # its own hypertables/continuous aggregates (with refresh policies)
+      # in a fresh, short-lived schema against this one shared instance.
+      # TimescaleDB's background worker launcher polls for due jobs every
+      # ~60s independent of cargo test's own concurrency, and if its scan
+      # lands while one of those schemas is still alive, it launches a
+      # real background worker that races the test's own foreground
+      # transaction -- the same root cause fixed for TestDatabase's own
+      # containers in #196, just needed here too since this job never
+      # goes through that Rust code path. `max_background_workers=0`
+      # still allows CREATE EXTENSION / create_hypertable /
+      # add_continuous_aggregate_policy to succeed; it only stops the
+      # launcher from ever executing scheduled jobs, which no test here
+      # relies on.
+      - name: Start TimescaleDB (background workers disabled)
+        run: |
+          docker run -d --name timescaledb \
+            -e POSTGRES_DB=test_db \
+            -e POSTGRES_USER=test_user \
+            -e POSTGRES_PASSWORD=test_password \
+            -e POSTGRES_HOST_AUTH_METHOD=trust \
+            -p 5432:5432 \
+            timescale/timescaledb-ha:pg18 \
+            postgres -c timescaledb.max_background_workers=0
 
       - name: Checkout code
         uses: actions/checkout@v4
@@ -420,7 +431,14 @@ jobs:
 
       - name: Verify TimescaleDB is ready
         run: |
-          timeout 60 bash -c 'until nc -z localhost 5432; do sleep 1; done'
+          # pg_isready runs inside the container -- GitHub Actions'
+          # `services:` block used to gate the job on this same check via
+          # its `options: --health-cmd`, which we lost by switching to a
+          # plain `docker run` step (needed to pass a custom postgres CMD,
+          # see the step above). A bare `nc -z` here would only prove the
+          # TCP listener is up, not that Postgres has finished its
+          # first-boot initdb+restart cycle.
+          timeout 60 bash -c 'until docker exec timescaledb pg_isready -U test_user -d test_db; do sleep 1; done'
           echo "TimescaleDB is ready"
 
       - name: Run integration tests
