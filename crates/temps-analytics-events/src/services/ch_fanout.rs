@@ -306,7 +306,7 @@ impl ChFanoutWorker {
         };
 
         // 4. Push to CH via the typed Inserter.
-        let mut inserter = self.ch.insert::<ChEventRow>("events").map_err(|e| {
+        let mut inserter = self.ch.insert::<ChEventRow>("events").await.map_err(|e| {
             ChFanoutError::ClickHouseInsert {
                 first_event_id: first_id,
                 reason: format!("inserter setup failed: {e}"),

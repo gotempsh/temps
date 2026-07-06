@@ -64,10 +64,6 @@ impl PermissionInfo {
             Permission::UsersCreate => "Create new users",
             Permission::SystemAdmin => "Full system administration access",
             Permission::SystemRead => "View system configuration",
-            Permission::McpConnect => "Connect to MCP services",
-            Permission::McpExecute => "Execute MCP commands",
-            Permission::McpRead => "Read MCP data",
-            Permission::McpWrite => "Modify MCP configurations",
             Permission::ApiKeysRead => "View API keys",
             Permission::ApiKeysWrite => "Modify API keys",
             Permission::ApiKeysDelete => "Delete API keys",
@@ -94,9 +90,11 @@ impl RoleInfo {
     pub fn from_role(role: &Role) -> Self {
         let description = match role {
             Role::Admin => "Full administrative access to all resources",
+            Role::PlatformAdmin => {
+                "Platform administration (users, settings, system) without deploy access to projects or deployments"
+            }
             Role::User => "Standard user access with ability to manage own resources",
             Role::Reader => "Read-only access to resources",
-            Role::Mcp => "Access for MCP service operations",
             Role::ApiReader => "Read-only API access",
             Role::Custom => "Custom role with specific permissions",
             Role::MetricsIngest => "Token for infrastructure metrics ingest (si_ prefix)",

@@ -7,10 +7,8 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
+import { startContainer, stopContainer, restartContainer } from '@/api/client'
 import {
-  startContainerMutation,
-  stopContainerMutation,
-  restartContainerMutation,
   listContainersOptions,
   getContainerDetailOptions,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -53,20 +51,14 @@ export function ContainerActionDialog({
       }
 
       if (action === 'start') {
-        const options = startContainerMutation()
-        if (options.mutationFn) {
-          return await options.mutationFn(baseParams)
-        }
+        const { data } = await startContainer({ ...baseParams, throwOnError: true })
+        return data
       } else if (action === 'stop') {
-        const options = stopContainerMutation()
-        if (options.mutationFn) {
-          return await options.mutationFn(baseParams)
-        }
+        const { data } = await stopContainer({ ...baseParams, throwOnError: true })
+        return data
       } else if (action === 'restart') {
-        const options = restartContainerMutation()
-        if (options.mutationFn) {
-          return await options.mutationFn(baseParams)
-        }
+        const { data } = await restartContainer({ ...baseParams, throwOnError: true })
+        return data
       }
       throw new Error(`Invalid action: ${action}`)
     },

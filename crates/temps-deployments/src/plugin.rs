@@ -387,6 +387,17 @@ impl TempsPlugin for DeploymentsPlugin {
         // Get audit service for logging write operations
         let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
 
+        // Deployment-token management routes carry their own app state
+        // (`DeploymentTokenAppState`), so build it here and mount the router as
+        // a sub-router below. Without this wiring the token endpoints -- create,
+        // list, get, update, delete, and the rotate route -- 404 at runtime and
+        // never appear in the OpenAPI schema.
+        let deployment_token_state =
+            Arc::new(handlers::deployment_tokens::DeploymentTokenAppState {
+                deployment_token_service,
+                audit_service: audit_service.clone(),
+            });
+
         // Get data directory for local file storage
         let data_dir = config_service.data_dir();
 
@@ -428,11 +439,11 @@ impl TempsPlugin for DeploymentsPlugin {
         let external_images_routes = handlers::external_images::configure_routes();
         let remote_deployments_routes = handlers::remote_deployments::configure_routes();
         let admin_node_routes = handlers::nodes::configure_admin_routes();
-        let deployment_token_routes = handlers::deployment_tokens::configure_routes().with_state(
-            Arc::new(handlers::deployment_tokens::DeploymentTokenAppState {
-                deployment_token_service,
-            }),
-        );
+
+        // Token routes use their own state; apply it before merging so the
+        // combined router resolves to a single `Router<()>`.
+        let deployment_token_routes =
+            handlers::deployment_tokens::configure_routes().with_state(deployment_token_state);
 
         let routes = deployments_routes
             .merge(cron_routes)
@@ -497,21 +508,29 @@ mod tests {
         // This test just verifies the plugin structure is correct
     }
 
+    // Guards against the deployment-token router/schema being dropped from the
+    // plugin wiring: those endpoints previously never appeared in the OpenAPI
+    // schema (and 404'd at runtime) because `deployment_tokens` was merged into
+    // neither `configure_routes` nor `openapi_schema`.
     #[test]
-    fn test_openapi_schema_includes_deployment_token_routes() {
-        let plugin = DeploymentsPlugin::new();
-        let schema = plugin
+    fn openapi_schema_exposes_deployment_token_routes() {
+        let schema = DeploymentsPlugin::new()
             .openapi_schema()
-            .expect("deployments plugin should expose OpenAPI schema");
+            .expect("deployments plugin must expose an OpenAPI schema");
         let paths = schema.paths.paths;
 
         assert!(
+            paths.contains_key("/projects/{project_id}/deployment-tokens/{token_id}/rotate"),
+            "deployment-token rotate path must be in the merged OpenAPI schema; got paths: {:?}",
+            paths.keys().collect::<Vec<_>>()
+        );
+        assert!(
             paths.contains_key("/projects/{project_id}/deployment-tokens"),
-            "deployment token collection route should be exposed in plugin OpenAPI schema"
+            "deployment-token create/list paths must be in the merged OpenAPI schema"
         );
         assert!(
             paths.contains_key("/projects/{project_id}/deployment-tokens/{token_id}"),
-            "deployment token item route should be exposed in plugin OpenAPI schema"
+            "deployment-token item route must be in the merged OpenAPI schema"
         );
     }
 }

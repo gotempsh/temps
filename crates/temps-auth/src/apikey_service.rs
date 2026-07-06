@@ -204,7 +204,7 @@ impl ApiKeyService {
             // For predefined roles, validate the role exists
             if Role::from_str(&request.role_type).is_none() {
                 return Err(ApiKeyServiceError::ValidationError(
-                    format!("Invalid role type: {}. Valid roles are: admin, user, reader, mcp, api_reader, or custom", request.role_type)
+                    format!("Invalid role type: {}. Valid roles are: admin, platform_admin, user, reader, api_reader, or custom", request.role_type)
                 ));
             }
             None
@@ -479,6 +479,54 @@ impl ApiKeyService {
             expires_at: None,
         };
         self.update_api_key(user_id, api_key_id, request).await
+    }
+
+    /// Rotate an API key's secret in place.
+    ///
+    /// Generates a brand new plaintext secret for the same key record (same
+    /// id, name, role/permissions, and expiry policy), overwrites the stored
+    /// hash so the old secret stops authenticating immediately, and returns
+    /// the new plaintext secret exactly once -- mirroring `create_api_key`'s
+    /// "only shown at creation/rotation time" contract.
+    pub async fn rotate_api_key(
+        &self,
+        user_id: i32,
+        api_key_id: i32,
+    ) -> Result<CreateApiKeyResponse, ApiKeyServiceError> {
+        let api_key = ApiKeyEntity::find_by_id(api_key_id)
+            .filter(temps_entities::api_keys::Column::UserId.eq(user_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| {
+                ApiKeyServiceError::NotFound(format!("API key {} not found", api_key_id))
+            })?;
+
+        let new_secret = self.generate_api_key();
+        let key_hash = self.hash_api_key(&new_secret);
+        let key_prefix = new_secret.chars().take(8).collect::<String>();
+
+        let mut api_key_active: ApiKeyActiveModel = api_key.into();
+        api_key_active.key_hash = Set(key_hash);
+        api_key_active.key_prefix = Set(key_prefix.clone());
+        // The old secret is gone, so any "last used" timestamp recorded
+        // against it no longer means anything for the new secret.
+        api_key_active.last_used_at = Set(None);
+        api_key_active.updated_at = Set(Utc::now());
+
+        let updated = api_key_active.update(self.db.as_ref()).await?;
+
+        Ok(CreateApiKeyResponse {
+            id: updated.id,
+            name: updated.name,
+            key_prefix,
+            role_type: updated.role_type,
+            permissions: updated
+                .permissions
+                .and_then(|p| serde_json::from_str(&p).ok()),
+            api_key: new_secret, // Only returned on rotation
+            expires_at: updated.expires_at,
+            created_at: updated.created_at,
+        })
     }
 
     /// Generate a service-scoped metrics ingest key (`si_` prefix).
@@ -994,6 +1042,96 @@ mod tests {
 
         assert!(result.is_err());
         matches!(result.unwrap_err(), ApiKeyServiceError::NotFound(_));
+    }
+
+    // API Key Rotation Tests
+
+    #[tokio::test]
+    async fn test_rotate_api_key_invalidates_old_secret_and_issues_new_one() {
+        let (_db, api_key_service, user) = setup_test_env().await;
+
+        let create_response = api_key_service
+            .create_api_key(
+                user.id,
+                CreateApiKeyRequest {
+                    name: "Rotate Me".to_string(),
+                    role_type: "admin".to_string(),
+                    permissions: None,
+                    expires_at: Some(Utc::now() + Duration::days(30)),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Old secret works before rotation.
+        assert!(api_key_service
+            .validate_api_key(&create_response.api_key)
+            .await
+            .is_ok());
+
+        let rotated = api_key_service
+            .rotate_api_key(user.id, create_response.id)
+            .await
+            .unwrap();
+
+        // Same key record: id, name, role, and expiry policy unchanged.
+        assert_eq!(rotated.id, create_response.id);
+        assert_eq!(rotated.name, create_response.name);
+        assert_eq!(rotated.role_type, create_response.role_type);
+        assert_eq!(rotated.expires_at, create_response.expires_at);
+
+        // A brand new plaintext secret was minted.
+        assert_ne!(rotated.api_key, create_response.api_key);
+        assert!(rotated.api_key.starts_with("tk_"));
+
+        // The old secret must no longer authenticate ...
+        let old_result = api_key_service
+            .validate_api_key(&create_response.api_key)
+            .await;
+        assert!(old_result.is_err());
+        assert!(matches!(
+            old_result.unwrap_err(),
+            ApiKeyServiceError::Unauthorized(_)
+        ));
+
+        // ... while the new secret does.
+        let (validated_user, role, _, _, key_id) = api_key_service
+            .validate_api_key(&rotated.api_key)
+            .await
+            .unwrap();
+        assert_eq!(validated_user.id, user.id);
+        assert_eq!(role, Some(Role::Admin));
+        assert_eq!(key_id, create_response.id);
+    }
+
+    #[tokio::test]
+    async fn test_rotate_api_key_not_found() {
+        let (_db, api_key_service, user) = setup_test_env().await;
+
+        let result = api_key_service.rotate_api_key(user.id, 999999).await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ApiKeyServiceError::NotFound(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_rotate_api_key_wrong_user_is_not_found() {
+        let (db, api_key_service, user) = setup_test_env().await;
+
+        let api_key = create_test_api_key(&db.db, user.id, "Test Key", "admin").await;
+
+        let result = api_key_service
+            .rotate_api_key(user.id + 1, api_key.id)
+            .await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ApiKeyServiceError::NotFound(_)
+        ));
     }
 
     // API Key Validation Tests
