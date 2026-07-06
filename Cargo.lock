@@ -11908,7 +11908,7 @@ name = "temps-git-credential"
 version = "0.1.0-beta.42"
 dependencies = [
  "chrono",
- "nix 0.29.0",
+ "nix 0.31.3",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -12252,7 +12252,7 @@ dependencies = [
  "mockall 0.13.1",
  "netlink-packet-core 0.7.0",
  "netlink-packet-route",
- "nix 0.29.0",
+ "nix 0.31.3",
  "rtnetlink",
  "sea-orm",
  "sea-orm-migration",
@@ -12602,7 +12602,7 @@ dependencies = [
  "clap",
  "futures",
  "libc",
- "nix 0.29.0",
+ "nix 0.31.3",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
