@@ -192,7 +192,14 @@ aes-gcm = "0.10.3"
 hkdf = "0.12"
 totp-rs = "5.7.0"
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
-sha2 = "0.11.0"
+# NOTE: pinned below 0.11 -- the 0.11 bump (dependabot PR #225, merged into
+# origin/main as ee38f985) breaks compilation across the workspace: several
+# crates format digests with `{:x}` (relies on sha2 0.10's GenericArray
+# implementing LowerHex, which sha2 0.11's Array type does not), and RSA/HMAC
+# signing in temps-dns's AWS/GCP providers pull in `rsa`/`hmac 0.12`, which
+# are still pinned to `digest 0.10` and conflict with a 0.11 Sha256. Revert
+# until those call sites are migrated in a dedicated PR.
+sha2 = "0.10.9"
 base64 = "0.22"
 hex = "0.4.3"
 # openidconnect 4.x — bumped from 3.x to clear three transitive
@@ -305,6 +312,18 @@ clap = { version = "4.4", features = ["derive", "env"] }
 # ============================================================================
 bytes = "1.11.1"
 libc = "0.2"
+# jemalloc as the global allocator (temps-cli bin only) -- reduces RSS
+# fragmentation vs. glibc malloc under the proxy's high-churn, multi-threaded
+# allocation pattern (many short-lived per-request allocations across cores).
+# "profiling"/"stats" compile in jemalloc's heap profiler and stats counters.
+# Both are INERT unless enabled at process start via the env var
+# `_RJEM_MALLOC_CONF` (tikv builds jemalloc with the `_rjem_` symbol prefix),
+# e.g.:
+#   _RJEM_MALLOC_CONF=prof:true,prof_active:true,lg_prof_sample:19,prof_prefix:/tmp/jeprof
+# so production/default runs pay nothing. Dumps are pprof-compatible
+# (`jeprof` / `pprof -symbolize`). Note: macOS `leaks`/MallocStackLogging
+# cannot see jemalloc allocations -- this is the supported way to profile.
+tikv-jemallocator = { version = "0.6", features = ["profiling", "stats"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 rand = "0.8"
 sysinfo = "0.29.0"

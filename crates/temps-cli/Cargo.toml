@@ -123,6 +123,9 @@ bytes = { workspace = true }
 http-body-util = { workspace = true }
 libc = { workspace = true }
 
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { workspace = true }
+
 [dev-dependencies]
 # `tower`'s `util` feature provides `ServiceExt::oneshot`, used to drive the
 # console health router through a single request in unit tests without binding
