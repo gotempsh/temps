@@ -10,6 +10,7 @@ use axum::{
     Router,
 };
 use std::sync::Arc;
+use temps_auth::{Permission, RequireAuth};
 use tracing::{debug, error};
 use utoipa::OpenApi;
 
@@ -41,19 +42,31 @@ pub struct FileApiDoc;
     tag = "Files",
     responses(
         (status = 200, description = "File content retrieved successfully", content_type = "application/octet-stream"),
-        (status = 403, description = "Access denied - path outside static directory"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Access denied - path outside static directory or insufficient permissions"),
         (status = 404, description = "File not found"),
         (status = 500, description = "Internal server error")
     ),
     params(
         ("file_path" = String, Path, description = "Relative path to the file from static directory")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 async fn get_file(
+    RequireAuth(auth): RequireAuth,
     Path(file_path): Path<String>,
     State(state): State<Arc<FileState>>,
 ) -> impl IntoResponse {
     debug!("GET /files/{}", file_path);
+
+    if !auth.has_permission(&Permission::FilesRead) {
+        error!("Insufficient permissions to read file: {}", file_path);
+        return (
+            StatusCode::FORBIDDEN,
+            [(header::CONTENT_TYPE, "text/plain")],
+            b"Insufficient permissions".to_vec(),
+        );
+    }
 
     match state.file_service.get_file(&file_path).await {
         Ok(content) => {

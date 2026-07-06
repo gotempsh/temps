@@ -12,6 +12,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use temps_auth::{deny_deployment_token, permission_guard, project_scope_guard, RequireAuth};
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::Problem;
 use temps_core::RequestMetadata;
@@ -391,14 +392,21 @@ impl From<SessionReplayError> for Problem {
     responses(
         (status = 200, description = "Session replays retrieved successfully", body = GetProjectSessionReplaysResponse),
         (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Insufficient permissions", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
-    tag = "Analytics"
+    tag = "Analytics",
+    security(("bearer_auth" = []))
 )]
 pub async fn get_project_session_replays(
+    RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
     Query(query): Query<GetProjectSessionReplaysQuery>,
 ) -> Result<Json<GetProjectSessionReplaysResponse>, Problem> {
+    permission_guard!(auth, AnalyticsRead);
+    project_scope_guard!(auth, query.project_id);
+
     debug!("Getting session replays for project: {}", query.project_id);
 
     let page = query.page.unwrap_or(1);
@@ -435,15 +443,24 @@ pub async fn get_project_session_replays(
     ),
     responses(
         (status = 200, description = "Session replays retrieved successfully", body = GetVisitorSessionsResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Insufficient permissions", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
-    tag = "Analytics"
+    tag = "Analytics",
+    security(("bearer_auth" = []))
 )]
 pub async fn get_visitor_sessions(
+    RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path(visitor_id): Path<i32>,
     Query(query): Query<GetVisitorSessionsQuery>,
 ) -> Result<Json<GetVisitorSessionsResponse>, Problem> {
+    permission_guard!(auth, AnalyticsRead);
+    // No project_id is available on this route (only visitor_id) — deny
+    // project-scoped deployment tokens outright rather than skip scoping.
+    deny_deployment_token!(auth);
+
     debug!("Getting session replays for visitor: {}", visitor_id);
 
     let page = query.page.unwrap_or(1);
@@ -480,15 +497,22 @@ pub async fn get_visitor_sessions(
     ),
     responses(
         (status = 200, description = "Session replay retrieved successfully", body = GetSessionReplayResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Insufficient permissions", body = ErrorResponse),
         (status = 404, description = "Session not found", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
-    tag = "Analytics"
+    tag = "Analytics",
+    security(("bearer_auth" = []))
 )]
 pub async fn get_session_replay(
+    RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path((visitor_id, session_id)): Path<(i32, i32)>,
 ) -> Result<Json<GetSessionReplayResponse>, Problem> {
+    permission_guard!(auth, AnalyticsRead);
+    deny_deployment_token!(auth);
+
     debug!(
         "Getting session replay: {} for visitor: {}",
         session_id, visitor_id
@@ -516,15 +540,22 @@ pub async fn get_session_replay(
     ),
     responses(
         (status = 200, description = "Session replay with events retrieved successfully", body = SessionReplayWithEventsDto),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Insufficient permissions", body = ErrorResponse),
         (status = 404, description = "Session not found", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
-    tag = "Analytics"
+    tag = "Analytics",
+    security(("bearer_auth" = []))
 )]
 pub async fn get_session_replay_events(
+    RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path((visitor_id, session_id)): Path<(i32, i32)>,
 ) -> Result<Json<SessionReplayWithEventsDto>, Problem> {
+    permission_guard!(auth, AnalyticsRead);
+    deny_deployment_token!(auth);
+
     debug!(
         "Getting session replay events: {} for visitor: {}",
         session_id, visitor_id
@@ -551,16 +582,23 @@ pub async fn get_session_replay_events(
     request_body = UpdateSessionDurationRequest,
     responses(
         (status = 200, description = "Session duration updated successfully", body = UpdateSessionDurationResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Insufficient permissions", body = ErrorResponse),
         (status = 404, description = "Session not found", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
-    tag = "Analytics"
+    tag = "Analytics",
+    security(("bearer_auth" = []))
 )]
 pub async fn update_session_duration(
+    RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path((visitor_id, session_id)): Path<(i32, String)>,
     Json(request): Json<UpdateSessionDurationRequest>,
 ) -> Result<Json<UpdateSessionDurationResponse>, Problem> {
+    permission_guard!(auth, AnalyticsWrite);
+    deny_deployment_token!(auth);
+
     debug!(
         "Updating duration for session: {} for visitor: {}",
         session_id, visitor_id
@@ -588,15 +626,22 @@ pub async fn update_session_duration(
     ),
     responses(
         (status = 200, description = "Session replay deleted successfully"),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Insufficient permissions", body = ErrorResponse),
         (status = 404, description = "Session not found", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
-    tag = "Analytics"
+    tag = "Analytics",
+    security(("bearer_auth" = []))
 )]
 pub async fn delete_session_replay(
+    RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path((visitor_id, session_id)): Path<(i32, String)>,
 ) -> Result<StatusCode, Problem> {
+    permission_guard!(auth, AnalyticsWrite);
+    deny_deployment_token!(auth);
+
     debug!(
         "Deleting session replay: {} for visitor: {}",
         session_id, visitor_id
@@ -624,16 +669,23 @@ pub async fn delete_session_replay(
     responses(
         (status = 200, description = "Events added successfully", body = AddEventsResponse),
         (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Insufficient permissions", body = ErrorResponse),
         (status = 404, description = "Session not found", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
-    tag = "Analytics"
+    tag = "Analytics",
+    security(("bearer_auth" = []))
 )]
 pub async fn add_events(
+    RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path((visitor_id, session_id)): Path<(i32, String)>,
     Json(request): Json<AddEventsRequest>,
 ) -> Result<Json<AddEventsResponse>, Problem> {
+    permission_guard!(auth, AnalyticsWrite);
+    deny_deployment_token!(auth);
+
     debug!(
         "Adding events to session: {} for visitor: {}",
         session_id, visitor_id

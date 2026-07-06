@@ -5040,7 +5040,7 @@ dependencies = [
  "hyper",
  "hyper-rustls",
  "hyper-util",
- "rcgen",
+ "rcgen 0.14.8",
  "rustls",
  "rustls-pki-types",
  "serde",
@@ -6686,7 +6686,7 @@ version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
 dependencies = [
- "base64 0.21.7",
+ "base64 0.22.1",
  "chrono",
  "getrandom 0.2.17",
  "http 1.4.2",
@@ -8417,6 +8417,20 @@ dependencies = [
 
 [[package]]
 name = "rcgen"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75e669e5202259b5314d1ea5397316ad400819437857b90861765f24c4cf80a2"
+dependencies = [
+ "pem",
+ "ring",
+ "rustls-pki-types",
+ "time",
+ "x509-parser 0.16.0",
+ "yasna 0.5.2",
+]
+
+[[package]]
+name = "rcgen"
 version = "0.14.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57f6d249aad744e274e682777a50283a225a32705394ee6d5fcc01efa25e4055"
@@ -8427,7 +8441,7 @@ dependencies = [
  "rustls-pki-types",
  "time",
  "x509-parser 0.18.1",
- "yasna",
+ "yasna 0.6.0",
 ]
 
 [[package]]
@@ -10910,6 +10924,7 @@ dependencies = [
  "sea-orm",
  "serde",
  "serde_json",
+ "temps-auth",
  "temps-core",
  "temps-entities",
  "temps-geo",
@@ -11283,7 +11298,7 @@ dependencies = [
  "log",
  "once_cell",
  "rand 0.8.6",
- "rcgen",
+ "rcgen 0.13.2",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -11508,7 +11523,7 @@ dependencies = [
  "hyper-util",
  "instant-acme",
  "log",
- "rcgen",
+ "rcgen 0.14.8",
  "reqwest 0.12.28",
  "rustls",
  "rustls-native-certs",
@@ -11832,6 +11847,7 @@ dependencies = [
  "rand 0.8.6",
  "sea-orm",
  "serde",
+ "temps-auth",
  "temps-core",
  "temps-database",
  "temps-entities",
@@ -12548,7 +12564,7 @@ dependencies = [
  "pingora-openssl",
  "pingora-proxy",
  "rand 0.8.6",
- "rcgen",
+ "rcgen 0.13.2",
  "regex",
  "rustls",
  "rustls-pemfile",
@@ -12829,6 +12845,7 @@ name = "temps-static-files"
 version = "0.1.0-beta.42"
 dependencies = [
  "axum 0.8.9",
+ "temps-auth",
  "temps-config",
  "temps-core",
  "tokio",
@@ -15418,6 +15435,7 @@ dependencies = [
  "lazy_static",
  "nom 7.1.3",
  "oid-registry 0.7.1",
+ "ring",
  "rusticata-macros",
  "thiserror 1.0.69",
  "time",
@@ -15499,6 +15517,15 @@ name = "yansi"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
+
+[[package]]
+name = "yasna"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e17bb3549cc1321ae1296b9cdc2698e2b6cb1992adfa19a8c72e5b7a738f44cd"
+dependencies = [
+ "time",
+]
 
 [[package]]
 name = "yasna"

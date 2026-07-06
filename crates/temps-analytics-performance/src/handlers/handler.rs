@@ -14,9 +14,44 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use temps_auth::{AuthContext, Permission, RequireAuth};
 use temps_core::DateTime;
 use tracing::{error, info};
 use utoipa::{OpenApi, ToSchema};
+
+/// Manual auth check for this crate's dashboard-query handlers.
+///
+/// These handlers predate the `Result<impl IntoResponse, Problem>` convention
+/// used elsewhere and return `(StatusCode, Json<ErrorResponse>)` instead, so
+/// they can't use the `permission_guard!`/`project_scope_guard!` macros
+/// directly (those return `Problem`). This mirrors the same two checks.
+fn require_analytics_read(
+    auth: &AuthContext,
+    project_id: i32,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if !auth.has_permission(&Permission::AnalyticsRead) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "Insufficient permissions".to_string(),
+                details: Some("This operation requires the AnalyticsRead permission".to_string()),
+            }),
+        ));
+    }
+    if !auth.is_scoped_to_project(project_id) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "Cross-project access denied".to_string(),
+                details: Some(
+                    "This deployment token is scoped to a different project and cannot access this resource"
+                        .to_string(),
+                ),
+            }),
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Deserialize, Clone, ToSchema)]
 pub struct PerformanceMetricsQuery {
@@ -160,13 +195,19 @@ pub fn configure_public_routes() -> Router<Arc<AppState>> {
     responses(
         (status = 200, description = "Successfully retrieved performance metrics", body = PerformanceMetricsResponse),
         (status = 400, description = "Invalid date format or missing parameters", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Insufficient permissions", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 async fn get_performance_metrics(
+    RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
     Query(query): Query<PerformanceMetricsQuery>,
 ) -> Result<Json<PerformanceMetricsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    require_analytics_read(&auth, query.project_id)?;
+
     match state
         .performance_service
         .get_metrics(
@@ -209,13 +250,19 @@ async fn get_performance_metrics(
     responses(
         (status = 200, description = "Successfully retrieved metrics over time", body = MetricsOverTimeResponse),
         (status = 400, description = "Invalid date format or missing parameters", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Insufficient permissions", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 async fn get_metrics_over_time(
+    RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
     Query(query): Query<PerformanceMetricsQuery>,
 ) -> Result<Json<MetricsOverTimeResponse>, (StatusCode, Json<ErrorResponse>)> {
+    require_analytics_read(&auth, query.project_id)?;
+
     match state
         .performance_service
         .get_metrics_over_time(
@@ -258,13 +305,19 @@ async fn get_metrics_over_time(
     responses(
         (status = 200, description = "Successfully retrieved grouped page metrics", body = GroupedPageMetricsResponse),
         (status = 400, description = "Invalid date format, missing parameters, or invalid group_by value", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Insufficient permissions", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 async fn get_grouped_page_metrics(
+    RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
     Query(query): Query<GroupedPageMetricsQuery>,
 ) -> Result<Json<GroupedPageMetricsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    require_analytics_read(&auth, query.project_id)?;
+
     let group_by = match query.group_by.as_str() {
         "path" => GroupBy::Path,
         "country" => GroupBy::Country,
@@ -321,13 +374,19 @@ async fn get_grouped_page_metrics(
     ),
     responses(
         (status = 200, description = "Successfully checked performance metrics availability", body = HasMetricsResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Insufficient permissions", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 async fn has_performance_metrics(
+    RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
     Query(query): Query<HasMetricsQuery>,
 ) -> Result<Json<HasMetricsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    require_analytics_read(&auth, query.project_id)?;
+
     match state
         .performance_service
         .has_metrics(query.project_id)

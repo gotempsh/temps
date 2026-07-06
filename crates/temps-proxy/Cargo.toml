@@ -82,4 +82,9 @@ tower = "0.4"
 anyhow = "1.0"
 lazy_static = "1.4"
 temps-presets = { path = "../temps-presets" }
-rcgen = { workspace = true }
+# Pinned below 0.14, matching temps-core's override — the 0.14.8 bump changed
+# `CertifiedKey`'s field from `key_pair` to `signing_key` and made `signed_by`
+# take a single `&Issuer` argument instead of `(&cert, &key)`, breaking
+# tls_cert_loader.rs's self-signed cert generation. Revert until this crate is
+# migrated to the 0.14 Issuer API alongside temps-core's node_pki.rs.
+rcgen = "0.13.2"

@@ -45,7 +45,12 @@ arc-swap = "1.7"
 # Per-cluster CA + per-node certificate issuance for multi-node mTLS (ADR-020 WS-2.1).
 # Pinned to match temps-domains; x509-parser feature enables loading an existing CA
 # and parsing CSRs.
-rcgen = { version = "0.14.8", features = ["x509-parser"] }
+# NOTE: pinned below 0.14 -- the 0.14.8 bump (dependabot PR #222) breaks
+# node_pki.rs: `CertificateParams::from_ca_cert_pem` was removed (0.14 moved
+# CA-signing to the new `Issuer` API) and `Ia5String` is no longer re-exported.
+# Same failure class as the sha2 0.11 bump reverted in #247. Revert until
+# node_pki is migrated to the 0.14 Issuer API in a dedicated PR.
+rcgen = { version = "0.13.2", features = ["x509-parser"] }
 
 # Internal dependencies - only core dependencies to avoid cycles
 temps-memory = { path = "../temps-memory" }

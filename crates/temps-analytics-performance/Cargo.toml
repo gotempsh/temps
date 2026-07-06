@@ -12,6 +12,7 @@ temps-core = { path = "../temps-core" }
 temps-entities = { path = "../temps-entities" }
 temps-routes = { path = "../temps-routes" }
 temps-geo = { path = "../temps-geo" }
+temps-auth = { path = "../temps-auth" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
