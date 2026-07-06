@@ -4,7 +4,7 @@
 //! requests and shows an HTML password form. After the user enters the correct
 //! password, an HMAC-signed cookie is set so subsequent requests pass through.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 /// Cookie name for password-protected environments

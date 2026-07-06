@@ -52,6 +52,16 @@ async-trait = { workspace = true }
 async-stream = { workspace = true }
 urlencoding = { workspace = true }
 
+[features]
+# Docker-dependent integration tests. Mirrors temps-providers: gated behind a
+# feature so `cargo test` on a host without a reachable Docker socket skips
+# the heavy end-to-end tests, while CI opts in explicitly. The test files
+# themselves also skip gracefully at runtime when Docker is unreachable.
+docker-tests = []
+
 [dev-dependencies]
 sea-orm = { workspace = true, features = ["mock"] }
 testcontainers = { workspace = true }
+sqlx = { workspace = true }
+temps-migrations = { path = "../temps-migrations" }
+tracing-subscriber = { workspace = true }

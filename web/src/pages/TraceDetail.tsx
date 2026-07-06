@@ -34,6 +34,7 @@ import {
   TabsTrigger,
 } from '@/components/ui/tabs'
 import { useAssistantPageContext } from '@/components/ai/AiAssistantContext'
+import { usePageTitle } from '@/hooks/usePageTitle'
 import {
   SpanWaterfall,
   formatDuration,
@@ -560,6 +561,7 @@ export default function TraceDetail({ project }: TraceDetailProps) {
 
   const tree = useMemo(() => buildSpanTree(displaySpans), [displaySpans])
   const flatSpans = useMemo(() => flattenTree(tree), [tree])
+  usePageTitle(tree[0]?.span?.name ?? 'Trace')
 
   // Calculate trace-level timing for waterfall positioning
   const traceStart = useMemo(() => {

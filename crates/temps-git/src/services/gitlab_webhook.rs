@@ -336,7 +336,7 @@ pub fn verify_gitlab_signature(
     signing_token: &str,
 ) -> bool {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
 
     // Derive the HMAC key from the `whsec_<base64>` token.
@@ -405,7 +405,7 @@ pub fn generate_signing_token() -> String {
 mod tests {
     use super::*;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
 
     // ── helpers ───────────────────────────────────────────────────────────

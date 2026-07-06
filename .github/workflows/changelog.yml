@@ -81,7 +81,7 @@ jobs:
       # above still runs and gates every PR; only the preview comment is skipped.
       - name: Post preview comment
         if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const fs = require('fs');

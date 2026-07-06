@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use chrono::Utc;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use http::HeaderMap;
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 use sha2::Sha256;

@@ -144,7 +144,7 @@ impl DeploymentTokenValidationService {
     fn hash_token(&self, token: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(token.as_bytes());
-        format!("{:x}", hasher.finalize())
+        hex::encode(hasher.finalize())
     }
 }
 
@@ -167,7 +167,7 @@ mod tests {
 
         let mut hasher = Sha256::new();
         hasher.update(token.as_bytes());
-        let expected_hash = format!("{:x}", hasher.finalize());
+        let expected_hash = hex::encode(hasher.finalize());
 
         // Hash should be 64 chars (SHA256 hex)
         assert_eq!(expected_hash.len(), 64);
@@ -180,11 +180,11 @@ mod tests {
 
         let mut hasher1 = Sha256::new();
         hasher1.update(token.as_bytes());
-        let hash1 = format!("{:x}", hasher1.finalize());
+        let hash1 = hex::encode(hasher1.finalize());
 
         let mut hasher2 = Sha256::new();
         hasher2.update(token.as_bytes());
-        let hash2 = format!("{:x}", hasher2.finalize());
+        let hash2 = hex::encode(hasher2.finalize());
 
         assert_eq!(hash1, hash2);
     }
@@ -196,11 +196,11 @@ mod tests {
 
         let mut hasher1 = Sha256::new();
         hasher1.update(token1.as_bytes());
-        let hash1 = format!("{:x}", hasher1.finalize());
+        let hash1 = hex::encode(hasher1.finalize());
 
         let mut hasher2 = Sha256::new();
         hasher2.update(token2.as_bytes());
-        let hash2 = format!("{:x}", hasher2.finalize());
+        let hash2 = hex::encode(hasher2.finalize());
 
         assert_ne!(hash1, hash2);
     }
@@ -285,7 +285,7 @@ mod tests {
 
         let mut hasher = Sha256::new();
         hasher.update(token.as_bytes());
-        let token_hash = format!("{:x}", hasher.finalize());
+        let token_hash = hex::encode(hasher.finalize());
 
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![temps_entities::deployment_tokens::Model {
@@ -325,7 +325,7 @@ mod tests {
 
         let mut hasher = Sha256::new();
         hasher.update(token.as_bytes());
-        let token_hash = format!("{:x}", hasher.finalize());
+        let token_hash = hex::encode(hasher.finalize());
 
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![temps_entities::deployment_tokens::Model {
@@ -365,7 +365,7 @@ mod tests {
 
         let mut hasher = Sha256::new();
         hasher.update(token.as_bytes());
-        let token_hash = format!("{:x}", hasher.finalize());
+        let token_hash = hex::encode(hasher.finalize());
 
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![temps_entities::deployment_tokens::Model {
@@ -432,7 +432,7 @@ mod tests {
 
         let mut hasher = Sha256::new();
         hasher.update(token.as_bytes());
-        let token_hash = format!("{:x}", hasher.finalize());
+        let token_hash = hex::encode(hasher.finalize());
 
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![temps_entities::deployment_tokens::Model {
@@ -500,7 +500,7 @@ mod tests {
 
         let mut hasher = Sha256::new();
         hasher.update(token.as_bytes());
-        let token_hash = format!("{:x}", hasher.finalize());
+        let token_hash = hex::encode(hasher.finalize());
 
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![temps_entities::deployment_tokens::Model {
@@ -567,7 +567,7 @@ mod tests {
 
         let mut hasher = Sha256::new();
         hasher.update(token.as_bytes());
-        let token_hash = format!("{:x}", hasher.finalize());
+        let token_hash = hex::encode(hasher.finalize());
 
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![temps_entities::deployment_tokens::Model {
@@ -632,7 +632,7 @@ mod tests {
 
         let mut hasher = Sha256::new();
         hasher.update(token.as_bytes());
-        let token_hash = format!("{:x}", hasher.finalize());
+        let token_hash = hex::encode(hasher.finalize());
 
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![temps_entities::deployment_tokens::Model {

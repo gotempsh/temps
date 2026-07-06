@@ -4535,7 +4535,19 @@ mod tests {
         };
 
         // Create PostgreSQL service
-        let pg_port = 15432u16; // Use unique port
+        //
+        // Pick a free port so parallel test runs (and leaked containers from
+        // previous runs) don't collide. Previously hardcoded to 15432, which
+        // caused "port is already allocated" failures in CI when a leftover
+        // container held the port (see redis.rs's identical fix for 16379).
+        let pg_port = match find_available_port(15432) {
+            Some(p) => p,
+            None => {
+                println!("No available port in 15432..16432 range, skipping test");
+                let _ = minio.cleanup().await;
+                return;
+            }
+        };
         let pg_password = "testpass123";
         let service_name = format!("test_pg_backup_{}", chrono::Utc::now().timestamp_millis());
 
@@ -5234,6 +5246,7 @@ mod tests {
             consecutive_health_failures: 0,
             health_metadata: None,
             metrics_enabled: false,
+            default_backup_provisioned: false,
         };
         // Build a MockDatabase for the `pool` slot — restore_pitr for
         // Postgres doesn't touch it in the legacy-reject path.

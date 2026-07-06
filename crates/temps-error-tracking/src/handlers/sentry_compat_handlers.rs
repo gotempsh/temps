@@ -200,7 +200,7 @@ async fn authenticate_bearer(
     // Deployment tokens start with "dt_" — validate via hash lookup
     if token.starts_with("dt_") {
         use sha2::{Digest, Sha256};
-        let token_hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+        let token_hash = hex::encode(Sha256::digest(token.as_bytes()));
         let token_prefix: String = token.chars().take(8).collect();
 
         let dt = deployment_tokens::Entity::find()

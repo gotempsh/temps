@@ -739,7 +739,7 @@ fn verify_checksum(data: &[u8], checksum_text: &str) -> anyhow::Result<()> {
 
     let mut hasher = Sha256::new();
     hasher.update(data);
-    let computed = format!("{:x}", hasher.finalize());
+    let computed = hex::encode(hasher.finalize());
 
     // Checksum file format: "<hash>  <filename>" or "<hash> <filename>"
     let expected = checksum_text
@@ -1207,7 +1207,7 @@ mod tests {
         let data = b"hello world";
         let mut hasher = Sha256::new();
         hasher.update(data);
-        let hash = format!("{:x}", hasher.finalize());
+        let hash = hex::encode(hasher.finalize());
 
         let checksum_text = format!("{}  temps-darwin-arm64.tar.gz", hash);
         let result = verify_checksum(data, &checksum_text);

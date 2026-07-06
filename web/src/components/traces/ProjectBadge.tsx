@@ -35,7 +35,7 @@ export function ProjectBadge({
   return (
     <span
       className={cn(
-        'inline-flex max-w-[120px] items-center gap-1 truncate rounded px-1.5 py-0.5 text-[10px] font-medium',
+        'inline-flex max-w-[88px] shrink-0 items-center gap-1 truncate rounded px-1.5 py-0.5 text-[10px] font-medium',
         className
       )}
       style={{ backgroundColor: `${color}22`, color }}

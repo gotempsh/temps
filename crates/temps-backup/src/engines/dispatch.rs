@@ -13,6 +13,8 @@
 //! | `"postgres"`   | other        | no               | `"postgres_pgdump"` |
 //! | `"redis"`      | any          | –                | `"redis"`           |
 //! | `"mongodb"`    | any          | –                | `"mongodb"`         |
+//! | `"mariadb"`    | any          | yes (PITR tools) | `"mariadb_physical"` |
+//! | `"mariadb"`    | any          | no               | `"mariadb_dump"`    |
 //! | `"s3"` / `"minio"` / `"blob"` | any | –       | `"s3_mirror"`       |
 //! | anything else  | –            | –                | `Err(Unsupported)`  |
 
@@ -24,7 +26,7 @@ pub enum ResolveEngineError {
     /// The service's `service_type` is not supported by any registered engine.
     #[error(
         "Service type '{service_type}' (service_id={service_id}) is not supported by any backup engine. \
-         Supported types: postgres, redis, mongodb, s3, minio, blob"
+         Supported types: postgres, redis, mongodb, mariadb, s3, minio, blob"
     )]
     Unsupported {
         service_id: i32,
@@ -70,6 +72,21 @@ pub async fn resolve_engine_key(
         }
         "redis" => Ok("redis"),
         "mongodb" => Ok("mongodb"),
+        "mariadb" => {
+            // PITR needs both mariadb-backup (physical base) and
+            // mariadb-binlog (binary-log replay) inside the container.
+            // Container naming must match the provider's
+            // `get_container_name()` — `mariadb-{name}`
+            // (see temps-providers/src/externalsvc/mariadb.rs:298-300).
+            // Using a different prefix here makes the probe miss every
+            // container and silently fall back to the logical dump.
+            let container_name = format!("mariadb-{}", service.name);
+            if container_has_mariadb_pitr_tools(docker, &container_name).await {
+                Ok("mariadb_physical")
+            } else {
+                Ok("mariadb_dump")
+            }
+        }
         "s3" | "minio" | "blob" => Ok("s3_mirror"),
         other => Err(ResolveEngineError::Unsupported {
             service_id: service.id,
@@ -134,6 +151,68 @@ async fn container_has_walg(docker: &bollard::Docker, container_name: &str) -> b
     false
 }
 
+/// Probe whether the MariaDB PITR tools (`mariadb-backup` AND `mariadb-binlog`)
+/// are available in `container_name`.
+///
+/// Both are required: `mariadb-backup` for the physical base and
+/// `mariadb-binlog`/`mysqlbinlog` for replay. Returns `false` on any error or
+/// if either tool is missing, so the caller falls back to the logical
+/// `mariadb_dump` engine gracefully. The stock `mariadb:lts` image ships both,
+/// so this normally resolves to `mariadb_physical`.
+async fn container_has_mariadb_pitr_tools(docker: &bollard::Docker, container_name: &str) -> bool {
+    use bollard::exec::{CreateExecOptions, StartExecOptions};
+
+    // Single shell test: exit 0 only if BOTH tools resolve. `mariadb-binlog`
+    // and `mysqlbinlog` are the same tool (symlink); accept either.
+    let probe = "command -v mariadb-backup >/dev/null 2>&1 || command -v mariabackup >/dev/null 2>&1; \
+                 a=$?; \
+                 command -v mariadb-binlog >/dev/null 2>&1 || command -v mysqlbinlog >/dev/null 2>&1; \
+                 b=$?; \
+                 [ $a -eq 0 ] && [ $b -eq 0 ]";
+
+    let exec = match docker
+        .create_exec(
+            container_name,
+            CreateExecOptions {
+                cmd: Some(vec!["sh", "-c", probe]),
+                attach_stdout: Some(false),
+                attach_stderr: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+
+    if docker
+        .start_exec(
+            &exec.id,
+            Some(StartExecOptions {
+                detach: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .is_err()
+    {
+        return false;
+    }
+
+    for _ in 0..5u32 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        match docker.inspect_exec(&exec.id).await {
+            Ok(info) if info.running == Some(false) => {
+                return info.exit_code == Some(0);
+            }
+            Ok(_) => continue,
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -163,6 +242,7 @@ mod tests {
             consecutive_health_failures: 0,
             health_metadata: None,
             metrics_enabled: false,
+            default_backup_provisioned: false,
         }
     }
 
@@ -257,6 +337,26 @@ mod tests {
                     "got: {:?}",
                     result
                 );
+            });
+    }
+
+    #[test]
+    fn test_mariadb_resolves_to_dump_when_pitr_tools_absent() {
+        // With no running `mariadb-test-svc` container, the PITR-tools probe
+        // fails and dispatch must fall back to the logical dump engine.
+        let svc = make_service("mariadb", "standalone");
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let docker = bollard::Docker::connect_with_local_defaults();
+                if docker.is_err() {
+                    return;
+                }
+                let docker = docker.unwrap();
+                let result = resolve_engine_key(&svc, &docker).await;
+                assert!(matches!(result, Ok("mariadb_dump")), "got: {:?}", result);
             });
     }
 

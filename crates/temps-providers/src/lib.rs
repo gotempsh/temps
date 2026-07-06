@@ -3,6 +3,7 @@
 pub mod env_vars_provider_impl;
 pub mod externalsvc;
 pub mod health_monitor;
+pub mod mariadb_query;
 pub mod parameter_strategies;
 pub mod postgres_lifecycle;
 pub mod postgres_upgrade_service;

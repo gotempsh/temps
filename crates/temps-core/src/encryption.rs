@@ -115,10 +115,10 @@ impl EncryptionService {
     /// cryptographically independent from the master key and from other derived keys.
     /// Use this when you need a separate key for a specific purpose (e.g., HMAC signing).
     pub fn derive_subkey(&self, domain: &str) -> [u8; 32] {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         type HmacSha256 = Hmac<Sha256>;
 
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(self.master_key.as_slice())
+        let mut mac = HmacSha256::new_from_slice(self.master_key.as_slice())
             .expect("HMAC can take key of any size");
         mac.update(domain.as_bytes());
         let result = mac.finalize().into_bytes();

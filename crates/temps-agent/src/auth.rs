@@ -33,7 +33,7 @@ impl AgentAuth {
 /// SHA-256 hash a string and return lowercase hex.
 fn sha256_hex(input: &str) -> String {
     let digest = Sha256::digest(input.as_bytes());
-    format!("{:x}", digest)
+    hex::encode(digest)
 }
 
 /// Constant-time byte comparison to prevent timing attacks.

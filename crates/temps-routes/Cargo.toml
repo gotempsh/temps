@@ -36,6 +36,7 @@ serde_json = { workspace = true }
 axum = { workspace = true }
 http = { workspace = true }
 sha2 = { workspace = true }
+hex = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 
