@@ -2,6 +2,7 @@ use chrono::Utc;
 use moka::future::Cache;
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -25,6 +26,10 @@ const MAX_TRACKING_BATCH_SIZE: usize = 512;
 /// How long to wait before flushing a partial batch.
 const FLUSH_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Emit a shed warning once per this many dropped entries (per handle kind),
+/// so overload produces a handful of log lines instead of one per request.
+const DROP_LOG_EVERY: u64 = 10_000;
+
 /// TTL for the UUID → i32 id cache. Entries that haven't been accessed for
 /// this duration are evicted; the next flush will re-populate from the DB.
 const CACHE_TTL: Duration = Duration::from_secs(3600); // 1 hour
@@ -36,15 +41,27 @@ const CACHE_TTL: Duration = Duration::from_secs(3600); // 1 hour
 #[derive(Clone)]
 pub struct TrackingBatchHandle {
     sender: mpsc::Sender<TrackingEvent>,
+    dropped: Arc<AtomicU64>,
 }
 
 impl TrackingBatchHandle {
     /// Enqueue a tracking event. Non-blocking — drops the event if the channel
-    /// is full (fail-open), matching the proxy-log handle's behaviour.
+    /// is full (fail-open, load-shedding), matching the proxy-log handle.
     pub fn send(&self, event: TrackingEvent) {
         if self.sender.try_send(event).is_err() {
-            warn!("Tracking batch channel full, visitor/session event dropped");
+            let total = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            if total == 1 || total.is_multiple_of(DROP_LOG_EVERY) {
+                warn!(
+                    dropped_total = total,
+                    "Tracking batch channel full — shedding visitor/session events"
+                );
+            }
         }
+    }
+
+    /// Total tracking events shed since startup.
+    pub fn dropped_total(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 }
 
@@ -91,20 +108,32 @@ pub struct TrackingEvent {
 #[derive(Clone)]
 pub struct ProxyLogBatchHandle {
     sender: mpsc::Sender<CreateProxyLogRequest>,
+    dropped: Arc<AtomicU64>,
 }
 
 impl ProxyLogBatchHandle {
-    /// Send a log entry to the batch writer.
-    /// Applies backpressure when the channel is full (blocks the caller briefly).
-    /// Returns false if the batch writer has been shut down.
-    pub async fn send(&self, request: CreateProxyLogRequest) -> bool {
-        self.sender.send(request).await.is_ok()
+    /// Enqueue a log entry without ever blocking or queueing outside the
+    /// bounded channel. When the writer can't keep up the entry is DROPPED
+    /// (load-shedding, Cloudflare-style): access logs degrade under overload
+    /// so proxy memory stays flat. Never `.await`-send from the hot path and
+    /// never wrap this in `tokio::spawn` — parked send futures each pin the
+    /// full request struct and become an unbounded queue in the task list.
+    pub fn send_or_drop(&self, request: CreateProxyLogRequest) {
+        if self.sender.try_send(request).is_err() {
+            let total = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            if total == 1 || total.is_multiple_of(DROP_LOG_EVERY) {
+                warn!(
+                    dropped_total = total,
+                    capacity = CHANNEL_CAPACITY,
+                    "Proxy log channel full — shedding access-log entries"
+                );
+            }
+        }
     }
 
-    /// Try to send without blocking. Returns false if the channel is full or closed.
-    /// Use this in contexts where you cannot afford to wait (e.g., fail_to_proxy).
-    pub fn try_send(&self, request: CreateProxyLogRequest) -> bool {
-        self.sender.try_send(request).is_ok()
+    /// Total proxy-log entries shed since startup.
+    pub fn dropped_total(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 }
 
@@ -150,9 +179,13 @@ impl ProxyLogBatchWriter {
         let (sender, receiver) = mpsc::channel(CHANNEL_CAPACITY);
         let (tracking_sender, tracking_receiver) = mpsc::channel(CHANNEL_CAPACITY);
 
-        let log_handle = ProxyLogBatchHandle { sender };
+        let log_handle = ProxyLogBatchHandle {
+            sender,
+            dropped: Arc::new(AtomicU64::new(0)),
+        };
         let tracking_handle = TrackingBatchHandle {
             sender: tracking_sender,
+            dropped: Arc::new(AtomicU64::new(0)),
         };
 
         let visitor_id_cache = Cache::builder()
@@ -622,8 +655,9 @@ mod tests {
 
         let request = make_test_log_request("/");
 
-        // Send should succeed
-        assert!(handle.send(request).await);
+        // Enqueue should not shed when the channel has capacity
+        handle.send_or_drop(request);
+        assert_eq!(handle.dropped_total(), 0);
 
         // Verify the entry is in the channel
         let received = writer.receiver.try_recv();
@@ -640,8 +674,9 @@ mod tests {
 
         let request = make_test_log_request("/test");
 
-        // try_send should succeed when channel has capacity
-        assert!(handle.try_send(request));
+        // send_or_drop should not shed when channel has capacity
+        handle.send_or_drop(request);
+        assert_eq!(handle.dropped_total(), 0);
     }
 
     #[tokio::test]
@@ -656,8 +691,9 @@ mod tests {
 
         let request = make_test_log_request("/");
 
-        // Send should fail because the writer (receiver) is dropped
-        assert!(!handle.send(request).await);
+        // Enqueue counts a shed entry because the writer (receiver) is dropped
+        handle.send_or_drop(request);
+        assert_eq!(handle.dropped_total(), 1);
     }
 
     #[tokio::test]

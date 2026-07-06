@@ -378,14 +378,27 @@ pub fn setup_proxy_server(
         conf: None,       // No config file path
     };
 
-    let mut server = pingora_core::server::Server::new(Some(opt))?;
+    // Pingora's default ServerConf runs each service on a SINGLE worker thread,
+    // which caps the whole data plane at one core (~20k req/s) while the rest
+    // of the machine idles. Size the work-stealing runtime to the host, capped
+    // so the proxy doesn't starve the console/background services on big boxes.
+    let conf = pingora_core::server::configuration::ServerConf {
+        threads: std::thread::available_parallelism()
+            .map(|n| n.get().min(16))
+            .unwrap_or(4),
+        ..Default::default()
+    };
+    info!("Proxy data plane worker threads: {}", conf.threads);
+    let mut server = pingora_core::server::Server::new_with_opt_and_conf(Some(opt), conf);
     server.bootstrap();
 
     // Create HTTP proxy service using the builder (Pingora 0.8.0)
     // Limit downstream connection reuse to prevent slow memory leaks from long-lived
     // keep-alive connections. Equivalent to nginx's keepalive_requests directive.
+    // 8192 (vs 1024) keeps the leak bound while cutting connection-recycle churn
+    // 8x at high req/s (each recycle costs a client reconnect + a TIME_WAIT slot).
     let mut server_options = HttpServerOptions::default();
-    server_options.keepalive_request_limit = Some(1024);
+    server_options.keepalive_request_limit = Some(8192);
 
     let mut proxy_service = ProxyServiceBuilder::new(&server.configuration, lb)
         .name("Temps HTTP Proxy Service")

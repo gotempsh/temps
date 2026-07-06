@@ -1400,13 +1400,10 @@ impl LoadBalancer {
                 error_group_id: None,
             };
 
-            // Send to batch writer with backpressure (blocks briefly if buffer full)
-            let handle = self.proxy_log_handle.clone();
-            tokio::spawn(async move {
-                if !handle.send(proxy_log_request).await {
-                    warn!("Proxy log batch writer is closed, log entry dropped");
-                }
-            });
+            // Non-blocking enqueue; sheds the entry when the writer is behind.
+            // Never spawn-and-await a send here: each parked send future pins
+            // the full log struct and the task list becomes an unbounded queue.
+            self.proxy_log_handle.send_or_drop(proxy_log_request);
         }
 
         Ok(())
@@ -1524,10 +1521,8 @@ impl LoadBalancer {
             error_group_id: None,
         };
 
-        // Send to batch writer (non-blocking, drops if buffer full)
-        if !self.proxy_log_handle.try_send(proxy_log_request) {
-            warn!("Proxy log batch writer full, static file log entry dropped");
-        }
+        // Non-blocking enqueue; shed with rate-limited accounting when full.
+        self.proxy_log_handle.send_or_drop(proxy_log_request);
     }
 
     /// Set visitor and session cookies on the response.
@@ -4226,10 +4221,8 @@ impl ProxyHttp for LoadBalancer {
                 error_group_id: None,
             };
 
-            // Send to batch writer (non-blocking, drops if buffer full)
-            if !self.proxy_log_handle.try_send(proxy_log_request) {
-                warn!("Proxy log batch writer full, failed request log entry dropped");
-            }
+            // Non-blocking enqueue; shed with rate-limited accounting when full.
+            self.proxy_log_handle.send_or_drop(proxy_log_request);
         }
 
         FailToProxy {
