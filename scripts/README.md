@@ -69,6 +69,29 @@ Next steps:
 Push now? (y/N)
 ```
 
+## Testcontainer Cleanup
+
+`cleanup-testcontainers.sh` - Removes orphaned `testcontainers`-managed
+Docker containers left over from interrupted `cargo test` runs (the
+companion "Ryuk" reaper testcontainers-rs relies on for guaranteed
+cleanup doesn't reliably register on every machine, notably Docker
+Desktop for Mac). Left running, these accumulate DB connections until
+Postgres hits `max_connections` and refuses new connections entirely.
+
+Scoped to the `org.testcontainers.managed-by=testcontainers` label, so
+it only ever touches test infrastructure, never a real container.
+
+### Usage
+
+```bash
+scripts/cleanup-testcontainers.sh            # remove orphaned testcontainers
+scripts/cleanup-testcontainers.sh --dry-run  # list without removing
+```
+
+Run this whenever `docker ps` looks cluttered with old Postgres/Timescale
+containers after a round of local integration testing, or if Postgres
+itself starts refusing connections.
+
 ## Adding More Scripts
 
 When adding new scripts:
