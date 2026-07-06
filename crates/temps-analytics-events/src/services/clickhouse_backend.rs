@@ -1475,7 +1475,10 @@ mod tests {
     /// return deterministic results in tests (production tolerates some
     /// duplication during merges; tests want determinism).
     async fn insert_rows(client: &::clickhouse::Client, rows: &[SeedRow]) {
-        let mut inserter = client.insert::<SeedRow>("events").expect("inserter setup");
+        let mut inserter = client
+            .insert::<SeedRow>("events")
+            .await
+            .expect("inserter setup");
         for row in rows {
             inserter.write(row).await.expect("insert row");
         }

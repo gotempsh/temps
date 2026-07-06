@@ -7,7 +7,7 @@
 
 use crate::error::NetworkError;
 use crate::linux::bridge::link_index_by_name;
-use rtnetlink::Handle;
+use rtnetlink::{Handle, LinkUnspec, LinkVxlan};
 use std::net::IpAddr;
 use std::process::Stdio;
 use tokio::process::Command;
@@ -32,8 +32,7 @@ pub async fn ensure(
         // and the integration tests will catch it.
         handle
             .link()
-            .set(idx)
-            .mtu(mtu)
+            .set(LinkUnspec::new_with_index(idx).mtu(mtu).build())
             .execute()
             .await
             .map_err(|e| NetworkError::Vxlan {
@@ -42,8 +41,7 @@ pub async fn ensure(
             })?;
         handle
             .link()
-            .set(idx)
-            .up()
+            .set(LinkUnspec::new_with_index(idx).up().build())
             .execute()
             .await
             .map_err(|e| NetworkError::Vxlan {
@@ -63,11 +61,13 @@ pub async fn ensure(
 
     handle
         .link()
-        .add()
-        .vxlan(name.into(), vni)
-        .link(parent_index)
-        .port(port)
-        .learning(false)
+        .add(
+            LinkVxlan::new(name, vni)
+                .dev(parent_index)
+                .port(port)
+                .learning(false)
+                .build(),
+        )
         .execute()
         .await
         .map_err(|e| NetworkError::Vxlan {
@@ -84,8 +84,7 @@ pub async fn ensure(
 
     handle
         .link()
-        .set(idx)
-        .mtu(mtu)
+        .set(LinkUnspec::new_with_index(idx).mtu(mtu).build())
         .execute()
         .await
         .map_err(|e| NetworkError::Vxlan {
@@ -95,8 +94,7 @@ pub async fn ensure(
 
     handle
         .link()
-        .set(idx)
-        .up()
+        .set(LinkUnspec::new_with_index(idx).up().build())
         .execute()
         .await
         .map_err(|e| NetworkError::Vxlan {
@@ -130,8 +128,11 @@ pub async fn enslave_to_bridge(
 
     handle
         .link()
-        .set(vxlan_idx)
-        .controller(bridge_idx)
+        .set(
+            LinkUnspec::new_with_index(vxlan_idx)
+                .controller(bridge_idx)
+                .build(),
+        )
         .execute()
         .await
         .map_err(|e| NetworkError::Vxlan {

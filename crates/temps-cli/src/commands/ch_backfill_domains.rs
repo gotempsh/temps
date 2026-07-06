@@ -586,6 +586,7 @@ mod proxy_logs {
 
             let mut inserter = ch
                 .insert::<ChProxyLogRow>("proxy_logs")
+                .await
                 .context("ClickHouse proxy_logs inserter setup")?;
             for r in &rows {
                 inserter
@@ -706,6 +707,7 @@ mod traces {
 
             let mut inserter = ch
                 .insert::<ChSpanRow>("spans")
+                .await
                 .context("ClickHouse spans inserter setup")?;
             for r in &rows {
                 inserter
@@ -857,6 +859,7 @@ mod metrics {
 
                 let mut inserter = ch
                     .insert::<ChMetricRow>("service_metrics")
+                    .await
                     .context("ClickHouse service_metrics inserter setup")?;
                 for r in &rows {
                     inserter

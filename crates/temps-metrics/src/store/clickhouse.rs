@@ -336,6 +336,7 @@ impl MetricsStore for ClickhouseMetricsStore {
             let mut inserter = self
                 .client
                 .insert::<ChMetricRow>("service_metrics")
+                .await
                 .map_err(|e| MetricsError::ClickHouse {
                     operation: "write_batch (inserter setup)".to_string(),
                     reason: e.to_string(),

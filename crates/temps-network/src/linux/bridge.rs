@@ -3,7 +3,7 @@
 use crate::config::{NetworkConfig, NodeAlloc};
 use crate::error::NetworkError;
 use futures::TryStreamExt;
-use rtnetlink::Handle;
+use rtnetlink::{Handle, LinkBridge, LinkUnspec};
 use std::net::IpAddr;
 use tracing::{debug, info};
 
@@ -26,8 +26,7 @@ pub async fn ensure(
         None => {
             handle
                 .link()
-                .add()
-                .bridge(name.into())
+                .add(LinkBridge::new(name).build())
                 .execute()
                 .await
                 .map_err(|e| NetworkError::Netlink {
@@ -48,8 +47,7 @@ pub async fn ensure(
     // Set MTU. Idempotent — the kernel accepts setting the same value.
     handle
         .link()
-        .set(index)
-        .mtu(mtu)
+        .set(LinkUnspec::new_with_index(index).mtu(mtu).build())
         .execute()
         .await
         .map_err(|e| NetworkError::Netlink {
@@ -65,8 +63,7 @@ pub async fn ensure(
     // Bring up.
     handle
         .link()
-        .set(index)
-        .up()
+        .set(LinkUnspec::new_with_index(index).up().build())
         .execute()
         .await
         .map_err(|e| NetworkError::Netlink {
