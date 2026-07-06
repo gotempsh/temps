@@ -47,7 +47,7 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 mime_guess = "2.0"
 chrono = { workspace = true }
-clickhouse = { version = "0.13", features = ["uuid", "chrono"] }
+clickhouse = { version = "0.15", features = ["uuid", "chrono"] }
 thiserror = { workspace = true }
 base64 = { workspace = true }
 anyhow = { workspace = true }

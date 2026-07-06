@@ -19,7 +19,7 @@ tracing = { workspace = true }
 
 # ClickHouse metrics store (opt-in via TEMPS_CLICKHOUSE_*; TimescaleDB remains
 # the default). Version/features mirror temps-otel's CH backend.
-clickhouse = { version = "0.13", features = ["uuid", "chrono"] }
+clickhouse = { version = "0.15", features = ["uuid", "chrono"] }
 
 # Scraper: entity access and config
 temps-core = { path = "../temps-core" }

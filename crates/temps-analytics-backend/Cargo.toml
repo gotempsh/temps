@@ -34,7 +34,7 @@ uuid = { workspace = true }
 
 # ClickHouse client. Always linked — operators flip CH on by setting
 # TEMPS_CLICKHOUSE_*; we don't make them rebuild with a feature flag for it.
-clickhouse = { version = "0.13", features = ["uuid", "chrono"] }
+clickhouse = { version = "0.15", features = ["uuid", "chrono"] }
 
 [dev-dependencies]
 tokio = { workspace = true }
