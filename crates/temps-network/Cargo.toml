@@ -31,7 +31,7 @@ chrono = { workspace = true, optional = true }
 # so the crate still compiles on macOS/Windows for type-checking and shared logic tests.
 [target.'cfg(target_os = "linux")'.dependencies]
 rtnetlink = "0.14"
-netlink-packet-route = "0.19"
+netlink-packet-route = "0.30"
 netlink-packet-core = "0.7"
 nix = { version = "0.29", features = ["net", "sched", "fs"] }
 libc = "0.2"
