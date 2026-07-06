@@ -1917,6 +1917,16 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                     // observability, runtime/deploy status, errors, and MASKED
                     // metadata. Adding an entry is a security decision — verify the
                     // operation's response contains NO decrypted secret/token/key.
+                    //
+                    // Analytics `custom_data`/`event_data` (freeform JSON on
+                    // visitors/events) is an ACCEPTED risk, not an oversight: it's
+                    // developer-controlled data the project operator already sends
+                    // themselves, gated by the same AnalyticsRead + project scope
+                    // as every other analytics tool below — not a platform secret.
+                    // Raw HTTP request/response headers (session logs) and
+                    // session-replay DOM/keystroke capture are excluded on purpose;
+                    // those can carry Authorization/Cookie values or typed
+                    // passwords and are a different risk class entirely.
                     let allowlist: Vec<String> = [
                         // ── OpenTelemetry: metrics / traces / logs / health ──
                         "query_metrics",
@@ -2028,12 +2038,141 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                         // ── Analytics (the user's own traffic data) ──
                         "get_general_stats",
                         "get_visitor_stats",
+                        "get_visitors",
                         "get_today_stats",
                         "get_recent_activity",
                         "get_events_timeline",
                         "get_events_count",
                         "get_page_paths",
                         "get_performance_metrics",
+                        // Aggregates / counts / booleans — no PII, no secrets
+                        "get_analytics_events_count",
+                        "get_event_detail",
+                        "get_visitor_facets",
+                        "check_analytics_has_events",
+                        "get_page_path_detail",
+                        "get_page_hourly_sessions",
+                        "get_page_paths_sparklines",
+                        "get_page_flow",
+                        "has_analytics_events",
+                        "get_event_type_breakdown",
+                        "get_active_visitors",
+                        "get_hourly_visits",
+                        "get_unique_counts",
+                        "get_aggregated_buckets",
+                        "get_dashboard_projects_analytics",
+                        "get_metrics_over_time",
+                        "get_grouped_page_metrics",
+                        "has_performance_metrics",
+                        "get_funnel_metrics",
+                        "list_funnels",
+                        "get_unique_events",
+                        // Per-visitor/session metadata — same risk class as
+                        // get_visitors/get_visitor_stats above (IP, geolocation,
+                        // user_agent, is_crawler, custom_data/event_data)
+                        "get_event_visitors",
+                        "get_visitor_details",
+                        "get_visitor_info",
+                        "get_analytics_visitor_sessions",
+                        "get_visitor_journey",
+                        "get_session_details",
+                        "get_session_events",
+                        "get_page_path_visitors",
+                        "get_analytics_active_visitors",
+                        "get_live_visitors_list",
+                        "get_visitor_by_id",
+                        "get_visitor_by_guid",
+                        // Excluded on purpose: get_property_breakdown /
+                        // get_property_timeline (developer custom-property VALUES
+                        // by name — held pending explicit review), get_session_logs
+                        // (raw request/response headers), and all
+                        // temps-analytics-session-replay reads (raw DOM/keystroke
+                        // capture) — see allowlist comment above.
+                        //
+                        // ── Auth / API keys / OIDC (masked keys/secrets only) ──
+                        "list_api_keys",
+                        "get_api_key",
+                        "list_public_providers",
+                        "list_oidc_providers",
+                        "list_oidc_provider_users",
+                        "list_oidc_role_mappings",
+                        "get_current_user",
+                        // ── Webhooks (no signing secrets — those are excluded) ──
+                        "list_webhooks",
+                        "get_webhook",
+                        "list_deliveries",
+                        "get_delivery",
+                        "list_event_types",
+                        // ── KV / Blob: status only, no connection strings ──
+                        "kv_status",
+                        "blob_status",
+                        "blob_list",
+                        // ── Email: stats/tracking/DNS, no provider credentials ──
+                        "list_emails",
+                        "get_email",
+                        "get_email_stats",
+                        "list_email_domains",
+                        "get_global_event_stats",
+                        "get_global_events",
+                        "get_email_tracking",
+                        "get_email_events",
+                        "get_email_links",
+                        // ── Git: provider/connection/repo metadata, no OAuth tokens ──
+                        "list_git_providers",
+                        "get_git_provider",
+                        "list_connections",
+                        "list_repositories_by_connection",
+                        "list_repositories_by_provider",
+                        "list_synced_repositories",
+                        "get_repository_preset_by_name",
+                        "get_repository_by_name",
+                        "get_public_branches",
+                        "get_public_repository",
+                        // ── Agents / skills / MCP / sandbox — config + run status ──
+                        "list_agents",
+                        "get_agent",
+                        "list_skills",
+                        "get_skill",
+                        "list_mcps",
+                        "get_mcp",
+                        "list_global_skills",
+                        "get_global_skill",
+                        "list_global_mcps",
+                        "get_global_mcp",
+                        "get_run",
+                        "get_cli_status",
+                        "get_sandbox_status",
+                        "get_global_sandbox_status",
+                        // ── AI Gateway: masked keys, usage/cost stats, conversations ──
+                        "list_models",
+                        "get_usage_summary",
+                        "get_usage_by_provider",
+                        "get_usage_timeseries",
+                        "get_usage_top_models",
+                        "get_usage_recent",
+                        "get_conversations",
+                        "get_conversation_detail",
+                        "get_pricing",
+                        "list_provider_keys",
+                        // ── Status page: monitors/incidents/uptime ──
+                        "list_monitors",
+                        "get_monitor",
+                        "get_uptime_history",
+                        "get_bucketed_status",
+                        "list_incidents",
+                        "get_incident",
+                        "get_incident_updates",
+                        "get_bucketed_incidents",
+                        // ── Vulnerability scanning: results, no credentials ──
+                        "list_project_scans",
+                        "get_scan",
+                        "get_scan_vulnerabilities",
+                        "get_latest_scan",
+                        "get_latest_scans_per_environment",
+                        "get_scan_by_deployment",
+                        // ── Import ──
+                        "list_sources",
+                        "get_import_status",
                     ]
                     .iter()
                     .map(|s| s.to_string())
