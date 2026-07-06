@@ -239,7 +239,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
     "tls12",
     "logging",
 ] }
-webpki-roots = "0.26"
+webpki-roots = "1.0"
 
 # ============================================================================
 # Reverse Proxy (Pingora)
