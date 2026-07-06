@@ -69,7 +69,11 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: e2e-release
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          # Save from every ref, not just main — PRs used to depend entirely
+          # on main's copy surviving GitHub's cache eviction, which it
+          # routinely didn't (repo-wide cache churn from per-PR debug-build
+          # caches kept evicting this one). Now every PR keeps its own copy
+          # warm too.
 
       - name: Cache Bun dependencies
         uses: actions/cache@v6

@@ -29,6 +29,14 @@ jobs:
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
+        with:
+          # Share the same cache slot as build-tests/clippy instead of each
+          # getting its own — they compile largely the same dependency graph,
+          # and per-job caches were bloating the repo's total cache footprint
+          # enough to evict other workflows' caches (e.g. e2e-tests.yml's
+          # release build) well before their 7-day idle expiry.
+          shared-key: test-build
+          save-if: true
 
       - name: Cache wasm-pack binary
         uses: actions/cache@v6
@@ -112,6 +120,10 @@ jobs:
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
+        with:
+          # See the check job above for why this shares build-tests' key.
+          shared-key: test-build
+          save-if: true
 
       - name: Cache wasm-pack binary
         uses: actions/cache@v6
