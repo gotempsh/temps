@@ -554,7 +554,7 @@ impl ApiKeyService {
     pub(crate) fn hash_api_key(&self, api_key: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(api_key.as_bytes());
-        format!("{:x}", hasher.finalize())
+        hex::encode(hasher.finalize())
     }
 }
 

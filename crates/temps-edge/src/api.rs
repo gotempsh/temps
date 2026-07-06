@@ -35,13 +35,13 @@ impl TokenAuth {
     fn new(token: &str) -> Self {
         let digest = Sha256::digest(token.as_bytes());
         Self {
-            token_hash: format!("{:x}", digest),
+            token_hash: hex::encode(digest),
         }
     }
 
     fn verify(&self, provided: &str) -> bool {
         let digest = Sha256::digest(provided.as_bytes());
-        let provided_hash = format!("{:x}", digest);
+        let provided_hash = hex::encode(digest);
         constant_time_eq(self.token_hash.as_bytes(), provided_hash.as_bytes())
     }
 }

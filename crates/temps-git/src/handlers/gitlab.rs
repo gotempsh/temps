@@ -402,7 +402,7 @@ mod tests {
     /// payload + headers + signing token.
     fn make_sig(payload: &[u8], webhook_id: &str, ts: &str, signing_token: &str) -> String {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
         let key = STANDARD
             .decode(signing_token.strip_prefix("whsec_").expect("whsec_ prefix"))

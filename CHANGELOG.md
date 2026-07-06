@@ -9,11 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Crypto dependency alignment**: Move direct `hmac` users and workspace `hkdf` onto digest-0.11-compatible releases so the merged `sha2` 0.11 dependency update continues to compile instead of requiring a rollback.
 - **Deployment token routes**: Mount `deployment_tokens::configure_routes()` and merge `DeploymentTokensApiDoc` in `DeploymentsPlugin` so deployment-token API paths are reachable at runtime and visible in the generated OpenAPI schema.
 
 ### Tests
 
 - **MinIO restore coverage**: Extend `test_s3_backup_and_restore_to_s3` to create 100 MinIO buckets with synthetic files, back them up through the production S3 mirror path, restore into a second service, and verify all restored objects so managed S3 compatibility regressions are caught in the Docker backup suite.
+- **MinIO test container cleanup**: Keep the Docker test helper from sweeping active `temps-test-minio-*` containers created by the same test run, because multi-MinIO backup tests need source and destination containers alive at the same time.
 
 ## [0.1.0-beta.42] - 2026-07-04
 

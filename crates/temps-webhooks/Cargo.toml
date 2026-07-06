@@ -25,7 +25,7 @@ uuid = { workspace = true }
 axum = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
-hmac = "0.12"
+hmac = "0.13"
 sha2 = { workspace = true }
 hex = { workspace = true }
 url = "2.5"  # For URL validation and SSRF prevention

@@ -3,7 +3,7 @@
 //! Prevents open redirects by cryptographically binding each redirect URL
 //! to the specific email that contained it.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;

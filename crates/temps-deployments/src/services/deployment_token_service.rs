@@ -690,7 +690,7 @@ impl DeploymentTokenService {
     pub(crate) fn hash_token(&self, token: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(token.as_bytes());
-        format!("{:x}", hasher.finalize())
+        hex::encode(hasher.finalize())
     }
 }
 
@@ -1240,7 +1240,7 @@ mod tests {
 
         let mut hasher = Sha256::new();
         hasher.update(token.as_bytes());
-        let hash = format!("{:x}", hasher.finalize());
+        let hash = hex::encode(hasher.finalize());
 
         // SHA256 hash should be 64 hex characters
         assert_eq!(hash.len(), 64);
@@ -1261,13 +1261,13 @@ mod tests {
         let hash1 = {
             let mut hasher = Sha256::new();
             hasher.update(token.as_bytes());
-            format!("{:x}", hasher.finalize())
+            hex::encode(hasher.finalize())
         };
 
         let hash2 = {
             let mut hasher = Sha256::new();
             hasher.update(token.as_bytes());
-            format!("{:x}", hasher.finalize())
+            hex::encode(hasher.finalize())
         };
 
         // Same input should produce same hash
@@ -1285,13 +1285,13 @@ mod tests {
         let hash1 = {
             let mut hasher = Sha256::new();
             hasher.update(token1.as_bytes());
-            format!("{:x}", hasher.finalize())
+            hex::encode(hasher.finalize())
         };
 
         let hash2 = {
             let mut hasher = Sha256::new();
             hasher.update(token2.as_bytes());
-            format!("{:x}", hasher.finalize())
+            hex::encode(hasher.finalize())
         };
 
         // Different tokens should produce different hashes

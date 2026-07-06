@@ -1197,7 +1197,7 @@ impl GitProviderService for GiteaProvider {
         signature: &str,
         secret: &str,
     ) -> Result<bool, GitProviderError> {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
 
         // Hex-decode the signature. An empty or malformed hex string rejects.
@@ -1770,7 +1770,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_verify_webhook_signature_valid() {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
 
         let secret = "my-secret";
@@ -1788,7 +1788,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_verify_webhook_signature_wrong_secret_rejects() {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
 
         let secret = "correct-secret";
@@ -1806,7 +1806,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_verify_webhook_signature_tampered_payload_rejects() {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
 
         let secret = "s";

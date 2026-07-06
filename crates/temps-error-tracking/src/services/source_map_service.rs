@@ -98,7 +98,7 @@ impl SourceMapService {
         let checksum = {
             let mut hasher = Sha256::new();
             hasher.update(&source_map_data);
-            format!("{:x}", hasher.finalize())
+            hex::encode(hasher.finalize())
         };
 
         let normalized_path = normalize_file_path(file_path);

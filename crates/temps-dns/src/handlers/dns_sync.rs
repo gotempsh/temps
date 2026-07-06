@@ -278,7 +278,7 @@ fn sha256_hash(input: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {

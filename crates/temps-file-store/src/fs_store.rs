@@ -34,7 +34,7 @@ impl FsFileStore {
     pub fn content_hash(data: &[u8]) -> String {
         let mut hasher = Sha256::new();
         hasher.update(data);
-        format!("{:x}", hasher.finalize())
+        hex::encode(hasher.finalize())
     }
 
     /// Git-style double-prefix sharding: `blobs/{hash[0..2]}/{hash[2..4]}/{hash}`
