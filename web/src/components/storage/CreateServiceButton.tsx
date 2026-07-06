@@ -13,7 +13,6 @@ import { useQuery } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 
 export function CreateServiceButton({
-  onSuccess,
   open,
   onOpenChange,
 }: {

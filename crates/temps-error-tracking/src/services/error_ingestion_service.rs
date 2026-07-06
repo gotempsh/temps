@@ -187,7 +187,7 @@ impl ErrorIngestionService {
         let content = components.join("||");
         let mut hasher = Sha256::new();
         hasher.update(content.as_bytes());
-        format!("{:x}", hasher.finalize())
+        hex::encode(hasher.finalize())
     }
 
     /// Normalize error messages for consistent grouping

@@ -9,7 +9,7 @@
 //! No network calls are made here — the whole crate is offline-only.
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use http::HeaderMap;
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
@@ -597,7 +597,7 @@ fn invoice_mrr_realized_events(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hmac::Mac;
+    use hmac::{KeyInit, Mac};
 
     const SECRET: &str = "whsec_test_secret_value";
 

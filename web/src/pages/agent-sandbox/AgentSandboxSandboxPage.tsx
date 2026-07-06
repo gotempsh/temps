@@ -177,7 +177,7 @@ export function AgentSandboxSandboxPage() {
           // Carry forward fields we don't edit on this page (providers map,
           // legacy auth_type / api_key_encrypted) so a save here doesn't wipe
           // per-provider credentials configured on /agent-sandbox/providers/:id.
-          ...(settings?.agent_sandbox ?? {}),
+          ...settings?.agent_sandbox,
           default_provider: defaultProvider,
           enabled: true,
           runtime,
@@ -185,6 +185,9 @@ export function AgentSandboxSandboxPage() {
           cpu_limit: cpuLimit,
           memory_limit_mb: memoryLimitMb,
           network_mode: settings?.agent_sandbox?.network_mode ?? 'full',
+          api_key_saved: settings?.agent_sandbox?.api_key_saved ?? false,
+          auth_type: settings?.agent_sandbox?.auth_type ?? '',
+          providers: settings?.agent_sandbox?.providers ?? {},
         },
         ai_config: {
           ...(settings?.ai_config ?? {}),

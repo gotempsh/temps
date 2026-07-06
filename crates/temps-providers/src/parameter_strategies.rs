@@ -756,6 +756,12 @@ impl ParameterStrategy for S3ParameterStrategy {
             "type": "object",
             "title": "S3 Parameters",
             "properties": {
+                "backend": {
+                    "type": "string",
+                    "description": "Managed S3-compatible backend to provision. RustFS is the default; Garage and MinIO are available backend selectors.",
+                    "enum": ["rustfs", "garage", "minio"],
+                    "default": "rustfs"
+                },
                 "access_key": {
                     "type": "string",
                     "description": "Access key (read-only after creation, auto-generated)",
@@ -792,7 +798,7 @@ impl ParameterStrategy for S3ParameterStrategy {
                     "default": "rustfs/rustfs:1.0.0-alpha.98"
                 }
             },
-            "readonly": ["access_key", "secret_key", "host", "region"]
+            "readonly": ["backend", "access_key", "secret_key", "host", "region"]
         }))
     }
 

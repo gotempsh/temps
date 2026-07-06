@@ -145,12 +145,6 @@ define_permissions! {
     SystemAdmin => Permission::SystemAdmin,
     SystemRead => Permission::SystemRead,
 
-    // MCP
-    McpConnect => Permission::McpConnect,
-    McpExecute => Permission::McpExecute,
-    McpRead => Permission::McpRead,
-    McpWrite => Permission::McpWrite,
-
     // API Keys
     ApiKeysRead => Permission::ApiKeysRead,
     ApiKeysWrite => Permission::ApiKeysWrite,

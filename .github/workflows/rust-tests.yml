@@ -65,6 +65,32 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+  web-typecheck:
+    name: Web TypeScript Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Cache Bun dependencies
+        uses: actions/cache@v4
+        with:
+          path: web/node_modules
+          key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      - name: Install dependencies
+        run: cd web && bun install
+
+      - name: Type check
+        run: cd web && bunx tsc --noEmit
+
   clippy:
     name: Clippy (advisory)
     runs-on: ubuntu-latest
@@ -295,13 +321,20 @@ jobs:
             # NOTE: orchestrator_* tests run in a dedicated `postgres-upgrades`
             # group, and *_backup_and_restore_to_s3 tests in a dedicated
             # `docker-backups` group (both serial, long-running, container-heavy).
-            # Skip them here so this group stays fast and parallel-safe.
+            # Skip them here so this group stays fast.
+            # --test-threads=1: this group's tests hit the shared `services:
+            # timescaledb` container just like docker-backups/postgres-upgrades/
+            # docker-deployments below, and the default multi-threaded libtest
+            # runner was racing against it -- observed as a Postgres deadlock
+            # (40P01) and background-worker exhaustion (e.g. test_delete_service).
+            # Match the same serial fix already applied to the other groups.
             cargo_args: >-
               test --no-fail-fast --lib
               -p temps-providers --features docker-tests
             test_args: >-
               --skip orchestrator_
               --skip backup_and_restore_to_s3
+              --test-threads=1
           - group: docker-backups
             # Heavyweight S3 backup/restore integration tests
             # (test_{mongodb,postgres,redis,s3}_backup_and_restore_to_s3). Each

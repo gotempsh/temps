@@ -109,10 +109,7 @@ export default function ApiKeyCreate() {
     setOpenCategories(newOpenCategories)
   }
 
-  const toggleCategoryPermissions = (
-    category: string,
-    categoryPermissions: any[]
-  ) => {
+  const toggleCategoryPermissions = (categoryPermissions: any[]) => {
     const categoryPermissionNames = categoryPermissions.map((p) => p.name)
     const allSelected = categoryPermissionNames.every((name) =>
       selectedPermissions.has(name)
@@ -493,7 +490,6 @@ export default function ApiKeyCreate() {
                                   }}
                                   onCheckedChange={() => {
                                     toggleCategoryPermissions(
-                                      category,
                                       categoryPermissions
                                     )
                                   }}

@@ -259,6 +259,7 @@ async fn push_batch(
 ) -> Result<(), ChBackfillError> {
     let mut inserter =
         ch.insert::<ChEventRow>("events")
+            .await
             .map_err(|e| ChBackfillError::ClickHouseInsert {
                 first_event_id: first_id,
                 reason: format!("inserter setup failed: {e}"),

@@ -33,12 +33,10 @@ mod docker_utils {
             use bollard::query_parameters::CreateImageOptions;
             use futures::StreamExt;
 
-            // Sweep any `temps-test-minio-*` containers left behind by a
-            // killed previous test run. Even though container names are
-            // already unique-per-call (timestamp + random suffix), the
-            // leaked instances hold ports + memory and pile up on dev
-            // machines and CI runners. This sweep is best-effort —
-            // anything we can't remove just stays for someone else.
+            // Sweep stale `temps-test-minio-*` containers left behind by a
+            // killed previous test run. The sweep is state/age aware so a test
+            // that starts multiple MinIO instances does not delete its own
+            // first container when creating the second one.
             sweep_orphan_test_containers(&docker, "temps-test-minio-").await;
 
             // Find available port for MinIO - use random offset to avoid parallel test conflicts
@@ -337,22 +335,23 @@ mod docker_utils {
         ))
     }
 
-    /// Best-effort removal of orphaned test containers whose names start
-    /// with `name_prefix`. Used by integration helpers (e.g.
-    /// `MinioTestContainer::start`) to keep dev machines and CI runners
-    /// from accumulating leaked containers when a test panics before
-    /// reaching its cleanup path.
+    /// Best-effort removal of stale test containers whose names start with
+    /// `name_prefix`. Used by integration helpers (e.g.
+    /// `MinioTestContainer::start`) to keep dev machines and CI runners from
+    /// accumulating leaked containers when a test panics before reaching its
+    /// cleanup path.
     ///
     /// All errors are swallowed — this is a "make a best attempt"
     /// hygiene step, not a correctness gate.
     pub(super) async fn sweep_orphan_test_containers(docker: &Docker, name_prefix: &str) {
         use bollard::query_parameters::{ListContainersOptions, RemoveContainerOptions};
 
+        const ACTIVE_CONTAINER_GRACE_SECONDS: i64 = 60 * 60;
+
         let mut filters = HashMap::new();
         // Docker matches `name` filters as a substring, so the prefix
-        // alone is enough; the per-test timestamp/random suffix keeps
-        // it from sweeping concurrent siblings since each test waits
-        // on its own future.
+        // alone is enough; state/age checks below keep this from sweeping
+        // active siblings in the same test process.
         filters.insert("name".to_string(), vec![name_prefix.to_string()]);
 
         let Ok(containers) = docker
@@ -367,6 +366,27 @@ mod docker_utils {
         };
 
         for c in containers {
+            let is_active = matches!(
+                c.state,
+                Some(
+                    bollard::models::ContainerSummaryStateEnum::CREATED
+                        | bollard::models::ContainerSummaryStateEnum::RUNNING
+                        | bollard::models::ContainerSummaryStateEnum::RESTARTING
+                )
+            );
+            if is_active {
+                let too_young_to_sweep = c
+                    .created
+                    .map(|created| {
+                        chrono::Utc::now().timestamp().saturating_sub(created)
+                            < ACTIVE_CONTAINER_GRACE_SECONDS
+                    })
+                    .unwrap_or(true);
+                if too_young_to_sweep {
+                    continue;
+                }
+            }
+
             let id = match c.id {
                 Some(id) => id,
                 None => continue,

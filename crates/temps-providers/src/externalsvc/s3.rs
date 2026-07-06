@@ -2558,8 +2558,11 @@ mod tests {
             }
         };
 
-        // Start MinIO container for S3 operations (this will be used for both source and backup)
-        let minio = match MinioTestContainer::start(docker.clone(), "s3-backup-test").await {
+        // Use separate MinIO instances so the backup destination is not mirrored
+        // back into the source service while copying all source buckets.
+        let run_id = chrono::Utc::now().timestamp_millis();
+        let source_bucket_0 = format!("temps-s3-roundtrip-{run_id}-000");
+        let source_minio = match MinioTestContainer::start(docker.clone(), &source_bucket_0).await {
             Ok(m) => m,
             Err(e) => {
                 let error_msg = e.to_string();
@@ -2567,7 +2570,7 @@ mod tests {
                     || error_msg.contains("TrustStore")
                     || error_msg.contains("panicked")
                 {
-                    println!("❌ Skipping S3 backup test: TLS certificate issue");
+                    println!("Skipping S3 backup test: TLS certificate issue");
                     println!(
                         "   Reason: {}",
                         error_msg.lines().next().unwrap_or(&error_msg)
@@ -2579,115 +2582,114 @@ mod tests {
             }
         };
 
-        // Create S3 service (source)
-        let service_name = format!("test_s3_backup_{}", chrono::Utc::now().timestamp_millis());
+        let backup_minio =
+            match MinioTestContainer::start(docker.clone(), "s3-backup-destination").await {
+                Ok(m) => m,
+                Err(e) => {
+                    let _ = source_minio.cleanup().await;
+                    panic!("Failed to start backup MinIO container: {}", e);
+                }
+            };
+
+        let source_service_name = format!("test-s3-backup-{run_id}");
+        let restored_service_name = format!("test-s3-restore-{run_id}");
 
         let s3_params = serde_json::json!({
             "host": "localhost",
-            "port": minio.port.to_string(),
-            "access_key": minio.access_key.clone(),
-            "secret_key": minio.secret_key.clone(),
-            "bucket_name": minio.bucket_name.clone(),
+            "port": source_minio.port.to_string(),
+            "access_key": source_minio.access_key.clone(),
+            "secret_key": source_minio.secret_key.clone(),
             "region": "us-east-1",
-            "endpoint": format!("http://localhost:{}", minio.port),
+            "docker_image": "minio/minio:latest",
         });
 
         let s3_config = ServiceConfig {
-            name: service_name.clone(),
+            name: source_service_name.clone(),
             service_type: ServiceType::S3,
             version: Some("latest".to_string()),
             parameters: s3_params,
         };
 
         let s3_service = S3Service::new(
-            service_name.clone(),
+            source_service_name.clone(),
             docker.clone(),
             encryption_service.clone(),
         );
 
-        // Initialize S3 service
-        match s3_service.init(s3_config.clone()).await {
-            Ok(_) => println!("✓ S3 service initialized"),
-            Err(e) => {
-                println!("Failed to initialize S3: {}. Skipping test", e);
-                let _ = minio.cleanup().await;
-                return;
+        let mut expected_objects = Vec::new();
+        for bucket_index in 0..100 {
+            let bucket_name = format!("temps-s3-roundtrip-{run_id}-{bucket_index:03}");
+            if bucket_index > 0 {
+                source_minio
+                    .s3_client
+                    .create_bucket()
+                    .bucket(&bucket_name)
+                    .send()
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("failed to create source bucket {bucket_name}: {e}")
+                    });
+            }
+
+            for object_index in 0..2 {
+                let key = format!("fixtures/object-{object_index:02}.txt");
+                let body = format!(
+                    "synthetic minio backup fixture run={run_id} bucket={bucket_index} object={object_index}\n"
+                );
+                source_minio
+                    .s3_client
+                    .put_object()
+                    .bucket(&bucket_name)
+                    .key(&key)
+                    .body(aws_sdk_s3::primitives::ByteStream::from(
+                        body.as_bytes().to_vec(),
+                    ))
+                    .send()
+                    .await
+                    .unwrap_or_else(|e| panic!("failed to create object {bucket_name}/{key}: {e}"));
+                expected_objects.push((bucket_name.clone(), key, body));
             }
         }
 
-        // Create test objects in S3
-        let test_objects = vec![
-            ("test-file-1.txt", "content of file 1"),
-            ("test-file-2.txt", "content of file 2"),
-            ("test-file-3.txt", "content of file 3"),
-        ];
-
-        for (key, content) in &test_objects {
-            match minio
-                .s3_client
-                .put_object()
-                .bucket(&minio.bucket_name)
-                .key(*key)
-                .body(aws_sdk_s3::primitives::ByteStream::from(
-                    content.as_bytes().to_vec(),
-                ))
-                .send()
-                .await
-            {
-                Ok(_) => println!("✓ Created object: {}", key),
-                Err(e) => {
-                    println!("Failed to create object {}: {}. Skipping test", key, e);
-                    let _ = minio.cleanup().await;
-                    return;
-                }
-            }
-        }
-
-        // Verify objects exist
-        match minio
+        let source_buckets = source_minio
             .s3_client
-            .list_objects_v2()
-            .bucket(&minio.bucket_name)
+            .list_buckets()
             .send()
             .await
-        {
-            Ok(response) => {
-                let count = response.contents().len();
-                assert_eq!(count, 3, "Should have 3 objects");
-                println!("✓ Verified {} objects in source bucket", count);
-            }
-            Err(e) => {
-                println!("Failed to list objects: {}. Skipping test", e);
-                let _ = minio.cleanup().await;
-                return;
-            }
-        }
+            .expect("source MinIO should list buckets");
+        assert_eq!(source_buckets.buckets().len(), 100);
+        println!("Created 100 source buckets and 200 synthetic objects");
 
         // Create mock database connection for backup/restore operations
         let mock_db = match create_mock_db().await {
             Ok(db) => db,
             Err(e) => {
                 println!("Failed to create mock database: {}. Skipping test", e);
-                let _ = minio.cleanup().await;
+                let _ = source_minio.cleanup().await;
+                let _ = backup_minio.cleanup().await;
                 return;
             }
         };
 
         // Create mock backup record - using encrypted credentials for the backup destination
-        let encrypted_access_key = match encryption_service.encrypt_string(&minio.access_key) {
+        let encrypted_access_key = match encryption_service.encrypt_string(&backup_minio.access_key)
+        {
             Ok(encrypted) => encrypted,
             Err(e) => {
                 println!("Failed to encrypt access key: {}. Skipping test", e);
-                let _ = minio.cleanup().await;
+                let _ = source_minio.cleanup().await;
+                let _ = backup_minio.cleanup().await;
                 return;
             }
         };
 
-        let encrypted_secret_key = match encryption_service.encrypt_string(&minio.secret_key) {
+        let encrypted_secret_key = match encryption_service.encrypt_string(&backup_minio.secret_key)
+        {
             Ok(encrypted) => encrypted,
             Err(e) => {
                 println!("Failed to encrypt secret key: {}. Skipping test", e);
-                let _ = minio.cleanup().await;
+                let _ = source_minio.cleanup().await;
+                let _ = backup_minio.cleanup().await;
                 return;
             }
         };
@@ -2696,9 +2698,9 @@ mod tests {
         let backup_s3_source = temps_entities::s3_sources::Model {
             id: 2,
             name: "backup-destination".to_string(),
-            bucket_name: minio.bucket_name.clone(),
+            bucket_name: backup_minio.bucket_name.clone(),
             region: "us-east-1".to_string(),
-            endpoint: Some(format!("http://localhost:{}", minio.port)),
+            endpoint: Some(format!("http://localhost:{}", backup_minio.port)),
             bucket_path: "".to_string(),
             access_key_id: encrypted_access_key,
             secret_key: encrypted_secret_key,
@@ -2708,154 +2710,131 @@ mod tests {
             updated_at: chrono::Utc::now(),
         };
 
-        let backup = create_mock_backup("backups/s3/test");
-        let external_service = create_mock_external_service(service_name.clone(), "s3", "latest");
+        let backup_s3_source_plaintext = temps_entities::s3_sources::Model {
+            access_key_id: backup_minio.access_key.clone(),
+            secret_key: backup_minio.secret_key.clone(),
+            ..backup_s3_source.clone()
+        };
 
-        // Note: S3 backup_to_s3 uses the mc (MinIO Client) container to mirror data
-        // This is a complex operation that requires Docker networking
-        // For simplicity, we'll test that the method can be called, but the actual
-        // mirroring may not work in the test environment without additional setup
-        println!("⚠️  S3 backup uses mc container - full integration may require additional Docker networking setup");
+        let subpath_root = format!("external_services/s3/{source_service_name}");
+        let backup = create_mock_backup(&subpath_root);
+        let external_service =
+            create_mock_external_service(source_service_name.clone(), "s3", "latest");
 
-        let s3_creds = minio.s3_credentials();
-        match s3_service
+        let s3_creds = backup_minio.s3_credentials();
+        let outcome = s3_service
             .backup_to_s3(
-                &minio.s3_client,
+                &backup_minio.s3_client,
                 &s3_creds,
-                backup,
+                backup.clone(),
                 &backup_s3_source,
-                "backups/s3",
-                "backups",
+                &subpath_root,
+                &subpath_root,
                 &mock_db,
                 &external_service,
                 s3_config.clone(),
             )
             .await
-        {
-            Ok(outcome) => {
-                println!(
-                    "✓ Backup initiated: {} ({:?} bytes)",
-                    outcome.location, outcome.size_bytes
-                );
-                // Note: Due to the complexity of mc container and Docker networking,
-                // this test verifies the backup workflow can be called, but may not
-                // fully complete the mirror operation in all test environments
-            }
-            Err(e) => {
-                // Expected in many test environments due to mc container requirements
-                println!("⚠️  Backup encountered expected limitations: {}", e);
-                println!(
-                    "   This is normal - S3 backup requires mc container with Docker networking"
-                );
-            }
-        }
+            .expect("S3 service backup to MinIO should complete");
+        assert_eq!(outcome.location, subpath_root);
+        assert!(
+            outcome.size_bytes.unwrap_or_default() > 0,
+            "backup should report copied object bytes"
+        );
+        println!("Backed up source service to {}", outcome.location);
 
-        // For restore, we'll test the basic object operations instead of full mc workflow
-        // Delete one object to simulate partial data loss
-        match minio
-            .s3_client
-            .delete_object()
-            .bucket(&minio.bucket_name)
-            .key("test-file-2.txt")
-            .send()
+        let restore_ctx = super::super::RestoreContext {
+            s3_client: &backup_minio.s3_client,
+            s3_credentials: &s3_creds,
+            s3_source: &backup_s3_source_plaintext,
+            backup: &backup,
+            backup_location: &outcome.location,
+            source_service: &external_service,
+            source_config: s3_config.clone(),
+            pool: &mock_db,
+        };
+
+        let restore_result = s3_service
+            .restore_to_new_service(
+                restore_ctx,
+                restored_service_name.clone(),
+                serde_json::json!({}),
+            )
             .await
-        {
-            Ok(_) => println!("✓ Deleted test-file-2.txt (simulating data loss)"),
-            Err(e) => {
-                println!("Failed to delete object: {}. Skipping test", e);
-                let _ = minio.cleanup().await;
-                return;
-            }
-        }
+            .expect("S3 restore-to-new-service from MinIO backup should complete");
 
-        // Verify object was deleted. Scoped to the `test-file-` prefix: the
-        // backup destination above writes to the SAME bucket under
-        // `backups/s3/...`, so an unscoped list also counts backup copies
-        // and no longer reflects just the three original test objects.
-        match minio
-            .s3_client
-            .list_objects_v2()
-            .bucket(&minio.bucket_name)
-            .prefix("test-file-")
-            .send()
-            .await
-        {
-            Ok(response) => {
-                let count = response.contents().len();
-                assert!(count < 3, "Should have fewer than 3 objects after deletion");
-                println!("✓ Verified object deletion - {} objects remaining", count);
-            }
-            Err(e) => {
-                println!("Failed to verify deletion: {}. Skipping test", e);
-                let _ = minio.cleanup().await;
-                return;
-            }
-        }
+        let restored_port = restore_result
+            .parameters
+            .get("port")
+            .expect("restored service should report port")
+            .clone();
+        let restored_access_key = restore_result
+            .parameters
+            .get("access_key")
+            .expect("restored service should report access_key")
+            .clone();
+        let restored_secret_key = restore_result
+            .parameters
+            .get("secret_key")
+            .expect("restored service should report secret_key")
+            .clone();
 
-        // Restore the deleted object manually (simulating restore)
-        match minio
-            .s3_client
-            .put_object()
-            .bucket(&minio.bucket_name)
-            .key("test-file-2.txt")
-            .body(aws_sdk_s3::primitives::ByteStream::from(
-                "content of file 2".as_bytes().to_vec(),
+        let restored_s3_config = aws_sdk_s3::Config::builder()
+            .endpoint_url(format!("http://localhost:{restored_port}"))
+            .region(Region::new("us-east-1"))
+            .behavior_version_latest()
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                restored_access_key,
+                restored_secret_key,
+                None,
+                None,
+                "restored-minio",
             ))
+            .force_path_style(true)
+            .build();
+        let restored_client = aws_sdk_s3::Client::from_conf(restored_s3_config);
+
+        let restored_buckets = restored_client
+            .list_buckets()
             .send()
             .await
-        {
-            Ok(_) => println!("✓ Restored test-file-2.txt"),
-            Err(e) => {
-                println!("Failed to restore object: {}. Skipping test", e);
-                let _ = minio.cleanup().await;
-                return;
-            }
+            .expect("restored MinIO should list buckets");
+        assert_eq!(restored_buckets.buckets().len(), 100);
+
+        for (bucket, key, expected_body) in expected_objects {
+            let object = restored_client
+                .get_object()
+                .bucket(&bucket)
+                .key(&key)
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("missing restored object {bucket}/{key}: {e}"));
+            let bytes = object
+                .body
+                .collect()
+                .await
+                .unwrap_or_else(|e| panic!("failed reading restored object {bucket}/{key}: {e}"))
+                .into_bytes();
+            assert_eq!(
+                bytes.as_ref(),
+                expected_body.as_bytes(),
+                "restored object body should match for {bucket}/{key}"
+            );
         }
 
-        // Verify all objects are restored (same prefix scoping as above)
-        match minio
-            .s3_client
-            .list_objects_v2()
-            .bucket(&minio.bucket_name)
-            .prefix("test-file-")
-            .send()
-            .await
-        {
-            Ok(response) => {
-                let count = response.contents().len();
-                assert_eq!(count, 3, "Should have 3 objects after restore");
-                println!("✓ Verified {} objects after restore", count);
-
-                // Verify all expected objects exist
-                let keys: Vec<String> = response
-                    .contents()
-                    .iter()
-                    .filter_map(|obj| obj.key().map(|k| k.to_string()))
-                    .collect();
-
-                for (expected_key, _) in &test_objects {
-                    assert!(
-                        keys.contains(&(*expected_key).to_string()),
-                        "Should contain {}",
-                        expected_key
-                    );
-                }
-                println!("✓ Verified all expected objects exist");
-            }
-            Err(e) => {
-                println!("Failed to verify restore: {}. Skipping test", e);
-                let _ = minio.cleanup().await;
-                return;
-            }
-        }
+        println!("Verified 100 restored buckets and 200 restored objects");
 
         // Cleanup
-        let _ = s3_service.cleanup().await;
-        let _ = minio.cleanup().await;
-
-        println!("✅ S3 backup and restore test passed!");
-        println!(
-            "   Note: Full mc container backup/restore requires additional Docker networking setup"
+        let restored_service = S3Service::new(
+            restored_service_name,
+            docker.clone(),
+            encryption_service.clone(),
         );
+        let _ = restored_service.remove().await;
+        let _ = s3_service.cleanup().await;
+        let _ = source_minio.cleanup().await;
+        let _ = backup_minio.cleanup().await;
+
+        println!("S3 MinIO backup and restore-to-new-service test passed");
     }
 }

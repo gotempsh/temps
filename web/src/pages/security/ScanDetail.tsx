@@ -209,25 +209,7 @@ export function ScanDetail() {
     enabled: !!scan?.project_id && !!scan?.environment_id,
   })
 
-  const vulnerabilities = vulnerabilitiesData?.data || []
-
-  // Configure Fuse.js for fuzzy search
-  const fuse = useMemo(
-    () =>
-      new Fuse(vulnerabilities, {
-        keys: [
-          { name: 'vulnerability_id', weight: 2 }, // CVE ID gets higher weight
-          { name: 'title', weight: 1.5 },
-          { name: 'package_name', weight: 1.5 },
-          { name: 'severity', weight: 1 },
-          { name: 'description', weight: 0.5 },
-        ],
-        threshold: 0.3, // Lower = more strict matching (0.0 is perfect match)
-        includeScore: true,
-        minMatchCharLength: 2,
-      }),
-    [vulnerabilities]
-  )
+  const vulnerabilities = vulnerabilitiesData || []
 
   // Filter vulnerabilities using Fuse.js fuzzy search AND type filter
   const filteredVulnerabilities = useMemo(() => {

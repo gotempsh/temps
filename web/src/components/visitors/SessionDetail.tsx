@@ -1,7 +1,8 @@
 import {
   getSessionDetailsOptions,
   getVisitorDetailsOptions,
-  getSessionEventsOptions,
+  getVisitorStatsOptions,
+  getAnalyticsSessionEventsOptions,
   getSessionLogsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { ProjectResponse } from '@/api/client/types.gen'
@@ -116,6 +117,17 @@ export function SessionDetail({
     }),
   })
 
+  const { data: visitorStats } = useQuery({
+    ...getVisitorStatsOptions({
+      path: {
+        visitor_id: visitorId,
+      },
+      query: {
+        project_id: project.id,
+      },
+    }),
+  })
+
   // Separate query for session logs with pagination
   const { data: sessionLogs, isLoading: isLoadingLogs } = useQuery({
     ...getSessionLogsOptions({
@@ -134,7 +146,7 @@ export function SessionDetail({
 
   // Separate query for session events with pagination
   const { data: sessionEvents, isLoading: isLoadingEvents } = useQuery({
-    ...getSessionEventsOptions({
+    ...getAnalyticsSessionEventsOptions({
       path: {
         session_id: sessionId,
       },
@@ -400,7 +412,7 @@ export function SessionDetail({
                     Total Sessions
                   </div>
                   <div className="text-sm font-medium mt-1">
-                    {visitorDetails?.total_sessions}
+                    {visitorStats?.total_sessions}
                   </div>
                 </div>
                 <div>
@@ -408,7 +420,7 @@ export function SessionDetail({
                     Total Page Views
                   </div>
                   <div className="text-sm font-medium mt-1">
-                    {visitorDetails?.total_page_views}
+                    {visitorStats?.total_page_views}
                   </div>
                 </div>
               </div>

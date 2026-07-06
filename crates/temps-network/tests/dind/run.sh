@@ -118,6 +118,17 @@ install_toolchain "$NODE_B"
 # ---------------------------------------------------------------------------
 # 4. Run the kernel-touching tests inside node A
 # ---------------------------------------------------------------------------
+# `cargo test` runs tests in alphabetical order, not declaration order, and
+# every other test in this file calls the `fixture()` helper, which tears
+# down all kernel/docker state (`cleanup_all()`) before it runs. bootstrap_only
+# is deliberately the one test that does NOT clean up after itself, so the
+# node-B step and the container-ping step below can find its state — but
+# alphabetically it sorts before `bridge_address_outside_cidr_rejected`,
+# `docker_cidr_collision_is_detected`, `reconcile_peers_*`, and
+# `teardown_removes_everything_and_is_idempotent`, all of which run after it
+# and immediately wipe out what it left behind. Run it as its own filtered
+# pass, strictly after everything else, so its state actually survives to
+# the container-ping step.
 log "running kernel integration tests in $NODE_A"
 docker exec \
   -e TEMPS_IT_LOCAL_NAME=node-a \
@@ -130,10 +141,25 @@ docker exec \
   "$NODE_A" sh -c '
     cd /workspace
     export PATH=/root/.cargo/bin:$PATH
-    cargo test -p temps-network --features integration_kernel --test it_kernel -- --test-threads=1 --nocapture
+    cargo test -p temps-network --features integration_kernel --test it_kernel -- --skip bootstrap_only --test-threads=1 --nocapture
   ' || fail "kernel tests failed in $NODE_A"
 
 log "kernel integration tests passed in $NODE_A"
+
+log "bootstrapping $NODE_A for the cross-host scenario (must run last: see comment above)"
+docker exec \
+  -e TEMPS_IT_LOCAL_NAME=node-a \
+  -e TEMPS_IT_LOCAL_CIDR=172.20.1.0/24 \
+  -e TEMPS_IT_LOCAL_BRIDGE_IP=172.20.1.1 \
+  -e TEMPS_IT_LOCAL_UNDERLAY="$NODE_A_IP" \
+  -e TEMPS_IT_PEER_CIDR=172.20.2.0/24 \
+  -e TEMPS_IT_PEER_UNDERLAY="$NODE_B_IP" \
+  -e TEMPS_RUN_DIND_TESTS=1 \
+  "$NODE_A" sh -c '
+    cd /workspace
+    export PATH=/root/.cargo/bin:$PATH
+    cargo test -p temps-network --features integration_kernel --test it_kernel bootstrap_only -- --test-threads=1 --nocapture
+  ' || fail "node-a bootstrap failed"
 
 # ---------------------------------------------------------------------------
 # 5. Two-node cross-host ping scenario

@@ -77,6 +77,10 @@ function formatBytes(bytes: number): string {
 
 // --- Component ---
 
+interface SourceMapsProps {
+  project: ProjectResponse
+}
+
 export function SourceMaps({ project }: SourceMapsProps) {
   const queryClient = useQueryClient()
   const [selectedRelease, setSelectedRelease] = useState<string | null>(null)

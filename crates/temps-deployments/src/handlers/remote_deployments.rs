@@ -1474,7 +1474,7 @@ pub async fn upload_static_bundle(
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(&file_bytes);
-    let checksum = format!("sha256:{:x}", hasher.finalize());
+    let checksum = format!("sha256:{}", hex::encode(hasher.finalize()));
 
     // Store static bundle in local data directory
     let local_path = state.data_dir.join(&blob_path);

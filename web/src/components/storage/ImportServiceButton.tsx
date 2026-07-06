@@ -2,7 +2,7 @@ import { Button } from '@/components/ui/button'
 import { Download } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 
-export function ImportServiceButton({ onSuccess }: { onSuccess?: () => void }) {
+export function ImportServiceButton(_props: { onSuccess?: () => void }) {
   const navigate = useNavigate()
 
   return (

@@ -948,6 +948,7 @@ impl OtelStorage for ClickHouseOtelStorage {
             let mut inserter = self
                 .ch
                 .insert::<ChSpanRow>("spans")
+                .await
                 .map_err(|e| ch_ingest_err("store_spans (inserter setup)", e))?;
 
             for span in chunk {
@@ -2014,6 +2015,7 @@ impl OtelStorage for ClickHouseOtelStorage {
             let mut inserter = self
                 .ch
                 .insert::<ChMetricRow>("metrics")
+                .await
                 .map_err(|e| ch_ingest_err("store_metrics (inserter setup)", e))?;
 
             for point in chunk {

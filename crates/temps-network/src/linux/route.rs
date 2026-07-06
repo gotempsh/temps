@@ -7,7 +7,7 @@
 use crate::error::NetworkError;
 use crate::linux::bridge::link_index_by_name;
 use ipnet::Ipv4Net;
-use rtnetlink::Handle;
+use rtnetlink::{Handle, RouteMessageBuilder};
 use std::net::{IpAddr, Ipv4Addr};
 use tracing::{debug, warn};
 
@@ -34,16 +34,13 @@ pub async fn add_via_dev(
             reason: format!("device '{}' not found", dev),
         })?;
 
-    let mut req = handle
-        .route()
-        .add()
-        .v4()
+    let mut builder = RouteMessageBuilder::<Ipv4Addr>::new()
         .destination_prefix(cidr.network(), cidr.prefix_len())
         .output_interface(dev_idx);
     if let Some(src) = pref_src {
-        req = req.pref_source(src);
+        builder = builder.pref_source(src);
     }
-    let res = req.execute().await;
+    let res = handle.route().add(builder.build()).execute().await;
 
     handle_route_result(res, "add_via_dev", cidr, dev)
 }
@@ -64,10 +61,12 @@ pub async fn add_via_gateway(handle: &Handle, cidr: Ipv4Net, gw: IpAddr) -> crat
 
     let res = handle
         .route()
-        .add()
-        .v4()
-        .destination_prefix(cidr.network(), cidr.prefix_len())
-        .gateway(gw_v4)
+        .add(
+            RouteMessageBuilder::<Ipv4Addr>::new()
+                .destination_prefix(cidr.network(), cidr.prefix_len())
+                .gateway(gw_v4)
+                .build(),
+        )
         .execute()
         .await;
 
@@ -78,9 +77,11 @@ pub async fn add_via_gateway(handle: &Handle, cidr: Ipv4Net, gw: IpAddr) -> crat
 pub async fn remove(handle: &Handle, cidr: Ipv4Net) -> crate::Result<()> {
     use futures::TryStreamExt;
     use netlink_packet_route::route::{RouteAddress, RouteAttribute};
-    use rtnetlink::IpVersion;
 
-    let mut routes = handle.route().get(IpVersion::V4).execute();
+    let mut routes = handle
+        .route()
+        .get(RouteMessageBuilder::<Ipv4Addr>::new().build())
+        .execute();
     while let Some(msg) = routes.try_next().await.map_err(|e| NetworkError::Route {
         op: "list_routes",
         cidr,

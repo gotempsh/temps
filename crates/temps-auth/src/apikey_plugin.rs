@@ -65,10 +65,16 @@ impl TempsPlugin for ApiKeyPlugin {
                         as Arc<dyn temps_core::telemetry::TelemetryReporter>
                 });
 
+            // Audit logger for write operations (e.g. key rotation) -- required,
+            // not optional: rotation audit entries must never be silently skipped
+            // because the plugin wiring forgot to register a logger.
+            let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
+
             // Create ApiKeyState for handlers
             let apikey_state = Arc::new(ApiKeyState {
                 api_key_service: apikey_service,
                 telemetry,
+                audit_service,
             });
             context.register_service(apikey_state);
 
@@ -95,6 +101,10 @@ impl TempsPlugin for ApiKeyPlugin {
             .route(
                 "/api-keys/{id}/deactivate",
                 post(apikey_handler::deactivate_api_key),
+            )
+            .route(
+                "/api-keys/{id}/rotate",
+                post(apikey_handler::rotate_api_key),
             )
             .route(
                 "/api-keys/permissions",

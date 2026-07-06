@@ -189,17 +189,10 @@ schemars = { version = "0.8", features = ["preserve_order"] }
 # ============================================================================
 argon2 = "0.5"
 aes-gcm = "0.10.3"
-hkdf = "0.12"
+hkdf = "0.13"
 totp-rs = "5.7.0"
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
-# NOTE: pinned below 0.11 -- the 0.11 bump (dependabot PR #225, merged into
-# origin/main as ee38f985) breaks compilation across the workspace: several
-# crates format digests with `{:x}` (relies on sha2 0.10's GenericArray
-# implementing LowerHex, which sha2 0.11's Array type does not), and RSA/HMAC
-# signing in temps-dns's AWS/GCP providers pull in `rsa`/`hmac 0.12`, which
-# are still pinned to `digest 0.10` and conflict with a 0.11 Sha256. Revert
-# until those call sites are migrated in a dedicated PR.
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 base64 = "0.22"
 hex = "0.4.3"
 # openidconnect 4.x — bumped from 3.x to clear three transitive

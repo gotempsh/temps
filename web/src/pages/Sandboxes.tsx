@@ -152,7 +152,6 @@ export default function Sandboxes() {
   })
 
   const items: SandboxView[] = (data?.sandboxes ?? []).map(toSandboxView)
-  const pageCount = data?.pagination?.count ?? items.length
   const hasNext = data?.pagination?.next != null
   const hasPrev = data?.pagination?.prev != null
 

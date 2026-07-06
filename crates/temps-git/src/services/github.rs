@@ -1,6 +1,6 @@
 use chrono::Utc;
 use hex;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use octocrab::models::{AppId, InstallationId, InstallationRepositories, InstallationToken};
 use octocrab::params::apps::CreateInstallationAccessToken;
 use octocrab::Octocrab;

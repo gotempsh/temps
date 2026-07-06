@@ -429,6 +429,70 @@ impl DeploymentTokenService {
         Ok(())
     }
 
+    /// Rotate a deployment token's secret in place.
+    ///
+    /// Generates a brand new plaintext token for the same row (same id,
+    /// name, project/environment/deployment scope, and permissions),
+    /// overwrites the stored hash and encrypted value so the old secret
+    /// stops validating immediately, and returns the new plaintext token
+    /// exactly once -- mirroring `create_token`'s "only shown once" contract.
+    pub async fn rotate_token(
+        &self,
+        project_id: i32,
+        token_id: i32,
+    ) -> Result<CreateDeploymentTokenResponse, DeploymentTokenServiceError> {
+        let token = DeploymentTokenEntity::find_by_id(token_id)
+            .filter(temps_entities::deployment_tokens::Column::ProjectId.eq(project_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| {
+                DeploymentTokenServiceError::NotFound(format!(
+                    "Deployment token {} not found in project {}",
+                    token_id, project_id
+                ))
+            })?;
+
+        let new_token = self.generate_token();
+        let new_hash = self.hash_token(&new_token);
+        let new_prefix = new_token.chars().take(8).collect::<String>();
+
+        let encrypted_token = self
+            .encryption_service
+            .encrypt_string(&new_token)
+            .map_err(|e| {
+                DeploymentTokenServiceError::InternalServerError(format!(
+                    "Failed to encrypt rotated token for deployment token {}: {}",
+                    token_id, e
+                ))
+            })?;
+
+        let mut token_active: DeploymentTokenActiveModel = token.into();
+        token_active.token_hash = Set(new_hash);
+        token_active.token_prefix = Set(new_prefix.clone());
+        token_active.encrypted_token = Set(Some(encrypted_token));
+        // The old secret is gone, so any "last used" timestamp recorded
+        // against it no longer means anything for the new secret.
+        token_active.last_used_at = Set(None);
+        token_active.updated_at = Set(Utc::now());
+
+        let updated = token_active.update(self.db.as_ref()).await?;
+
+        Ok(CreateDeploymentTokenResponse {
+            id: updated.id,
+            project_id: updated.project_id,
+            environment_id: updated.environment_id,
+            deployment_id: updated.deployment_id,
+            name: updated.name,
+            token_prefix: new_prefix,
+            permissions: updated
+                .permissions
+                .and_then(|p| serde_json::from_value(p).ok()),
+            token: new_token, // Only returned on rotation
+            expires_at: updated.expires_at,
+            created_at: updated.created_at,
+        })
+    }
+
     /// Revoke a token immediately by setting its expiry to the current time.
     ///
     /// Used by the agent executor to invalidate run-scoped tokens the moment a
@@ -690,7 +754,7 @@ impl DeploymentTokenService {
     pub(crate) fn hash_token(&self, token: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(token.as_bytes());
-        format!("{:x}", hasher.finalize())
+        hex::encode(hasher.finalize())
     }
 }
 
@@ -974,6 +1038,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_rotate_deployment_token_invalidates_old_secret_and_issues_new_one() {
+        let Some((_db, service, project)) = setup_test_env().await else {
+            return;
+        };
+
+        let request = CreateDeploymentTokenRequest {
+            name: "Rotate Me".to_string(),
+            environment_id: None,
+            deployment_id: None,
+            permissions: Some(vec!["visitors:enrich".to_string()]),
+            expires_at: None,
+        };
+
+        let created = service
+            .create_token(project.id, None, request)
+            .await
+            .unwrap();
+
+        // Old token works before rotation.
+        assert!(service.validate_token(&created.token).await.is_ok());
+
+        let rotated = service.rotate_token(project.id, created.id).await.unwrap();
+
+        // Same row: id, name, project scope, and permissions unchanged.
+        assert_eq!(rotated.id, created.id);
+        assert_eq!(rotated.name, created.name);
+        assert_eq!(rotated.project_id, created.project_id);
+        assert_eq!(rotated.permissions, created.permissions);
+
+        // A brand new plaintext token was minted.
+        assert_ne!(rotated.token, created.token);
+        assert!(rotated.token.starts_with("dt_"));
+
+        // The old token must no longer validate ...
+        let old_result = service.validate_token(&created.token).await;
+        assert!(old_result.is_err());
+        assert!(matches!(
+            old_result.unwrap_err(),
+            DeploymentTokenServiceError::Unauthorized(_)
+        ));
+
+        // ... while the new token does.
+        let (validated_project_id, _, permissions) =
+            service.validate_token(&rotated.token).await.unwrap();
+        assert_eq!(validated_project_id, project.id);
+        assert_eq!(permissions, vec![DeploymentTokenPermission::VisitorsEnrich]);
+    }
+
+    #[tokio::test]
+    async fn test_rotate_deployment_token_not_found() {
+        let Some((_db, service, project)) = setup_test_env().await else {
+            return;
+        };
+
+        let result = service.rotate_token(project.id, 999999).await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            DeploymentTokenServiceError::NotFound(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_rotate_deployment_token_wrong_project_is_not_found() {
+        let Some((_db, service, project)) = setup_test_env().await else {
+            return;
+        };
+
+        let request = CreateDeploymentTokenRequest {
+            name: "Scoped Token".to_string(),
+            environment_id: None,
+            deployment_id: None,
+            permissions: None,
+            expires_at: None,
+        };
+
+        let created = service
+            .create_token(project.id, None, request)
+            .await
+            .unwrap();
+
+        // Rotating with the wrong project_id must not find the token.
+        let result = service.rotate_token(project.id + 1, created.id).await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            DeploymentTokenServiceError::NotFound(_)
+        ));
+    }
+
+    #[tokio::test]
     async fn test_validate_deployment_token() {
         let Some((_db, service, project)) = setup_test_env().await else {
             return;
@@ -1240,7 +1397,7 @@ mod tests {
 
         let mut hasher = Sha256::new();
         hasher.update(token.as_bytes());
-        let hash = format!("{:x}", hasher.finalize());
+        let hash = hex::encode(hasher.finalize());
 
         // SHA256 hash should be 64 hex characters
         assert_eq!(hash.len(), 64);
@@ -1261,13 +1418,13 @@ mod tests {
         let hash1 = {
             let mut hasher = Sha256::new();
             hasher.update(token.as_bytes());
-            format!("{:x}", hasher.finalize())
+            hex::encode(hasher.finalize())
         };
 
         let hash2 = {
             let mut hasher = Sha256::new();
             hasher.update(token.as_bytes());
-            format!("{:x}", hasher.finalize())
+            hex::encode(hasher.finalize())
         };
 
         // Same input should produce same hash
@@ -1285,13 +1442,13 @@ mod tests {
         let hash1 = {
             let mut hasher = Sha256::new();
             hasher.update(token1.as_bytes());
-            format!("{:x}", hasher.finalize())
+            hex::encode(hasher.finalize())
         };
 
         let hash2 = {
             let mut hasher = Sha256::new();
             hasher.update(token2.as_bytes());
-            format!("{:x}", hasher.finalize())
+            hex::encode(hasher.finalize())
         };
 
         // Different tokens should produce different hashes

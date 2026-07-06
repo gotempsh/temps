@@ -1578,6 +1578,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "bnum"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "119771309b95163ec7aaf79810da82f7cd0599c19722d48b9c03894dca833966"
+
+[[package]]
 name = "bollard"
 version = "0.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1629,7 +1635,7 @@ version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85a885520bf6249ab931a764ffdb87b0ceef48e6e7d807cfdb21b751e086e1ad"
 dependencies = [
- "prost 0.14.3",
+ "prost 0.14.4",
  "prost-types 0.14.3",
  "tonic 0.14.6",
  "tonic-prost",
@@ -1646,7 +1652,7 @@ dependencies = [
  "bollard-buildkit-proto",
  "bytes",
  "chrono",
- "prost 0.14.3",
+ "prost 0.14.4",
  "serde",
  "serde_json",
  "serde_repr",
@@ -1831,6 +1837,9 @@ name = "bytes"
 version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ae3f5d315924270530207e2a68396c3cc547f6dca3fbdca317cfb1a51edb593"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "bytes-utils"
@@ -2139,41 +2148,53 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "clickhouse"
-version = "0.13.3"
+version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a9a81a1dffadd762ee662635ce409232258ce9beebd7cc0fa227df0b5e7efc0"
+checksum = "d8063696febb0a10a6fb9df1460c52c509188f1d19da2157694ab3ca0feffc74"
 dependencies = [
+ "bnum",
  "bstr",
  "bytes",
  "chrono",
  "cityhash-rs",
- "clickhouse-derive",
- "futures",
+ "clickhouse-macros",
+ "clickhouse-types",
  "futures-channel",
+ "futures-util",
  "http-body-util",
  "hyper",
  "hyper-util",
  "lz4_flex",
- "replace_with",
- "sealed",
+ "polonius-the-crab",
  "serde",
- "static_assertions",
- "thiserror 1.0.69",
+ "serde_json",
+ "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "url",
  "uuid",
 ]
 
 [[package]]
-name = "clickhouse-derive"
-version = "0.2.0"
+name = "clickhouse-macros"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d70f3e2893f7d3e017eeacdc9a708fbc29a10488e3ebca21f9df6a5d2b616dbb"
+checksum = "ff6669899e23cb87b43daf7996f0ea3b9c07d0fb933d745bb7b815b052515ae3"
 dependencies = [
  "proc-macro2",
  "quote",
  "serde_derive_internals",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "clickhouse-types"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "30a5efddc880ce9e2573bd867413d9056fa2bea0206af88dec21e72178b9dc74"
+dependencies = [
+ "bytes",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2932,7 +2953,7 @@ dependencies = [
  "log",
  "netlink-packet-core 0.8.1",
  "netlink-packet-generic",
- "netlink-packet-route 0.30.0",
+ "netlink-packet-route",
  "netlink-packet-utils 0.6.0",
  "netlink-packet-wireguard",
  "netlink-sys",
@@ -3361,7 +3382,7 @@ dependencies = [
  "ff",
  "generic-array",
  "group",
- "hkdf",
+ "hkdf 0.12.4",
  "pem-rfc7468",
  "pkcs8",
  "rand_core 0.6.4",
@@ -4374,12 +4395,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "higher-kinded-types"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e690f8474c6c5d8ff99656fcbc195a215acc3949481a8b0b3351c838972dc776"
+dependencies = [
+ "macro_rules_attribute",
+ "never-say-never",
+ "paste",
+]
+
+[[package]]
 name = "hkdf"
 version = "0.12.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7b5f8eb2ad728638ea2c7d47a21db23b7b58a72ed6a38256b8a1849f15fbbdf7"
 dependencies = [
  "hmac 0.12.1",
+]
+
+[[package]]
+name = "hkdf"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4aaa26c720c68b866f2c96ef5c1264b3e6f473fe5d4ce61cd44bbe913e553018"
+dependencies = [
+ "hmac 0.13.0",
 ]
 
 [[package]]
@@ -6258,20 +6299,6 @@ dependencies = [
 
 [[package]]
 name = "netlink-packet-route"
-version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74c171cd77b4ee8c7708da746ce392440cb7bcf618d122ec9ecc607b12938bf4"
-dependencies = [
- "anyhow",
- "byteorder",
- "libc",
- "log",
- "netlink-packet-core 0.7.0",
- "netlink-packet-utils 0.5.2",
-]
-
-[[package]]
-name = "netlink-packet-route"
 version = "0.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be8919612f6028ab4eacbbfe1234a9a43e3722c6e0915e7ff519066991905092"
@@ -6319,14 +6346,14 @@ dependencies = [
 
 [[package]]
 name = "netlink-proto"
-version = "0.11.5"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72452e012c2f8d612410d89eea01e2d9b56205274abb35d53f60200b2ec41d60"
+checksum = "b65d130ee111430e47eed7896ea43ca693c387f097dd97376bffafbf25812128"
 dependencies = [
  "bytes",
  "futures",
  "log",
- "netlink-packet-core 0.7.0",
+ "netlink-packet-core 0.8.1",
  "netlink-sys",
  "thiserror 2.0.18",
 ]
@@ -6343,6 +6370,12 @@ dependencies = [
  "log",
  "tokio",
 ]
+
+[[package]]
+name = "never-say-never"
+version = "6.6.666"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf5a574dadd7941adeaa71823ecba5e28331b8313fb2e1c6a5c7e5981ea53ad6"
 
 [[package]]
 name = "new_debug_unreachable"
@@ -6364,17 +6397,6 @@ dependencies = [
 
 [[package]]
 name = "nix"
-version = "0.27.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2eb04e9c688eff1c89d72b407f168cf79bb9e867a9d3323ed6c01519eb9cc053"
-dependencies = [
- "bitflags 2.11.1",
- "cfg-if",
- "libc",
-]
-
-[[package]]
-name = "nix"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "71e2746dc3a24dd78b3cfcb7be93368c6de9963d30f43a6a73998a9cf4b17b46"
@@ -6384,6 +6406,18 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "memoffset 0.9.1",
+]
+
+[[package]]
+name = "nix"
+version = "0.30.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
+dependencies = [
+ "bitflags 2.11.1",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
 ]
 
 [[package]]
@@ -7642,6 +7676,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "polonius-the-crab"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec242d7eccbb2fd8b3b5b6e3cf89f94a91a800f469005b44d154359609f8af72"
+dependencies = [
+ "higher-kinded-types",
+ "never-say-never",
+]
+
+[[package]]
 name = "poly1305"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7932,12 +7976,12 @@ dependencies = [
 
 [[package]]
 name = "prost"
-version = "0.14.3"
+version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2ea70524a2f82d518bce41317d0fae74151505651af45faf1ffbd6fd33f0568"
+checksum = "528ac67416ff8646872a3c02cad9cc4ee5dc9f9540c9b10771855c95cb2e5ae1"
 dependencies = [
  "bytes",
- "prost-derive 0.14.3",
+ "prost-derive 0.14.4",
 ]
 
 [[package]]
@@ -7975,9 +8019,9 @@ dependencies = [
 
 [[package]]
 name = "prost-derive"
-version = "0.14.3"
+version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
+checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
  "itertools 0.14.0",
@@ -8001,7 +8045,7 @@ version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8991c4cbdb8bc5b11f0b074ffe286c30e523de90fee5ba8132f1399f23cb3dd7"
 dependencies = [
- "prost 0.14.3",
+ "prost 0.14.4",
 ]
 
 [[package]]
@@ -8686,12 +8730,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "replace_with"
-version = "0.1.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51743d3e274e2b18df81c4dc6caf8a5b8e15dbe799e0dca05c7617380094e884"
-
-[[package]]
 name = "reqwest"
 version = "0.12.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8901,18 +8939,18 @@ dependencies = [
 
 [[package]]
 name = "rtnetlink"
-version = "0.14.1"
+version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b684475344d8df1859ddb2d395dd3dac4f8f3422a1aa0725993cb375fc5caba5"
+checksum = "dc19f84f710fa2f337617f9bc0400260a94224bde7bae28fd8879f3771ca5784"
 dependencies = [
- "futures",
+ "futures-channel",
+ "futures-util",
  "log",
- "netlink-packet-core 0.7.0",
- "netlink-packet-route 0.19.0",
- "netlink-packet-utils 0.5.2",
+ "netlink-packet-core 0.8.1",
+ "netlink-packet-route",
  "netlink-proto",
  "netlink-sys",
- "nix 0.27.1",
+ "nix 0.30.1",
  "thiserror 1.0.69",
  "tokio",
 ]
@@ -9454,17 +9492,6 @@ name = "seahash"
 version = "4.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
-
-[[package]]
-name = "sealed"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22f968c5ea23d555e670b449c1c5e7b2fc399fdaec1d304a17cd48e288abc107"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
 
 [[package]]
 name = "sec1"
@@ -10240,7 +10267,7 @@ dependencies = [
  "futures-util",
  "generic-array",
  "hex",
- "hkdf",
+ "hkdf 0.12.4",
  "hmac 0.12.1",
  "itoa",
  "log",
@@ -10283,7 +10310,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "hex",
- "hkdf",
+ "hkdf 0.12.4",
  "hmac 0.12.1",
  "home",
  "itoa",
@@ -10604,6 +10631,7 @@ dependencies = [
  "bollard",
  "bytes",
  "futures",
+ "hex",
  "http 1.4.2",
  "http-body-util",
  "hyper",
@@ -10616,7 +10644,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "sysinfo 0.29.11",
  "tempfile",
  "temps-core",
@@ -10977,7 +11005,7 @@ dependencies = [
  "serde",
  "serde_derive",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "temps-core",
  "temps-database",
  "temps-entities",
@@ -11143,7 +11171,7 @@ dependencies = [
  "sea-orm",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "sysinfo 0.29.11",
  "tar",
  "temps-agent",
@@ -11233,7 +11261,7 @@ dependencies = [
  "serde",
  "serde_derive",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "sqlx",
  "sysinfo 0.33.1",
  "temps-auth",
@@ -11262,8 +11290,8 @@ dependencies = [
  "cookie 0.18.1",
  "futures",
  "hex",
- "hkdf",
- "hmac 0.12.1",
+ "hkdf 0.13.0",
+ "hmac 0.13.0",
  "ipnet",
  "log",
  "once_cell",
@@ -11272,7 +11300,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tempfile",
  "temps-memory",
  "thiserror 2.0.18",
@@ -11373,7 +11401,7 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "serde_yaml",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "sysinfo 0.29.11",
  "tar",
  "tempfile",
@@ -11424,7 +11452,7 @@ dependencies = [
  "futures",
  "hex",
  "hickory-resolver",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "mockall 0.13.1",
  "quick-xml",
  "reqwest 0.12.28",
@@ -11433,6 +11461,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "sha2 0.11.0",
  "temps-auth",
  "temps-core",
  "temps-database",
@@ -11501,7 +11530,7 @@ dependencies = [
  "sea-orm",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tar",
  "temps-auth",
  "temps-config",
@@ -11534,7 +11563,8 @@ dependencies = [
  "dirs",
  "flate2",
  "gethostname",
- "hkdf",
+ "hex",
+ "hkdf 0.13.0",
  "http 1.4.2",
  "http-body-util",
  "pingora",
@@ -11549,7 +11579,7 @@ dependencies = [
  "sea-orm-migration",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tempfile",
  "temps-core",
  "temps-file-store",
@@ -11611,13 +11641,13 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "hex",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "lol_html",
  "reqwest 0.12.28",
  "sea-orm",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "temps-auth",
  "temps-config",
  "temps-core",
@@ -11715,7 +11745,7 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "serial_test",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "sourcemap",
  "temps-auth",
  "temps-config",
@@ -11792,7 +11822,8 @@ version = "0.1.0-beta.42"
 dependencies = [
  "async-trait",
  "bytes",
- "sha2 0.10.9",
+ "hex",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -11839,7 +11870,7 @@ dependencies = [
  "futures-util",
  "git2",
  "hex",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "http-body-util",
  "hyper",
  "jsonwebtoken",
@@ -11853,7 +11884,7 @@ dependencies = [
  "serde",
  "serde_derive",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "subtle",
  "tar",
  "tempfile",
@@ -11878,7 +11909,7 @@ name = "temps-git-credential"
 version = "0.1.0-beta.42"
 dependencies = [
  "chrono",
- "nix 0.29.0",
+ "nix 0.31.3",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -12097,7 +12128,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tempfile",
  "temps-auth",
  "temps-core",
@@ -12221,8 +12252,8 @@ dependencies = [
  "libc",
  "mockall 0.13.1",
  "netlink-packet-core 0.7.0",
- "netlink-packet-route 0.19.0",
- "nix 0.29.0",
+ "netlink-packet-route",
+ "nix 0.31.3",
  "rtnetlink",
  "sea-orm",
  "sea-orm-migration",
@@ -12314,12 +12345,12 @@ dependencies = [
  "http 1.4.2",
  "http-body-util",
  "hyper",
- "prost 0.14.3",
+ "prost 0.14.4",
  "prost-build",
  "sea-orm",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "temps-ai",
  "temps-auth",
  "temps-config",
@@ -12414,7 +12445,7 @@ dependencies = [
  "serde",
  "serde_derive",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "slug",
  "tempfile",
  "temps-auth",
@@ -12510,7 +12541,7 @@ dependencies = [
  "flate2",
  "futures",
  "hex",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "htmd",
  "http-body-util",
  "hyper",
@@ -12537,7 +12568,7 @@ dependencies = [
  "sea-orm-migration",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "sqlx",
  "temp-dir",
  "temps-analytics",
@@ -12572,7 +12603,7 @@ dependencies = [
  "clap",
  "futures",
  "libc",
- "nix 0.29.0",
+ "nix 0.31.3",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -12697,14 +12728,14 @@ dependencies = [
  "chrono",
  "csv",
  "hex",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "http 1.4.2",
  "rand 0.8.6",
  "sea-orm",
  "sea-orm-migration",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "subtle",
  "temps-auth",
  "temps-core",
@@ -12727,13 +12758,14 @@ dependencies = [
  "async-trait",
  "axum 0.8.9",
  "chrono",
+ "hex",
  "http 1.4.2",
  "parking_lot",
  "sea-orm",
  "sea-orm-migration",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "sqlx",
  "subtle",
  "temps-core",
@@ -12907,12 +12939,12 @@ dependencies = [
  "axum 0.8.9",
  "chrono",
  "hex",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "reqwest 0.12.28",
  "sea-orm",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "temps-auth",
  "temps-core",
  "temps-database",
@@ -13611,7 +13643,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "50849f68853be452acf590cde0b146665b8d507b3b8af17261df47e02c209ea0"
 dependencies = [
  "bytes",
- "prost 0.14.3",
+ "prost 0.14.4",
  "tonic 0.14.6",
 ]
 

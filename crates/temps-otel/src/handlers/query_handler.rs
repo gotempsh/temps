@@ -550,6 +550,7 @@ pub async fn query_traces(
         ("end_time" = Option<String>, Query, description = "End time (RFC 3339)"),
         ("environment_id" = Option<i32>, Query, description = "Filter by environment ID"),
         ("deployment_id" = Option<i32>, Query, description = "Filter by deployment ID"),
+        ("name_pattern" = Option<String>, Query, description = "Filter by span name pattern (ILIKE)"),
         ("sort_by" = Option<String>, Query, description = "Sort field: 'start_time' (default) or 'duration'"),
         ("sort_order" = Option<String>, Query, description = "Sort direction: 'asc' or 'desc' (default)"),
         ("limit" = Option<u64>, Query, description = "Max traces to return (default: 50, max: 100)"),

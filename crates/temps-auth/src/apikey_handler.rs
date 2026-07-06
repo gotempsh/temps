@@ -2,10 +2,13 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Json},
+    Extension,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_core::problemdetails::Problem;
+use temps_core::{AuditContext, RequestMetadata};
+use tracing::error;
 use utoipa::{OpenApi, ToSchema};
 
 use super::permission_guard;
@@ -14,6 +17,7 @@ use crate::apikey_handler_types::{
     ApiKeyListResponse, ApiKeyResponse, CreateApiKeyRequest, CreateApiKeyResponse,
     UpdateApiKeyRequest,
 };
+use crate::audit::ApiKeyRotatedAudit;
 use crate::{
     apikey_service::ApiKeyService,
     apikey_types::{get_available_permissions, AvailablePermissions},
@@ -29,6 +33,8 @@ pub struct ApiKeyState {
     pub api_key_service: Arc<ApiKeyService>,
     /// Anonymous product telemetry reporter
     pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
+    /// Audit logger for write operations (e.g. key rotation)
+    pub audit_service: Arc<dyn temps_core::AuditLogger>,
 }
 
 #[utoipa::path(
@@ -286,6 +292,57 @@ pub async fn activate_api_key(
 }
 
 #[utoipa::path(
+    post,
+    path = "/api-keys/{id}/rotate",
+    params(
+        ("id" = i32, Path, description = "API key ID")
+    ),
+    responses(
+        (status = 200, description = "API key rotated successfully; the response contains the new plaintext secret, shown only once", body = CreateApiKeyResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = "API Keys",
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+pub async fn rotate_api_key(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<ApiKeyState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(api_key_id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ApiKeysWrite);
+
+    let rotated = state
+        .api_key_service
+        .rotate_api_key(auth.user_id(), api_key_id)
+        .await
+        .map_err(|e| e.to_problem())?;
+
+    let audit = ApiKeyRotatedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        api_key_id: rotated.id,
+        api_key_name: rotated.name.clone(),
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!(
+            "Failed to create audit log for API key {} rotation: {}",
+            api_key_id, e
+        );
+    }
+
+    Ok(Json(rotated))
+}
+
+#[utoipa::path(
     get,
     path = "/api-keys/permissions",
     responses(
@@ -313,6 +370,7 @@ pub async fn get_api_key_permissions(RequireAuth(_auth): RequireAuth) -> impl In
         delete_api_key,
         activate_api_key,
         deactivate_api_key,
+        rotate_api_key,
         get_api_key_permissions,
     ),
     components(

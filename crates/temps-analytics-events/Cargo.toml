@@ -22,7 +22,7 @@ temps-config = { path = "../temps-config" }
 # ClickHouse Rust client. Always linked. The actual ClickHouse backend is
 # only constructed at runtime when ServerConfig::is_clickhouse_enabled()
 # returns true (i.e. operator set TEMPS_CLICKHOUSE_* env vars).
-clickhouse = { version = "0.13", features = ["uuid", "chrono"] }
+clickhouse = { version = "0.15", features = ["uuid", "chrono"] }
 
 # Web framework
 axum = { workspace = true }
