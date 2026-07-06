@@ -45,7 +45,7 @@ arc-swap = "1.7"
 # Per-cluster CA + per-node certificate issuance for multi-node mTLS (ADR-020 WS-2.1).
 # Pinned to match temps-domains; x509-parser feature enables loading an existing CA
 # and parsing CSRs.
-rcgen = { version = "0.13.2", features = ["x509-parser"] }
+rcgen = { version = "0.14.8", features = ["x509-parser"] }
 
 # Internal dependencies - only core dependencies to avoid cycles
 temps-memory = { path = "../temps-memory" }

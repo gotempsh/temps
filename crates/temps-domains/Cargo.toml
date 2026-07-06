@@ -32,7 +32,7 @@ hyper-util = { version = "0.1", default-features = false, features = ["client", 
 http-body-util = "0.1"
 bytes = "1"
 rustls-native-certs = "0.8"
-rcgen = { version = "0.13.2", features = ["x509-parser"] }
+rcgen = { version = "0.14.8", features = ["x509-parser"] }
 thiserror = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = [
     "std",
