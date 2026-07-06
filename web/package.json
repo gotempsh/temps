@@ -82,7 +82,7 @@
     "react-resizable-panels": "^3.0.6",
     "react-router-dom": "^7.18.1",
     "react-simple-maps": "^3.0.0",
-    "recharts": "2.15.4",
+    "recharts": "3.9.2",
     "rehype-highlight": "^7.0.2",
     "remark-gfm": "^4.0.1",
     "rrweb-player": "^1.0.0-alpha.4",
