@@ -115,9 +115,9 @@ export interface SecuritySettingsFormData {
 }
 
 interface SecuritySettingsProps {
-  control: Control<any>
-  register: UseFormRegister<any>
-  setValue: UseFormSetValue<any>
+  control: Control<SecuritySettingsFormData>
+  register: UseFormRegister<SecuritySettingsFormData>
+  setValue: UseFormSetValue<SecuritySettingsFormData>
   securityHeaders: SecurityHeadersSettings | undefined
   rateLimiting: RateLimitSettings | undefined
 }

@@ -23,10 +23,14 @@ export interface DockerRegistrySettings {
   ca_certificate: string | null
 }
 
+interface DockerRegistryFormValues {
+  docker_registry: DockerRegistrySettings
+}
+
 interface DockerRegistrySettingsProps {
-  control: Control<any>
-  register: UseFormRegister<any>
-  setValue: UseFormSetValue<any>
+  control: Control<DockerRegistryFormValues>
+  register: UseFormRegister<DockerRegistryFormValues>
+  setValue: UseFormSetValue<DockerRegistryFormValues>
   dockerRegistry: DockerRegistrySettings | undefined
 }
 

@@ -20,10 +20,14 @@ import { HardDrive, AlertTriangle } from 'lucide-react'
 import type { Control, UseFormRegister, UseFormSetValue } from 'react-hook-form'
 import type { DiskSpaceAlertSettings } from '@/api/platformSettings'
 
+interface MonitoringFormValues {
+  disk_space_alert: DiskSpaceAlertSettings
+}
+
 interface MonitoringSettingsProps {
-  control: Control<any>
-  register: UseFormRegister<any>
-  setValue: UseFormSetValue<any>
+  control: Control<MonitoringFormValues>
+  register: UseFormRegister<MonitoringFormValues>
+  setValue: UseFormSetValue<MonitoringFormValues>
   diskSpaceAlert: DiskSpaceAlertSettings | undefined
 }
 
