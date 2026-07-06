@@ -78,6 +78,14 @@ The shortest way to spot a missing step: TypeScript compile errors
 in `web/src/` that say "Module ... has no exported member ...". That
 means the SDK is stale.
 
+## Scope Docker usage on shared hosts
+
+This host may already be running a live Temps instance or other
+operator-owned Docker resources. Do not stop, remove, prune, rebuild,
+retag, or otherwise mutate existing containers, images, volumes, or
+networks. Docker-backed tests may create uniquely named temporary
+resources and must clean up only the resources created by that test run.
+
 ## Pre-commit hooks run cargo fmt and cargo clippy
 
 Hooks **will** reformat your files and **will** fail the commit if
