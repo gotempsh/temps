@@ -308,7 +308,7 @@ libc = "0.2"
 # jemalloc global allocator (temps-cli bin only): low fragmentation + time-based
 # decay returns freed pages to the OS. "profiling"/"stats" are inert unless
 # _RJEM_MALLOC_CONF is set at process start (see temps-cli/src/main.rs).
-tikv-jemallocator = { version = "0.6", features = ["profiling", "stats"] }
+tikv-jemallocator = { version = "0.7", features = ["profiling", "stats"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 rand = "0.8"
 sysinfo = "0.29.0"

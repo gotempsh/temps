@@ -164,6 +164,9 @@ jobs:
           FORCE_WEB_BUILD: 1
           CARGO_INCREMENTAL: 0
           TEMPS_VERSION: ${{ github.ref_name }}
+          # jemalloc bakes max page size at build time; aarch64 kernels vary
+          # (4K/16K/64K). lg-page=16 (64K) makes the binary run on all of them.
+          JEMALLOC_SYS_WITH_LG_PAGE: 16
 
       - name: Strip binary
         run: strip target/release/temps
