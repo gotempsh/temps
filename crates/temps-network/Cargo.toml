@@ -30,7 +30,7 @@ chrono = { workspace = true, optional = true }
 # Linux-only kernel data-plane control. We gate every use behind cfg(target_os = "linux")
 # so the crate still compiles on macOS/Windows for type-checking and shared logic tests.
 [target.'cfg(target_os = "linux")'.dependencies]
-rtnetlink = "0.14"
+rtnetlink = "0.21"
 netlink-packet-route = "0.30"
 netlink-packet-core = "0.7"
 nix = { version = "0.29", features = ["net", "sched", "fs"] }
