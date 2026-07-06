@@ -282,10 +282,6 @@ pub struct MariaDbInputConfig {
     /// to S3. Smaller = less data lost on restore, more frequent uploads.
     #[serde(default)]
     pub binlog_archive_interval: BinlogArchiveInterval,
-
-    /// Existing Docker container name for imported services.
-    #[serde(default)]
-    pub container_name: Option<String>,
 }
 
 /// Internal runtime configuration for MariaDB service.
@@ -302,8 +298,6 @@ pub struct MariaDbConfig {
     pub size_profile: MariaDbSizeProfile,
     #[serde(default)]
     pub binlog_archive_interval: BinlogArchiveInterval,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub container_name: Option<String>,
 }
 
 impl From<MariaDbInputConfig> for MariaDbConfig {
@@ -322,7 +316,6 @@ impl From<MariaDbInputConfig> for MariaDbConfig {
             docker_image: input.docker_image,
             size_profile: input.size_profile,
             binlog_archive_interval: input.binlog_archive_interval,
-            container_name: input.container_name,
         }
     }
 }
@@ -418,13 +411,6 @@ impl MariaDbService {
 
     fn get_container_name(&self) -> String {
         format!("mariadb-{}", self.name)
-    }
-
-    fn get_live_container_name(&self, config: &MariaDbConfig) -> String {
-        config
-            .container_name
-            .clone()
-            .unwrap_or_else(|| self.get_container_name())
     }
 
     fn get_mariadb_config(&self, service_config: ServiceConfig) -> Result<MariaDbConfig> {
@@ -852,7 +838,7 @@ impl MariaDbService {
     }
 
     async fn run_admin_sql(&self, config: &MariaDbConfig, sql: &str) -> Result<()> {
-        let container_name = self.get_live_container_name(config);
+        let container_name = self.get_container_name();
         self.run_container_command(
             &container_name,
             vec![
@@ -877,7 +863,7 @@ impl MariaDbService {
     }
 
     async fn ping(&self, config: &MariaDbConfig) -> Result<()> {
-        let container_name = self.get_live_container_name(config);
+        let container_name = self.get_container_name();
         self.run_container_command(
             &container_name,
             vec![
@@ -934,7 +920,7 @@ impl MariaDbService {
     ) -> Result<HashMap<String, String>> {
         let config = self.get_mariadb_config(service_config)?;
         Self::build_env_vars(
-            &self.get_live_container_name(&config),
+            &self.get_container_name(),
             MARIADB_INTERNAL_PORT,
             resource_name,
             &config.username,
@@ -1187,7 +1173,7 @@ impl MariaDbService {
         s3_source: &temps_entities::s3_sources::Model,
         config: &MariaDbConfig,
     ) -> Result<usize> {
-        let container_name = self.get_live_container_name(config);
+        let container_name = self.get_container_name();
         let bucket = &s3_source.bucket_name;
         let prefix = s3_source.bucket_path.trim_matches('/');
 
@@ -1291,7 +1277,7 @@ impl MariaDbService {
 
     /// Raw `SHOW BINARY LOGS` output (tab-separated rows: filename, size, ...).
     async fn show_binary_logs(&self, config: &MariaDbConfig) -> Result<String> {
-        let container_name = self.get_live_container_name(config);
+        let container_name = self.get_container_name();
         self.run_container_command(
             &container_name,
             vec![
@@ -1534,7 +1520,7 @@ impl MariaDbService {
     ) -> Result<()> {
         use std::io::Write;
 
-        let container_name = self.get_live_container_name(config);
+        let container_name = self.get_container_name();
         let env = [
             format!("MYSQL_PWD={}", config.root_password),
             format!("MARIADB_PWD={}", config.root_password),
@@ -1644,7 +1630,7 @@ impl MariaDbService {
         config: &MariaDbConfig,
         sql_path: &std::path::Path,
     ) -> Result<()> {
-        let container_name = self.get_live_container_name(config);
+        let container_name = self.get_container_name();
         let restore_filename = "temps_mariadb_restore.sql";
 
         let tar_data = {
@@ -1829,7 +1815,7 @@ impl MariaDbService {
         config: &MariaDbConfig,
         mbstream_host_path: &std::path::Path,
     ) -> Result<()> {
-        let container_name = self.get_live_container_name(config);
+        let container_name = self.get_container_name();
 
         // 1. Disable restart policy FIRST so Docker doesn't bounce the
         //    container back up while the helper holds the volume.
@@ -2170,7 +2156,8 @@ impl MariaDbService {
     ///   only meaningful when that file is the final segment replayed. A bare
     ///   position (no `file:`) is rejected as ambiguous across segments.
     /// - `Xid`   → GTID stop is not yet expressible via a single mysqlbinlog
-    ///   invocation here; rejected rather than silently mis-recovering.
+    ///   invocation here; rejected rather than silently recovering to the
+    ///   wrong point.
     /// - `Name`  → no MariaDB equivalent; rejected.
     pub(crate) fn recovery_target_to_stop_flag(
         target: &RecoveryTarget,
@@ -2321,7 +2308,7 @@ impl MariaDbService {
             return Ok(());
         }
 
-        let container_name = self.get_live_container_name(config);
+        let container_name = self.get_container_name();
         let container_dir = "/var/tmp/temps-binlogs";
 
         // Upload every segment into the container, preserving filenames.
@@ -2487,9 +2474,7 @@ impl MariaDbService {
     ) -> Result<(MariaDbService, MariaDbConfig)> {
         let mut config = self.get_mariadb_config(source_config.clone())?;
 
-        // Fresh port (the source's is taken). A restored new service is its own
-        // container, not an imported one.
-        config.container_name = None;
+        // Fresh port (the source's is taken).
         let new_port = find_available_port(3306)
             .ok_or_else(|| anyhow::anyhow!("No available ports for new MariaDB service"))?
             .to_string();
@@ -2621,16 +2606,8 @@ impl ExternalService for MariaDbService {
         *self.config.write().await = Some(mariadb_config.clone());
         *self.resource_limits.write().await = resource_limits.clone();
 
-        if mariadb_config.container_name.is_none() {
-            self.create_container(&self.docker, &mariadb_config, &resource_limits)
-                .await?;
-        } else {
-            info!(
-                "MariaDB service '{}' is imported from container '{}'; skipping container creation",
-                self.name,
-                self.get_live_container_name(&mariadb_config)
-            );
-        }
+        self.create_container(&self.docker, &mariadb_config, &resource_limits)
+            .await?;
 
         let runtime_config_json = serde_json::to_value(&mariadb_config)
             .map_err(|e| anyhow::anyhow!("Failed to serialize MariaDB runtime config: {}", e))?;
@@ -2776,10 +2753,7 @@ impl ExternalService for MariaDbService {
 
     async fn start(&self) -> Result<()> {
         let existing_config = self.config.read().await.as_ref().cloned();
-        let container_name = existing_config
-            .as_ref()
-            .map(|config| self.get_live_container_name(config))
-            .unwrap_or_else(|| self.get_container_name());
+        let container_name = self.get_container_name();
         info!("Starting MariaDB container {}", container_name);
 
         let containers = self
@@ -2797,12 +2771,6 @@ impl ExternalService for MariaDbService {
         if containers.is_empty() {
             let config = existing_config
                 .ok_or_else(|| anyhow::anyhow!("MariaDB configuration not found"))?;
-            if config.container_name.is_some() {
-                return Err(anyhow::anyhow!(
-                    "Imported MariaDB container '{}' not found",
-                    container_name
-                ));
-            }
             let limits = self.resource_limits.read().await.clone();
             self.create_container(&self.docker, &config, &limits)
                 .await?;
@@ -2830,13 +2798,7 @@ impl ExternalService for MariaDbService {
     }
 
     async fn stop(&self) -> Result<()> {
-        let container_name = self
-            .config
-            .read()
-            .await
-            .as_ref()
-            .map(|config| self.get_live_container_name(config))
-            .unwrap_or_else(|| self.get_container_name());
+        let container_name = self.get_container_name();
         let containers = self
             .docker
             .list_containers(Some(bollard::query_parameters::ListContainersOptions {
@@ -3035,10 +2997,7 @@ impl ExternalService for MariaDbService {
         let config = self.get_mariadb_config(service_config)?;
 
         if temps_core::DeploymentMode::is_docker() {
-            Ok((
-                self.get_live_container_name(&config),
-                MARIADB_INTERNAL_PORT.to_string(),
-            ))
+            Ok((self.get_container_name(), MARIADB_INTERNAL_PORT.to_string()))
         } else {
             Ok(("localhost".to_string(), config.port))
         }
@@ -3646,7 +3605,6 @@ mod tests {
             docker_image: DEFAULT_MARIADB_IMAGE.to_string(),
             size_profile: MariaDbSizeProfile::Standard,
             binlog_archive_interval: BinlogArchiveInterval::Min15,
-            container_name: None,
         });
 
         assert_eq!(config.size_profile, MariaDbSizeProfile::Standard);
@@ -4184,7 +4142,6 @@ mod tests {
             docker_image: default_docker_image(),
             size_profile: MariaDbSizeProfile::default(),
             binlog_archive_interval: BinlogArchiveInterval::default(),
-            container_name: None,
         };
 
         let config: MariaDbConfig = input.into();
@@ -4224,7 +4181,6 @@ mod tests {
             docker_image: "mariadb:11.4".to_string(),
             size_profile: MariaDbSizeProfile::default(),
             binlog_archive_interval: BinlogArchiveInterval::default(),
-            container_name: None,
         };
 
         let config: MariaDbConfig = input.into();
@@ -4667,5 +4623,19 @@ mod tests {
         // which version upgrades actually happen.
         let env_vars = ["MARIADB_AUTO_UPGRADE=1".to_string()];
         assert!(env_vars.contains(&"MARIADB_AUTO_UPGRADE=1".to_string()));
+    }
+
+    #[test]
+    fn test_container_name_is_not_a_user_input() {
+        // container_name is derived from the service name at creation time
+        // (`mariadb-{name}`), never supplied by the client — same as Postgres.
+        // The create form is generated from this schema, so the field must not
+        // appear in it (previously a stray "" made init skip container creation
+        // and start POST /containers//start, which Docker answers with a 301).
+        let schema = serde_json::to_value(schemars::schema_for!(MariaDbInputConfig)).unwrap();
+        assert!(
+            !schema.to_string().contains("container_name"),
+            "container_name leaked into the MariaDB create schema"
+        );
     }
 }
