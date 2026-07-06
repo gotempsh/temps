@@ -17,7 +17,7 @@ export function ReloadableImage({
   const [loaded, setLoaded] = useState(false)
 
   useEffect(() => {
-    let interval: NodeJS.Timer | undefined
+    let interval: ReturnType<typeof setInterval> | undefined
 
     if (!loaded && src) {
       interval = setInterval(() => {

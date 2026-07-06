@@ -30,6 +30,9 @@ use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::Docker;
 use futures::StreamExt;
 
+const DOCKER_EXEC_API_TIMEOUT: Duration = Duration::from_secs(30);
+const DOCKER_EXEC_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
+
 /// Result of a successful exec invocation.
 #[derive(Debug, Clone)]
 pub struct ExecResult {
@@ -61,8 +64,11 @@ pub async fn run_exec(
     env: Option<Vec<String>>,
     timeout: Duration,
 ) -> Result<ExecResult> {
-    let exec = docker
-        .create_exec(
+    let api_timeout = docker_api_timeout(timeout);
+
+    let exec = tokio::time::timeout(
+        api_timeout,
+        docker.create_exec(
             container,
             CreateExecOptions {
                 cmd: Some(cmd.iter().map(|s| s.as_str()).collect()),
@@ -71,19 +77,35 @@ pub async fn run_exec(
                 attach_stderr: Some(true),
                 ..Default::default()
             },
+        ),
+    )
+    .await
+    .map_err(|_| {
+        anyhow!(
+            "docker create_exec timed out after {:?} in container {}. cmd: {:?}",
+            api_timeout,
+            container,
+            cmd.iter().take(3).collect::<Vec<_>>(),
         )
-        .await
-        .map_err(|e| {
-            anyhow!(
-                "docker create_exec failed in container {}: {}",
-                container,
-                e
-            )
-        })?;
+    })?
+    .map_err(|e| {
+        anyhow!(
+            "docker create_exec failed in container {}: {}",
+            container,
+            e
+        )
+    })?;
 
-    let stream = docker
-        .start_exec(&exec.id, None)
+    let stream = tokio::time::timeout(api_timeout, docker.start_exec(&exec.id, None))
         .await
+        .map_err(|_| {
+            anyhow!(
+                "docker start_exec timed out after {:?} in container {}. cmd: {:?}",
+                api_timeout,
+                container,
+                cmd.iter().take(3).collect::<Vec<_>>(),
+            )
+        })?
         .map_err(|e| anyhow!("docker start_exec failed in container {}: {}", container, e))?;
 
     // Drain output concurrently with polling. We collect into a String;
@@ -144,13 +166,29 @@ pub async fn run_exec(
                         ));
                     }
 
-                    match docker.inspect_exec(&exec.id).await {
-                        Ok(info) => {
+                    match tokio::time::timeout(api_timeout, docker.inspect_exec(&exec.id)).await {
+                        Ok(Ok(info)) => {
                             match info.running {
                                 Some(false) => {
                                     // Drain remaining buffered chunks.
-                                    while let Some(Ok(msg)) = output.next().await {
-                                        captured.push_str(&msg.to_string());
+                                    loop {
+                                        match tokio::time::timeout(
+                                            DOCKER_EXEC_DRAIN_TIMEOUT,
+                                            output.next(),
+                                        ).await {
+                                            Ok(Some(Ok(msg))) => {
+                                                captured.push_str(&msg.to_string());
+                                            }
+                                            Ok(Some(Err(e))) => {
+                                                tracing::debug!(
+                                                    "exec output stream error while draining in container {}: {}",
+                                                    container,
+                                                    e
+                                                );
+                                                break;
+                                            }
+                                            Ok(None) | Err(_) => break,
+                                        }
                                     }
                                     let exit_code = info.exit_code.unwrap_or(-1);
                                     if exit_code == 0 {
@@ -192,13 +230,25 @@ pub async fn run_exec(
                                 }
                             }
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             return Err(anyhow!(
                                 "docker inspect_exec failed for {} in container {}: {}. \
                                  output captured ({} bytes):\n{}",
                                 exec.id,
                                 container,
                                 e,
+                                captured.len(),
+                                tail(&captured, 4096),
+                            ));
+                        }
+                        Err(_) => {
+                            return Err(anyhow!(
+                                "docker inspect_exec timed out after {:?} for {} in container {}. \
+                                 cmd: {:?}. output captured ({} bytes):\n{}",
+                                api_timeout,
+                                exec.id,
+                                container,
+                                cmd.iter().take(3).collect::<Vec<_>>(),
                                 captured.len(),
                                 tail(&captured, 4096),
                             ));
@@ -215,6 +265,10 @@ pub async fn run_exec(
         "docker start_exec returned a detached result for container {} (this is a bug)",
         container,
     ))
+}
+
+fn docker_api_timeout(command_timeout: Duration) -> Duration {
+    command_timeout.min(DOCKER_EXEC_API_TIMEOUT)
 }
 
 /// Trim a long string to its trailing N characters, with an indicator if

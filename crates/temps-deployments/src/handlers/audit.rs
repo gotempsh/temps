@@ -138,6 +138,16 @@ pub struct StaticBundleDeletedAudit {
     pub bundle_id: i32,
 }
 
+// ── Deployment token audits ──────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeploymentTokenRotatedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub token_id: i32,
+    pub token_name: String,
+}
+
 // ── AuditOperation implementations ──────────────────────────────────────────
 
 macro_rules! impl_audit_operation {
@@ -184,3 +194,4 @@ impl_audit_operation!(StaticBundleUploadedAudit, "STATIC_BUNDLE_UPLOADED");
 impl_audit_operation!(ExternalImageRegisteredAudit, "EXTERNAL_IMAGE_REGISTERED");
 impl_audit_operation!(ExternalImageDeletedAudit, "EXTERNAL_IMAGE_DELETED");
 impl_audit_operation!(StaticBundleDeletedAudit, "STATIC_BUNDLE_DELETED");
+impl_audit_operation!(DeploymentTokenRotatedAudit, "DEPLOYMENT_TOKEN_ROTATED");

@@ -658,7 +658,7 @@ async fn gitea_provider_e2e() {
     let payload = br#"{"action":"push","ref":"refs/heads/main"}"#;
     // Compute the correct HMAC-SHA256 signature.
     {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
         let mut mac = Hmac::<Sha256>::new_from_slice(webhook_secret.as_bytes()).expect("HMAC init");
         mac.update(payload);

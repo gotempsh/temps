@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Crypto dependency alignment**: Move direct `hmac` users and workspace `hkdf` onto digest-0.11-compatible releases so the merged `sha2` 0.11 dependency update continues to compile instead of requiring a rollback.
+- **Deployment token routes**: Mount `deployment_tokens::configure_routes()` and merge `DeploymentTokensApiDoc` in `DeploymentsPlugin` so deployment-token API paths are reachable at runtime and visible in the generated OpenAPI schema.
+
+### Tests
+
+- **MinIO restore coverage**: Extend `test_s3_backup_and_restore_to_s3` to create 100 MinIO buckets with synthetic files, back them up through the production S3 mirror path, restore into a second service, and verify all restored objects so managed S3 compatibility regressions are caught in the Docker backup suite.
+- **MinIO test container cleanup**: Keep the Docker test helper from sweeping active `temps-test-minio-*` containers created by the same test run, because multi-MinIO backup tests need source and destination containers alive at the same time.
+
 ## [0.1.0-beta.42] - 2026-07-04
 
 ### Added
@@ -39,6 +51,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.0-beta.40] - 2026-07-01
 
 ### Added
+- **Managed S3 backend driver contract**: `temps-providers` now defines a `ManagedS3Backend` protocol for RustFS-compatible and Garage-compatible object-storage lifecycle operations, keeping `rustfs` as the default while requiring `garage` to be managed by an out-of-process provider over `provider_socket` so AGPL storage engines are not compiled into the Temps binary.
+- **MinIO as an S3 backend option**: Managed `s3` services can now select `backend=minio` alongside the default `rustfs` and Garage backend selector, so operators can keep MinIO compatibility without creating a separate current service type.
 
 - **notifications:** Add Cloudflare Email Sending provider ([#160](https://github.com/gotempsh/temps/issues/160))
 - **otel:** ClickHouse-first OTEL metrics storage with full-fidelity decode

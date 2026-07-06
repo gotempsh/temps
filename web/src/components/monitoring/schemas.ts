@@ -46,8 +46,7 @@ export const digestSectionsSchema = z.object({
   deployments: z.boolean(),
   errors: z.boolean(),
   funnels: z.boolean(),
-  security: z.boolean(),
-  resources: z.boolean(),
+  projects: z.boolean(),
 })
 
 export const weeklyDigestSchema = z.object({
@@ -93,7 +92,7 @@ export const providerSchema = z
       // Webhook config
       url: z.string().optional(),
       method: z.enum(['POST', 'PUT', 'PATCH']).optional(),
-      headers: z.record(z.string()).optional(),
+      headers: z.record(z.string(), z.string()).optional(),
       timeout_secs: z.number().min(1).max(300).optional(),
     }),
   })

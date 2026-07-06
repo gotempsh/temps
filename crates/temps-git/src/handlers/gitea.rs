@@ -88,7 +88,7 @@ pub(crate) async fn verify_gitea_webhook_signature(
     };
 
     // Verify HMAC-SHA256 on raw bytes (before JSON parsing).
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
 
     let decoded = match hex::decode(sig) {
@@ -381,7 +381,7 @@ mod tests {
     async fn test_gitea_hmac_via_provider() {
         use crate::services::git_provider::{AuthMethod, GitProviderService};
         use crate::services::gitea_provider::GiteaProvider;
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
 
         let secret = "test-secret";

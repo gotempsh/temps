@@ -45,6 +45,14 @@ pub struct Model {
     /// `m20260601_000002_add_monitoring_settings`.
     #[sea_orm(default_value = false)]
     pub metrics_enabled: bool,
+    /// Whether the auto-provisioning reconcile loop has already created a
+    /// default daily full-backup schedule for this service. Acts as a one-shot
+    /// latch: provisioning happens exactly once (when `false`), then this is
+    /// set to `true` so we never recreate a schedule the operator later
+    /// deletes. Added by migration
+    /// `m20260623_000001_add_external_services_default_backup_provisioned`.
+    #[sea_orm(default_value = false)]
+    pub default_backup_provisioned: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

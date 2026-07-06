@@ -10,20 +10,28 @@
 //! the monitor sends a notification via the shared `NotificationService`.
 //! A recovery notification is sent when the service returns to `operational`.
 
+use crate::externalsvc::mariadb::{BinlogArchiveInterval, MariaDbConfig, MariaDbService};
 use crate::externalsvc::postgres_wal_health::{self, PostgresWalHealth};
-use crate::externalsvc::{HealthProbeStatus, ServiceType};
+use crate::externalsvc::{HealthProbeStatus, S3Credentials, ServiceType};
 use crate::services::ExternalServiceManager;
+use bollard::Docker;
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use temps_core::notifications::{
     NotificationData, NotificationPriority, NotificationService, NotificationType,
 };
-use temps_entities::{external_service_health_checks, external_services};
+use temps_core::EncryptionService;
+use temps_entities::{
+    backup_schedule_services, backup_schedules, external_service_health_checks, external_services,
+    s3_sources,
+};
 use thiserror::Error;
+use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 /// Key under `external_services.health_metadata` for Postgres WAL probe output.
@@ -72,6 +80,15 @@ pub struct ExternalServiceHealthMonitor {
     manager: Arc<ExternalServiceManager>,
     notification_service: Arc<dyn NotificationService>,
     config: ExternalServiceHealthConfig,
+    /// Docker handle used by the per-service MariaDB binlog archiver to read
+    /// closed binlog segments out of the container.
+    docker: Arc<Docker>,
+    /// Decrypts `s3_sources` credentials so the archiver can build an S3 client.
+    encryption_service: Arc<EncryptionService>,
+    /// Last time we ran the binlog archiver for each MariaDB service, keyed by
+    /// service id. The health loop ticks every `poll_interval_secs`; we gate
+    /// archiving so it only fires once per service's `binlog_archive_interval`.
+    last_binlog_archive: Arc<Mutex<HashMap<i32, Instant>>>,
 }
 
 impl ExternalServiceHealthMonitor {
@@ -80,12 +97,17 @@ impl ExternalServiceHealthMonitor {
         manager: Arc<ExternalServiceManager>,
         notification_service: Arc<dyn NotificationService>,
         config: ExternalServiceHealthConfig,
+        docker: Arc<Docker>,
+        encryption_service: Arc<EncryptionService>,
     ) -> Self {
         Self {
             db,
             manager,
             notification_service,
             config,
+            docker,
+            encryption_service,
+            last_binlog_archive: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -262,7 +284,202 @@ impl ExternalServiceHealthMonitor {
             self.send_recovered_alert(service).await;
         }
 
+        // 4. MariaDB PITR: ship closed binary-log segments to S3 on the
+        //    service's configured cadence. Only for running standalone
+        //    MariaDB services that have a backup schedule (→ S3 destination).
+        //    Failures here never affect health monitoring of other services.
+        if service.service_type == "mariadb"
+            && service.topology == "standalone"
+            && service.status == "running"
+            && !matches!(status, HealthProbeStatus::Down)
+        {
+            self.maybe_archive_mariadb_binlogs(service).await;
+        }
+
         Ok(())
+    }
+
+    /// Per-service MariaDB binlog archiver tick. Gated so the actual ship only
+    /// happens once per the service's `binlog_archive_interval`, even though
+    /// the health loop calls this every `poll_interval_secs`.
+    ///
+    /// All failures are logged and swallowed — binlog archiving must never
+    /// disrupt health monitoring.
+    async fn maybe_archive_mariadb_binlogs(&self, service: &external_services::Model) {
+        // Load config to read the configured ship cadence. Cheap relative to
+        // the schedule scan below, and needed for the interval gate.
+        let service_config = match self.manager.get_service_config(service.id).await {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                debug!(
+                    service_id = service.id,
+                    "Failed to load MariaDB config for binlog archive: {}", e
+                );
+                return;
+            }
+        };
+        let mariadb_config: MariaDbConfig =
+            match serde_json::from_value(service_config.parameters.clone()) {
+                Ok(c) => c,
+                Err(e) => {
+                    debug!(
+                        service_id = service.id,
+                        "Failed to parse MariaDB config for binlog archive: {}", e
+                    );
+                    return;
+                }
+            };
+        let interval = mariadb_config.binlog_archive_interval;
+
+        // Interval gate (cheap, in-memory) FIRST: only proceed if enough
+        // wall-clock time has elapsed since the last archive run. Checked
+        // before the backup-schedule DB scan so we don't query every poll tick.
+        if !self.binlog_interval_elapsed(service.id, interval).await {
+            return;
+        }
+
+        // Discover the S3 destination from a backup schedule covering this
+        // service. No schedule = no PITR destination configured = skip.
+        let s3_source = match self.find_s3_source_for_service(service.id).await {
+            Ok(Some(src)) => src,
+            Ok(None) => {
+                debug!(
+                    service_id = service.id,
+                    "MariaDB service has no backup schedule; skipping binlog archive"
+                );
+                return;
+            }
+            Err(e) => {
+                debug!(
+                    service_id = service.id,
+                    "Failed to resolve S3 source for MariaDB binlog archive: {}", e
+                );
+                return;
+            }
+        };
+
+        // Build a decrypted S3 client from the source row.
+        let creds = match self.build_s3_credentials(&s3_source) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    service_id = service.id,
+                    "Failed to build S3 credentials for MariaDB binlog archive: {}", e
+                );
+                return;
+            }
+        };
+        let s3_client = creds.build_s3_client().await;
+
+        let mariadb = MariaDbService::new(service.name.clone(), self.docker.clone());
+        match mariadb
+            .archive_binlogs(&s3_client, &s3_source, &mariadb_config)
+            .await
+        {
+            Ok(shipped) => {
+                if shipped > 0 {
+                    info!(
+                        service_id = service.id,
+                        service = %service.name,
+                        shipped,
+                        "Archived MariaDB binlog segment(s) to S3"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    service_id = service.id,
+                    service = %service.name,
+                    "MariaDB binlog archive run failed: {}", e
+                );
+            }
+        }
+    }
+
+    /// Check the per-service interval gate and, if elapsed, record `now` as the
+    /// new last-archived time. Returns true when the caller should proceed.
+    async fn binlog_interval_elapsed(
+        &self,
+        service_id: i32,
+        interval: BinlogArchiveInterval,
+    ) -> bool {
+        let mut map = self.last_binlog_archive.lock().await;
+        let now = Instant::now();
+        match map.get(&service_id) {
+            Some(last) if now.duration_since(*last) < Duration::from_secs(interval.seconds()) => {
+                false
+            }
+            _ => {
+                map.insert(service_id, now);
+                true
+            }
+        }
+    }
+
+    /// Find the S3 source for a service via an enabled backup schedule that
+    /// covers it. A schedule covers the service when `target_all_services` is
+    /// true, or when the `backup_schedule_services` join links them. Prefers
+    /// the most recently updated schedule when several apply.
+    async fn find_s3_source_for_service(
+        &self,
+        service_id: i32,
+    ) -> Result<Option<s3_sources::Model>, HealthMonitorError> {
+        use sea_orm::QueryOrder;
+
+        let schedules = backup_schedules::Entity::find()
+            .filter(backup_schedules::Column::Enabled.eq(true))
+            .order_by_desc(backup_schedules::Column::UpdatedAt)
+            .all(self.db.as_ref())
+            .await?;
+
+        for schedule in schedules {
+            let covers = if schedule.target_all_services {
+                true
+            } else {
+                backup_schedule_services::Entity::find()
+                    .filter(backup_schedule_services::Column::ScheduleId.eq(schedule.id))
+                    .filter(backup_schedule_services::Column::ServiceId.eq(service_id))
+                    .one(self.db.as_ref())
+                    .await?
+                    .is_some()
+            };
+            if !covers {
+                continue;
+            }
+            if let Some(source) = s3_sources::Entity::find_by_id(schedule.s3_source_id)
+                .one(self.db.as_ref())
+                .await?
+            {
+                return Ok(Some(source));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Decrypt an `s3_sources` row into usable `S3Credentials`.
+    fn build_s3_credentials(
+        &self,
+        s3_source: &s3_sources::Model,
+    ) -> Result<S3Credentials, anyhow::Error> {
+        let access_key_id = self
+            .encryption_service
+            .decrypt_string(&s3_source.access_key_id)
+            .map_err(|e| anyhow::anyhow!("Failed to decrypt S3 access key: {}", e))?;
+        let secret_key = self
+            .encryption_service
+            .decrypt_string(&s3_source.secret_key)
+            .map_err(|e| anyhow::anyhow!("Failed to decrypt S3 secret key: {}", e))?;
+
+        Ok(S3Credentials {
+            access_key_id,
+            secret_key,
+            region: s3_source.region.clone(),
+            endpoint: s3_source.endpoint.clone(),
+            bucket_name: s3_source.bucket_name.clone(),
+            bucket_path: s3_source.bucket_path.clone(),
+            force_path_style: s3_source.force_path_style.unwrap_or(false),
+        })
     }
 
     /// Run the WAL/archive probe for a standalone Postgres service.

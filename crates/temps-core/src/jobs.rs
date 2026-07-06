@@ -358,6 +358,22 @@ pub struct BackupFailedJob {
     pub error_message: String,
 }
 
+/// Ask the deployment job processor to re-run its [`DeploymentGate`] check for
+/// a deployment that a previous check left sitting in `Pending`.
+///
+/// Generic, gate-agnostic: this job type carries no knowledge of *why* the
+/// deployment was blocked (a manual approval workflow, or any future gate)
+/// — it just says "conditions may have changed, please re-evaluate."
+/// Whatever registered a [`DeploymentGate`] implementation is responsible
+/// for enqueuing this once its own state changes (e.g. an approval request
+/// reaching its required approval count).
+///
+/// [`DeploymentGate`]: crate::DeploymentGate
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeploymentGateRecheckJob {
+    pub deployment_id: i32,
+}
+
 /// Cancel request from the HTTP cancel handler. The processor looks the
 /// `backup_id` up in its in-memory cancel-token map and fires the token,
 /// which signals the in-flight container to stop.
@@ -424,6 +440,10 @@ pub enum Job {
     /// (hourly/daily rollups) have their own TimescaleDB retention policies
     /// and do not need to be pruned here.
     PruneMetrics,
+    /// Re-evaluate the [`DeploymentGate`](crate::DeploymentGate) for a
+    /// deployment that a previous check left sitting pre-`Running`. See
+    /// [`DeploymentGateRecheckJob`].
+    DeploymentGateRecheck(DeploymentGateRecheckJob),
 }
 
 impl fmt::Display for Job {
@@ -474,6 +494,9 @@ impl fmt::Display for Job {
             Job::BackupFailed(job) => write!(f, "BackupFailed(backup: {}, engine: {})", job.backup_id, job.engine),
             Job::BackupCancelRequested(job) => write!(f, "BackupCancelRequested(backup: {})", job.backup_id),
             Job::PruneMetrics => write!(f, "PruneMetrics"),
+            Job::DeploymentGateRecheck(job) => {
+                write!(f, "DeploymentGateRecheck(deployment: {})", job.deployment_id)
+            }
         }
     }
 }

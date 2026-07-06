@@ -160,6 +160,7 @@ export function useServiceTypePreset(
 ): PresetState {
   // One hook call per possible preset keeps hook order stable.
   const postgres = usePostgresPreset()
+  const mariadb = useMariDbPreset()
   const redis = useRedisPreset()
   const mongodb = useMongodbPreset()
   const s3 = useS3Preset()
@@ -167,6 +168,8 @@ export function useServiceTypePreset(
   switch (serviceType) {
     case 'postgres':
       return postgres
+    case 'mariadb':
+      return mariadb
     case 'redis':
       return redis
     case 'mongodb':
@@ -177,6 +180,54 @@ export function useServiceTypePreset(
       return s3
     default:
       return { overrides: {}, ownedFields: [], ui: null }
+  }
+}
+
+// -----------------------------------------------------------------------------
+// MariaDB preset — official MariaDB LTS image + custom.
+// -----------------------------------------------------------------------------
+
+const MARIADB_MANAGED_IMAGE = 'mariadb:lts'
+
+const MARIADB_OPTIONS: PresetOption[] = [
+  {
+    id: 'managed',
+    title: 'MariaDB LTS',
+    subtitle: 'Official image',
+    value: MARIADB_MANAGED_IMAGE,
+  },
+  {
+    id: 'custom',
+    title: 'Custom image',
+    subtitle: 'MariaDB-compatible',
+    custom: true,
+  },
+]
+
+function useMariDbPreset(): PresetState {
+  const [selected, setSelected] = useState('managed')
+  const [custom, setCustom] = useState('')
+  const option = MARIADB_OPTIONS.find((o) => o.id === selected)
+  const resolved = option?.value ?? (option?.custom ? custom.trim() : '')
+  const overrides: Record<string, string | undefined> = {
+    docker_image: resolved || undefined,
+  }
+
+  return {
+    overrides,
+    ownedFields: ['docker_image'],
+    ui: (
+      <PresetGroup
+        label="MariaDB version"
+        description="Create a shared MariaDB server. Linked projects get separate databases inside it; use the size profile below to tune the container for the host."
+        options={MARIADB_OPTIONS}
+        selected={selected}
+        customValue={custom}
+        onSelect={setSelected}
+        onCustomChange={setCustom}
+        customPlaceholder="e.g. mariadb:11"
+      />
+    ),
   }
 }
 

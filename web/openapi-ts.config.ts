@@ -17,5 +17,26 @@ export default {
     },
   },
   output: 'src/api/client',
+  parser: {
+    filters: {
+      // Excluding the SSE operations below shouldn't cascade into dropping
+      // unrelated schemas that become "orphaned" only because openapi-ts
+      // recomputes the whole referenced-schema graph after the exclusion.
+      orphans: true,
+      operations: {
+        // Server-Sent Events endpoints: the @tanstack/react-query plugin
+        // generates a `const { data } = await ...` mutation wrapper for
+        // every operation uniformly, but `client.sse.post()` returns a
+        // ServerSentEventsResult (stream), which has no `.data` field —
+        // that mismatch fails `tsc`. Neither endpoint has a frontend
+        // consumer yet; exclude until real SSE consumption is built and
+        // this can be revisited.
+        exclude: [
+          'POST /projects/{project_id}/ai/conversations/{public_id}/messages',
+          'POST /settings/sandbox-rebuild',
+        ],
+      },
+    },
+  },
   plugins: ['@tanstack/react-query'],
 }

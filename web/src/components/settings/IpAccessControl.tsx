@@ -39,8 +39,8 @@ import {
   deleteIpAccessControlMutation,
   listIpAccessControlOptions,
   updateIpAccessControlMutation,
-  type IpAccessControlResponse,
 } from '@/api/client/@tanstack/react-query.gen'
+import type { IpAccessControlResponse } from '@/api/client/types.gen'
 import { Ban, Plus, Shield, Trash2, Edit, Loader2 } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { useForm } from 'react-hook-form'

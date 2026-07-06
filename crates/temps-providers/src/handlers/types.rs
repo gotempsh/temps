@@ -78,6 +78,7 @@ impl From<ServiceParameter> for crate::externalsvc::ServiceParameter {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum ServiceTypeRoute {
+    Mariadb,
     Mongodb,
     Postgres,
     Redis,
@@ -97,6 +98,7 @@ impl ServiceTypeRoute {
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> anyhow::Result<Self> {
         match s.to_lowercase().as_str() {
+            "mariadb" => Ok(ServiceTypeRoute::Mariadb),
             "mongodb" => Ok(ServiceTypeRoute::Mongodb),
             "postgres" => Ok(ServiceTypeRoute::Postgres),
             "redis" => Ok(ServiceTypeRoute::Redis),
@@ -112,6 +114,7 @@ impl ServiceTypeRoute {
     /// Returns a Vec containing all available service types
     pub fn get_all() -> Vec<ServiceTypeRoute> {
         vec![
+            ServiceTypeRoute::Mariadb,
             ServiceTypeRoute::Mongodb,
             ServiceTypeRoute::Postgres,
             ServiceTypeRoute::Redis,
@@ -134,6 +137,7 @@ impl ServiceTypeRoute {
 impl std::fmt::Display for ServiceTypeRoute {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ServiceTypeRoute::Mariadb => write!(f, "mariadb"),
             ServiceTypeRoute::Mongodb => write!(f, "mongodb"),
             ServiceTypeRoute::Postgres => write!(f, "postgres"),
             ServiceTypeRoute::Redis => write!(f, "redis"),
@@ -150,6 +154,7 @@ impl From<ServiceTypeRoute> for crate::externalsvc::ServiceType {
     #[allow(deprecated)]
     fn from(service_type: ServiceTypeRoute) -> Self {
         match service_type {
+            ServiceTypeRoute::Mariadb => crate::externalsvc::ServiceType::Mariadb,
             ServiceTypeRoute::Mongodb => crate::externalsvc::ServiceType::Mongodb,
             ServiceTypeRoute::Postgres => crate::externalsvc::ServiceType::Postgres,
             ServiceTypeRoute::Redis => crate::externalsvc::ServiceType::Redis,
@@ -166,6 +171,7 @@ impl From<crate::externalsvc::ServiceType> for ServiceTypeRoute {
     #[allow(deprecated)]
     fn from(service_type: crate::externalsvc::ServiceType) -> Self {
         match service_type {
+            crate::externalsvc::ServiceType::Mariadb => ServiceTypeRoute::Mariadb,
             crate::externalsvc::ServiceType::Mongodb => ServiceTypeRoute::Mongodb,
             crate::externalsvc::ServiceType::Postgres => ServiceTypeRoute::Postgres,
             crate::externalsvc::ServiceType::Redis => ServiceTypeRoute::Redis,
@@ -310,6 +316,13 @@ pub struct ProviderMetadata {
 impl ProviderMetadata {
     pub fn get_all() -> Vec<Self> {
         vec![
+            Self {
+                service_type: ServiceTypeRoute::Mariadb,
+                display_name: "MariaDB".to_string(),
+                description: "Shared MariaDB server with per-project databases".to_string(),
+                icon_url: "https://cdn.simpleicons.org/mariadb/003545".to_string(),
+                color: "#003545".to_string(),
+            },
             Self {
                 service_type: ServiceTypeRoute::Mongodb,
                 display_name: "MongoDB".to_string(),

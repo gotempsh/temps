@@ -101,11 +101,12 @@ export function serviceTypeRouteForEngine(
   if (!serviceType) return null
   const normalized = serviceType.toLowerCase()
 
-  if (
-    normalized.startsWith('postgres') ||
-    normalized === 'postgresql'
-  ) {
+  if (normalized.startsWith('postgres') || normalized === 'postgresql') {
     return 'postgres'
+  }
+
+  if (normalized === 'mariadb' || normalized === 'mysql') {
+    return 'mariadb'
   }
 
   if (normalized === 'mongodb' || normalized === 'mongo') {

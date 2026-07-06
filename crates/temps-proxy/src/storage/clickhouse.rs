@@ -880,6 +880,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
             let mut inserter = self
                 .client
                 .insert::<ChProxyLogRow>("proxy_logs")
+                .await
                 .map_err(|e| ProxyLogServiceError::ClickHouse {
                     operation: "write_batch (inserter setup)".to_string(),
                     reason: e.to_string(),

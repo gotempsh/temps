@@ -1,7 +1,7 @@
 export const metadata = {
   title: 'Deploy with a Database',
   description:
-    'Provision a managed PostgreSQL database, connect it to your application, and deploy — all without leaving Temps.',
+    'Provision a managed PostgreSQL or MariaDB database, connect it to your application, and deploy — all without leaving Temps.',
   alternates: {
     canonical: '/docs/deploy-with-database',
   },
@@ -11,6 +11,7 @@ export const sections = [
   { title: 'What you will build', id: 'what-you-will-build' },
   { title: 'Prerequisites', id: 'prerequisites' },
   { title: 'Create a PostgreSQL service', id: 'create-a-postgresql-service' },
+  { title: 'Use MariaDB instead', id: 'use-mariadb-instead' },
   { title: 'Link the service to your project', id: 'link-the-service-to-your-project' },
   { title: 'Understand the injected environment variables', id: 'understand-the-injected-environment-variables' },
   { title: 'Update your application', id: 'update-your-application' },
@@ -22,7 +23,7 @@ export const sections = [
 
 # Deploy with a Database
 
-This tutorial walks you through provisioning a managed PostgreSQL database on Temps, connecting it to your application, and deploying. No external database providers, no connection string juggling — Temps runs the database on your server and wires everything together automatically. {{ className: 'lead' }}
+This tutorial walks you through provisioning a managed database on Temps, connecting it to your application, and deploying. The main path uses PostgreSQL; the same workflow also supports MariaDB for MySQL-compatible applications. No external database providers, no connection string juggling — Temps runs the database on your server and wires everything together automatically. {{ className: 'lead' }}
 
 ---
 
@@ -30,7 +31,7 @@ This tutorial walks you through provisioning a managed PostgreSQL database on Te
 
 By the end of this tutorial, you will have:
 
-- A managed PostgreSQL database running as a Docker container on your server
+- A managed PostgreSQL or MariaDB database running as a Docker container on your server
 - The database linked to your project with environment variables injected automatically
 - An application deployed and connected to the database
 - A Redis cache added as a bonus second service
@@ -42,7 +43,7 @@ By the end of this tutorial, you will have:
 
 | Covered | Not covered |
 |---------|-------------|
-| Provisioning PostgreSQL and Redis | MongoDB and S3 storage (same process, different service type) |
+| Provisioning PostgreSQL or MariaDB and Redis | MongoDB and S3 storage (same process, different service type) |
 | Linking services to projects | Database migrations and schema management |
 | Automatic environment variable injection | Connection pooling and performance tuning |
 | Per-environment database isolation | Replication and high availability |
@@ -98,6 +99,24 @@ When the status shows **Running**, your database is ready.
 
 ---
 
+## Use MariaDB instead {{ anchor: true, id: 'use-mariadb-instead' }}
+
+Choose MariaDB when your application expects a MySQL-compatible database, such as many Laravel, WordPress, Rails, Node.js, or Go applications. Temps still uses PostgreSQL with TimescaleDB internally; MariaDB is only for hosted projects that opt into it.
+
+1. In the sidebar, click **Services**
+2. Click **Create Service**
+3. Select **MariaDB** as the service type
+4. Keep the default `mariadb:lts` image, or provide another MariaDB/MySQL-compatible image
+5. Pick a size profile for your host and click **Create Database**
+
+Temps pulls and starts the MariaDB container only when you create or import a MariaDB service. A fresh Temps install does not run MariaDB by default.
+
+<Note>
+MariaDB services are designed to be shared. Link the same MariaDB service to multiple projects; Temps creates a separate `{project_slug}_{environment_slug}` database for each linked project/environment.
+</Note>
+
+---
+
 ## Link the service to your project {{ anchor: true, id: 'link-the-service-to-your-project' }}
 
 Creating a service does not automatically connect it to any project. You need to explicitly link them.
@@ -105,21 +124,21 @@ Creating a service does not automatically connect it to any project. You need to
 1. Open your project in the dashboard
 2. Click **Services** in the project sidebar
 3. Click **Link Service**
-4. Select the PostgreSQL service you just created
+4. Select the database service you just created
 5. Click **Link**
 
 That is it. The next time your project deploys, Temps will inject the database connection details as environment variables into your application container.
 
 ### What linking does under the hood
 
-When you link a PostgreSQL service to a project, Temps:
+When you link a PostgreSQL or MariaDB service to a project, Temps:
 
-1. Creates a **dedicated database** inside the PostgreSQL instance named `{project_slug}_{environment_slug}` (e.g. `my_app_production`). Each project-environment combination gets its own isolated database.
+1. Creates a **dedicated database** inside the service named `{project_slug}_{environment_slug}` (e.g. `my_app_production`). Each project-environment combination gets its own isolated database.
 2. Generates **environment variables** with the connection details, using the Docker container name as the hostname (so containers can talk to each other over the Docker network).
 3. Stores the link in a `project_services` table — only one service of each type can be linked per project.
 
 <Note>
-**One service, many projects:** A single PostgreSQL service can be linked to multiple projects. Each project gets its own database inside the same PostgreSQL instance. This is efficient for a single server — you run one PostgreSQL container instead of one per project.
+**One service, many projects:** A single PostgreSQL or MariaDB service can be linked to multiple projects. Each project gets its own database inside the same database server. This is efficient for a single server — you run one database container instead of one per project.
 </Note>
 
 ---
@@ -153,6 +172,36 @@ When a PostgreSQL service is linked to your project, Temps injects these environ
     The auto-generated password.
   </Property>
 </Properties>
+
+### MariaDB variables
+
+When a MariaDB service is linked, Temps injects both MySQL-compatible and MariaDB-labeled variables:
+
+<Properties>
+  <Property name="DATABASE_URL">
+    Full connection string using the `mysql://` scheme for driver compatibility: `mysql://app:PASSWORD@mariadb-SERVICE-NAME:3306/PROJECT_ENV_DB`
+  </Property>
+  <Property name="MYSQL_URL / MARIADB_URL">
+    Aliases for the same connection string.
+  </Property>
+  <Property name="MYSQL_HOST / MARIADB_HOST">
+    The MariaDB container hostname, e.g. `mariadb-my-app-db`.
+  </Property>
+  <Property name="MYSQL_PORT / MARIADB_PORT">
+    The internal port: `3306`.
+  </Property>
+  <Property name="MYSQL_DATABASE / MARIADB_DATABASE">
+    The per-project database name, e.g. `my_app_production`.
+  </Property>
+  <Property name="MYSQL_USER / MARIADB_USER">
+    The application username.
+  </Property>
+  <Property name="MYSQL_PASSWORD / MARIADB_PASSWORD">
+    The auto-generated application password.
+  </Property>
+</Properties>
+
+The URL intentionally uses `mysql://` because most frameworks, ORMs, and drivers treat MariaDB as MySQL-compatible at the driver layer.
 
 ### Preview before deploying
 

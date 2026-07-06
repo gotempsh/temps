@@ -18,6 +18,13 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from '@/components/ui/collapsible'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { AlertTriangle, ChevronDown, ChevronRight } from 'lucide-react'
@@ -103,6 +110,7 @@ type ParamFieldObj = {
   default_value?: string
   description?: string
   type?: string
+  enum_values?: string[]
 }
 
 function ParamField({
@@ -123,20 +131,38 @@ function ParamField({
             {paramObj.required && <span className="text-destructive">*</span>}
           </FormLabel>
           <FormControl>
-            <Input
-              {...field}
-              value={field.value as string}
-              type={
-                paramObj.encrypted
-                  ? 'password'
-                  : paramObj.type === 'number'
-                    ? 'number'
-                    : 'text'
-              }
-              required={paramObj.required}
-              pattern={paramObj.validation_pattern || undefined}
-              placeholder={paramObj.default_value || undefined}
-            />
+            {paramObj.enum_values && paramObj.enum_values.length > 0 ? (
+              <Select
+                value={(field.value as string) || paramObj.default_value}
+                onValueChange={field.onChange}
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder={paramObj.default_value || 'Select value'} />
+                </SelectTrigger>
+                <SelectContent>
+                  {paramObj.enum_values.map((value) => (
+                    <SelectItem key={value} value={value}>
+                      {value}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            ) : (
+              <Input
+                {...field}
+                value={field.value as string}
+                type={
+                  paramObj.encrypted
+                    ? 'password'
+                    : paramObj.type === 'number'
+                      ? 'number'
+                      : 'text'
+                }
+                required={paramObj.required}
+                pattern={paramObj.validation_pattern || undefined}
+                placeholder={paramObj.default_value || undefined}
+              />
+            )}
           </FormControl>
           {paramObj.description && (
             <p className="text-sm text-muted-foreground">
@@ -211,6 +237,7 @@ export function CreateServiceForm({
           key.toLowerCase().includes('password') ||
           key.toLowerCase().includes('secret'),
         validation_pattern: prop.pattern || undefined,
+        enum_values: Array.isArray(prop.enum) ? prop.enum : undefined,
         // Track if this field should be a number
         type:
           prop.type === 'integer' ||
@@ -395,6 +422,7 @@ export function CreateServiceForm({
               default_value?: string
               description?: string
               type?: string
+              enum_values?: string[]
             }
             const valid = (parameters as unknown[]).filter(
               (p): p is ParamObj =>

@@ -133,6 +133,16 @@ const FIELD_HINTS: Record<string, Record<string, FieldHint>> = {
     ssl_mode: { group: 'advanced' },
     docker_image: { group: 'advanced' },
   },
+  mariadb: {
+    host: { group: 'connection', hiddenWhenManaged: true },
+    port: { group: 'connection', hiddenWhenManaged: true },
+    database: { group: 'credentials' },
+    username: { group: 'credentials' },
+    password: { group: 'credentials' },
+    root_password: { group: 'credentials' },
+    size_profile: { group: 'basic' },
+    docker_image: { group: 'advanced' },
+  },
   redis: {
     host: { group: 'connection', hiddenWhenManaged: true },
     port: { group: 'connection', hiddenWhenManaged: true },

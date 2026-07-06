@@ -133,6 +133,16 @@ pub struct EmailVerifiedAudit {
     pub email: String,
 }
 
+// API key rotation audit. Rotation invalidates the old secret and mints a new
+// one for the same key record -- an auditor needs the key's id/name to tie
+// this event to the credential's lifecycle without seeing the secret itself.
+#[derive(Debug, Clone, Serialize)]
+pub struct ApiKeyRotatedAudit {
+    pub context: AuditContext,
+    pub api_key_id: i32,
+    pub api_key_name: String,
+}
+
 // OIDC provider configuration audits. SSO provider config is one of
 // the highest-impact settings in the system — it controls who can log
 // in and with what role — so every mutation gets a row. The diff-shape
@@ -520,6 +530,29 @@ impl AuditOperation for PasswordChangedAudit {
 impl AuditOperation for EmailVerifiedAudit {
     fn operation_type(&self) -> String {
         "EMAIL_VERIFIED".to_string()
+    }
+
+    fn user_id(&self) -> i32 {
+        self.context.user_id
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+impl AuditOperation for ApiKeyRotatedAudit {
+    fn operation_type(&self) -> String {
+        "API_KEY_ROTATED".to_string()
     }
 
     fn user_id(&self) -> i32 {

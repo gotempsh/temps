@@ -1460,7 +1460,7 @@ impl GitProviderService for GitHubProvider {
         signature: &str,
         secret: &str,
     ) -> Result<bool, GitProviderError> {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
 
         // GitHub uses HMAC-SHA256 for webhook signatures

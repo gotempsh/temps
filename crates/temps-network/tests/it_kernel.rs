@@ -509,10 +509,24 @@ async fn bootstrap_only() {
     // testing using the bootstrapped state.
     let env = Env::from_env();
     cleanup_all().await;
-    let mgr = NetworkManager::new(env.config()).expect("manager new");
-    mgr.bootstrap(env.alloc(), vec![env.peer()])
+    let cfg = env.config();
+    let alloc = env.alloc();
+    let mgr = NetworkManager::new(cfg.clone()).expect("manager new");
+    mgr.bootstrap(alloc.clone(), vec![env.peer()])
         .await
         .expect("bootstrap_only");
     // Give the kernel a moment to settle FDB / route additions.
     tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Mirror what the production caller (temps-agent's network_sync.rs)
+    // does right after bootstrap: create the Docker bridge network pinned
+    // to the kernel bridge we just brought up. `NetworkManager::bootstrap`
+    // deliberately stays pure of bollard (see `bootstrap_creates_docker_network`
+    // above), so callers that need containers on the overlay — including the
+    // DinD harness's cross-host container-ping step in run.sh — must create
+    // it themselves.
+    let docker = bollard::Docker::connect_with_local_defaults().expect("docker connect");
+    temps_network::docker::ensure_network(&docker, &cfg, &alloc)
+        .await
+        .expect("ensure docker network");
 }

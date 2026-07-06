@@ -43,6 +43,7 @@ const DEFAULTS: MonitoringSettings = {
   retention_raw_days: 7,
   retention_hourly_days: 90,
   retention_daily_years: 2,
+  clickhouse_url_set: false,
   clickhouse_url: null,
 }
 

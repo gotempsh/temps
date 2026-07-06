@@ -239,7 +239,7 @@ impl GcpProvider {
         use rsa::pkcs8::DecodePrivateKey;
         use rsa::signature::{SignatureEncoding, Signer};
         use rsa::RsaPrivateKey;
-        use sha2::Sha256;
+        use sha2_010::Sha256;
 
         let private_key = RsaPrivateKey::from_pkcs8_pem(private_key_pem)
             .map_err(|e| DnsError::InvalidCredentials(format!("Invalid private key: {}", e)))?;

@@ -4119,6 +4119,172 @@ impl BackupService {
         Ok(result.rows_affected())
     }
 
+    /// Auto-provision a covering daily full-backup schedule for every MariaDB
+    /// external service that does not yet have one.
+    ///
+    /// This drives point-in-time recovery out of the box: the daily full
+    /// backup produces base backups via the `mariadb_physical` engine, and the
+    /// binlog archiver already ships binary logs every few minutes, so
+    /// base + binlogs = PITR with no operator action.
+    ///
+    /// Design (gated by the per-service `default_backup_provisioned` latch):
+    /// - Only services where `default_backup_provisioned = false` are
+    ///   considered, so we provision **exactly once** and never recreate a
+    ///   schedule the operator later deletes.
+    /// - Scope is **MariaDB only** (`service_type = "mariadb"`).
+    /// - Requires a configured default S3 source. If none exists yet we log at
+    ///   `debug` and return `Ok(())` — the next periodic tick retries, which
+    ///   handles the "storage configured after the service" ordering.
+    /// - Per-service failures are logged at `warn` and skipped, leaving the
+    ///   latch `false` so the service is retried on the next tick. A single bad
+    ///   service can't block the others.
+    ///
+    /// Idempotent and safe to call on a periodic tick.
+    pub async fn reconcile_default_external_service_schedules(&self) -> Result<(), BackupError> {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+        // 1. Resolve the default S3 source. If none is configured yet, this is
+        //    not an error — we simply have nothing to point a schedule at, so
+        //    we bail quietly and retry on the next tick.
+        let s3_source_id = match self.resolve_s3_source_id(None).await {
+            Ok(id) => id,
+            Err(_) => {
+                debug!(
+                    "reconcile_default_external_service_schedules: no default S3 source \
+                     configured yet, skipping (will retry next tick)"
+                );
+                return Ok(());
+            }
+        };
+
+        // 2. Load unprovisioned MariaDB services.
+        let services = temps_entities::external_services::Entity::find()
+            .filter(temps_entities::external_services::Column::ServiceType.eq("mariadb"))
+            .filter(temps_entities::external_services::Column::DefaultBackupProvisioned.eq(false))
+            .all(self.db.as_ref())
+            .await?;
+
+        if services.is_empty() {
+            return Ok(());
+        }
+
+        debug!(
+            count = services.len(),
+            s3_source_id,
+            "reconcile_default_external_service_schedules: provisioning default backup \
+             schedules for MariaDB services"
+        );
+
+        // 3. For each, create a daily full-backup schedule targeting exactly
+        //    that service, then flip the latch.
+        for service in services {
+            if let Err(e) = self.provision_default_schedule_for_service(&service).await {
+                // Leave default_backup_provisioned = false so the next tick
+                // retries. One failing service must not block the others.
+                warn!(
+                    service_id = service.id,
+                    service_name = %service.name,
+                    error = %e,
+                    "Failed to auto-provision default backup schedule for MariaDB service; \
+                     will retry on next reconcile tick"
+                );
+                continue;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Create the default daily full-backup schedule for a single MariaDB
+    /// service and mark it provisioned. Helper for
+    /// [`reconcile_default_external_service_schedules`]; on success the
+    /// service's `default_backup_provisioned` latch is set to `true`.
+    async fn provision_default_schedule_for_service(
+        &self,
+        service: &temps_entities::external_services::Model,
+    ) -> Result<(), BackupError> {
+        use sea_orm::{ActiveModelTrait, Set};
+
+        // Daily at 03:00 UTC. 6-field cron (`sec min hour dom mon dow`) as
+        // required by the `cron` crate / `validate_backup_schedule`; the two
+        // adjacent occurrences are 24h apart, satisfying the validator's
+        // "at least 1 hour" rule. Reuse create_backup_schedule for validation
+        // and next-run computation — do NOT hand-roll a second insert.
+        let request = CreateBackupScheduleRequest {
+            name: format!("Auto base backup — {}", service.name),
+            // `backup_type` is the schedule/job label ("full"); the actual
+            // backup engine (`mariadb_physical`) is resolved from the service's
+            // `service_type` at run time, not from this field.
+            backup_type: "full".to_string(),
+            // Days. 14 days of base backups is a sane default retention window.
+            retention_period: 14,
+            // Use the resolved default S3 source.
+            s3_source_id: None,
+            schedule_expression: "0 0 3 * * *".to_string(),
+            enabled: true,
+            description: Some(
+                "Automatically created daily base backup so point-in-time recovery \
+                 works out of the box. Safe to edit or delete."
+                    .to_string(),
+            ),
+            tags: vec![],
+            max_runtime_secs: None,
+            // Target exactly this service (attached below), not every DB.
+            //
+            // `create_backup_schedule` refuses to create a schedule that has
+            // nothing to back up (target_all=false AND include_control_plane=
+            // false) because no services can be attached until the schedule
+            // row exists. So we create it with the control plane temporarily
+            // included, attach the service, then flip include_control_plane
+            // off via `update_backup_schedule` — which permits the otherwise-
+            // empty combination precisely because a service is now attached.
+            target_all_services: Some(false),
+            include_control_plane: Some(true),
+        };
+
+        let schedule = self.create_backup_schedule(request).await?;
+
+        // Attach exactly this service so the schedule's fan-out targets it.
+        self.attach_services_to_schedule(schedule.id, &[service.id])
+            .await?;
+
+        // Now that the service is attached, narrow the schedule down to exactly
+        // that service: drop the control-plane backup so the schedule only
+        // produces base backups for this MariaDB service.
+        let schedule = self
+            .update_backup_schedule(
+                schedule.id,
+                UpdateBackupScheduleRequest {
+                    name: None,
+                    description: None,
+                    schedule_expression: None,
+                    retention_period: None,
+                    max_runtime_secs: None,
+                    enabled: None,
+                    tags: None,
+                    target_all_services: None,
+                    include_control_plane: Some(false),
+                },
+            )
+            .await?;
+
+        // Flip the one-shot latch so we never provision this service again.
+        let mut active: temps_entities::external_services::ActiveModel = service.clone().into();
+        active.default_backup_provisioned = Set(true);
+        active.update(self.db.as_ref()).await?;
+
+        info!(
+            service_id = service.id,
+            service_name = %service.name,
+            schedule_id = schedule.id,
+            schedule_name = %schedule.name,
+            "Auto-provisioned default daily base-backup schedule for MariaDB service \
+             (enables point-in-time recovery; edit or delete it like any schedule)"
+        );
+
+        Ok(())
+    }
+
     /// Detach a single external service from a backup schedule.
     ///
     /// Returns `true` if a row was removed, `false` if nothing was attached.
@@ -9179,6 +9345,7 @@ mod tests {
             consecutive_health_failures: Set(0),
             health_metadata: Set(None),
             metrics_enabled: Set(false),
+            default_backup_provisioned: Set(false),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
         };
@@ -9354,6 +9521,7 @@ mod tests {
             consecutive_health_failures: Set(0),
             health_metadata: Set(None),
             metrics_enabled: Set(false),
+            default_backup_provisioned: Set(false),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
         }
@@ -9502,6 +9670,208 @@ mod tests {
         );
     }
 
+    /// The daily base-backup cron expression used by the auto-provisioner
+    /// (`reconcile_default_external_service_schedules`) must satisfy
+    /// `validate_backup_schedule`: parse under the `cron` crate's 6-field
+    /// format and produce adjacent runs at least one hour apart. This guards
+    /// the load-bearing literal so a typo can't ship a schedule that the
+    /// validator rejects at provision time.
+    #[tokio::test]
+    async fn auto_provision_cron_expression_is_valid() {
+        // Same expression as provision_default_schedule_for_service.
+        const DAILY_3AM: &str = "0 0 3 * * *";
+
+        // Parses under the cron crate (6-field sec/min/hour/dom/mon/dow).
+        let schedule =
+            Schedule::from_str(DAILY_3AM).expect("auto-provision cron expression must parse");
+
+        // Two adjacent runs are 24h apart -> passes the >= 1h rule in
+        // validate_backup_schedule.
+        let next_two: Vec<_> = schedule.upcoming(Utc).take(2).collect();
+        assert_eq!(next_two.len(), 2, "expected two upcoming runs");
+        let gap = next_two[1] - next_two[0];
+        assert_eq!(
+            gap.num_hours(),
+            24,
+            "daily base-backup runs should be 24h apart, got {} hours",
+            gap.num_hours()
+        );
+    }
+
+    /// `reconcile_default_external_service_schedules` is a safe no-op when no
+    /// default S3 source is configured: `resolve_s3_source_id(None)` errors,
+    /// the reconcile swallows it and returns `Ok(())` so the periodic tick can
+    /// retry once storage is configured. The MockDatabase returns an empty
+    /// `s3_sources` result for the `is_default = true` lookup, so the service
+    /// never reaches the MariaDB query.
+    #[tokio::test]
+    async fn reconcile_default_schedules_noop_without_default_source() {
+        if skip_if_no_docker() {
+            return;
+        }
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                // get_default_s3_source: no default configured -> empty result.
+                .append_query_results(vec![Vec::<s3_sources::Model>::new()])
+                .into_connection(),
+        );
+        let svc = BackupService::new(
+            db.clone(),
+            create_mock_external_service_manager(db),
+            create_mock_notification_service(),
+            create_mock_config_service(),
+            Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
+        );
+
+        let result = svc.reconcile_default_external_service_schedules().await;
+        assert!(
+            result.is_ok(),
+            "reconcile must be a no-op (Ok) when no default S3 source exists, got {:?}",
+            result
+        );
+    }
+
+    /// Full-path integration test (needs a real DB + Docker): with a default
+    /// S3 source and an unprovisioned MariaDB service, reconcile creates
+    /// exactly one daily schedule, attaches the service to it, flips
+    /// `default_backup_provisioned`, and is idempotent on a second call.
+    #[tokio::test]
+    async fn reconcile_default_schedules_provisions_mariadb_once() {
+        if skip_if_no_docker() {
+            return;
+        }
+        use sea_orm::ActiveValue::Set;
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        use temps_database::test_utils::TestDatabase;
+
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(d) => d,
+            Err(e) => {
+                println!("TestDatabase unavailable, skipping: {e}");
+                return;
+            }
+        };
+        let db = test_db.db.clone();
+
+        // Default S3 source so resolve_s3_source_id(None) succeeds.
+        temps_entities::s3_sources::ActiveModel {
+            id: sea_orm::NotSet,
+            name: Set("auto-prov-source".to_string()),
+            bucket_name: Set("b".to_string()),
+            bucket_path: Set("/".to_string()),
+            access_key_id: Set("".to_string()),
+            secret_key: Set("".to_string()),
+            region: Set("us-east-1".to_string()),
+            endpoint: Set(None),
+            force_path_style: Set(Some(true)),
+            is_default: Set(true),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert s3 source");
+
+        // One unprovisioned MariaDB service + one Postgres service (which must
+        // be left alone — scope is MariaDB only).
+        let maria = temps_entities::external_services::ActiveModel {
+            id: sea_orm::NotSet,
+            name: Set("maria-auto".to_string()),
+            service_type: Set("mariadb".to_string()),
+            status: Set("running".to_string()),
+            topology: Set("standalone".to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert mariadb service");
+
+        let pg = temps_entities::external_services::ActiveModel {
+            id: sea_orm::NotSet,
+            name: Set("pg-untouched".to_string()),
+            service_type: Set("postgres".to_string()),
+            status: Set("running".to_string()),
+            topology: Set("standalone".to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert postgres service");
+
+        let svc = BackupService::new(
+            db.clone(),
+            create_mock_external_service_manager(db.clone()),
+            create_mock_notification_service(),
+            create_mock_config_service(),
+            Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
+        );
+
+        svc.reconcile_default_external_service_schedules()
+            .await
+            .expect("first reconcile succeeds");
+
+        // Exactly one schedule created.
+        let schedules = temps_entities::backup_schedules::Entity::find()
+            .all(db.as_ref())
+            .await
+            .expect("list schedules");
+        assert_eq!(
+            schedules.len(),
+            1,
+            "expected exactly one auto-provisioned schedule"
+        );
+        let schedule = &schedules[0];
+        assert_eq!(schedule.schedule_expression, "0 0 3 * * *");
+        assert_eq!(schedule.backup_type, "full");
+        assert_eq!(schedule.retention_period, 14);
+        assert!(!schedule.target_all_services);
+        assert!(!schedule.include_control_plane);
+
+        // The MariaDB service is attached to it.
+        let attached = svc
+            .list_services_for_schedule(schedule.id)
+            .await
+            .expect("list attached services");
+        assert_eq!(attached.len(), 1, "exactly the mariadb service attached");
+        assert_eq!(attached[0].id, maria.id);
+
+        // Latch flipped on MariaDB, untouched on Postgres.
+        let maria_after = temps_entities::external_services::Entity::find_by_id(maria.id)
+            .one(db.as_ref())
+            .await
+            .expect("reload mariadb")
+            .expect("mariadb exists");
+        assert!(
+            maria_after.default_backup_provisioned,
+            "mariadb latch must be set after provisioning"
+        );
+        let pg_after = temps_entities::external_services::Entity::find_by_id(pg.id)
+            .one(db.as_ref())
+            .await
+            .expect("reload postgres")
+            .expect("postgres exists");
+        assert!(
+            !pg_after.default_backup_provisioned,
+            "non-mariadb services must never be provisioned"
+        );
+
+        // Idempotency: a second reconcile creates nothing new.
+        svc.reconcile_default_external_service_schedules()
+            .await
+            .expect("second reconcile succeeds");
+        let count_after = temps_entities::backup_schedules::Entity::find()
+            .filter(temps_entities::backup_schedules::Column::Id.eq(schedule.id))
+            .count(db.as_ref())
+            .await
+            .expect("count");
+        let total = temps_entities::backup_schedules::Entity::find()
+            .count(db.as_ref())
+            .await
+            .expect("count all");
+        assert_eq!(count_after, 1);
+        assert_eq!(total, 1, "second reconcile must not create a duplicate");
+    }
+
     /// Integration test: when `include_control_plane = false` and a single
     /// service is attached, the fan-out produces exactly one backup row
     /// (no control-plane row alongside it). This is the scenario from
@@ -9584,6 +9954,7 @@ mod tests {
             consecutive_health_failures: Set(0),
             health_metadata: Set(None),
             metrics_enabled: Set(false),
+            default_backup_provisioned: Set(false),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
         }

@@ -1,4 +1,4 @@
-import { ProjectResponse, WebhookDeliveryResponse } from '@/api/client'
+import { ProjectResponse } from '@/api/client'
 import { listDeliveriesOptions } from '@/api/client/@tanstack/react-query.gen'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -22,15 +22,6 @@ interface DeliveryDetailDialogProps {
   project: ProjectResponse
   webhookId: number
   deliveryId: number
-}
-
-function formatJSON(str: string | null | undefined): string {
-  if (!str) return 'N/A'
-  try {
-    return JSON.stringify(JSON.parse(str), null, 2)
-  } catch {
-    return str
-  }
 }
 
 export function DeliveryDetailDialog({
@@ -190,27 +181,7 @@ export function DeliveryDetailDialog({
               </>
             )}
 
-            {/* Response Body */}
-            {delivery.response_body && (
-              <div>
-                <div className="flex items-center justify-between mb-2">
-                  <div className="text-sm font-medium">Response Body</div>
-                  <CopyButton
-                    value={delivery.response_body}
-                    className="h-7 px-2"
-                  >
-                    Copy
-                  </CopyButton>
-                </div>
-                <div className="bg-muted rounded-lg p-4 overflow-auto">
-                  <pre className="text-xs font-mono whitespace-pre-wrap break-all">
-                    {formatJSON(delivery.response_body)}
-                  </pre>
-                </div>
-              </div>
-            )}
-
-            {!delivery.response_body && !delivery.error_message && (
+            {!delivery.error_message && (
               <div className="text-center py-8 text-muted-foreground text-sm">
                 No response data available
               </div>

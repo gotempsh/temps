@@ -250,8 +250,9 @@ function PageViewNode({ event }: { event: JourneyEvent }) {
 
 function CustomEventNode({ event }: { event: JourneyEvent }) {
   const [expanded, setExpanded] = React.useState(false)
-  const hasData =
+  const hasData = Boolean(
     event.event_data && Object.keys(event.event_data).length > 0
+  )
 
   return (
     <div className="flex items-start gap-3">

@@ -1,6 +1,6 @@
 export const metadata = {
   title: 'Deploy a Laravel App',
-  description: 'Deploy a Laravel application on Temps with PostgreSQL, queue workers, and automatic HTTPS.',
+  description: 'Deploy a Laravel application on Temps with PostgreSQL or MariaDB, queue workers, and automatic HTTPS.',
   alternates: {
     canonical: '/docs/deploy-laravel',
   },
@@ -8,14 +8,14 @@ export const metadata = {
 
 # Deploy a Laravel App
 
-This tutorial walks you through deploying a Laravel application on Temps with PostgreSQL, Nginx, and PHP-FPM. By the end, you will have a production Laravel app with automatic HTTPS. {{ className: 'lead' }}
+This tutorial walks you through deploying a Laravel application on Temps with PostgreSQL or MariaDB, Nginx, and PHP-FPM. By the end, you will have a production Laravel app with automatic HTTPS. {{ className: 'lead' }}
 
 ---
 
 ## What you will build {{ anchor: true, id: 'what-you-will-build' }}
 
 - A Laravel app deployed from a Git repository
-- PostgreSQL database provisioned and connected
+- PostgreSQL or MariaDB database provisioned and connected
 - Nginx + PHP-FPM in a single container
 - Automatic HTTPS and deployment on every push
 
@@ -76,17 +76,19 @@ RUN composer install --no-dev --no-scripts --optimize-autoloader
 
 COPY . .
 RUN composer dump-autoload --optimize && \
-    php artisan config:cache && \
-    php artisan route:cache && \
-    php artisan view:cache
+    php artisan config:clear
 
 COPY docker/nginx.conf /etc/nginx/http.d/default.conf
 
 RUN chown -R www-data:www-data storage bootstrap/cache
 
 EXPOSE 8080
-CMD sh -c "php-fpm -D && nginx -g 'daemon off;'"
+CMD sh -c "php artisan config:cache && php artisan route:cache && php artisan view:cache && php-fpm -D && nginx -g 'daemon off;'"
 ```
+
+Laravel's config cache must be built at container start, not during the Docker
+build. Temps injects `APP_KEY`, `DATABASE_URL`, and linked-service credentials
+at runtime; caching config in the image would bake in empty or build-time values.
 
 ### Create Nginx config
 
@@ -131,6 +133,39 @@ bunx @temps-sdk/cli services create -p my-laravel-app -t postgres -n "laravel-db
 
 The `DATABASE_URL` environment variable is automatically injected.
 
+### Using MariaDB instead
+
+If your Laravel app is already configured for MySQL, create a MariaDB service instead of PostgreSQL:
+
+```bash
+bunx @temps-sdk/cli services create -p my-laravel-app -t mariadb -n "laravel-db"
+```
+
+Set `DB_CONNECTION=mysql`. Temps injects a MySQL-compatible `DATABASE_URL` plus `MYSQL_*` and `MARIADB_*` variables for the linked MariaDB service.
+
+If your Laravel config still reads only Laravel's default `DB_*` variables, either
+set those aliases in Temps or add fallbacks to the variables injected by the
+linked MariaDB service:
+
+```php {{ title: 'config/database.php (MariaDB/MySQL excerpt)' }}
+'mysql' => [
+    'driver' => 'mysql',
+    'url' => env('DB_URL', env('DATABASE_URL')),
+    'host' => env('DB_HOST', env('MYSQL_HOST', env('MARIADB_HOST', '127.0.0.1'))),
+    'port' => env('DB_PORT', env('MYSQL_PORT', env('MARIADB_PORT', '3306'))),
+    'database' => env('DB_DATABASE', env('MYSQL_DATABASE', env('MARIADB_DATABASE', 'laravel'))),
+    'username' => env('DB_USERNAME', env('MYSQL_USER', env('MARIADB_USER', 'root'))),
+    'password' => env('DB_PASSWORD', env('MYSQL_PASSWORD', env('MARIADB_PASSWORD', ''))),
+],
+```
+
+For a MariaDB/MySQL build, install the PHP MySQL extension instead of PostgreSQL support:
+
+```dockerfile
+RUN apk add --no-cache nginx && \
+    docker-php-ext-install pdo_mysql opcache
+```
+
 ---
 
 ## Step 4: Connect your repository {{ anchor: true, id: 'connect-repo' }}
@@ -168,11 +203,9 @@ bunx @temps-sdk/cli deploy my-laravel-app -b main -e production -y
 bunx @temps-sdk/cli exec my-laravel-app -- php artisan migrate --force
 ```
 
-For subsequent deployments, add to your start command:
-
-```dockerfile
-CMD sh -c "php artisan migrate --force && php-fpm -D && nginx -g 'daemon off;'"
-```
+Run migrations as a one-off release step for each deployment. Do not put
+`php artisan migrate --force` in the container start command: rolling deploys,
+restarts, or multiple replicas can start the command more than once.
 
 ---
 

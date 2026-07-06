@@ -146,7 +146,6 @@ function buildSummaryStats(deployment: DeploymentResponse): StatItem[] {
   return stats
 }
 
-
 function Field({
   label,
   value,
@@ -175,21 +174,48 @@ interface CommitUrls {
   branch: string | null
 }
 
+interface RepoWebBase {
+  base: string
+  isGitlab: boolean
+}
+
 // Best-effort derivation of the repository's web base URL so the commit hash and
 // branch can deep-link back to the git provider. Falls back to plain text when we
 // can't confidently build a URL.
-function deriveRepoWebBase(project: ProjectResponse): string | null {
+function deriveRepoWebBase(project: ProjectResponse): RepoWebBase | null {
   const gitUrl = project.git_url
   if (gitUrl) {
     const https = gitUrl.match(/^https?:\/\/([^/]+)\/(.+?)(?:\.git)?\/?$/i)
-    if (https) return `https://${https[1]}/${https[2]}`
+    if (https)
+      return {
+        base: `https://${https[1]}/${https[2]}`,
+        isGitlab: /gitlab/i.test(https[1]),
+      }
     const scp = gitUrl.match(/^[^@]+@([^:]+):(.+?)(?:\.git)?\/?$/i)
-    if (scp) return `https://${scp[1]}/${scp[2]}`
+    if (scp)
+      return {
+        base: `https://${scp[1]}/${scp[2]}`,
+        isGitlab: /gitlab/i.test(scp[1]),
+      }
     const ssh = gitUrl.match(/^ssh:\/\/[^@]+@([^/]+)\/(.+?)(?:\.git)?\/?$/i)
-    if (ssh) return `https://${ssh[1]}/${ssh[2]}`
+    if (ssh)
+      return {
+        base: `https://${ssh[1]}/${ssh[2]}`,
+        isGitlab: /gitlab/i.test(ssh[1]),
+      }
   }
   if (project.repo_owner && project.repo_name) {
-    return `https://github.com/${project.repo_owner}/${project.repo_name}`
+    // No raw clone URL to sniff a host from. A non-null `gitlab_webhook_id` is
+    // the one signal the frontend actually has that this project is wired up
+    // through a GitLab provider connection (it's only ever set by
+    // install_gitlab_webhook_for_connection); anything else defaults to
+    // GitHub, the common case for connections without a raw git_url.
+    const isGitlab = project.gitlab_webhook_id != null
+    const host = isGitlab ? 'https://gitlab.com' : 'https://github.com'
+    return {
+      base: `${host}/${project.repo_owner}/${project.repo_name}`,
+      isGitlab,
+    }
   }
   return null
 }
@@ -198,19 +224,23 @@ function commitWebUrls(
   project: ProjectResponse,
   deployment: DeploymentResponse
 ): CommitUrls {
-  let base = deriveRepoWebBase(project)
-  if (!base) {
+  let resolved = deriveRepoWebBase(project)
+  if (!resolved) {
     const gpe = deployment.metadata?.gitPushEvent
     if (gpe?.owner && gpe?.repo) {
-      base = `https://github.com/${gpe.owner}/${gpe.repo}`
+      const isGitlab = project.gitlab_webhook_id != null
+      const host = isGitlab ? 'https://gitlab.com' : 'https://github.com'
+      resolved = { base: `${host}/${gpe.owner}/${gpe.repo}`, isGitlab }
     }
   }
-  if (!base) return { commit: null, branch: null }
-  const isGitlab = /gitlab/i.test(base)
+  if (!resolved) return { commit: null, branch: null }
+  const { base, isGitlab } = resolved
   const commitSeg = isGitlab ? '/-/commit/' : '/commit/'
   const treeSeg = isGitlab ? '/-/tree/' : '/tree/'
   return {
-    commit: deployment.commit_hash ? `${base}${commitSeg}${deployment.commit_hash}` : null,
+    commit: deployment.commit_hash
+      ? `${base}${commitSeg}${deployment.commit_hash}`
+      : null,
     branch: deployment.branch
       ? `${base}${treeSeg}${encodeURIComponent(deployment.branch)}`
       : null,
@@ -631,9 +661,7 @@ function DeploymentHeader({
             <Clock className="h-3.5 w-3.5" />
             {buildStats.map((stat, i) => (
               <span key={stat.label} className="inline-flex items-center gap-1">
-                {i > 0 && (
-                  <span className="text-muted-foreground/40">·</span>
-                )}
+                {i > 0 && <span className="text-muted-foreground/40">·</span>}
                 <span>{stat.label}</span>
                 <span className="font-medium tabular-nums text-foreground">
                   {stat.value}
@@ -1018,15 +1046,27 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
         md.imageUploadedLocally)
   )
 
-  // The resource facts worth surfacing, as compact chips: CPU + memory request
-  // and replica count. Limits, exposed port, and feature toggles are omitted.
+  // The resource facts worth surfacing, as compact chips: CPU + memory
+  // request/limit and replica count. Exposed port and feature toggles are omitted.
   const resourceBadges: string[] = []
-  if (cfg?.cpuRequest != null)
-    resourceBadges.push(`${formatMicrocores(cfg.cpuRequest)} CPU`)
-  if (cfg?.memoryRequest != null)
-    resourceBadges.push(`${cfg.memoryRequest} MB memory`)
+  if (cfg?.cpuRequest != null) {
+    const cpuLabel =
+      cfg.cpuLimit != null && cfg.cpuLimit !== cfg.cpuRequest
+        ? `${formatMicrocores(cfg.cpuRequest)}-${formatMicrocores(cfg.cpuLimit)} CPU`
+        : `${formatMicrocores(cfg.cpuRequest)} CPU`
+    resourceBadges.push(cpuLabel)
+  }
+  if (cfg?.memoryRequest != null) {
+    const memoryLabel =
+      cfg.memoryLimit != null && cfg.memoryLimit !== cfg.memoryRequest
+        ? `${cfg.memoryRequest}-${cfg.memoryLimit} MB memory`
+        : `${cfg.memoryRequest} MB memory`
+    resourceBadges.push(memoryLabel)
+  }
   if (cfg?.replicas != null)
-    resourceBadges.push(`${cfg.replicas} replica${cfg.replicas === 1 ? '' : 's'}`)
+    resourceBadges.push(
+      `${cfg.replicas} replica${cfg.replicas === 1 ? '' : 's'}`
+    )
 
   const overviewProps: OverviewProps = {
     project,

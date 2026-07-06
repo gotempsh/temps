@@ -291,6 +291,38 @@ pub async fn check_explorer_support(
 
     // Check if service type supports querying
     let (supported, capabilities, filter_schema, hierarchy, reason) = match service.service_type {
+        crate::externalsvc::ServiceType::Mariadb => {
+            let filter_schema = app_state
+                .query_service
+                .get_filter_schema(service_id)
+                .await
+                .ok();
+
+            let hierarchy = vec![
+                HierarchyLevel {
+                    level: 0,
+                    name: "root".to_string(),
+                    container_type: "database".to_string(),
+                    can_list_containers: true,
+                    can_list_entities: false,
+                },
+                HierarchyLevel {
+                    level: 1,
+                    name: "database".to_string(),
+                    container_type: "table".to_string(),
+                    can_list_containers: false,
+                    can_list_entities: true,
+                },
+            ];
+
+            (
+                true,
+                vec!["sql".to_string()],
+                filter_schema,
+                hierarchy,
+                None,
+            )
+        }
         crate::externalsvc::ServiceType::Postgres => {
             // Get filter schema from QueryService
             let filter_schema = app_state

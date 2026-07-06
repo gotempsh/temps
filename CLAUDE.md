@@ -797,7 +797,7 @@ Types: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`
 | **Operations** | `temps-backup`, `temps-logs`, `temps-monitoring`, `temps-audit`, `temps-notifications` |
 | **Storage** | `temps-kv`, `temps-blob`, `temps-static-files` |
 | **Error Tracking** | `temps-error-tracking`, `temps-embeddings` |
-| **Other** | `temps-cli`, `temps-email`, `temps-webhooks`, `temps-geo`, `temps-presets`, `temps-import`, `temps-import-types`, `temps-import-docker`, `temps-vulnerability-scanner`, `temps-infra`, `temps-status-page`, `temps-mcp`, `temps-captcha-wasm` |
+| **Other** | `temps-cli`, `temps-email`, `temps-webhooks`, `temps-geo`, `temps-presets`, `temps-import`, `temps-import-types`, `temps-import-docker`, `temps-vulnerability-scanner`, `temps-infra`, `temps-status-page`, `temps-captcha-wasm` |
 
 ---
 

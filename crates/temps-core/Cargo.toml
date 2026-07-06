@@ -33,7 +33,7 @@ hkdf = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
-hmac = "0.12"
+hmac = "0.13"
 x25519-dalek = { workspace = true }
 futures = { workspace = true }
 log = { workspace = true }

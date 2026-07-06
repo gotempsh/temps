@@ -426,7 +426,7 @@ pub fn configure_admin_routes() -> Router<Arc<AppState>> {
 /// SHA-256 hash a token string
 fn sha256_hash(token: &str) -> String {
     let digest = sha2::Sha256::digest(token.as_bytes());
-    format!("{:x}", digest)
+    hex::encode(digest)
 }
 
 // ---------------------------------------------------------------------------

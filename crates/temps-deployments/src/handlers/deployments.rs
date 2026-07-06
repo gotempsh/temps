@@ -3285,6 +3285,7 @@ mod tests {
                 bollard::Docker::connect_with_local_defaults()
                     .unwrap_or_else(|_| bollard::Docker::connect_with_defaults().unwrap()),
             ),
+            deployment_gate: None,
         })
     }
 

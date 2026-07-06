@@ -11,11 +11,13 @@ use temps_query_s3::S3Source;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
+use crate::externalsvc::mariadb::MariaDbInputConfig;
 use crate::externalsvc::mongodb::MongodbInputConfig;
 use crate::externalsvc::postgres::PostgresInputConfig;
 use crate::externalsvc::redis::RedisInputConfig;
 use crate::externalsvc::rustfs::RustfsConfig;
 use crate::externalsvc::s3::S3InputConfig;
+use crate::mariadb_query::MariaDbSource;
 use crate::ExternalServiceManager;
 
 /// Cache of active connections by (service_id, database_name)
@@ -160,6 +162,42 @@ impl QueryService {
 
         // Create connection based on service type
         let connection: Arc<dyn DataSource> = match service.service_type {
+            crate::externalsvc::ServiceType::Mariadb => {
+                let config: MariaDbInputConfig = serde_json::from_value(service.parameters.clone())
+                    .map_err(|e| {
+                        DataError::InvalidConfiguration(format!(
+                            "Failed to parse MariaDB configuration: {}",
+                            e
+                        ))
+                    })?;
+
+                let port = config
+                    .port
+                    .unwrap_or_else(|| "3306".to_string())
+                    .parse::<u16>()
+                    .map_err(|e| {
+                        DataError::InvalidConfiguration(format!("Invalid port number: {}", e))
+                    })?;
+                let password = config.password.unwrap_or_default();
+
+                let source = MariaDbSource::connect(
+                    &config.host,
+                    port,
+                    &config.username,
+                    &password,
+                    database,
+                )
+                .await
+                .map_err(|e| {
+                    error!(
+                        "Failed to connect to MariaDB service {} database {}: {}",
+                        service_id, database, e
+                    );
+                    e
+                })?;
+
+                Arc::new(source)
+            }
             crate::externalsvc::ServiceType::Postgres => {
                 // Deserialize parameters into typed PostgresInputConfig
                 let config: PostgresInputConfig =
@@ -583,6 +621,20 @@ impl QueryService {
 
         // Determine which database/identifier to connect to based on service type and path depth
         let database = match service.service_type {
+            crate::externalsvc::ServiceType::Mariadb => {
+                if path.depth() == 0 {
+                    let config: MariaDbInputConfig =
+                        serde_json::from_value(service.parameters.clone()).map_err(|e| {
+                            DataError::InvalidConfiguration(format!(
+                                "Failed to parse MariaDB configuration: {}",
+                                e
+                            ))
+                        })?;
+                    config.database.clone()
+                } else {
+                    path.segments[0].clone()
+                }
+            }
             crate::externalsvc::ServiceType::Postgres => {
                 if path.depth() == 0 {
                     // Root level - use configured database for connection
@@ -814,6 +866,12 @@ impl QueryService {
                         .await;
                 }
 
+                if let Some(queryable) = conn.downcast_ref::<MariaDbSource>() {
+                    return queryable
+                        .query(&path_clone, &entity_name, filters, options)
+                        .await;
+                }
+
                 Err(DataError::OperationNotSupported(
                     "Service does not support querying".to_string(),
                 ))
@@ -831,21 +889,42 @@ impl QueryService {
             .await
             .map_err(|e| DataError::ConnectionFailed(format!("Service not found: {}", e)))?;
 
-        let config: PostgresInputConfig = serde_json::from_value(service.parameters.clone())
-            .map_err(|e| {
-                DataError::InvalidConfiguration(format!(
-                    "Failed to parse PostgreSQL configuration: {}",
-                    e
-                ))
-            })?;
-
-        let database = config.database.clone();
+        let database = match service.service_type {
+            crate::externalsvc::ServiceType::Mariadb => {
+                let config: MariaDbInputConfig = serde_json::from_value(service.parameters.clone())
+                    .map_err(|e| {
+                        DataError::InvalidConfiguration(format!(
+                            "Failed to parse MariaDB configuration: {}",
+                            e
+                        ))
+                    })?;
+                config.database.clone()
+            }
+            crate::externalsvc::ServiceType::Postgres => {
+                let config: PostgresInputConfig =
+                    serde_json::from_value(service.parameters.clone()).map_err(|e| {
+                        DataError::InvalidConfiguration(format!(
+                            "Failed to parse PostgreSQL configuration: {}",
+                            e
+                        ))
+                    })?;
+                config.database.clone()
+            }
+            _ => {
+                return Err(DataError::OperationNotSupported(
+                    "Service does not support query schemas".to_string(),
+                ));
+            }
+        };
         let conn = self
             .get_connection_for_database(service_id, &database)
             .await?;
 
         // Check if source supports schema provider
         if let Some(provider) = conn.downcast_ref::<PostgresSource>() {
+            use temps_query::QuerySchemaProvider;
+            Ok(provider.get_filter_schema())
+        } else if let Some(provider) = conn.downcast_ref::<MariaDbSource>() {
             use temps_query::QuerySchemaProvider;
             Ok(provider.get_filter_schema())
         } else {
@@ -875,6 +954,9 @@ impl QueryService {
 
         // Check if source supports schema provider
         if let Some(provider) = conn.downcast_ref::<PostgresSource>() {
+            use temps_query::QuerySchemaProvider;
+            provider.get_sort_schema(container_path, entity_name)
+        } else if let Some(provider) = conn.downcast_ref::<MariaDbSource>() {
             use temps_query::QuerySchemaProvider;
             provider.get_sort_schema(container_path, entity_name)
         } else {
