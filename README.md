@@ -6,10 +6,10 @@
   <img alt="Temps" src="web/public/logo/temps-logo-dark.png" width="280">
 </picture>
 
-### The open-source, self-hosted deployment platform.
+### The fair-source, self-hosted deployment platform.
 ### Deploy, observe, and scale -- from a single binary.
 
-[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-FSL--1.1--ALv2-blue.svg)](LICENSE)
 [![GitHub Release](https://img.shields.io/github/v/release/gotempsh/temps)](https://github.com/gotempsh/temps/releases)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
 [![GitHub Stars](https://img.shields.io/github/stars/gotempsh/temps?style=social)](https://github.com/gotempsh/temps)
@@ -172,7 +172,8 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 | Request-level logging | Yes | No | No | No | No | Partial | Partial |
 | Preview deployments | Yes | Yes | Yes | No | No | Yes | Yes |
 | Built with Rust | Yes | No | No | No | No | No | No |
-| Free & open source | Yes | Yes | Yes | Yes | Yes | No | No |
+| Free to self-host | Yes | Yes | Yes | Yes | Yes | No | No |
+| License | Fair Source (FSL) | Apache-2.0 | Apache-2.0 | Apache-2.0 | MIT | Proprietary | Proprietary |
 
 ---
 
@@ -259,7 +260,18 @@ cargo build --release
 
 ## License
 
-Dual-licensed under [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE).
+Temps is [Fair Source](https://fair.io), licensed under the [Functional Source License, Version 1.1, ALv2 Future License](LICENSE) (FSL-1.1-ALv2) — the same license used by Sentry.
+
+**What this means in practice:**
+
+- **Self-hosting is free, forever.** Use Temps for your own projects, your company's infrastructure, and your clients' deployments — commercially, at any scale, with no restrictions.
+- **You can read, modify, and redistribute** the source code.
+- **The only thing you can't do** is sell Temps itself as a competing hosted service or product (e.g. launching your own "Temps Cloud"). That's how we fund development.
+- **Every release automatically becomes Apache 2.0** two years after it ships. Nothing is locked away permanently.
+
+Client-side code stays permissive so nothing you embed in your own applications is ever restricted: the SDKs ([`sdks/`](sdks/), MIT), the generated API client ([`packages/`](packages/), Apache-2.0), and the CLI ([`apps/temps-cli/`](apps/temps-cli/), MIT).
+
+Releases published before the FSL adoption remain under their original MIT OR Apache-2.0 terms.
 
 ---
 

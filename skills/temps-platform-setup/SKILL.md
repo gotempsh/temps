@@ -1074,4 +1074,4 @@ After installing Temps:
 
 ---
 
-**License:** Dual-licensed under MIT or Apache 2.0
+**License:** Fair Source (FSL-1.1-ALv2) -- free to self-host; each release becomes Apache 2.0 after two years

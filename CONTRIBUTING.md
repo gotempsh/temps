@@ -252,4 +252,14 @@ This project follows a Code of Conduct to ensure a welcoming and inclusive commu
 
 ## License
 
-Temps is dual-licensed under the [MIT License](LICENSE-MIT) and [Apache License 2.0](LICENSE-APACHE). By contributing, you agree that your contributions will be licensed under the same terms.
+Temps is licensed under the [Functional Source License, Version 1.1, ALv2 Future License](LICENSE) (FSL-1.1-ALv2). Self-hosting is free forever; the only restricted use is offering Temps itself as a competing hosted service, and every release automatically becomes Apache 2.0 two years after it ships.
+
+Some directories are licensed separately under permissive licenses: `sdks/` (MIT), `packages/` (Apache-2.0), and `apps/temps-cli/` (MIT). Contributions to those directories are licensed under the respective directory's license; all other contributions are licensed under FSL-1.1-ALv2.
+
+## Developer Certificate of Origin
+
+Contributions require a [Developer Certificate of Origin](https://developercertificate.org/) sign-off. This certifies that you wrote the change (or have the right to submit it) and agree to the licensing above. Add a `Signed-off-by` line to each commit, which git does for you with the `-s` flag:
+
+```bash
+git commit -s -m "feat(scope): description"
+```
