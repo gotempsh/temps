@@ -16,9 +16,10 @@
 //! Wiring it into the agent's TLS listener, the control-plane client, and the
 //! enrollment handshake happens in the respective crates.
 
+use rcgen::string::Ia5String;
 use rcgen::{
     BasicConstraints, CertificateParams, CertificateSigningRequestParams, DistinguishedName,
-    DnType, ExtendedKeyUsagePurpose, Ia5String, IsCa, KeyPair, KeyUsagePurpose, SanType,
+    DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, SanType,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -167,14 +168,10 @@ pub fn sign_node_csr(
         context: "CA key".into(),
         reason: e.to_string(),
     })?;
-    let ca_params =
-        CertificateParams::from_ca_cert_pem(ca_cert_pem).map_err(|e| PkiError::PemParse {
-            context: "CA certificate".into(),
-            reason: e.to_string(),
-        })?;
-    let ca_cert = ca_params
-        .self_signed(&ca_key)
-        .map_err(|e| PkiError::CertBuild(e.to_string()))?;
+    let issuer = Issuer::from_ca_cert_pem(ca_cert_pem, ca_key).map_err(|e| PkiError::PemParse {
+        context: "CA certificate".into(),
+        reason: e.to_string(),
+    })?;
 
     // Parse the CSR; constrain the leaf to client+server auth.
     let mut csr =
@@ -202,11 +199,9 @@ pub fn sign_node_csr(
     }
     csr.params.subject_alt_names = sans;
 
-    let leaf = csr
-        .signed_by(&ca_cert, &ca_key)
-        .map_err(|e| PkiError::CsrSign {
-            reason: e.to_string(),
-        })?;
+    let leaf = csr.signed_by(&issuer).map_err(|e| PkiError::CsrSign {
+        reason: e.to_string(),
+    })?;
 
     let cert_pem = leaf.pem();
     let fingerprint = {
