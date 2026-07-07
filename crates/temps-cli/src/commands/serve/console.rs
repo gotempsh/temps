@@ -94,7 +94,7 @@ pub(crate) fn set_embedded_ui(dir: &'static Dir<'static>) -> Result<(), &'static
 }
 
 /// Optional extra listener that serves the ORIGINAL temps console (admin API
-/// + original SPA bundle) when the document root has been overridden by an
+/// and original SPA bundle) when the document root has been overridden by an
 /// embedding binary. A separate listener — not a path prefix — because the
 /// console SPA assumes it owns its origin (absolute asset paths, client-side
 /// routing). Bind to loopback unless you mean to expose it.
@@ -2386,12 +2386,12 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     // Platform-console listener: when an embedding binary overrode the root
     // bundle AND configured an address, serve the ORIGINAL console (same
     // admin API + admin gate) on its own listener/origin.
-    let platform_router = if WEBSITE_OVERRIDE.get().is_some() && PLATFORM_CONSOLE_ADDR.get().is_some()
-    {
-        Some(admin_router.clone())
-    } else {
-        None
-    };
+    let platform_router =
+        if WEBSITE_OVERRIDE.get().is_some() && PLATFORM_CONSOLE_ADDR.get().is_some() {
+            Some(admin_router.clone())
+        } else {
+            None
+        };
 
     let admin_app = Router::new()
         .nest("/api", admin_router)
