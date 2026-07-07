@@ -101,7 +101,8 @@ impl TempsPlugin for LogAggregatorPlugin {
                 chunk_writer.clone(),
                 collector_metadata.clone(),
                 10_000,
-            );
+            )
+            .with_db(db.clone());
 
             // Wire callback: when a chunk is flushed during streaming, insert chunk metadata into DB.
             // This callback runs in the collector's streaming task, so it must be Send + Sync.

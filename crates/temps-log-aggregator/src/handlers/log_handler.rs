@@ -155,6 +155,10 @@ impl temps_core::AuditOperation for LogsPurgedAudit {
 pub struct SearchLogsRequest {
     /// Project ID (integer, as used by the rest of the platform)
     pub project_id: i32,
+    /// When set, search an imported/managed external service's logs instead
+    /// of a project's. `project_id` is ignored in this mode.
+    #[serde(default)]
+    pub external_service_id: Option<i32>,
     /// Start of time range (ISO 8601). Defaults to 1 hour ago.
     pub start_time: Option<String>,
     /// End of time range (ISO 8601). Defaults to now.
@@ -223,6 +227,10 @@ pub struct ContextLogsResponse {
 pub struct TailLogsRequest {
     /// Project ID (integer, as used by the rest of the platform)
     pub project_id: i32,
+    /// When set, tail an imported/managed external service's logs instead of
+    /// a project's (`project_id` is ignored in this mode).
+    #[serde(default)]
+    pub external_service_id: Option<i32>,
     pub service: String,
     pub env: String,
     #[serde(default)]
@@ -324,6 +332,7 @@ async fn search_logs(
 
     let filter = LogSearchFilter {
         project_id: request.project_id,
+        external_service_id: request.external_service_id,
         start_time,
         end_time,
         levels,
@@ -422,6 +431,7 @@ async fn tail_logs(
 
     let filter = TailFilter {
         project_id: request.project_id,
+        external_service_id: request.external_service_id,
         service: request.service,
         env: request.env,
         levels,
@@ -707,6 +717,7 @@ mod tests {
             service: service.to_string(),
             env: env.to_string(),
             project_id,
+            external_service_id: None,
             deploy_id: None,
             node_id: None,
             node_name: None,

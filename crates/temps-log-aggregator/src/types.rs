@@ -25,8 +25,13 @@ pub struct LogLine {
     pub service: String,
     /// Environment (ID as string) from Docker label
     pub env: String,
-    /// Platform integer project ID from Docker label
+    /// Platform integer project ID from Docker label. `0` (sentinel) for
+    /// external-service logs, which key on `external_service_id` instead.
     pub project_id: i32,
+    /// Set for imported/managed external-service containers (Postgres, Redis,
+    /// …). `None` for deployment/application containers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_service_id: Option<i32>,
     /// Active deployment ID (deployments.id) at time of log
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deploy_id: Option<i32>,
@@ -107,6 +112,9 @@ impl std::fmt::Display for LogLevel {
 pub struct ChunkMeta {
     pub id: Uuid,
     pub project_id: i32,
+    /// Set for external-service chunks — see [`LogLine::external_service_id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_service_id: Option<i32>,
     pub env: String,
     pub service: String,
     pub container_id: String,
@@ -129,6 +137,9 @@ pub struct ChunkMeta {
 #[derive(Debug, Clone)]
 pub struct ContainerContext {
     pub project_id: i32,
+    /// Set for imported/managed external-service containers — see
+    /// [`LogLine::external_service_id`].
+    pub external_service_id: Option<i32>,
     pub env: String,
     pub service: String,
     pub container_id: String,
@@ -139,6 +150,11 @@ pub struct ContainerContext {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogSearchFilter {
     pub project_id: i32,
+    /// When set, scope the search to an imported/managed external service
+    /// instead of a project. `project_id` is ignored in this mode (external
+    /// -service chunks carry the sentinel `project_id = 0`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_service_id: Option<i32>,
     pub start_time: DateTime<Utc>,
     pub end_time: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -328,6 +344,10 @@ pub struct ContextLine {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TailFilter {
     pub project_id: i32,
+    /// When set, tail an imported/managed external service instead of a
+    /// project (external-service lines carry `project_id = 0`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_service_id: Option<i32>,
     pub service: String,
     pub env: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -441,6 +461,7 @@ mod tests {
             service: "web".to_string(),
             env: "2".to_string(),
             project_id: 42,
+            external_service_id: None,
             deploy_id: None,
             node_id: None,
             node_name: None,

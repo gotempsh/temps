@@ -245,6 +245,9 @@ impl RemoteLogCollectorService {
     ) {
         let ctx = ContainerContext {
             project_id: info.project_id,
+            // Remote workers only run deployment containers; managed external
+            // services are control-plane-local.
+            external_service_id: None,
             env: info.env.clone(),
             service: info.service.clone(),
             container_id: info.container_id.clone(),

@@ -56,6 +56,10 @@ pub struct CollectorService {
     docker: Arc<Docker>,
     chunk_writer: Arc<ChunkWriterService>,
     metadata_service: Arc<LogMetadataService>,
+    /// DB handle used to resolve an imported external service's
+    /// `temps.service_name` label to its `external_services.id`. `None` in
+    /// tests that don't exercise external-service log collection.
+    db: Option<Arc<sea_orm::DatabaseConnection>>,
     /// Broadcast channel for live tail subscribers
     tail_tx: broadcast::Sender<LogLine>,
     /// Active streaming tasks per container_id
@@ -76,10 +80,19 @@ impl CollectorService {
             docker,
             chunk_writer,
             metadata_service,
+            db: None,
             tail_tx,
             active_streams: Mutex::new(HashMap::new()),
             on_chunk_flushed: None,
         }
+    }
+
+    /// Attach a DB handle so external-service containers (labelled
+    /// `temps.service_type`/`temps.service_name`) resolve to their
+    /// `external_services.id` and get first-class log history.
+    pub fn with_db(mut self, db: Arc<sea_orm::DatabaseConnection>) -> Self {
+        self.db = Some(db);
+        self
     }
 
     /// Set a callback that is invoked whenever a chunk is flushed.
@@ -264,6 +277,17 @@ impl CollectorService {
             None => return Ok(None),
         };
 
+        // Deployment/application containers carry `sh.temps.project_id`.
+        // Imported/managed external-service containers (Postgres, Redis, …)
+        // carry `temps.service_type` + `temps.service_name` instead (set by
+        // the providers) and have no project — collect their logs under the
+        // external-service dimension so they get the same history/search.
+        if !labels.contains_key(LABEL_PROJECT_ID) {
+            return self
+                .extract_external_service_context(container_id, labels)
+                .await;
+        }
+
         let project_id = match labels.get(LABEL_PROJECT_ID) {
             Some(id) => match id.parse::<i32>() {
                 Ok(pid) => pid,
@@ -286,10 +310,56 @@ impl CollectorService {
 
         Ok(Some(ContainerContext {
             project_id,
+            external_service_id: None,
             env,
             service,
             container_id: container_id.to_string(),
             deploy_id,
+        }))
+    }
+
+    /// Build context for an imported/managed external-service container from
+    /// its `temps.service_type`/`temps.service_name` labels. Resolves the
+    /// service name to `external_services.id` via the DB; skips (returns None)
+    /// if the labels are absent, no DB handle is attached, or no matching row
+    /// exists.
+    async fn extract_external_service_context(
+        &self,
+        container_id: &str,
+        labels: &std::collections::HashMap<String, String>,
+    ) -> Result<Option<ContainerContext>, LogAggregatorError> {
+        let prefix = temps_core::DOCKER_LABEL_PREFIX; // "temps."
+        let service_name = match labels.get(&format!("{prefix}service_name")) {
+            Some(name) => name.clone(),
+            None => return Ok(None),
+        };
+        let Some(db) = self.db.as_ref() else {
+            return Ok(None);
+        };
+
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        let svc = temps_entities::external_services::Entity::find()
+            .filter(temps_entities::external_services::Column::Name.eq(service_name.clone()))
+            .one(db.as_ref())
+            .await
+            .map_err(|e| LogAggregatorError::DockerStreamFailed {
+                container_id: container_id.to_string(),
+                reason: format!("Failed to resolve external service '{service_name}': {e}"),
+            })?;
+        let svc = match svc {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        Ok(Some(ContainerContext {
+            // Sentinel: external-service chunks key on external_service_id, not
+            // project_id (a service isn't owned by a single project).
+            project_id: 0,
+            external_service_id: Some(svc.id),
+            env: "default".to_string(),
+            service: service_name,
+            container_id: container_id.to_string(),
+            deploy_id: None,
         }))
     }
 

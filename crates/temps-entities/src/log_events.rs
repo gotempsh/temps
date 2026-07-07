@@ -13,6 +13,9 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub time: DBDateTime,
     pub project_id: i32,
+    /// Set for imported/managed external-service logs — see
+    /// `log_chunks::Model::external_service_id`.
+    pub external_service_id: Option<i32>,
     pub service: String,
     pub env: String,
     /// Normalized level: ERROR or WARN

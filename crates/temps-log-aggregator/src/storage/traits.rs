@@ -48,9 +48,14 @@ pub trait LogStorage: Send + Sync + 'static {
 
 /// Build the storage key for a log chunk.
 ///
-/// Layout: `logs/{project_id}/{env}/{service}/{YYYY-MM-DD}/{HH}/{container_id}-{sequence}.ndjson.zst`
+/// Deployment/application layout:
+///   `logs/{project_id}/{env}/{service}/{YYYY-MM-DD}/{HH}/{container_id}-{sequence}.ndjson.zst`
+/// Imported/managed external-service layout (when `external_service_id` is set):
+///   `logs/external-services/{service_id}/{env}/{service}/{YYYY-MM-DD}/{HH}/{container_id}-{sequence}.ndjson.zst`
+#[allow(clippy::too_many_arguments)]
 pub fn build_storage_key(
     project_id: i32,
+    external_service_id: Option<i32>,
     env: &str,
     service: &str,
     date: &chrono::NaiveDate,
@@ -58,9 +63,13 @@ pub fn build_storage_key(
     container_id: &str,
     sequence: u64,
 ) -> String {
+    let scope = match external_service_id {
+        Some(id) => format!("external-services/{id}"),
+        None => project_id.to_string(),
+    };
     format!(
-        "logs/{project_id}/{env}/{service}/{date}/{hour:02}/{container_id}-{sequence:06}.ndjson.zst",
-        project_id = project_id,
+        "logs/{scope}/{env}/{service}/{date}/{hour:02}/{container_id}-{sequence:06}.ndjson.zst",
+        scope = scope,
         env = env,
         service = service,
         date = date.format("%Y-%m-%d"),
@@ -78,7 +87,7 @@ mod tests {
     #[test]
     fn test_build_storage_key() {
         let date = NaiveDate::from_ymd_opt(2026, 2, 25).unwrap();
-        let key = build_storage_key(2, "3", "web", &date, 14, "abc123def456", 1);
+        let key = build_storage_key(2, None, "3", "web", &date, 14, "abc123def456", 1);
         assert_eq!(
             key,
             "logs/2/3/web/2026-02-25/14/abc123def456-000001.ndjson.zst"
@@ -88,7 +97,28 @@ mod tests {
     #[test]
     fn test_build_storage_key_truncates_long_container_id() {
         let date = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
-        let key = build_storage_key(5, "1", "api", &date, 0, "abcdef123456789extra", 42);
+        let key = build_storage_key(5, None, "1", "api", &date, 0, "abcdef123456789extra", 42);
         assert!(key.contains("abcdef123456-000042.ndjson.zst"));
+    }
+
+    #[test]
+    fn test_build_storage_key_external_service() {
+        let date = NaiveDate::from_ymd_opt(2026, 2, 25).unwrap();
+        // External-service chunks (project_id sentinel = 0) key under
+        // logs/external-services/{id}/… instead of logs/{project_id}/….
+        let key = build_storage_key(
+            0,
+            Some(7),
+            "default",
+            "postgres",
+            &date,
+            14,
+            "abc123def456",
+            1,
+        );
+        assert_eq!(
+            key,
+            "logs/external-services/7/default/postgres/2026-02-25/14/abc123def456-000001.ndjson.zst"
+        );
     }
 }

@@ -8,6 +8,11 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: Uuid,
     pub project_id: i32,
+    /// Set when this chunk belongs to an imported/managed external service
+    /// (Postgres, MariaDB, Redis, MongoDB, MinIO, …) rather than a deployment.
+    /// External-service chunks store `project_id = 0` (sentinel) and key on
+    /// this instead — a service isn't owned by a single project.
+    pub external_service_id: Option<i32>,
     pub env: String,
     pub service: String,
     pub container_id: String,
