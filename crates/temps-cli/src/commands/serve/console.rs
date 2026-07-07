@@ -93,6 +93,19 @@ pub(crate) fn set_embedded_ui(dir: &'static Dir<'static>) -> Result<(), &'static
         .map_err(|_| "embedded UI override already set")
 }
 
+/// Optional extra listener that serves the ORIGINAL temps console (admin API
+/// + original SPA bundle) when the document root has been overridden by an
+/// embedding binary. A separate listener — not a path prefix — because the
+/// console SPA assumes it owns its origin (absolute asset paths, client-side
+/// routing). Bind to loopback unless you mean to expose it.
+static PLATFORM_CONSOLE_ADDR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+pub(crate) fn set_platform_console_addr(addr: String) -> Result<(), &'static str> {
+    PLATFORM_CONSOLE_ADDR
+        .set(addr)
+        .map_err(|_| "platform console address already set")
+}
+
 fn website() -> &'static Dir<'static> {
     WEBSITE_OVERRIDE.get().copied().unwrap_or(&WEBSITE)
 }
@@ -602,6 +615,16 @@ fn create_swagger_router(plugin_manager: &PluginManager) -> anyhow::Result<Route
 
 /// Static file handler for embedded website
 async fn serve_static_file(req: Request) -> Response {
+    serve_static_from(website(), req)
+}
+
+/// Same, but always the ORIGINAL console bundle (for the platform-console
+/// listener when the root bundle has been overridden by an embedding binary).
+async fn serve_original_console(req: Request) -> Response {
+    serve_static_from(&WEBSITE, req)
+}
+
+fn serve_static_from(site: &'static Dir<'static>, req: Request) -> Response {
     let raw_path = req.uri().path();
 
     // Never serve the SPA for /api/ paths — those should 404 if unmatched
@@ -628,7 +651,7 @@ async fn serve_static_file(req: Request) -> Response {
 
     debug!("Attempting to serve static file: {}", path);
 
-    match website().get_file(path) {
+    match site.get_file(path) {
         Some(file) => {
             let mime_type = mime_guess::from_path(path)
                 .first_or_octet_stream()
@@ -654,7 +677,7 @@ async fn serve_static_file(req: Request) -> Response {
         }
         None => {
             // If file not found, try serving index.html (for SPA routing)
-            if let Some(index) = website().get_file("index.html") {
+            if let Some(index) = site.get_file("index.html") {
                 debug!("File not found, serving index.html for SPA routing");
                 Response::builder()
                     .status(StatusCode::OK)
@@ -2359,6 +2382,17 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let public_app = Router::new()
         .merge(health_router(ready_flag.clone()))
         .nest("/api", public_router);
+
+    // Platform-console listener: when an embedding binary overrode the root
+    // bundle AND configured an address, serve the ORIGINAL console (same
+    // admin API + admin gate) on its own listener/origin.
+    let platform_router = if WEBSITE_OVERRIDE.get().is_some() && PLATFORM_CONSOLE_ADDR.get().is_some()
+    {
+        Some(admin_router.clone())
+    } else {
+        None
+    };
+
     let admin_app = Router::new()
         .nest("/api", admin_router)
         .fallback(serve_static_file);
@@ -2374,6 +2408,28 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         admin_gate_handle.clone(),
         super::admin_gate::admin_gate,
     ));
+
+    if let (Some(router), Some(addr)) = (platform_router, PLATFORM_CONSOLE_ADDR.get()) {
+        let platform_app = Router::new()
+            .nest("/api", router)
+            .fallback(serve_original_console)
+            .layer(axum::middleware::from_fn_with_state(
+                admin_gate_handle.clone(),
+                super::admin_gate::admin_gate,
+            ));
+        let listener = TcpListener::bind(addr).await?;
+        info!("Platform console (original temps UI) listening on {addr}");
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(
+                listener,
+                platform_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            {
+                tracing::error!("Platform console listener failed: {e}");
+            }
+        });
+    }
 
     info!("Plugin system initialized successfully with static file serving");
 
