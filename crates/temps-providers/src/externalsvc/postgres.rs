@@ -5100,6 +5100,50 @@ mod tests {
     }
 
     #[test]
+    fn test_get_effective_address_docker_mode_uses_imported_container_name() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("DEPLOYMENT_MODE", "docker") };
+
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let service = PostgresService::new("imported-svc".to_string(), docker);
+
+        let config = ServiceConfig {
+            name: "imported-svc".to_string(),
+            service_type: super::ServiceType::Postgres,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": "5432",
+                "database": "testdb",
+                "username": "postgres",
+                "password": "testpass",
+                "max_connections": 100,
+                "container_name": "legacy-postgres",
+            }),
+        };
+
+        let (host, port) = service.get_effective_address(config).unwrap();
+        // The imported container name wins over the derived `postgres-{name}`.
+        assert_eq!(host, "legacy-postgres");
+        assert_eq!(port, "5432");
+
+        unsafe { std::env::remove_var("DEPLOYMENT_MODE") };
+    }
+
+    #[test]
+    fn test_container_name_is_not_a_user_input() {
+        // container_name is derived from the service name at creation time
+        // (`postgres-{name}`), never supplied by the client — same as
+        // MariaDB (see mariadb.rs's identical test). The create form is
+        // generated from this schema, so the field must not appear in it.
+        let schema = serde_json::to_value(schemars::schema_for!(PostgresInputConfig)).unwrap();
+        assert!(
+            !schema.to_string().contains("container_name"),
+            "container_name leaked into the PostgreSQL create schema"
+        );
+    }
+
+    #[test]
     fn test_get_environment_variables_always_uses_container_name() {
         // get_environment_variables always uses container name and internal port
         // for container-to-container communication, regardless of deployment mode

@@ -7072,7 +7072,10 @@ echo "[restore] Pre-seed complete"
             // re-initialize.
             if matches!(
                 service_type_enum,
-                ServiceType::Mariadb | ServiceType::Postgres
+                ServiceType::Mariadb
+                    | ServiceType::Postgres
+                    | ServiceType::Redis
+                    | ServiceType::Mongodb
             ) {
                 let parameters = self.get_service_parameters(service_id).await?;
                 if parameters.contains_key("container_name") {
@@ -7228,7 +7231,10 @@ echo "[restore] Pre-seed complete"
 
             if matches!(
                 service_type_enum,
-                ServiceType::Mariadb | ServiceType::Postgres
+                ServiceType::Mariadb
+                    | ServiceType::Postgres
+                    | ServiceType::Redis
+                    | ServiceType::Mongodb
             ) {
                 let parameters = self.get_service_parameters(service_id).await?;
                 if parameters.contains_key("container_name") {
