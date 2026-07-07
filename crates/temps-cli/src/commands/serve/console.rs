@@ -81,6 +81,22 @@ use utoipa_swagger_ui::SwaggerUi;
 // Embed the dist directory at compile time
 static WEBSITE: Dir = include_dir!("$CARGO_MANIFEST_DIR/dist");
 
+/// Optional replacement UI bundle supplied by an embedding binary (EE,
+/// VibeTemps, ...) via [`crate::set_embedded_ui`] before `dispatch`. When
+/// set, the SPA fallback serves this bundle at the document root instead of
+/// the OSS console. The OSS console's API surface is unaffected.
+static WEBSITE_OVERRIDE: std::sync::OnceLock<&'static Dir<'static>> = std::sync::OnceLock::new();
+
+pub(crate) fn set_embedded_ui(dir: &'static Dir<'static>) -> Result<(), &'static str> {
+    WEBSITE_OVERRIDE
+        .set(dir)
+        .map_err(|_| "embedded UI override already set")
+}
+
+fn website() -> &'static Dir<'static> {
+    WEBSITE_OVERRIDE.get().copied().unwrap_or(&WEBSITE)
+}
+
 /// Ensure the system user (id=0) exists in the database.
 /// Emit the anonymous `instance_started` telemetry event with non-identifying
 /// depth-of-usage counts (number of projects, environments, managed services,
@@ -612,7 +628,7 @@ async fn serve_static_file(req: Request) -> Response {
 
     debug!("Attempting to serve static file: {}", path);
 
-    match WEBSITE.get_file(path) {
+    match website().get_file(path) {
         Some(file) => {
             let mime_type = mime_guess::from_path(path)
                 .first_or_octet_stream()
@@ -638,7 +654,7 @@ async fn serve_static_file(req: Request) -> Response {
         }
         None => {
             // If file not found, try serving index.html (for SPA routing)
-            if let Some(index) = WEBSITE.get_file("index.html") {
+            if let Some(index) = website().get_file("index.html") {
                 debug!("File not found, serving index.html for SPA routing");
                 Response::builder()
                     .status(StatusCode::OK)

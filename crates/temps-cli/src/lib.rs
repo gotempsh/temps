@@ -191,6 +191,18 @@ pub fn install_tracing(log_level: &str, log_format: &str) {
         .expect("Failed to set global default subscriber");
 }
 
+// Re-exported so embedding binaries build their UI bundle with the exact
+// `include_dir` version this crate compares `Dir` types against.
+pub use include_dir;
+
+/// Replace the embedded console SPA with the embedding binary's own UI
+/// bundle. Call once, before [`dispatch`]. The bundle is served at the
+/// document root with the same SPA-fallback semantics as the OSS console;
+/// the `/api` surface is unaffected. Returns `Err` if already set.
+pub fn set_embedded_ui(dir: &'static include_dir::Dir<'static>) -> Result<(), &'static str> {
+    commands::serve::console::set_embedded_ui(dir)
+}
+
 /// Dispatch the parsed CLI. `extra_plugins` is forwarded to `temps serve`
 /// only; every other subcommand ignores it (they have no plugin lifecycle).
 pub fn dispatch(
