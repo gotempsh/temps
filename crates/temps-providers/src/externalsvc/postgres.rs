@@ -7,7 +7,6 @@ use schemars::JsonSchema;
 use sea_orm::{prelude::*, *};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use temps_entities::external_service_backups;
@@ -157,6 +156,19 @@ pub struct PostgresInputConfig {
     #[serde(default = "default_docker_image")]
     #[schemars(example = "example_docker_image", default = "default_docker_image")]
     pub docker_image: Option<String>,
+
+    /// Real Docker container name when this service was imported from an
+    /// existing PostgreSQL-compatible container (set by
+    /// `import_from_container`, never user-editable — omitted from the
+    /// create form). Overrides the derived `postgres-{name}` container name
+    /// so internal addressing targets the actual pre-existing container
+    /// instead of a synthesized name that doesn't exist. Deserialized
+    /// through `deserialize_optional_non_empty` as a second guard alongside
+    /// `#[schemars(skip)]`, mirroring the MariaDB fix for the same class of
+    /// bug (see `crates/temps-providers/src/externalsvc/mariadb.rs`).
+    #[serde(default, deserialize_with = "deserialize_optional_non_empty")]
+    #[schemars(skip)]
+    pub container_name: Option<String>,
 }
 
 /// Internal runtime configuration for PostgreSQL service
@@ -172,6 +184,10 @@ pub struct PostgresConfig {
     pub max_connections: u32,
     pub ssl_mode: Option<String>,
     pub docker_image: String,
+    /// Real container name for imported services — see
+    /// `PostgresInputConfig::container_name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_name: Option<String>,
 }
 
 impl From<PostgresInputConfig> for PostgresConfig {
@@ -191,8 +207,19 @@ impl From<PostgresInputConfig> for PostgresConfig {
             docker_image: input
                 .docker_image
                 .unwrap_or_else(|| "gotempsh/postgres-walg:18-bookworm".to_string()),
+            container_name: input.container_name,
         }
     }
+}
+
+/// Treats a blank string the same as an absent value — see
+/// `PostgresInputConfig::container_name`.
+fn deserialize_optional_non_empty<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    Ok(opt.filter(|s| !s.is_empty()))
 }
 
 fn deserialize_optional_password<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -330,6 +357,19 @@ impl PostgresService {
     }
     fn get_container_name(&self) -> String {
         format!("postgres-{}", self.name)
+    }
+
+    /// The container this service actually runs in: the imported container's
+    /// real name when `config.container_name` is set, otherwise the derived
+    /// `postgres-{name}`. Every operation that talks to the live container
+    /// (admin SQL, backup, restore, start/stop) must resolve through this,
+    /// not `get_container_name()` directly, or it targets a synthesized name
+    /// that doesn't exist for imported services.
+    fn get_live_container_name(&self, config: &PostgresConfig) -> String {
+        config
+            .container_name
+            .clone()
+            .unwrap_or_else(|| self.get_container_name())
     }
 
     /// Creates and starts the PostgreSQL container, retrying with a fresh host
@@ -1283,7 +1323,7 @@ impl PostgresService {
         let config: PostgresConfig = self.get_postgres_config(service_config)?;
         let mut env_vars = HashMap::new();
 
-        let effective_host = self.get_container_name();
+        let effective_host = self.get_live_container_name(&config);
         let effective_port = POSTGRES_INTERNAL_PORT.to_string();
 
         env_vars.insert("POSTGRES_DATABASE".to_string(), resource_name.to_string());
@@ -1565,7 +1605,7 @@ impl PostgresService {
         use bollard::exec::CreateExecOptions;
 
         let postgres_config = self.get_postgres_config(service_config)?;
-        let container_name = self.get_container_name();
+        let container_name = self.get_live_container_name(&postgres_config);
 
         info!(
             "Restoring PostgreSQL from WAL-G backup (prefix: {}) in container '{}'",
@@ -1969,7 +2009,7 @@ impl PostgresService {
         let mut decompressed_data = Vec::new();
         std::io::Read::read_to_end(&mut decoder, &mut decompressed_data)?;
 
-        let container_name = self.get_container_name();
+        let container_name = self.get_live_container_name(&postgres_config);
 
         // Detect backup format from the S3 location
         let is_plain_format = backup_location.ends_with(".sql.gz");
@@ -2023,7 +2063,7 @@ impl PostgresService {
         use sea_orm::*;
 
         let postgres_config = self.get_postgres_config(service_config)?;
-        let container_name = self.get_container_name();
+        let container_name = self.get_live_container_name(&postgres_config);
 
         let metadata = serde_json::json!({
             "service_type": "postgres",
@@ -2281,7 +2321,7 @@ impl PostgresService {
         use bollard::query_parameters::RemoveContainerOptions;
         use chrono::Utc;
 
-        let db_container_name = self.get_container_name();
+        let db_container_name = self.get_live_container_name(postgres_config);
         let sidecar_image = postgres_config.docker_image.clone();
 
         info!("Pulling sidecar image {} for pg_dump", sidecar_image);
@@ -2538,7 +2578,7 @@ impl ExternalService for PostgresService {
         if temps_core::DeploymentMode::is_docker() {
             // Docker mode: use container name and internal port
             Ok((
-                self.get_container_name(),
+                self.get_live_container_name(&config),
                 POSTGRES_INTERNAL_PORT.to_string(),
             ))
         } else {
@@ -2574,7 +2614,8 @@ impl ExternalService for PostgresService {
         external_service: &temps_entities::external_services::Model,
         service_config: ServiceConfig,
     ) -> anyhow::Result<super::BackupOutcome> {
-        let container_name = self.get_container_name();
+        let postgres_config = self.get_postgres_config(service_config.clone())?;
+        let container_name = self.get_live_container_name(&postgres_config);
 
         if self.container_has_walg(&container_name).await {
             info!(
@@ -2632,11 +2673,19 @@ impl ExternalService for PostgresService {
         *self.config.write().await = Some(postgres_config.clone());
         *self.resource_limits.write().await = resource_limits.clone();
 
-        // Create Docker container. New services always start with archiving
-        // off — `enable_wal_archiving()` recreates with archiving on when
-        // WAL-G is later configured.
-        self.create_container(&self.docker, &postgres_config, &resource_limits, false)
-            .await?;
+        if postgres_config.container_name.is_none() {
+            // Create Docker container. New services always start with archiving
+            // off — `enable_wal_archiving()` recreates with archiving on when
+            // WAL-G is later configured.
+            self.create_container(&self.docker, &postgres_config, &resource_limits, false)
+                .await?;
+        } else {
+            info!(
+                "PostgreSQL service '{}' is imported from container '{}'; skipping container creation",
+                self.name,
+                self.get_live_container_name(&postgres_config)
+            );
+        }
 
         // Serialize the full runtime config to save to database
         // This ensures auto-generated values (password, port) are persisted
@@ -2829,8 +2878,14 @@ impl ExternalService for PostgresService {
             .get("database")
             .context("Missing database parameter")?;
 
-        // Always use container name and internal port for container-to-container communication
-        let effective_host = self.get_container_name();
+        // Always use container name and internal port for container-to-container
+        // communication. An imported service's real container name (stored raw
+        // in parameters, since the typed config isn't available here) wins over
+        // the derived one.
+        let effective_host = parameters
+            .get("container_name")
+            .cloned()
+            .unwrap_or_else(|| self.get_container_name());
         let effective_port = POSTGRES_INTERNAL_PORT.to_string();
 
         let url = format!(
@@ -2894,8 +2949,58 @@ impl ExternalService for PostgresService {
     }
 
     async fn start(&self) -> Result<()> {
-        let container_name = self.get_container_name();
+        let existing_config = self.config.read().await.as_ref().cloned();
+        let container_name = existing_config
+            .as_ref()
+            .map(|config| self.get_live_container_name(config))
+            .unwrap_or_else(|| self.get_container_name());
         info!("Starting PostgreSQL container {}", container_name);
+
+        // Imported services skip the drift-reconciliation path entirely: the
+        // archive_mode CMD check and its stop+remove+recreate response below
+        // assume Temps owns the container's lifecycle and volume naming.
+        // Running that against a pre-existing container the operator brought
+        // in would delete their real database to "fix" a CMD mismatch that
+        // was never Temps' to manage.
+        if let Some(config) = existing_config
+            .as_ref()
+            .filter(|c| c.container_name.is_some())
+        {
+            let containers = self
+                .docker
+                .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+                    all: true,
+                    filters: Some(HashMap::from([(
+                        "name".to_string(),
+                        vec![container_name.clone()],
+                    )])),
+                    ..Default::default()
+                }))
+                .await?;
+            if containers.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "Imported PostgreSQL container '{}' not found",
+                    container_name
+                ));
+            }
+            let is_running = matches!(
+                containers[0].state,
+                Some(bollard::models::ContainerSummaryStateEnum::RUNNING)
+            );
+            if !is_running {
+                self.docker
+                    .start_container(
+                        &container_name,
+                        None::<bollard::query_parameters::StartContainerOptions>,
+                    )
+                    .await
+                    .context("Failed to start imported PostgreSQL container")?;
+            }
+            self.wait_for_container_health(&self.docker, &container_name)
+                .await?;
+            let _ = config;
+            return Ok(());
+        }
 
         // Reconcile-on-start. The desired `archive_mode` is derived from
         // on-disk truth: `/var/lib/postgresql/walg.env` exists on the
@@ -3010,7 +3115,13 @@ impl ExternalService for PostgresService {
 
     async fn stop(&self) -> Result<()> {
         // Stop the container if Docker is available
-        let container_name = self.get_container_name();
+        let container_name = self
+            .config
+            .read()
+            .await
+            .as_ref()
+            .map(|config| self.get_live_container_name(config))
+            .unwrap_or_else(|| self.get_container_name());
 
         // Check if container exists before attempting to stop
         let containers = self
@@ -3113,8 +3224,14 @@ impl ExternalService for PostgresService {
             .get("password")
             .context("Missing password parameter")?;
 
-        // Always use container name and internal port for container-to-container communication
-        let effective_host = self.get_container_name();
+        // Always use container name and internal port for container-to-container
+        // communication. An imported service's real container name (stored raw
+        // in parameters, since the typed config isn't available here) wins over
+        // the derived one.
+        let effective_host = parameters
+            .get("container_name")
+            .cloned()
+            .unwrap_or_else(|| self.get_container_name());
         let effective_port = POSTGRES_INTERNAL_PORT.to_string();
 
         let url = format!(
@@ -3259,7 +3376,13 @@ impl ExternalService for PostgresService {
     }
 
     async fn get_current_docker_image(&self) -> Result<(String, String)> {
-        let container_name = self.get_container_name();
+        let container_name = self
+            .config
+            .read()
+            .await
+            .as_ref()
+            .map(|config| self.get_live_container_name(config))
+            .unwrap_or_else(|| self.get_container_name());
         let container = self
             .docker
             .inspect_container(
@@ -3311,6 +3434,15 @@ impl ExternalService for PostgresService {
                 anyhow::anyhow!("Failed to inspect container '{}': {}", container_id, e)
             })?;
 
+        // The real Docker container name — every operation on an imported
+        // service must target this, not the derived `postgres-{name}`.
+        let imported_container_name = container
+            .name
+            .as_deref()
+            .unwrap_or(&container_id)
+            .trim_start_matches('/')
+            .to_string();
+
         // Extract image name and version
         let image = container.config.and_then(|c| c.image).ok_or_else(|| {
             anyhow::anyhow!("Could not determine image for container '{}'", container_id)
@@ -3344,27 +3476,63 @@ impl ExternalService for PostgresService {
             .unwrap_or("5432")
             .to_string();
 
-        // Verify connection to the imported service
+        // Verify connection to the imported service. Connects directly with
+        // `.await` on the current runtime — spinning up a nested
+        // `tokio::runtime::Runtime` and calling `block_on` here panics with
+        // "Cannot start a runtime from within a runtime", since this
+        // `async fn` is already driven by one.
         let connection_url = format!(
-            "postgresql://{}:{}@{}:{}/{}",
-            username, password, "localhost", port, database
+            "postgresql://{}:{}@localhost:{}/{}",
+            urlencoding::encode(&username),
+            urlencoding::encode(&password),
+            port,
+            urlencoding::encode(&database)
         );
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&connection_url)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to connect to PostgreSQL at localhost:{} with provided credentials: {}",
+                    port,
+                    e
+                )
+            })?;
+        pool.close().await;
+        info!("Successfully verified PostgreSQL connection for import");
 
-        match sqlx::postgres::PgConnectOptions::from_str(&connection_url)
-            .ok()
-            .and_then(|_opts| {
-                tokio::runtime::Runtime::new()
-                    .ok()
-                    .and_then(|rt| rt.block_on(sqlx::PgPool::connect(&connection_url)).ok())
-            }) {
-            Some(_) => {
-                info!("Successfully verified PostgreSQL connection for import");
+        let network_ready = match ensure_network_exists(&self.docker).await {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(
+                    "Failed to ensure Temps Docker network before PostgreSQL import attach: {:?}",
+                    e
+                );
+                false
             }
-            None => {
-                return Err(anyhow::anyhow!(
-                    "Failed to connect to PostgreSQL at {}:{} with provided credentials. Verify host, port, username, and password.",
-                    "localhost", port
-                ));
+        };
+        if network_ready {
+            let network_name = temps_core::NETWORK_NAME.as_str();
+            let request = bollard::models::NetworkConnectRequest {
+                container: container_id.clone(),
+                ..Default::default()
+            };
+            match self.docker.connect_network(network_name, request).await {
+                Ok(()) => info!(
+                    "Attached imported PostgreSQL container '{}' to {}",
+                    imported_container_name, network_name
+                ),
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 403, ..
+                }) => debug!(
+                    "Imported PostgreSQL container '{}' is already attached to {}",
+                    imported_container_name, network_name
+                ),
+                Err(e) => warn!(
+                    "Failed to attach imported PostgreSQL container '{}' to {}: {}",
+                    imported_container_name, network_name, e
+                ),
             }
         }
 
@@ -3382,7 +3550,7 @@ impl ExternalService for PostgresService {
                 "max_connections": "20",
                 "ssl_mode": "disable",
                 "docker_image": image,
-                "container_id": container_id,
+                "container_name": imported_container_name,
             }),
         };
 
@@ -3669,6 +3837,7 @@ mod tests {
             max_connections: default_max_connections(),
             ssl_mode: default_ssl_mode(),
             docker_image: None,
+            container_name: None,
         };
 
         let runtime_config: PostgresConfig = config.into();
@@ -3695,6 +3864,7 @@ mod tests {
             max_connections: 50,
             ssl_mode: Some("disable".to_string()),
             docker_image: Some("timescale/timescaledb-ha:pg18".to_string()),
+            container_name: None,
         };
 
         let runtime_config: PostgresConfig = config.into();
@@ -4003,6 +4173,7 @@ mod tests {
             max_connections: 100,
             ssl_mode: Some("disable".to_string()),
             docker_image: Some("gotempsh/postgres-walg:18-bookworm".to_string()),
+            container_name: None,
         };
 
         let downgrade_config = PostgresInputConfig {
@@ -4014,6 +4185,7 @@ mod tests {
             max_connections: 100,
             ssl_mode: Some("disable".to_string()),
             docker_image: Some("gotempsh/postgres-walg:17-bookworm".to_string()),
+            container_name: None,
         };
 
         let old_version =
@@ -4045,6 +4217,7 @@ mod tests {
             max_connections: 100,
             ssl_mode: Some("disable".to_string()),
             docker_image: Some("gotempsh/postgres-walg:17-bookworm".to_string()),
+            container_name: None,
         };
 
         let v18_config = PostgresInputConfig {
@@ -4056,6 +4229,7 @@ mod tests {
             max_connections: 100,
             ssl_mode: Some("disable".to_string()),
             docker_image: Some("gotempsh/postgres-walg:18-bookworm".to_string()),
+            container_name: None,
         };
 
         // Convert to runtime configs

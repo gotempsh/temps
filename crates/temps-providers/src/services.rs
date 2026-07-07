@@ -7064,13 +7064,16 @@ echo "[restore] Pre-seed complete"
             )?;
 
             // A freshly-constructed instance has no in-memory config, so
-            // `start()` can't resolve an imported MariaDB service's real
-            // container name (it only lives in `config.container_name`).
-            // Hydrate it via `init()` first — same fix as `stop_service` — so
-            // `start()` targets the real container instead of failing with
-            // "MariaDB configuration not found" and falling back to a full
+            // `start()` can't resolve an imported service's real container
+            // name (it only lives in `config.container_name`). Hydrate it via
+            // `init()` first — same fix as `stop_service` — so `start()`
+            // targets the real container instead of failing with
+            // "configuration not found" and falling back to a full
             // re-initialize.
-            if service_type_enum == ServiceType::Mariadb {
+            if matches!(
+                service_type_enum,
+                ServiceType::Mariadb | ServiceType::Postgres
+            ) {
                 let parameters = self.get_service_parameters(service_id).await?;
                 if parameters.contains_key("container_name") {
                     let service_config = ServiceConfig {
@@ -7087,8 +7090,8 @@ echo "[restore] Pre-seed complete"
                         ExternalServiceError::StartFailed {
                             id: service_id,
                             reason: format!(
-                                "Failed to initialize imported MariaDB service before start: {}",
-                                e
+                                "Failed to initialize imported {} service before start: {}",
+                                service_type_enum, e
                             ),
                         }
                     })?;
@@ -7223,7 +7226,10 @@ echo "[restore] Pre-seed complete"
                 &parameters,
             )?;
 
-            if service_type_enum == ServiceType::Mariadb {
+            if matches!(
+                service_type_enum,
+                ServiceType::Mariadb | ServiceType::Postgres
+            ) {
                 let parameters = self.get_service_parameters(service_id).await?;
                 if parameters.contains_key("container_name") {
                     let service_config = ServiceConfig {
@@ -7240,8 +7246,8 @@ echo "[restore] Pre-seed complete"
                         ExternalServiceError::StopFailed {
                             id: service_id,
                             reason: format!(
-                                "Failed to initialize imported MariaDB service before stop: {}",
-                                e
+                                "Failed to initialize imported {} service before stop: {}",
+                                service_type_enum, e
                             ),
                         }
                     })?;
