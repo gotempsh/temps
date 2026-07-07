@@ -7070,13 +7070,16 @@ echo "[restore] Pre-seed complete"
             // targets the real container instead of failing with
             // "configuration not found" and falling back to a full
             // re-initialize.
-            if matches!(
+            #[allow(deprecated)]
+            let needs_config_hydration = matches!(
                 service_type_enum,
                 ServiceType::Mariadb
                     | ServiceType::Postgres
                     | ServiceType::Redis
                     | ServiceType::Mongodb
-            ) {
+                    | ServiceType::Minio
+            );
+            if needs_config_hydration {
                 let parameters = self.get_service_parameters(service_id).await?;
                 if parameters.contains_key("container_name") {
                     let service_config = ServiceConfig {
@@ -7229,13 +7232,16 @@ echo "[restore] Pre-seed complete"
                 &parameters,
             )?;
 
-            if matches!(
+            #[allow(deprecated)]
+            let needs_config_hydration = matches!(
                 service_type_enum,
                 ServiceType::Mariadb
                     | ServiceType::Postgres
                     | ServiceType::Redis
                     | ServiceType::Mongodb
-            ) {
+                    | ServiceType::Minio
+            );
+            if needs_config_hydration {
                 let parameters = self.get_service_parameters(service_id).await?;
                 if parameters.contains_key("container_name") {
                     let service_config = ServiceConfig {
@@ -8552,7 +8558,11 @@ echo "[restore] Pre-seed complete"
 
         for (key, value) in &request.parameters {
             match key.as_str() {
-                "username" | "password" | "database" | "root_password" => {
+                // S3/MinIO import reads access_key/secret_key from `credentials`
+                // (not additional_config) — without them here, the S3 provider
+                // rejects every import with "Access key is required".
+                "username" | "password" | "database" | "root_password" | "access_key"
+                | "secret_key" => {
                     if let Some(str_value) = value.as_str() {
                         credentials.insert(key.clone(), str_value.to_string());
                     }

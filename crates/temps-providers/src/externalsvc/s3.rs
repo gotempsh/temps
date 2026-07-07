@@ -60,6 +60,17 @@ pub struct S3InputConfig {
     #[serde(default = "default_image")]
     #[schemars(example = "example_image", default = "default_image")]
     pub docker_image: String,
+
+    /// Real Docker container name when this service was imported from an
+    /// existing MinIO/S3-compatible container (set by `import_from_container`,
+    /// never user-editable — omitted from the create form). Overrides the
+    /// derived `s3-{name}` container name so internal addressing targets the
+    /// actual pre-existing container instead of a synthesized name that
+    /// doesn't exist. Mirrors the MariaDB/Postgres/Redis/MongoDB fix for the
+    /// same class of bug.
+    #[serde(default, deserialize_with = "deserialize_optional_non_empty")]
+    #[schemars(skip)]
+    pub container_name: Option<String>,
 }
 
 /// Internal runtime configuration for S3/MinIO service
@@ -72,6 +83,10 @@ pub struct S3Config {
     pub host: String,
     pub region: String,
     pub docker_image: String,
+    /// Real container name for imported services — see
+    /// `S3InputConfig::container_name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_name: Option<String>,
 }
 
 impl From<S3InputConfig> for S3Config {
@@ -87,6 +102,7 @@ impl From<S3InputConfig> for S3Config {
             host: input.host,
             region: input.region,
             docker_image: input.docker_image,
+            container_name: input.container_name,
         }
     }
 }
@@ -100,6 +116,16 @@ where
         Some(s) if !s.is_empty() => Some(s),
         _ => None,
     })
+}
+
+/// Treats a blank string the same as an absent value — see
+/// `S3InputConfig::container_name`.
+fn deserialize_optional_non_empty<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    Ok(opt.filter(|s| !s.is_empty()))
 }
 fn default_region() -> String {
     "us-east-1".to_string()
@@ -193,6 +219,18 @@ impl S3Service {
 
     fn get_container_name(&self) -> String {
         format!("minio-{}", self.name)
+    }
+
+    /// The container this service actually runs in: the imported container's
+    /// real name when `config.container_name` is set, otherwise the derived
+    /// `minio-{name}`. Every operation that talks to the live container must
+    /// resolve through this, not `get_container_name()` directly, or it
+    /// targets a synthesized name that doesn't exist for imported services.
+    fn get_live_container_name(&self, config: &S3Config) -> String {
+        config
+            .container_name
+            .clone()
+            .unwrap_or_else(|| self.get_container_name())
     }
 
     /// Creates and starts the MinIO container, retrying with a fresh host
@@ -471,9 +509,18 @@ impl S3Service {
                 .inspect_container(container_id, None::<InspectContainerOptions>)
                 .await?;
             if let Some(state) = info.state {
-                if state.status == Some(bollard::models::ContainerStateStatusEnum::RUNNING)
-                    && state.health.as_ref().and_then(|h| h.status.as_ref())
-                        == Some(&bollard::models::HealthStatusEnum::HEALTHY)
+                // Considered ready if it's running and either has a HEALTHY
+                // Docker healthcheck status or no healthcheck is defined at
+                // all (e.g. an imported container from a vanilla image with
+                // no HEALTHCHECK directive — requiring an explicit HEALTHY
+                // here would spin until `max_wait` every time).
+                let is_running =
+                    state.status == Some(bollard::models::ContainerStateStatusEnum::RUNNING);
+                let health_status = state.health.as_ref().and_then(|h| h.status.as_ref());
+
+                if is_running
+                    && (health_status.is_none()
+                        || health_status == Some(&bollard::models::HealthStatusEnum::HEALTHY))
                 {
                     return Ok(());
                 }
@@ -648,7 +695,8 @@ impl S3Service {
     ) -> Result<HashMap<String, String>> {
         let mut env_vars = HashMap::new();
 
-        let effective_host = self.get_container_name();
+        let s3_config = self.get_s3_config(config.clone())?;
+        let effective_host = self.get_live_container_name(&s3_config);
         let effective_port = S3_INTERNAL_PORT.to_string();
 
         env_vars.insert("S3_BUCKET".to_string(), bucket_name.to_string());
@@ -694,7 +742,10 @@ impl ExternalService for S3Service {
 
         if temps_core::DeploymentMode::is_docker() {
             // Docker mode: use container name and internal port
-            Ok((self.get_container_name(), S3_INTERNAL_PORT.to_string()))
+            Ok((
+                self.get_live_container_name(&config),
+                S3_INTERNAL_PORT.to_string(),
+            ))
         } else {
             // Baremetal mode: use localhost and exposed port
             Ok(("localhost".to_string(), config.port))
@@ -732,9 +783,17 @@ impl ExternalService for S3Service {
         // Store runtime config
         *self.config.write().await = Some(s3_config.clone());
 
-        // Create Docker container
-        self.create_container(&self.docker, &s3_config, &resource_limits)
-            .await?;
+        if s3_config.container_name.is_none() {
+            // Create Docker container
+            self.create_container(&self.docker, &s3_config, &resource_limits)
+                .await?;
+        } else {
+            info!(
+                "S3/MinIO service '{}' is imported from container '{}'; skipping container creation",
+                self.name,
+                self.get_live_container_name(&s3_config)
+            );
+        }
 
         // Serialize the full runtime config to save to database
         // This ensures auto-generated values (keys, port) are persisted
@@ -894,7 +953,11 @@ impl ExternalService for S3Service {
 
     async fn start(&self) -> Result<()> {
         let docker = &self.docker;
-        let container_name = self.get_container_name();
+        let existing_config = self.config.read().await.as_ref().cloned();
+        let container_name = existing_config
+            .as_ref()
+            .map(|config| self.get_live_container_name(config))
+            .unwrap_or_else(|| self.get_container_name());
         info!("Starting MinIO container {}", container_name);
 
         let containers = docker
@@ -908,14 +971,43 @@ impl ExternalService for S3Service {
             }))
             .await?;
 
+        // Imported services never create a container: the real one already
+        // exists (we only attach + address it). Fail loudly if it's gone
+        // rather than silently synthesizing a fresh empty one.
+        if let Some(config) = existing_config
+            .as_ref()
+            .filter(|c| c.container_name.is_some())
+        {
+            if containers.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "Imported S3/MinIO container '{}' not found",
+                    container_name
+                ));
+            }
+            let is_running = matches!(
+                containers[0].state,
+                Some(bollard::models::ContainerSummaryStateEnum::RUNNING)
+            );
+            if !is_running {
+                docker
+                    .start_container(
+                        &container_name,
+                        None::<bollard::query_parameters::StartContainerOptions>,
+                    )
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("Failed to start imported S3/MinIO container: {}", e)
+                    })?;
+            }
+            self.wait_for_container_health(docker, &container_name)
+                .await?;
+            let _ = config;
+            return Ok(());
+        }
+
         if containers.is_empty() {
-            let config = self
-                .config
-                .read()
-                .await
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("S3 configuration not found"))?
-                .clone();
+            let config =
+                existing_config.ok_or_else(|| anyhow::anyhow!("S3 configuration not found"))?;
             let limits = self.resource_limits.read().await.clone();
             self.create_container(docker, &config, &limits).await?;
         } else {
@@ -940,7 +1032,13 @@ impl ExternalService for S3Service {
 
         // Stop the container
         let docker = &self.docker;
-        let container_name = self.get_container_name();
+        let container_name = self
+            .config
+            .read()
+            .await
+            .as_ref()
+            .map(|config| self.get_live_container_name(config))
+            .unwrap_or_else(|| self.get_container_name());
         info!("Stopping MinIO container {}", container_name);
 
         let containers = docker
@@ -1058,8 +1156,14 @@ impl ExternalService for S3Service {
     ) -> Result<HashMap<String, String>> {
         let mut env_vars = HashMap::new();
 
-        // Always use container name and internal port for container-to-container communication
-        let effective_host = self.get_container_name();
+        // Always use container name and internal port for container-to-container
+        // communication. An imported service's real container name (stored raw
+        // in parameters, since the typed config isn't available here) wins over
+        // the derived one.
+        let effective_host = parameters
+            .get("container_name")
+            .cloned()
+            .unwrap_or_else(|| self.get_container_name());
         let effective_port = S3_INTERNAL_PORT.to_string();
 
         let endpoint = format!("http://{}:{}", effective_host, effective_port);
@@ -1094,8 +1198,14 @@ impl ExternalService for S3Service {
     ) -> Result<HashMap<String, String>> {
         let mut env_vars = HashMap::new();
 
-        // Always use container name and internal port for container-to-container communication
-        let effective_host = self.get_container_name();
+        // Always use container name and internal port for container-to-container
+        // communication. An imported service's real container name (stored raw
+        // in parameters, since the typed config isn't available here) wins over
+        // the derived one.
+        let effective_host = parameters
+            .get("container_name")
+            .cloned()
+            .unwrap_or_else(|| self.get_container_name());
         let effective_port = S3_INTERNAL_PORT.to_string();
 
         let access_key = parameters
@@ -2091,7 +2201,13 @@ impl ExternalService for S3Service {
     }
 
     async fn get_current_docker_image(&self) -> Result<(String, String)> {
-        let container_name = self.get_container_name();
+        let container_name = self
+            .config
+            .read()
+            .await
+            .as_ref()
+            .map(|config| self.get_live_container_name(config))
+            .unwrap_or_else(|| self.get_container_name());
         let container = self
             .docker
             .inspect_container(
@@ -2172,6 +2288,15 @@ impl ExternalService for S3Service {
                 anyhow::anyhow!("Failed to inspect container '{}': {}", container_id, e)
             })?;
 
+        // The real Docker container name — every operation on an imported
+        // service must target this, not the derived `minio-{name}`.
+        let imported_container_name = container
+            .name
+            .as_deref()
+            .unwrap_or(&container_id)
+            .trim_start_matches('/')
+            .to_string();
+
         // Extract image name and version
         let image = container.config.and_then(|c| c.image).ok_or_else(|| {
             anyhow::anyhow!("Could not determine image for container '{}'", container_id)
@@ -2204,41 +2329,82 @@ impl ExternalService for S3Service {
         // Build endpoint
         let endpoint = format!("http://localhost:{}", port);
 
-        // Verify connection to the imported service by attempting to list buckets
-        match tokio::runtime::Runtime::new().ok().and_then(|rt| {
-            rt.block_on(async {
-                let creds = aws_sdk_s3::config::Credentials::new(
-                    &access_key,
-                    &secret_key,
-                    None,
-                    None,
-                    "imported",
+        // Verify connection to the imported service by attempting to list
+        // buckets. Connects directly with `.await` on the current runtime —
+        // spinning up a nested `tokio::runtime::Runtime` and calling
+        // `block_on` here panics with "Cannot start a runtime from within a
+        // runtime", since this `async fn` is already driven by one.
+        let creds =
+            aws_sdk_s3::config::Credentials::new(&access_key, &secret_key, None, None, "imported");
+        let s3_client_config = aws_sdk_s3::config::Config::builder()
+            .credentials_provider(creds)
+            .endpoint_url(&endpoint)
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .force_path_style(true)
+            .behavior_version_latest()
+            .build();
+        let client = aws_sdk_s3::Client::from_conf(s3_client_config);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.list_buckets().send(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("S3/MinIO connection timed out after 5 seconds"))?
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to connect to S3/MinIO at {} with provided credentials: {}",
+                endpoint,
+                e
+            )
+        })?;
+        info!("Successfully verified S3/MinIO connection for import");
+
+        let network_ready = match ensure_network_exists(&self.docker).await {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(
+                    "Failed to ensure Temps Docker network before S3/MinIO import attach: {:?}",
+                    e
                 );
-
-                let config = aws_sdk_s3::config::Config::builder()
-                    .credentials_provider(creds)
-                    .endpoint_url(&endpoint)
-                    .build();
-
-                let client = aws_sdk_s3::Client::from_conf(config);
-                client.list_buckets().send().await.ok()
-            })
-        }) {
-            Some(_) => {
-                info!("Successfully verified S3/MinIO connection for import");
+                false
             }
-            None => {
-                return Err(anyhow::anyhow!(
-                    "Failed to connect to S3/MinIO at {} with provided credentials. Verify endpoint, access key, and secret key.",
-                    endpoint
-                ));
+        };
+        if network_ready {
+            let network_name = temps_core::NETWORK_NAME.as_str();
+            let request = bollard::models::NetworkConnectRequest {
+                container: container_id.clone(),
+                ..Default::default()
+            };
+            match self.docker.connect_network(network_name, request).await {
+                Ok(()) => info!(
+                    "Attached imported S3/MinIO container '{}' to {}",
+                    imported_container_name, network_name
+                ),
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 403, ..
+                }) => debug!(
+                    "Imported S3/MinIO container '{}' is already attached to {}",
+                    imported_container_name, network_name
+                ),
+                Err(e) => warn!(
+                    "Failed to attach imported S3/MinIO container '{}' to {}: {}",
+                    imported_container_name, network_name, e
+                ),
             }
         }
 
-        // Build the ServiceConfig for registration
+        // Register as `Minio`, NOT `S3`: only the `Minio` service type routes
+        // back to `S3Service` in `create_service_instance` (the `S3` type
+        // routes to `RustfsService`, which manages its own RustFS container
+        // and can't operate this imported MinIO container). Storing `S3` here
+        // would make every later start/stop/backup reload the service as a
+        // RustfsService against a synthesized `rustfs-{name}` container that
+        // doesn't exist. This branch is only reachable by importing a
+        // container as the `minio` type in the first place.
+        #[allow(deprecated)]
         let config = ServiceConfig {
             name: service_name,
-            service_type: ServiceType::S3,
+            service_type: ServiceType::Minio,
             version: Some(version),
             parameters: serde_json::json!({
                 "endpoint": endpoint,
@@ -2247,7 +2413,7 @@ impl ExternalService for S3Service {
                 "secret_key": secret_key,
                 "use_ssl": false,
                 "docker_image": image,
-                "container_id": container_id,
+                "container_name": imported_container_name,
             }),
         };
 
@@ -2359,6 +2525,7 @@ mod tests {
             host: "localhost".to_string(),
             region: "us-east-1".to_string(),
             docker_image: "minio/minio:RELEASE.2025-09-07T16-13-09Z".to_string(),
+            container_name: None,
         };
 
         // Convert to runtime config
@@ -2368,6 +2535,53 @@ mod tests {
         assert_eq!(
             runtime_config.docker_image,
             "minio/minio:RELEASE.2025-09-07T16-13-09Z"
+        );
+    }
+
+    #[test]
+    fn test_get_effective_address_docker_mode_uses_imported_container_name() {
+        let _lock = crate::externalsvc::DEPLOYMENT_MODE_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("DEPLOYMENT_MODE", "docker") };
+
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let encryption_service =
+            Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
+        let service = S3Service::new("imported-svc".to_string(), docker, encryption_service);
+
+        let config = ServiceConfig {
+            name: "imported-svc".to_string(),
+            service_type: ServiceType::S3,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": "9000",
+                "access_key": "minioadmin",
+                "secret_key": "minioadmin",
+                "region": "us-east-1",
+                "container_name": "legacy-minio",
+            }),
+        };
+
+        let (host, port) = service.get_effective_address(config).unwrap();
+        // The imported container name wins over the derived `minio-{name}`.
+        assert_eq!(host, "legacy-minio");
+        assert_eq!(port, S3_INTERNAL_PORT);
+
+        unsafe { std::env::remove_var("DEPLOYMENT_MODE") };
+    }
+
+    #[test]
+    fn test_container_name_is_not_a_user_input() {
+        // container_name is derived from the service name at creation time
+        // (`minio-{name}`), never supplied by the client — same as MariaDB
+        // (see mariadb.rs's identical test). The create form is generated
+        // from this schema, so the field must not appear in it.
+        let schema = serde_json::to_value(schemars::schema_for!(S3InputConfig)).unwrap();
+        assert!(
+            !schema.to_string().contains("container_name"),
+            "container_name leaked into the S3/MinIO create schema"
         );
     }
 
