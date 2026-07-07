@@ -245,17 +245,25 @@ jobs:
       matrix:
         include:
           - group: unit-a
+            # kind(=lib): the old `--lib` flag excluded tests/*.rs integration
+            # test files. Some of those files (e.g. temps-providers' Docker
+            # integration tests) were never run by ANY CI job and aren't
+            # necessarily green -- switching the shared archive to
+            # --all-targets pulled them in by accident once (see PR
+            # discussion), so every group that used to pass --lib keeps that
+            # exact scope here via kind(=lib) instead.
             filter: >-
-              package(temps-providers) or package(temps-presets) or
+              (package(temps-providers) or package(temps-presets) or
               package(temps-auth) or package(temps-core) or
               package(temps-monitoring) or package(temps-kv) or
               package(temps-analytics-funnels) or package(temps-webhooks) or
               package(temps-infra) or package(temps-captcha-wasm) or
               package(temps-geo) or package(temps-environments) or
-              package(temps-audit) or package(temps-analytics-performance)
+              package(temps-audit) or package(temps-analytics-performance))
+              and kind(=lib)
           - group: unit-b
             filter: >-
-              package(temps-proxy) or package(temps-error-tracking) or
+              (package(temps-proxy) or package(temps-error-tracking) or
               package(temps-git) or package(temps-screenshots) or
               package(temps-routes) or package(temps-entities) or
               package(temps-cli) or package(temps-status-page) or
@@ -263,7 +271,7 @@ jobs:
               package(temps-query) or package(temps-analytics-session-replay) or
               package(temps-dns) or package(temps-email) or
               package(temps-analytics) or package(temps-analytics-events) or
-              package(temps-otel)
+              package(temps-otel)) and kind(=lib)
 
     steps:
       - name: Checkout code
@@ -325,8 +333,12 @@ jobs:
             # docker-deployments below, and the default multi-threaded runner
             # was racing against it -- observed as a Postgres deadlock (40P01)
             # and background-worker exhaustion (e.g. test_delete_service).
+            # kind(=lib): matches the old --lib flag -- excludes
+            # tests/*.rs integration test files (e.g. temps-providers'
+            # mariadb_binlog_health_integration.rs), which no CI job has ever
+            # run and aren't necessarily green yet.
             archive: docker-tests
-            filter: package(temps-providers) and not test(orchestrator_) and not test(backup_and_restore_to_s3)
+            filter: package(temps-providers) and kind(=lib) and not test(orchestrator_) and not test(backup_and_restore_to_s3)
             test_threads: "1"
           - group: docker-backups
             # Heavyweight S3 backup/restore integration tests
@@ -336,7 +348,7 @@ jobs:
             # Docker and races for host ports (`port is already allocated`),
             # causing 300s hangs. --test-threads=1 guarantees serial execution.
             archive: docker-tests
-            filter: package(temps-providers) and test(backup_and_restore_to_s3)
+            filter: package(temps-providers) and kind(=lib) and test(backup_and_restore_to_s3)
             extra_args: --no-capture
             test_threads: "1"
           - group: postgres-upgrades
@@ -345,7 +357,7 @@ jobs:
             # so they're 2–6 min apiece and must not contend for Docker.
             # --test-threads=1 guarantees serial execution.
             archive: docker-tests
-            filter: package(temps-providers) and test(orchestrator_)
+            filter: package(temps-providers) and kind(=lib) and test(orchestrator_)
             extra_args: --no-capture
             test_threads: "1"
           - group: docker-deployments
