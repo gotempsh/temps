@@ -378,10 +378,15 @@ impl PostgresService {
     /// it). The container name is deterministic, so a failed attempt must be
     /// removed before retrying or the next attempt's "already exists" check
     /// short-circuits without picking a new port.
+    ///
+    /// `config` is taken by mutable reference so a retry's port change is
+    /// written back to the caller — otherwise the caller (and anything it
+    /// persists to the database) keeps referencing the original port even
+    /// though the container actually ended up bound to a different one.
     async fn create_container(
         &self,
         docker: &Docker,
-        config: &PostgresConfig,
+        config: &mut PostgresConfig,
         resource_limits: &ServiceResourceLimits,
         enable_archiving: bool,
     ) -> Result<()> {
@@ -392,7 +397,10 @@ impl PostgresService {
                 .create_container_once(docker, &attempt_config, resource_limits, enable_archiving)
                 .await
             {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    *config = attempt_config;
+                    return Ok(());
+                }
                 Err(e) if attempt < MAX_ATTEMPTS && is_port_conflict_error(&e.to_string()) => {
                     warn!(
                         "Port {} for PostgreSQL container was already allocated (attempt {}/{}), retrying with a fresh port: {}",
@@ -969,7 +977,11 @@ impl PostgresService {
             })?;
 
         let limits = self.resource_limits.read().await.clone();
-        self.create_container(&self.docker, postgres_config, &limits, true)
+        // `postgres_config` is a caller-owned `&PostgresConfig` here (used
+        // only for this recreate, not persisted afterward), so retry port
+        // changes are applied to a local clone rather than threaded further.
+        let mut recreate_config = postgres_config.clone();
+        self.create_container(&self.docker, &mut recreate_config, &limits, true)
             .await?;
         self.docker
             .start_container(
@@ -2666,19 +2678,25 @@ impl ExternalService for PostgresService {
         }
 
         // Parse input config and transform to runtime config
-        let postgres_config = self.get_postgres_config(config)?;
+        let mut postgres_config = self.get_postgres_config(config)?;
 
         // Store runtime config and limits so `start()` can recreate the
-        // container with the same constraints if it has been removed.
+        // container with the same constraints if it has been removed. This
+        // gets overwritten below once the real container port is known.
         *self.config.write().await = Some(postgres_config.clone());
         *self.resource_limits.write().await = resource_limits.clone();
 
         if postgres_config.container_name.is_none() {
             // Create Docker container. New services always start with archiving
             // off — `enable_wal_archiving()` recreates with archiving on when
-            // WAL-G is later configured.
-            self.create_container(&self.docker, &postgres_config, &resource_limits, false)
+            // WAL-G is later configured. `create_container` may retry on a
+            // different host port than requested (see its docs); it writes
+            // that back into `postgres_config`, so everything below —
+            // `self.config` and the DB-persisted parameters — reflects the
+            // port the container is actually bound to.
+            self.create_container(&self.docker, &mut postgres_config, &resource_limits, false)
                 .await?;
+            *self.config.write().await = Some(postgres_config.clone());
         } else {
             info!(
                 "PostgreSQL service '{}' is imported from container '{}'; skipping container creation",
@@ -3061,7 +3079,7 @@ impl ExternalService for PostgresService {
         }
 
         if need_create {
-            let config = self
+            let mut config = self
                 .config
                 .read()
                 .await
@@ -3069,8 +3087,9 @@ impl ExternalService for PostgresService {
                 .ok_or_else(|| anyhow::anyhow!("PostgreSQL configuration not found"))?
                 .clone();
             let limits = self.resource_limits.read().await.clone();
-            self.create_container(&self.docker, &config, &limits, desired_enable_archiving)
+            self.create_container(&self.docker, &mut config, &limits, desired_enable_archiving)
                 .await?;
+            *self.config.write().await = Some(config);
         } else {
             // Container exists and CMD matches desired state. Just start it
             // if it isn't already running.
@@ -3292,7 +3311,7 @@ impl ExternalService for PostgresService {
 
     async fn upgrade(&self, old_config: ServiceConfig, new_config: ServiceConfig) -> Result<()> {
         let old_pg_config = self.get_postgres_config(old_config)?;
-        let new_pg_config = self.get_postgres_config(new_config)?;
+        let mut new_pg_config = self.get_postgres_config(new_config)?;
 
         // Extract version numbers from Docker images
         let old_version = Self::extract_postgres_version(&old_pg_config.docker_image)?;
@@ -3360,8 +3379,9 @@ impl ExternalService for PostgresService {
         // Preserve archiving state across the image swap by reading
         // `walg.env` from the existing volume — same rule as `start()`.
         let enable_archiving = self.compute_desired_enable_archiving().await;
-        self.create_container(&self.docker, &new_pg_config, &limits, enable_archiving)
+        self.create_container(&self.docker, &mut new_pg_config, &limits, enable_archiving)
             .await?;
+        *self.config.write().await = Some(new_pg_config);
         info!("PostgreSQL image swap completed successfully");
 
         Ok(())
@@ -3644,10 +3664,13 @@ impl ExternalService for PostgresService {
 
         // Create the new container+volume. Restored services start with
         // archiving off — the operator decides whether to wire WAL-G to the
-        // new service explicitly.
+        // new service explicitly. `create_container` writes any port-conflict
+        // retry back into `source_config`, so everything serialized below
+        // reflects the port the container actually bound to.
         new_service
-            .create_container(&self.docker, &source_config, &cloned_limits, false)
+            .create_container(&self.docker, &mut source_config, &cloned_limits, false)
             .await?;
+        *new_service.config.write().await = Some(source_config.clone());
 
         // Build a ServiceConfig that parses cleanly back into PostgresConfig.
         let new_service_config = ServiceConfig {
@@ -3748,8 +3771,9 @@ impl ExternalService for PostgresService {
             *new_service.config.write().await = Some(source_config.clone());
             *new_service.resource_limits.write().await = cloned_limits.clone();
             new_service
-                .create_container(&self.docker, &source_config, &cloned_limits, false)
+                .create_container(&self.docker, &mut source_config, &cloned_limits, false)
                 .await?;
+            *new_service.config.write().await = Some(source_config.clone());
 
             let new_service_config = ServiceConfig {
                 name: new_name.clone(),
@@ -4000,6 +4024,118 @@ mod tests {
         );
 
         // Cleanup
+        let _ = service.cleanup().await;
+    }
+
+    /// Regression test for a bug where `init()` persisted the *requested*
+    /// host port even when `create_container`'s retry-on-conflict logic
+    /// bound the container to a *different* port. Reported symptom: the
+    /// service's stored config (and DB-persisted connection info) showed
+    /// port 5441, but `docker ps` showed the container published on 5446 —
+    /// any client using the stored port couldn't connect.
+    ///
+    /// Reproduced deterministically by pre-occupying the requested port with
+    /// a plain `TcpListener` before calling `init()`, forcing Docker's own
+    /// bind to fail with "port is already allocated" and triggering the
+    /// exact retry path that used to lose track of the real port.
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn test_init_persists_actual_port_after_conflict_retry() {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => d,
+            Err(_) => {
+                println!("Docker not available, skipping");
+                return;
+            }
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not available, skipping");
+            return;
+        }
+
+        let requested_port = find_available_port(5432).expect("an OS-bindable port should exist");
+
+        // Hold the port so Docker's own bind fails with "port is already
+        // allocated" — the exact race `create_container`'s retry handles.
+        let _blocker = std::net::TcpListener::bind(("0.0.0.0", requested_port))
+            .expect("failed to occupy the port for the test");
+
+        let docker = Arc::new(docker);
+        let service = PostgresService::new("test-port-conflict-retry".to_string(), docker);
+
+        let config = ServiceConfig {
+            name: "test-postgres-conflict".to_string(),
+            service_type: super::ServiceType::Postgres,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": requested_port.to_string(),
+                "database": "testdb",
+                "username": "testuser",
+                "password": "testpass123",
+                "max_connections": 100,
+                "ssl_mode": "disable",
+                "docker_image": "gotempsh/postgres-walg:18-bookworm"
+            }),
+        };
+
+        let inferred_params = service
+            .init(config)
+            .await
+            .expect("init should succeed by retrying on a fresh port");
+
+        let persisted_port: u16 = inferred_params
+            .get("port")
+            .expect("port should be present in inferred params")
+            .parse()
+            .expect("port should be numeric");
+
+        assert_ne!(
+            persisted_port, requested_port,
+            "persisted port must differ from the occupied port that forced a retry"
+        );
+
+        // The in-memory config used by start()/health checks must agree too.
+        let cached_port: u16 = service
+            .config
+            .read()
+            .await
+            .as_ref()
+            .expect("config should be set after init")
+            .port
+            .parse()
+            .expect("cached port should be numeric");
+        assert_eq!(
+            cached_port, persisted_port,
+            "cached config port must match what was persisted"
+        );
+
+        // And it must match the port the container is actually bound to.
+        let container_name = service.get_container_name();
+        let inspect = service
+            .docker
+            .inspect_container(
+                &container_name,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .expect("container should exist");
+        let bound_ports: Vec<u16> = inspect
+            .network_settings
+            .and_then(|ns| ns.ports)
+            .into_iter()
+            .flatten()
+            .filter_map(|(_, bindings)| bindings)
+            .flatten()
+            .filter_map(|b| b.host_port.and_then(|p| p.parse().ok()))
+            .collect();
+        assert!(
+            bound_ports.contains(&persisted_port),
+            "container's actual bound ports {:?} should include the persisted port {}",
+            bound_ports,
+            persisted_port
+        );
+
         let _ = service.cleanup().await;
     }
 

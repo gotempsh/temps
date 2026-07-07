@@ -360,10 +360,15 @@ impl MongodbService {
     /// it). The container name is deterministic, so a failed attempt must be
     /// removed before retrying or the next attempt's "already exists" check
     /// short-circuits without picking a new port.
+    ///
+    /// `config` is taken by mutable reference so a retry's port change is
+    /// written back to the caller — otherwise the caller (and anything it
+    /// persists to the database) keeps referencing the original port even
+    /// though the container actually ended up bound to a different one.
     async fn create_container(
         &self,
         docker: &Docker,
-        config: &MongodbRuntimeConfig,
+        config: &mut MongodbRuntimeConfig,
         resource_limits: &ServiceResourceLimits,
     ) -> Result<()> {
         const MAX_ATTEMPTS: u32 = 3;
@@ -373,7 +378,10 @@ impl MongodbService {
                 .create_container_once(docker, &attempt_config, resource_limits)
                 .await
             {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    *config = attempt_config;
+                    return Ok(());
+                }
                 Err(e) if attempt < MAX_ATTEMPTS && is_port_conflict_error(&e.to_string()) => {
                     warn!(
                         "Port {} for MongoDB container was already allocated (attempt {}/{}), retrying with a fresh port: {}",
@@ -1879,7 +1887,7 @@ impl ExternalService for MongodbService {
             }))
             .await?;
 
-        let config =
+        let mut config =
             existing_config.ok_or_else(|| anyhow::anyhow!("MongoDB configuration not found"))?;
 
         // Imported services skip the replica-set drift-reconciliation path
@@ -1914,7 +1922,8 @@ impl ExternalService for MongodbService {
 
         let limits = self.resource_limits.read().await.clone();
         if containers.is_empty() {
-            self.create_container(docker, &config, &limits).await?;
+            self.create_container(docker, &mut config, &limits).await?;
+            *self.config.write().await = Some(config);
         } else {
             // If the persisted config now requires `--replSet` but the
             // existing container was created in standalone mode, restarting it
@@ -1958,7 +1967,8 @@ impl ExternalService for MongodbService {
                             e
                         )
                     })?;
-                self.create_container(docker, &config, &limits).await?;
+                self.create_container(docker, &mut config, &limits).await?;
+                *self.config.write().await = Some(config);
             } else {
                 docker
                     .start_container(
@@ -2449,7 +2459,7 @@ impl ExternalService for MongodbService {
         info!("Starting MongoDB upgrade");
 
         let _old_mongodb_config = self.get_mongodb_config(old_config)?;
-        let new_mongodb_config = self.get_mongodb_config(new_config)?;
+        let mut new_mongodb_config = self.get_mongodb_config(new_config)?;
 
         // Verify the new image can be pulled BEFORE stopping the old container
         info!(
@@ -2467,8 +2477,9 @@ impl ExternalService for MongodbService {
         // Create container with new image (keeping the same volume for data persistence)
         info!("Starting MongoDB container with new image");
         let limits = self.resource_limits.read().await.clone();
-        self.create_container(&self.docker, &new_mongodb_config, &limits)
+        self.create_container(&self.docker, &mut new_mongodb_config, &limits)
             .await?;
+        *self.config.write().await = Some(new_mongodb_config);
 
         info!("MongoDB upgrade completed successfully");
         Ok(())
@@ -3245,7 +3256,7 @@ mod tests {
         println!("Step 3: Starting MongoDB container...");
         let service = MongodbService::new(service_name.clone(), docker.clone());
 
-        let mongodb_config = MongodbRuntimeConfig {
+        let mut mongodb_config = MongodbRuntimeConfig {
             host: "localhost".to_string(),
             port: test_port.to_string(),
             database: database.to_string(),
@@ -3261,7 +3272,11 @@ mod tests {
 
         // Create and start MongoDB container
         service
-            .create_container(&docker, &mongodb_config, &ServiceResourceLimits::default())
+            .create_container(
+                &docker,
+                &mut mongodb_config,
+                &ServiceResourceLimits::default(),
+            )
             .await
             .expect("Failed to create MongoDB container");
         println!("✓ MongoDB container started and healthy");
