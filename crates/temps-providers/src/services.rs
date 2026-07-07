@@ -7063,6 +7063,38 @@ echo "[restore] Pre-seed complete"
                 &parameters,
             )?;
 
+            // A freshly-constructed instance has no in-memory config, so
+            // `start()` can't resolve an imported MariaDB service's real
+            // container name (it only lives in `config.container_name`).
+            // Hydrate it via `init()` first — same fix as `stop_service` — so
+            // `start()` targets the real container instead of failing with
+            // "MariaDB configuration not found" and falling back to a full
+            // re-initialize.
+            if service_type_enum == ServiceType::Mariadb {
+                let parameters = self.get_service_parameters(service_id).await?;
+                if parameters.contains_key("container_name") {
+                    let service_config = ServiceConfig {
+                        name: service.name.clone(),
+                        service_type: service_type_enum,
+                        version: service.version.clone(),
+                        parameters: serde_json::to_value(parameters).map_err(|e| {
+                            ExternalServiceError::InternalError {
+                                reason: format!("Failed to serialize parameters: {}", e),
+                            }
+                        })?,
+                    };
+                    service_instance.init(service_config).await.map_err(|e| {
+                        ExternalServiceError::StartFailed {
+                            id: service_id,
+                            reason: format!(
+                                "Failed to initialize imported MariaDB service before start: {}",
+                                e
+                            ),
+                        }
+                    })?;
+                }
+            }
+
             match service_instance.start().await {
                 Ok(()) => {}
                 Err(e) => {
@@ -7480,7 +7512,15 @@ echo "[restore] Pre-seed complete"
         // Use Docker container name and internal port directly — these match what
         // get_runtime_env_vars() puts in env var values (always Docker container names,
         // regardless of DeploymentMode). This is critical for cross-node env var rewriting.
-        let container_name = service_instance.get_docker_container_name();
+        // An imported service's real container name (stored raw in parameters, since
+        // get_docker_container_name() only knows the derived `{type}-{name}` form)
+        // wins over the derived one.
+        let container_name = service_config
+            .parameters
+            .get("container_name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| service_instance.get_docker_container_name());
         let internal_port = service_instance.get_docker_internal_port();
 
         // get_local_address returns "localhost:{host_port}" — we need the host port
@@ -8722,10 +8762,14 @@ echo "[restore] Pre-seed complete"
                 service_type,
                 &parameters,
             )?;
-            Ok(vec![(
-                "standalone".to_string(),
-                instance.get_docker_container_name(),
-            )])
+            // An imported service's real container name wins over the derived
+            // `{type}-{name}` one — see the identical pattern in `get_runtime_info`.
+            let container_name = parameters
+                .get("container_name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| instance.get_docker_container_name());
+            Ok(vec![("standalone".to_string(), container_name)])
         }
     }
 
