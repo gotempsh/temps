@@ -493,11 +493,11 @@ mod tests {
     /// `domain` using rcgen + the test EncryptionService. Returns
     /// `(cert_pem, encrypted_key_pem)` ready to embed in a mock [`domains::Model`].
     fn make_test_cert(domain: &str, enc: &temps_core::EncryptionService) -> (String, String) {
-        let rcgen::CertifiedKey { cert, key_pair } =
+        let rcgen::CertifiedKey { cert, signing_key } =
             rcgen::generate_simple_self_signed(vec![domain.to_string()])
                 .expect("rcgen should generate a test certificate");
         let cert_pem = cert.pem();
-        let key_pem = key_pair.serialize_pem();
+        let key_pem = signing_key.serialize_pem();
         let encrypted_key = enc.encrypt_string(&key_pem).expect("encrypt test key");
         (cert_pem, encrypted_key)
     }
