@@ -9,17 +9,24 @@ import { TimeAgo } from '@/components/utils/TimeAgo'
 import {
   type LogLevel,
   type LogSearchLine,
-  useLogHistory,
+  useLogHistoryInfinite,
 } from '@/hooks/useLogHistory'
 import { useQuery } from '@tanstack/react-query'
 import {
   ArrowLeft,
   Database,
+  Loader2,
   RefreshCw,
   ScrollText,
   Server,
 } from 'lucide-react'
-import { useMemo, useState } from 'react'
+import {
+  useCallback,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
 import { Link, useParams } from 'react-router-dom'
 
 /** Tailwind classes per normalized level — mirrors the deployment log viewer. */
@@ -33,6 +40,13 @@ const LEVEL_CLASS: Record<LogLevel, string> = {
 
 const LEVELS: LogLevel[] = ['ERROR', 'WARN', 'INFO', 'DEBUG', 'TRACE']
 
+/** Lines fetched per page. The viewer tails the newest page on load and walks
+    older pages on scroll-to-top, so we deliberately do NOT load everything. */
+const PAGE_SIZE = 200
+
+/** Distance (px) from the top that triggers loading the next-older page. */
+const LOAD_OLDER_THRESHOLD = 48
+
 function formatTs(ts: string): string {
   const d = new Date(ts)
   if (Number.isNaN(d.getTime())) return ts
@@ -45,6 +59,10 @@ function formatTs(ts: string): string {
  * search pipeline as application/deployment logs, scoped by
  * `external_service_id` instead of a project. Wears the same header shell as
  * the service detail page so it reads as one app.
+ *
+ * The log panel tails to the newest lines on load (like a terminal) and lazily
+ * pages *older* lines in as the operator scrolls to the top, preserving scroll
+ * position across each prepend so the viewport never jumps.
  */
 export function ServiceLogs() {
   const { id } = useParams<{ id: string }>()
@@ -57,34 +75,117 @@ export function ServiceLogs() {
 
   const [text, setText] = useState('')
   const [activeLevels, setActiveLevels] = useState<LogLevel[]>([])
+  // Bumped by Refresh to collapse back to a single newest page and re-tail.
+  const [refreshKey, setRefreshKey] = useState(0)
 
-  // Look back 24h by default — matches the service history window operators expect.
+  // Look back 24h by default — matches the service history window operators
+  // expect. Memoized so it stays stable across renders (the pagination window
+  // must not shift under the cursor).
   const startTime = useMemo(
     () => new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
     []
   )
 
-  const { data, isLoading, isFetching, error, refetch } = useLogHistory(
+  const levels = activeLevels.length ? activeLevels : undefined
+  const trimmedText = text.trim() || undefined
+
+  const {
+    data,
+    isLoading,
+    isFetching,
+    isFetchingNextPage,
+    hasNextPage,
+    fetchNextPage,
+    error,
+  } = useLogHistoryInfinite(
     {
       // projectId is ignored server-side when externalServiceId is set.
       projectId: 0,
       externalServiceId: serviceId,
       startTime,
-      levels: activeLevels.length ? activeLevels : undefined,
-      text: text.trim() || undefined,
-      pageSize: 500,
+      levels,
+      text: trimmedText,
+      pageSize: PAGE_SIZE,
+      refreshKey,
     },
     !Number.isNaN(serviceId)
   )
 
-  const lines: LogSearchLine[] = data?.lines ?? []
+  // Pages come newest-first (page 0 = newest). Reverse so the oldest loaded
+  // page sits at the top and the newest line lands at the bottom of the rope.
+  const lines: LogSearchLine[] = useMemo(() => {
+    const pages = data?.pages ?? []
+    return [...pages].reverse().flatMap((p) => p.lines)
+  }, [data])
+
   const svc = service?.service
+
+  // ── Scroll management: tail-on-load + preserve-position-on-prepend ──────
+  const scrollRef = useRef<HTMLDivElement | null>(null)
+  // How many pages were rendered last commit — lets us distinguish the first
+  // page (0→1, tail to bottom) from an older-page prepend (N→N+1, restore).
+  const renderedPagesRef = useRef(0)
+  // scrollHeight + scrollTop captured just before a fetchNextPage() so we can
+  // re-anchor the viewport exactly after older lines prepend at the top.
+  const pendingRestore = useRef<{ height: number; top: number } | null>(null)
+
+  const pageCount = data?.pages.length ?? 0
+
+  // A fresh query (filters changed or Refresh pressed) must re-tail from the
+  // bottom. Reset the page counter whenever the query identity changes; this
+  // effect is declared first so it runs before the scroll effect below.
+  const querySig = `${serviceId}|${trimmedText ?? ''}|${
+    levels?.join(',') ?? ''
+  }|${refreshKey}`
+  useLayoutEffect(() => {
+    renderedPagesRef.current = 0
+    pendingRestore.current = null
+  }, [querySig])
+
+  useLayoutEffect(() => {
+    const el = scrollRef.current
+    if (!el) return
+    const prev = renderedPagesRef.current
+    if (pageCount > prev) {
+      if (prev === 0) {
+        // First page of a fresh query → tail to the newest line.
+        el.scrollTop = el.scrollHeight
+      } else if (pendingRestore.current) {
+        // Older page prepended → re-anchor the viewport on the line the user
+        // was reading. New content added above shifts everything down by the
+        // scrollHeight delta; offset scrollTop by exactly that to hold still.
+        // (overflow-anchor:none on the container disables the browser's own
+        // anchoring so this manual math is the sole authority.)
+        const { height, top } = pendingRestore.current
+        el.scrollTop = top + (el.scrollHeight - height)
+        pendingRestore.current = null
+      }
+      renderedPagesRef.current = pageCount
+    }
+  }, [pageCount])
+
+  const handleScroll = useCallback(() => {
+    const el = scrollRef.current
+    if (!el) return
+    if (
+      el.scrollTop <= LOAD_OLDER_THRESHOLD &&
+      hasNextPage &&
+      !isFetchingNextPage
+    ) {
+      // Snapshot height+top so the prepend effect can restore the anchor.
+      pendingRestore.current = { height: el.scrollHeight, top: el.scrollTop }
+      fetchNextPage()
+    }
+  }, [hasNextPage, isFetchingNextPage, fetchNextPage])
 
   function toggleLevel(level: LogLevel) {
     setActiveLevels((prev) =>
       prev.includes(level) ? prev.filter((l) => l !== level) : [...prev, level]
     )
   }
+
+  // Refresh spins only for a full reload, not for background older-page loads.
+  const refreshing = isFetching && !isFetchingNextPage
 
   return (
     <div className="flex-1 overflow-auto">
@@ -167,11 +268,11 @@ export function ServiceLogs() {
               variant="outline"
               size="sm"
               className="gap-2"
-              onClick={() => refetch()}
-              disabled={isFetching}
+              onClick={() => setRefreshKey((k) => k + 1)}
+              disabled={refreshing}
             >
               <RefreshCw
-                className={`h-4 w-4 ${isFetching ? 'animate-spin' : ''}`}
+                className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`}
               />
               <span className="hidden sm:inline">Refresh</span>
             </Button>
@@ -200,11 +301,12 @@ export function ServiceLogs() {
           </div>
           <span className="text-xs text-muted-foreground sm:ml-auto">
             Last 24h · {lines.length} line{lines.length === 1 ? '' : 's'}
+            {hasNextPage ? '+' : ''}
           </span>
         </div>
 
-        {/* Log panel — bounded height + its own scrollbar so the page chrome
-            (header/filter) stays put and long output scrolls inside. */}
+        {/* Log panel — bounded height + its own scrollbar. Tails to the newest
+            line on load; scrolling to the top lazily pages in older lines. */}
         {error ? (
           <div className="rounded-md border border-destructive/40 bg-destructive/5 p-4 text-sm text-destructive">
             Failed to load logs: {(error as Error).message}
@@ -222,8 +324,27 @@ export function ServiceLogs() {
           </div>
         ) : (
           <div className="rounded-md border bg-muted/30">
-            <div className="max-h-[calc(100vh-19rem)] overflow-auto">
-              <pre className="min-w-full p-3 font-mono text-xs leading-relaxed">
+            <div
+              ref={scrollRef}
+              onScroll={handleScroll}
+              className="max-h-[calc(100vh-19rem)] overflow-auto [overflow-anchor:none]"
+            >
+              {/* Top affordance for the "load older" walk. */}
+              {isFetchingNextPage ? (
+                <div className="flex items-center justify-center gap-2 py-2 text-xs text-muted-foreground">
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                  Loading older logs…
+                </div>
+              ) : hasNextPage ? (
+                <div className="py-1.5 text-center text-xs text-muted-foreground/70">
+                  Scroll up to load older logs
+                </div>
+              ) : (
+                <div className="py-1.5 text-center text-xs text-muted-foreground/50">
+                  Beginning of the last 24 hours
+                </div>
+              )}
+              <pre className="min-w-full px-3 pb-3 font-mono text-xs leading-relaxed">
                 {lines.map((line, i) => (
                   <div
                     key={`${line.chunk_id}-${line.line_offset}-${i}`}
