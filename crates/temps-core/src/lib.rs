@@ -16,6 +16,7 @@ pub mod openapi;
 pub mod plugin;
 pub mod problemdetails;
 pub mod retry;
+pub mod secrets_manager;
 pub mod telemetry;
 pub mod tls;
 pub mod traces;
@@ -50,6 +51,7 @@ pub use error::*;
 pub use error_builder::*;
 pub use jobs::*;
 pub use on_demand::*;
+pub use secrets_manager::SecretsManagerResolver;
 pub use telemetry::{NoopTelemetryReporter, TelemetryEvent, TelemetryEventKind, TelemetryReporter};
 pub use traces::{
     TraceQueryFilter, TraceReader, TraceReaderError, TraceSpanDto, TraceSpanEventDto,

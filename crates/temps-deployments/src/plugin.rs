@@ -10,7 +10,8 @@ use utoipa::{openapi::OpenApi, OpenApi as UtoimaOpenApi};
 use crate::{
     handlers,
     services::{
-        DeploymentGateSlot, DeploymentService, JobProcessorService, WorkflowExecutionService,
+        DeploymentGateSlot, DeploymentService, JobProcessorService, SecretsResolverSlot,
+        WorkflowExecutionService,
     },
     WorkflowPlanner,
 };
@@ -26,12 +27,19 @@ pub struct DeploymentsPlugin {
     /// order, and this plugin registers (and starts its processor) before
     /// any later-registered plugin gets a chance to provide a gate.
     deployment_gate_slot: tokio::sync::OnceCell<DeploymentGateSlot>,
+    /// Handle to the `WorkflowPlanner`'s `secrets_resolver` slot, captured
+    /// before the planner is moved into the background task. Uses the same
+    /// two-phase handoff pattern as `deployment_gate_slot`: the actual EE
+    /// resolver is written in `initialize_plugin_services` once every plugin
+    /// has registered.  Remains `None` on OSS-only builds — a strict no-op.
+    secrets_resolver_slot: tokio::sync::OnceCell<SecretsResolverSlot>,
 }
 
 impl DeploymentsPlugin {
     pub fn new() -> Self {
         Self {
             deployment_gate_slot: tokio::sync::OnceCell::new(),
+            secrets_resolver_slot: tokio::sync::OnceCell::new(),
         }
     }
 }
@@ -261,6 +269,15 @@ impl TempsPlugin for DeploymentsPlugin {
                 encryption_service,
             ));
 
+            // Capture the secrets-resolver handle BEFORE moving workflow_planner
+            // into the job processor.  This is the two-phase handoff: the actual
+            // EE resolver (if any) is written into this slot in
+            // initialize_plugin_services, which runs only after every plugin has
+            // registered its services.  Any EE plugin that registers a
+            // SecretsManagerResolver will register AFTER this plugin, so looking
+            // it up here with get_service would always return None.
+            let secrets_resolver_handle = workflow_planner.secrets_resolver_handle();
+
             // Clone workflow_execution_service before passing to job processor
             // (the job processor takes ownership, but we need to register it too)
             let workflow_execution_service_for_processor = workflow_execution_service.clone();
@@ -283,6 +300,14 @@ impl TempsPlugin for DeploymentsPlugin {
             if self
                 .deployment_gate_slot
                 .set(job_processor.deployment_gate_handle())
+                .is_err()
+            {
+                unreachable!("register_services runs exactly once per plugin instance");
+            }
+
+            if self
+                .secrets_resolver_slot
+                .set(secrets_resolver_handle)
                 .is_err()
             {
                 unreachable!("register_services runs exactly once per plugin instance");
@@ -329,6 +354,20 @@ impl TempsPlugin for DeploymentsPlugin {
                     tracing::debug!("Deployment gate wired into job processor");
                 }
             }
+
+            // Wire the optional EE-provided SecretsManagerResolver into the
+            // WorkflowPlanner.  Uses get_service (not require_service) so that
+            // OSS-only builds — where no EE plugin registers the resolver —
+            // continue to work without secrets support (strict no-op).
+            if let Some(slot) = self.secrets_resolver_slot.get() {
+                if let Some(resolver) =
+                    context.get_service::<dyn temps_core::SecretsManagerResolver>()
+                {
+                    *slot.write().await = Some(resolver);
+                    tracing::debug!("SecretsManagerResolver wired into WorkflowPlanner");
+                }
+            }
+
             Ok(())
         })
     }
@@ -370,6 +409,26 @@ impl TempsPlugin for DeploymentsPlugin {
             dsn_service,
             encryption_service,
         ));
+
+        // Wire the SecretsManagerResolver into this secondary WorkflowPlanner
+        // (used for the remote-deployment handlers). configure_routes runs
+        // after initialize_plugin_services, so the resolver is already in the
+        // service registry if an EE plugin provided one.  The lock is freshly
+        // created and uncontested, so try_write() always succeeds here.
+        if let Some(resolver) = context.get_service::<dyn temps_core::SecretsManagerResolver>() {
+            match workflow_planner.secrets_resolver_handle().try_write() {
+                Ok(mut guard) => {
+                    *guard = Some(resolver);
+                    tracing::debug!("SecretsManagerResolver wired into secondary WorkflowPlanner");
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "Could not acquire secrets resolver slot in configure_routes; \
+                         secrets-manager bindings will be unavailable for remote deployments"
+                    );
+                }
+            }
+        }
 
         // Get WorkflowExecutionService
         let workflow_executor = context.require_service::<WorkflowExecutionService>();
