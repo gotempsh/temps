@@ -60,6 +60,11 @@ export interface SearchLogsResponse {
 
 export interface LogSearchParams {
   projectId: number
+  /**
+   * When set, search an imported/managed external service's logs instead of a
+   * project's. `projectId` is ignored server-side in this mode.
+   */
+  externalServiceId?: number
   startTime?: string
   endTime?: string
   levels?: LogLevel[]
@@ -85,6 +90,8 @@ async function searchLogs(params: LogSearchParams): Promise<SearchLogsResponse> 
     project_id: params.projectId,
   }
 
+  if (params.externalServiceId != null)
+    body.external_service_id = params.externalServiceId
   if (params.startTime) body.start_time = params.startTime
   if (params.endTime) body.end_time = params.endTime
   if (params.levels?.length) body.levels = params.levels
@@ -115,6 +122,7 @@ export function useLogHistory(params: LogSearchParams, enabled = true) {
     queryKey: [
       'log-history',
       params.projectId,
+      params.externalServiceId,
       params.startTime,
       params.endTime,
       params.levels,
@@ -129,7 +137,7 @@ export function useLogHistory(params: LogSearchParams, enabled = true) {
       params.nodeIds,
     ],
     queryFn: () => searchLogs(params),
-    enabled: enabled && !!params.projectId,
+    enabled: enabled && (!!params.projectId || params.externalServiceId != null),
     staleTime: 1000 * 30, // 30 seconds
     placeholderData: keepPreviousData,
   })

@@ -256,38 +256,57 @@ impl TempsPlugin for LogAggregatorPlugin {
             }
 
             // ── Container discovery: startup scan ───────────────────────
-            // Find already-running containers with sh.temps.* labels and start streaming.
-            // Retries with exponential backoff if Docker is temporarily unavailable.
+            // Find already-running containers and start streaming. Two label
+            // families are collected: deployment/application containers
+            // (`sh.temps.project_id`) and imported/managed external-service
+            // containers (`temps.service_type`). Docker's `label` filter ANDs
+            // multiple values, so each family needs its own list call; the IDs
+            // are unioned. Retries with exponential backoff if Docker is
+            // temporarily unavailable.
             let startup_collector = collector.clone();
             let startup_docker = docker.clone();
             tokio::spawn(async move {
                 use bollard::query_parameters::ListContainersOptions;
-                use std::collections::HashMap;
+                use std::collections::{HashMap, HashSet};
+
+                let scan_labels = ["sh.temps.project_id", "temps.service_type"];
 
                 let mut delay = STARTUP_SCAN_BASE_DELAY;
                 for attempt in 0..=STARTUP_SCAN_MAX_RETRIES {
-                    let mut filters = HashMap::new();
-                    filters.insert("status".to_string(), vec!["running".to_string()]);
-                    filters.insert("label".to_string(), vec!["sh.temps.project_id".to_string()]);
+                    let mut scan_result: Result<HashSet<String>, bollard::errors::Error> =
+                        Ok(HashSet::new());
+                    for label in scan_labels {
+                        let mut filters = HashMap::new();
+                        filters.insert("status".to_string(), vec!["running".to_string()]);
+                        filters.insert("label".to_string(), vec![label.to_string()]);
+                        let options = ListContainersOptions {
+                            all: false,
+                            filters: Some(filters),
+                            ..Default::default()
+                        };
+                        match startup_docker.list_containers(Some(options)).await {
+                            Ok(containers) => {
+                                if let Ok(ids) = scan_result.as_mut() {
+                                    ids.extend(containers.into_iter().filter_map(|c| c.id));
+                                }
+                            }
+                            Err(e) => {
+                                scan_result = Err(e);
+                                break;
+                            }
+                        }
+                    }
 
-                    let options = ListContainersOptions {
-                        all: false,
-                        filters: Some(filters),
-                        ..Default::default()
-                    };
-
-                    match startup_docker.list_containers(Some(options)).await {
-                        Ok(containers) => {
-                            let count = containers.len();
-                            for container in containers {
-                                if let Some(id) = container.id {
-                                    if let Err(e) = startup_collector.start_streaming(&id).await {
-                                        tracing::warn!(
-                                            container_id = %id,
-                                            error = %e,
-                                            "Failed to start streaming for existing container"
-                                        );
-                                    }
+                    match scan_result {
+                        Ok(ids) => {
+                            let count = ids.len();
+                            for id in ids {
+                                if let Err(e) = startup_collector.start_streaming(&id).await {
+                                    tracing::warn!(
+                                        container_id = %id,
+                                        error = %e,
+                                        "Failed to start streaming for existing container"
+                                    );
                                 }
                             }
                             tracing::info!(

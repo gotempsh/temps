@@ -73,6 +73,11 @@ const ServiceDataBrowser = lazy(() =>
     default: m.ServiceDataBrowser,
   }))
 )
+const ServiceLogs = lazy(() =>
+  import('./pages/ServiceLogs').then((m) => ({
+    default: m.ServiceLogs,
+  }))
+)
 const ServiceRestore = lazy(() =>
   import('./pages/ServiceRestore').then((m) => ({
     default: m.ServiceRestore,
@@ -507,6 +512,7 @@ const FullAppRoutes = () => {
                 <Route path="/storage/:id" element={<ServiceDetail />} />
                 <Route path="/storage/:id/monitoring" element={<ServiceMonitoring />} />
                 <Route path="/storage/:id/browse" element={<ServiceDataBrowser />} />
+                <Route path="/storage/:id/logs" element={<ServiceLogs />} />
                 <Route path="/storage/:id/restore" element={<ServiceRestore />} />
                 <Route path="/storage/:id/upgrades/:upgradeId" element={<MajorUpgradeDetail />} />
                 <Route path="/storage/:id/members/add" element={<AddClusterMember />} />
