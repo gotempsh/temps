@@ -16,8 +16,8 @@ use temps_core::error_builder::ErrorBuilder;
 use temps_core::{
     problemdetails::Problem, AiConfigSettings, AppSettings, AuditContext, AuditLogger,
     AuditOperation, BuildLimitsSettings, ClusterDnsSettings, ContainerLogSettings,
-    DiskSpaceAlertSettings, LetsEncryptSettings, MetricsStoreKind, RateLimitSettings,
-    RequestMetadata, ScreenshotSettings, SecurityHeadersSettings,
+    DiskSpaceAlertSettings, LetsEncryptSettings, MetricsStoreKind, PublicHostnameStrategy,
+    RateLimitSettings, RequestMetadata, ScreenshotSettings, SecurityHeadersSettings,
 };
 use tracing::{error, info};
 use utoipa::{OpenApi, ToSchema};
@@ -396,6 +396,7 @@ impl AppSettingsResponse {
         crate::disk_status::DiskSpaceCheckResult,
         ContainerLogSettings,
         ClusterDnsSettings,
+        PublicHostnameStrategy,
         DnsProviderSettingsMasked,
         DockerRegistrySettingsMasked,
         AgentSandboxSettingsMasked,
