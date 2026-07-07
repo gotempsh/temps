@@ -8710,12 +8710,23 @@ echo "[restore] Pre-seed complete"
             .encrypt(config_json.as_bytes())
             .map_err(|e| anyhow::anyhow!("Failed to encrypt service configuration: {}", e))?;
 
+        // Plaintext real container name so the log collector can map the
+        // imported (label-less) container back to this service without
+        // decrypting `config`. Every provider's import_from_container stamps
+        // `container_name` into the parameters.
+        let imported_container_name = service_config
+            .parameters
+            .get("container_name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
         let external_service = external_services::ActiveModel {
             name: Set(service_config.name.clone()),
             service_type: Set(service_config.service_type.to_string()),
             version: Set(service_config.version.clone()),
             status: Set("running".to_string()),
             config: Set(Some(encrypted_config)),
+            container_name: Set(imported_container_name),
             ..Default::default()
         }
         .insert(self.db.as_ref())

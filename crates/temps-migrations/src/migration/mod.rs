@@ -142,6 +142,7 @@ mod m20260702_000003_add_grouped_threshold_and_series_state_to_metric_alert_rule
 mod m20260703_000001_cross_project_trace_refs;
 mod m20260705_000001_add_visitor_unique_index;
 mod m20260707_000001_add_external_service_to_logs;
+mod m20260707_000002_add_external_services_container_name;
 
 pub struct Migrator;
 
@@ -289,6 +290,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260703_000001_cross_project_trace_refs::Migration),
             Box::new(m20260705_000001_add_visitor_unique_index::Migration),
             Box::new(m20260707_000001_add_external_service_to_logs::Migration),
+            Box::new(m20260707_000002_add_external_services_container_name::Migration),
         ]
     }
 }

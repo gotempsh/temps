@@ -270,21 +270,31 @@ impl CollectorService {
                 }
             })?;
 
-        let labels = inspect.config.as_ref().and_then(|c| c.labels.as_ref());
+        // Real Docker container name (e.g. "legacy-postgres"), used to resolve
+        // imported external-service containers that carry no temps.* labels.
+        let container_name = inspect
+            .name
+            .as_deref()
+            .map(|n| n.trim_start_matches('/').to_string());
 
-        let labels = match labels {
-            Some(l) => l,
-            None => return Ok(None),
-        };
+        // Empty map when the container has no labels at all (e.g. an imported
+        // pre-existing container) — still fall through to the external-service
+        // resolution below rather than bailing out.
+        let empty_labels = std::collections::HashMap::new();
+        let labels = inspect
+            .config
+            .as_ref()
+            .and_then(|c| c.labels.as_ref())
+            .unwrap_or(&empty_labels);
 
         // Deployment/application containers carry `sh.temps.project_id`.
-        // Imported/managed external-service containers (Postgres, Redis, …)
-        // carry `temps.service_type` + `temps.service_name` instead (set by
-        // the providers) and have no project — collect their logs under the
-        // external-service dimension so they get the same history/search.
+        // Everything else is a candidate external-service container: either
+        // Temps-created (carries `temps.service_type`/`temps.service_name`
+        // labels) or IMPORTED (no temps.* labels — resolved by matching the
+        // real container name against `external_services.container_name`).
         if !labels.contains_key(LABEL_PROJECT_ID) {
             return self
-                .extract_external_service_context(container_id, labels)
+                .extract_external_service_context(container_id, container_name.as_deref(), labels)
                 .await;
         }
 
@@ -318,38 +328,68 @@ impl CollectorService {
         }))
     }
 
-    /// Build context for an imported/managed external-service container from
-    /// its `temps.service_type`/`temps.service_name` labels. Resolves the
-    /// service name to `external_services.id` via the DB; skips (returns None)
-    /// if the labels are absent, no DB handle is attached, or no matching row
-    /// exists.
+    /// Resolve an external-service container to its `external_services` row.
+    ///
+    /// Two resolution paths, in order:
+    ///  1. **Created** services carry a `temps.service_name` label → look the
+    ///     service up by name.
+    ///  2. **Imported** services' pre-existing containers have no temps.*
+    ///     labels (Docker labels are immutable) → match the real container
+    ///     name against the plaintext `external_services.container_name`
+    ///     column stamped at import time.
+    ///
+    /// Returns `None` (container skipped) when neither resolves, no DB handle
+    /// is attached, or the container has no name.
     async fn extract_external_service_context(
         &self,
         container_id: &str,
+        container_name: Option<&str>,
         labels: &std::collections::HashMap<String, String>,
     ) -> Result<Option<ContainerContext>, LogAggregatorError> {
-        let prefix = temps_core::DOCKER_LABEL_PREFIX; // "temps."
-        let service_name = match labels.get(&format!("{prefix}service_name")) {
-            Some(name) => name.clone(),
-            None => return Ok(None),
-        };
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
         let Some(db) = self.db.as_ref() else {
             return Ok(None);
         };
+        let prefix = temps_core::DOCKER_LABEL_PREFIX; // "temps."
 
-        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-        let svc = temps_entities::external_services::Entity::find()
-            .filter(temps_entities::external_services::Column::Name.eq(service_name.clone()))
-            .one(db.as_ref())
-            .await
-            .map_err(|e| LogAggregatorError::DockerStreamFailed {
-                container_id: container_id.to_string(),
-                reason: format!("Failed to resolve external service '{service_name}': {e}"),
-            })?;
+        // Path 1: created service — resolve by the temps.service_name label.
+        // Path 2: imported service — resolve by the real container name.
+        let (svc, service_label) = if let Some(name) = labels.get(&format!("{prefix}service_name"))
+        {
+            let svc = temps_entities::external_services::Entity::find()
+                .filter(temps_entities::external_services::Column::Name.eq(name.clone()))
+                .one(db.as_ref())
+                .await
+                .map_err(|e| LogAggregatorError::DockerStreamFailed {
+                    container_id: container_id.to_string(),
+                    reason: format!("Failed to resolve external service '{name}': {e}"),
+                })?;
+            (svc, Some(name.clone()))
+        } else if let Some(cname) = container_name {
+            let svc = temps_entities::external_services::Entity::find()
+                .filter(temps_entities::external_services::Column::ContainerName.eq(cname))
+                .one(db.as_ref())
+                .await
+                .map_err(|e| LogAggregatorError::DockerStreamFailed {
+                    container_id: container_id.to_string(),
+                    reason: format!(
+                        "Failed to resolve imported service for container '{cname}': {e}"
+                    ),
+                })?;
+            (svc, None)
+        } else {
+            return Ok(None);
+        };
+
         let svc = match svc {
             Some(s) => s,
             None => return Ok(None),
         };
+
+        // Service name for display/grouping: the label if present, else the
+        // service's own name from the DB row.
+        let service = service_label.unwrap_or_else(|| svc.name.clone());
 
         Ok(Some(ContainerContext {
             // Sentinel: external-service chunks key on external_service_id, not
@@ -357,7 +397,7 @@ impl CollectorService {
             project_id: 0,
             external_service_id: Some(svc.id),
             env: "default".to_string(),
-            service: service_name,
+            service,
             container_id: container_id.to_string(),
             deploy_id: None,
         }))

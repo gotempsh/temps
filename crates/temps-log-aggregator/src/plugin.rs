@@ -175,6 +175,7 @@ impl TempsPlugin for LogAggregatorPlugin {
             let metadata_service = context.require_service::<LogMetadataService>();
             let collector = context.require_service::<CollectorService>();
             let docker = context.require_service::<bollard::Docker>();
+            let db = context.require_service::<sea_orm::DatabaseConnection>();
             let retention_service = context.require_service::<RetentionService>();
             let retention_metadata = context.require_service::<LogMetadataService>();
 
@@ -265,6 +266,7 @@ impl TempsPlugin for LogAggregatorPlugin {
             // temporarily unavailable.
             let startup_collector = collector.clone();
             let startup_docker = docker.clone();
+            let startup_db = db.clone();
             tokio::spawn(async move {
                 use bollard::query_parameters::ListContainersOptions;
                 use std::collections::{HashMap, HashSet};
@@ -293,6 +295,44 @@ impl TempsPlugin for LogAggregatorPlugin {
                             Err(e) => {
                                 scan_result = Err(e);
                                 break;
+                            }
+                        }
+                    }
+
+                    // Imported external-service containers carry NO temps.*
+                    // labels, so the label scans above miss them. Discover them
+                    // by the plaintext container names recorded at import time
+                    // and add any that are running by name filter.
+                    if let Ok(ids) = scan_result.as_mut() {
+                        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
+                        let imported_names: Vec<String> =
+                            temps_entities::external_services::Entity::find()
+                                .filter(
+                                    temps_entities::external_services::Column::ContainerName
+                                        .is_not_null(),
+                                )
+                                .select_only()
+                                .column(temps_entities::external_services::Column::ContainerName)
+                                .into_tuple::<Option<String>>()
+                                .all(startup_db.as_ref())
+                                .await
+                                .unwrap_or_default()
+                                .into_iter()
+                                .flatten()
+                                .collect();
+                        for name in imported_names {
+                            let mut filters = HashMap::new();
+                            filters.insert("status".to_string(), vec!["running".to_string()]);
+                            filters.insert("name".to_string(), vec![name.clone()]);
+                            let options = ListContainersOptions {
+                                all: false,
+                                filters: Some(filters),
+                                ..Default::default()
+                            };
+                            if let Ok(containers) =
+                                startup_docker.list_containers(Some(options)).await
+                            {
+                                ids.extend(containers.into_iter().filter_map(|c| c.id));
                             }
                         }
                     }
