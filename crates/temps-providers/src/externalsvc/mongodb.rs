@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Bound for a single MongoDB backup `docker exec`. Mongo dumps can be
 /// large; 4 hours is a reasonable middle ground.
@@ -74,6 +74,17 @@ pub struct MongodbInputConfig {
     #[serde(default, deserialize_with = "deserialize_optional_replica_set")]
     #[schemars(with = "Option<String>", example = "example_replica_set")]
     pub replica_set: Option<String>,
+
+    /// Real Docker container name when this service was imported from an
+    /// existing MongoDB-compatible container (set by `import_from_container`,
+    /// never user-editable — omitted from the create form). Overrides the
+    /// derived `temps-mongodb-{name}` container name so internal addressing
+    /// targets the actual pre-existing container instead of a synthesized
+    /// name that doesn't exist. Mirrors the MariaDB/Postgres/Redis fix for
+    /// the same class of bug.
+    #[serde(default, deserialize_with = "deserialize_optional_non_empty")]
+    #[schemars(skip)]
+    pub container_name: Option<String>,
 }
 
 // Example functions for schemars
@@ -129,6 +140,10 @@ pub struct MongodbRuntimeConfig {
     /// here so the same keyfile is written into the container on every restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keyfile_content: Option<String>,
+    /// Real container name for imported services — see
+    /// `MongodbInputConfig::container_name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_name: Option<String>,
 }
 
 impl From<MongodbInputConfig> for MongodbRuntimeConfig {
@@ -152,6 +167,7 @@ impl From<MongodbInputConfig> for MongodbRuntimeConfig {
             docker_image: input.docker_image,
             replica_set,
             keyfile_content,
+            container_name: input.container_name,
         }
     }
 }
@@ -168,6 +184,16 @@ where
         Some(s) if !s.is_empty() => Some(s),
         _ => None,
     })
+}
+
+/// Treats a blank string the same as an absent value — see
+/// `MongodbInputConfig::container_name`.
+fn deserialize_optional_non_empty<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    Ok(opt.filter(|s| !s.is_empty()))
 }
 
 /// Treat empty string as `None` so the UI can submit a blank field without
@@ -313,6 +339,19 @@ impl MongodbService {
 
     fn get_container_name(&self) -> String {
         format!("temps-mongodb-{}", self.name)
+    }
+
+    /// The container this service actually runs in: the imported container's
+    /// real name when `config.container_name` is set, otherwise the derived
+    /// `temps-mongodb-{name}`. Every operation that talks to the live
+    /// container must resolve through this, not `get_container_name()`
+    /// directly, or it targets a synthesized name that doesn't exist for
+    /// imported services.
+    fn get_live_container_name(&self, config: &MongodbRuntimeConfig) -> String {
+        config
+            .container_name
+            .clone()
+            .unwrap_or_else(|| self.get_container_name())
     }
 
     /// Creates and starts the MongoDB container, retrying with a fresh host
@@ -717,9 +756,18 @@ impl MongodbService {
                 .inspect_container(container_id, None::<InspectContainerOptions>)
                 .await?;
             if let Some(state) = info.state {
-                if state.status == Some(bollard::models::ContainerStateStatusEnum::RUNNING)
-                    && state.health.as_ref().and_then(|h| h.status.as_ref())
-                        == Some(&bollard::models::HealthStatusEnum::HEALTHY)
+                // Considered ready if it's running and either has a HEALTHY
+                // Docker healthcheck status or no healthcheck is defined at
+                // all (e.g. an imported container from a vanilla image with
+                // no HEALTHCHECK directive — requiring an explicit HEALTHY
+                // here would spin until `max_wait` every time).
+                let is_running =
+                    state.status == Some(bollard::models::ContainerStateStatusEnum::RUNNING);
+                let health_status = state.health.as_ref().and_then(|h| h.status.as_ref());
+
+                if is_running
+                    && (health_status.is_none()
+                        || health_status == Some(&bollard::models::HealthStatusEnum::HEALTHY))
                 {
                     return Ok(());
                 }
@@ -925,7 +973,7 @@ impl MongodbService {
             .map(String::from);
 
         let config = self.get_mongodb_config(service_config)?;
-        let container_name = self.get_container_name();
+        let container_name = self.get_live_container_name(&config);
 
         info!(
             "Restoring MongoDB from WAL-G backup (prefix: {}) in container '{}'",
@@ -1150,7 +1198,7 @@ impl MongodbService {
         service_config: ServiceConfig,
     ) -> Result<()> {
         let config = self.get_mongodb_config(service_config)?;
-        let container_name = self.get_container_name();
+        let container_name = self.get_live_container_name(&config);
 
         info!(
             "Restoring MongoDB from legacy backup format: {}",
@@ -1414,7 +1462,7 @@ impl MongodbService {
         use bollard::exec::CreateExecOptions;
 
         let config = self.get_mongodb_config(service_config)?;
-        let container_name = self.get_container_name();
+        let container_name = self.get_live_container_name(&config);
         let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
         let backup_file = format!("mongodb_backup_{}.gz", timestamp);
         let backup_path = format!("{}/{}", subpath, backup_file);
@@ -1551,7 +1599,7 @@ impl MongodbService {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("MongoDB not configured"))?;
 
-        let effective_host = self.get_container_name();
+        let effective_host = self.get_live_container_name(config);
         let effective_port = MONGODB_INTERNAL_PORT.to_string();
 
         let mut env_vars = HashMap::new();
@@ -1583,7 +1631,10 @@ impl ExternalService for MongodbService {
 
         if temps_core::DeploymentMode::is_docker() {
             // Docker mode: use container name and internal port
-            Ok((self.get_container_name(), MONGODB_INTERNAL_PORT.to_string()))
+            Ok((
+                self.get_live_container_name(&config),
+                MONGODB_INTERNAL_PORT.to_string(),
+            ))
         } else {
             // Baremetal mode: use localhost and exposed port
             Ok(("localhost".to_string(), config.port))
@@ -1810,7 +1861,11 @@ impl ExternalService for MongodbService {
 
     async fn start(&self) -> Result<()> {
         let docker = &self.docker;
-        let container_name = self.get_container_name();
+        let existing_config = self.config.read().await.as_ref().cloned();
+        let container_name = existing_config
+            .as_ref()
+            .map(|config| self.get_live_container_name(config))
+            .unwrap_or_else(|| self.get_container_name());
         info!("Starting MongoDB container {}", container_name);
 
         let containers = docker
@@ -1824,13 +1879,38 @@ impl ExternalService for MongodbService {
             }))
             .await?;
 
-        let config = self
-            .config
-            .read()
-            .await
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("MongoDB configuration not found"))?
-            .clone();
+        let config =
+            existing_config.ok_or_else(|| anyhow::anyhow!("MongoDB configuration not found"))?;
+
+        // Imported services skip the replica-set drift-reconciliation path
+        // entirely: the stop+remove+recreate below assumes Temps owns the
+        // container's lifecycle and volume naming. Running that against a
+        // pre-existing container the operator brought in would delete their
+        // real database to "fix" a mismatch that was never Temps' to manage.
+        if config.container_name.is_some() {
+            if containers.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "Imported MongoDB container '{}' not found",
+                    container_name
+                ));
+            }
+            let is_running = matches!(
+                containers[0].state,
+                Some(bollard::models::ContainerSummaryStateEnum::RUNNING)
+            );
+            if !is_running {
+                docker
+                    .start_container(
+                        &container_name,
+                        None::<bollard::query_parameters::StartContainerOptions>,
+                    )
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("Failed to start imported MongoDB container: {}", e)
+                    })?;
+            }
+            return Ok(());
+        }
 
         let limits = self.resource_limits.read().await.clone();
         if containers.is_empty() {
@@ -1895,7 +1975,13 @@ impl ExternalService for MongodbService {
     }
 
     async fn stop(&self) -> Result<()> {
-        let container_name = self.get_container_name();
+        let container_name = self
+            .config
+            .read()
+            .await
+            .as_ref()
+            .map(|config| self.get_live_container_name(config))
+            .unwrap_or_else(|| self.get_container_name());
         info!("Stopping MongoDB container {}", container_name);
 
         self.docker
@@ -1960,8 +2046,13 @@ impl ExternalService for MongodbService {
             .get("password")
             .ok_or_else(|| anyhow::anyhow!("Missing password parameter"))?;
 
-        // Always use container name and internal port for container-to-container communication
-        let effective_host = self.get_container_name();
+        // An imported service's real container name (stored raw in
+        // parameters, since the typed config isn't available here) wins
+        // over the derived one.
+        let effective_host = parameters
+            .get("container_name")
+            .cloned()
+            .unwrap_or_else(|| self.get_container_name());
         let effective_port = MONGODB_INTERNAL_PORT.to_string();
         let replica_set = parameters.get("replica_set").map(String::as_str);
 
@@ -2000,8 +2091,13 @@ impl ExternalService for MongodbService {
             .get("password")
             .ok_or_else(|| anyhow::anyhow!("Missing password parameter"))?;
 
-        // Always use container name and internal port for container-to-container communication
-        let effective_host = self.get_container_name();
+        // An imported service's real container name (stored raw in
+        // parameters, since the typed config isn't available here) wins
+        // over the derived one.
+        let effective_host = parameters
+            .get("container_name")
+            .cloned()
+            .unwrap_or_else(|| self.get_container_name());
         let effective_port = MONGODB_INTERNAL_PORT.to_string();
         let replica_set = parameters.get("replica_set").map(String::as_str);
 
@@ -2161,7 +2257,8 @@ impl ExternalService for MongodbService {
         use chrono::Utc;
         use sea_orm::*;
 
-        let container_name = self.get_container_name();
+        let mongodb_config = self.get_mongodb_config(service_config.clone())?;
+        let container_name = self.get_live_container_name(&mongodb_config);
 
         if !self.container_has_walg(&container_name).await {
             info!(
@@ -2309,7 +2406,13 @@ impl ExternalService for MongodbService {
     }
 
     async fn get_current_docker_image(&self) -> Result<(String, String)> {
-        let container_name = self.get_container_name();
+        let container_name = self
+            .config
+            .read()
+            .await
+            .as_ref()
+            .map(|config| self.get_live_container_name(config))
+            .unwrap_or_else(|| self.get_container_name());
         let container = self
             .docker
             .inspect_container(
@@ -2390,6 +2493,15 @@ impl ExternalService for MongodbService {
                 anyhow::anyhow!("Failed to inspect container '{}': {}", container_id, e)
             })?;
 
+        // The real Docker container name — every operation on an imported
+        // service must target this, not the derived `temps-mongodb-{name}`.
+        let imported_container_name = container
+            .name
+            .as_deref()
+            .unwrap_or(&container_id)
+            .trim_start_matches('/')
+            .to_string();
+
         // Extract image name and version
         let image = container.config.and_then(|c| c.image).ok_or_else(|| {
             anyhow::anyhow!("Could not determine image for container '{}'", container_id)
@@ -2430,23 +2542,61 @@ impl ExternalService for MongodbService {
             format!("mongodb://localhost:{}", port)
         };
 
-        // Verify connection to the imported service
-        match tokio::runtime::Runtime::new().ok().and_then(|rt| {
-            rt.block_on(async {
-                match mongodb::Client::with_uri_str(&connection_url).await {
-                    Ok(client) => client.list_databases().await.ok(),
-                    Err(_) => None,
-                }
-            })
-        }) {
-            Some(_) => {
-                info!("Successfully verified MongoDB connection for import");
+        // Verify connection to the imported service. Connects directly with
+        // `.await` on the current runtime — spinning up a nested
+        // `tokio::runtime::Runtime` and calling `block_on` here panics with
+        // "Cannot start a runtime from within a runtime", since this
+        // `async fn` is already driven by one.
+        use std::future::IntoFuture;
+        let client = mongodb::Client::with_uri_str(&connection_url)
+            .await
+            .map_err(|e| anyhow::anyhow!("Invalid MongoDB connection URL: {}", e))?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.list_databases().into_future(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("MongoDB connection timed out after 5 seconds"))?
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to connect to MongoDB at localhost:{} with provided credentials: {}",
+                port,
+                e
+            )
+        })?;
+        info!("Successfully verified MongoDB connection for import");
+
+        let network_ready = match ensure_network_exists(&self.docker).await {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(
+                    "Failed to ensure Temps Docker network before MongoDB import attach: {:?}",
+                    e
+                );
+                false
             }
-            None => {
-                return Err(anyhow::anyhow!(
-                    "Failed to connect to MongoDB at localhost:{} with provided credentials. Verify port, username, and password.",
-                    port
-                ));
+        };
+        if network_ready {
+            let network_name = temps_core::NETWORK_NAME.as_str();
+            let request = bollard::models::NetworkConnectRequest {
+                container: container_id.clone(),
+                ..Default::default()
+            };
+            match self.docker.connect_network(network_name, request).await {
+                Ok(()) => info!(
+                    "Attached imported MongoDB container '{}' to {}",
+                    imported_container_name, network_name
+                ),
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 403, ..
+                }) => debug!(
+                    "Imported MongoDB container '{}' is already attached to {}",
+                    imported_container_name, network_name
+                ),
+                Err(e) => warn!(
+                    "Failed to attach imported MongoDB container '{}' to {}: {}",
+                    imported_container_name, network_name, e
+                ),
             }
         }
 
@@ -2462,7 +2612,7 @@ impl ExternalService for MongodbService {
                 "password": password.unwrap_or_default(),
                 "database": database,
                 "docker_image": image,
-                "container_id": container_id,
+                "container_name": imported_container_name,
             }),
         };
 
@@ -2535,6 +2685,52 @@ mod tests {
         let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
         let service = MongodbService::new("test-service".to_string(), docker);
         assert_eq!(service.get_container_name(), "temps-mongodb-test-service");
+    }
+
+    #[test]
+    fn test_get_effective_address_docker_mode_uses_imported_container_name() {
+        let _lock = crate::externalsvc::DEPLOYMENT_MODE_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("DEPLOYMENT_MODE", "docker") };
+
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let service = MongodbService::new("imported-svc".to_string(), docker);
+
+        let config = ServiceConfig {
+            name: "imported-svc".to_string(),
+            service_type: ServiceType::Mongodb,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": "27018",
+                "database": "admin",
+                "username": "root",
+                "password": "testpass",
+                "container_name": "legacy-mongo",
+            }),
+        };
+
+        let (host, port) = service.get_effective_address(config).unwrap();
+        // The imported container name wins over the derived
+        // `temps-mongodb-{name}`.
+        assert_eq!(host, "legacy-mongo");
+        assert_eq!(port, "27017");
+
+        unsafe { std::env::remove_var("DEPLOYMENT_MODE") };
+    }
+
+    #[test]
+    fn test_container_name_is_not_a_user_input() {
+        // container_name is derived from the service name at creation time
+        // (`temps-mongodb-{name}`), never supplied by the client — same as
+        // MariaDB (see mariadb.rs's identical test). The create form is
+        // generated from this schema, so the field must not appear in it.
+        let schema = serde_json::to_value(schemars::schema_for!(MongodbInputConfig)).unwrap();
+        assert!(
+            !schema.to_string().contains("container_name"),
+            "container_name leaked into the MongoDB create schema"
+        );
     }
 
     #[test]
@@ -3058,6 +3254,7 @@ mod tests {
             docker_image: "gotempsh/mongodb-walg:8.0".to_string(),
             replica_set: None,
             keyfile_content: None,
+            container_name: None,
         };
 
         *service.config.write().await = Some(mongodb_config.clone());
