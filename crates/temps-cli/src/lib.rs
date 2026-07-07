@@ -90,12 +90,26 @@ pub enum Commands {
 
 /// Install the global tracing subscriber. Safe to call once per process.
 pub fn install_tracing(log_level: &str, log_format: &str) {
+    install_tracing_extra(log_level, log_format, "");
+}
+
+/// Like [`install_tracing`], with extra filter directives appended — for
+/// embedding binaries whose own crate targets aren't in the default list
+/// (e.g. `vibetemps_api={level}`). `extra` is comma-separated directives,
+/// empty for none.
+pub fn install_tracing_extra(log_level: &str, log_format: &str, extra: &str) {
     let filter = if std::env::var("RUST_LOG").is_ok() {
         tracing_subscriber::EnvFilter::try_from_default_env()
             .expect("Invalid RUST_LOG environment variable")
     } else {
+        let extra = if extra.is_empty() {
+            String::new()
+        } else {
+            format!("{extra},")
+        };
         tracing_subscriber::EnvFilter::new(format!(
-            "temps_cli={level},\
+            "{extra}\
+             temps_cli={level},\
              temps_deployments={level},\
              temps_deployer={level},\
              temps_core={level},\
