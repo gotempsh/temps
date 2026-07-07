@@ -337,6 +337,42 @@ impl TempsPlugin for LogAggregatorPlugin {
                         }
                     }
 
+                    // Local cluster members (monitor/primary/replica) carry
+                    // deployment-style `sh.temps.service.*` labels the scans
+                    // above don't target, and their names live in
+                    // `service_members`, not on the service row. Discover the
+                    // control-plane-local ones (node_id IS NULL) by name — the
+                    // collector resolves each to its owning service via
+                    // `service_members.container_name`. Remote members are
+                    // handled separately by the remote collector.
+                    if let Ok(ids) = scan_result.as_mut() {
+                        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
+                        let member_names: Vec<String> =
+                            temps_entities::service_members::Entity::find()
+                                .filter(temps_entities::service_members::Column::NodeId.is_null())
+                                .select_only()
+                                .column(temps_entities::service_members::Column::ContainerName)
+                                .into_tuple::<String>()
+                                .all(startup_db.as_ref())
+                                .await
+                                .unwrap_or_default();
+                        for name in member_names {
+                            let mut filters = HashMap::new();
+                            filters.insert("status".to_string(), vec!["running".to_string()]);
+                            filters.insert("name".to_string(), vec![name.clone()]);
+                            let options = ListContainersOptions {
+                                all: false,
+                                filters: Some(filters),
+                                ..Default::default()
+                            };
+                            if let Ok(containers) =
+                                startup_docker.list_containers(Some(options)).await
+                            {
+                                ids.extend(containers.into_iter().filter_map(|c| c.id));
+                            }
+                        }
+                    }
+
                     match scan_result {
                         Ok(ids) => {
                             let count = ids.len();

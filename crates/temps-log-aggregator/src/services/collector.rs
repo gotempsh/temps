@@ -328,18 +328,28 @@ impl CollectorService {
         }))
     }
 
-    /// Resolve an external-service container to its `external_services` row.
+    /// Resolve an external-service container to its owning `external_services`
+    /// row, returning a context keyed on `external_service_id` (with the
+    /// `project_id = 0` sentinel, since a service isn't owned by one project).
     ///
-    /// Two resolution paths, in order:
-    ///  1. **Created** services carry a `temps.service_name` label → look the
-    ///     service up by name.
-    ///  2. **Imported** services' pre-existing containers have no temps.*
-    ///     labels (Docker labels are immutable) → match the real container
-    ///     name against the plaintext `external_services.container_name`
+    /// Three resolution paths, in order:
+    ///  1. **Created standalone** services carry a `temps.service_name` label
+    ///     → look the service up by name.
+    ///  2. **Imported standalone** services' pre-existing containers have no
+    ///     temps.* labels (Docker labels are immutable) → match the real
+    ///     container name against the plaintext `external_services.container_name`
     ///     column stamped at import time.
+    ///  3. **Cluster members** (monitor/primary/replica) carry deployment-style
+    ///     `sh.temps.service.*` labels the standalone paths don't recognise, and
+    ///     their per-member names live in `service_members`, not on the service
+    ///     row. Match the real container name against `service_members.container_name`
+    ///     → its `service_id` ties every member to the one external service, so
+    ///     the whole cluster's logs aggregate under one `/storage/{id}/logs`.
+    ///     The member container name becomes `service` so members stay
+    ///     distinguishable within that scope.
     ///
-    /// Returns `None` (container skipped) when neither resolves, no DB handle
-    /// is attached, or the container has no name.
+    /// Returns `None` (container skipped) when none resolve, no DB handle is
+    /// attached, or the container has no name.
     async fn extract_external_service_context(
         &self,
         container_id: &str,
@@ -353,10 +363,8 @@ impl CollectorService {
         };
         let prefix = temps_core::DOCKER_LABEL_PREFIX; // "temps."
 
-        // Path 1: created service — resolve by the temps.service_name label.
-        // Path 2: imported service — resolve by the real container name.
-        let (svc, service_label) = if let Some(name) = labels.get(&format!("{prefix}service_name"))
-        {
+        // Path 1: created standalone service — resolve by the temps.service_name label.
+        if let Some(name) = labels.get(&format!("{prefix}service_name")) {
             let svc = temps_entities::external_services::Entity::find()
                 .filter(temps_entities::external_services::Column::Name.eq(name.clone()))
                 .one(db.as_ref())
@@ -365,42 +373,64 @@ impl CollectorService {
                     container_id: container_id.to_string(),
                     reason: format!("Failed to resolve external service '{name}': {e}"),
                 })?;
-            (svc, Some(name.clone()))
-        } else if let Some(cname) = container_name {
-            let svc = temps_entities::external_services::Entity::find()
-                .filter(temps_entities::external_services::Column::ContainerName.eq(cname))
-                .one(db.as_ref())
-                .await
-                .map_err(|e| LogAggregatorError::DockerStreamFailed {
-                    container_id: container_id.to_string(),
-                    reason: format!(
-                        "Failed to resolve imported service for container '{cname}': {e}"
-                    ),
-                })?;
-            (svc, None)
-        } else {
+            return Ok(svc.map(|svc| ContainerContext {
+                project_id: 0,
+                external_service_id: Some(svc.id),
+                env: "default".to_string(),
+                service: name.clone(),
+                container_id: container_id.to_string(),
+                deploy_id: None,
+            }));
+        }
+
+        // Paths 2 & 3 both key off the real container name.
+        let Some(cname) = container_name else {
             return Ok(None);
         };
 
-        let svc = match svc {
-            Some(s) => s,
-            None => return Ok(None),
-        };
+        // Path 2: imported standalone service — real container name matches the
+        // plaintext external_services.container_name stamped at import.
+        if let Some(svc) = temps_entities::external_services::Entity::find()
+            .filter(temps_entities::external_services::Column::ContainerName.eq(cname))
+            .one(db.as_ref())
+            .await
+            .map_err(|e| LogAggregatorError::DockerStreamFailed {
+                container_id: container_id.to_string(),
+                reason: format!("Failed to resolve imported service for container '{cname}': {e}"),
+            })?
+        {
+            return Ok(Some(ContainerContext {
+                project_id: 0,
+                external_service_id: Some(svc.id),
+                env: "default".to_string(),
+                service: svc.name,
+                container_id: container_id.to_string(),
+                deploy_id: None,
+            }));
+        }
 
-        // Service name for display/grouping: the label if present, else the
-        // service's own name from the DB row.
-        let service = service_label.unwrap_or_else(|| svc.name.clone());
+        // Path 3: cluster member — real container name matches a
+        // service_members row; its service_id is the owning external service.
+        if let Some(member) = temps_entities::service_members::Entity::find()
+            .filter(temps_entities::service_members::Column::ContainerName.eq(cname))
+            .one(db.as_ref())
+            .await
+            .map_err(|e| LogAggregatorError::DockerStreamFailed {
+                container_id: container_id.to_string(),
+                reason: format!("Failed to resolve cluster member for container '{cname}': {e}"),
+            })?
+        {
+            return Ok(Some(ContainerContext {
+                project_id: 0,
+                external_service_id: Some(member.service_id),
+                env: "default".to_string(),
+                service: cname.to_string(),
+                container_id: container_id.to_string(),
+                deploy_id: None,
+            }));
+        }
 
-        Ok(Some(ContainerContext {
-            // Sentinel: external-service chunks key on external_service_id, not
-            // project_id (a service isn't owned by a single project).
-            project_id: 0,
-            external_service_id: Some(svc.id),
-            env: "default".to_string(),
-            service,
-            container_id: container_id.to_string(),
-            deploy_id: None,
-        }))
+        Ok(None)
     }
 
     /// Returns true if the error string indicates the container no longer exists.
@@ -552,5 +582,102 @@ impl CollectorService {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::{FilesystemStorage, LogStorage};
+    use sea_orm::{DatabaseBackend, MockDatabase};
+
+    /// Build a CollectorService backed by a MockDatabase. `extract_external_service_context`
+    /// only touches `self.db`, so the Docker handle is never dialed — but `new`
+    /// requires one, so we lazily construct a client (no daemon connection).
+    fn collector_with_db(db: Arc<sea_orm::DatabaseConnection>) -> Option<CollectorService> {
+        let docker = Docker::connect_with_local_defaults().ok()?;
+        let tmp = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn LogStorage> =
+            Arc::new(FilesystemStorage::new(tmp.path().to_path_buf()).unwrap());
+        let chunk_writer = Arc::new(ChunkWriterService::new(storage));
+        let metadata = Arc::new(LogMetadataService::new(db.clone()));
+        Some(CollectorService::new(Arc::new(docker), chunk_writer, metadata, 16).with_db(db))
+    }
+
+    fn member(service_id: i32, container_name: &str) -> temps_entities::service_members::Model {
+        temps_entities::service_members::Model {
+            id: 1,
+            service_id,
+            node_id: None,
+            role: "primary".into(),
+            container_id: Some("abc123".into()),
+            container_name: container_name.into(),
+            hostname: None,
+            port: Some(5432),
+            compute_ip: None,
+            status: "running".into(),
+            ordinal: 1,
+            config: None,
+            provisioning_step: None,
+            provisioning_error: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    // A cluster member carries neither the standalone `temps.service_name` label
+    // (Path 1) nor an `external_services.container_name` match (Path 2); it must
+    // resolve via `service_members.container_name` → its owning service (Path 3),
+    // so every member's logs aggregate under the one external service.
+    #[tokio::test]
+    async fn test_cluster_member_resolves_via_service_members() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // Path 2: external_services by container_name → miss.
+            .append_query_results(vec![Vec::<temps_entities::external_services::Model>::new()])
+            // Path 3: service_members by container_name → the member.
+            .append_query_results(vec![vec![member(7, "postgres-mydb-1")]])
+            .into_connection();
+        let Some(collector) = collector_with_db(Arc::new(db)) else {
+            println!("Docker client unavailable, skipping");
+            return;
+        };
+
+        let labels = HashMap::new(); // no temps.service_name label
+        let ctx = collector
+            .extract_external_service_context("cid", Some("postgres-mydb-1"), &labels)
+            .await
+            .expect("resolution must not error")
+            .expect("cluster member should resolve to its owning external service");
+
+        assert_eq!(ctx.external_service_id, Some(7));
+        assert_eq!(
+            ctx.project_id, 0,
+            "external-service chunks use the 0 sentinel"
+        );
+        assert_eq!(
+            ctx.service, "postgres-mydb-1",
+            "member container name is kept as `service` for per-member distinction"
+        );
+    }
+
+    // A container that matches no standalone service and no cluster member is
+    // skipped (None), not misattributed.
+    #[tokio::test]
+    async fn test_unknown_container_resolves_to_none() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<temps_entities::external_services::Model>::new()])
+            .append_query_results(vec![Vec::<temps_entities::service_members::Model>::new()])
+            .into_connection();
+        let Some(collector) = collector_with_db(Arc::new(db)) else {
+            println!("Docker client unavailable, skipping");
+            return;
+        };
+
+        let labels = HashMap::new();
+        let ctx = collector
+            .extract_external_service_context("cid", Some("some-random-container"), &labels)
+            .await
+            .expect("resolution must not error");
+        assert!(ctx.is_none(), "unresolved container must be skipped");
     }
 }
