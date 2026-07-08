@@ -268,7 +268,7 @@ function FeedRow({ log }: { log: ProxyLogResponse }) {
 
   return (
     <Link
-      to={`/proxy-logs/${log.id}`}
+      to={`/proxy-logs/${log.id}?ts=${encodeURIComponent(log.timestamp)}`}
       className="flex items-center gap-3 px-3 py-2.5 text-sm transition-colors hover:bg-muted/50"
     >
       <AiAgentLogo provider={providerName} agent={log.bot_name} size={22} />

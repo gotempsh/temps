@@ -34,6 +34,12 @@ import {
 
 interface ProxyLogDetailProps {
   logId: number
+  /**
+   * Event time of the log row, forwarded from the list link. Bounds the
+   * backend's hypertable lookup; without it the lookup falls back to a
+   * wider (slower) scan.
+   */
+  timestamp?: string
 }
 
 function formatBytes(bytes: number | null | undefined): string {
@@ -56,7 +62,7 @@ function getDeviceIcon(deviceType: string | null | undefined) {
   }
 }
 
-export function ProxyLogDetail({ logId }: ProxyLogDetailProps) {
+export function ProxyLogDetail({ logId, timestamp }: ProxyLogDetailProps) {
   const {
     data: log,
     isLoading,
@@ -64,6 +70,7 @@ export function ProxyLogDetail({ logId }: ProxyLogDetailProps) {
   } = useQuery({
     ...getProxyLogByIdOptions({
       path: { id: logId },
+      query: timestamp ? { timestamp } : undefined,
     }),
   })
 

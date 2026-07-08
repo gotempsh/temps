@@ -1607,7 +1607,7 @@ function ProxyLogInlineDetail({ log }: { log: ProxyLogResponse }) {
       {/* Link to full detail page */}
       <div className="flex justify-end">
         <Link
-          to={`/proxy-logs/${log.id}`}
+          to={`/proxy-logs/${log.id}?ts=${encodeURIComponent(log.timestamp)}`}
           className="inline-flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
           onClick={(e) => e.stopPropagation()}
         >

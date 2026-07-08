@@ -41274,7 +41274,16 @@ export type GetProxyLogByIdData = {
          */
         id: number;
     };
-    query?: never;
+    query?: {
+        /**
+         * Event time of the log row (ISO 8601). When provided, the lookup is
+         * bounded to the hypertable chunks around this instant instead of
+         * scanning (and decompressing) the whole retention window. The list
+         * endpoint already returns this value per row — always pass it when
+         * navigating from a list.
+         */
+        timestamp?: string | null;
+    };
     url: '/proxy-logs/{id}';
 };
 

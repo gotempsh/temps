@@ -524,7 +524,11 @@ export function SessionDetail({
                               className="cursor-pointer hover:bg-muted/50"
                               onClick={() =>
                                 navigate(
-                                  `/projects/${project.slug}/logs/${log.id}`
+                                  `/projects/${project.slug}/logs/${log.id}${
+                                    log.timestamp
+                                      ? `?ts=${encodeURIComponent(log.timestamp)}`
+                                      : ''
+                                  }`
                                 )
                               }
                             >
