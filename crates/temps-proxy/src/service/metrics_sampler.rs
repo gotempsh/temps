@@ -162,13 +162,13 @@ fn build_points(samples: &[crate::metrics::ProxySample]) -> Vec<MetricPoint> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metrics::{METRIC_REQUESTS, METRIC_REQUESTS_5XX};
+    use crate::metrics::{RequestDestination, METRIC_REQUESTS, METRIC_REQUESTS_5XX};
 
     #[test]
     fn test_build_points_maps_samples_to_node_points() {
         let metrics = ProxyMetrics::default();
-        metrics.record(200, 12);
-        metrics.record(502, 340);
+        metrics.record(200, 12, RequestDestination::Project);
+        metrics.record(502, 340, RequestDestination::Console);
         let delta = metrics.snapshot().delta_since(&MetricsSnapshot::default());
 
         let points = build_points(&delta.samples());

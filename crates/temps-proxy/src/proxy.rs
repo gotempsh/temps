@@ -880,12 +880,6 @@ impl LoadBalancer {
         self.log_request(session, upstream_response, ctx).await?;
         self.add_response_timing(upstream_response, ctx)?;
 
-        // Hot-path metrics: a few relaxed atomic adds, no I/O.
-        self.proxy_metrics.record(
-            upstream_response.status.as_u16(),
-            ctx.start_time.elapsed().as_millis() as u64,
-        );
-
         Ok(())
     }
 
@@ -1490,13 +1484,6 @@ impl LoadBalancer {
         error_message: Option<String>,
         response_size: Option<i64>,
     ) {
-        // Count every static response in the hot-path metrics, including the
-        // assets excluded from per-request logging below.
-        self.proxy_metrics.record(
-            status_code.max(0) as u16,
-            ctx.start_time.elapsed().as_millis() as u64,
-        );
-
         // Only log HTML pages (skip .js, .css, .svg, etc.)
         if !Self::should_log_static_request(&ctx.path) {
             return;
@@ -4249,14 +4236,45 @@ impl ProxyHttp for LoadBalancer {
             self.proxy_log_handle.send_or_drop(proxy_log_request);
         }
 
-        // Failed requests never reach finalize_response, so count them here.
-        self.proxy_metrics
-            .record(error_code, ctx.start_time.elapsed().as_millis() as u64);
-
         FailToProxy {
             error_code,
             can_reuse_downstream,
         }
+    }
+
+    /// End-of-request hook — Pingora calls this exactly once for EVERY
+    /// request, whether it was proxied, served directly from `request_filter`
+    /// (redirects, password walls, ACME challenges, static files), or failed.
+    /// This is therefore the single record site for hot-path metrics, which
+    /// guarantees the destination counters sum to `proxy.requests`.
+    async fn logging(&self, session: &mut PingoraSession, _e: Option<&Error>, ctx: &mut Self::CTX)
+    where
+        Self::CTX: Send + Sync,
+    {
+        // No response written (client abort / connect failure with no reply)
+        // has no status; 0 falls into the 5xx class, which is the honest read.
+        let status_code = session
+            .response_written()
+            .map(|resp| resp.status.as_u16())
+            .unwrap_or(0);
+
+        let destination = if ctx.project.is_some() {
+            crate::metrics::RequestDestination::Project
+        } else if ctx.routing_status == "no_project" {
+            // Route lookup found no project — served by the console fallback.
+            crate::metrics::RequestDestination::Console
+        } else {
+            // Handled by the proxy itself: redirects, ACME, password walls,
+            // admin-gate denials, provisioning errors, ...
+            crate::metrics::RequestDestination::Other
+        };
+
+        // Hot path: 4 relaxed atomic adds, no locks, no I/O.
+        self.proxy_metrics.record(
+            status_code,
+            ctx.start_time.elapsed().as_millis() as u64,
+            destination,
+        );
     }
 }
 

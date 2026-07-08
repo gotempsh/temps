@@ -162,6 +162,32 @@ const NODE_PANELS: NodePanelDef[] = [
     valueFormatter: formatCount,
   },
   {
+    title: 'Requests by destination',
+    description:
+      'Per-interval request count, split by destination: project routes, console fallback, or handled by the proxy itself',
+    series: [
+      {
+        metric: 'proxy.requests_project',
+        dataKey: 'proxy.requests_project',
+        label: 'Project',
+        color: '#2563eb',
+      },
+      {
+        metric: 'proxy.requests_console',
+        dataKey: 'proxy.requests_console',
+        label: 'Console',
+        color: '#7c3aed',
+      },
+      {
+        metric: 'proxy.requests_other',
+        dataKey: 'proxy.requests_other',
+        label: 'Other',
+        color: '#6b7280',
+      },
+    ],
+    valueFormatter: formatCount,
+  },
+  {
     title: 'Error rate',
     description: 'Percentage of requests answered with a 5xx status',
     series: [
@@ -574,9 +600,11 @@ type StatCardProps = {
   title: string
   value: string | null
   isPending: boolean
+  /** Optional muted one-liner under the value (e.g. a traffic split). */
+  sub?: string | null
 }
 
-function StatCard({ title, value, isPending }: StatCardProps) {
+function StatCard({ title, value, isPending, sub }: StatCardProps) {
   return (
     <Card>
       <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
@@ -588,9 +616,14 @@ function StatCard({ title, value, isPending }: StatCardProps) {
         {isPending ? (
           <Skeleton className="h-8 w-24" />
         ) : (
-          <div className="text-2xl font-semibold tracking-tight tabular-nums">
-            {value ?? '—'}
-          </div>
+          <>
+            <div className="text-2xl font-semibold tracking-tight tabular-nums">
+              {value ?? '—'}
+            </div>
+            {sub && (
+              <p className="mt-1 text-[11px] text-muted-foreground">{sub}</p>
+            )}
+          </>
         )}
       </CardContent>
     </Card>
@@ -600,13 +633,19 @@ function StatCard({ title, value, isPending }: StatCardProps) {
 /** Unfiltered stats — computed from the process-wide node metric series. */
 function NodeSummaryStats({ range }: { range: RangeValue }) {
   // Same query keys the chart panels use — React Query dedupes the fetches.
-  const [requests, errors5xx, p95] = useQueries({
-    queries: [
-      proxySeriesQuery('proxy.requests', range),
-      proxySeriesQuery('proxy.requests_5xx', range),
-      proxySeriesQuery('proxy.request_duration_p95_ms', range),
-    ],
-  })
+  const [requests, errors5xx, p95, destProject, destConsole, destOther] =
+    useQueries({
+      queries: [
+        proxySeriesQuery('proxy.requests', range),
+        proxySeriesQuery('proxy.requests_5xx', range),
+        proxySeriesQuery('proxy.request_duration_p95_ms', range),
+        // Destination split — same options the "Requests by destination"
+        // panel uses, so React Query dedupes the fetches.
+        proxySeriesQuery('proxy.requests_project', range),
+        proxySeriesQuery('proxy.requests_console', range),
+        proxySeriesQuery('proxy.requests_other', range),
+      ],
+    })
 
   const totalRequests = (requests.data ?? []).reduce(
     (acc, p) => acc + (p.value ?? 0),
@@ -621,6 +660,22 @@ function NodeSummaryStats({ range }: { range: RangeValue }) {
     .find((p) => p.value != null)?.value
 
   const hasRequests = !requests.isPending && !requests.isError
+
+  // Muted destination split under Total requests — only when we have traffic
+  // and all three destination series loaded (they always sum to
+  // proxy.requests on the backend).
+  const sumSeries = (q: typeof destProject | undefined) =>
+    (q?.data ?? []).reduce((acc, p) => acc + (p.value ?? 0), 0)
+  const destsReady = [destProject, destConsole, destOther].every(
+    (q) => !q.isPending && !q.isError
+  )
+  const destSplit =
+    hasRequests && destsReady && totalRequests > 0
+      ? (() => {
+          const pct = (n: number) => Math.round((n / totalRequests) * 100)
+          return `${pct(sumSeries(destProject))}% project · ${pct(sumSeries(destConsole))}% console · ${pct(sumSeries(destOther))}% other`
+        })()
+      : null
 
   return (
     <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
@@ -637,6 +692,7 @@ function NodeSummaryStats({ range }: { range: RangeValue }) {
         title="Total requests"
         isPending={requests.isPending}
         value={hasRequests ? formatCount(totalRequests) : null}
+        sub={destSplit}
       />
       <StatCard
         title="Error rate"
