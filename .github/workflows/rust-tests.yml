@@ -274,6 +274,41 @@ jobs:
               package(temps-otel)) and kind(=lib)
 
     steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          sudo apt-get autoremove -y && sudo apt-get clean
+
+      # TestDatabase::new() (crates/temps-database/src/test_utils.rs) falls
+      # back to lazily booting its own TimescaleDB container via a
+      # process-local `OnceCell` when TEMPS_TEST_DATABASE_URL isn't set --
+      # reused across tests only within the SAME process. Nextest runs every
+      # test in its own fresh process by design (its core isolation
+      # feature), so that OnceCell resets before every single test: instead
+      # of one container booted once per crate (cargo test's per-binary
+      # model), nextest was trying to cold-boot a brand new container for
+      # EVERY test, which starved connect_with_retry's budget (tuned for "an
+      # already-warm container", not "just called .start() this instant")
+      # and caused Docker port-allocation races from the extra churn.
+      # Pointing at one externally-started, already-running TimescaleDB via
+      # TEMPS_TEST_DATABASE_URL (matching integration-tests/mariadb-pitr-e2e
+      # below) sidesteps that: TestDatabase connects and isolates via a
+      # unique schema per test instead of booting a container at all, which
+      # is exactly what those other jobs already do safely across many
+      # separate processes hitting one shared instance (see
+      # run_migrations_with_retry's deadlock-retry logic in test_utils.rs).
+      - name: Start TimescaleDB (background workers disabled)
+        run: |
+          docker run -d --name timescaledb \
+            -e POSTGRES_DB=test_db \
+            -e POSTGRES_USER=test_user \
+            -e POSTGRES_PASSWORD=test_password \
+            -e POSTGRES_HOST_AUTH_METHOD=trust \
+            -p 5432:5432 \
+            timescale/timescaledb-ha:pg18 \
+            postgres -c timescaledb.max_background_workers=0
+
       - name: Checkout code
         uses: actions/checkout@v4
 
@@ -288,9 +323,15 @@ jobs:
         with:
           name: test-binaries-default
 
+      - name: Verify TimescaleDB is ready
+        run: |
+          timeout 60 bash -c 'until docker exec timescaledb pg_isready -U test_user -d test_db; do sleep 1; done'
+          echo "TimescaleDB is ready"
+
       - name: Run unit tests
         env:
           RUST_BACKTRACE: 1
+          TEMPS_TEST_DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db
         # Many crates' tests spin up a real Postgres/TimescaleDB-backed
         # TestDatabase, and their DDL/DML against the one shared TimescaleDB
         # instance can genuinely deadlock (Postgres error 40P01) -- confirmed
