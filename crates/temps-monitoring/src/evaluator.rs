@@ -1096,10 +1096,14 @@ fn rustfs_default_seeds() -> Vec<RuleSeed> {
 /// metrics sampler (`proxy.*`, `SourceKind::Node`, control-plane node).
 /// Thresholds are rate/latency based — never absolute request counts — so
 /// they hold at any traffic volume.
+///
+/// One rule per metric name: the `uidx_monitoring_alert_rules_node_metric`
+/// unique index (mirroring the service/deployment indexes) makes a second
+/// seed on the same metric a silent ON CONFLICT no-op.
 fn proxy_default_seeds() -> Vec<RuleSeed> {
     vec![
         RuleSeed {
-            name: "High proxy error rate (warning)",
+            name: "High proxy error rate",
             metric_name: "proxy.error_rate_percent",
             threshold: 20.0,
             comparator: ">",
@@ -1107,15 +1111,7 @@ fn proxy_default_seeds() -> Vec<RuleSeed> {
             for_duration_secs: 300,
         },
         RuleSeed {
-            name: "High proxy error rate (critical)",
-            metric_name: "proxy.error_rate_percent",
-            threshold: 50.0,
-            comparator: ">",
-            severity: "critical",
-            for_duration_secs: 120,
-        },
-        RuleSeed {
-            name: "Slow proxy responses p99 (warning)",
+            name: "Slow proxy responses (p99)",
             metric_name: "proxy.request_duration_p99_ms",
             threshold: 5000.0,
             comparator: ">",
@@ -1302,15 +1298,23 @@ mod tests {
     }
 
     #[test]
-    fn proxy_default_seeds_are_rate_based() {
+    fn proxy_default_seeds_are_rate_based_and_unique_per_metric() {
         let seeds = proxy_default_seeds();
-        assert_eq!(seeds.len(), 3);
+        assert_eq!(seeds.len(), 2);
+        let mut names = std::collections::HashSet::new();
         for s in &seeds {
             assert!(s.metric_name.starts_with("proxy."));
             // Rules must be rate/latency based, never absolute counts.
             assert!(
                 s.metric_name.contains("percent") || s.metric_name.contains("_ms"),
                 "seed {} is not rate/latency based",
+                s.metric_name
+            );
+            // One rule per metric: (node_id, metric_name) is a unique index,
+            // a duplicate metric would be a silent ON CONFLICT no-op.
+            assert!(
+                names.insert(s.metric_name),
+                "duplicate seed metric {}",
                 s.metric_name
             );
         }
