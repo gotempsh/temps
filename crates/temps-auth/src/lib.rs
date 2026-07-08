@@ -14,6 +14,7 @@ mod decorators;
 mod deployment_token_service;
 mod email_templates;
 pub mod handlers;
+mod last_used_throttle;
 mod macros;
 mod middleware;
 mod oidc_errors;

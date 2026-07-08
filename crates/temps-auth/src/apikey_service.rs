@@ -166,11 +166,20 @@ impl ApiKeyServiceError {
 
 pub struct ApiKeyService {
     db: Arc<DbConnection>,
+    /// Throttles `last_used_at` writes so repeated validations of the same
+    /// key within the window skip the DB write entirely. See
+    /// [`crate::last_used_throttle`].
+    last_used_throttle: crate::last_used_throttle::LastUsedThrottle,
 }
 
 impl ApiKeyService {
     pub fn new(db: Arc<DbConnection>) -> Self {
-        Self { db }
+        Self {
+            db,
+            last_used_throttle: crate::last_used_throttle::LastUsedThrottle::new(
+                crate::last_used_throttle::LAST_USED_UPDATE_INTERVAL,
+            ),
+        }
     }
 
     pub async fn create_api_key(
@@ -439,10 +448,13 @@ impl ApiKeyService {
             (Some(role), None)
         };
 
-        // Update last_used_at
-        let mut api_key_active: ApiKeyActiveModel = api_key_model.clone().into();
-        api_key_active.last_used_at = Set(Some(Utc::now()));
-        let _ = api_key_active.update(self.db.as_ref()).await; // Don't fail if this fails
+        // Update last_used_at, throttled so repeated validations of the
+        // same key within LAST_USED_UPDATE_INTERVAL skip the DB write.
+        if self.last_used_throttle.should_update(api_key_model.id) {
+            let mut api_key_active: ApiKeyActiveModel = api_key_model.clone().into();
+            api_key_active.last_used_at = Set(Some(Utc::now()));
+            let _ = api_key_active.update(self.db.as_ref()).await; // Don't fail if this fails
+        }
 
         Ok((
             user,
@@ -1290,6 +1302,57 @@ mod tests {
             .unwrap();
 
         assert!(api_key.last_used_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_validate_api_key_repeat_call_skips_last_used_update() {
+        let (db, api_key_service, user) = setup_test_env().await;
+
+        let request = CreateApiKeyRequest {
+            name: "Throttled Usage Key".to_string(),
+            role_type: "admin".to_string(),
+            permissions: None,
+            expires_at: None,
+        };
+
+        let create_response = api_key_service
+            .create_api_key(user.id, request)
+            .await
+            .unwrap();
+
+        api_key_service
+            .validate_api_key(&create_response.api_key)
+            .await
+            .unwrap();
+
+        let after_first_call = api_keys::Entity::find_by_id(create_response.id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap()
+            .last_used_at
+            .expect("first validation should write last_used_at");
+
+        // Immediately validate again — within LAST_USED_UPDATE_INTERVAL, the
+        // throttle should skip the write entirely, so last_used_at must be
+        // byte-identical to what the first call wrote.
+        api_key_service
+            .validate_api_key(&create_response.api_key)
+            .await
+            .unwrap();
+
+        let after_second_call = api_keys::Entity::find_by_id(create_response.id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap()
+            .last_used_at
+            .expect("last_used_at should still be set");
+
+        assert_eq!(
+            after_first_call, after_second_call,
+            "second validate_api_key call within the throttle window must not rewrite last_used_at"
+        );
     }
 
     // Activation/Deactivation Tests
