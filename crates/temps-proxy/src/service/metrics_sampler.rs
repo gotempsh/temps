@@ -75,21 +75,26 @@ impl ProxyMetricsSampler {
                 }
             };
             tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+            self.sample_once(&mut last_snapshot).await;
+        }
+    }
 
-            let snapshot = self.metrics.snapshot();
-            let delta = snapshot.delta_since(&last_snapshot);
-            last_snapshot = snapshot;
+    /// One snapshot → delta → write cycle. Extracted from [`Self::run`] so
+    /// integration tests can drive discrete cycles against a real store.
+    pub async fn sample_once(&self, last_snapshot: &mut MetricsSnapshot) {
+        let snapshot = self.metrics.snapshot();
+        let delta = snapshot.delta_since(last_snapshot);
+        *last_snapshot = snapshot;
 
-            let points = build_points(&delta.samples());
-            if points.is_empty() {
-                continue;
-            }
+        let points = build_points(&delta.samples());
+        if points.is_empty() {
+            return;
+        }
 
-            if let Err(e) = self.store.write_batch(points).await {
-                // Non-fatal: counters keep accumulating; the next successful
-                // cycle writes a wider delta and the series re-converges.
-                warn!("ProxyMetricsSampler: write_batch failed (non-fatal): {e}");
-            }
+        if let Err(e) = self.store.write_batch(points).await {
+            // Non-fatal: counters keep accumulating; the next successful
+            // cycle writes a wider delta and the series re-converges.
+            warn!("ProxyMetricsSampler: write_batch failed (non-fatal): {e}");
         }
     }
 }
@@ -199,5 +204,108 @@ mod tests {
     #[test]
     fn test_build_points_empty_samples() {
         assert!(build_points(&[]).is_empty());
+    }
+
+    /// Full pipeline integration: record on the hot-path counters → sampler
+    /// cycle → TimescaleDB store → read back via the same `query_latest` the
+    /// alert evaluator and (via `query_range`) the `/nodes/{id}/metrics`
+    /// endpoint use. Skips gracefully when no test Postgres is available,
+    /// per the repo's Docker-test convention.
+    #[tokio::test]
+    async fn test_sampler_pipeline_end_to_end_against_real_store() {
+        use temps_database::test_utils::TestDatabase;
+        use temps_metrics::{LatestQuery, TimescaleMetricsStore};
+
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Test database not available, skipping: {e}");
+                return;
+            }
+        };
+        let db = test_db.connection_arc().clone();
+
+        let metrics = Arc::new(ProxyMetrics::default());
+        let store: Arc<dyn MetricsStore> = Arc::new(TimescaleMetricsStore::new(db.clone()));
+        let config = Arc::new(
+            temps_config::ServerConfig::new(
+                "127.0.0.1:3000".to_string(),
+                "postgresql://unused@localhost/unused".to_string(),
+                None,
+                None,
+            )
+            .expect("test ServerConfig"),
+        );
+        let config_service = Arc::new(temps_config::ConfigService::new(config, db));
+        let sampler =
+            ProxyMetricsSampler::new(Arc::clone(&metrics), Arc::clone(&store), config_service);
+
+        // ── Cycle 1: mixed traffic ────────────────────────────────────────
+        metrics.record(200, 100, Some(80), RequestDestination::Project);
+        metrics.record(200, 40, Some(30), RequestDestination::Project);
+        metrics.record(404, 5, None, RequestDestination::Console);
+        metrics.record(502, 60, Some(55), RequestDestination::Project);
+
+        let mut last_snapshot = MetricsSnapshot::default();
+        sampler.sample_once(&mut last_snapshot).await;
+
+        let latest = store
+            .query_latest(LatestQuery {
+                source_kind: SourceKind::Node,
+                source_id: CONTROL_PLANE_NODE_ID,
+                names: vec![],
+            })
+            .await
+            .expect("query_latest after first cycle");
+
+        assert_eq!(latest["proxy.requests"], 4.0);
+        assert_eq!(latest["proxy.requests_2xx"], 2.0);
+        assert_eq!(latest["proxy.requests_4xx"], 1.0);
+        assert_eq!(latest["proxy.requests_5xx"], 1.0);
+        // Destination partition read back intact.
+        assert_eq!(latest["proxy.requests_project"], 3.0);
+        assert_eq!(latest["proxy.requests_console"], 1.0);
+        assert_eq!(latest["proxy.requests_other"], 0.0);
+        // Error rate = 1 of 4.
+        assert_eq!(latest["proxy.error_rate_percent"], 25.0);
+        // Latency split: backend avg (80+30+55)/3, self avg (20+10+5)/3.
+        assert!((latest["proxy.upstream_duration_avg_ms"] - 55.0).abs() < 1e-9);
+        assert!((latest["proxy.self_duration_avg_ms"] - (35.0 / 3.0)).abs() < 1e-9);
+
+        // ── Cycle 2: only new traffic must be reported ────────────────────
+        metrics.record(200, 10, Some(8), RequestDestination::Project);
+        sampler.sample_once(&mut last_snapshot).await;
+
+        let latest = store
+            .query_latest(LatestQuery {
+                source_kind: SourceKind::Node,
+                source_id: CONTROL_PLANE_NODE_ID,
+                names: vec![
+                    "proxy.requests".to_string(),
+                    "proxy.requests_5xx".to_string(),
+                ],
+            })
+            .await
+            .expect("query_latest after second cycle");
+        assert_eq!(
+            latest["proxy.requests"], 1.0,
+            "second cycle must be delta-only"
+        );
+        assert_eq!(latest["proxy.requests_5xx"], 0.0);
+
+        // ── Cycle 3: idle interval still writes zero counters ─────────────
+        sampler.sample_once(&mut last_snapshot).await;
+        let latest = store
+            .query_latest(LatestQuery {
+                source_kind: SourceKind::Node,
+                source_id: CONTROL_PLANE_NODE_ID,
+                names: vec!["proxy.requests".to_string()],
+            })
+            .await
+            .expect("query_latest after idle cycle");
+        assert_eq!(
+            latest["proxy.requests"], 0.0,
+            "idle interval draws a zero, not a gap"
+        );
     }
 }
