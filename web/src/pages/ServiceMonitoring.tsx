@@ -11,6 +11,7 @@
  */
 
 import { Button } from '@/components/ui/button'
+import { TOOLTIP_CONTENT_STYLE, TOOLTIP_LABEL_STYLE } from '@/lib/chart-tooltip'
 import { Badge } from '@/components/ui/badge'
 import {
   Dialog,
@@ -363,7 +364,7 @@ const PG_PER_DATABASE_GROUPS: MetricGroup[] = [
 
 // Flat list of every per-database metric name (for the by-database query).
 const PG_PER_DATABASE_METRICS: string[] = PG_PER_DATABASE_GROUPS.flatMap(
-  (g) => g.metrics,
+  (g) => g.metrics
 )
 
 // All known metrics for alert rule creation. For Postgres this includes both
@@ -376,7 +377,7 @@ const ALL_METRICS: Record<EngineKind, string[]> = Object.fromEntries(
       ...groups.flatMap((g) => g.metrics),
       ...(engine === 'postgres' ? PG_PER_DATABASE_METRICS : []),
     ],
-  ]),
+  ])
 ) as Record<EngineKind, string[]>
 
 // Headline metrics shown in the hero row
@@ -399,19 +400,34 @@ const HERO_METRICS: Record<EngineKind, string[]> = {
     'mongo.op_query_total',
     'mongo.replication_buffer_ratio',
   ],
-  s3: ['s3.bucket_count', 's3.total_size_bytes', 's3.capacity_usable_total_bytes', 's3.object_count'],
-  rustfs: ['rustfs_cluster_buckets_total', 'rustfs_cluster_capacity_used_bytes', 'rustfs_cluster_capacity_free_bytes', 'rustfs_s3_operations_total'],
+  s3: [
+    's3.bucket_count',
+    's3.total_size_bytes',
+    's3.capacity_usable_total_bytes',
+    's3.object_count',
+  ],
+  rustfs: [
+    'rustfs_cluster_buckets_total',
+    'rustfs_cluster_capacity_used_bytes',
+    'rustfs_cluster_capacity_free_bytes',
+    'rustfs_s3_operations_total',
+  ],
 }
 
 // ---------------------------------------------------------------------------
 // Formatting helpers
 // ---------------------------------------------------------------------------
 
-function normalizeEngine(engine: string, dockerImage?: string | null): EngineKind {
+function normalizeEngine(
+  engine: string,
+  dockerImage?: string | null
+): EngineKind {
   // An s3 service running the rustfs image should use rustfs metric groups
-  if (engine === 's3' && dockerImage?.toLowerCase().includes('rustfs')) return 'rustfs'
+  if (engine === 's3' && dockerImage?.toLowerCase().includes('rustfs'))
+    return 'rustfs'
   if (engine === 'rustfs') return 'rustfs'
-  if (['postgres', 'redis', 'mongodb', 's3'].includes(engine)) return engine as EngineKind
+  if (['postgres', 'redis', 'mongodb', 's3'].includes(engine))
+    return engine as EngineKind
   return 'postgres'
 }
 
@@ -431,13 +447,21 @@ function formatRelativeTime(iso: string): string {
 }
 
 function formatMetricValue(name: string, value: number): string {
-  if (name.endsWith('_bytes') || name.endsWith('_bytes_total')) return formatBytes(value)
+  if (name.endsWith('_bytes') || name.endsWith('_bytes_total'))
+    return formatBytes(value)
   if (name.endsWith('_ratio')) return `${(value * 100).toFixed(1)}%`
-  if (name.endsWith('_percent') || name.endsWith('_usage')) return `${value.toFixed(1)}%`
-  if (name.endsWith('_seconds') || name.endsWith('_sec')) return `${value.toFixed(2)}s`
+  if (name.endsWith('_percent') || name.endsWith('_usage'))
+    return `${value.toFixed(1)}%`
+  if (name.endsWith('_seconds') || name.endsWith('_sec'))
+    return `${value.toFixed(2)}s`
   if (name.endsWith('_ms')) return `${value.toFixed(0)}ms`
   // Counters and totals are event counts — always display as integers
-  if (name.endsWith('_total') || name.endsWith('.total') || name.endsWith('_count') || name.endsWith('.count'))
+  if (
+    name.endsWith('_total') ||
+    name.endsWith('.total') ||
+    name.endsWith('_count') ||
+    name.endsWith('.count')
+  )
     return Math.round(value).toString()
   if (Number.isInteger(value)) return value.toString()
   return value.toFixed(2)
@@ -451,23 +475,23 @@ const METRIC_LABELS: Record<string, string> = {
   'pg.connections_idle': 'Idle',
   'pg.connections_idle_in_transaction': 'Idle in Transaction',
   'pg.connections_other': 'Other',
-  'rustfs_cluster_buckets_total': 'Buckets',
-  'rustfs_cluster_objects_total': 'Objects',
-  'rustfs_cluster_capacity_usable_total_bytes': 'Usable Capacity',
-  'rustfs_cluster_capacity_used_bytes': 'Used Capacity',
-  'rustfs_cluster_capacity_free_bytes': 'Free Capacity',
-  'rustfs_cluster_capacity_raw_total_bytes': 'Raw Capacity',
-  'rustfs_node_disk_total_bytes': 'Disk Total',
-  'rustfs_node_disk_used_bytes': 'Disk Used',
-  'rustfs_node_disk_free_bytes': 'Disk Free',
-  'rustfs_process_cpu_percent': 'CPU %',
-  'rustfs_process_memory_bytes': 'Memory',
-  'rustfs_process_uptime_seconds': 'Uptime',
-  'rustfs_s3_operations_total': 'S3 Operations',
+  rustfs_cluster_buckets_total: 'Buckets',
+  rustfs_cluster_objects_total: 'Objects',
+  rustfs_cluster_capacity_usable_total_bytes: 'Usable Capacity',
+  rustfs_cluster_capacity_used_bytes: 'Used Capacity',
+  rustfs_cluster_capacity_free_bytes: 'Free Capacity',
+  rustfs_cluster_capacity_raw_total_bytes: 'Raw Capacity',
+  rustfs_node_disk_total_bytes: 'Disk Total',
+  rustfs_node_disk_used_bytes: 'Disk Used',
+  rustfs_node_disk_free_bytes: 'Disk Free',
+  rustfs_process_cpu_percent: 'CPU %',
+  rustfs_process_memory_bytes: 'Memory',
+  rustfs_process_uptime_seconds: 'Uptime',
+  rustfs_s3_operations_total: 'S3 Operations',
   'rustfs.api.requests.total': 'API Requests',
   'rustfs.request.body.bytes_total': 'Request Bytes',
-  'rustfs_system_process_cpu_usage': 'CPU Usage',
-  'rustfs_system_process_resident_memory_bytes': 'Resident Memory',
+  rustfs_system_process_cpu_usage: 'CPU Usage',
+  rustfs_system_process_resident_memory_bytes: 'Resident Memory',
 }
 
 function labelForMetric(name: string): string {
@@ -526,7 +550,10 @@ function loadStoredRefreshInterval(): number | null {
 
 function storeRefreshInterval(value: number | null): void {
   try {
-    localStorage.setItem(REFRESH_STORAGE_KEY, value === null ? 'off' : String(value))
+    localStorage.setItem(
+      REFRESH_STORAGE_KEY,
+      value === null ? 'off' : String(value)
+    )
   } catch {
     // ignore — non-critical
   }
@@ -545,7 +572,14 @@ type MetricTileProps = {
   size?: 'hero' | 'group'
 }
 
-function MetricTile({ name, value, selected, onClick, alert, size = 'group' }: MetricTileProps) {
+function MetricTile({
+  name,
+  value,
+  selected,
+  onClick,
+  alert,
+  size = 'group',
+}: MetricTileProps) {
   const isHero = size === 'hero'
   return (
     <button
@@ -608,7 +642,10 @@ function MetricChart({ serviceId, metricName, range }: MetricChartProps) {
   })
 
   const chartData = (data ?? []).map((p) => ({
-    time: new Date(p.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    time: new Date(p.time).toLocaleTimeString([], {
+      hour: '2-digit',
+      minute: '2-digit',
+    }),
     value: p.value,
   }))
 
@@ -634,8 +671,15 @@ function MetricChart({ serviceId, metricName, range }: MetricChartProps) {
       {/* Right margin leaves room so the last data point isn't flush against
           the panel edge — otherwise its hover tooltip renders past the edge and
           gets clipped by the scroll container. */}
-      <LineChart data={chartData} margin={{ top: 4, right: 24, left: 0, bottom: 0 }}>
-        <CartesianGrid strokeDasharray="3 3" stroke="rgba(128,128,128,0.15)" vertical={false} />
+      <LineChart
+        data={chartData}
+        margin={{ top: 4, right: 24, left: 0, bottom: 0 }}
+      >
+        <CartesianGrid
+          strokeDasharray="3 3"
+          stroke="rgba(128,128,128,0.15)"
+          vertical={false}
+        />
         <XAxis
           dataKey="time"
           tick={{ fontSize: 10, fill: 'rgba(156,163,175,0.9)' }}
@@ -650,7 +694,8 @@ function MetricChart({ serviceId, metricName, range }: MetricChartProps) {
           width={
             metricName.endsWith('_ratio') || metricName.endsWith('_percent')
               ? 52
-              : metricName.endsWith('_bytes') || metricName.endsWith('_bytes_total')
+              : metricName.endsWith('_bytes') ||
+                  metricName.endsWith('_bytes_total')
                 ? 70
                 : 44
           }
@@ -659,19 +704,14 @@ function MetricChart({ serviceId, metricName, range }: MetricChartProps) {
         <Tooltip
           wrapperStyle={{ zIndex: 50 }}
           allowEscapeViewBox={{ x: true, y: true }}
-          contentStyle={{
-            fontSize: 12,
-            backgroundColor: 'hsl(var(--popover))',
-            border: '1px solid hsl(var(--border))',
-            borderRadius: '6px',
-            color: 'hsl(var(--popover-foreground))',
-            boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.3)',
-            padding: '6px 10px',
-          }}
-          labelStyle={{ color: 'hsl(var(--muted-foreground))', fontSize: 11, marginBottom: 2 }}
+          contentStyle={TOOLTIP_CONTENT_STYLE}
+          labelStyle={TOOLTIP_LABEL_STYLE}
           itemStyle={{ color: CHART_LINE_COLOR }}
           cursor={{ stroke: 'rgba(128,128,128,0.3)', strokeWidth: 1 }}
-          formatter={(v: number) => [formatMetricValue(metricName, v), labelForMetric(metricName)]}
+          formatter={(v: number) => [
+            formatMetricValue(metricName, v),
+            labelForMetric(metricName),
+          ]}
         />
         <Line
           type="monotone"
@@ -735,7 +775,9 @@ function AddAlertRuleDialog({
         </DialogHeader>
         <div className="space-y-4 py-2">
           <div className="space-y-1.5">
-            <label className="text-sm font-medium text-foreground">Rule name</label>
+            <label className="text-sm font-medium text-foreground">
+              Rule name
+            </label>
             <Input
               value={name}
               onChange={(e) => setName(e.target.value)}
@@ -743,7 +785,9 @@ function AddAlertRuleDialog({
             />
           </div>
           <div className="space-y-1.5">
-            <label className="text-sm font-medium text-foreground">Metric</label>
+            <label className="text-sm font-medium text-foreground">
+              Metric
+            </label>
             <Select value={metricName} onValueChange={setMetricName}>
               <SelectTrigger>
                 <SelectValue />
@@ -759,12 +803,12 @@ function AddAlertRuleDialog({
           </div>
           <div className="flex gap-3">
             <div className="w-32 space-y-1.5">
-              <label className="text-sm font-medium text-foreground">Comparator</label>
+              <label className="text-sm font-medium text-foreground">
+                Comparator
+              </label>
               <Select
                 value={comparator}
-                onValueChange={(v) =>
-                  setComparator(v as Comparator)
-                }
+                onValueChange={(v) => setComparator(v as Comparator)}
               >
                 <SelectTrigger>
                   <SelectValue />
@@ -778,7 +822,9 @@ function AddAlertRuleDialog({
               </Select>
             </div>
             <div className="flex-1 space-y-1.5">
-              <label className="text-sm font-medium text-foreground">Threshold</label>
+              <label className="text-sm font-medium text-foreground">
+                Threshold
+              </label>
               <Input
                 type="number"
                 value={threshold}
@@ -787,12 +833,12 @@ function AddAlertRuleDialog({
             </div>
           </div>
           <div className="space-y-1.5">
-            <label className="text-sm font-medium text-foreground">Severity</label>
+            <label className="text-sm font-medium text-foreground">
+              Severity
+            </label>
             <Select
               value={severity}
-              onValueChange={(v) =>
-                setSeverity(v as Severity)
-              }
+              onValueChange={(v) => setSeverity(v as Severity)}
             >
               <SelectTrigger>
                 <SelectValue />
@@ -824,7 +870,9 @@ function AddAlertRuleDialog({
             }
             disabled={create.isPending || !name.trim()}
           >
-            {create.isPending && <Loader2 className="mr-2 size-4 animate-spin" />}
+            {create.isPending && (
+              <Loader2 className="mr-2 size-4 animate-spin" />
+            )}
             Add Rule
           </Button>
         </DialogFooter>
@@ -855,7 +903,10 @@ type DatabasesSectionProps = {
  * the tile grids re-render for that scope. Kept separate from the global tiles
  * so a per-db sum is never shown unlabelled next to a true instance metric.
  */
-function DatabasesSection({ serviceId, aggregateByName }: DatabasesSectionProps) {
+function DatabasesSection({
+  serviceId,
+  aggregateByName,
+}: DatabasesSectionProps) {
   const refetchInterval = useRefreshInterval()
   const [selected, setSelected] = useState<string>(ALL_DATABASES)
 
@@ -939,7 +990,8 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
   const queryClient = useQueryClient()
   const refetchInterval = useRefreshInterval()
   const [addDialogOpen, setAddDialogOpen] = useState(false)
-  const [ruleToDelete, setRuleToDelete] = useState<ServiceAlertRuleResponse | null>(null)
+  const [ruleToDelete, setRuleToDelete] =
+    useState<ServiceAlertRuleResponse | null>(null)
 
   const { data: rules, isLoading } = useQuery({
     ...externalServiceMetricsGetAlertRulesOptions({ path: { id: serviceId } }),
@@ -961,7 +1013,8 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
       setRuleToDelete(null)
       invalidate()
     },
-    onError: (err: Error) => toast.error('Failed to delete rule', { description: err.message }),
+    onError: (err: Error) =>
+      toast.error('Failed to delete rule', { description: err.message }),
   })
 
   // The backend does not surface a per-rule firing state, so the badge count
@@ -1002,7 +1055,8 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
           <div className="flex flex-col items-center gap-3 rounded-lg border border-dashed border-border py-10 text-center">
             <Activity className="size-6 text-muted-foreground" />
             <p className="max-w-xs text-sm text-muted-foreground">
-              No alert rules yet. Add one to get notified when metrics cross a threshold.
+              No alert rules yet. Add one to get notified when metrics cross a
+              threshold.
             </p>
           </div>
         ) : (
@@ -1013,7 +1067,9 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
                   <TableHead>Name</TableHead>
                   <TableHead className="hidden sm:table-cell">Metric</TableHead>
                   <TableHead>Condition</TableHead>
-                  <TableHead className="hidden sm:table-cell">Severity</TableHead>
+                  <TableHead className="hidden sm:table-cell">
+                    Severity
+                  </TableHead>
                   <TableHead>Status</TableHead>
                   <TableHead className="w-8" />
                 </TableRow>
@@ -1021,12 +1077,15 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
               <TableBody>
                 {rules.map((rule) => (
                   <TableRow key={rule.id} className="even:bg-muted/30">
-                    <TableCell className="font-medium text-foreground">{rule.name}</TableCell>
+                    <TableCell className="font-medium text-foreground">
+                      {rule.name}
+                    </TableCell>
                     <TableCell className="hidden font-mono text-xs text-muted-foreground sm:table-cell">
                       {rule.metric_name}
                     </TableCell>
                     <TableCell className="text-sm tabular-nums text-foreground">
-                      {rule.comparator} {formatMetricValue(rule.metric_name, rule.threshold)}
+                      {rule.comparator}{' '}
+                      {formatMetricValue(rule.metric_name, rule.threshold)}
                     </TableCell>
                     <TableCell className="hidden sm:table-cell">
                       <Badge
@@ -1073,14 +1132,21 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
         onSuccess={invalidate}
       />
 
-      <Dialog open={!!ruleToDelete} onOpenChange={(o) => { if (!o) setRuleToDelete(null) }}>
+      <Dialog
+        open={!!ruleToDelete}
+        onOpenChange={(o) => {
+          if (!o) setRuleToDelete(null)
+        }}
+      >
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Delete Alert Rule</DialogTitle>
             <DialogDescription>
               Delete{' '}
-              <span className="font-medium text-foreground">{ruleToDelete?.name}</span>? This
-              cannot be undone.
+              <span className="font-medium text-foreground">
+                {ruleToDelete?.name}
+              </span>
+              ? This cannot be undone.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -1097,7 +1163,9 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
                 })
               }
             >
-              {removeRule.isPending && <Loader2 className="mr-2 size-4 animate-spin" />}
+              {removeRule.isPending && (
+                <Loader2 className="mr-2 size-4 animate-spin" />
+              )}
               Delete
             </Button>
           </DialogFooter>
@@ -1127,7 +1195,7 @@ function MonitoringDashboard({
   const heroMetrics = HERO_METRICS[engine]
 
   const [selectedMetric, setSelectedMetric] = useState(
-    heroMetrics[0] ?? groups[0]?.metrics[0] ?? '',
+    heroMetrics[0] ?? groups[0]?.metrics[0] ?? ''
   )
   const [range, setRange] = useState('1h')
 
@@ -1196,7 +1264,9 @@ function MonitoringDashboard({
             <p className="truncate text-sm font-medium text-foreground">
               {labelForMetric(selectedMetric)}
             </p>
-            <p className="mt-0.5 truncate font-mono text-xs text-muted-foreground">{selectedMetric}</p>
+            <p className="mt-0.5 truncate font-mono text-xs text-muted-foreground">
+              {selectedMetric}
+            </p>
           </div>
           <div className="flex shrink-0 gap-1">
             {RANGE_OPTIONS.map((opt) => (
@@ -1213,7 +1283,11 @@ function MonitoringDashboard({
           </div>
         </div>
         <div className="h-56 px-2 py-4 overflow-visible">
-          <MetricChart serviceId={serviceId} metricName={selectedMetric} range={range} />
+          <MetricChart
+            serviceId={serviceId}
+            metricName={selectedMetric}
+            range={range}
+          />
         </div>
       </div>
 
@@ -1242,7 +1316,10 @@ function MonitoringDashboard({
 
       {/* Per-database breakdown (Postgres) */}
       {engine === 'postgres' && (
-        <DatabasesSection serviceId={serviceId} aggregateByName={latestByName} />
+        <DatabasesSection
+          serviceId={serviceId}
+          aggregateByName={latestByName}
+        />
       )}
 
       {/* Alert rules */}
@@ -1262,7 +1339,9 @@ export function ServiceMonitoring() {
 
   // Auto-refresh interval (ms) or null = off. Persisted in localStorage so the
   // user's choice survives navigation/reload.
-  const [refreshMs, setRefreshMs] = useState<number | null>(loadStoredRefreshInterval)
+  const [refreshMs, setRefreshMs] = useState<number | null>(
+    loadStoredRefreshInterval
+  )
   const refetchInterval: number | false = refreshMs ?? false
 
   const serviceId = id ? parseInt(id) : 0
@@ -1274,13 +1353,13 @@ export function ServiceMonitoring() {
 
   const engine = normalizeEngine(
     serviceData?.service?.service_type ?? '',
-    serviceData?.current_parameters?.docker_image,
+    serviceData?.current_parameters?.docker_image
   )
 
   usePageTitle(
     serviceData?.service?.name
       ? `${serviceData.service.name} · Monitoring`
-      : 'Monitoring',
+      : 'Monitoring'
   )
 
   const {
@@ -1311,7 +1390,8 @@ export function ServiceMonitoring() {
     },
   })
 
-  const isDisabled = metricsError != null && isMonitoringUnavailable(metricsError)
+  const isDisabled =
+    metricsError != null && isMonitoringUnavailable(metricsError)
 
   const serviceName = serviceData?.service?.name ?? 'Service'
 
@@ -1333,120 +1413,137 @@ export function ServiceMonitoring() {
   }
 
   return (
-   <RefreshIntervalContext.Provider value={refetchInterval}>
-    <div className="flex-1 overflow-auto">
-      <div className="p-4 space-y-6 md:p-6">
-      {/* Page header */}
-      <div className="flex items-start justify-between gap-4">
-        <div className="min-w-0">
-          {/* Breadcrumb */}
-          <div className="flex min-w-0 items-center gap-1.5 mb-1">
-            <button
-              type="button"
-              onClick={() => navigate(`/storage/${id}`)}
-              className="text-muted-foreground hover:text-foreground transition-colors"
-            >
-              <ArrowLeft className="size-3.5" />
-            </button>
-            <span className="text-muted-foreground text-xs">/</span>
-            <button
-              type="button"
-              onClick={() => navigate(`/storage/${id}`)}
-              className="truncate text-xs text-muted-foreground hover:text-foreground transition-colors"
-            >
-              {serviceName}
-            </button>
-            <span className="text-muted-foreground text-xs">/</span>
-            <span className="text-xs text-muted-foreground">Monitoring</span>
-          </div>
-          {/* Page title */}
-          <h1 className="text-xl font-semibold text-foreground truncate">
-            {serviceName}
-          </h1>
-          <p className="text-sm text-muted-foreground mt-0.5">
-            Real-time metrics and performance monitoring
-            {lastReceivedAt && (
-              <span> · last received {formatRelativeTime(lastReceivedAt)}</span>
-            )}
-          </p>
-        </div>
-        <div className="flex shrink-0 items-center gap-2">
-          {/* Auto-refresh interval */}
-          <Select
-            value={refreshMs === null ? 'off' : String(refreshMs)}
-            onValueChange={(v) => {
-              const next = v === 'off' ? null : parseInt(v, 10)
-              setRefreshMs(next)
-              storeRefreshInterval(next)
-            }}
-          >
-            <SelectTrigger className="h-8 w-[88px] gap-1.5 text-xs">
-              <RefreshCw className="size-3.5 shrink-0 text-muted-foreground" />
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {REFRESH_OPTIONS.map((opt) => (
-                <SelectItem
-                  key={opt.label}
-                  value={opt.value === null ? 'off' : String(opt.value)}
+    <RefreshIntervalContext.Provider value={refetchInterval}>
+      <div className="flex-1 overflow-auto">
+        <div className="p-4 space-y-6 md:p-6">
+          {/* Page header */}
+          <div className="flex items-start justify-between gap-4">
+            <div className="min-w-0">
+              {/* Breadcrumb */}
+              <div className="flex min-w-0 items-center gap-1.5 mb-1">
+                <button
+                  type="button"
+                  onClick={() => navigate(`/storage/${id}`)}
+                  className="text-muted-foreground hover:text-foreground transition-colors"
                 >
-                  {opt.label}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          <Button
-            variant="outline"
-            size="sm"
-            className="gap-1.5"
-            onClick={handleRefresh}
-            disabled={isFetching}
-          >
-            <RefreshCw className={`size-3.5 ${isFetching ? 'animate-spin' : ''}`} />
-            <span>Refresh</span>
-          </Button>
-        </div>
-      </div>
+                  <ArrowLeft className="size-3.5" />
+                </button>
+                <span className="text-muted-foreground text-xs">/</span>
+                <button
+                  type="button"
+                  onClick={() => navigate(`/storage/${id}`)}
+                  className="truncate text-xs text-muted-foreground hover:text-foreground transition-colors"
+                >
+                  {serviceName}
+                </button>
+                <span className="text-muted-foreground text-xs">/</span>
+                <span className="text-xs text-muted-foreground">
+                  Monitoring
+                </span>
+              </div>
+              {/* Page title */}
+              <h1 className="text-xl font-semibold text-foreground truncate">
+                {serviceName}
+              </h1>
+              <p className="text-sm text-muted-foreground mt-0.5">
+                Real-time metrics and performance monitoring
+                {lastReceivedAt && (
+                  <span>
+                    {' '}
+                    · last received {formatRelativeTime(lastReceivedAt)}
+                  </span>
+                )}
+              </p>
+            </div>
+            <div className="flex shrink-0 items-center gap-2">
+              {/* Auto-refresh interval */}
+              <Select
+                value={refreshMs === null ? 'off' : String(refreshMs)}
+                onValueChange={(v) => {
+                  const next = v === 'off' ? null : parseInt(v, 10)
+                  setRefreshMs(next)
+                  storeRefreshInterval(next)
+                }}
+              >
+                <SelectTrigger className="h-8 w-[88px] gap-1.5 text-xs">
+                  <RefreshCw className="size-3.5 shrink-0 text-muted-foreground" />
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {REFRESH_OPTIONS.map((opt) => (
+                    <SelectItem
+                      key={opt.label}
+                      value={opt.value === null ? 'off' : String(opt.value)}
+                    >
+                      {opt.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Button
+                variant="outline"
+                size="sm"
+                className="gap-1.5"
+                onClick={handleRefresh}
+                disabled={isFetching}
+              >
+                <RefreshCw
+                  className={`size-3.5 ${isFetching ? 'animate-spin' : ''}`}
+                />
+                <span>Refresh</span>
+              </Button>
+            </div>
+          </div>
 
-      {/* Body */}
-      {serviceLoading || metricsLoading ? (
-        <div className="flex flex-col items-center justify-center gap-2 py-16 text-center">
-          <Loader2 className="size-5 animate-spin text-muted-foreground" />
-          <p className="text-sm text-muted-foreground">Loading metrics…</p>
+          {/* Body */}
+          {serviceLoading || metricsLoading ? (
+            <div className="flex flex-col items-center justify-center gap-2 py-16 text-center">
+              <Loader2 className="size-5 animate-spin text-muted-foreground" />
+              <p className="text-sm text-muted-foreground">Loading metrics…</p>
+            </div>
+          ) : isDisabled ? (
+            <div className="flex flex-col items-center gap-4 rounded-lg border border-dashed border-border bg-card p-12 text-center">
+              <Activity className="size-8 text-muted-foreground" />
+              <div>
+                <p className="text-sm font-medium text-foreground">
+                  Monitoring not enabled
+                </p>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  Enable monitoring on the service page to start collecting
+                  metrics.
+                </p>
+              </div>
+              <Button
+                variant="outline"
+                onClick={() => navigate(`/storage/${id}`)}
+              >
+                Go to service
+              </Button>
+            </div>
+          ) : !latestMetrics || latestMetrics.length === 0 ? (
+            <div className="flex items-center gap-3 rounded-lg border border-border bg-card p-6">
+              <span className="relative flex size-3">
+                <span className="absolute inline-flex size-full animate-ping rounded-full bg-primary opacity-75" />
+                <span className="relative inline-flex size-3 rounded-full bg-primary" />
+              </span>
+              <div>
+                <p className="text-sm font-medium text-foreground">
+                  Collecting first metrics…
+                </p>
+                <p className="text-sm text-muted-foreground">
+                  First metrics appear within 30 seconds.
+                </p>
+              </div>
+            </div>
+          ) : (
+            <MonitoringDashboard
+              serviceId={serviceId}
+              engine={engine}
+              latestMetrics={latestMetrics}
+            />
+          )}
         </div>
-      ) : isDisabled ? (
-        <div className="flex flex-col items-center gap-4 rounded-lg border border-dashed border-border bg-card p-12 text-center">
-          <Activity className="size-8 text-muted-foreground" />
-          <div>
-            <p className="text-sm font-medium text-foreground">Monitoring not enabled</p>
-            <p className="mt-1 text-sm text-muted-foreground">
-              Enable monitoring on the service page to start collecting metrics.
-            </p>
-          </div>
-          <Button variant="outline" onClick={() => navigate(`/storage/${id}`)}>
-            Go to service
-          </Button>
-        </div>
-      ) : !latestMetrics || latestMetrics.length === 0 ? (
-        <div className="flex items-center gap-3 rounded-lg border border-border bg-card p-6">
-          <span className="relative flex size-3">
-            <span className="absolute inline-flex size-full animate-ping rounded-full bg-primary opacity-75" />
-            <span className="relative inline-flex size-3 rounded-full bg-primary" />
-          </span>
-          <div>
-            <p className="text-sm font-medium text-foreground">Collecting first metrics…</p>
-            <p className="text-sm text-muted-foreground">First metrics appear within 30 seconds.</p>
-          </div>
-        </div>
-      ) : (
-        <MonitoringDashboard
-          serviceId={serviceId}
-          engine={engine}
-          latestMetrics={latestMetrics}
-        />
-      )}
       </div>
-    </div>
-   </RefreshIntervalContext.Provider>
+    </RefreshIntervalContext.Provider>
   )
 }

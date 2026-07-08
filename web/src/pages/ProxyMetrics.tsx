@@ -19,6 +19,7 @@ import {
   getGeneralStatsOptions,
   nodeMetricsGetRangeOptions,
 } from '@/api/client/@tanstack/react-query.gen'
+import { TOOLTIP_CONTENT_STYLE, TOOLTIP_LABEL_STYLE } from '@/lib/chart-tooltip'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -71,25 +72,6 @@ const RANGE_SECONDS: Record<RangeValue, number> = {
   '6h': 21_600,
   '24h': 86_400,
   '7d': 604_800,
-}
-
-// The theme tokens are full oklch() colors (Tailwind v4), so they must be
-// consumed as `var(--token)` — wrapping them in hsl() produces an invalid
-// color and the tooltip renders transparent.
-const TOOLTIP_CONTENT_STYLE: React.CSSProperties = {
-  fontSize: 12,
-  backgroundColor: 'var(--popover)',
-  border: '1px solid var(--border)',
-  borderRadius: 8,
-  color: 'var(--popover-foreground)',
-  boxShadow: '0 4px 12px -2px rgb(0 0 0 / 0.4)',
-  padding: '6px 10px',
-}
-
-const TOOLTIP_LABEL_STYLE: React.CSSProperties = {
-  color: 'var(--muted-foreground)',
-  fontSize: 11,
-  marginBottom: 2,
 }
 
 /** One line in a chart panel: metric name + display label + stroke color. */

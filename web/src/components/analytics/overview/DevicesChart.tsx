@@ -24,9 +24,9 @@ const DEVICE_ICONS: Record<string, LucideIcon> = {
 }
 
 const DEVICE_COLORS: Record<string, string> = {
-  Desktop: 'hsl(var(--chart-1))',
-  Mobile: 'hsl(var(--chart-2))',
-  Tablet: 'hsl(var(--chart-3))',
+  Desktop: 'var(--chart-1)',
+  Mobile: 'var(--chart-2)',
+  Tablet: 'var(--chart-3)',
 }
 
 interface DevicesChartProps {
