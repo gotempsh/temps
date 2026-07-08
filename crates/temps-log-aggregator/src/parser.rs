@@ -86,6 +86,7 @@ pub fn parse_log_line(
             service: ctx.service.clone(),
             env: ctx.env.clone(),
             project_id: ctx.project_id,
+            external_service_id: ctx.external_service_id,
             deploy_id: ctx.deploy_id,
             // node fields are stamped by the collector after parsing — the
             // parser only knows Docker-label-derived context, not platform
@@ -108,6 +109,7 @@ pub fn parse_log_line(
         service: ctx.service.clone(),
         env: ctx.env.clone(),
         project_id: ctx.project_id,
+        external_service_id: ctx.external_service_id,
         deploy_id: ctx.deploy_id,
         node_id: None,
         node_name: None,
@@ -306,6 +308,7 @@ mod tests {
     fn test_ctx() -> ContainerContext {
         ContainerContext {
             project_id: 1,
+            external_service_id: None,
             env: "1".to_string(),
             service: "web".to_string(),
             container_id: "abc123".to_string(),
@@ -475,6 +478,7 @@ mod tests {
     fn test_context_fields_applied() {
         let ctx = ContainerContext {
             project_id: 7,
+            external_service_id: None,
             env: "2".to_string(),
             service: "api".to_string(),
             container_id: "container-abc".to_string(),

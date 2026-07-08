@@ -2245,9 +2245,9 @@ dependencies = [
 
 [[package]]
 name = "cmov"
-version = "0.5.3"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f88a43d011fc4a6876cb7344703e297c71dda42494fee094d5f7c76bf13f746"
+checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
 name = "color_quant"
@@ -2561,9 +2561,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-epoch"
-version = "0.9.18"
+version = "0.9.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"
+checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -6686,7 +6686,7 @@ version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
 dependencies = [
- "base64 0.21.7",
+ "base64 0.22.1",
  "chrono",
  "getrandom 0.2.17",
  "http 1.4.2",
@@ -10910,6 +10910,7 @@ dependencies = [
  "sea-orm",
  "serde",
  "serde_json",
+ "temps-auth",
  "temps-core",
  "temps-entities",
  "temps-geo",
@@ -11007,6 +11008,7 @@ dependencies = [
  "urlencoding",
  "utoipa",
  "uuid",
+ "walkdir",
 ]
 
 [[package]]
@@ -11832,6 +11834,7 @@ dependencies = [
  "rand 0.8.6",
  "sea-orm",
  "serde",
+ "temps-auth",
  "temps-core",
  "temps-database",
  "temps-entities",
@@ -12569,6 +12572,7 @@ dependencies = [
  "temps-entities",
  "temps-file-store",
  "temps-geo",
+ "temps-metrics",
  "temps-migrations",
  "temps-presets",
  "temps-routes",
@@ -12829,6 +12833,7 @@ name = "temps-static-files"
 version = "0.1.0-beta.42"
 dependencies = [
  "axum 0.8.9",
+ "temps-auth",
  "temps-config",
  "temps-core",
  "tokio",

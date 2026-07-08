@@ -514,12 +514,13 @@ impl JobProcessorService {
     /// [`temps_core::DeploymentGateRecheckJob`] can call this same helper
     /// again once conditions change, without recreating anything.
     ///
-    /// `pub(crate)` — also called directly by the manual-deploy HTTP
-    /// handlers (`handlers::remote_deployments::{deploy_from_image,
-    /// deploy_from_image_upload, deploy_from_static}`), which run outside
-    /// the job-queue dispatch loop and would otherwise skip the gate
-    /// entirely.
-    pub(crate) async fn gate_check_then_run(
+    /// `pub` — also called directly by the manual-deploy HTTP handlers
+    /// (`handlers::remote_deployments::{deploy_from_image,
+    /// deploy_from_image_upload, deploy_from_static}`) and by embedding
+    /// binaries that create deployments in-process (e.g. vibetemps' Ship
+    /// It), all of which run outside the job-queue dispatch loop and would
+    /// otherwise skip the gate entirely.
+    pub async fn gate_check_then_run(
         db: &Arc<DbConnection>,
         workflow_executor: &Arc<WorkflowExecutionService>,
         deployment_gate: &Option<Arc<dyn temps_core::DeploymentGate>>,

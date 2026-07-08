@@ -58,9 +58,17 @@ impl TailService {
 
 /// Check if a log line matches the tail filter.
 fn matches_tail_filter(line: &LogLine, filter: &TailFilter) -> bool {
-    // Project ID must match
-    if line.project_id != filter.project_id {
-        return false;
+    // External-service tail: match on the service dimension, not project_id
+    // (external-service lines carry the sentinel project_id = 0).
+    if let Some(svc_id) = filter.external_service_id {
+        if line.external_service_id != Some(svc_id) {
+            return false;
+        }
+    } else {
+        // Deployment/application tail: project ID must match.
+        if line.project_id != filter.project_id {
+            return false;
+        }
     }
 
     // Service must match
@@ -104,6 +112,7 @@ mod tests {
             service: service.to_string(),
             env: "1".to_string(),
             project_id: 42,
+            external_service_id: None,
             deploy_id: None,
             node_id: None,
             node_name: None,
@@ -113,6 +122,7 @@ mod tests {
     fn make_filter(service: &str) -> TailFilter {
         TailFilter {
             project_id: 42,
+            external_service_id: None,
             service: service.to_string(),
             env: "1".to_string(),
             levels: vec![],

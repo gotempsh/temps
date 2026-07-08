@@ -73,6 +73,11 @@ const ServiceDataBrowser = lazy(() =>
     default: m.ServiceDataBrowser,
   }))
 )
+const ServiceLogs = lazy(() =>
+  import('./pages/ServiceLogs').then((m) => ({
+    default: m.ServiceLogs,
+  }))
+)
 const ServiceRestore = lazy(() =>
   import('./pages/ServiceRestore').then((m) => ({
     default: m.ServiceRestore,
@@ -190,6 +195,7 @@ const CliLogin = lazy(() =>
   import('./pages/CliLogin').then((m) => ({ default: m.CliLogin }))
 )
 const ProxyLogs = lazy(() => import('./pages/ProxyLogs'))
+const ProxyMetrics = lazy(() => import('./pages/ProxyMetrics'))
 const ProxyLogDetail = lazy(() => import('./pages/ProxyLogDetail'))
 const IpGeolocationDetail = lazy(() => import('./pages/IpGeolocationDetail'))
 const CrossProjectTraceDetail = lazy(
@@ -453,6 +459,7 @@ const FullAppRoutes = () => {
                   path="/traces/global/:traceId"
                   element={<CrossProjectTraceDetail />}
                 />
+                <Route path="/proxy" element={<ProxyMetrics />} />
                 <Route path="/proxy-logs" element={<ProxyLogs />} />
                 <Route path="/proxy-logs/:id" element={<ProxyLogDetail />} />
                 <Route path="/audit-logs" element={<AuditLogs />} />
@@ -507,6 +514,7 @@ const FullAppRoutes = () => {
                 <Route path="/storage/:id" element={<ServiceDetail />} />
                 <Route path="/storage/:id/monitoring" element={<ServiceMonitoring />} />
                 <Route path="/storage/:id/browse" element={<ServiceDataBrowser />} />
+                <Route path="/storage/:id/logs" element={<ServiceLogs />} />
                 <Route path="/storage/:id/restore" element={<ServiceRestore />} />
                 <Route path="/storage/:id/upgrades/:upgradeId" element={<MajorUpgradeDetail />} />
                 <Route path="/storage/:id/members/add" element={<AddClusterMember />} />

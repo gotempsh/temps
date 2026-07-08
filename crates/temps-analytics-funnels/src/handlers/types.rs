@@ -7,6 +7,8 @@ use crate::services::{FunnelService, SmartFilter};
 
 pub struct AppState {
     pub funnel_service: Arc<FunnelService>,
+    /// Optional checker for team-based project access (human sessions only).
+    pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]

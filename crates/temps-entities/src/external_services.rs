@@ -53,6 +53,14 @@ pub struct Model {
     /// `m20260623_000001_add_external_services_default_backup_provisioned`.
     #[sea_orm(default_value = false)]
     pub default_backup_provisioned: bool,
+    /// Real Docker container name this service's logs are collected under.
+    /// Plaintext (unlike the encrypted `config`) so the log collector can map
+    /// a running container back to its service without decryption. Set for
+    /// IMPORTED services to the pre-existing container's actual name (which
+    /// carries no `temps.*` labels); NULL for Temps-created services, which
+    /// the collector already resolves via the `temps.service_name` Docker
+    /// label. Added by `m20260707_000002_add_external_services_container_name`.
+    pub container_name: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

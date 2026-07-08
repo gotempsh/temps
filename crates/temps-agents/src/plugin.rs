@@ -580,7 +580,18 @@ impl TempsPlugin for AgentsPlugin {
                 cron_scheduler.run().await;
             });
 
-            // Store state for route configuration
+            // Store state for route configuration.
+            //
+            // `project_access_checker` is intentionally set to `None` here and
+            // resolved in `configure_routes` instead. `configure_routes` runs
+            // after every plugin's `register_services` and
+            // `initialize_plugin_services` have completed, which guarantees
+            // that a checker registered by any other plugin (e.g. the
+            // team-access plugin) is already present in the service registry
+            // by the time we look it up. Resolving it here — in
+            // `register_services` — races against other plugins' registration
+            // order and would see `None` whenever the checker plugin loads
+            // after this one.
             let app_state = Arc::new(AppState {
                 db: context.require_service::<sea_orm::DatabaseConnection>(),
                 encryption_service: context.require_service::<temps_core::EncryptionService>(),
@@ -596,6 +607,7 @@ impl TempsPlugin for AgentsPlugin {
                 telemetry: context
                     .get_service::<dyn temps_core::TelemetryReporter>()
                     .unwrap_or_else(|| Arc::new(temps_core::NoopTelemetryReporter)),
+                project_access_checker: None,
             });
             context.register_plugin_state("agents", app_state);
 
@@ -647,7 +659,28 @@ impl TempsPlugin for AgentsPlugin {
     }
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
-        let app_state = context.get_plugin_state::<AppState>("agents")?;
+        // Resolve the ProjectAccessChecker here, not in register_services.
+        // configure_routes runs after ALL plugins have completed both
+        // register_services and initialize_plugin_services, so any checker
+        // registered by another plugin is guaranteed to be visible here
+        // regardless of plugin load order.
+        let old = context.get_plugin_state::<AppState>("agents")?;
+        let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
+        let app_state = Arc::new(AppState {
+            db: old.db.clone(),
+            encryption_service: old.encryption_service.clone(),
+            config_service: old.config_service.clone(),
+            run_service: old.run_service.clone(),
+            executor: old.executor.clone(),
+            audit_service: old.audit_service.clone(),
+            autofixer_service: old.autofixer_service.clone(),
+            secret_service: old.secret_service.clone(),
+            definition_service: old.definition_service.clone(),
+            docker: old.docker.clone(),
+            platform_config_service: old.platform_config_service.clone(),
+            telemetry: old.telemetry.clone(),
+            project_access_checker,
+        });
 
         let router = crate::handlers::configure_routes().with_state(app_state);
 

@@ -101,7 +101,8 @@ impl TempsPlugin for LogAggregatorPlugin {
                 chunk_writer.clone(),
                 collector_metadata.clone(),
                 10_000,
-            );
+            )
+            .with_db(db.clone());
 
             // Wire callback: when a chunk is flushed during streaming, insert chunk metadata into DB.
             // This callback runs in the collector's streaming task, so it must be Send + Sync.
@@ -174,6 +175,7 @@ impl TempsPlugin for LogAggregatorPlugin {
             let metadata_service = context.require_service::<LogMetadataService>();
             let collector = context.require_service::<CollectorService>();
             let docker = context.require_service::<bollard::Docker>();
+            let db = context.require_service::<sea_orm::DatabaseConnection>();
             let retention_service = context.require_service::<RetentionService>();
             let retention_metadata = context.require_service::<LogMetadataService>();
 
@@ -255,38 +257,132 @@ impl TempsPlugin for LogAggregatorPlugin {
             }
 
             // ── Container discovery: startup scan ───────────────────────
-            // Find already-running containers with sh.temps.* labels and start streaming.
-            // Retries with exponential backoff if Docker is temporarily unavailable.
+            // Find already-running containers and start streaming. Two label
+            // families are collected: deployment/application containers
+            // (`sh.temps.project_id`) and imported/managed external-service
+            // containers (`temps.service_type`). Docker's `label` filter ANDs
+            // multiple values, so each family needs its own list call; the IDs
+            // are unioned. Retries with exponential backoff if Docker is
+            // temporarily unavailable.
             let startup_collector = collector.clone();
             let startup_docker = docker.clone();
+            let startup_db = db.clone();
             tokio::spawn(async move {
                 use bollard::query_parameters::ListContainersOptions;
-                use std::collections::HashMap;
+                use std::collections::{HashMap, HashSet};
+
+                let scan_labels = ["sh.temps.project_id", "temps.service_type"];
 
                 let mut delay = STARTUP_SCAN_BASE_DELAY;
                 for attempt in 0..=STARTUP_SCAN_MAX_RETRIES {
-                    let mut filters = HashMap::new();
-                    filters.insert("status".to_string(), vec!["running".to_string()]);
-                    filters.insert("label".to_string(), vec!["sh.temps.project_id".to_string()]);
+                    let mut scan_result: Result<HashSet<String>, bollard::errors::Error> =
+                        Ok(HashSet::new());
+                    for label in scan_labels {
+                        let mut filters = HashMap::new();
+                        filters.insert("status".to_string(), vec!["running".to_string()]);
+                        filters.insert("label".to_string(), vec![label.to_string()]);
+                        let options = ListContainersOptions {
+                            all: false,
+                            filters: Some(filters),
+                            ..Default::default()
+                        };
+                        match startup_docker.list_containers(Some(options)).await {
+                            Ok(containers) => {
+                                if let Ok(ids) = scan_result.as_mut() {
+                                    ids.extend(containers.into_iter().filter_map(|c| c.id));
+                                }
+                            }
+                            Err(e) => {
+                                scan_result = Err(e);
+                                break;
+                            }
+                        }
+                    }
 
-                    let options = ListContainersOptions {
-                        all: false,
-                        filters: Some(filters),
-                        ..Default::default()
-                    };
+                    // Imported external-service containers carry NO temps.*
+                    // labels, so the label scans above miss them. Discover them
+                    // by the plaintext container names recorded at import time
+                    // and add any that are running by name filter.
+                    if let Ok(ids) = scan_result.as_mut() {
+                        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
+                        let imported_names: Vec<String> =
+                            temps_entities::external_services::Entity::find()
+                                .filter(
+                                    temps_entities::external_services::Column::ContainerName
+                                        .is_not_null(),
+                                )
+                                .select_only()
+                                .column(temps_entities::external_services::Column::ContainerName)
+                                .into_tuple::<Option<String>>()
+                                .all(startup_db.as_ref())
+                                .await
+                                .unwrap_or_default()
+                                .into_iter()
+                                .flatten()
+                                .collect();
+                        for name in imported_names {
+                            let mut filters = HashMap::new();
+                            filters.insert("status".to_string(), vec!["running".to_string()]);
+                            filters.insert("name".to_string(), vec![name.clone()]);
+                            let options = ListContainersOptions {
+                                all: false,
+                                filters: Some(filters),
+                                ..Default::default()
+                            };
+                            if let Ok(containers) =
+                                startup_docker.list_containers(Some(options)).await
+                            {
+                                ids.extend(containers.into_iter().filter_map(|c| c.id));
+                            }
+                        }
+                    }
 
-                    match startup_docker.list_containers(Some(options)).await {
-                        Ok(containers) => {
-                            let count = containers.len();
-                            for container in containers {
-                                if let Some(id) = container.id {
-                                    if let Err(e) = startup_collector.start_streaming(&id).await {
-                                        tracing::warn!(
-                                            container_id = %id,
-                                            error = %e,
-                                            "Failed to start streaming for existing container"
-                                        );
-                                    }
+                    // Local cluster members (monitor/primary/replica) carry
+                    // deployment-style `sh.temps.service.*` labels the scans
+                    // above don't target, and their names live in
+                    // `service_members`, not on the service row. Discover the
+                    // control-plane-local ones (node_id IS NULL) by name — the
+                    // collector resolves each to its owning service via
+                    // `service_members.container_name`. Remote members are
+                    // handled separately by the remote collector.
+                    if let Ok(ids) = scan_result.as_mut() {
+                        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
+                        let member_names: Vec<String> =
+                            temps_entities::service_members::Entity::find()
+                                .filter(temps_entities::service_members::Column::NodeId.is_null())
+                                .select_only()
+                                .column(temps_entities::service_members::Column::ContainerName)
+                                .into_tuple::<String>()
+                                .all(startup_db.as_ref())
+                                .await
+                                .unwrap_or_default();
+                        for name in member_names {
+                            let mut filters = HashMap::new();
+                            filters.insert("status".to_string(), vec!["running".to_string()]);
+                            filters.insert("name".to_string(), vec![name.clone()]);
+                            let options = ListContainersOptions {
+                                all: false,
+                                filters: Some(filters),
+                                ..Default::default()
+                            };
+                            if let Ok(containers) =
+                                startup_docker.list_containers(Some(options)).await
+                            {
+                                ids.extend(containers.into_iter().filter_map(|c| c.id));
+                            }
+                        }
+                    }
+
+                    match scan_result {
+                        Ok(ids) => {
+                            let count = ids.len();
+                            for id in ids {
+                                if let Err(e) = startup_collector.start_streaming(&id).await {
+                                    tracing::warn!(
+                                        container_id = %id,
+                                        error = %e,
+                                        "Failed to start streaming for existing container"
+                                    );
                                 }
                             }
                             tracing::info!(
@@ -452,7 +548,16 @@ impl TempsPlugin for LogAggregatorPlugin {
     }
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
-        let app_state = context.require_service::<LogAggregatorAppState>();
+        let old = context.require_service::<LogAggregatorAppState>();
+        let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
+        let app_state = Arc::new(LogAggregatorAppState {
+            search_service: old.search_service.clone(),
+            metadata_service: old.metadata_service.clone(),
+            tail_service: old.tail_service.clone(),
+            retention_service: old.retention_service.clone(),
+            audit_service: old.audit_service.clone(),
+            project_access_checker,
+        });
         let routes = handlers::configure_routes().with_state(app_state);
 
         Some(PluginRoutes::new(routes))

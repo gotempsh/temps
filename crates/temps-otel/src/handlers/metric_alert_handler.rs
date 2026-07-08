@@ -21,7 +21,7 @@ use crate::handlers::audit::{
 use crate::services::anomaly_preview::compute_anomaly_preview;
 use crate::services::metric_alert_evaluator::SeriesStateEntry;
 use crate::OtelAppState;
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{permission_guard, project_access_guard, RequireAuth};
 use temps_core::problemdetails::Problem;
 use temps_core::{AuditContext, ProblemDetails, RequestMetadata};
 use temps_entities::metric_alert_rules::Model;
@@ -342,6 +342,7 @@ pub async fn list_alerts(
     Query(params): Query<ListMetricAlertsParams>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, OtelRead);
+    project_access_guard!(auth, params.project_id, state.project_access_checker);
 
     let (items, total) = state
         .metric_alert_service
@@ -380,6 +381,7 @@ pub async fn create_alert(
     Json(request): Json<CreateMetricAlertRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, OtelWrite);
+    project_access_guard!(auth, request.project_id, state.project_access_checker);
 
     let model = state
         .metric_alert_service
@@ -446,6 +448,7 @@ pub async fn get_alert(
     Query(scope): Query<MetricAlertScopeParams>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, OtelRead);
+    project_access_guard!(auth, scope.project_id, state.project_access_checker);
 
     let model = state.metric_alert_service.get(scope.project_id, id).await?;
     let mut resp = OtelMetricAlertRuleResponse::from(model);
@@ -482,6 +485,7 @@ pub async fn update_alert(
     Json(request): Json<UpdateMetricAlertRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, OtelWrite);
+    project_access_guard!(auth, scope.project_id, state.project_access_checker);
 
     let model = state
         .metric_alert_service
@@ -549,6 +553,7 @@ pub async fn delete_alert(
     Query(scope): Query<MetricAlertScopeParams>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, OtelWrite);
+    project_access_guard!(auth, scope.project_id, state.project_access_checker);
 
     // Verify ownership FIRST (404s if `id` isn't in `scope.project_id`): the
     // evaluator's in-memory maps below are keyed only by `rule_id`, not
@@ -612,6 +617,7 @@ pub async fn preview_alert(
     Json(req): Json<AnomalyPreviewRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, OtelRead);
+    project_access_guard!(auth, req.project_id, state.project_access_checker);
 
     // Preview only makes sense for a band-based (anomaly) detector.
     let params = match &req.detection_config {

@@ -121,7 +121,8 @@ export function VisitorSparkline({
                       cy: number
                       payload: { value: number }
                     }
-                    if (!payload || payload.value === 0) return <g key={`dot-${cx}`} />
+                    if (!payload || payload.value === 0)
+                      return <g key={`dot-${cx}`} />
                     return (
                       <circle
                         key={`dot-${cx}`}
@@ -144,12 +145,12 @@ export function VisitorSparkline({
 						<linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
 							<stop
 								offset="5%"
-								stopColor={isHovering ? "hsl(var(--chart-2))" : "hsl(var(--primary))"}
+								stopColor={isHovering ? "var(--chart-2)" : "var(--primary)"}
 								stopOpacity={0.4}
 							/>
 							<stop
 								offset="95%"
-								stopColor={isHovering ? "hsl(var(--chart-2))" : "hsl(var(--primary))"}
+								stopColor={isHovering ? "var(--chart-2)" : "var(--primary)"}
 								stopOpacity={0.05}
 							/>
 						</linearGradient>
@@ -172,7 +173,7 @@ export function VisitorSparkline({
 					<Area
 						dataKey="value"
 						type="monotone"
-						stroke={isHovering ? "hsl(var(--chart-2))" : "hsl(var(--primary))"}
+						stroke={isHovering ? "var(--chart-2)" : "var(--primary)"}
 						strokeWidth={1.5}
 						fill={`url(#${gradientId})`}
 						dot={false}

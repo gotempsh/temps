@@ -21,7 +21,9 @@ use serde::{Deserialize, Serialize};
 use tracing::error;
 use utoipa::{OpenApi, ToSchema};
 
-use temps_auth::{deny_deployment_token, permission_guard, project_scope_guard, RequireAuth};
+use temps_auth::{
+    deny_deployment_token, permission_guard, project_access_guard, project_scope_guard, RequireAuth,
+};
 use temps_core::problemdetails::{self, Problem};
 use temps_core::{AuditContext, AuditLogger, RequestMetadata};
 use temps_entities::{ai_conversations, ai_messages, ai_pending_actions};
@@ -42,6 +44,8 @@ pub struct AppState {
     pub audit_service: Arc<dyn AuditLogger>,
     /// Pending-action service (confirm/reject write proposals).
     pub pending_actions: Arc<PendingActionService>,
+    /// Optional checker for team-based project access (human sessions only).
+    pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
 }
 
 impl AppState {
@@ -450,6 +454,7 @@ pub async fn find_conversation(
 ) -> Result<Json<Option<ConversationResponse>>, Problem> {
     permission_guard!(auth, ProjectsRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     // Bound the lookup keys, consistent with create_conversation, so oversized
     // query strings can't reach the DB.
     if q.context_type.len() > MAX_CONTEXT_TYPE_LEN {
@@ -520,6 +525,7 @@ pub async fn list_conversations(
 ) -> Result<Json<Vec<ConversationResponse>>, Problem> {
     permission_guard!(auth, ProjectsRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     ensure_chat_enabled(state.db.as_ref(), project_id).await?;
     let conversations = state.service.list_conversations(project_id).await?;
     Ok(Json(
@@ -549,6 +555,7 @@ pub async fn create_conversation(
     // Creating a conversation mutates state and can drive AI cost → write scope.
     permission_guard!(auth, ProjectsWrite);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     if req.context_type.len() > MAX_CONTEXT_TYPE_LEN {
         return Err(too_long("context_type", MAX_CONTEXT_TYPE_LEN));
     }
@@ -595,6 +602,7 @@ pub async fn get_conversation(
 ) -> Result<Json<ConversationDetailResponse>, Problem> {
     permission_guard!(auth, ProjectsRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     ensure_chat_enabled(state.db.as_ref(), project_id).await?;
     let conv = state
         .service
@@ -633,6 +641,7 @@ pub async fn send_message(
     // Sending a message runs an AI turn (mutates state + incurs cost) → write scope.
     permission_guard!(auth, ProjectsWrite);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     if req.content.trim().is_empty() {
         return Err(problemdetails::new(axum::http::StatusCode::BAD_REQUEST)
             .with_title("Empty Message")
@@ -726,6 +735,7 @@ pub async fn archive_conversation(
 ) -> Result<axum::http::StatusCode, Problem> {
     permission_guard!(auth, ProjectsWrite);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     ensure_chat_enabled(state.db.as_ref(), project_id).await?;
     let conv = state
         .service
@@ -764,6 +774,7 @@ pub async fn rename_conversation(
 ) -> Result<Json<ConversationResponse>, Problem> {
     permission_guard!(auth, ProjectsWrite);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     ensure_chat_enabled(state.db.as_ref(), project_id).await?;
 
     let title = req.title.trim();
@@ -821,6 +832,7 @@ pub async fn list_pending_actions(
 ) -> Result<Json<Vec<PendingActionResponse>>, Problem> {
     permission_guard!(auth, ProjectsRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     ensure_chat_enabled(state.db.as_ref(), project_id).await?;
     // Verify conversation exists + is scoped to this project.
     let conv = state
@@ -858,6 +870,7 @@ pub async fn get_pending_action(
 ) -> Result<Json<PendingActionResponse>, Problem> {
     permission_guard!(auth, ProjectsRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     ensure_chat_enabled(state.db.as_ref(), project_id).await?;
     let action = state
         .pending_actions
@@ -890,6 +903,7 @@ pub async fn confirm_pending_action(
 ) -> Result<Json<PendingActionResponse>, Problem> {
     permission_guard!(auth, ProjectsWrite);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     ensure_chat_enabled(state.db.as_ref(), project_id).await?;
     let confirmed_by = Some(auth.user_id());
     let updated = state
@@ -940,6 +954,7 @@ pub async fn reject_pending_action(
 ) -> Result<Json<PendingActionResponse>, Problem> {
     permission_guard!(auth, ProjectsWrite);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     ensure_chat_enabled(state.db.as_ref(), project_id).await?;
     let rejected_by = Some(auth.user_id());
     let updated = state

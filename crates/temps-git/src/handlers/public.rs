@@ -15,10 +15,11 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::Json,
-    Router,
+    Extension, Router,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use temps_auth::AuthContext;
 use temps_core::problemdetails::{new as problem_new, Problem};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
@@ -140,6 +141,7 @@ fn map_error(err: PublicRepoError, owner: &str, repo: &str) -> Problem {
     tag = "Public Repositories"
 )]
 pub async fn get_public_branches(
+    auth: Option<Extension<AuthContext>>,
     State(state): State<Arc<AppState>>,
     Path((provider, owner, repo)): Path<(String, String, String)>,
     Query(params): Query<PublicRepoQueryParams>,
@@ -165,8 +167,9 @@ pub async fn get_public_branches(
     }
 
     // Try to get a token from any existing GitHub connection for higher rate limits
+    // (authenticated callers only — see get_github_token_from_connections)
     let token = if provider == "github" {
-        get_github_token_from_connections(&state).await
+        get_github_token_from_connections(&state, auth.is_some()).await
     } else {
         None
     };
@@ -232,13 +235,15 @@ pub async fn get_public_branches(
     tag = "Public Repositories"
 )]
 pub async fn detect_public_presets(
+    auth: Option<Extension<AuthContext>>,
     State(state): State<Arc<AppState>>,
     Path((provider, owner, repo)): Path<(String, String, String)>,
     Query(params): Query<PresetQueryParams>,
 ) -> Result<Json<PublicPresetResponse>, Problem> {
     // Try to get a token from any existing GitHub connection for higher rate limits
+    // (authenticated callers only — see get_github_token_from_connections)
     let token = if provider == "github" {
-        get_github_token_from_connections(&state).await
+        get_github_token_from_connections(&state, auth.is_some()).await
     } else {
         None
     };
@@ -360,12 +365,14 @@ pub async fn detect_public_presets(
     tag = "Public Repositories"
 )]
 pub async fn get_public_repository(
+    auth: Option<Extension<AuthContext>>,
     State(state): State<Arc<AppState>>,
     Path((provider, owner, repo)): Path<(String, String, String)>,
 ) -> Result<Json<PublicRepositoryInfo>, Problem> {
     // Try to get a token from any existing GitHub connection for higher rate limits
+    // (authenticated callers only — see get_github_token_from_connections)
     let token = if provider == "github" {
-        get_github_token_from_connections(&state).await
+        get_github_token_from_connections(&state, auth.is_some()).await
     } else {
         None
     };
@@ -435,7 +442,19 @@ pub struct PublicRepositoriesApiDoc;
 
 /// Try to get a GitHub access token from any configured GitHub connection.
 /// This avoids the 60 req/hr unauthenticated rate limit by using an existing token (5000 req/hr).
-async fn get_github_token_from_connections(state: &AppState) -> Option<String> {
+///
+/// Only ever returns a token for authenticated callers. These routes are
+/// intentionally public (no `RequireAuth` — see module docs), but that means
+/// an anonymous internet caller must not be able to silently spend the
+/// server's own GitHub OAuth quota; unauthenticated requests fall back to
+/// GitHub's unauthenticated rate limit instead.
+async fn get_github_token_from_connections(
+    state: &AppState,
+    is_authenticated: bool,
+) -> Option<String> {
+    if !is_authenticated {
+        return None;
+    }
     state.git_provider_manager.get_any_github_token().await
 }
 

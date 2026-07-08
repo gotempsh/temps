@@ -23,6 +23,8 @@ pub struct AppState {
     /// Anonymous product telemetry reporter. Always present (may be a no-op when
     /// telemetry is disabled or the reporter crate is not loaded).
     pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
+    /// Optional checker for team-based project access (human sessions only).
+    pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -35,6 +37,7 @@ pub fn create_environment_app_state(
     on_demand_waker: Option<Arc<dyn temps_core::OnDemandWaker>>,
     integration_env_provider: Option<Arc<dyn ProjectEnvVarsProvider>>,
     telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
+    project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
 ) -> Arc<AppState> {
     Arc::new(AppState {
         environment_service,
@@ -45,6 +48,7 @@ pub fn create_environment_app_state(
         on_demand_waker,
         integration_env_provider,
         telemetry,
+        project_access_checker,
     })
 }
 

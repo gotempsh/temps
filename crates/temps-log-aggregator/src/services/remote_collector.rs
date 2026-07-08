@@ -64,6 +64,13 @@ pub struct RemoteContainerInfo {
     pub service: String,
     /// Active deployment ID (`deployments.id`), if known.
     pub deploy_id: Option<i32>,
+    /// Owning managed external service (`external_services.id`) when this
+    /// container is a **cluster member** running on a worker node, rather than
+    /// an ordinary deployment container. `None` for deployments. When set, the
+    /// collected chunks key on the external service (with the `project_id = 0`
+    /// sentinel) so a remote replica's logs surface under the service's history
+    /// identically to a control-plane-local member.
+    pub external_service_id: Option<i32>,
 }
 
 /// A stream of raw, timestamp-prefixed log lines from a remote container — one
@@ -245,6 +252,10 @@ impl RemoteLogCollectorService {
     ) {
         let ctx = ContainerContext {
             project_id: info.project_id,
+            // Set for cluster members on worker nodes; None for deployments.
+            // When set, chunks key on the external service (project_id is the
+            // 0 sentinel) so remote members join the service's log history.
+            external_service_id: info.external_service_id,
             env: info.env.clone(),
             service: info.service.clone(),
             container_id: info.container_id.clone(),
@@ -396,6 +407,7 @@ mod tests {
             env: "1".into(),
             service: "web".into(),
             deploy_id: Some(7),
+            external_service_id: None,
         }
     }
 

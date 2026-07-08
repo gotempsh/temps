@@ -15,7 +15,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{permission_guard, project_access_guard, RequireAuth};
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::Problem;
 use temps_core::{AuditContext, AuditLogger, RequestMetadata};
@@ -40,6 +40,8 @@ pub struct ManagementState {
     pub analytics: Arc<RevenueAnalyticsService>,
     pub import: Arc<RevenueImportService>,
     pub audit: Arc<dyn AuditLogger>,
+    /// Optional checker for team-based project access (human sessions only).
+    pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
 }
 
 impl ManagementState {
@@ -48,12 +50,14 @@ impl ManagementState {
         analytics: Arc<RevenueAnalyticsService>,
         import: Arc<RevenueImportService>,
         audit: Arc<dyn AuditLogger>,
+        project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
     ) -> Self {
         Self {
             integrations,
             analytics,
             import,
             audit,
+            project_access_checker,
         }
     }
 }
@@ -445,6 +449,7 @@ async fn revenue_list_integrations(
     Path(project_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     let rows = state
         .integrations
         .list_for_project(project_id)
@@ -481,6 +486,7 @@ async fn revenue_create_integration(
     Json(body): Json<CreateIntegrationBody>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     let input = CreateIntegrationInput {
         project_id,
         provider: body.provider.clone(),
@@ -531,6 +537,7 @@ async fn revenue_delete_integration(
     Path((project_id, integration_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     // Fetch first so the audit log captures what was deleted.
     let existing = state
         .integrations
@@ -580,6 +587,7 @@ async fn revenue_rotate_token(
     Path((project_id, integration_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     let updated = state
         .integrations
         .rotate_path_token(project_id, integration_id)
@@ -632,6 +640,7 @@ async fn revenue_update_secret(
     Json(body): Json<UpdateSecretBody>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     let updated = state
         .integrations
         .update_signing_secret(project_id, integration_id, &body.signing_secret)
@@ -685,6 +694,7 @@ async fn revenue_update_config(
     Json(body): Json<UpdateConfigBody>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     let cleared = body.config.is_none();
     let updated = state
         .integrations
@@ -732,6 +742,7 @@ async fn revenue_metrics_summary(
     Query(q): Query<SummaryQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     let currency = q.currency.as_deref().unwrap_or("usd");
     let summary = state
         .analytics
@@ -849,6 +860,7 @@ async fn revenue_metrics_mrr(
     Query(q): Query<MrrQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     let (from, to) = default_range(q.from, q.to);
     let bucket =
         Bucket::parse(q.bucket.as_deref().unwrap_or("day")).map_err(analytics_error_to_problem)?;
@@ -888,6 +900,7 @@ async fn revenue_metrics_customers(
     Query(q): Query<MovementQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     let (from, to) = default_range(q.from, q.to);
     let bucket =
         Bucket::parse(q.bucket.as_deref().unwrap_or("day")).map_err(analytics_error_to_problem)?;
@@ -924,6 +937,7 @@ async fn revenue_recent_events(
     Query(q): Query<RecentEventsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     let limit = q.limit.unwrap_or(50);
     let rows = state
         .analytics
@@ -1069,6 +1083,7 @@ async fn revenue_import_subscriptions_csv(
     multipart: Multipart,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     let bytes = read_csv_field(multipart).await?;
     let outcome = state
         .import
@@ -1136,6 +1151,7 @@ async fn revenue_import_invoices_csv(
     multipart: Multipart,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     let bytes = read_csv_field(multipart).await?;
     let outcome = state
         .import

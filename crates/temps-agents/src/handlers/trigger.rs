@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::ToSchema;
 
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{permission_guard, project_access_guard, RequireAuth};
 use temps_core::audit::{AuditContext, AuditOperation};
 use temps_core::problemdetails::{self, Problem};
 use temps_core::RequestMetadata;
@@ -125,6 +125,7 @@ pub async fn trigger_agent(
     Json(request): Json<TriggerAgentRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     // Load agent to get config_id and verify it is enabled
     let agent = app_state
@@ -392,11 +393,12 @@ pub struct CliStatusQuery {
 )]
 pub async fn get_cli_status(
     RequireAuth(auth): RequireAuth,
-    State(_app_state): State<Arc<AppState>>,
-    Path(_project_id): Path<i32>,
+    State(app_state): State<Arc<AppState>>,
+    Path(project_id): Path<i32>,
     Query(query): Query<CliStatusQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsRead);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     let provider_name = query.provider.as_deref().unwrap_or("claude_cli");
 
@@ -447,9 +449,10 @@ pub struct SandboxStatusResponse {
 pub async fn get_sandbox_status(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AppState>>,
-    Path(_project_id): Path<i32>,
+    Path(project_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsRead);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     let sandbox_registry = &app_state.executor.sandbox_registry();
     let provider = sandbox_registry.provider();
@@ -641,10 +644,11 @@ pub struct SmokeTestQuery {
 pub async fn smoke_test_agent(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AppState>>,
-    Path(_project_id): Path<i32>,
+    Path(project_id): Path<i32>,
     Query(query): Query<SmokeTestQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     // Check if sandbox is enabled globally
     let global_sandbox = {

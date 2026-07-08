@@ -12,7 +12,7 @@ use std::time::Duration;
 use sqlx::mysql::MySqlPoolOptions;
 use temps_providers::externalsvc::mariadb_binlog_health::{self, BinlogWarning};
 use testcontainers::{
-    core::{ContainerPort, WaitFor},
+    core::{wait::LogWaitStrategy, ContainerPort, WaitFor},
     runners::AsyncRunner,
     ContainerAsync, GenericImage, ImageExt,
 };
@@ -26,9 +26,21 @@ const ROOT_PASSWORD: &str = "probe-root-pw";
 ///
 /// Returns `None` when Docker is unavailable so tests skip rather than fail.
 async fn boot_mariadb(extra_cmd: &[&str]) -> Option<(String, ContainerAsync<GenericImage>)> {
+    // MariaDB's docker-entrypoint restarts the server once during first boot
+    // to apply custom CLI flags (confirmed via container logs: "ready for
+    // connections" appears once for a throwaway init server -- reachable
+    // only over the Unix socket, not the mapped TCP port -- then again ~1-2s
+    // later for the final server with the real config applied). Waiting for
+    // only the first occurrence plus a short fixed sleep can race that
+    // restart on a loaded host: the probe's connection lands in the gap and
+    // reads pre-restart variable values. Wait for the SECOND occurrence
+    // whenever extra_cmd changes server config, so the container is
+    // genuinely done restarting before anything connects.
+    let ready_message = LogWaitStrategy::stderr("ready for connections")
+        .with_times(if extra_cmd.is_empty() { 1 } else { 2 });
     let mut image = GenericImage::new("mariadb", "lts")
         .with_exposed_port(ContainerPort::Tcp(3306))
-        .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
+        .with_wait_for(WaitFor::log(ready_message))
         .with_env_var("MARIADB_ROOT_PASSWORD", ROOT_PASSWORD)
         .with_env_var("MARIADB_DATABASE", "appdb");
 
@@ -47,10 +59,9 @@ async fn boot_mariadb(extra_cmd: &[&str]) -> Option<(String, ContainerAsync<Gene
     let host = container.get_host().await.ok()?;
     let port = container.get_host_port_ipv4(3306).await.ok()?;
 
-    // MariaDB logs "ready for connections" during init AND after final
-    // startup; a short pause avoids racing the restart that briefly closes
-    // inbound connections.
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Small buffer on top of the log-based wait above for the TCP listener
+    // to actually accept connections after the log line is emitted.
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     let conn_str = format!("mysql://root:{ROOT_PASSWORD}@{host}:{port}/");
 

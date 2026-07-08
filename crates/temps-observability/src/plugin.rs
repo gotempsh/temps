@@ -46,12 +46,8 @@ impl TempsPlugin for ObservabilityPlugin {
         Box::pin(async move {
             let db = context.require_service::<DatabaseConnection>();
             let service = Arc::new(ObservabilityService::new(db));
-            let state = Arc::new(ObservabilityState {
-                service: service.clone(),
-            });
 
             context.register_service(service);
-            context.register_service(state);
 
             debug!("Observability plugin services registered");
             Ok(())
@@ -59,7 +55,12 @@ impl TempsPlugin for ObservabilityPlugin {
     }
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
-        let state = context.require_service::<ObservabilityState>();
+        let service = context.require_service::<ObservabilityService>();
+        let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
+        let state = Arc::new(ObservabilityState {
+            service,
+            project_access_checker,
+        });
         let router: Router = configure_observability_routes().with_state(state);
         Some(PluginRoutes::new(router))
     }

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Proxy metrics, dashboard and default alerts**: The Pingora proxy now records per-request metrics in lock-free atomic counters (status classes 1xx–5xx plus a fixed duration-bucket histogram in `temps-proxy/src/metrics.rs`) — a few relaxed atomic adds per request, no locks or I/O on the hot path, constant memory at any request rate. Recording happens once per request in the Pingora `logging()` end-of-request hook, so short-circuited responses (redirects, password walls, ACME challenges, admin-gate denials) are counted too. A background `ProxyMetricsSampler` flushes interval deltas every `monitoring.scrape_interval_secs` to the metrics store (ClickHouse or TimescaleDB, same backend selection as the console) as `SourceKind::Node` points for the control-plane node (`proxy.requests`, `proxy.requests_2xx/3xx/4xx/5xx`, `proxy.requests_project/console/other` (destination split: project route vs console fallback vs proxy-handled — always sums to `proxy.requests`), `proxy.error_rate_percent`, `proxy.request_duration_avg_ms/p50/p95/p99`, and a backend-vs-proxy latency split for proxied requests — `proxy.upstream_duration_*` (upstream connect + processing + TTFB) and `proxy.self_duration_*` (total minus backend, the proxy's own overhead)), readable via the existing `GET /nodes/{id}/metrics` endpoint in both single-process and split proxy/console (ADR-017) topologies. A new "Proxy" page in the web console charts traffic, error rate, and latency percentiles. Migration `m20260708_000001_add_node_id_to_monitoring_alert_rules` adds `node_id` as a third alert-rule target so the `AlertEvaluator` can watch node-scoped metrics; default proxy rules are seeded at startup (error rate >20%, p99 >5s — one rule per metric, matching the (target, metric_name) unique-index semantics).
+
 ### Fixed
 
 - **Crypto dependency alignment**: Move direct `hmac` users and workspace `hkdf` onto digest-0.11-compatible releases so the merged `sha2` 0.11 dependency update continues to compile instead of requiring a rollback.

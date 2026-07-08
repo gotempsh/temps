@@ -46,6 +46,7 @@ impl LogMetadataService {
         let model = temps_entities::log_chunks::ActiveModel {
             id: Set(meta.id),
             project_id: Set(meta.project_id),
+            external_service_id: Set(meta.external_service_id),
             env: Set(meta.env.clone()),
             service: Set(meta.service.clone()),
             container_id: Set(meta.container_id.clone()),
@@ -96,6 +97,7 @@ impl LogMetadataService {
             let model = temps_entities::log_events::ActiveModel {
                 time: Set(line.ts),
                 project_id: Set(line.project_id),
+                external_service_id: Set(line.external_service_id),
                 service: Set(line.service.clone()),
                 env: Set(line.env.clone()),
                 level: Set(line.level.to_string()),
@@ -152,6 +154,7 @@ impl LogMetadataService {
     pub async fn find_chunks(
         &self,
         project_id: i32,
+        external_service_id: Option<i32>,
         service: Option<&str>,
         start_time: DateTime<Utc>,
         end_time: DateTime<Utc>,
@@ -159,8 +162,14 @@ impl LogMetadataService {
         container_ids: &[String],
         node_ids: &[i32],
     ) -> Result<Vec<ChunkMeta>, LogAggregatorError> {
+        // Scope by external service when set (its chunks carry project_id = 0),
+        // otherwise by project — see `LogSearchFilter::external_service_id`.
+        let scope = match external_service_id {
+            Some(id) => temps_entities::log_chunks::Column::ExternalServiceId.eq(id),
+            None => temps_entities::log_chunks::Column::ProjectId.eq(project_id),
+        };
         let mut condition = Condition::all()
-            .add(temps_entities::log_chunks::Column::ProjectId.eq(project_id))
+            .add(scope)
             .add(temps_entities::log_chunks::Column::StartedAt.lte(end_time))
             .add(temps_entities::log_chunks::Column::EndedAt.gte(start_time));
 
@@ -197,6 +206,7 @@ impl LogMetadataService {
             .map(|m| ChunkMeta {
                 id: m.id,
                 project_id: m.project_id,
+                external_service_id: m.external_service_id,
                 env: m.env,
                 service: m.service,
                 container_id: m.container_id,
@@ -222,6 +232,7 @@ impl LogMetadataService {
     pub async fn list_sources(
         &self,
         project_id: i32,
+        external_service_id: Option<i32>,
         env: Option<&str>,
         deploy_id: Option<i32>,
         start_time: DateTime<Utc>,
@@ -237,8 +248,12 @@ impl LogMetadataService {
             node_name: Option<String>,
         }
 
+        let scope = match external_service_id {
+            Some(id) => temps_entities::log_chunks::Column::ExternalServiceId.eq(id),
+            None => temps_entities::log_chunks::Column::ProjectId.eq(project_id),
+        };
         let mut condition = Condition::all()
-            .add(temps_entities::log_chunks::Column::ProjectId.eq(project_id))
+            .add(scope)
             .add(temps_entities::log_chunks::Column::StartedAt.lte(end_time))
             .add(temps_entities::log_chunks::Column::EndedAt.gte(start_time));
 
@@ -307,6 +322,28 @@ impl LogMetadataService {
         Ok(events)
     }
 
+    /// Return all project IDs that have linked this external service via `project_services`.
+    ///
+    /// Used by the access guard in log handlers: when `external_service_id` is
+    /// supplied the normal project-based `project_access_guard!` cannot be used,
+    /// so the handler looks up the owning project(s) and checks team membership
+    /// against those instead.
+    ///
+    /// An empty `Vec` means the external service has no project association
+    /// (orphaned). Callers **must** treat that as a denial — there is no
+    /// legitimate use case for reading logs of an unlinked external service, and
+    /// defaulting to fail-open on an anomalous state would be an IDOR.
+    pub async fn find_owning_project_ids(
+        &self,
+        external_service_id: i32,
+    ) -> Result<Vec<i32>, LogAggregatorError> {
+        let rows = temps_entities::project_services::Entity::find()
+            .filter(temps_entities::project_services::Column::ServiceId.eq(external_service_id))
+            .all(self.db.as_ref())
+            .await?;
+        Ok(rows.into_iter().map(|ps| ps.project_id).collect())
+    }
+
     /// Find chunks older than a given timestamp for retention cleanup.
     pub async fn find_expired_chunks(
         &self,
@@ -327,6 +364,7 @@ impl LogMetadataService {
             .map(|m| ChunkMeta {
                 id: m.id,
                 project_id: m.project_id,
+                external_service_id: m.external_service_id,
                 env: m.env,
                 service: m.service,
                 container_id: m.container_id,
@@ -403,6 +441,7 @@ impl LogMetadataService {
         Ok(chunk.map(|m| ChunkMeta {
             id: m.id,
             project_id: m.project_id,
+            external_service_id: m.external_service_id,
             env: m.env,
             service: m.service,
             container_id: m.container_id,
@@ -436,6 +475,7 @@ mod tests {
         let chunk = ChunkMeta {
             id: Uuid::new_v4(),
             project_id,
+            external_service_id: None,
             env: env.to_string(),
             service: svc.to_string(),
             container_id: "test-container".to_string(),
@@ -525,6 +565,7 @@ mod tests {
         let mk = |cid: &str, node: Option<i32>, nname: Option<&str>| ChunkMeta {
             id: Uuid::new_v4(),
             project_id: project,
+            external_service_id: None,
             env: "1".to_string(),
             service: "web".to_string(),
             container_id: cid.to_string(),
@@ -561,6 +602,7 @@ mod tests {
         let sources = service
             .list_sources(
                 project,
+                None,
                 Some("1"),
                 None,
                 now - Duration::hours(1),

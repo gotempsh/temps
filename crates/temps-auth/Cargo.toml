@@ -45,3 +45,4 @@ reqwest = { workspace = true }
 [dev-dependencies]
 temps-migrations = { path = "../temps-migrations" }
 tokio-test = "0.4"
+walkdir = { workspace = true }

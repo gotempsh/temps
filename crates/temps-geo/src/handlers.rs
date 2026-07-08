@@ -8,6 +8,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use temps_auth::{permission_guard, RequireAuth};
 use temps_core::{
     problemdetails::{self, Problem},
     ProblemDetails,
@@ -98,14 +99,20 @@ impl From<(String, GeoLocation)> for GeoLocationResponse {
     responses(
         (status = 200, description = "Geolocation information retrieved", body = GeoLocationResponse),
         (status = 400, description = "Invalid IP address", body = ProblemDetails),
+        (status = 401, description = "Authentication required", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "IP address not found in database", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails)
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn get_ip_geolocation(
+    RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path(ip_str): Path<String>,
 ) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, AnalyticsRead);
+
     // Parse IP address
     let ip = ip_str.parse().map_err(|_| {
         problemdetails::new(StatusCode::BAD_REQUEST)
@@ -136,6 +143,29 @@ mod tests {
     use super::*;
     use crate::MockGeoIpService;
 
+    fn test_auth_context() -> temps_auth::AuthContext {
+        let user = temps_entities::users::Model {
+            id: 1,
+            name: "Test User".to_string(),
+            email: "test@example.com".to_string(),
+            password_hash: Some("hashed".to_string()),
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        temps_auth::AuthContext::new_session(user, temps_auth::Role::Admin)
+    }
+
     #[tokio::test]
     async fn test_get_ip_geolocation_success() {
         let geo_service = Arc::new(GeoIpService::Mock(MockGeoIpService::new()));
@@ -143,7 +173,12 @@ mod tests {
             geo_ip_service: geo_service,
         });
 
-        let result = get_ip_geolocation(State(state), Path("127.0.0.1".to_string())).await;
+        let result = get_ip_geolocation(
+            RequireAuth(test_auth_context()),
+            State(state),
+            Path("127.0.0.1".to_string()),
+        )
+        .await;
         assert!(result.is_ok(), "Should successfully geolocate localhost");
     }
 
@@ -154,7 +189,12 @@ mod tests {
             geo_ip_service: geo_service,
         });
 
-        let result = get_ip_geolocation(State(state), Path("not-an-ip".to_string())).await;
+        let result = get_ip_geolocation(
+            RequireAuth(test_auth_context()),
+            State(state),
+            Path("not-an-ip".to_string()),
+        )
+        .await;
         assert!(result.is_err(), "Should fail with invalid IP");
     }
 

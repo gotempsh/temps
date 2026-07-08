@@ -5,10 +5,20 @@
 use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use serde_json;
 use std::sync::Arc;
-use temps_core::EncryptionService;
+use temps_core::{EncryptionService, SecretsManagerResolver};
 use temps_entities::{deployment_jobs, deployments, environments, projects, types::JobStatus};
 use temps_logs::LogService;
 use tracing::{debug, info};
+
+/// Shared slot type for the optional [`temps_core::SecretsManagerResolver`].
+///
+/// Mirrors the two-phase wiring pattern of
+/// [`super::job_processor::DeploymentGateSlot`]: the slot is captured from
+/// `WorkflowPlanner` inside `DeploymentsPlugin::register_services` (before the
+/// planner is moved into the background task) and written into from
+/// `DeploymentsPlugin::initialize_plugin_services` (which runs only after every
+/// plugin has registered its services).
+pub type SecretsResolverSlot = Arc<tokio::sync::RwLock<Option<Arc<dyn SecretsManagerResolver>>>>;
 #[derive(Debug, Clone)]
 pub struct JobDefinition {
     pub job_id: String,
@@ -32,6 +42,17 @@ pub struct WorkflowPlanner {
     dsn_service: Arc<temps_error_tracking::DSNService>,
     deployment_token_service: Arc<DeploymentTokenService>,
     encryption_service: Arc<EncryptionService>,
+    /// Optional EE-provided resolver for secrets-manager bindings.
+    ///
+    /// Held behind a shared lock — identical to the `deployment_gate` slot in
+    /// [`super::job_processor::JobProcessorService`] — so it can be wired in
+    /// by `DeploymentsPlugin::initialize_plugin_services` after this struct
+    /// has already been moved into a background task by `register_services`.
+    ///
+    /// `None` on OSS-only builds (strict no-op). When `Some`, any error from
+    /// [`SecretsManagerResolver::resolve_secrets_for_deployment`] aborts the
+    /// entire deployment (fail-closed).
+    secrets_resolver: SecretsResolverSlot,
 }
 
 impl WorkflowPlanner {
@@ -55,7 +76,19 @@ impl WorkflowPlanner {
             dsn_service,
             deployment_token_service,
             encryption_service,
+            secrets_resolver: Arc::new(tokio::sync::RwLock::new(None)),
         }
+    }
+
+    /// Returns a clone of the shared secrets-resolver slot.
+    ///
+    /// Call this **before** moving `self` into a spawned task so that
+    /// `DeploymentsPlugin::initialize_plugin_services` can write the EE
+    /// resolver into it after every plugin has registered. The background
+    /// task re-reads the slot on every deployment, so a resolver wired in
+    /// after startup still protects every subsequent deployment.
+    pub fn secrets_resolver_handle(&self) -> SecretsResolverSlot {
+        self.secrets_resolver.clone()
     }
 
     /// Gather all environment variables for a deployment
@@ -219,6 +252,71 @@ impl WorkflowPlanner {
             );
 
             return Err(anyhow::anyhow!(error_message));
+        }
+
+        // 2b. Secrets-manager bindings (EE only — strict no-op when resolver is absent).
+        //
+        // Placed between the external-service env vars (step 2, fail-closed) and the
+        // system-generated vars (Sentry DSN, deployment token, OTel — steps 3-5).
+        // Secrets-manager bindings are operator-controlled and may shadow manual env
+        // vars (step 1) or integration env vars (step 2). They can never shadow
+        // system-generated vars because those are injected in later steps, after
+        // this block completes.
+        {
+            // Clone the Arc and drop the read guard before awaiting, so the lock is
+            // not held across an await point.
+            let maybe_resolver = {
+                let guard = self.secrets_resolver.read().await;
+                guard.as_ref().cloned()
+            };
+
+            if let Some(resolver) = maybe_resolver {
+                match resolver
+                    .resolve_secrets_for_deployment(project.id, environment.id)
+                    .await
+                {
+                    Ok(secrets_map) => {
+                        // Log resolved keys only — never log values (S2 of ADR 0009).
+                        info!(
+                            "Resolved {} secret(s) for project {} environment {}: [{}]",
+                            secrets_map.len(),
+                            project.id,
+                            environment.id,
+                            secrets_map.keys().cloned().collect::<Vec<_>>().join(", ")
+                        );
+                        // Warn when a secrets-manager binding overwrites a value
+                        // that was already set by a manual or integration env var so
+                        // operators can detect unintended shadowing. System-generated
+                        // vars (Sentry, OTel, deployment token) are added in later
+                        // steps and are therefore never shadowed here.
+                        for key in secrets_map.keys() {
+                            if env_vars_map.contains_key(key.as_str()) {
+                                tracing::warn!(
+                                    "Secrets binding overwrites existing env var '{}' for \
+                                     project {} environment {}",
+                                    key,
+                                    project.id,
+                                    environment.id,
+                                );
+                            }
+                        }
+                        env_vars_map.extend(secrets_map);
+                    }
+                    Err(e) => {
+                        // Fail-closed: abort the entire deployment. This is the same
+                        // treatment applied to a failed external service in the block
+                        // above — no partial success, no silent empty-string fallback.
+                        return Err(anyhow::anyhow!(
+                            "Secrets-manager resolution failed for project {} environment {}: {}. \
+                             The deployment cannot proceed. \
+                             Verify provider connectivity and credentials.",
+                            project.id,
+                            environment.id,
+                            e,
+                        ));
+                    }
+                }
+            }
         }
 
         // 3. Get or create Sentry DSN for error tracking
@@ -2618,5 +2716,193 @@ mod tests {
                 preset
             );
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // SecretsManagerResolver seam tests (ADR 0009 §Decision-2)
+    // -------------------------------------------------------------------------
+
+    /// A mock resolver that always returns an error, simulating a Vault outage
+    /// or misconfiguration.
+    struct FailingSecretsResolver {
+        message: String,
+    }
+
+    #[async_trait::async_trait]
+    impl temps_core::SecretsManagerResolver for FailingSecretsResolver {
+        async fn resolve_secrets_for_deployment(
+            &self,
+            _project_id: i32,
+            _environment_id: i32,
+        ) -> Result<
+            std::collections::HashMap<String, String>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Err(self.message.clone().into())
+        }
+    }
+
+    /// A mock resolver that returns a fixed set of secrets.
+    struct SucceedingSecretsResolver {
+        secrets: std::collections::HashMap<String, String>,
+    }
+
+    #[async_trait::async_trait]
+    impl temps_core::SecretsManagerResolver for SucceedingSecretsResolver {
+        async fn resolve_secrets_for_deployment(
+            &self,
+            _project_id: i32,
+            _environment_id: i32,
+        ) -> Result<
+            std::collections::HashMap<String, String>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(self.secrets.clone())
+        }
+    }
+
+    /// ADR 0009 §S1: when the resolver returns `Err`, the entire deployment
+    /// must be aborted (fail-closed). `create_deployment_jobs` must propagate
+    /// the error rather than continuing with a partial or empty env-var map.
+    #[tokio::test]
+    async fn secrets_resolver_fail_closed_on_error() -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let log_service = Arc::new(LogService::new(std::env::temp_dir()));
+        let config_service = create_test_config_service(db.clone());
+        let dsn_service = create_test_dsn_service(db.clone());
+        let external_service_manager = create_test_external_service_manager(db.clone());
+        let planner = Arc::new(WorkflowPlanner::new(
+            db.clone(),
+            log_service,
+            external_service_manager,
+            config_service,
+            dsn_service,
+            create_test_encryption_service(),
+        ));
+
+        // Wire in a resolver that always fails.
+        let resolver: Arc<dyn temps_core::SecretsManagerResolver> =
+            Arc::new(FailingSecretsResolver {
+                message: "simulated Vault outage".to_string(),
+            });
+        *planner.secrets_resolver_handle().write().await = Some(resolver);
+
+        let (_project, _environment, deployment) =
+            create_test_project(db.as_ref(), Preset::NextJs).await?;
+
+        let result = planner.create_deployment_jobs(deployment.id).await;
+
+        assert!(
+            result.is_err(),
+            "create_deployment_jobs must fail when the secrets resolver returns Err (fail-closed)"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Secrets-manager resolution failed"),
+            "error message must mention secrets-manager resolution failure; got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("simulated Vault outage"),
+            "error message must include the original resolver error; got: {err_msg}"
+        );
+
+        Ok(())
+    }
+
+    /// When the resolver returns `Ok`, deployment planning must succeed and the
+    /// resolved secrets must not appear in any error (they are merged silently
+    /// into the env-var map used by subsequent job-config assembly steps).
+    #[tokio::test]
+    async fn secrets_resolver_success_does_not_break_planning(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let log_service = Arc::new(LogService::new(std::env::temp_dir()));
+        let config_service = create_test_config_service(db.clone());
+        let dsn_service = create_test_dsn_service(db.clone());
+        let external_service_manager = create_test_external_service_manager(db.clone());
+        let planner = Arc::new(WorkflowPlanner::new(
+            db.clone(),
+            log_service,
+            external_service_manager,
+            config_service,
+            dsn_service,
+            create_test_encryption_service(),
+        ));
+
+        // Wire in a resolver that returns one secret.
+        let mut secrets = std::collections::HashMap::new();
+        secrets.insert("MY_API_KEY".to_string(), "super-secret-value".to_string());
+        let resolver: Arc<dyn temps_core::SecretsManagerResolver> =
+            Arc::new(SucceedingSecretsResolver { secrets });
+        *planner.secrets_resolver_handle().write().await = Some(resolver);
+
+        let (_project, _environment, deployment) =
+            create_test_project(db.as_ref(), Preset::NextJs).await?;
+
+        // Deployment planning must succeed when the resolver returns Ok.
+        let jobs = planner.create_deployment_jobs(deployment.id).await?;
+        assert!(
+            !jobs.is_empty(),
+            "create_deployment_jobs must succeed when the secrets resolver returns Ok"
+        );
+
+        Ok(())
+    }
+
+    /// ADR 0009 §Consequences (Positive): when no resolver is registered
+    /// (`None`), `create_deployment_jobs` must succeed with exactly the same
+    /// behaviour as before this seam was introduced — a strict no-op.
+    #[tokio::test]
+    async fn secrets_resolver_absent_is_strict_noop() -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let log_service = Arc::new(LogService::new(std::env::temp_dir()));
+        let config_service = create_test_config_service(db.clone());
+        let dsn_service = create_test_dsn_service(db.clone());
+        let external_service_manager = create_test_external_service_manager(db.clone());
+        // Create planner without wiring any resolver — slot stays None.
+        let planner = WorkflowPlanner::new(
+            db.clone(),
+            log_service,
+            external_service_manager,
+            config_service,
+            dsn_service,
+            create_test_encryption_service(),
+        );
+
+        // Verify the slot is indeed None.
+        assert!(
+            planner.secrets_resolver_handle().read().await.is_none(),
+            "slot must start as None"
+        );
+
+        let (_project, _environment, deployment) =
+            create_test_project(db.as_ref(), Preset::NextJs).await?;
+
+        // Deployment planning must succeed exactly as it did before ADR 0009.
+        let jobs = planner.create_deployment_jobs(deployment.id).await?;
+        assert!(
+            !jobs.is_empty(),
+            "create_deployment_jobs must succeed when no secrets resolver is registered"
+        );
+
+        // The standard set of jobs must still be created (unchanged pre-ADR behaviour).
+        let job_ids: Vec<String> = jobs.iter().map(|j| j.job_id.clone()).collect();
+        assert!(
+            job_ids.contains(&"download_repo".to_string()),
+            "download_repo job must still be planned when secrets resolver is absent"
+        );
+        assert!(
+            job_ids.contains(&"build_image".to_string()),
+            "build_image job must still be planned when secrets resolver is absent"
+        );
+        assert!(
+            job_ids.contains(&"deploy_container".to_string()),
+            "deploy_container job must still be planned when secrets resolver is absent"
+        );
+
+        Ok(())
     }
 }

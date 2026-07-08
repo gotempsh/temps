@@ -111,6 +111,8 @@ impl TempsPlugin for ProvidersPlugin {
         // Create QueryService
         let query_service = Arc::new(crate::QueryService::new(external_service_manager.clone()));
 
+        let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
+
         // Create AppState for handlers
         let app_state = Arc::new(AppState {
             external_service_manager,
@@ -122,6 +124,7 @@ impl TempsPlugin for ProvidersPlugin {
             api_key_service,
             config_service,
             telemetry,
+            project_access_checker,
         });
 
         // Configure routes with the app state

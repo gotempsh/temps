@@ -21,7 +21,7 @@ interface PageListItemProps {
 const chartConfig = {
   sessions: {
     label: 'Sessions',
-    color: 'hsl(var(--primary))',
+    color: 'var(--primary)',
   },
 } satisfies ChartConfig
 
@@ -105,19 +105,19 @@ export function PageListItem({
                 >
                   <stop
                     offset="5%"
-                    stopColor="hsl(var(--primary))"
+                    stopColor="var(--primary)"
                     stopOpacity={0.3}
                   />
                   <stop
                     offset="95%"
-                    stopColor="hsl(var(--primary))"
+                    stopColor="var(--primary)"
                     stopOpacity={0}
                   />
                 </linearGradient>
               </defs>
               <Area
                 dataKey="sessions"
-                stroke="hsl(var(--primary))"
+                stroke="var(--primary)"
                 fill={`url(#gradient-${pagePath})`}
                 strokeWidth={1}
                 dot={false}
@@ -128,7 +128,7 @@ export function PageListItem({
               <ChartTooltip
                 content={<ChartTooltipContent />}
                 cursor={{
-                  stroke: 'hsl(var(--primary))',
+                  stroke: 'var(--primary)',
                   strokeWidth: 1,
                   strokeDasharray: '2 2',
                 }}

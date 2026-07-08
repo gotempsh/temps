@@ -283,8 +283,21 @@ pub struct MariaDbInputConfig {
     #[serde(default)]
     pub binlog_archive_interval: BinlogArchiveInterval,
 
-    /// Existing Docker container name for imported services.
-    #[serde(default)]
+    /// Real Docker container name when this service was imported from an
+    /// existing MariaDB-compatible container (set by `import_from_container`,
+    /// never user-editable — omitted from the create form). Overrides the
+    /// derived `mariadb-{name}` container name so internal addressing
+    /// targets the actual pre-existing container instead of a synthesized
+    /// name that doesn't exist.
+    ///
+    /// Deserialized through `deserialize_optional_non_empty` as a second,
+    /// independent guard alongside `#[schemars(skip)]`: an empty string here
+    /// previously made `init` treat the service as imported (skipping
+    /// container creation) and fail with a Docker 301 on
+    /// `POST /containers//start` — normalize blank to `None` regardless of
+    /// how the value reaches this struct.
+    #[serde(default, deserialize_with = "deserialize_optional_non_empty")]
+    #[schemars(skip)]
     pub container_name: Option<String>,
 }
 
@@ -298,12 +311,14 @@ pub struct MariaDbConfig {
     pub password: String,
     pub root_password: String,
     pub docker_image: String,
+    /// Real container name for imported services — see
+    /// `MariaDbInputConfig::container_name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_name: Option<String>,
     #[serde(default)]
     pub size_profile: MariaDbSizeProfile,
     #[serde(default)]
     pub binlog_archive_interval: BinlogArchiveInterval,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub container_name: Option<String>,
 }
 
 impl From<MariaDbInputConfig> for MariaDbConfig {
@@ -320,9 +335,9 @@ impl From<MariaDbInputConfig> for MariaDbConfig {
             password: input.password.unwrap_or_else(generate_password),
             root_password: input.root_password.unwrap_or_else(generate_password),
             docker_image: input.docker_image,
+            container_name: input.container_name,
             size_profile: input.size_profile,
             binlog_archive_interval: input.binlog_archive_interval,
-            container_name: input.container_name,
         }
     }
 }
@@ -336,6 +351,18 @@ where
         Some(s) if !s.is_empty() && s.len() >= MIN_PASSWORD_LENGTH => Some(s),
         _ => None,
     })
+}
+
+/// Treats a blank string the same as an absent value. Used for
+/// `container_name` so a stray `""` (e.g. from a generic parameters-edit
+/// path that isn't schema-driven) can never be mistaken for "this service is
+/// imported from an existing container" — see `MariaDbInputConfig::container_name`.
+fn deserialize_optional_non_empty<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    Ok(opt.filter(|s| !s.is_empty()))
 }
 
 fn default_host() -> String {
@@ -420,6 +447,12 @@ impl MariaDbService {
         format!("mariadb-{}", self.name)
     }
 
+    /// The container this service actually runs in: the imported container's
+    /// real name when `config.container_name` is set, otherwise the derived
+    /// `mariadb-{name}`. Every operation that talks to the live container
+    /// (admin SQL, backup, restore, binlog shipping, start/stop) must resolve
+    /// through this, not `get_container_name()` directly, or it targets a
+    /// synthesized name that doesn't exist for imported services.
     fn get_live_container_name(&self, config: &MariaDbConfig) -> String {
         config
             .container_name
@@ -562,13 +595,7 @@ impl MariaDbService {
             .map_err(|e| anyhow::anyhow!("Failed to create MariaDB volume: {}", e))?;
 
         let mut host_config = bollard::models::HostConfig {
-            port_bindings: Some(HashMap::from([(
-                "3306/tcp".to_string(),
-                Some(vec![bollard::models::PortBinding {
-                    host_ip: Some("0.0.0.0".to_string()),
-                    host_port: Some(config.port.clone()),
-                }]),
-            )])),
+            port_bindings: Some(crate::utils::local_port_binding("3306/tcp", &config.port)),
             mounts: Some(vec![bollard::models::Mount {
                 target: Some("/var/lib/mysql".to_string()),
                 source: Some(volume_name),
@@ -2170,7 +2197,8 @@ impl MariaDbService {
     ///   only meaningful when that file is the final segment replayed. A bare
     ///   position (no `file:`) is rejected as ambiguous across segments.
     /// - `Xid`   → GTID stop is not yet expressible via a single mysqlbinlog
-    ///   invocation here; rejected rather than silently mis-recovering.
+    ///   invocation here; rejected rather than silently recovering to the
+    ///   wrong point.
     /// - `Name`  → no MariaDB equivalent; rejected.
     pub(crate) fn recovery_target_to_stop_flag(
         target: &RecoveryTarget,
@@ -3644,9 +3672,9 @@ mod tests {
             password: Some("secretpass".to_string()),
             root_password: Some("rootpass1".to_string()),
             docker_image: DEFAULT_MARIADB_IMAGE.to_string(),
+            container_name: None,
             size_profile: MariaDbSizeProfile::Standard,
             binlog_archive_interval: BinlogArchiveInterval::Min15,
-            container_name: None,
         });
 
         assert_eq!(config.size_profile, MariaDbSizeProfile::Standard);
@@ -4182,9 +4210,9 @@ mod tests {
             password: None,
             root_password: None,
             docker_image: default_docker_image(),
+            container_name: None,
             size_profile: MariaDbSizeProfile::default(),
             binlog_archive_interval: BinlogArchiveInterval::default(),
-            container_name: None,
         };
 
         let config: MariaDbConfig = input.into();
@@ -4222,9 +4250,9 @@ mod tests {
             password: Some("mypassword".to_string()),
             root_password: Some("myrootpassword".to_string()),
             docker_image: "mariadb:11.4".to_string(),
+            container_name: None,
             size_profile: MariaDbSizeProfile::default(),
             binlog_archive_interval: BinlogArchiveInterval::default(),
-            container_name: None,
         };
 
         let config: MariaDbConfig = input.into();
@@ -4667,5 +4695,19 @@ mod tests {
         // which version upgrades actually happen.
         let env_vars = ["MARIADB_AUTO_UPGRADE=1".to_string()];
         assert!(env_vars.contains(&"MARIADB_AUTO_UPGRADE=1".to_string()));
+    }
+
+    #[test]
+    fn test_container_name_is_not_a_user_input() {
+        // container_name is derived from the service name at creation time
+        // (`mariadb-{name}`), never supplied by the client — same as Postgres.
+        // The create form is generated from this schema, so the field must not
+        // appear in it (previously a stray "" made init skip container creation
+        // and start POST /containers//start, which Docker answers with a 301).
+        let schema = serde_json::to_value(schemars::schema_for!(MariaDbInputConfig)).unwrap();
+        assert!(
+            !schema.to_string().contains("container_name"),
+            "container_name leaked into the MariaDB create schema"
+        );
     }
 }

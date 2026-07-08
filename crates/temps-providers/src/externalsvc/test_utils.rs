@@ -460,6 +460,7 @@ pub fn create_mock_external_service(
         health_metadata: None,
         metrics_enabled: false,
         default_backup_provisioned: false,
+        container_name: None,
     }
 }
 

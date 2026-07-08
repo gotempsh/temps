@@ -269,6 +269,7 @@ impl ChunkWriterService {
         let chunk_id = Uuid::new_v4();
         let first_line = &data.lines[0];
         let project_id = first_line.project_id;
+        let external_service_id = first_line.external_service_id;
         let service = first_line.service.clone();
         let env = first_line.env.clone();
         let deploy_id = first_line.deploy_id;
@@ -312,6 +313,7 @@ impl ChunkWriterService {
             .unwrap_or(0);
         let storage_key = build_storage_key(
             project_id,
+            external_service_id,
             &env,
             &service,
             &date,
@@ -344,6 +346,7 @@ impl ChunkWriterService {
             meta: ChunkMeta {
                 id: chunk_id,
                 project_id,
+                external_service_id,
                 env,
                 service,
                 container_id: container_id.to_string(),
@@ -388,6 +391,7 @@ mod tests {
             service: "web".to_string(),
             env: "1".to_string(),
             project_id: 1,
+            external_service_id: None,
             deploy_id: None,
             node_id: None,
             node_name: None,

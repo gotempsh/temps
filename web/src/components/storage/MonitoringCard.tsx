@@ -5,12 +5,8 @@
  */
 
 import { Button } from '@/components/ui/button'
-import {
-  Card,
-  CardContent,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card'
+import { TOOLTIP_CONTENT_STYLE, TOOLTIP_LABEL_STYLE } from '@/lib/chart-tooltip'
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import {
   Collapsible,
   CollapsibleContent,
@@ -152,8 +148,18 @@ const ENGINE_STAT_METRICS: Record<EngineKind, string[]> = {
     'mongo.op_query_total',
     'mongo.replication_buffer_ratio',
   ],
-  s3: ['s3.bucket_count', 's3.total_size_bytes', 's3.capacity_usable_total_bytes', 's3.object_count'],
-  rustfs: ['rustfs_cluster_buckets_total', 'rustfs_cluster_capacity_usable_total_bytes', 'rustfs_cluster_capacity_used_bytes', 'rustfs_cluster_objects_total'],
+  s3: [
+    's3.bucket_count',
+    's3.total_size_bytes',
+    's3.capacity_usable_total_bytes',
+    's3.object_count',
+  ],
+  rustfs: [
+    'rustfs_cluster_buckets_total',
+    'rustfs_cluster_capacity_usable_total_bytes',
+    'rustfs_cluster_capacity_used_bytes',
+    'rustfs_cluster_objects_total',
+  ],
 }
 
 const DEFAULT_CHART_METRIC: Record<EngineKind, string> = {
@@ -281,7 +287,8 @@ function isNormalEngine(engine: string): engine is EngineKind {
 }
 
 function normalizeEngine(engine: string, dockerImage?: string): EngineKind {
-  if (engine === 's3' && dockerImage?.toLowerCase().includes('rustfs')) return 'rustfs'
+  if (engine === 's3' && dockerImage?.toLowerCase().includes('rustfs'))
+    return 'rustfs'
   return isNormalEngine(engine) ? engine : 'postgres'
 }
 
@@ -323,9 +330,7 @@ function formatMetricValue(name: string, value: number): string {
 function labelForMetric(name: string): string {
   // Strip engine prefix (e.g. "pg.", "redis.", "mongo.", "s3.")
   const bare = name.replace(/^[a-z0-9]+\./, '')
-  return bare
-    .replace(/_/g, ' ')
-    .replace(/\b\w/g, (c) => c.toUpperCase())
+  return bare.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
 }
 
 // ---------------------------------------------------------------------------
@@ -499,7 +504,8 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
   const queryClient = useQueryClient()
   const [open, setOpen] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
-  const [ruleToDelete, setRuleToDelete] = useState<ServiceAlertRuleResponse | null>(null)
+  const [ruleToDelete, setRuleToDelete] =
+    useState<ServiceAlertRuleResponse | null>(null)
   // Track which rule is being threshold-edited inline: ruleId -> string value
   const [editingThreshold, setEditingThreshold] = useState<
     Record<number, string>
@@ -561,8 +567,8 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
               <div className="flex flex-col items-center gap-3 rounded-lg border border-dashed border-border py-8 text-center">
                 <Activity className="h-6 w-6 text-muted-foreground" />
                 <p className="max-w-xs text-sm text-muted-foreground">
-                  No alert rules yet. Add one to get notified when metrics cross a
-                  threshold.
+                  No alert rules yet. Add one to get notified when metrics cross
+                  a threshold.
                 </p>
               </div>
             ) : (
@@ -571,9 +577,13 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
                   <TableHeader>
                     <TableRow>
                       <TableHead>Name</TableHead>
-                      <TableHead className="hidden sm:table-cell">Metric</TableHead>
+                      <TableHead className="hidden sm:table-cell">
+                        Metric
+                      </TableHead>
                       <TableHead>Threshold</TableHead>
-                      <TableHead className="hidden sm:table-cell">Severity</TableHead>
+                      <TableHead className="hidden sm:table-cell">
+                        Severity
+                      </TableHead>
                       <TableHead>Status</TableHead>
                       <TableHead className="w-8" />
                     </TableRow>
@@ -763,7 +773,7 @@ const CHART_LINE_COLOR = '#0070f3'
 function LiveMetrics({ serviceId, engine, latestMetrics }: LiveMetricsProps) {
   const statMetrics = ENGINE_STAT_METRICS[engine]
   const [selectedMetric, setSelectedMetric] = useState(
-    DEFAULT_CHART_METRIC[engine],
+    DEFAULT_CHART_METRIC[engine]
   )
   const [rangeHours, setRangeHours] = useState(1)
 
@@ -840,9 +850,7 @@ function LiveMetrics({ serviceId, engine, latestMetrics }: LiveMetricsProps) {
                 {labelForMetric(name)}
               </span>
               <span className="text-base font-semibold tabular-nums text-foreground">
-                {latest != null
-                  ? formatMetricValue(name, latest.value)
-                  : '—'}
+                {latest != null ? formatMetricValue(name, latest.value) : '—'}
               </span>
             </button>
           )
@@ -852,7 +860,9 @@ function LiveMetrics({ serviceId, engine, latestMetrics }: LiveMetricsProps) {
       {/* Range selector + chart */}
       <div className="space-y-2 overflow-visible">
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <span className="text-sm font-medium">{labelForMetric(selectedMetric)}</span>
+          <span className="text-sm font-medium">
+            {labelForMetric(selectedMetric)}
+          </span>
           <div className="flex gap-1">
             {RANGE_OPTIONS.map((opt) => (
               <Button
@@ -909,20 +919,8 @@ function LiveMetrics({ serviceId, engine, latestMetrics }: LiveMetricsProps) {
                 <Tooltip
                   wrapperStyle={{ zIndex: 50 }}
                   allowEscapeViewBox={{ x: true, y: true }}
-                  contentStyle={{
-                    fontSize: 12,
-                    backgroundColor: 'hsl(var(--popover))',
-                    border: '1px solid hsl(var(--border))',
-                    borderRadius: '6px',
-                    color: 'hsl(var(--popover-foreground))',
-                    boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.3)',
-                    padding: '6px 10px',
-                  }}
-                  labelStyle={{
-                    color: 'hsl(var(--muted-foreground))',
-                    fontSize: 11,
-                    marginBottom: 2,
-                  }}
+                  contentStyle={TOOLTIP_CONTENT_STYLE}
+                  labelStyle={TOOLTIP_LABEL_STYLE}
                   itemStyle={{ color: CHART_LINE_COLOR }}
                   cursor={{ stroke: 'rgba(128,128,128,0.3)', strokeWidth: 1 }}
                   formatter={(v: number) => [
@@ -974,7 +972,13 @@ export interface MonitoringCardProps {
  *   B — enabled, no data yet → pending card with polling
  *   C — data available → live stat row + chart + alert rules
  */
-export function MonitoringCard({ serviceId, engine, dockerImage, metricsEnabled = false, onMonitoringChange }: MonitoringCardProps) {
+export function MonitoringCard({
+  serviceId,
+  engine,
+  dockerImage,
+  metricsEnabled = false,
+  onMonitoringChange,
+}: MonitoringCardProps) {
   const queryClient = useQueryClient()
   const normalEngine = normalizeEngine(engine, dockerImage)
 
@@ -1025,7 +1029,9 @@ export function MonitoringCard({ serviceId, engine, dockerImage, metricsEnabled 
   const enableMonitoring = useMutation({
     ...externalServiceMetricsToggleMutation(),
     onSuccess: () => {
-      toast.success('Monitoring enabled — first metrics appear within 30 seconds.')
+      toast.success(
+        'Monitoring enabled — first metrics appear within 30 seconds.'
+      )
       queryClient.invalidateQueries({
         queryKey: externalServiceMetricsGetLatestQueryKey({
           path: { id: serviceId },
@@ -1056,7 +1062,8 @@ export function MonitoringCard({ serviceId, engine, dockerImage, metricsEnabled 
 
   // State A: monitoring disabled for this service. Either the service flag is
   // off (no API call made at all) or the API reported it's not enabled.
-  const isDisabled = !metricsEnabled || (error != null && isMonitoringUnavailable(error))
+  const isDisabled =
+    !metricsEnabled || (error != null && isMonitoringUnavailable(error))
 
   if (isDisabled) {
     return (
@@ -1108,7 +1115,9 @@ export function MonitoringCard({ serviceId, engine, dockerImage, metricsEnabled 
               <span className="relative inline-flex h-3 w-3 rounded-full bg-primary" />
             </span>
             <div>
-              <p className="text-sm font-medium">Setting up metrics collection…</p>
+              <p className="text-sm font-medium">
+                Setting up metrics collection…
+              </p>
               <p className="text-muted-foreground text-sm">
                 First metrics appear within 30 seconds.
               </p>
@@ -1126,9 +1135,11 @@ export function MonitoringCard({ serviceId, engine, dockerImage, metricsEnabled 
             disabled={disableMonitoring.isPending}
             className="text-muted-foreground hover:text-destructive"
           >
-            {disableMonitoring.isPending
-              ? <Loader2 className="h-4 w-4 animate-spin" />
-              : <PowerOff className="h-4 w-4" />}
+            {disableMonitoring.isPending ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <PowerOff className="h-4 w-4" />
+            )}
             <span className="ml-1.5 hidden sm:inline">Disable</span>
           </Button>
         </CardContent>
@@ -1162,9 +1173,11 @@ export function MonitoringCard({ serviceId, engine, dockerImage, metricsEnabled 
             disabled={disableMonitoring.isPending}
             className="text-muted-foreground hover:text-destructive"
           >
-            {disableMonitoring.isPending
-              ? <Loader2 className="h-4 w-4 animate-spin" />
-              : <PowerOff className="h-4 w-4" />}
+            {disableMonitoring.isPending ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <PowerOff className="h-4 w-4" />
+            )}
             <span className="ml-1.5 hidden sm:inline">Disable</span>
           </Button>
         </CardTitle>

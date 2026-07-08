@@ -507,7 +507,8 @@ impl TempsPlugin for OtelPlugin {
                 ))
             };
 
-            // Create app state for handlers
+            // Create app state for handlers. The `project_access_checker` is
+            // injected in `configure_routes` (after all services register).
             let app_state = OtelAppState {
                 otel_service: otel_service.clone(),
                 metrics_store: Some(metrics_store.clone()),
@@ -518,6 +519,7 @@ impl TempsPlugin for OtelPlugin {
                 audit_service: audit_service.clone(),
                 trace_hint_tx: Some(trace_hint_tx),
                 cross_project_service: cross_project_service.clone(),
+                project_access_checker: None,
             };
             context.register_service(Arc::new(app_state.clone()));
 
@@ -664,7 +666,9 @@ impl TempsPlugin for OtelPlugin {
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         let app_state_arc = context.require_service::<OtelAppState>();
-        let app_state: OtelAppState = app_state_arc.as_ref().clone();
+        let mut app_state: OtelAppState = app_state_arc.as_ref().clone();
+        app_state.project_access_checker =
+            context.get_service::<dyn temps_core::ProjectAccessChecker>();
 
         let router = handlers::configure_routes().with_state(app_state);
 

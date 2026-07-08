@@ -7063,6 +7063,47 @@ echo "[restore] Pre-seed complete"
                 &parameters,
             )?;
 
+            // A freshly-constructed instance has no in-memory config, so
+            // `start()` can't resolve an imported service's real container
+            // name (it only lives in `config.container_name`). Hydrate it via
+            // `init()` first — same fix as `stop_service` — so `start()`
+            // targets the real container instead of failing with
+            // "configuration not found" and falling back to a full
+            // re-initialize.
+            #[allow(deprecated)]
+            let needs_config_hydration = matches!(
+                service_type_enum,
+                ServiceType::Mariadb
+                    | ServiceType::Postgres
+                    | ServiceType::Redis
+                    | ServiceType::Mongodb
+                    | ServiceType::Minio
+            );
+            if needs_config_hydration {
+                let parameters = self.get_service_parameters(service_id).await?;
+                if parameters.contains_key("container_name") {
+                    let service_config = ServiceConfig {
+                        name: service.name.clone(),
+                        service_type: service_type_enum,
+                        version: service.version.clone(),
+                        parameters: serde_json::to_value(parameters).map_err(|e| {
+                            ExternalServiceError::InternalError {
+                                reason: format!("Failed to serialize parameters: {}", e),
+                            }
+                        })?,
+                    };
+                    service_instance.init(service_config).await.map_err(|e| {
+                        ExternalServiceError::StartFailed {
+                            id: service_id,
+                            reason: format!(
+                                "Failed to initialize imported {} service before start: {}",
+                                service_type_enum, e
+                            ),
+                        }
+                    })?;
+                }
+            }
+
             match service_instance.start().await {
                 Ok(()) => {}
                 Err(e) => {
@@ -7191,7 +7232,16 @@ echo "[restore] Pre-seed complete"
                 &parameters,
             )?;
 
-            if service_type_enum == ServiceType::Mariadb {
+            #[allow(deprecated)]
+            let needs_config_hydration = matches!(
+                service_type_enum,
+                ServiceType::Mariadb
+                    | ServiceType::Postgres
+                    | ServiceType::Redis
+                    | ServiceType::Mongodb
+                    | ServiceType::Minio
+            );
+            if needs_config_hydration {
                 let parameters = self.get_service_parameters(service_id).await?;
                 if parameters.contains_key("container_name") {
                     let service_config = ServiceConfig {
@@ -7208,8 +7258,8 @@ echo "[restore] Pre-seed complete"
                         ExternalServiceError::StopFailed {
                             id: service_id,
                             reason: format!(
-                                "Failed to initialize imported MariaDB service before stop: {}",
-                                e
+                                "Failed to initialize imported {} service before stop: {}",
+                                service_type_enum, e
                             ),
                         }
                     })?;
@@ -7480,7 +7530,15 @@ echo "[restore] Pre-seed complete"
         // Use Docker container name and internal port directly — these match what
         // get_runtime_env_vars() puts in env var values (always Docker container names,
         // regardless of DeploymentMode). This is critical for cross-node env var rewriting.
-        let container_name = service_instance.get_docker_container_name();
+        // An imported service's real container name (stored raw in parameters, since
+        // get_docker_container_name() only knows the derived `{type}-{name}` form)
+        // wins over the derived one.
+        let container_name = service_config
+            .parameters
+            .get("container_name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| service_instance.get_docker_container_name());
         let internal_port = service_instance.get_docker_internal_port();
 
         // get_local_address returns "localhost:{host_port}" — we need the host port
@@ -8500,7 +8558,11 @@ echo "[restore] Pre-seed complete"
 
         for (key, value) in &request.parameters {
             match key.as_str() {
-                "username" | "password" | "database" | "root_password" => {
+                // S3/MinIO import reads access_key/secret_key from `credentials`
+                // (not additional_config) — without them here, the S3 provider
+                // rejects every import with "Access key is required".
+                "username" | "password" | "database" | "root_password" | "access_key"
+                | "secret_key" => {
                     if let Some(str_value) = value.as_str() {
                         credentials.insert(key.clone(), str_value.to_string());
                     }
@@ -8648,12 +8710,23 @@ echo "[restore] Pre-seed complete"
             .encrypt(config_json.as_bytes())
             .map_err(|e| anyhow::anyhow!("Failed to encrypt service configuration: {}", e))?;
 
+        // Plaintext real container name so the log collector can map the
+        // imported (label-less) container back to this service without
+        // decrypting `config`. Every provider's import_from_container stamps
+        // `container_name` into the parameters.
+        let imported_container_name = service_config
+            .parameters
+            .get("container_name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
         let external_service = external_services::ActiveModel {
             name: Set(service_config.name.clone()),
             service_type: Set(service_config.service_type.to_string()),
             version: Set(service_config.version.clone()),
             status: Set("running".to_string()),
             config: Set(Some(encrypted_config)),
+            container_name: Set(imported_container_name),
             ..Default::default()
         }
         .insert(self.db.as_ref())
@@ -8722,10 +8795,14 @@ echo "[restore] Pre-seed complete"
                 service_type,
                 &parameters,
             )?;
-            Ok(vec![(
-                "standalone".to_string(),
-                instance.get_docker_container_name(),
-            )])
+            // An imported service's real container name wins over the derived
+            // `{type}-{name}` one — see the identical pattern in `get_runtime_info`.
+            let container_name = parameters
+                .get("container_name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| instance.get_docker_container_name());
+            Ok(vec![("standalone".to_string(), container_name)])
         }
     }
 

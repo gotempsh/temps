@@ -43,9 +43,10 @@ cookie = { workspace = true }
 ipnet = "2.10"
 arc-swap = "1.7"
 # Per-cluster CA + per-node certificate issuance for multi-node mTLS (ADR-020 WS-2.1).
-# Pinned to match temps-domains; x509-parser feature enables loading an existing CA
-# and parsing CSRs.
-rcgen = { version = "0.14.8", features = ["x509-parser"] }
+# x509-parser feature enables loading an existing CA and parsing CSRs. Uses the
+# workspace 0.14.8; node_pki.rs was migrated to the 0.14 `Issuer` API in #250
+# (merged from main), so the earlier 0.13.2 pin is no longer needed.
+rcgen = { workspace = true }
 
 # Internal dependencies - only core dependencies to avoid cycles
 temps-memory = { path = "../temps-memory" }

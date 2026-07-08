@@ -18,6 +18,7 @@ temps-entities = { path = "../temps-entities" }
 temps-file-store = { path = "../temps-file-store" }
 temps-geo = { path = "../temps-geo" }
 temps-routes = { path = "../temps-routes" }
+temps-metrics = { path = "../temps-metrics" }
 temps-migrations = { path = "../temps-migrations" }
 serde = { workspace = true }
 tokio = { workspace = true }
@@ -82,4 +83,7 @@ tower = "0.4"
 anyhow = "1.0"
 lazy_static = "1.4"
 temps-presets = { path = "../temps-presets" }
+# Uses the workspace 0.14.8; tls_cert_loader.rs was migrated to the 0.14
+# `Issuer`/`signing_key` API in #250 (merged from main), so the earlier
+# 0.13.2 pin (matching temps-core's) is no longer needed.
 rcgen = { workspace = true }

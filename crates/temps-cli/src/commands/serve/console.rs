@@ -81,6 +81,35 @@ use utoipa_swagger_ui::SwaggerUi;
 // Embed the dist directory at compile time
 static WEBSITE: Dir = include_dir!("$CARGO_MANIFEST_DIR/dist");
 
+/// Optional replacement UI bundle supplied by an embedding binary (EE,
+/// VibeTemps, ...) via [`crate::set_embedded_ui`] before `dispatch`. When
+/// set, the SPA fallback serves this bundle at the document root instead of
+/// the OSS console. The OSS console's API surface is unaffected.
+static WEBSITE_OVERRIDE: std::sync::OnceLock<&'static Dir<'static>> = std::sync::OnceLock::new();
+
+pub(crate) fn set_embedded_ui(dir: &'static Dir<'static>) -> Result<(), &'static str> {
+    WEBSITE_OVERRIDE
+        .set(dir)
+        .map_err(|_| "embedded UI override already set")
+}
+
+/// Optional extra listener that serves the ORIGINAL temps console (admin API
+/// and original SPA bundle) when the document root has been overridden by an
+/// embedding binary. A separate listener — not a path prefix — because the
+/// console SPA assumes it owns its origin (absolute asset paths, client-side
+/// routing). Bind to loopback unless you mean to expose it.
+static PLATFORM_CONSOLE_ADDR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+pub(crate) fn set_platform_console_addr(addr: String) -> Result<(), &'static str> {
+    PLATFORM_CONSOLE_ADDR
+        .set(addr)
+        .map_err(|_| "platform console address already set")
+}
+
+fn website() -> &'static Dir<'static> {
+    WEBSITE_OVERRIDE.get().copied().unwrap_or(&WEBSITE)
+}
+
 /// Ensure the system user (id=0) exists in the database.
 /// Emit the anonymous `instance_started` telemetry event with non-identifying
 /// depth-of-usage counts (number of projects, environments, managed services,
@@ -586,6 +615,16 @@ fn create_swagger_router(plugin_manager: &PluginManager) -> anyhow::Result<Route
 
 /// Static file handler for embedded website
 async fn serve_static_file(req: Request) -> Response {
+    serve_static_from(website(), req)
+}
+
+/// Same, but always the ORIGINAL console bundle (for the platform-console
+/// listener when the root bundle has been overridden by an embedding binary).
+async fn serve_original_console(req: Request) -> Response {
+    serve_static_from(&WEBSITE, req)
+}
+
+fn serve_static_from(site: &'static Dir<'static>, req: Request) -> Response {
     let raw_path = req.uri().path();
 
     // Never serve the SPA for /api/ paths — those should 404 if unmatched
@@ -612,7 +651,7 @@ async fn serve_static_file(req: Request) -> Response {
 
     debug!("Attempting to serve static file: {}", path);
 
-    match WEBSITE.get_file(path) {
+    match site.get_file(path) {
         Some(file) => {
             let mime_type = mime_guess::from_path(path)
                 .first_or_octet_stream()
@@ -638,7 +677,7 @@ async fn serve_static_file(req: Request) -> Response {
         }
         None => {
             // If file not found, try serving index.html (for SPA routing)
-            if let Some(index) = WEBSITE.get_file("index.html") {
+            if let Some(index) = site.get_file("index.html") {
                 debug!("File not found, serving index.html for SPA routing");
                 Response::builder()
                     .status(StatusCode::OK)
@@ -1917,6 +1956,16 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                     // observability, runtime/deploy status, errors, and MASKED
                     // metadata. Adding an entry is a security decision — verify the
                     // operation's response contains NO decrypted secret/token/key.
+                    //
+                    // Analytics `custom_data`/`event_data` (freeform JSON on
+                    // visitors/events) is an ACCEPTED risk, not an oversight: it's
+                    // developer-controlled data the project operator already sends
+                    // themselves, gated by the same AnalyticsRead + project scope
+                    // as every other analytics tool below — not a platform secret.
+                    // Raw HTTP request/response headers (session logs) and
+                    // session-replay DOM/keystroke capture are excluded on purpose;
+                    // those can carry Authorization/Cookie values or typed
+                    // passwords and are a different risk class entirely.
                     let allowlist: Vec<String> = [
                         // ── OpenTelemetry: metrics / traces / logs / health ──
                         "query_metrics",
@@ -2028,12 +2077,141 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                         // ── Analytics (the user's own traffic data) ──
                         "get_general_stats",
                         "get_visitor_stats",
+                        "get_visitors",
                         "get_today_stats",
                         "get_recent_activity",
                         "get_events_timeline",
                         "get_events_count",
                         "get_page_paths",
                         "get_performance_metrics",
+                        // Aggregates / counts / booleans — no PII, no secrets
+                        "get_analytics_events_count",
+                        "get_event_detail",
+                        "get_visitor_facets",
+                        "check_analytics_has_events",
+                        "get_page_path_detail",
+                        "get_page_hourly_sessions",
+                        "get_page_paths_sparklines",
+                        "get_page_flow",
+                        "has_analytics_events",
+                        "get_event_type_breakdown",
+                        "get_active_visitors",
+                        "get_hourly_visits",
+                        "get_unique_counts",
+                        "get_aggregated_buckets",
+                        "get_dashboard_projects_analytics",
+                        "get_metrics_over_time",
+                        "get_grouped_page_metrics",
+                        "has_performance_metrics",
+                        "get_funnel_metrics",
+                        "list_funnels",
+                        "get_unique_events",
+                        // Per-visitor/session metadata — same risk class as
+                        // get_visitors/get_visitor_stats above (IP, geolocation,
+                        // user_agent, is_crawler, custom_data/event_data)
+                        "get_event_visitors",
+                        "get_visitor_details",
+                        "get_visitor_info",
+                        "get_analytics_visitor_sessions",
+                        "get_visitor_journey",
+                        "get_session_details",
+                        "get_session_events",
+                        "get_page_path_visitors",
+                        "get_analytics_active_visitors",
+                        "get_live_visitors_list",
+                        "get_visitor_by_id",
+                        "get_visitor_by_guid",
+                        // Excluded on purpose: get_property_breakdown /
+                        // get_property_timeline (developer custom-property VALUES
+                        // by name — held pending explicit review), get_session_logs
+                        // (raw request/response headers), and all
+                        // temps-analytics-session-replay reads (raw DOM/keystroke
+                        // capture) — see allowlist comment above.
+                        //
+                        // ── Auth / API keys / OIDC (masked keys/secrets only) ──
+                        "list_api_keys",
+                        "get_api_key",
+                        "list_public_providers",
+                        "list_oidc_providers",
+                        "list_oidc_provider_users",
+                        "list_oidc_role_mappings",
+                        "get_current_user",
+                        // ── Webhooks (no signing secrets — those are excluded) ──
+                        "list_webhooks",
+                        "get_webhook",
+                        "list_deliveries",
+                        "get_delivery",
+                        "list_event_types",
+                        // ── KV / Blob: status only, no connection strings ──
+                        "kv_status",
+                        "blob_status",
+                        "blob_list",
+                        // ── Email: stats/tracking/DNS, no provider credentials ──
+                        "list_emails",
+                        "get_email",
+                        "get_email_stats",
+                        "list_email_domains",
+                        "get_global_event_stats",
+                        "get_global_events",
+                        "get_email_tracking",
+                        "get_email_events",
+                        "get_email_links",
+                        // ── Git: provider/connection/repo metadata, no OAuth tokens ──
+                        "list_git_providers",
+                        "get_git_provider",
+                        "list_connections",
+                        "list_repositories_by_connection",
+                        "list_repositories_by_provider",
+                        "list_synced_repositories",
+                        "get_repository_preset_by_name",
+                        "get_repository_by_name",
+                        "get_public_branches",
+                        "get_public_repository",
+                        // ── Agents / skills / MCP / sandbox — config + run status ──
+                        "list_agents",
+                        "get_agent",
+                        "list_skills",
+                        "get_skill",
+                        "list_mcps",
+                        "get_mcp",
+                        "list_global_skills",
+                        "get_global_skill",
+                        "list_global_mcps",
+                        "get_global_mcp",
+                        "get_run",
+                        "get_cli_status",
+                        "get_sandbox_status",
+                        "get_global_sandbox_status",
+                        // ── AI Gateway: masked keys, usage/cost stats, conversations ──
+                        "list_models",
+                        "get_usage_summary",
+                        "get_usage_by_provider",
+                        "get_usage_timeseries",
+                        "get_usage_top_models",
+                        "get_usage_recent",
+                        "get_conversations",
+                        "get_conversation_detail",
+                        "get_pricing",
+                        "list_provider_keys",
+                        // ── Status page: monitors/incidents/uptime ──
+                        "list_monitors",
+                        "get_monitor",
+                        "get_uptime_history",
+                        "get_bucketed_status",
+                        "list_incidents",
+                        "get_incident",
+                        "get_incident_updates",
+                        "get_bucketed_incidents",
+                        // ── Vulnerability scanning: results, no credentials ──
+                        "list_project_scans",
+                        "get_scan",
+                        "get_scan_vulnerabilities",
+                        "get_latest_scan",
+                        "get_latest_scans_per_environment",
+                        "get_scan_by_deployment",
+                        // ── Import ──
+                        "list_sources",
+                        "get_import_status",
                     ]
                     .iter()
                     .map(|s| s.to_string())
@@ -2101,6 +2279,12 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                             //    account-global domain create/delete excluded) ──
                             "add_environment_domain",
                             "delete_environment_domain",
+                            // ── Managed external services (databases, caches, etc.) —
+                            //    provisioning a new container and linking an existing
+                            //    one to a project. Both reversible (a service can be
+                            //    unlinked / left running unused; nothing is deleted).
+                            "create_service",
+                            "link_service_to_project",
                         ]
                         .iter()
                         .map(|s| s.to_string())
@@ -2204,6 +2388,17 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let public_app = Router::new()
         .merge(health_router(ready_flag.clone()))
         .nest("/api", public_router);
+
+    // Platform-console listener: when an embedding binary overrode the root
+    // bundle AND configured an address, serve the ORIGINAL console (same
+    // admin API + admin gate) on its own listener/origin.
+    let platform_router =
+        if WEBSITE_OVERRIDE.get().is_some() && PLATFORM_CONSOLE_ADDR.get().is_some() {
+            Some(admin_router.clone())
+        } else {
+            None
+        };
+
     let admin_app = Router::new()
         .nest("/api", admin_router)
         .fallback(serve_static_file);
@@ -2219,6 +2414,28 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         admin_gate_handle.clone(),
         super::admin_gate::admin_gate,
     ));
+
+    if let (Some(router), Some(addr)) = (platform_router, PLATFORM_CONSOLE_ADDR.get()) {
+        let platform_app = Router::new()
+            .nest("/api", router)
+            .fallback(serve_original_console)
+            .layer(axum::middleware::from_fn_with_state(
+                admin_gate_handle.clone(),
+                super::admin_gate::admin_gate,
+            ));
+        let listener = TcpListener::bind(addr).await?;
+        info!("Platform console (original temps UI) listening on {addr}");
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(
+                listener,
+                platform_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            {
+                tracing::error!("Platform console listener failed: {e}");
+            }
+        });
+    }
 
     info!("Plugin system initialized successfully with static file serving");
 

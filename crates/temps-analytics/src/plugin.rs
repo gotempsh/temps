@@ -64,9 +64,13 @@ impl TempsPlugin for AnalyticsPlugin {
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         // Get the AnalyticsService from the context
         let analytics_service = context.require_service::<dyn Analytics>();
+        let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
 
         // Create AppState
-        let app_state = Arc::new(AppState { analytics_service });
+        let app_state = Arc::new(AppState {
+            analytics_service,
+            project_access_checker,
+        });
 
         // Configure routes with the state
         let routes = configure_routes().with_state(app_state);

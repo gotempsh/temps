@@ -63,12 +63,14 @@ impl TempsPlugin for SessionReplayPlugin {
         let telemetry = context
             .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
             .unwrap_or_else(|| std::sync::Arc::new(temps_core::telemetry::NoopTelemetryReporter));
+        let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
         let routes = crate::handlers::configure_routes().with_state(Arc::new(
             crate::handlers::types::AppState {
                 session_replay_service,
                 audit_service,
                 route_table,
                 telemetry,
+                project_access_checker,
             },
         ));
 
@@ -89,6 +91,7 @@ impl TempsPlugin for SessionReplayPlugin {
                 audit_service,
                 route_table,
                 telemetry,
+                project_access_checker: None,
             },
         ));
 

@@ -222,11 +222,14 @@ impl TempsPlugin for ErrorTrackingPlugin {
         let dsn_service = context.require_service::<DSNService>();
         let source_map_service = context.require_service::<SourceMapService>();
 
+        let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
+
         // Admin: error tracking dashboard + alert rules
         let error_tracking_state = Arc::new(crate::handlers::types::AppState {
             error_tracking_service: error_tracking_service.clone(),
             alert_service: alert_service.clone(),
             audit_service: audit_service.clone(),
+            project_access_checker: project_access_checker.clone(),
         });
         let error_tracking_routes =
             crate::handlers::handler::configure_routes().with_state(error_tracking_state.clone());
@@ -246,6 +249,7 @@ impl TempsPlugin for ErrorTrackingPlugin {
         let source_map_state = Arc::new(crate::handlers::source_map_handlers::SourceMapAppState {
             source_map_service: source_map_service.clone(),
             audit_service: audit_service.clone(),
+            project_access_checker,
         });
         let source_map_routes = crate::handlers::source_map_handlers::configure_source_map_routes()
             .with_state(source_map_state);

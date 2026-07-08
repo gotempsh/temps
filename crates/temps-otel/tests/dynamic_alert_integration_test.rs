@@ -684,6 +684,7 @@ async fn test_delete_alert_rejects_cross_project_rule_id_before_touching_evaluat
         audit_service: Arc::new(NoOpAuditLogger),
         cross_project_service,
         trace_hint_tx: None,
+        project_access_checker: None,
     };
 
     let attacker_auth = AuthContext::new_session(attacker_user, Role::Admin);

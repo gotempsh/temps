@@ -89,6 +89,7 @@ impl LogSearchService {
                 .metadata_service
                 .list_sources(
                     filter.project_id,
+                    filter.external_service_id,
                     filter.envs.first().map(|s| s.as_str()),
                     filter.deploy_id,
                     filter.start_time,
@@ -212,6 +213,7 @@ impl LogSearchService {
             .metadata_service
             .find_chunks(
                 filter.project_id,
+                filter.external_service_id,
                 service_filter,
                 filter.start_time,
                 effective_end,
@@ -655,6 +657,7 @@ mod tests {
     fn make_filter() -> LogSearchFilter {
         LogSearchFilter {
             project_id: 1,
+            external_service_id: None,
             start_time: Utc::now() - Duration::hours(1),
             end_time: Utc::now() + Duration::hours(1),
             levels: vec![],
@@ -682,6 +685,7 @@ mod tests {
             service: "web".to_string(),
             env: "1".to_string(),
             project_id: 1,
+            external_service_id: None,
             deploy_id: None,
             node_id: None,
             node_name: None,
@@ -984,6 +988,7 @@ mod tests {
             let project_id = test_project_id();
             let web_ctx = ContainerContext {
                 project_id,
+                external_service_id: None,
                 env: "production".into(),
                 service: "web".into(),
                 container_id: "cnt-web".into(),
@@ -991,6 +996,7 @@ mod tests {
             };
             let worker_ctx = ContainerContext {
                 project_id,
+                external_service_id: None,
                 env: "production".into(),
                 service: "worker".into(),
                 container_id: "cnt-worker".into(),
@@ -1004,6 +1010,7 @@ mod tests {
 
             let mut filter = LogSearchFilter {
                 project_id,
+                external_service_id: None,
                 start_time: Utc::now() - Duration::hours(1),
                 end_time: Utc::now() + Duration::hours(1),
                 levels: vec![],
@@ -1041,6 +1048,7 @@ mod tests {
                 .map(|svc| {
                     let ctx = ContainerContext {
                         project_id,
+                        external_service_id: None,
                         env: "production".into(),
                         service: svc.to_string(),
                         container_id: format!("cnt-{}", svc),
@@ -1055,6 +1063,7 @@ mod tests {
 
             let filter = LogSearchFilter {
                 project_id,
+                external_service_id: None,
                 start_time: Utc::now() - Duration::hours(1),
                 end_time: Utc::now() + Duration::hours(1),
                 levels: vec![],
@@ -1084,6 +1093,7 @@ mod tests {
             let project_id = test_project_id();
             let prod_ctx = ContainerContext {
                 project_id,
+                external_service_id: None,
                 env: "production".into(),
                 service: "web".into(),
                 container_id: "cnt-prod".into(),
@@ -1091,6 +1101,7 @@ mod tests {
             };
             let staging_ctx = ContainerContext {
                 project_id,
+                external_service_id: None,
                 env: "staging".into(),
                 service: "web".into(),
                 container_id: "cnt-staging".into(),
@@ -1103,6 +1114,7 @@ mod tests {
 
             let filter = LogSearchFilter {
                 project_id,
+                external_service_id: None,
                 start_time: Utc::now() - Duration::hours(1),
                 end_time: Utc::now() + Duration::hours(1),
                 levels: vec![],
@@ -1132,6 +1144,7 @@ mod tests {
             let deploy = test_deploy_id();
             let ctx_with_deploy = ContainerContext {
                 project_id,
+                external_service_id: None,
                 env: "production".into(),
                 service: "web".into(),
                 container_id: "cnt-1".into(),
@@ -1139,6 +1152,7 @@ mod tests {
             };
             let ctx_other_deploy = ContainerContext {
                 project_id,
+                external_service_id: None,
                 env: "production".into(),
                 service: "web".into(),
                 container_id: "cnt-2".into(),
@@ -1156,6 +1170,7 @@ mod tests {
 
             let filter = LogSearchFilter {
                 project_id,
+                external_service_id: None,
                 start_time: Utc::now() - Duration::hours(1),
                 end_time: Utc::now() + Duration::hours(1),
                 levels: vec![],
@@ -1184,6 +1199,7 @@ mod tests {
             let project_id = test_project_id();
             let ctx = ContainerContext {
                 project_id,
+                external_service_id: None,
                 env: "production".into(),
                 service: "api".into(),
                 container_id: "cnt-api".into(),
@@ -1196,6 +1212,7 @@ mod tests {
             // Filter: production + api + error only
             let filter = LogSearchFilter {
                 project_id,
+                external_service_id: None,
                 start_time: Utc::now() - Duration::hours(1),
                 end_time: Utc::now() + Duration::hours(1),
                 levels: vec![LogLevel::Error],
@@ -1226,6 +1243,7 @@ mod tests {
 
             let ctx = ContainerContext {
                 project_id,
+                external_service_id: None,
                 env: "production".into(),
                 service: "web".into(),
                 container_id: "cnt-1".into(),
@@ -1239,6 +1257,7 @@ mod tests {
 
             let filter = LogSearchFilter {
                 project_id,
+                external_service_id: None,
                 start_time: Utc::now() - Duration::hours(1),
                 end_time: Utc::now() + Duration::hours(1),
                 levels: vec![],
@@ -1266,6 +1285,7 @@ mod tests {
 
             let ctx = ContainerContext {
                 project_id,
+                external_service_id: None,
                 env: "production".into(),
                 service: "web".into(),
                 container_id: "cnt-1".into(),
@@ -1280,6 +1300,7 @@ mod tests {
             // Partial URL match
             let mut filter = LogSearchFilter {
                 project_id,
+                external_service_id: None,
                 start_time: Utc::now() - Duration::hours(1),
                 end_time: Utc::now() + Duration::hours(1),
                 levels: vec![],
@@ -1314,6 +1335,7 @@ mod tests {
 
             let ctx = ContainerContext {
                 project_id,
+                external_service_id: None,
                 env: "production".into(),
                 service: "web".into(),
                 container_id: "cnt-1".into(),
@@ -1332,6 +1354,7 @@ mod tests {
             // Text "timeout" + level ERROR
             let filter = LogSearchFilter {
                 project_id,
+                external_service_id: None,
                 start_time: Utc::now() - Duration::hours(1),
                 end_time: Utc::now() + Duration::hours(1),
                 levels: vec![LogLevel::Error],
@@ -1362,6 +1385,7 @@ mod tests {
 
             let ctx = ContainerContext {
                 project_id,
+                external_service_id: None,
                 env: "production".into(),
                 service: "api".into(),
                 container_id: "cnt-1".into(),
@@ -1383,6 +1407,7 @@ mod tests {
             // Filter by status=500
             let filter = LogSearchFilter {
                 project_id,
+                external_service_id: None,
                 start_time: Utc::now() - Duration::hours(1),
                 end_time: Utc::now() + Duration::hours(1),
                 levels: vec![],
@@ -1406,6 +1431,7 @@ mod tests {
             // Filter by request_id
             let filter_req = LogSearchFilter {
                 project_id,
+                external_service_id: None,
                 start_time: Utc::now() - Duration::hours(1),
                 end_time: Utc::now() + Duration::hours(1),
                 levels: vec![],
@@ -1436,6 +1462,7 @@ mod tests {
 
             let ctx = ContainerContext {
                 project_id,
+                external_service_id: None,
                 env: "production".into(),
                 service: "api".into(),
                 container_id: "cnt-1".into(),
@@ -1456,6 +1483,7 @@ mod tests {
             // Gt: duration_ms > 30 → true
             let filter_gt = LogSearchFilter {
                 project_id,
+                external_service_id: None,
                 start_time: Utc::now() - Duration::hours(1),
                 end_time: Utc::now() + Duration::hours(1),
                 levels: vec![],
@@ -1479,6 +1507,7 @@ mod tests {
             // Gt: duration_ms > 100 → false
             let filter_gt_high = LogSearchFilter {
                 project_id,
+                external_service_id: None,
                 start_time: Utc::now() - Duration::hours(1),
                 end_time: Utc::now() + Duration::hours(1),
                 levels: vec![],
@@ -1502,6 +1531,7 @@ mod tests {
             // Lt: duration_ms < 100 → true
             let filter_lt = LogSearchFilter {
                 project_id,
+                external_service_id: None,
                 start_time: Utc::now() - Duration::hours(1),
                 end_time: Utc::now() + Duration::hours(1),
                 levels: vec![],
@@ -1525,6 +1555,7 @@ mod tests {
             // Gte: duration_ms >= 45 → true
             let filter_gte = LogSearchFilter {
                 project_id,
+                external_service_id: None,
                 start_time: Utc::now() - Duration::hours(1),
                 end_time: Utc::now() + Duration::hours(1),
                 levels: vec![],
@@ -1548,6 +1579,7 @@ mod tests {
             // Lte: duration_ms <= 44 → false
             let filter_lte = LogSearchFilter {
                 project_id,
+                external_service_id: None,
                 start_time: Utc::now() - Duration::hours(1),
                 end_time: Utc::now() + Duration::hours(1),
                 levels: vec![],
@@ -1578,6 +1610,7 @@ mod tests {
 
             let ctx = ContainerContext {
                 project_id,
+                external_service_id: None,
                 env: "production".into(),
                 service: "web".into(),
                 container_id: "cnt-1".into(),
@@ -1589,6 +1622,7 @@ mod tests {
 
             let filter = LogSearchFilter {
                 project_id,
+                external_service_id: None,
                 start_time: Utc::now() - Duration::hours(1),
                 end_time: Utc::now() + Duration::hours(1),
                 levels: vec![],
@@ -1620,6 +1654,7 @@ mod tests {
 
             let ctx = ContainerContext {
                 project_id,
+                external_service_id: None,
                 env: "production".into(),
                 service: "api".into(),
                 container_id: "cnt-1".into(),
@@ -1634,6 +1669,7 @@ mod tests {
             // Both status=500 AND duration_ms > 1000 → should match
             let filter_both = LogSearchFilter {
                 project_id,
+                external_service_id: None,
                 start_time: Utc::now() - Duration::hours(1),
                 end_time: Utc::now() + Duration::hours(1),
                 levels: vec![],
@@ -1664,6 +1700,7 @@ mod tests {
             // status=500 AND duration_ms > 5000 → second fails
             let filter_partial = LogSearchFilter {
                 project_id,
+                external_service_id: None,
                 start_time: Utc::now() - Duration::hours(1),
                 end_time: Utc::now() + Duration::hours(1),
                 levels: vec![],
@@ -1704,6 +1741,7 @@ mod tests {
             let project_id = test_project_id();
             let ctx = ContainerContext {
                 project_id,
+                external_service_id: None,
                 env: "production".into(),
                 service: "payments".into(),
                 container_id: "cnt-pay".into(),
@@ -1725,6 +1763,7 @@ mod tests {
             // Filter: service=payments → all match
             let filter = LogSearchFilter {
                 project_id,
+                external_service_id: None,
                 start_time: Utc::now() - Duration::hours(1),
                 end_time: Utc::now() + Duration::hours(1),
                 levels: vec![],
@@ -1749,6 +1788,7 @@ mod tests {
             // Filter: service=billing → none match
             let filter_none = LogSearchFilter {
                 project_id,
+                external_service_id: None,
                 start_time: Utc::now() - Duration::hours(1),
                 end_time: Utc::now() + Duration::hours(1),
                 levels: vec![],
@@ -1783,6 +1823,7 @@ mod tests {
             let project_id = test_project_id();
             let ctx = ContainerContext {
                 project_id,
+                external_service_id: None,
                 env: "production".into(),
                 service: "web".into(),
                 container_id: "cnt-remote".into(),
@@ -1811,6 +1852,7 @@ mod tests {
             let project_id = test_project_id();
             let ctx = ContainerContext {
                 project_id,
+                external_service_id: None,
                 env: "production".into(),
                 service: "web".into(),
                 container_id: "cnt-web".into(),
@@ -1840,6 +1882,7 @@ mod tests {
             // Search for "users"
             let filter_users = LogSearchFilter {
                 project_id,
+                external_service_id: None,
                 start_time: Utc::now() - Duration::hours(1),
                 end_time: Utc::now() + Duration::hours(1),
                 levels: vec![],
@@ -1864,6 +1907,7 @@ mod tests {
             // Search for "500" (appears in orders error)
             let filter_500 = LogSearchFilter {
                 project_id,
+                external_service_id: None,
                 start_time: Utc::now() - Duration::hours(1),
                 end_time: Utc::now() + Duration::hours(1),
                 levels: vec![],
@@ -1889,6 +1933,7 @@ mod tests {
             // Search for "connection refused" — case insensitive
             let filter_conn = LogSearchFilter {
                 project_id,
+                external_service_id: None,
                 start_time: Utc::now() - Duration::hours(1),
                 end_time: Utc::now() + Duration::hours(1),
                 levels: vec![],
@@ -1922,6 +1967,7 @@ mod tests {
             let project_id = test_project_id();
             let ctx = ContainerContext {
                 project_id,
+                external_service_id: None,
                 env: "production".into(),
                 service: "api".into(),
                 container_id: "cnt-api".into(),
@@ -1957,6 +2003,7 @@ mod tests {
             // Filter: status=500 → 1 match
             let filter_500 = LogSearchFilter {
                 project_id,
+                external_service_id: None,
                 start_time: Utc::now() - Duration::hours(1),
                 end_time: Utc::now() + Duration::hours(1),
                 levels: vec![],
@@ -1986,6 +2033,7 @@ mod tests {
             // Filter: duration_ms > 1000 → 1 match (the 3500ms one)
             let filter_slow = LogSearchFilter {
                 project_id,
+                external_service_id: None,
                 start_time: Utc::now() - Duration::hours(1),
                 end_time: Utc::now() + Duration::hours(1),
                 levels: vec![],
@@ -2018,6 +2066,7 @@ mod tests {
             // Filter: user_id=u-1 → 2 matches
             let filter_user = LogSearchFilter {
                 project_id,
+                external_service_id: None,
                 start_time: Utc::now() - Duration::hours(1),
                 end_time: Utc::now() + Duration::hours(1),
                 levels: vec![],
@@ -2054,6 +2103,7 @@ mod tests {
             let project_id = test_project_id();
             let ctx = ContainerContext {
                 project_id,
+                external_service_id: None,
                 env: "production".into(),
                 service: "api".into(),
                 container_id: "cnt-api2".into(),
@@ -2081,6 +2131,7 @@ mod tests {
             // Text "timeout" + status=503 + duration_ms > 6000 → only postgres
             let filter = LogSearchFilter {
                 project_id,
+                external_service_id: None,
                 start_time: Utc::now() - Duration::hours(1),
                 end_time: Utc::now() + Duration::hours(1),
                 levels: vec![LogLevel::Error],
@@ -2127,6 +2178,7 @@ mod tests {
             let project_id = test_project_id();
             let ctx = ContainerContext {
                 project_id,
+                external_service_id: None,
                 env: "production".into(),
                 service: "legacy".into(),
                 container_id: "cnt-legacy".into(),
@@ -2146,6 +2198,7 @@ mod tests {
             // Filter ERROR only
             let filter_error = LogSearchFilter {
                 project_id,
+                external_service_id: None,
                 start_time: Utc::now() - Duration::hours(1),
                 end_time: Utc::now() + Duration::hours(1),
                 levels: vec![LogLevel::Error],
@@ -2171,6 +2224,7 @@ mod tests {
             // Fulltext "disk" across all levels
             let filter_disk = LogSearchFilter {
                 project_id,
+                external_service_id: None,
                 start_time: Utc::now() - Duration::hours(1),
                 end_time: Utc::now() + Duration::hours(1),
                 levels: vec![],
@@ -2205,6 +2259,7 @@ mod tests {
 
             let ctx = ContainerContext {
                 project_id,
+                external_service_id: None,
                 env: "production".into(),
                 service: "web".into(),
                 container_id: "cnt-1".into(),
@@ -2221,6 +2276,7 @@ mod tests {
             // Filter last hour
             let filter = LogSearchFilter {
                 project_id,
+                external_service_id: None,
                 start_time: now - Duration::hours(1),
                 end_time: now + Duration::hours(1),
                 levels: vec![],
@@ -2250,6 +2306,7 @@ mod tests {
 
             let filter = LogSearchFilter {
                 project_id: test_project_id(),
+                external_service_id: None,
                 start_time: Utc::now() + Duration::hours(1),
                 end_time: Utc::now(),
                 levels: vec![],
@@ -2283,6 +2340,7 @@ mod tests {
 
             let filter = LogSearchFilter {
                 project_id: test_project_id(),
+                external_service_id: None,
                 start_time: Utc::now() - Duration::hours(48),
                 end_time: Utc::now(),
                 levels: vec![],
@@ -2322,6 +2380,7 @@ mod tests {
             let project_id = test_project_id();
             let ctx = ContainerContext {
                 project_id,
+                external_service_id: None,
                 env: "production".into(),
                 service: "api".into(),
                 container_id: "cnt-large".into(),
@@ -2370,6 +2429,7 @@ mod tests {
             // Filter: ERROR level + "timeout" text + status=503
             let filter = LogSearchFilter {
                 project_id,
+                external_service_id: None,
                 start_time: Utc::now() - Duration::hours(1),
                 end_time: Utc::now() + Duration::hours(1),
                 levels: vec![LogLevel::Error],
@@ -2424,6 +2484,7 @@ mod tests {
 
             let ctx = ContainerContext {
                 project_id,
+                external_service_id: None,
                 env: "production".into(),
                 service: "web".into(),
                 container_id: "cnt-1".into(),
@@ -2440,6 +2501,7 @@ mod tests {
             // No level, service, env, text, or field filters
             let filter = LogSearchFilter {
                 project_id,
+                external_service_id: None,
                 start_time: Utc::now() - Duration::hours(1),
                 end_time: Utc::now() + Duration::hours(1),
                 levels: vec![],
@@ -2481,6 +2543,7 @@ mod tests {
                     service: "web".to_string(),
                     env: "1".to_string(),
                     project_id: 1,
+                    external_service_id: None,
                     deploy_id: None,
                     node_id: None,
                     node_name: None,

@@ -8,7 +8,7 @@
     "start": "node -r ./tracing.js server.js"
   },
   "dependencies": {
-    "@opentelemetry/sdk-node": "latest",
+    "@opentelemetry/sdk-node": "^0.220.0",
     "@opentelemetry/exporter-trace-otlp-proto": "latest",
     "@opentelemetry/instrumentation-http": "latest",
     "@sentry/node": "latest"

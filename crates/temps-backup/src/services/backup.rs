@@ -9346,6 +9346,7 @@ mod tests {
             health_metadata: Set(None),
             metrics_enabled: Set(false),
             default_backup_provisioned: Set(false),
+            container_name: Set(None),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
         };
@@ -9522,6 +9523,7 @@ mod tests {
             health_metadata: Set(None),
             metrics_enabled: Set(false),
             default_backup_provisioned: Set(false),
+            container_name: Set(None),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
         }
@@ -9955,6 +9957,7 @@ mod tests {
             health_metadata: Set(None),
             metrics_enabled: Set(false),
             default_backup_provisioned: Set(false),
+            container_name: Set(None),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
         }

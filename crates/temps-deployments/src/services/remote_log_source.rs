@@ -48,9 +48,9 @@ impl RemoteContainerLogSource for RemoteLogSourceImpl {
     async fn list_remote_containers(
         &self,
     ) -> Result<Vec<RemoteContainerInfo>, RemoteLogSourceError> {
-        use temps_entities::{deployment_containers, deployments, nodes};
+        use temps_entities::{deployment_containers, deployments, nodes, service_members};
 
-        // Currently-tracked containers that run on a remote worker node.
+        // Currently-tracked deployment containers that run on a remote worker node.
         let containers = deployment_containers::Entity::find()
             .filter(deployment_containers::Column::NodeId.is_not_null())
             .filter(deployment_containers::Column::DeletedAt.is_null())
@@ -58,12 +58,24 @@ impl RemoteContainerLogSource for RemoteLogSourceImpl {
             .await
             .map_err(|e| RemoteLogSourceError::Database(e.to_string()))?;
 
-        if containers.is_empty() {
+        // Cluster members (Postgres HA monitor/primary/replica, etc.) placed on
+        // a remote node. Their logs are invisible to the local collector too,
+        // so we pull them the same way — but they key on the owning external
+        // service rather than a project, so a remote replica's output surfaces
+        // under `/storage/{id}/logs` alongside control-plane-local members.
+        let members = service_members::Entity::find()
+            .filter(service_members::Column::NodeId.is_not_null())
+            .filter(service_members::Column::ContainerId.is_not_null())
+            .all(self.db.as_ref())
+            .await
+            .map_err(|e| RemoteLogSourceError::Database(e.to_string()))?;
+
+        if containers.is_empty() && members.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Batch-resolve deployment → (project_id, environment_id) and
-        // node_id → node_name, avoiding per-container N+1 queries.
+        // Batch-resolve deployment → (project_id, environment_id), avoiding
+        // per-container N+1 queries.
         let deploy_ids: Vec<i32> = containers
             .iter()
             .map(|c| c.deployment_id)
@@ -79,9 +91,11 @@ impl RemoteContainerLogSource for RemoteLogSourceImpl {
             .map(|d| (d.id, (d.project_id, d.environment_id)))
             .collect();
 
+        // node_id → node_name for both deployment containers and cluster members.
         let node_ids: Vec<i32> = containers
             .iter()
             .filter_map(|c| c.node_id)
+            .chain(members.iter().filter_map(|m| m.node_id))
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
@@ -94,7 +108,14 @@ impl RemoteContainerLogSource for RemoteLogSourceImpl {
             .map(|n| (n.id, n.name))
             .collect();
 
-        let mut out = Vec::with_capacity(containers.len());
+        let node_name_for = |node_id: i32| {
+            node_map
+                .get(&node_id)
+                .cloned()
+                .unwrap_or_else(|| format!("node-{node_id}"))
+        };
+
+        let mut out = Vec::with_capacity(containers.len() + members.len());
         for c in containers {
             let Some(node_id) = c.node_id else {
                 continue;
@@ -104,10 +125,6 @@ impl RemoteContainerLogSource for RemoteLogSourceImpl {
             let Some(&(project_id, environment_id)) = dep_map.get(&c.deployment_id) else {
                 continue;
             };
-            let node_name = node_map
-                .get(&node_id)
-                .cloned()
-                .unwrap_or_else(|| format!("node-{node_id}"));
             // `service` mirrors the local collector's `sh.temps.service` label
             // semantics: compose service name when present, else the container
             // name. Container-level filtering (by container_id) is the precise
@@ -119,12 +136,33 @@ impl RemoteContainerLogSource for RemoteLogSourceImpl {
 
             out.push(RemoteContainerInfo {
                 node_id,
-                node_name,
+                node_name: node_name_for(node_id),
                 container_id: c.container_id,
                 project_id,
                 env: environment_id.to_string(),
                 service,
                 deploy_id: Some(c.deployment_id),
+                external_service_id: None,
+            });
+        }
+
+        for m in members {
+            let (Some(node_id), Some(container_id)) = (m.node_id, m.container_id) else {
+                continue;
+            };
+            out.push(RemoteContainerInfo {
+                node_id,
+                node_name: node_name_for(node_id),
+                container_id,
+                // Sentinel: external-service chunks key on external_service_id,
+                // not project_id (see the local collector's resolution).
+                project_id: 0,
+                env: "default".to_string(),
+                // Per-member container name so members stay distinguishable
+                // within the service's log scope.
+                service: m.container_name,
+                deploy_id: None,
+                external_service_id: Some(m.service_id),
             });
         }
 

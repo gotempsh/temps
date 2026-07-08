@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::ToSchema;
 
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{permission_guard, project_access_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
 use temps_entities::{agent_run_logs, agent_runs};
 
@@ -244,6 +244,7 @@ pub async fn list_all_runs(
     Query(query): Query<ListRunsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsRead);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     let page = query.page.unwrap_or(1);
     let page_size = query.page_size.unwrap_or(20);
@@ -305,6 +306,7 @@ pub async fn latest_run_for_source(
     Query(query): Query<LatestForSourceQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsRead);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     let run = app_state
         .run_service
@@ -366,6 +368,7 @@ pub async fn list_agent_runs(
     Query(query): Query<ListRunsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsRead);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     let agent = app_state
         .config_service
@@ -430,6 +433,7 @@ pub async fn get_run_with_logs(
     Path((project_id, run_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsRead);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     app_state
         .run_service
@@ -495,6 +499,7 @@ pub async fn stream_run_events(
     Path((project_id, run_id)): Path<(i32, i32)>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, Problem> {
     permission_guard!(auth, ProjectsRead);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     app_state
         .run_service
@@ -591,6 +596,7 @@ pub async fn cancel_run(
     Path((project_id, run_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     app_state
         .run_service
@@ -644,6 +650,7 @@ pub async fn retry_run(
     Path((project_id, run_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     app_state
         .run_service

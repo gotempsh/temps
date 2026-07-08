@@ -16,7 +16,7 @@ use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
 use axum::Extension;
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{permission_guard, project_access_guard, RequireAuth, Role};
 use temps_core::problemdetails;
 use temps_core::problemdetails::{Problem, ProblemDetails};
 use temps_core::RequestMetadata;
@@ -116,6 +116,76 @@ impl From<LogAggregatorError> for Problem {
     }
 }
 
+// ── External-service access guard ───────────────────────────────────────
+
+/// Guard log access for an external service by checking the caller's membership
+/// in at least one of the projects that own the service (via `project_services`).
+///
+/// This is the external-service analogue of `project_access_guard!`.  It cannot
+/// reuse that macro because a service may be linked to multiple projects, and the
+/// correct semantic is "allow when the caller has access to **any** linked project"
+/// (minimum bar) rather than the macro's single-project check.
+///
+/// Deployment tokens and instance admins bypass the check (identical semantics to
+/// `project_access_guard!`).  When no `ProjectAccessChecker` is registered this
+/// is a synchronous no-op — OSS-only binaries are unaffected.
+async fn guard_external_service_access(
+    auth: &temps_auth::AuthContext,
+    external_service_id: i32,
+    project_ids: &[i32],
+    checker: &Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+) -> Result<(), Problem> {
+    // Deployment tokens are already confined by project_scope_guard! and carry
+    // no user identity — skip the team-membership check.
+    if auth.is_deployment_token() {
+        return Ok(());
+    }
+    // Instance administrators are never restricted by team membership.
+    if auth.is_admin() || auth.has_role(&Role::PlatformAdmin) {
+        return Ok(());
+    }
+    // No checker registered → no-op (matches project_access_guard! behaviour).
+    let Some(ref checker) = checker else {
+        return Ok(());
+    };
+    // user_id_opt() is always Some for non-deployment-token auth, but be safe.
+    let Some(user_id) = auth.user_id_opt() else {
+        return Ok(());
+    };
+    // Allow when the user has access to any one of the linked projects.
+    for &project_id in project_ids {
+        match checker.user_can_access_project(user_id, project_id).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => {} // try next project
+            Err(e) => {
+                tracing::error!(
+                    external_service_id,
+                    project_id,
+                    user_id,
+                    error = %e,
+                    "ProjectAccessChecker infrastructure failure — denying access to \
+                     external service logs"
+                );
+                return Err(temps_core::error_builder::ErrorBuilder::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                )
+                .type_("https://temps.sh/probs/project-access-check-failed")
+                .title("Project Access Check Failed")
+                .detail("Could not verify project access; please try again")
+                .build());
+            }
+        }
+    }
+    // The checker denied all linked projects.
+    Err(
+        temps_core::error_builder::ErrorBuilder::new(StatusCode::FORBIDDEN)
+            .type_("https://temps.sh/probs/project-access-denied")
+            .title("Project Access Denied")
+            .detail("Your team membership does not include access to this resource")
+            .build(),
+    )
+}
+
 // ── Audit types ─────────────────────────────────────────────────────────
 
 /// Audit event for log purge operations
@@ -155,6 +225,10 @@ impl temps_core::AuditOperation for LogsPurgedAudit {
 pub struct SearchLogsRequest {
     /// Project ID (integer, as used by the rest of the platform)
     pub project_id: i32,
+    /// When set, search an imported/managed external service's logs instead
+    /// of a project's. `project_id` is ignored in this mode.
+    #[serde(default)]
+    pub external_service_id: Option<i32>,
     /// Start of time range (ISO 8601). Defaults to 1 hour ago.
     pub start_time: Option<String>,
     /// End of time range (ISO 8601). Defaults to now.
@@ -223,6 +297,10 @@ pub struct ContextLogsResponse {
 pub struct TailLogsRequest {
     /// Project ID (integer, as used by the rest of the platform)
     pub project_id: i32,
+    /// When set, tail an imported/managed external service's logs instead of
+    /// a project's (`project_id` is ignored in this mode).
+    #[serde(default)]
+    pub external_service_id: Option<i32>,
     pub service: String,
     pub env: String,
     #[serde(default)]
@@ -301,6 +379,35 @@ async fn search_logs(
     Json(request): Json<SearchLogsRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, LogsRead);
+    // When `external_service_id` is set, `project_id` is ignored by the search
+    // engine; the resource being accessed is the external service itself.
+    // Resolve its owning project(s) and check team-based access against those.
+    // When only `project_id` is set, guard on it directly as usual.
+    match request.external_service_id {
+        None => {
+            project_access_guard!(auth, request.project_id, app_state.project_access_checker);
+        }
+        Some(service_id) => {
+            let project_ids = app_state
+                .metadata_service
+                .find_owning_project_ids(service_id)
+                .await?;
+            if project_ids.is_empty() {
+                return Err(problemdetails::new(StatusCode::NOT_FOUND)
+                    .with_title("External Service Not Found")
+                    .with_detail(format!(
+                        "External service {service_id} is not associated with any project"
+                    )));
+            }
+            guard_external_service_access(
+                &auth,
+                service_id,
+                &project_ids,
+                &app_state.project_access_checker,
+            )
+            .await?;
+        }
+    }
 
     let now = Utc::now();
     let start_time = request
@@ -324,6 +431,7 @@ async fn search_logs(
 
     let filter = LogSearchFilter {
         project_id: request.project_id,
+        external_service_id: request.external_service_id,
         start_time,
         end_time,
         levels,
@@ -413,6 +521,35 @@ async fn tail_logs(
     Query(request): Query<TailLogsRequest>,
 ) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, Problem> {
     permission_guard!(auth, LogsRead);
+    // When `external_service_id` is set, `project_id` is ignored by the tail
+    // service; the resource being accessed is the external service itself.
+    // Resolve its owning project(s) and check team-based access against those.
+    // When only `project_id` is set, guard on it directly as usual.
+    match request.external_service_id {
+        None => {
+            project_access_guard!(auth, request.project_id, app_state.project_access_checker);
+        }
+        Some(service_id) => {
+            let project_ids = app_state
+                .metadata_service
+                .find_owning_project_ids(service_id)
+                .await?;
+            if project_ids.is_empty() {
+                return Err(problemdetails::new(StatusCode::NOT_FOUND)
+                    .with_title("External Service Not Found")
+                    .with_detail(format!(
+                        "External service {service_id} is not associated with any project"
+                    )));
+            }
+            guard_external_service_access(
+                &auth,
+                service_id,
+                &project_ids,
+                &app_state.project_access_checker,
+            )
+            .await?;
+        }
+    }
 
     let levels: Vec<LogLevel> = request
         .levels
@@ -422,6 +559,7 @@ async fn tail_logs(
 
     let filter = TailFilter {
         project_id: request.project_id,
+        external_service_id: request.external_service_id,
         service: request.service,
         env: request.env,
         levels,
@@ -475,6 +613,7 @@ async fn purge_project_logs(
     Json(request): Json<PurgeLogsRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, LogsDelete);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     let before = chrono::DateTime::parse_from_rfc3339(&request.before)
         .map_err(|_| LogAggregatorError::Validation {
@@ -594,6 +733,7 @@ mod tests {
             tail_service,
             retention_service,
             audit_service,
+            project_access_checker: None,
         });
 
         TestContext {
@@ -707,6 +847,7 @@ mod tests {
             service: service.to_string(),
             env: env.to_string(),
             project_id,
+            external_service_id: None,
             deploy_id: None,
             node_id: None,
             node_name: None,
@@ -1588,6 +1729,242 @@ mod tests {
             StatusCode::FORBIDDEN,
             "Reader should get 403 on purge, got {}",
             response.status_code()
+        );
+    }
+
+    // ── External-service IDOR regression tests ─────────────────────────
+
+    /// Mock `ProjectAccessChecker` that allows access only for project IDs in
+    /// the `allowed` list.  Used to simulate team-based project access control
+    /// without needing a real database-backed implementation.
+    #[derive(Clone)]
+    struct MockProjectAccessChecker {
+        allowed: Vec<i32>,
+    }
+
+    #[async_trait]
+    impl temps_core::ProjectAccessChecker for MockProjectAccessChecker {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.allowed.contains(&project_id))
+        }
+    }
+
+    /// Seed the full FK chain required for a `project_services` row:
+    ///
+    /// 1. Insert an `external_services` row (the service whose logs we guard).
+    /// 2. Insert a `projects` row (the owning project).
+    /// 3. Insert a `project_services` row linking them.
+    ///
+    /// Returns `(service_id, project_id)` using the DB-assigned auto-increment
+    /// IDs so there are no FK violations.
+    async fn seed_external_service_with_project(db: &sea_orm::DatabaseConnection) -> (i32, i32) {
+        use sea_orm::{ActiveModelTrait, Set};
+        use temps_entities::preset::Preset;
+
+        let svc = temps_entities::external_services::ActiveModel {
+            name: Set(format!("test-ext-svc-{}", Uuid::new_v4())),
+            service_type: Set("postgres".to_string()),
+            status: Set("pending".to_string()),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("Failed to seed external_services row");
+
+        let proj = temps_entities::projects::ActiveModel {
+            name: Set("Test Project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("/test".to_string()),
+            main_branch: Set("main".to_string()),
+            slug: Set(format!("test-proj-{}", Uuid::new_v4())),
+            preset: Set(Preset::NextJs),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("Failed to seed projects row");
+
+        temps_entities::project_services::ActiveModel {
+            project_id: Set(proj.id),
+            service_id: Set(svc.id),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("Failed to seed project_services row");
+
+        (svc.id, proj.id)
+    }
+
+    /// Build a server where the authenticated user has `Role::User` (has
+    /// `LogsRead`) AND a `ProjectAccessChecker` is active.  Tests that
+    /// exercise the external-service IDOR guard need both conditions: a
+    /// non-admin user (so the admin bypass does not fire) and a registered
+    /// checker (so the guard actually calls `user_can_access_project`).
+    fn build_server_with_user_and_checker(
+        base_state: &Arc<LogAggregatorAppState>,
+        checker: Arc<dyn temps_core::ProjectAccessChecker>,
+    ) -> TestServer {
+        let app_state = Arc::new(LogAggregatorAppState {
+            search_service: base_state.search_service.clone(),
+            metadata_service: base_state.metadata_service.clone(),
+            tail_service: base_state.tail_service.clone(),
+            retention_service: base_state.retention_service.clone(),
+            audit_service: base_state.audit_service.clone(),
+            project_access_checker: Some(checker),
+        });
+        build_test_server_with_role(app_state, temps_auth::Role::User)
+    }
+
+    /// (a) A user WITH access to the external service's owning project can
+    /// search its logs (200).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_search_external_service_allowed_project_access() {
+        let ctx = create_test_context().await;
+        let (service_id, owning_project) =
+            seed_external_service_with_project(ctx._db.db.as_ref()).await;
+
+        let checker = Arc::new(MockProjectAccessChecker {
+            allowed: vec![owning_project],
+        });
+        let server = build_server_with_user_and_checker(&ctx.app_state, checker);
+
+        let now = Utc::now();
+        let response = server
+            .post("/logs/search")
+            .json(&serde_json::json!({
+                "project_id": 0,          // ignored when external_service_id is set
+                "external_service_id": service_id,
+                "start_time": (now - Duration::hours(1)).to_rfc3339(),
+                "end_time": (now + Duration::hours(1)).to_rfc3339(),
+            }))
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "user with access to the owning project must be allowed; body: {}",
+            response.text()
+        );
+    }
+
+    /// (b) A user WITHOUT access to the owning project is denied (403) even
+    /// though they hold `LogsRead`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_search_external_service_denied_project_access() {
+        let ctx = create_test_context().await;
+        let (service_id, owning_project) =
+            seed_external_service_with_project(ctx._db.db.as_ref()).await;
+
+        // Checker allows a completely different project — NOT the one that
+        // owns this service — so access must be denied.
+        let different_project = owning_project + 1_000_000;
+        let checker = Arc::new(MockProjectAccessChecker {
+            allowed: vec![different_project],
+        });
+        let server = build_server_with_user_and_checker(&ctx.app_state, checker);
+
+        let now = Utc::now();
+        let response = server
+            .post("/logs/search")
+            .json(&serde_json::json!({
+                "project_id": 0,
+                "external_service_id": service_id,
+                "start_time": (now - Duration::hours(1)).to_rfc3339(),
+                "end_time": (now + Duration::hours(1)).to_rfc3339(),
+            }))
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            StatusCode::FORBIDDEN,
+            "user without access to the owning project must be denied 403; body: {}",
+            response.text()
+        );
+    }
+
+    /// (c) An `external_service_id` with no project association must be denied
+    /// (404), not fail-open.  An allow-all checker is used so the 404 must
+    /// originate from the missing project link, not from the checker.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_search_external_service_orphaned_service() {
+        let ctx = create_test_context().await;
+        // Seed an external_services row but deliberately do NOT create a
+        // project_services row linking it to any project.
+        use sea_orm::{ActiveModelTrait, Set};
+        let orphaned_svc = temps_entities::external_services::ActiveModel {
+            name: Set(format!("orphaned-svc-{}", Uuid::new_v4())),
+            service_type: Set("postgres".to_string()),
+            status: Set("pending".to_string()),
+            ..Default::default()
+        }
+        .insert(ctx._db.db.as_ref())
+        .await
+        .expect("Failed to seed orphaned external_services row");
+
+        // Checker that allows everything — ensures the 404 comes from the
+        // missing project link, not from the checker.
+        let checker = Arc::new(MockProjectAccessChecker {
+            allowed: vec![1, 2, 3, 9999],
+        });
+        let server = build_server_with_user_and_checker(&ctx.app_state, checker);
+
+        let now = Utc::now();
+        let response = server
+            .post("/logs/search")
+            .json(&serde_json::json!({
+                "project_id": 0,
+                "external_service_id": orphaned_svc.id,
+                "start_time": (now - Duration::hours(1)).to_rfc3339(),
+                "end_time": (now + Duration::hours(1)).to_rfc3339(),
+            }))
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            StatusCode::NOT_FOUND,
+            "external service with no project link must be denied 404, not fail-open; \
+             body: {}",
+            response.text()
+        );
+    }
+
+    /// Verify the guard is also wired into `tail_logs`.  We only test the
+    /// access-denied path here (not SSE streaming); a 403 returned before the
+    /// stream is created is a plain HTTP response that axum-test handles correctly.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_tail_external_service_denied_project_access() {
+        let ctx = create_test_context().await;
+        let (service_id, _owning_project) =
+            seed_external_service_with_project(ctx._db.db.as_ref()).await;
+
+        // Checker denies all projects — proves the guard fires on tail_logs too.
+        let checker = Arc::new(MockProjectAccessChecker { allowed: vec![] });
+        let server = build_server_with_user_and_checker(&ctx.app_state, checker);
+
+        let response = server
+            .get(&format!(
+                "/logs/tail?project_id=0&external_service_id={}&service=web&env=prod",
+                service_id
+            ))
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            StatusCode::FORBIDDEN,
+            "tail_logs must also enforce project access for external_service_id; body: {}",
+            response.text()
         );
     }
 

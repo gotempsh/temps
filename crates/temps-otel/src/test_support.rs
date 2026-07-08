@@ -28,6 +28,12 @@ pub struct MockOtelStorage {
     pub fail_store_spans: Arc<Mutex<Option<String>>>,
     /// If set, archive_logs will return this error.
     pub fail_archive_logs: Arc<Mutex<Option<String>>>,
+    /// Counts calls to `get_storage_quota`, so tests can assert on
+    /// caching behavior in callers like `OtelService::check_quota`.
+    pub get_storage_quota_calls: Arc<Mutex<u32>>,
+    /// Overrides `get_storage_quota`'s `usage_pct`/`total_bytes`/`limit_bytes`
+    /// for tests that need to simulate a project over its quota.
+    pub quota_override: Arc<Mutex<Option<StorageQuota>>>,
 }
 
 impl MockOtelStorage {
@@ -53,6 +59,11 @@ impl MockOtelStorage {
     /// Return all archived logs (S3 path).
     pub fn stored_archived_logs(&self) -> Vec<LogRecord> {
         self.archived_logs.lock().unwrap().clone()
+    }
+
+    /// Number of times `get_storage_quota` has been called.
+    pub fn get_storage_quota_call_count(&self) -> u32 {
+        *self.get_storage_quota_calls.lock().unwrap()
     }
 }
 
@@ -301,6 +312,10 @@ impl OtelStorage for MockOtelStorage {
     }
 
     async fn get_storage_quota(&self, project_id: i32) -> StorageResult<StorageQuota> {
+        *self.get_storage_quota_calls.lock().unwrap() += 1;
+        if let Some(quota) = self.quota_override.lock().unwrap().clone() {
+            return Ok(quota);
+        }
         Ok(StorageQuota {
             project_id,
             metrics_bytes: 0,

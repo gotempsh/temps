@@ -90,12 +90,26 @@ pub enum Commands {
 
 /// Install the global tracing subscriber. Safe to call once per process.
 pub fn install_tracing(log_level: &str, log_format: &str) {
+    install_tracing_extra(log_level, log_format, "");
+}
+
+/// Like [`install_tracing`], with extra filter directives appended — for
+/// embedding binaries whose own crate targets aren't in the default list
+/// (e.g. `vibetemps_api={level}`). `extra` is comma-separated directives,
+/// empty for none.
+pub fn install_tracing_extra(log_level: &str, log_format: &str, extra: &str) {
     let filter = if std::env::var("RUST_LOG").is_ok() {
         tracing_subscriber::EnvFilter::try_from_default_env()
             .expect("Invalid RUST_LOG environment variable")
     } else {
+        let extra = if extra.is_empty() {
+            String::new()
+        } else {
+            format!("{extra},")
+        };
         tracing_subscriber::EnvFilter::new(format!(
-            "temps_cli={level},\
+            "{extra}\
+             temps_cli={level},\
              temps_deployments={level},\
              temps_deployer={level},\
              temps_core={level},\
@@ -189,6 +203,28 @@ pub fn install_tracing(log_level: &str, log_format: &str) {
     let subscriber = tracing_subscriber::registry().with(filter).with(fmt_layer);
     tracing::subscriber::set_global_default(subscriber)
         .expect("Failed to set global default subscriber");
+}
+
+// Re-exported so embedding binaries build their UI bundle with the exact
+// `include_dir` version this crate compares `Dir` types against.
+pub use include_dir;
+
+/// Replace the embedded console SPA with the embedding binary's own UI
+/// bundle. Call once, before [`dispatch`]. The bundle is served at the
+/// document root with the same SPA-fallback semantics as the OSS console;
+/// the `/api` surface is unaffected. Returns `Err` if already set.
+pub fn set_embedded_ui(dir: &'static include_dir::Dir<'static>) -> Result<(), &'static str> {
+    commands::serve::console::set_embedded_ui(dir)
+}
+
+/// Serve the ORIGINAL temps console on its own dedicated listener (extra
+/// port) when the root bundle has been replaced via [`set_embedded_ui`].
+/// The console SPA assumes it owns its origin, so a path prefix cannot work;
+/// a separate listener gives it a clean origin. Same `/api`, same auth and
+/// admin gate. Bind to loopback (e.g. `127.0.0.1:8082`) unless you
+/// deliberately want it exposed. Call once, before [`dispatch`].
+pub fn set_platform_console_addr(addr: impl Into<String>) -> Result<(), &'static str> {
+    commands::serve::console::set_platform_console_addr(addr.into())
 }
 
 /// Dispatch the parsed CLI. `extra_plugins` is forwarded to `temps serve`

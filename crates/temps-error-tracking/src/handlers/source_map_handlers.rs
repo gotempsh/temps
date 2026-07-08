@@ -7,7 +7,7 @@ use axum::{
 };
 use serde::Serialize;
 use std::sync::Arc;
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{permission_guard, project_access_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
 use tracing::error;
 use utoipa::{OpenApi, ToSchema};
@@ -39,6 +39,8 @@ pub struct SourceMapApiDoc;
 pub struct SourceMapAppState {
     pub source_map_service: Arc<SourceMapService>,
     pub audit_service: Arc<dyn temps_core::AuditLogger>,
+    /// Optional checker for team-based project access (human sessions only).
+    pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
 }
 
 pub fn configure_source_map_routes() -> Router<Arc<SourceMapAppState>> {
@@ -164,6 +166,7 @@ async fn upload_source_map(
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ErrorTrackingCreate);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     // Maximum source map size: 50MB
     const MAX_SOURCE_MAP_SIZE: usize = 50 * 1024 * 1024;
@@ -277,6 +280,7 @@ async fn list_source_maps(
     Path((project_id, release)): Path<(i32, String)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ErrorTrackingRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let maps = state
         .source_map_service
@@ -310,6 +314,7 @@ async fn list_releases(
     Path(project_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ErrorTrackingRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let releases = state.source_map_service.list_releases(project_id).await?;
 
@@ -338,6 +343,7 @@ async fn delete_release_source_maps(
     Path((project_id, release)): Path<(i32, String)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ErrorTrackingWrite);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let deleted = state
         .source_map_service
@@ -370,6 +376,7 @@ async fn delete_source_map(
     Path((project_id, source_map_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ErrorTrackingWrite);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     state
         .source_map_service

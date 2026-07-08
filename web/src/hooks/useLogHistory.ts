@@ -1,5 +1,9 @@
 import { client } from '@/api/client/client.gen'
-import { useQuery, keepPreviousData } from '@tanstack/react-query'
+import {
+  keepPreviousData,
+  useInfiniteQuery,
+  useQuery,
+} from '@tanstack/react-query'
 
 // ── Types matching the Rust SearchLogsResponse ─────────────────────────
 
@@ -60,6 +64,11 @@ export interface SearchLogsResponse {
 
 export interface LogSearchParams {
   projectId: number
+  /**
+   * When set, search an imported/managed external service's logs instead of a
+   * project's. `projectId` is ignored server-side in this mode.
+   */
+  externalServiceId?: number
   startTime?: string
   endTime?: string
   levels?: LogLevel[]
@@ -76,6 +85,10 @@ export interface LogSearchParams {
   containerIds?: string[]
   /** Filter to specific worker nodes (node_id). Empty/undefined = all nodes. */
   nodeIds?: number[]
+  /** Bump to force a brand-new query (busts the infinite-query cache so the
+      viewer collapses back to a single newest page and re-tails). Ignored by
+      the plain {@link useLogHistory} hook. */
+  refreshKey?: number
 }
 
 // ── API call ───────────────────────────────────────────────────────────
@@ -85,6 +98,8 @@ async function searchLogs(params: LogSearchParams): Promise<SearchLogsResponse> 
     project_id: params.projectId,
   }
 
+  if (params.externalServiceId != null)
+    body.external_service_id = params.externalServiceId
   if (params.startTime) body.start_time = params.startTime
   if (params.endTime) body.end_time = params.endTime
   if (params.levels?.length) body.levels = params.levels
@@ -115,6 +130,7 @@ export function useLogHistory(params: LogSearchParams, enabled = true) {
     queryKey: [
       'log-history',
       params.projectId,
+      params.externalServiceId,
       params.startTime,
       params.endTime,
       params.levels,
@@ -129,8 +145,53 @@ export function useLogHistory(params: LogSearchParams, enabled = true) {
       params.nodeIds,
     ],
     queryFn: () => searchLogs(params),
-    enabled: enabled && !!params.projectId,
+    enabled: enabled && (!!params.projectId || params.externalServiceId != null),
     staleTime: 1000 * 30, // 30 seconds
     placeholderData: keepPreviousData,
+  })
+}
+
+/**
+ * Infinite/tailing variant of {@link useLogHistory} for terminal-style viewers.
+ *
+ * The server bounds the first page (no cursor) to the *newest* `pageSize`
+ * matches and returns them oldest→newest, so the caller can render newest at
+ * the bottom and scroll to it on load. Each `fetchNextPage()` walks `next_cursor`
+ * into strictly *older* lines — the caller prepends those at the top. Pages are
+ * therefore concatenated as `[...pages].reverse().flatMap(p => p.lines)` to get
+ * a single fully-ascending rope (oldest loaded at the top, newest at the bottom).
+ *
+ * Changing any filter (or bumping `refreshKey`) resets to a fresh newest page.
+ */
+export function useLogHistoryInfinite(
+  params: Omit<LogSearchParams, 'cursor'>,
+  enabled = true
+) {
+  return useInfiniteQuery({
+    queryKey: [
+      'log-history-infinite',
+      params.projectId,
+      params.externalServiceId,
+      params.startTime,
+      params.endTime,
+      params.levels,
+      params.services,
+      params.envs,
+      params.text,
+      params.pageSize,
+      params.contextLines,
+      params.deployId,
+      params.containerIds,
+      params.nodeIds,
+      params.refreshKey,
+    ],
+    queryFn: ({ pageParam }) =>
+      searchLogs({ ...params, cursor: pageParam ?? undefined }),
+    initialPageParam: undefined as string | undefined,
+    // lastPage is the most recently fetched (oldest) page; its next_cursor
+    // points at the next-older page. Undefined stops the "load older" walk.
+    getNextPageParam: (lastPage) => lastPage.next_cursor ?? undefined,
+    enabled: enabled && (!!params.projectId || params.externalServiceId != null),
+    staleTime: 1000 * 30,
   })
 }

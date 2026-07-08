@@ -342,7 +342,7 @@ pub fn setup_proxy_server(
         project_context_resolver,
         crypto,
         db.clone(),
-        config_service,
+        config_service.clone(),
         ip_access_control_service,
         challenge_service,
         cert_host_cache,
@@ -367,6 +367,42 @@ pub fn setup_proxy_server(
     // Wire path-keyed file store for static asset serving
     lb = lb.with_file_store(cas_file_store);
     info!("Path-keyed file store enabled");
+
+    // Proxy hot-path metrics: a background sampler snapshots the lock-free
+    // request counters on the monitoring scrape interval and writes deltas to
+    // the metrics store as control-plane node points, where the console's
+    // `GET /nodes/{id}/metrics` endpoint and the alert evaluator read them.
+    // Works identically in single-process and split (ADR-017) topologies —
+    // the store is the meeting point, never in-process state. Mirrors the
+    // dedicated-thread pattern of the proxy-log batch writer above.
+    {
+        let proxy_metrics = lb.proxy_metrics();
+        let sampler_config_service = config_service.clone();
+        let sampler_config = config.clone();
+        let sampler_db = db.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create tokio runtime for proxy metrics sampler");
+            rt.block_on(async move {
+                let store = crate::service::metrics_sampler::build_metrics_store(
+                    &sampler_config_service,
+                    &sampler_config,
+                    sampler_db,
+                )
+                .await;
+                crate::service::metrics_sampler::ProxyMetricsSampler::new(
+                    proxy_metrics,
+                    store,
+                    sampler_config_service,
+                )
+                .run()
+                .await;
+            });
+        });
+        info!("Proxy metrics sampler enabled");
+    }
 
     // Setup Pingora server with explicit configuration
     // Disable upgrade mode to avoid "Console API failed to start: channel closed" error

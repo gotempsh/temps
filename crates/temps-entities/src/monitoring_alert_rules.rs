@@ -5,8 +5,8 @@ use temps_core::DBDateTime;
 /// A monitoring alert rule that the [`AlertEvaluator`] background task
 /// evaluates every 30 seconds.
 ///
-/// Exactly one of `service_id` or `deployment_id` must be non-null
-/// (enforced by a DB-level CHECK constraint).
+/// Exactly one of `service_id`, `deployment_id`, or `node_id` must be
+/// non-null (enforced by a DB-level CHECK constraint).
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "monitoring_alert_rules")]
 pub struct Model {
@@ -16,6 +16,10 @@ pub struct Model {
     pub service_id: Option<i32>,
     /// FK to `deployments.id` — set for container/OTLP metric rules.
     pub deployment_id: Option<i32>,
+    /// Node ID — set for node-scoped metric rules (e.g. `proxy.*` metrics).
+    /// No FK: the control plane uses the synthetic node ID `0`, which has no
+    /// row in `nodes`.
+    pub node_id: Option<i32>,
     /// Human-readable rule label (e.g. "High active connections").
     pub name: String,
     /// Dotted metric name to evaluate, e.g. `"pg.connections_active"`.

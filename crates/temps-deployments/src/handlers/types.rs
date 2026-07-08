@@ -48,6 +48,13 @@ pub struct AppState {
     /// guaranteed to already be present by this point. See
     /// [`temps_core::DeploymentGate`].
     pub deployment_gate: Option<Arc<dyn temps_core::DeploymentGate>>,
+    /// Optional checker enforcing team-based project access for human sessions.
+    ///
+    /// `None` when no plugin implementing this check is registered — the
+    /// `project_access_guard!` macro is a strict synchronous no-op in that
+    /// case. Resolved once in `configure_routes` via
+    /// `context.get_service::<dyn temps_core::ProjectAccessChecker>()`.
+    pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
 }
 
 use crate::services::types::Deployment;
