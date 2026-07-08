@@ -98,12 +98,15 @@ impl TempsPlugin for WebhooksPlugin {
     }
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
-        // Get the webhook state
-        let webhook_state = context.require_service::<WebhookState>();
+        let old = context.require_service::<WebhookState>();
+        let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
+        let webhook_state = Arc::new(WebhookState {
+            webhook_service: old.webhook_service.clone(),
+            audit_service: old.audit_service.clone(),
+            project_access_checker,
+        });
 
-        // Build webhook routes using the existing configure_routes function
         let routes = configure_routes().with_state(webhook_state);
-
         Some(PluginRoutes::new(routes))
     }
 

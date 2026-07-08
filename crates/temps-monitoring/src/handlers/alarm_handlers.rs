@@ -22,7 +22,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use temps_auth::{permission_guard, project_scope_guard, RequireAuth};
+use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::{
     problemdetails::{self, Problem},
     AuditContext, AuditOperation, RequestMetadata,
@@ -39,6 +39,8 @@ use crate::alarm_service::{AlarmError, AlarmFilters, AlarmService, AlarmSummary,
 pub struct AlarmAppState {
     pub alarm_service: Arc<AlarmService>,
     pub audit_service: Arc<dyn temps_core::AuditLogger>,
+    /// Optional checker for team-based project access (human sessions only).
+    pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -280,6 +282,7 @@ pub async fn list_project_alarms(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let page = params.page.unwrap_or(1);
     let page_size = params.page_size.unwrap_or(20);
@@ -377,6 +380,7 @@ pub async fn get_project_alarms_summary(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let summary = state
         .alarm_service
@@ -414,6 +418,7 @@ pub async fn acknowledge_alarm(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsWrite);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     state
         .alarm_service
@@ -468,6 +473,7 @@ pub async fn resolve_alarm(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsWrite);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     state
         .alarm_service

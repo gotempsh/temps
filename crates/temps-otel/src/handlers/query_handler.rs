@@ -19,7 +19,9 @@ use crate::services::cross_project::is_valid_trace_id;
 use crate::services::{CrossProjectTraceError, SiblingRef, UnifiedTrace};
 use crate::types::*;
 use crate::OtelAppState;
-use temps_auth::{deny_deployment_token, permission_guard, project_scope_guard, RequireAuth};
+use temps_auth::{
+    deny_deployment_token, permission_guard, project_access_guard, project_scope_guard, RequireAuth,
+};
 use temps_core::problemdetails::{self, Problem};
 use temps_core::{AuditContext, ProblemDetails, RequestMetadata};
 
@@ -315,6 +317,7 @@ pub async fn query_metrics(
     // Confine a project-scoped deployment token to its own project (no-op for
     // user/API-key/session auth).
     project_scope_guard!(auth, params.project_id);
+    project_access_guard!(auth, params.project_id, state.project_access_checker);
 
     let query = MetricQuery {
         project_id: params.project_id,
@@ -374,6 +377,7 @@ pub async fn list_metric_names(
     // Confine a project-scoped deployment token to its own project (no-op for
     // user/API-key/session auth).
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let names = state.otel_service.list_metric_names(project_id).await?;
     Ok(Json(OtelMetricNamesResponse { names }))
@@ -408,6 +412,7 @@ pub async fn list_metric_label_keys(
     // Confine a project-scoped deployment token to its own project's telemetry
     // (no-op for user/API-key/session auth).
     project_scope_guard!(auth, params.project_id);
+    project_access_guard!(auth, params.project_id, state.project_access_checker);
 
     let (start, end) = discovery_window(params.start_time.as_deref(), params.end_time.as_deref());
     let keys = state
@@ -448,6 +453,7 @@ pub async fn list_metric_label_values(
     // Confine a project-scoped deployment token to its own project's telemetry
     // (no-op for user/API-key/session auth).
     project_scope_guard!(auth, params.project_id);
+    project_access_guard!(auth, params.project_id, state.project_access_checker);
 
     let (start, end) = discovery_window(params.start_time.as_deref(), params.end_time.as_deref());
     let values = state
@@ -498,6 +504,7 @@ pub async fn query_traces(
     // Confine a project-scoped deployment token to its own project (no-op for
     // user/API-key/session auth).
     project_scope_guard!(auth, params.project_id);
+    project_access_guard!(auth, params.project_id, state.project_access_checker);
 
     let status = params.status.as_deref().map(|s| match s {
         "OK" | "ok" => SpanStatusCode::Ok,
@@ -573,6 +580,7 @@ pub async fn query_trace_summaries(
     // Confine a project-scoped deployment token to its own project (no-op for
     // user/API-key/session auth).
     project_scope_guard!(auth, params.project_id);
+    project_access_guard!(auth, params.project_id, state.project_access_checker);
 
     let status = params.status.as_deref().map(|s| match s {
         "OK" | "ok" => SpanStatusCode::Ok,
@@ -680,6 +688,7 @@ pub async fn get_trace(
     // Confine a project-scoped deployment token to its own project (no-op for
     // user/API-key/session auth).
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let data = state.otel_service.get_trace(project_id, &trace_id).await?;
     let count = data.len();
@@ -720,6 +729,7 @@ pub async fn query_logs(
     // Confine a project-scoped deployment token to its own project (no-op for
     // user/API-key/session auth).
     project_scope_guard!(auth, params.project_id);
+    project_access_guard!(auth, params.project_id, state.project_access_checker);
 
     let severity = params.severity.as_deref().map(|s| match s {
         "TRACE" | "trace" => LogSeverity::Trace,
@@ -778,6 +788,7 @@ pub async fn list_insights(
     // Confine a project-scoped deployment token to its own project (no-op for
     // user/API-key/session auth).
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let status = params.status.as_deref().map(|s| match s {
         "resolved" => InsightStatus::Resolved,
@@ -823,6 +834,7 @@ pub async fn get_health(
     // Confine a project-scoped deployment token to its own project (no-op for
     // user/API-key/session auth).
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let summaries = state
         .otel_service
@@ -857,6 +869,7 @@ pub async fn get_quota(
     // Confine a project-scoped deployment token to its own project (no-op for
     // user/API-key/session auth).
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let quota = state.otel_service.get_storage_quota(project_id).await?;
     Ok(Json(QuotaResponse { quota }))
@@ -918,6 +931,7 @@ pub async fn query_genai_traces(
     // Confine a project-scoped deployment token to its own project (no-op for
     // user/API-key/session auth).
     project_scope_guard!(auth, params.project_id);
+    project_access_guard!(auth, params.project_id, state.project_access_checker);
 
     // Build attribute filters. For gen_ai_system, we use gen_ai.provider.name (current)
     // but the SQL also handles the deprecated gen_ai.system via COALESCE.
@@ -987,6 +1001,7 @@ pub async fn get_genai_trace(
     // Confine a project-scoped deployment token to its own project (no-op for
     // user/API-key/session auth).
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let spans = state
         .otel_service

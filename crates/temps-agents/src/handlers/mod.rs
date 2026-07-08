@@ -209,6 +209,8 @@ pub struct AppState {
     /// Anonymous product-telemetry reporter. Fire-and-forget; never fails the
     /// surrounding request. Defaults to a no-op when telemetry is not registered.
     pub telemetry: Arc<dyn temps_core::TelemetryReporter>,
+    /// Optional checker for team-based project access (human sessions only).
+    pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
 }
 
 pub fn configure_routes() -> Router<Arc<AppState>> {

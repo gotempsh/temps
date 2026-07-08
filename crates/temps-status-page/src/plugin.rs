@@ -215,9 +215,12 @@ impl TempsPlugin for StatusPagePlugin {
             .get_service::<dyn temps_core::TelemetryReporter>()
             .unwrap_or_else(|| Arc::new(temps_core::telemetry::NoopTelemetryReporter));
 
+        let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
+
         struct AppState {
             status_page_service: Arc<StatusPageService>,
             telemetry: Arc<dyn temps_core::TelemetryReporter>,
+            project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
         }
 
         impl StatusPageAppState for AppState {
@@ -228,11 +231,16 @@ impl TempsPlugin for StatusPagePlugin {
             fn telemetry(&self) -> &Arc<dyn temps_core::TelemetryReporter> {
                 &self.telemetry
             }
+
+            fn project_access_checker(&self) -> Option<Arc<dyn temps_core::ProjectAccessChecker>> {
+                self.project_access_checker.clone()
+            }
         }
 
         let app_state = Arc::new(AppState {
             status_page_service,
             telemetry,
+            project_access_checker,
         });
 
         let routes = create_router().with_state(app_state);

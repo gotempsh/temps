@@ -24,7 +24,9 @@ use axum::{
     Router,
 };
 use std::sync::Arc;
-use temps_auth::{deny_deployment_token, permission_guard, project_scope_guard, RequireAuth};
+use temps_auth::{
+    deny_deployment_token, permission_guard, project_access_guard, project_scope_guard, RequireAuth,
+};
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::Problem;
 use temps_proxy::CachedPeerTable;
@@ -41,6 +43,8 @@ pub struct AppState {
     pub ip_address_service: Arc<temps_geo::IpAddressService>,
     pub cookie_crypto: Arc<temps_core::CookieCrypto>,
     pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
+    /// Optional checker for team-based project access (human sessions only).
+    pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
 }
 
 /// Get event counts with filtering
@@ -75,6 +79,7 @@ pub async fn get_events_count(
 ) -> Result<Json<Vec<EventCount>>, Problem> {
     permission_guard!(auth, AnalyticsRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let spec = EventsCountSpec::new(
         TimeRange {
@@ -128,6 +133,7 @@ pub async fn get_session_events(
 ) -> Result<Json<AnalyticsSessionEventsResponse>, Problem> {
     permission_guard!(auth, AnalyticsRead);
     project_scope_guard!(auth, query.project_id);
+    project_access_guard!(auth, query.project_id, state.project_access_checker);
 
     let spec = SessionEventsSpec {
         session_id: session_id.clone(),
@@ -178,6 +184,7 @@ pub async fn has_analytics_events(
 ) -> Result<Json<HasEventsResponse>, Problem> {
     permission_guard!(auth, AnalyticsRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let spec = HasEventsSpec {
         scope: AnalyticsScope::project(project_id),
@@ -227,6 +234,7 @@ pub async fn get_event_type_breakdown(
 ) -> Result<Json<Vec<EventTypeBreakdown>>, Problem> {
     permission_guard!(auth, AnalyticsRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let spec = EventTypeBreakdownSpec {
         range: TimeRange {
@@ -283,6 +291,7 @@ pub async fn get_events_timeline(
 ) -> Result<Json<Vec<EventTimeline>>, Problem> {
     permission_guard!(auth, AnalyticsRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let spec = EventsTimelineSpec {
         range: TimeRange {
@@ -336,6 +345,7 @@ pub async fn get_active_visitors(
 ) -> Result<Json<ActiveVisitorsResponse>, Problem> {
     permission_guard!(auth, AnalyticsRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let spec = ActiveVisitorsSpec {
         scope: AnalyticsScope::project(project_id)
@@ -390,6 +400,7 @@ pub async fn get_hourly_visits(
 ) -> Result<Json<Vec<EventTimeline>>, Problem> {
     permission_guard!(auth, AnalyticsRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let spec = HourlyVisitsSpec {
         range: TimeRange {
@@ -454,6 +465,7 @@ pub async fn get_property_breakdown(
 ) -> Result<Json<PropertyBreakdownResponse>, Problem> {
     permission_guard!(auth, AnalyticsRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let aggregation_level = query.aggregation_level.as_str();
 
@@ -529,6 +541,7 @@ pub async fn get_property_timeline(
 ) -> Result<Json<PropertyTimelineResponse>, Problem> {
     permission_guard!(auth, AnalyticsRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let aggregation_level = query.aggregation_level.as_str();
 
@@ -591,6 +604,7 @@ pub async fn get_unique_counts(
 ) -> Result<Json<UniqueCountsResponse>, Problem> {
     permission_guard!(auth, AnalyticsRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let spec = UniqueCountsSpec {
         range: TimeRange {
@@ -836,6 +850,7 @@ pub async fn record_console_event(
 
     permission_guard!(auth, AnalyticsWrite);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     info!(
         "Recording console event: {} for project {} path: {}",
@@ -961,6 +976,7 @@ pub async fn get_aggregated_buckets(
 ) -> Result<Json<crate::types::AggregatedBucketsResponse>, Problem> {
     permission_guard!(auth, AnalyticsRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let spec = AggregatedBucketsSpec {
         range: TimeRange {
@@ -1237,6 +1253,7 @@ mod tests {
             ip_address_service,
             cookie_crypto: cookie_crypto.clone(),
             telemetry: Arc::new(temps_core::telemetry::NoopTelemetryReporter),
+            project_access_checker: None,
         });
 
         let auth_middleware = middleware::from_fn(
@@ -1733,6 +1750,7 @@ mod tests {
             ip_address_service,
             cookie_crypto,
             telemetry: Arc::new(temps_core::telemetry::NoopTelemetryReporter),
+            project_access_checker: None,
         });
 
         // No auth middleware — should return 401

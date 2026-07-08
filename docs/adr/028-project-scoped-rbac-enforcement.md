@@ -5,7 +5,7 @@
 - **Deciders:** David
 - **Supersedes:** —
 - **Related:** ADR 009 (secrets-manager resolver, reuses the same optional-extension-point pattern); this ADR is also a prerequisite for a planned follow-on feature that assigns fine-grained, per-project permission sets to individual users.
-- **Related crates (OSS):** `temps-core` (new `ProjectAccessChecker` trait), `temps-auth` (new `project_access_guard!` macro), all ~18 OSS crates with project-scoped handlers
+- **Related crates (OSS):** `temps-core` (new `ProjectAccessChecker` trait), `temps-auth` (new `project_access_guard!` macro), all ~17 OSS crates with project-scoped handlers
 - **Security review required:** Yes. Per project CLAUDE.md, security-sensitive changes require `security-auditor` sign-off before merge. This ADR governs a missing authorization enforcement boundary in a team-based access-control feature — an IDOR class of gap where any authenticated user with a sufficient instance-wide role can read or modify any project on the instance regardless of team membership.
 
 ---
@@ -36,10 +36,10 @@ Two project-scoping guards already exist in `temps-auth`:
 
 A codebase scan across `temps/crates/` (excluding generated entities and migrations) finds:
 
-- **~94 OSS handler functions** that take a `project_id` as a path parameter (`Path(project_id): Path<i32>`), spread across **~18 crates**: `temps-deployments` (9), `temps-environments` (7), `temps-analytics-events` (11), `temps-error-tracking` (13), `temps-agents` (11), `temps-projects` (7), `temps-status-page` (6), `temps-revenue` (6), `temps-vulnerability-scanner` (4), `temps-otel` (4), `temps-analytics-funnels` (4), `temps-ai-chat` (3), `temps-webhooks` (2), `temps-providers` (2), `temps-monitoring` (2), `temps-observability` (1), `temps-log-aggregator` (1), `temps-auth` (1).
+- **~94 OSS handler functions** that take a `project_id` as a path parameter (`Path(project_id): Path<i32>`), spread across **~17 crates**: `temps-deployments` (9), `temps-environments` (7), `temps-analytics-events` (11), `temps-error-tracking` (13), `temps-agents` (11), `temps-projects` (7), `temps-status-page` (6), `temps-revenue` (6), `temps-vulnerability-scanner` (4), `temps-otel` (4), `temps-analytics-funnels` (4), `temps-ai-chat` (3), `temps-webhooks` (2), `temps-providers` (2), `temps-monitoring` (2), `temps-observability` (1), `temps-log-aggregator` (1). (Note: the original scan counted `temps-auth` (1), but that was a false positive — all `temps-auth` handlers are instance-wide, e.g. login/logout/register, not project-scoped. The count is 17 affected crates, corrected during implementation review.)
 - **~117 existing `project_scope_guard!` call sites** across 13 crates — covering deployment-token IDOR, unrelated to the team-access gap.
 
-This means the fix is "add a check to ~94 handlers across ~18 crates," not a trivial wrapping of a handful of endpoints. The design must minimize per-handler boilerplate.
+This means the fix is "add a check to ~94 handlers across ~17 crates," not a trivial wrapping of a handful of endpoints. The design must minimize per-handler boilerplate.
 
 ### Why this blocks a planned fine-grained permissions feature
 
@@ -185,7 +185,7 @@ pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
 
 `configure_routes` runs after `initialize_plugin_services` for all plugins, so by the time each plugin constructs its `AppState`, a checker registered by the team-access plugin is guaranteed to be present in the registry. This matches the comment in `temps-deployments/src/handlers/types.rs:44–49` and the identical reasoning for `deployment_gate`.
 
-Affected crates (18): `temps-deployments`, `temps-environments`, `temps-analytics-events`, `temps-error-tracking`, `temps-agents`, `temps-projects`, `temps-status-page`, `temps-revenue`, `temps-vulnerability-scanner`, `temps-otel`, `temps-analytics-funnels`, `temps-ai-chat`, `temps-webhooks`, `temps-providers`, `temps-monitoring`, `temps-observability`, `temps-log-aggregator`, `temps-auth`.
+Affected crates (17): `temps-deployments`, `temps-environments`, `temps-analytics-events`, `temps-error-tracking`, `temps-agents`, `temps-projects`, `temps-status-page`, `temps-revenue`, `temps-vulnerability-scanner`, `temps-otel`, `temps-analytics-funnels`, `temps-ai-chat`, `temps-webhooks`, `temps-providers`, `temps-monitoring`, `temps-observability`, `temps-log-aggregator`.
 
 ### 4. The team-access plugin registers the `ProjectAccessChecker` implementation
 
@@ -362,7 +362,7 @@ Rejected: the Temps data model uses a shared schema with Sea-ORM and does not se
 - Uses the established `DeploymentGate`-style optional extension point pattern — no new architectural precedent, no new class of coupling.
 
 ### Negative
-- ~94 OSS handler functions across ~18 crates each require three changes: one field added to the plugin's `AppState`, one line in `configure_routes` to resolve the checker, and one `project_access_guard!` call in the handler body. This is a large but mechanical change.
+- ~94 OSS handler functions across ~17 crates each require three changes: one field added to the plugin's `AppState`, one line in `configure_routes` to resolve the checker, and one `project_access_guard!` call in the handler body. This is a large but mechanical change.
 - Adding `moka` as a direct dependency of the team-access plugin (currently, moka is only used in a couple of other crates in this codebase). The version `0.12` is already in the workspace; this is a new dependency declaration, not a new package fetch.
 - A 60-second delay between an admin revoking team access and that revocation taking effect for in-flight sessions. This is the same latency class as other short-TTL caches already used in this codebase and is acceptable for the control-plane use case.
 
@@ -396,7 +396,7 @@ The ADR records that this is a security fix for a gap in an already-shipped feat
 OSS:
 - `temps-core`: new file `src/project_access.rs`, `pub use` in `lib.rs`
 - `temps-auth`: new `project_access_guard!` macro in `permission_guard.rs`, re-export in `lib.rs`
-- 18 crates listed in §3: `AppState` field addition + `configure_routes` resolver + `project_access_guard!` call in each project-scoped handler
+- 17 crates listed in §3: `AppState` field addition + `configure_routes` resolver + `project_access_guard!` call in each project-scoped handler
 
 Plugin side (separate repository, tracked independently):
 - the team-access plugin's crate: new `TeamProjectAccessChecker` module, `moka` dependency, call `context.register_service(checker)` in `register_services`, explicit cache invalidation in `grant_project_access`, `revoke_project_access`, `add_member`, `remove_member`
@@ -436,7 +436,7 @@ Plugin side (separate repository, tracked independently):
 The implementation should ship as a single PR to `temps` (OSS) that:
 1. Adds `ProjectAccessChecker` to `temps-core`
 2. Adds `project_access_guard!` to `temps-auth`
-3. Threads the field and call through all 18 affected crates
+3. Threads the field and call through all 17 affected crates
 
 ...followed by a separate PR to the team-access plugin's own repository that:
 1. Implements `TeamProjectAccessChecker`

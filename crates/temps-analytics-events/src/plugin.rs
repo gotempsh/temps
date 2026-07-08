@@ -75,6 +75,7 @@ impl TempsPlugin for EventsPlugin {
         let telemetry = context
             .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
             .unwrap_or_else(|| Arc::new(temps_core::telemetry::NoopTelemetryReporter));
+        let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
 
         let state = Arc::new(crate::handlers::AppState {
             events_service: events_backend,
@@ -83,6 +84,7 @@ impl TempsPlugin for EventsPlugin {
             ip_address_service,
             cookie_crypto,
             telemetry,
+            project_access_checker,
         });
 
         let routes = crate::handlers::configure_routes().with_state(state);
@@ -110,6 +112,7 @@ impl TempsPlugin for EventsPlugin {
             ip_address_service,
             cookie_crypto,
             telemetry,
+            project_access_checker: None,
         });
 
         let routes = crate::handlers::configure_public_routes().with_state(state);

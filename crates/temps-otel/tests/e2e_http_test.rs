@@ -223,6 +223,7 @@ async fn setup_e2e() -> Option<(
         audit_service: Arc::new(NoOpAuditLogger),
         cross_project_service,
         trace_hint_tx: None,
+        project_access_checker: None,
     };
 
     // Create auth middleware that injects AuthContext into request extensions.

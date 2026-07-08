@@ -8,7 +8,7 @@ use axum::{
     Json, Router,
 };
 use serde::Deserialize;
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{permission_guard, project_access_guard, RequireAuth};
 use temps_core::error_builder::{bad_request, internal_server_error, not_found};
 use temps_core::problemdetails::Problem;
 use temps_core::DateTime;
@@ -25,6 +25,8 @@ use crate::services::{
 pub trait StatusPageAppState: Send + Sync + 'static {
     fn status_page_service(&self) -> &StatusPageService;
     fn telemetry(&self) -> &std::sync::Arc<dyn temps_core::TelemetryReporter>;
+    /// Optional checker for team-based project access (human sessions only).
+    fn project_access_checker(&self) -> Option<Arc<dyn temps_core::ProjectAccessChecker>>;
 }
 
 /// OpenAPI documentation for status page endpoints
@@ -136,6 +138,7 @@ where
     T: StatusPageAppState,
 {
     permission_guard!(auth, StatusPageRead);
+    project_access_guard!(auth, project_id, app_state.project_access_checker());
     app_state
         .status_page_service()
         .get_status_overview(project_id, query.environment_id)
@@ -172,6 +175,7 @@ where
     T: StatusPageAppState,
 {
     permission_guard!(auth, StatusPageCreate);
+    project_access_guard!(auth, project_id, app_state.project_access_checker());
     let monitor = app_state
         .status_page_service()
         .monitor_service()
@@ -214,6 +218,7 @@ where
     T: StatusPageAppState,
 {
     permission_guard!(auth, StatusPageRead);
+    project_access_guard!(auth, project_id, app_state.project_access_checker());
     app_state
         .status_page_service()
         .monitor_service()
@@ -451,6 +456,7 @@ where
     T: StatusPageAppState,
 {
     permission_guard!(auth, StatusPageCreate);
+    project_access_guard!(auth, project_id, app_state.project_access_checker());
     app_state
         .status_page_service()
         .incident_service()
@@ -490,6 +496,7 @@ where
     T: StatusPageAppState,
 {
     permission_guard!(auth, StatusPageRead);
+    project_access_guard!(auth, project_id, app_state.project_access_checker());
     let (incidents, total) = app_state
         .status_page_service()
         .incident_service()
@@ -649,6 +656,7 @@ where
     T: StatusPageAppState,
 {
     permission_guard!(auth, StatusPageRead);
+    project_access_guard!(auth, project_id, app_state.project_access_checker());
     let interval = bucket_query.interval.as_deref().unwrap_or("hourly");
 
     app_state

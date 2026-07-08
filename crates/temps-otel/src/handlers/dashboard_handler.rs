@@ -18,7 +18,7 @@ use crate::handlers::audit::{
 };
 use crate::services::dashboard_service::DashboardLayout;
 use crate::OtelAppState;
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{permission_guard, project_access_guard, RequireAuth};
 use temps_core::problemdetails::Problem;
 use temps_core::{AuditContext, ProblemDetails, RequestMetadata};
 use temps_entities::metric_dashboards::Model;
@@ -128,6 +128,7 @@ pub async fn list_dashboards(
     Query(params): Query<ListDashboardsParams>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, OtelRead);
+    project_access_guard!(auth, params.project_id, state.project_access_checker);
 
     let (items, total) = state
         .dashboard_service
@@ -160,6 +161,7 @@ pub async fn create_dashboard(
     Json(request): Json<CreateDashboardRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, OtelWrite);
+    project_access_guard!(auth, request.project_id, state.project_access_checker);
 
     let model = state
         .dashboard_service
@@ -211,6 +213,7 @@ pub async fn get_dashboard(
     Query(scope): Query<DashboardScopeParams>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, OtelRead);
+    project_access_guard!(auth, scope.project_id, state.project_access_checker);
 
     let model = state.dashboard_service.get(scope.project_id, id).await?;
     Ok(Json(OtelDashboardResponse::from(model)))
@@ -245,6 +248,7 @@ pub async fn update_dashboard(
     Json(request): Json<UpdateDashboardRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, OtelWrite);
+    project_access_guard!(auth, scope.project_id, state.project_access_checker);
 
     let model = state
         .dashboard_service
@@ -293,6 +297,7 @@ pub async fn delete_dashboard(
     Query(scope): Query<DashboardScopeParams>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, OtelWrite);
+    project_access_guard!(auth, scope.project_id, state.project_access_checker);
 
     state.dashboard_service.delete(scope.project_id, id).await?;
 

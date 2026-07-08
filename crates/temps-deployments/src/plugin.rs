@@ -446,6 +446,13 @@ impl TempsPlugin for DeploymentsPlugin {
         // Get audit service for logging write operations
         let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
 
+        // Optional: team-based project access checker registered by a plugin.
+        // `configure_routes` runs after all plugins have completed
+        // `initialize_plugin_services`, so a checker registered by another
+        // plugin is guaranteed to be present in the registry by this point.
+        // When absent (plain OSS binary), project_access_guard! is a no-op.
+        let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
+
         // Deployment-token management routes carry their own app state
         // (`DeploymentTokenAppState`), so build it here and mount the router as
         // a sub-router below. Without this wiring the token endpoints -- create,
@@ -455,6 +462,7 @@ impl TempsPlugin for DeploymentsPlugin {
             Arc::new(handlers::deployment_tokens::DeploymentTokenAppState {
                 deployment_token_service,
                 audit_service: audit_service.clone(),
+                project_access_checker: project_access_checker.clone(),
             });
 
         // Get data directory for local file storage
@@ -491,6 +499,7 @@ impl TempsPlugin for DeploymentsPlugin {
             config_service: config_service.clone(),
             docker: docker_for_exec,
             deployment_gate,
+            project_access_checker,
         });
 
         let deployments_routes = handlers::deployments::configure_routes();

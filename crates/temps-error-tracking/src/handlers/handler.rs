@@ -9,7 +9,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::{permission_guard, project_scope_guard, RequireAuth};
+use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::Problem;
 use temps_core::DateTime;
 use utoipa::{IntoParams, OpenApi, ToSchema};
@@ -375,6 +375,7 @@ pub async fn list_error_groups(
 ) -> Result<Json<PaginatedErrorGroupsResponse>, Problem> {
     permission_guard!(auth, ErrorTrackingRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     let page = query.page;
     let page_size = std::cmp::min(query.page_size, 100);
 
@@ -430,6 +431,7 @@ pub async fn get_error_group(
 ) -> Result<Json<ErrorGroupResponse>, Problem> {
     permission_guard!(auth, ErrorTrackingRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     let group = state
         .error_tracking_service
         .get_error_group(group_id, project_id)
@@ -462,6 +464,7 @@ pub async fn update_error_group(
 ) -> Result<StatusCode, Problem> {
     permission_guard!(auth, ErrorTrackingWrite);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     state
         .error_tracking_service
         .update_error_group_status(group_id, project_id, request.status, request.assigned_to)
@@ -505,6 +508,7 @@ pub async fn list_error_events(
 ) -> Result<Json<PaginatedErrorEventsResponse>, Problem> {
     permission_guard!(auth, ErrorTrackingRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     let page = query.page;
     let page_size = std::cmp::min(query.page_size, 100);
 
@@ -553,6 +557,7 @@ pub async fn get_error_event(
 ) -> Result<Json<ErrorEventResponse>, Problem> {
     permission_guard!(auth, ErrorTrackingRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     let event = state
         .error_tracking_service
         .get_error_event(event_id, group_id, project_id)
@@ -581,6 +586,7 @@ pub async fn get_error_stats(
 ) -> Result<Json<ErrorGroupStatsResponse>, Problem> {
     permission_guard!(auth, ErrorTrackingRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     let stats = state
         .error_tracking_service
         .get_error_stats(project_id, None)
@@ -616,6 +622,7 @@ pub async fn get_error_dashboard_stats(
 ) -> Result<Json<ErrorDashboardStatsResponse>, Problem> {
     permission_guard!(auth, ErrorTrackingRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     let stats = state
         .error_tracking_service
         .get_dashboard_stats(
@@ -662,6 +669,7 @@ pub async fn get_error_time_series(
 ) -> Result<Json<Vec<ErrorTimeSeriesDataResponse>>, Problem> {
     permission_guard!(auth, ErrorTrackingRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     let data = state
         .error_tracking_service
         .get_error_time_series(
@@ -703,6 +711,7 @@ pub async fn has_error_groups(
 ) -> Result<Json<HasErrorGroupsResponse>, Problem> {
     permission_guard!(auth, ErrorTrackingRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     let has_error_groups = state
         .error_tracking_service
         .has_error_groups(project_id)

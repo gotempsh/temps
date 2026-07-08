@@ -99,4 +99,6 @@ pub struct OtelAppState {
     /// banner) and `GET /otel/global/traces/{trace_id}` (Phase 2 unified
     /// waterfall) query handlers.
     pub cross_project_service: std::sync::Arc<crate::services::CrossProjectTraceService>,
+    /// Optional checker for team-based project access (human sessions only).
+    pub project_access_checker: Option<std::sync::Arc<dyn temps_core::ProjectAccessChecker>>,
 }

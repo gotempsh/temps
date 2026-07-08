@@ -450,4 +450,174 @@ mod tests {
             "deployment tokens should bypass project_access_guard!"
         );
     }
+
+    // ---------------------------------------------------------------------------
+    // ADR-028 Phase B: Coverage enumeration
+    //
+    // Every Rust source file that contains `project_scope_guard!` must also
+    // contain `project_access_guard!` — the two guards are always paired.
+    // This test scans the workspace at test time and fails if any file has one
+    // without the other, catching handlers added in future crates that omit the
+    // companion guard.
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn every_project_scope_guard_has_access_guard_companion() {
+        // Locate the workspace crates/ directory relative to this crate.
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        // temps-auth lives at <workspace>/crates/temps-auth
+        let workspace_root = manifest_dir
+            .parent() // crates/
+            .and_then(|p| p.parent()) // workspace root
+            .expect("cannot resolve workspace root from CARGO_MANIFEST_DIR");
+        let crates_dir = workspace_root.join("crates");
+
+        let mut violations: Vec<String> = Vec::new();
+
+        for entry in walkdir::WalkDir::new(&crates_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("rs"))
+        {
+            let path = entry.path();
+            let contents = match std::fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            // Use `!(` to match actual macro invocations and avoid matching
+            // doc-comment references like `[`project_scope_guard!`]`.
+            let has_scope_guard = contents.contains("project_scope_guard!(");
+            let has_access_guard = contents.contains("project_access_guard!(");
+            // Skip the file that defines the macros themselves.
+            let is_definition_file = contents.contains("macro_rules! project_scope_guard")
+                || contents.contains("macro_rules! project_access_guard");
+            if is_definition_file {
+                continue;
+            }
+            if has_scope_guard && !has_access_guard {
+                violations.push(format!("{}", path.display()));
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "The following files have `project_scope_guard!` but are missing \
+             `project_access_guard!` (ADR-028 Phase B requires both to be paired):\n{}",
+            violations.join("\n")
+        );
+    }
+
+    /// ADR-028 Phase B — crate coverage snapshot.
+    ///
+    /// Documents which crates contain `project_access_guard!` usages as of the
+    /// Phase B rollout. When a new crate with project-scoped handlers is added,
+    /// this list must grow to maintain the inventory. Keep it sorted.
+    ///
+    /// The check is **bidirectional**:
+    /// - Every crate in `expected_crates` must still have at least one
+    ///   `project_access_guard!` call (catches accidental removal).
+    /// - Every crate that has a `project_access_guard!` call must be in
+    ///   `expected_crates` (catches new crates that add guard calls without
+    ///   being registered in this inventory, closing the silent-omission gap
+    ///   identified in the Phase B review).
+    #[test]
+    fn project_access_guard_coverage_snapshot() {
+        let expected_crates: &[&str] = &[
+            "temps-agents",
+            "temps-ai-chat",
+            "temps-analytics",
+            "temps-analytics-events",
+            "temps-analytics-funnels",
+            "temps-analytics-session-replay",
+            "temps-deployments",
+            "temps-environments",
+            "temps-error-tracking",
+            "temps-log-aggregator",
+            "temps-monitoring",
+            "temps-observability",
+            "temps-otel",
+            "temps-projects",
+            "temps-providers",
+            "temps-revenue",
+            "temps-status-page",
+            "temps-vulnerability-scanner",
+            "temps-webhooks",
+        ];
+
+        // Verify the snapshot is sorted (makes PR diffs easier to review).
+        let mut sorted = expected_crates.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(
+            expected_crates,
+            sorted.as_slice(),
+            "keep the coverage snapshot sorted alphabetically"
+        );
+
+        // Scan the workspace and collect crates that actually use project_access_guard!.
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workspace_root = manifest_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("cannot resolve workspace root");
+        let crates_dir = workspace_root.join("crates");
+
+        let mut found_crates: std::collections::BTreeSet<String> = Default::default();
+
+        for entry in walkdir::WalkDir::new(&crates_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("rs"))
+        {
+            let path = entry.path();
+            let contents = match std::fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            // Skip the file that defines the macro itself.
+            if contents.contains("macro_rules! project_access_guard") {
+                continue;
+            }
+            if contents.contains("project_access_guard!(") {
+                // Derive the crate name from the directory that directly contains
+                // this source file's Cargo.toml — walk up until we find it.
+                let mut dir = path.parent();
+                while let Some(d) = dir {
+                    if d.join("Cargo.toml").exists() {
+                        if let Some(name) = d.file_name().and_then(|n| n.to_str()) {
+                            found_crates.insert(name.to_string());
+                        }
+                        break;
+                    }
+                    dir = d.parent();
+                }
+            }
+        }
+
+        // Direction 1: every expected crate must still have a guard call.
+        for expected in expected_crates {
+            assert!(
+                found_crates.contains(*expected),
+                "Crate `{}` is in the coverage snapshot but no `project_access_guard!` \
+                 usage was found in its source — was it accidentally removed?",
+                expected
+            );
+        }
+
+        // Direction 2: every crate with a guard call must be in the snapshot.
+        // This catches crates that add guard calls without registering in this
+        // inventory, which would otherwise silently escape the coverage check.
+        let expected_set: std::collections::BTreeSet<&str> =
+            expected_crates.iter().copied().collect();
+        let extra_found: Vec<&str> = found_crates
+            .iter()
+            .filter(|c| !expected_set.contains(c.as_str()))
+            .map(|s| s.as_str())
+            .collect();
+        assert!(
+            extra_found.is_empty(),
+            "These crates use `project_access_guard!` but are not listed in the coverage \
+             snapshot — add them to `expected_crates` (sorted alphabetically):\n{}",
+            extra_found.join("\n")
+        );
+    }
 }

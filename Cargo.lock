@@ -11008,6 +11008,7 @@ dependencies = [
  "urlencoding",
  "utoipa",
  "uuid",
+ "walkdir",
 ]
 
 [[package]]

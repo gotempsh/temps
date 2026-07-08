@@ -348,10 +348,15 @@ pub async fn get_project_by_slug(
     Path(slug): Path<String>,
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, ProjectsRead);
+    permission_guard!(auth, ProjectsRead); // 1. instance-wide role check
 
     debug!("get project by slug called with slug: {}", slug);
+    // Resolve the project first so we have the numeric ID for the guards.
+    // Guards must run on the resolved ID — not skipped because the caller
+    // used a slug instead of an ID path.
     let project = state.project_service.get_project_by_slug(&slug).await?;
+    project_scope_guard!(auth, project.id); // 2. deployment-token IDOR check
+    project_access_guard!(auth, project.id, state.project_access_checker); // 3. team-based access
     Ok(Json(ProjectResponse::map_from_project(project)).into_response())
 }
 
@@ -383,6 +388,7 @@ pub async fn update_project(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
     project_scope_guard!(auth, id);
+    project_access_guard!(auth, id, state.project_access_checker);
 
     let project_req = crate::services::types::CreateProjectRequest {
         name: project.name.clone(),
@@ -467,6 +473,7 @@ pub async fn change_project_source(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
     project_scope_guard!(auth, id);
+    project_access_guard!(auth, id, state.project_access_checker);
 
     let updated = state
         .project_service
@@ -525,6 +532,7 @@ pub async fn delete_project(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsDelete);
     project_scope_guard!(auth, id);
+    project_access_guard!(auth, id, state.project_access_checker);
 
     // Get project details before deletion
     let project = state.project_service.get_project(id).await?;
@@ -585,6 +593,7 @@ pub async fn update_project_settings(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let updated_project = state
         .project_service
@@ -671,6 +680,7 @@ pub async fn update_automatic_deploy(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     info!(
         "Updating automatic deployment setting for project: {}",
@@ -728,6 +738,7 @@ pub async fn update_git_settings(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     info!(
         "Updating git settings for project: {} (branch: {}, repo: {}/{})",
@@ -819,6 +830,7 @@ pub async fn reinstall_gitlab_webhook(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     info!("Reinstalling GitLab webhook for project: {}", project_id);
 
@@ -894,6 +906,7 @@ pub async fn update_project_deployment_config(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     info!("Updating deployment config for project: {}", project_id);
 
@@ -992,6 +1005,7 @@ pub async fn trigger_project_pipeline(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
     project_scope_guard!(auth, id);
+    project_access_guard!(auth, id, state.project_access_checker);
 
     info!("Triggering pipeline for project with id: {}", id);
 
@@ -1710,6 +1724,51 @@ pub async fn create_project_from_template(
 #[cfg(test)]
 mod tests {
     use super::parse_owner_repo_from_git_url;
+
+    /// Regression test for ADR-028 finding #2: `get_project_by_slug` guard bypass.
+    ///
+    /// Before the fix, `GET /projects/by-slug/{slug}` only called
+    /// `permission_guard!` and skipped both `project_scope_guard!` and
+    /// `project_access_guard!`. Any authenticated user with `ProjectsRead`
+    /// could bypass team-access restrictions by using the slug endpoint
+    /// instead of the numeric-ID endpoint — slugs are guessable (used in
+    /// deployment URLs, CLI output, and webhook paths).
+    ///
+    /// After the fix, the handler resolves the project first and then applies
+    /// both guards using the resolved `project.id`, matching the guard order
+    /// in `get_project`.
+    ///
+    /// This test scans the handler source to verify both guards are present,
+    /// which catches the regression if either is removed while leaving the
+    /// rest of the function intact.
+    #[test]
+    fn get_project_by_slug_applies_scope_and_access_guards_on_resolved_id() {
+        let source = include_str!("handlers.rs");
+
+        // Locate the function body.
+        let fn_start = source
+            .find("pub async fn get_project_by_slug")
+            .expect("get_project_by_slug handler not found in source");
+        // Extract up to the start of the next pub async fn so we scope to
+        // just this handler and avoid false-positives from other functions.
+        let after_start = &source[fn_start + 1..];
+        let next_fn_offset = after_start
+            .find("pub async fn")
+            .unwrap_or(after_start.len());
+        let fn_body = &source[fn_start..fn_start + 1 + next_fn_offset];
+
+        assert!(
+            fn_body.contains("project_scope_guard!(auth, project.id)"),
+            "get_project_by_slug must call project_scope_guard! on the resolved project.id \
+             to block cross-project deployment-token IDOR via slug"
+        );
+        assert!(
+            fn_body
+                .contains("project_access_guard!(auth, project.id, state.project_access_checker)"),
+            "get_project_by_slug must call project_access_guard! on the resolved project.id \
+             to enforce team-based access (the same guard get_project applies)"
+        );
+    }
 
     #[test]
     fn parses_https_url_with_dot_git() {

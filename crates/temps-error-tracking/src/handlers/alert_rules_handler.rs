@@ -8,7 +8,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::{permission_guard, project_scope_guard, RequireAuth};
+use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::Problem;
 use temps_entities::error_alert_rules;
 use utoipa::{OpenApi, ToSchema};
@@ -156,6 +156,7 @@ pub async fn list_alert_rules(
 ) -> Result<Json<Vec<AlertRuleResponse>>, Problem> {
     permission_guard!(auth, ErrorTrackingRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     let rules = state.alert_service.list_rules(project_id).await?;
     Ok(Json(
         rules.into_iter().map(AlertRuleResponse::from).collect(),
@@ -184,6 +185,7 @@ pub async fn get_alert_rule(
 ) -> Result<Json<AlertRuleResponse>, Problem> {
     permission_guard!(auth, ErrorTrackingRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     let rule = state.alert_service.get_rule(rule_id, project_id).await?;
     Ok(Json(AlertRuleResponse::from(rule)))
 }
@@ -211,6 +213,7 @@ pub async fn create_alert_rule(
 ) -> Result<(StatusCode, Json<AlertRuleResponse>), Problem> {
     permission_guard!(auth, ErrorTrackingCreate);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     let rule = state
         .alert_service
         .create_rule(
@@ -254,6 +257,7 @@ pub async fn update_alert_rule(
 ) -> Result<Json<AlertRuleResponse>, Problem> {
     permission_guard!(auth, ErrorTrackingWrite);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     let rule = state
         .alert_service
         .update_rule(
@@ -295,6 +299,7 @@ pub async fn delete_alert_rule(
 ) -> Result<StatusCode, Problem> {
     permission_guard!(auth, ErrorTrackingWrite);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     state.alert_service.delete_rule(rule_id, project_id).await?;
 
     Ok(StatusCode::NO_CONTENT)

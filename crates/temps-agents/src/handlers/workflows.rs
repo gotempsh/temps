@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::ToSchema;
 
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{permission_guard, project_access_guard, RequireAuth};
 use temps_core::audit::{AuditContext, AuditOperation};
 use temps_core::problemdetails::Problem;
 use temps_core::RequestMetadata;
@@ -157,6 +157,7 @@ pub async fn workflow_dry_run(
     Json(request): Json<WorkflowDryRunRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     // Verify the project exists. Skipping this would leak ephemeral runs into
     // the agent_runs table for nonexistent projects (FK would catch it, but

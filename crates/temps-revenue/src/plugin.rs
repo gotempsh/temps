@@ -76,6 +76,7 @@ impl TempsPlugin for RevenuePlugin {
                 analytics.clone(),
                 import.clone(),
                 audit,
+                None,
             ));
             let public_state = Arc::new(PublicState::new(ingestion.clone()));
 
@@ -92,7 +93,18 @@ impl TempsPlugin for RevenuePlugin {
     }
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
-        let state = context.require_service::<ManagementState>();
+        let integrations = context.require_service::<RevenueIntegrationService>();
+        let analytics = context.require_service::<RevenueAnalyticsService>();
+        let import = context.require_service::<RevenueImportService>();
+        let audit = context.require_service::<dyn AuditLogger>();
+        let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
+        let state = Arc::new(ManagementState::new(
+            integrations,
+            analytics,
+            import,
+            audit,
+            project_access_checker,
+        ));
         let router: Router = configure_management_routes().with_state(state);
         Some(PluginRoutes::new(router))
     }

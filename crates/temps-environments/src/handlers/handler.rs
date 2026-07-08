@@ -12,7 +12,7 @@ use axum::{
     Json,
 };
 use std::sync::Arc;
-use temps_auth::{permission_guard, project_scope_guard, RequireAuth};
+use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::AuditContext;
 use temps_core::RequestMetadata;
 use tracing::{error, info};
@@ -126,6 +126,7 @@ pub async fn get_environments(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let environments = state
         .environment_service
@@ -196,6 +197,7 @@ pub async fn get_environment(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let env = state
         .environment_service
@@ -262,6 +264,7 @@ pub async fn get_environment_domains(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let domains = state
         .environment_service
@@ -313,6 +316,7 @@ pub async fn add_environment_domain(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsWrite);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let domain = state
         .environment_service
@@ -359,6 +363,7 @@ pub async fn delete_environment_domain(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsDelete);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     state
         .environment_service
@@ -395,6 +400,7 @@ pub async fn get_environment_variables(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let vars = state
         .env_var_service
@@ -476,6 +482,7 @@ pub async fn get_resolved_environment_variables(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     // Manual vars (already includes environment memberships).
     let manual = state
@@ -630,6 +637,7 @@ pub async fn get_resolved_environment_variable_value(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     info!(
         user_id = auth.user_id(),
@@ -721,6 +729,7 @@ pub async fn create_environment_variable(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsCreate);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let var = state
         .env_var_service
@@ -780,6 +789,7 @@ pub async fn delete_environment_variable(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsDelete);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     state
         .env_var_service
@@ -814,6 +824,7 @@ pub async fn update_environment_variable(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsWrite);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let var = state
         .env_var_service
@@ -875,6 +886,7 @@ pub async fn get_environment_variable_value(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     // Reveal of a single decrypted secret. Logged at info so any
     // bulk-reveal pattern (one of the obvious post-compromise behaviors)
@@ -921,6 +933,7 @@ pub async fn update_environment_settings(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsWrite);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     // Get project details for audit log
     let project = state.environment_service.get_project(project_id).await?;
@@ -1079,6 +1092,7 @@ pub async fn update_environment_subdomain(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsWrite);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let project = state.environment_service.get_project(project_id).await?;
     let environment = state
@@ -1181,6 +1195,7 @@ pub async fn wake_environment(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsWrite);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     // Cooldown: reject if last state change was less than 30 seconds ago
     let environment = state
@@ -1334,6 +1349,7 @@ pub async fn sleep_environment(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsWrite);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     // Cooldown: reject if last state change was less than 30 seconds ago
     let environment = state
@@ -1476,6 +1492,7 @@ pub async fn delete_environment(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsDelete);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     // Get environment details before deletion for audit log
     let environment = state
@@ -1562,6 +1579,7 @@ pub async fn create_environment(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsCreate);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let environment = state
         .environment_service
@@ -1658,6 +1676,7 @@ pub async fn list_project_secrets(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let secrets = state
         .secret_service
@@ -1715,6 +1734,7 @@ pub async fn create_project_secret(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsCreate);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let secret = state
         .secret_service
@@ -1776,6 +1796,7 @@ pub async fn update_project_secret(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsWrite);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let secret = state
         .secret_service
@@ -1833,6 +1854,7 @@ pub async fn delete_project_secret(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsDelete);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     state.secret_service.delete(project_id, secret_id).await?;
     Ok(StatusCode::NO_CONTENT.into_response())

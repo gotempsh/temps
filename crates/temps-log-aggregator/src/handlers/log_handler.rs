@@ -16,7 +16,7 @@ use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
 use axum::Extension;
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{permission_guard, project_access_guard, RequireAuth};
 use temps_core::problemdetails;
 use temps_core::problemdetails::{Problem, ProblemDetails};
 use temps_core::RequestMetadata;
@@ -485,6 +485,7 @@ async fn purge_project_logs(
     Json(request): Json<PurgeLogsRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, LogsDelete);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     let before = chrono::DateTime::parse_from_rfc3339(&request.before)
         .map_err(|_| LogAggregatorError::Validation {
@@ -604,6 +605,7 @@ mod tests {
             tail_service,
             retention_service,
             audit_service,
+            project_access_checker: None,
         });
 
         TestContext {

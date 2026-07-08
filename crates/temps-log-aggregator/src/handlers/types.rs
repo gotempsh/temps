@@ -11,6 +11,8 @@ pub struct LogAggregatorAppState {
     pub tail_service: Arc<TailService>,
     pub retention_service: Arc<RetentionService>,
     pub audit_service: Arc<dyn AuditLogger>,
+    /// Optional checker for team-based project access (human sessions only).
+    pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
 }
 
 pub async fn create_log_aggregator_app_state(
@@ -26,5 +28,6 @@ pub async fn create_log_aggregator_app_state(
         tail_service,
         retention_service,
         audit_service,
+        project_access_checker: None,
     })
 }

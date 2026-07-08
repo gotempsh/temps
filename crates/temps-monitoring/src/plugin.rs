@@ -77,10 +77,12 @@ impl TempsPlugin for MonitoringPlugin {
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         let alarm_service = context.require_service::<AlarmService>();
         let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
+        let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
 
         let app_state = Arc::new(AlarmAppState {
             alarm_service,
             audit_service,
+            project_access_checker,
         });
 
         let router = crate::handlers::alarm_handlers::configure_routes().with_state(app_state);

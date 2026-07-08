@@ -18,7 +18,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::{permission_guard, project_scope_guard, RequireAuth};
+use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, error, info, warn};
@@ -34,6 +34,7 @@ async fn verify_container_exec_access(
     container_id: String,
 ) -> Result<temps_entities::deployment_containers::Model, Problem> {
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     // Verify the container belongs to this project/environment before using
     // the caller-supplied Docker ID against any Docker daemon.

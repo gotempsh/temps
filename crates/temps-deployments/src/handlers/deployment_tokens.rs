@@ -12,8 +12,8 @@ use axum::{
     routing::get,
     Extension, Json, Router,
 };
-use temps_auth::permission_guard;
 use temps_auth::RequireAuth;
+use temps_auth::{permission_guard, project_access_guard};
 use temps_core::{AuditContext, RequestMetadata};
 use tracing::error;
 use utoipa::OpenApi;
@@ -33,6 +33,13 @@ pub struct DeploymentTokenAppState {
     pub deployment_token_service: Arc<DeploymentTokenService>,
     /// Audit logger for write operations (e.g. token rotation)
     pub audit_service: Arc<dyn temps_core::AuditLogger>,
+    /// Optional checker enforcing team-based project access for human sessions.
+    ///
+    /// `None` when no plugin implementing this check is registered — the
+    /// `project_access_guard!` macro is a strict synchronous no-op in that
+    /// case. Resolved once in `configure_routes` via
+    /// `context.get_service::<dyn temps_core::ProjectAccessChecker>()`.
+    pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -116,6 +123,7 @@ async fn list_deployment_tokens(
     Query(query): Query<ListDeploymentTokensQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentTokensRead);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     let page = query.page.unwrap_or(1);
     let page_size = std::cmp::min(query.page_size.unwrap_or(20), 100);
@@ -158,6 +166,7 @@ async fn create_deployment_token(
     Json(request): Json<CreateDeploymentTokenRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentTokensCreate);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     let response = app_state
         .deployment_token_service
@@ -195,6 +204,7 @@ async fn get_deployment_token(
     Path((project_id, token_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentTokensRead);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     let response = app_state
         .deployment_token_service
@@ -236,6 +246,7 @@ async fn update_deployment_token(
     Json(request): Json<UpdateDeploymentTokenRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentTokensWrite);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     let response = app_state
         .deployment_token_service
@@ -273,6 +284,7 @@ async fn delete_deployment_token(
     Path((project_id, token_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentTokensDelete);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     app_state
         .deployment_token_service
@@ -311,6 +323,7 @@ async fn rotate_deployment_token(
     Path((project_id, token_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentTokensWrite);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     let rotated = app_state
         .deployment_token_service

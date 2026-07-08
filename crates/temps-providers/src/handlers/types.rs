@@ -33,6 +33,8 @@ pub struct AppState {
     /// Telemetry reporter — fire-and-forget anonymous usage events.
     /// Defaults to a no-op when telemetry is not registered.
     pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
+    /// Optional checker for team-based project access (human sessions only).
+    pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
