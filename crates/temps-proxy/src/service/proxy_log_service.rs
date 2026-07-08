@@ -620,14 +620,48 @@ impl ProxyLogService {
         .await
     }
 
-    /// Get a single proxy log by ID
+    /// Get a single proxy log by ID.
+    ///
+    /// `proxy_logs` is a TimescaleDB hypertable partitioned by `timestamp`
+    /// (1-day chunks, compressed after 7 days), so a bare `WHERE id = $1`
+    /// cannot exclude any chunk and must decompress every compressed chunk —
+    /// observed as multi-second lookups. When the caller knows the row's event
+    /// time (the list endpoint returns it), a ±1-day bound reduces the lookup
+    /// to the couple of chunks that can contain the row. Without a timestamp,
+    /// the recent uncompressed window is probed first and the unbounded scan
+    /// only runs as a last resort so bare deep-links keep resolving.
     pub async fn get_by_id(
         &self,
         id: i32,
+        timestamp: Option<UtcDateTime>,
     ) -> Result<Option<proxy_logs::Model>, ProxyLogServiceError> {
         if let Some(storage) = &self.storage {
-            return storage.get_by_id(id).await;
+            return storage.get_by_id(id, timestamp).await;
         }
+
+        if let Some(ts) = timestamp {
+            let log = proxy_logs::Entity::find()
+                .filter(proxy_logs::Column::Id.eq(id))
+                .filter(proxy_logs::Column::Timestamp.gte(ts - chrono::Duration::days(1)))
+                .filter(proxy_logs::Column::Timestamp.lte(ts + chrono::Duration::days(1)))
+                .one(self.db.as_ref())
+                .await?;
+            return Ok(log);
+        }
+
+        // Compression policy compresses chunks older than 7 days; probing the
+        // uncompressed window first keeps the common case (recent log, no
+        // timestamp supplied) off the decompression path.
+        let recent_cutoff = Utc::now() - chrono::Duration::days(7);
+        let log = proxy_logs::Entity::find()
+            .filter(proxy_logs::Column::Id.eq(id))
+            .filter(proxy_logs::Column::Timestamp.gte(recent_cutoff))
+            .one(self.db.as_ref())
+            .await?;
+        if log.is_some() {
+            return Ok(log);
+        }
+
         let log = proxy_logs::Entity::find_by_id(id)
             .one(self.db.as_ref())
             .await?;

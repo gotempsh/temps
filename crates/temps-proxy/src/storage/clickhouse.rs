@@ -992,7 +992,11 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
         Ok((models, total))
     }
 
-    async fn get_by_id(&self, id: i32) -> Result<Option<proxy_logs::Model>, ProxyLogServiceError> {
+    async fn get_by_id(
+        &self,
+        id: i32,
+        _timestamp: Option<UtcDateTime>,
+    ) -> Result<Option<proxy_logs::Model>, ProxyLogServiceError> {
         // ClickHouse proxy_logs has no serial `id` column (see the schema note).
         // The list rows surface id=0 and the UI keys off request_id, so an
         // id-based lookup cannot resolve a CH row. Return None (404) rather than
@@ -2073,7 +2077,11 @@ mod tests {
             "temps",
             "temps_dev",
         ));
-        assert!(store.get_by_id(42).await.expect("no-io path").is_none());
+        assert!(store
+            .get_by_id(42, None)
+            .await
+            .expect("no-io path")
+            .is_none());
     }
 
     #[tokio::test]

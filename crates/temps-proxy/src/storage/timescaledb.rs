@@ -192,8 +192,12 @@ impl ProxyLogStorage for TimescaleDbProxyLogStore {
             .await
     }
 
-    async fn get_by_id(&self, id: i32) -> Result<Option<proxy_logs::Model>, ProxyLogServiceError> {
-        self.reader.get_by_id(id).await
+    async fn get_by_id(
+        &self,
+        id: i32,
+        timestamp: Option<UtcDateTime>,
+    ) -> Result<Option<proxy_logs::Model>, ProxyLogServiceError> {
+        self.reader.get_by_id(id, timestamp).await
     }
 
     async fn get_by_request_id(

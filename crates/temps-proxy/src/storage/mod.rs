@@ -85,7 +85,16 @@ pub trait ProxyLogStorage: Send + Sync {
     ) -> Result<(Vec<proxy_logs::Model>, u64), ProxyLogServiceError>;
 
     /// Fetch a single proxy log by its serial id.
-    async fn get_by_id(&self, id: i32) -> Result<Option<proxy_logs::Model>, ProxyLogServiceError>;
+    ///
+    /// `timestamp` is the row's known event time (the list endpoint returns it
+    /// per row). On the TimescaleDB hypertable it bounds the lookup to the
+    /// chunks around that instant instead of scanning — and decompressing —
+    /// the entire retention window.
+    async fn get_by_id(
+        &self,
+        id: i32,
+        timestamp: Option<UtcDateTime>,
+    ) -> Result<Option<proxy_logs::Model>, ProxyLogServiceError>;
 
     /// Fetch a single proxy log by its (unique) request id, for tracing joins.
     async fn get_by_request_id(
