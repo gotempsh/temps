@@ -2044,6 +2044,9 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                         "ExternalServiceMetricsStatus",
                         "ExternalServiceMetricsByDatabase",
                         "ExternalServiceMetricsGetAlertRules",
+                        "DeploymentMetricsGetRange",
+                        "DeploymentMetricsGetLatest",
+                        "NodeMetricsGetRange",
                         // ── Domains: metadata (no challenge tokens) ──
                         "list_domains",
                         "get_domain",
