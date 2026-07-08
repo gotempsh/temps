@@ -16,7 +16,7 @@
 
 import {
   getEnvironmentsOptions,
-  getGeneralStatsOptions,
+  getProjectsHealthOptions,
   getProjectsOptions,
   getTimeBucketStatsOptions,
   nodeMetricsGetRangeOptions,
@@ -280,15 +280,6 @@ function proxySeriesQuery(metric: string, range: RangeValue) {
   }
 }
 
-/**
- * Format a Date for the analytics API. Despite the OpenAPI description
- * saying "YYYY-MM-DD HH:MM:SS", the server rejects that and requires
- * ISO 8601 "YYYY-MM-DDTHH:MM:SSZ" (no fractional seconds).
- */
-function toAnalyticsDate(d: Date): string {
-  return d.toISOString().replace(/\.\d{3}Z$/, 'Z')
-}
-
 /** Memoized window bounds for the selected range (stable query keys). */
 function useWindowBounds(range: RangeValue) {
   return useMemo(() => {
@@ -297,8 +288,6 @@ function useWindowBounds(range: RangeValue) {
     return {
       startIso: start.toISOString(),
       endIso: end.toISOString(),
-      startAnalytics: toAnalyticsDate(start),
-      endAnalytics: toAnalyticsDate(end),
     }
   }, [range])
 }
@@ -856,38 +845,63 @@ function FilterBar({
 }
 
 // ---------------------------------------------------------------------------
-// Traffic by project (analytics page-view breakdown)
+// Traffic by project (proxy-log request stats per project)
 // ---------------------------------------------------------------------------
 
-type BreakdownSortKey =
-  | 'project_name'
-  | 'total_page_views'
-  | 'total_visits'
-  | 'unique_visitors'
-  | 'bounce_rate'
+/** One table row: project identity joined with its proxy-log health stats. */
+type ProjectTrafficRow = {
+  project_id: number
+  project_name: string
+  total_requests: number
+  total_errors: number
+  error_rate: number
+  avg_response_time_ms: number
+  status: string
+}
 
-const BREAKDOWN_COLUMNS: {
-  key: BreakdownSortKey
+type TrafficSortKey =
+  | 'project_name'
+  | 'total_requests'
+  | 'total_errors'
+  | 'error_rate'
+  | 'avg_response_time_ms'
+  | 'status'
+
+const TRAFFIC_COLUMNS: {
+  key: TrafficSortKey
   label: string
   numeric: boolean
   secondary: boolean
 }[] = [
   { key: 'project_name', label: 'Project', numeric: false, secondary: false },
+  { key: 'total_requests', label: 'Requests', numeric: true, secondary: false },
+  { key: 'total_errors', label: 'Errors', numeric: true, secondary: true },
+  { key: 'error_rate', label: 'Error rate', numeric: true, secondary: false },
   {
-    key: 'total_page_views',
-    label: 'Page views',
-    numeric: true,
-    secondary: false,
-  },
-  { key: 'total_visits', label: 'Visits', numeric: true, secondary: true },
-  {
-    key: 'unique_visitors',
-    label: 'Unique visitors',
+    key: 'avg_response_time_ms',
+    label: 'Avg latency',
     numeric: true,
     secondary: true,
   },
-  { key: 'bounce_rate', label: 'Bounce rate', numeric: true, secondary: true },
+  { key: 'status', label: 'Status', numeric: false, secondary: false },
 ]
+
+const STATUS_STYLES: Record<string, { dot: string; text: string }> = {
+  healthy: { dot: 'bg-emerald-500', text: 'text-emerald-600' },
+  degraded: { dot: 'bg-amber-500', text: 'text-amber-600' },
+  down: { dot: 'bg-red-500', text: 'text-red-600' },
+  unknown: { dot: 'bg-muted-foreground/40', text: 'text-muted-foreground' },
+}
+
+function StatusBadge({ status }: { status: string }) {
+  const style = STATUS_STYLES[status] ?? STATUS_STYLES.unknown
+  return (
+    <span className={`inline-flex items-center gap-1.5 text-xs ${style.text}`}>
+      <span className={`inline-block h-2 w-2 rounded-full ${style.dot}`} />
+      {status}
+    </span>
+  )
+}
 
 function TrafficByProject({
   range,
@@ -896,37 +910,60 @@ function TrafficByProject({
   range: RangeValue
   filter: ProxyFilter
 }) {
-  const [sortKey, setSortKey] = useState<BreakdownSortKey>('total_page_views')
+  const [sortKey, setSortKey] = useState<TrafficSortKey>('total_requests')
   const [sortDesc, setSortDesc] = useState(true)
-  const { startAnalytics, endAnalytics } = useWindowBounds(range)
+  const { startIso, endIso } = useWindowBounds(range)
 
-  const q = useQuery({
-    ...getGeneralStatsOptions({
+  // Same options FilterBar uses — React Query dedupes the fetch.
+  const projectsQ = useQuery({
+    ...getProjectsOptions({ query: { page: 1, per_page: 100 } }),
+    staleTime: 60_000,
+  })
+  const allProjects = projectsQ.data?.projects ?? []
+  const projects =
+    filter.projectId != null
+      ? allProjects.filter((p) => p.id === filter.projectId)
+      : allProjects
+
+  const idsParam = projects.map((p) => p.id).join(',')
+  const healthQ = useQuery({
+    ...getProjectsHealthOptions({
       query: {
-        start_date: startAnalytics,
-        end_date: endAnalytics,
-        include_project_breakdown: true,
-        project_ids: filter.projectId != null ? [filter.projectId] : undefined,
-        environment_id: filter.environmentId ?? undefined,
+        project_ids: idsParam,
+        start_time: startIso,
+        end_time: endIso,
       },
     }),
+    enabled: projects.length > 0,
     staleTime: 30_000,
+    refetchInterval: 60_000,
   })
 
-  const breakdown = q.data?.project_breakdown ?? []
-  const sorted = [...breakdown].sort((a, b) => {
+  const health = healthQ.data?.projects ?? {}
+  const rows: ProjectTrafficRow[] = projects.map((p) => {
+    const h = health[String(p.id)]
+    return {
+      project_id: p.id,
+      project_name: p.name,
+      total_requests: h?.total_requests ?? 0,
+      total_errors: h?.total_errors ?? 0,
+      error_rate: h?.error_rate ?? 0,
+      avg_response_time_ms: h?.avg_response_time_ms ?? 0,
+      status: h?.status ?? 'unknown',
+    }
+  })
+
+  const sorted = [...rows].sort((a, b) => {
     const av = a[sortKey]
     const bv = b[sortKey]
-    let cmp: number
-    if (typeof av === 'number' && typeof bv === 'number') {
-      cmp = av - bv
-    } else {
-      cmp = String(av ?? '').localeCompare(String(bv ?? ''))
-    }
+    const cmp =
+      typeof av === 'number' && typeof bv === 'number'
+        ? av - bv
+        : String(av ?? '').localeCompare(String(bv ?? ''))
     return sortDesc ? -cmp : cmp
   })
 
-  const onSort = (key: BreakdownSortKey) => {
+  const onSort = (key: TrafficSortKey) => {
     if (key === sortKey) {
       setSortDesc((d) => !d)
     } else {
@@ -935,36 +972,38 @@ function TrafficByProject({
     }
   }
 
+  const isPending =
+    projectsQ.isPending || (projects.length > 0 && healthQ.isPending)
+
   return (
     <Card>
       <CardHeader className="pb-2">
         <CardTitle className="text-base">Traffic by project</CardTitle>
         <CardDescription>
-          Analytics page-view traffic per project over the selected window — not
-          raw proxy request counts
+          Requests per project from proxy logs over the selected window
         </CardDescription>
       </CardHeader>
       <CardContent>
-        {q.isPending ? (
+        {isPending ? (
           <div className="space-y-2">
             <Skeleton className="h-8 w-full" />
             <Skeleton className="h-8 w-full" />
             <Skeleton className="h-8 w-full" />
           </div>
-        ) : q.isError ? (
+        ) : projectsQ.isError || healthQ.isError ? (
           <div className="py-8 text-center text-sm text-rose-500">
             Failed to load project traffic
           </div>
         ) : sorted.length === 0 ? (
           <div className="py-8 text-center text-sm text-muted-foreground">
-            No analytics traffic recorded in this window
+            No projects yet
           </div>
         ) : (
           <div className="overflow-x-auto">
-            <Table className="min-w-[420px]">
+            <Table className="min-w-[480px]">
               <TableHeader>
                 <TableRow>
-                  {BREAKDOWN_COLUMNS.map((col) => (
+                  {TRAFFIC_COLUMNS.map((col) => (
                     <TableHead
                       key={col.key}
                       className={
@@ -988,21 +1027,29 @@ function TrafficByProject({
               </TableHeader>
               <TableBody>
                 {sorted.map((row) => (
-                  <TableRow key={row.project_id}>
+                  <TableRow
+                    key={row.project_id}
+                    className={
+                      row.total_requests === 0 ? 'text-muted-foreground' : ''
+                    }
+                  >
                     <TableCell className="font-medium">
-                      {row.project_name?.trim() || `Project #${row.project_id}`}
+                      {row.project_name}
                     </TableCell>
                     <TableCell className="text-right tabular-nums">
-                      {formatCount(row.total_page_views)}
+                      {formatCount(row.total_requests)}
                     </TableCell>
                     <TableCell className="hidden text-right tabular-nums md:table-cell">
-                      {formatCount(row.total_visits)}
+                      {formatCount(row.total_errors)}
+                    </TableCell>
+                    <TableCell className="text-right tabular-nums">
+                      {formatPercent(row.error_rate)}
                     </TableCell>
                     <TableCell className="hidden text-right tabular-nums md:table-cell">
-                      {formatCount(row.unique_visitors)}
+                      {formatMs(row.avg_response_time_ms)}
                     </TableCell>
-                    <TableCell className="hidden text-right tabular-nums md:table-cell">
-                      {formatPercent(row.bounce_rate)}
+                    <TableCell>
+                      <StatusBadge status={row.status} />
                     </TableCell>
                   </TableRow>
                 ))}
