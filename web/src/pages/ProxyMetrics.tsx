@@ -4,17 +4,21 @@
  *
  * Route: /proxy
  *
- * Panels:
- *   - Requests by status class (proxy.requests + 2xx/4xx/5xx, multi-series)
- *   - Error rate % (proxy.error_rate_percent)
- *   - Latency percentiles (p50/p95/p99, multi-series)
- *   - Average request duration (proxy.request_duration_avg_ms)
+ * Sections:
+ *   - Summary stat cards (req/s, total requests, error rate, p95) computed
+ *     client-side from the same series the charts fetch
+ *   - Chart panels: requests by status class, error rate %, latency
+ *     percentiles, average duration
+ *   - Traffic by project: analytics page-view breakdown per project
  *
- * All data comes from the generated SDK binding for
- * `GET /nodes/{id}/metrics` — never hand-rolled fetch.
+ * All data comes from the generated SDK bindings (`GET /nodes/{id}/metrics`
+ * and `GET /analytics/general-stats`) — never hand-rolled fetch.
  */
 
-import { nodeMetricsGetRangeOptions } from '@/api/client/@tanstack/react-query.gen'
+import {
+  getGeneralStatsOptions,
+  nodeMetricsGetRangeOptions,
+} from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -24,10 +28,18 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { useQueries } from '@tanstack/react-query'
-import { useEffect, useState } from 'react'
+import { useQueries, useQuery } from '@tanstack/react-query'
+import { useEffect, useMemo, useState } from 'react'
 import {
   CartesianGrid,
   Line,
@@ -53,6 +65,32 @@ const RANGE_OPTIONS = [
 ] as const
 
 type RangeValue = (typeof RANGE_OPTIONS)[number]['value']
+
+const RANGE_SECONDS: Record<RangeValue, number> = {
+  '1h': 3_600,
+  '6h': 21_600,
+  '24h': 86_400,
+  '7d': 604_800,
+}
+
+// The theme tokens are full oklch() colors (Tailwind v4), so they must be
+// consumed as `var(--token)` — wrapping them in hsl() produces an invalid
+// color and the tooltip renders transparent.
+const TOOLTIP_CONTENT_STYLE: React.CSSProperties = {
+  fontSize: 12,
+  backgroundColor: 'var(--popover)',
+  border: '1px solid var(--border)',
+  borderRadius: 8,
+  color: 'var(--popover-foreground)',
+  boxShadow: '0 4px 12px -2px rgb(0 0 0 / 0.4)',
+  padding: '6px 10px',
+}
+
+const TOOLTIP_LABEL_STYLE: React.CSSProperties = {
+  color: 'var(--muted-foreground)',
+  fontSize: 11,
+  marginBottom: 2,
+}
 
 /** One line in a chart panel: metric name + display label + stroke color. */
 type SeriesDef = {
@@ -161,6 +199,111 @@ function formatTimeLabel(iso: string, range: RangeValue): string {
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
 }
 
+/** Shared query options for one proxy metric series on the CP node. */
+function proxySeriesQuery(metric: string, range: RangeValue) {
+  return {
+    ...nodeMetricsGetRangeOptions({
+      path: { id: CONTROL_PLANE_NODE_ID },
+      query: { metric, range },
+    }),
+    staleTime: 15_000,
+    refetchInterval: 30_000,
+    retry: 1,
+  }
+}
+
+/** Format a Date as the analytics API's "YYYY-MM-DD HH:MM:SS". */
+function toAnalyticsDate(d: Date): string {
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+}
+
+// ---------------------------------------------------------------------------
+// Summary stat cards
+// ---------------------------------------------------------------------------
+
+type StatCardProps = {
+  title: string
+  value: string | null
+  isPending: boolean
+}
+
+function StatCard({ title, value, isPending }: StatCardProps) {
+  return (
+    <Card>
+      <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+        <CardTitle className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+          {title}
+        </CardTitle>
+      </CardHeader>
+      <CardContent>
+        {isPending ? (
+          <Skeleton className="h-8 w-24" />
+        ) : (
+          <div className="text-2xl font-semibold tracking-tight tabular-nums">
+            {value ?? '—'}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+function SummaryStats({ range }: { range: RangeValue }) {
+  // Same query keys the chart panels use — React Query dedupes the fetches.
+  const [requests, errors5xx, p95] = useQueries({
+    queries: [
+      proxySeriesQuery('proxy.requests', range),
+      proxySeriesQuery('proxy.requests_5xx', range),
+      proxySeriesQuery('proxy.request_duration_p95_ms', range),
+    ],
+  })
+
+  const totalRequests = (requests.data ?? []).reduce(
+    (acc, p) => acc + (p.value ?? 0),
+    0
+  )
+  const total5xx = (errors5xx.data ?? []).reduce(
+    (acc, p) => acc + (p.value ?? 0),
+    0
+  )
+  const latestP95 = [...(p95.data ?? [])]
+    .reverse()
+    .find((p) => p.value != null)?.value
+
+  const hasRequests = !requests.isPending && !requests.isError
+  const reqPerSec = totalRequests / RANGE_SECONDS[range]
+
+  return (
+    <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
+      <StatCard
+        title="Requests/s"
+        isPending={requests.isPending}
+        value={hasRequests ? `${reqPerSec.toFixed(2)}/s` : null}
+      />
+      <StatCard
+        title="Total requests"
+        isPending={requests.isPending}
+        value={hasRequests ? formatCount(totalRequests) : null}
+      />
+      <StatCard
+        title="Error rate"
+        isPending={requests.isPending || errors5xx.isPending}
+        value={
+          hasRequests && !errors5xx.isError && totalRequests > 0
+            ? formatPercent((total5xx / totalRequests) * 100)
+            : null
+        }
+      />
+      <StatCard
+        title="p95 latency"
+        isPending={p95.isPending}
+        value={latestP95 != null ? formatMs(latestP95) : null}
+      />
+    </div>
+  )
+}
+
 // ---------------------------------------------------------------------------
 // Chart panel — fetches one query per series and merges them on timestamp
 // ---------------------------------------------------------------------------
@@ -172,15 +315,7 @@ type PanelProps = {
 
 function MetricPanel({ panel, range }: PanelProps) {
   const results = useQueries({
-    queries: panel.series.map((s) => ({
-      ...nodeMetricsGetRangeOptions({
-        path: { id: CONTROL_PLANE_NODE_ID },
-        query: { metric: s.metric, range },
-      }),
-      staleTime: 15_000,
-      refetchInterval: 30_000,
-      retry: 1,
-    })),
+    queries: panel.series.map((s) => proxySeriesQuery(s.metric, range)),
   })
 
   const isPending = results.some((r) => r.isPending)
@@ -260,20 +395,8 @@ function MetricPanel({ panel, range }: PanelProps) {
                 <Tooltip
                   wrapperStyle={{ zIndex: 50 }}
                   allowEscapeViewBox={{ x: true, y: true }}
-                  contentStyle={{
-                    fontSize: 12,
-                    backgroundColor: 'hsl(var(--popover))',
-                    border: '1px solid hsl(var(--border))',
-                    borderRadius: '6px',
-                    color: 'hsl(var(--popover-foreground))',
-                    boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.3)',
-                    padding: '6px 10px',
-                  }}
-                  labelStyle={{
-                    color: 'hsl(var(--muted-foreground))',
-                    fontSize: 11,
-                    marginBottom: 2,
-                  }}
+                  contentStyle={TOOLTIP_CONTENT_STYLE}
+                  labelStyle={TOOLTIP_LABEL_STYLE}
                   cursor={{ stroke: 'rgba(128,128,128,0.3)', strokeWidth: 1 }}
                   formatter={(v: number, name: string) => [
                     panel.valueFormatter(v),
@@ -319,6 +442,165 @@ function MetricPanel({ panel, range }: PanelProps) {
 }
 
 // ---------------------------------------------------------------------------
+// Traffic by project (analytics page-view breakdown)
+// ---------------------------------------------------------------------------
+
+type BreakdownSortKey =
+  | 'project_name'
+  | 'total_page_views'
+  | 'total_visits'
+  | 'unique_visitors'
+  | 'bounce_rate'
+
+const BREAKDOWN_COLUMNS: {
+  key: BreakdownSortKey
+  label: string
+  numeric: boolean
+  secondary: boolean
+}[] = [
+  { key: 'project_name', label: 'Project', numeric: false, secondary: false },
+  {
+    key: 'total_page_views',
+    label: 'Page views',
+    numeric: true,
+    secondary: false,
+  },
+  { key: 'total_visits', label: 'Visits', numeric: true, secondary: true },
+  {
+    key: 'unique_visitors',
+    label: 'Unique visitors',
+    numeric: true,
+    secondary: true,
+  },
+  { key: 'bounce_rate', label: 'Bounce rate', numeric: true, secondary: true },
+]
+
+function TrafficByProject({ range }: { range: RangeValue }) {
+  const [sortKey, setSortKey] = useState<BreakdownSortKey>('total_page_views')
+  const [sortDesc, setSortDesc] = useState(true)
+
+  // Stable per range selection — an inline `new Date()` in the query options
+  // would change the query key every render and refetch forever.
+  const { startDate, endDate } = useMemo(() => {
+    const end = new Date()
+    const start = new Date(end.getTime() - RANGE_SECONDS[range] * 1000)
+    return { startDate: toAnalyticsDate(start), endDate: toAnalyticsDate(end) }
+  }, [range])
+
+  const q = useQuery({
+    ...getGeneralStatsOptions({
+      query: {
+        start_date: startDate,
+        end_date: endDate,
+        include_project_breakdown: true,
+      },
+    }),
+    staleTime: 30_000,
+  })
+
+  const breakdown = q.data?.project_breakdown ?? []
+  const sorted = [...breakdown].sort((a, b) => {
+    const av = a[sortKey]
+    const bv = b[sortKey]
+    let cmp: number
+    if (typeof av === 'number' && typeof bv === 'number') {
+      cmp = av - bv
+    } else {
+      cmp = String(av ?? '').localeCompare(String(bv ?? ''))
+    }
+    return sortDesc ? -cmp : cmp
+  })
+
+  const onSort = (key: BreakdownSortKey) => {
+    if (key === sortKey) {
+      setSortDesc((d) => !d)
+    } else {
+      setSortKey(key)
+      setSortDesc(true)
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader className="pb-2">
+        <CardTitle className="text-base">Traffic by project</CardTitle>
+        <CardDescription>
+          Analytics page-view traffic per project over the selected window — not
+          raw proxy request counts
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        {q.isPending ? (
+          <div className="space-y-2">
+            <Skeleton className="h-8 w-full" />
+            <Skeleton className="h-8 w-full" />
+            <Skeleton className="h-8 w-full" />
+          </div>
+        ) : q.isError ? (
+          <div className="py-8 text-center text-sm text-rose-500">
+            Failed to load project traffic
+          </div>
+        ) : sorted.length === 0 ? (
+          <div className="py-8 text-center text-sm text-muted-foreground">
+            No analytics traffic recorded in this window
+          </div>
+        ) : (
+          <div className="overflow-x-auto">
+            <Table className="min-w-[420px]">
+              <TableHeader>
+                <TableRow>
+                  {BREAKDOWN_COLUMNS.map((col) => (
+                    <TableHead
+                      key={col.key}
+                      className={
+                        (col.numeric ? 'text-right ' : '') +
+                        (col.secondary ? 'hidden md:table-cell' : '')
+                      }
+                    >
+                      <button
+                        type="button"
+                        onClick={() => onSort(col.key)}
+                        className="inline-flex items-center gap-1 hover:text-foreground"
+                      >
+                        {col.label}
+                        {sortKey === col.key && (
+                          <span aria-hidden>{sortDesc ? '↓' : '↑'}</span>
+                        )}
+                      </button>
+                    </TableHead>
+                  ))}
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {sorted.map((row) => (
+                  <TableRow key={row.project_id}>
+                    <TableCell className="font-medium">
+                      {row.project_name?.trim() || `Project #${row.project_id}`}
+                    </TableCell>
+                    <TableCell className="text-right tabular-nums">
+                      {formatCount(row.total_page_views)}
+                    </TableCell>
+                    <TableCell className="hidden text-right tabular-nums md:table-cell">
+                      {formatCount(row.total_visits)}
+                    </TableCell>
+                    <TableCell className="hidden text-right tabular-nums md:table-cell">
+                      {formatCount(row.unique_visitors)}
+                    </TableCell>
+                    <TableCell className="hidden text-right tabular-nums md:table-cell">
+                      {formatPercent(row.bounce_rate)}
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------
 
@@ -332,8 +614,10 @@ export default function ProxyMetrics() {
 
   usePageTitle('Proxy')
 
+  // Full-width like Monitoring.tsx — the app layout wrapper supplies the
+  // outer padding, so no container/max-w here.
   return (
-    <div className="container max-w-7xl mx-auto py-8">
+    <div className="flex-1 overflow-auto">
       <div className="space-y-6">
         <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
           <div>
@@ -356,11 +640,15 @@ export default function ProxyMetrics() {
           </div>
         </div>
 
+        <SummaryStats range={range} />
+
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
           {PANELS.map((panel) => (
             <MetricPanel key={panel.title} panel={panel} range={range} />
           ))}
         </div>
+
+        <TrafficByProject range={range} />
       </div>
     </div>
   )
