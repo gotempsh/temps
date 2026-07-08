@@ -344,6 +344,16 @@ impl MonitorService {
         // Single query: for each project, get latest check status of production monitors.
         // Inlined subquery (no CTE) so Postgres can push predicates down.
         // LATERAL + LIMIT 1 uses idx_status_checks_monitor_time for index-only lookups.
+        //
+        // The `checked_at` lower bound is load-bearing: status_checks is a
+        // TimescaleDB hypertable (1-day chunks, 90-day retention, compressed
+        // after 30 days). Without a time predicate the planner cannot exclude
+        // any chunk, so the LIMIT 1 merge touches every chunk — including
+        // decompressing batches from every compressed one — per monitor. An
+        // active monitor's latest check is at most one check interval old
+        // (minutes), so a 1-day bound prunes to the newest chunks while a
+        // monitor whose checker has been dead for over a day correctly counts
+        // as not operational.
         let sql = format!(
             r#"
             SELECT
@@ -358,6 +368,7 @@ impl MonitorService {
                 SELECT sc.status
                 FROM status_checks sc
                 WHERE sc.monitor_id = sm.id
+                  AND sc.checked_at > NOW() - INTERVAL '1 day'
                 ORDER BY sc.checked_at DESC
                 LIMIT 1
             ) lc ON true
