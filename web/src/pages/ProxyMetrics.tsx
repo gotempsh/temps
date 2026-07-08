@@ -226,14 +226,53 @@ const NODE_PANELS: NodePanelDef[] = [
     valueFormatter: formatMs,
   },
   {
-    title: 'Average duration',
-    description: 'Mean request duration per interval',
+    title: 'Backend latency percentiles',
+    description:
+      'Upstream duration p50 / p95 / p99 (proxied requests only: connect + processing + TTFB)',
+    series: [
+      {
+        metric: 'proxy.upstream_duration_p50_ms',
+        dataKey: 'proxy.upstream_duration_p50_ms',
+        label: 'p50',
+        color: '#16a34a',
+      },
+      {
+        metric: 'proxy.upstream_duration_p95_ms',
+        dataKey: 'proxy.upstream_duration_p95_ms',
+        label: 'p95',
+        color: '#d97706',
+      },
+      {
+        metric: 'proxy.upstream_duration_p99_ms',
+        dataKey: 'proxy.upstream_duration_p99_ms',
+        label: 'p99',
+        color: '#dc2626',
+      },
+    ],
+    valueFormatter: formatMs,
+  },
+  {
+    title: 'Latency breakdown',
+    description:
+      'Mean request duration per interval, split into backend time and proxy overhead (proxied requests only for the split)',
     series: [
       {
         metric: 'proxy.request_duration_avg_ms',
         dataKey: 'proxy.request_duration_avg_ms',
-        label: 'avg',
+        label: 'Total avg',
         color: '#2563eb',
+      },
+      {
+        metric: 'proxy.upstream_duration_avg_ms',
+        dataKey: 'proxy.upstream_duration_avg_ms',
+        label: 'Backend avg',
+        color: '#d97706',
+      },
+      {
+        metric: 'proxy.self_duration_avg_ms',
+        dataKey: 'proxy.self_duration_avg_ms',
+        label: 'Proxy avg',
+        color: '#16a34a',
       },
     ],
     valueFormatter: formatMs,

@@ -167,8 +167,8 @@ mod tests {
     #[test]
     fn test_build_points_maps_samples_to_node_points() {
         let metrics = ProxyMetrics::default();
-        metrics.record(200, 12, RequestDestination::Project);
-        metrics.record(502, 340, RequestDestination::Console);
+        metrics.record(200, 12, None, RequestDestination::Project);
+        metrics.record(502, 340, None, RequestDestination::Console);
         let delta = metrics.snapshot().delta_since(&MetricsSnapshot::default());
 
         let points = build_points(&delta.samples());

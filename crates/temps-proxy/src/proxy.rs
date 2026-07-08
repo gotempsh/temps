@@ -388,6 +388,13 @@ pub struct ProxyContext {
     pub upstream_connect_tries: usize,
     /// Time upstream took to accept the request body (upload diagnostics, Pingora 0.8.0)
     pub upstream_write_pending_time_ms: Option<i32>,
+    /// When `upstream_peer` started resolving/connecting the upstream. Basis
+    /// for the backend-latency metric; `None` for requests the proxy answered
+    /// itself (static files, redirects, walls).
+    pub upstream_start_time: Option<Instant>,
+    /// Backend latency: `upstream_start_time` → first upstream response
+    /// header (connect + request + upstream processing + TTFB).
+    pub upstream_response_time_ms: Option<u64>,
     /// Set when the request matched a workspace preview hostname and passed
     /// auth — `upstream_peer` will route it to the local preview gateway.
     pub preview_route: Option<PreviewHost>,
@@ -2181,6 +2188,8 @@ impl ProxyHttp for LoadBalancer {
             markdown_buffer: Vec::new(),
             upstream_connect_tries: 0,
             upstream_write_pending_time_ms: None,
+            upstream_start_time: None,
+            upstream_response_time_ms: None,
             preview_route: None,
         }
     }
@@ -3709,6 +3718,14 @@ impl ProxyHttp for LoadBalancer {
         Self::CTX: Send + Sync,
     {
         debug!("Upstream response filter headers: {:?}", upstream_response);
+
+        // First upstream header = backend latency (connect + upstream time).
+        if ctx.upstream_response_time_ms.is_none() {
+            if let Some(start) = ctx.upstream_start_time {
+                ctx.upstream_response_time_ms = Some(start.elapsed().as_millis() as u64);
+            }
+        }
+
         ctx.upstream_response_headers = Some(upstream_response.clone());
 
         let headers_map: HashMap<String, String> = upstream_response
@@ -4003,6 +4020,10 @@ impl ProxyHttp for LoadBalancer {
         session: &mut PingoraSession,
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
+        // Backend-latency basis. On connect retries this is re-stamped, so the
+        // metric measures the attempt that actually served the response.
+        ctx.upstream_start_time = Some(Instant::now());
+
         // WebSocket upgrades legitimately sit silent for minutes (idle
         // terminals, push-only feeds). Cap them at 1h instead of the 60s
         // default that HTTP uses, otherwise Pingora RSTs the socket every
@@ -4263,10 +4284,11 @@ impl ProxyHttp for LoadBalancer {
             &ctx.routing_status,
         );
 
-        // Hot path: 4 relaxed atomic adds, no locks, no I/O.
+        // Hot path: a handful of relaxed atomic adds, no locks, no I/O.
         self.proxy_metrics.record(
             status_code,
             ctx.start_time.elapsed().as_millis() as u64,
+            ctx.upstream_response_time_ms,
             destination,
         );
     }
@@ -4559,6 +4581,8 @@ mod markdown_tests {
             markdown_buffer: Vec::new(),
             upstream_connect_tries: 0,
             upstream_write_pending_time_ms: None,
+            upstream_start_time: None,
+            upstream_response_time_ms: None,
             preview_route: None,
         }
     }
@@ -5098,6 +5122,8 @@ mod markdown_pipeline_tests {
             markdown_buffer: Vec::new(),
             upstream_connect_tries: 0,
             upstream_write_pending_time_ms: None,
+            upstream_start_time: None,
+            upstream_response_time_ms: None,
             preview_route: None,
         }
     }

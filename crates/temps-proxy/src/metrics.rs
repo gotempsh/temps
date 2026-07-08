@@ -42,6 +42,18 @@ pub const METRIC_DURATION_AVG: &str = "proxy.request_duration_avg_ms";
 pub const METRIC_DURATION_P50: &str = "proxy.request_duration_p50_ms";
 pub const METRIC_DURATION_P95: &str = "proxy.request_duration_p95_ms";
 pub const METRIC_DURATION_P99: &str = "proxy.request_duration_p99_ms";
+/// Backend latency: `upstream_peer` start → first upstream response header.
+/// Only observed for requests that were actually proxied to an upstream.
+pub const METRIC_UPSTREAM_AVG: &str = "proxy.upstream_duration_avg_ms";
+pub const METRIC_UPSTREAM_P50: &str = "proxy.upstream_duration_p50_ms";
+pub const METRIC_UPSTREAM_P95: &str = "proxy.upstream_duration_p95_ms";
+pub const METRIC_UPSTREAM_P99: &str = "proxy.upstream_duration_p99_ms";
+/// Proxy self time: total duration minus backend latency, for proxied
+/// requests. This is the overhead the proxy itself adds.
+pub const METRIC_SELF_AVG: &str = "proxy.self_duration_avg_ms";
+pub const METRIC_SELF_P50: &str = "proxy.self_duration_p50_ms";
+pub const METRIC_SELF_P95: &str = "proxy.self_duration_p95_ms";
+pub const METRIC_SELF_P99: &str = "proxy.self_duration_p99_ms";
 
 /// Where a request was routed. The three variants are mutually exclusive and
 /// exhaustive, so their per-interval counters always sum to `proxy.requests`.
@@ -92,11 +104,37 @@ pub struct ProxyMetrics {
     duration_sum_ms: AtomicU64,
     /// Requests by destination (project / console / other).
     destinations: [AtomicU64; NUM_DESTINATIONS],
+    /// Backend-latency histogram (upstream connect + processing + TTFB).
+    /// Only observed for proxied requests; `upstream_count` is its total.
+    upstream_buckets: [AtomicU64; NUM_BUCKETS],
+    upstream_sum_ms: AtomicU64,
+    upstream_count: AtomicU64,
+    /// Proxy self-time histogram (total − backend), same observation set.
+    self_buckets: [AtomicU64; NUM_BUCKETS],
+    self_sum_ms: AtomicU64,
+}
+
+/// Find the histogram bucket for a duration.
+fn bucket_index(elapsed_ms: u64) -> usize {
+    DURATION_BUCKETS_MS
+        .iter()
+        .position(|bound| elapsed_ms <= *bound)
+        .unwrap_or(NUM_BUCKETS - 1)
 }
 
 impl ProxyMetrics {
-    /// Record one completed request. Hot path: 4 relaxed atomic adds.
-    pub fn record(&self, status_code: u16, elapsed_ms: u64, destination: RequestDestination) {
+    /// Record one completed request. Hot path: 4 relaxed atomic adds, plus 5
+    /// more for proxied requests (`upstream_ms` present). No locks, no I/O.
+    ///
+    /// `upstream_ms` is the backend latency; `None` for requests the proxy
+    /// answered itself. Proxy self time is derived as `elapsed − upstream`.
+    pub fn record(
+        &self,
+        status_code: u16,
+        elapsed_ms: u64,
+        upstream_ms: Option<u64>,
+        destination: RequestDestination,
+    ) {
         let class = match status_code {
             100..=199 => 0,
             200..=299 => 1,
@@ -107,14 +145,22 @@ impl ProxyMetrics {
         };
         self.status_classes[class].fetch_add(1, Ordering::Relaxed);
 
-        let bucket = DURATION_BUCKETS_MS
-            .iter()
-            .position(|bound| elapsed_ms <= *bound)
-            .unwrap_or(NUM_BUCKETS - 1);
-        self.duration_buckets[bucket].fetch_add(1, Ordering::Relaxed);
+        self.duration_buckets[bucket_index(elapsed_ms)].fetch_add(1, Ordering::Relaxed);
         self.duration_sum_ms
             .fetch_add(elapsed_ms, Ordering::Relaxed);
         self.destinations[destination as usize].fetch_add(1, Ordering::Relaxed);
+
+        if let Some(upstream) = upstream_ms {
+            self.upstream_buckets[bucket_index(upstream)].fetch_add(1, Ordering::Relaxed);
+            self.upstream_sum_ms.fetch_add(upstream, Ordering::Relaxed);
+            self.upstream_count.fetch_add(1, Ordering::Relaxed);
+
+            // Clock reads for total and upstream are taken at different
+            // instants; saturate rather than underflow on the rare inversion.
+            let self_ms = elapsed_ms.saturating_sub(upstream);
+            self.self_buckets[bucket_index(self_ms)].fetch_add(1, Ordering::Relaxed);
+            self.self_sum_ms.fetch_add(self_ms, Ordering::Relaxed);
+        }
     }
 
     /// Read a consistent-enough view of all counters.
@@ -126,6 +172,13 @@ impl ProxyMetrics {
             }),
             duration_sum_ms: self.duration_sum_ms.load(Ordering::Relaxed),
             destinations: std::array::from_fn(|i| self.destinations[i].load(Ordering::Relaxed)),
+            upstream_buckets: std::array::from_fn(|i| {
+                self.upstream_buckets[i].load(Ordering::Relaxed)
+            }),
+            upstream_sum_ms: self.upstream_sum_ms.load(Ordering::Relaxed),
+            upstream_count: self.upstream_count.load(Ordering::Relaxed),
+            self_buckets: std::array::from_fn(|i| self.self_buckets[i].load(Ordering::Relaxed)),
+            self_sum_ms: self.self_sum_ms.load(Ordering::Relaxed),
         }
     }
 }
@@ -137,6 +190,11 @@ pub struct MetricsSnapshot {
     duration_buckets: [u64; NUM_BUCKETS],
     duration_sum_ms: u64,
     destinations: [u64; NUM_DESTINATIONS],
+    upstream_buckets: [u64; NUM_BUCKETS],
+    upstream_sum_ms: u64,
+    upstream_count: u64,
+    self_buckets: [u64; NUM_BUCKETS],
+    self_sum_ms: u64,
 }
 
 impl MetricsSnapshot {
@@ -157,6 +215,15 @@ impl MetricsSnapshot {
             destinations: std::array::from_fn(|i| {
                 self.destinations[i].saturating_sub(prev.destinations[i])
             }),
+            upstream_buckets: std::array::from_fn(|i| {
+                self.upstream_buckets[i].saturating_sub(prev.upstream_buckets[i])
+            }),
+            upstream_sum_ms: self.upstream_sum_ms.saturating_sub(prev.upstream_sum_ms),
+            upstream_count: self.upstream_count.saturating_sub(prev.upstream_count),
+            self_buckets: std::array::from_fn(|i| {
+                self.self_buckets[i].saturating_sub(prev.self_buckets[i])
+            }),
+            self_sum_ms: self.self_sum_ms.saturating_sub(prev.self_sum_ms),
         }
     }
 }
@@ -177,6 +244,11 @@ pub struct MetricsDelta {
     duration_buckets: [u64; NUM_BUCKETS],
     duration_sum_ms: u64,
     destinations: [u64; NUM_DESTINATIONS],
+    upstream_buckets: [u64; NUM_BUCKETS],
+    upstream_sum_ms: u64,
+    upstream_count: u64,
+    self_buckets: [u64; NUM_BUCKETS],
+    self_sum_ms: u64,
 }
 
 impl MetricsDelta {
@@ -269,6 +341,52 @@ impl MetricsDelta {
             });
         }
 
+        // Backend / proxy-self latency gauges: only for intervals where at
+        // least one request was actually proxied to an upstream.
+        if self.upstream_count > 0 {
+            let n = self.upstream_count as f64;
+            samples.push(ProxySample {
+                name: METRIC_UPSTREAM_AVG,
+                value: self.upstream_sum_ms as f64 / n,
+                is_counter: false,
+            });
+            samples.push(ProxySample {
+                name: METRIC_UPSTREAM_P50,
+                value: percentile_from(&self.upstream_buckets, 0.50),
+                is_counter: false,
+            });
+            samples.push(ProxySample {
+                name: METRIC_UPSTREAM_P95,
+                value: percentile_from(&self.upstream_buckets, 0.95),
+                is_counter: false,
+            });
+            samples.push(ProxySample {
+                name: METRIC_UPSTREAM_P99,
+                value: percentile_from(&self.upstream_buckets, 0.99),
+                is_counter: false,
+            });
+            samples.push(ProxySample {
+                name: METRIC_SELF_AVG,
+                value: self.self_sum_ms as f64 / n,
+                is_counter: false,
+            });
+            samples.push(ProxySample {
+                name: METRIC_SELF_P50,
+                value: percentile_from(&self.self_buckets, 0.50),
+                is_counter: false,
+            });
+            samples.push(ProxySample {
+                name: METRIC_SELF_P95,
+                value: percentile_from(&self.self_buckets, 0.95),
+                is_counter: false,
+            });
+            samples.push(ProxySample {
+                name: METRIC_SELF_P99,
+                value: percentile_from(&self.self_buckets, 0.99),
+                is_counter: false,
+            });
+        }
+
         samples
     }
 
@@ -279,38 +397,48 @@ impl MetricsDelta {
     /// finite bound (a deliberate, documented over-estimate — better to alarm
     /// high than to hide tail latency).
     fn percentile(&self, q: f64) -> f64 {
-        let total: u64 = self.duration_buckets.iter().sum();
-        if total == 0 {
-            return 0.0;
-        }
-        let target = (q * total as f64).ceil().max(1.0) as u64;
-
-        let mut cumulative: u64 = 0;
-        for (i, count) in self.duration_buckets.iter().enumerate() {
-            if *count == 0 {
-                continue;
-            }
-            let prev_cumulative = cumulative;
-            cumulative += count;
-            if cumulative >= target {
-                let lower = if i == 0 {
-                    0
-                } else {
-                    DURATION_BUCKETS_MS[i - 1]
-                };
-                let upper = if i < DURATION_BUCKETS_MS.len() {
-                    DURATION_BUCKETS_MS[i]
-                } else {
-                    // Overflow bucket: no true upper bound.
-                    DURATION_BUCKETS_MS[DURATION_BUCKETS_MS.len() - 1] * 2
-                };
-                let within = (target - prev_cumulative) as f64 / *count as f64;
-                return lower as f64 + within * (upper - lower) as f64;
-            }
-        }
-        // Unreachable when total > 0, but keep a sane fallback.
-        DURATION_BUCKETS_MS[DURATION_BUCKETS_MS.len() - 1] as f64
+        percentile_from(&self.duration_buckets, q)
     }
+}
+
+/// Estimate the q-th percentile (0.0..=1.0) from a bucket histogram.
+///
+/// Uses linear interpolation within the bucket that contains the target
+/// rank. The overflow bucket has no upper bound; it reports twice the last
+/// finite bound (a deliberate, documented over-estimate — better to alarm
+/// high than to hide tail latency).
+fn percentile_from(buckets: &[u64; NUM_BUCKETS], q: f64) -> f64 {
+    let total: u64 = buckets.iter().sum();
+    if total == 0 {
+        return 0.0;
+    }
+    let target = (q * total as f64).ceil().max(1.0) as u64;
+
+    let mut cumulative: u64 = 0;
+    for (i, count) in buckets.iter().enumerate() {
+        if *count == 0 {
+            continue;
+        }
+        let prev_cumulative = cumulative;
+        cumulative += count;
+        if cumulative >= target {
+            let lower = if i == 0 {
+                0
+            } else {
+                DURATION_BUCKETS_MS[i - 1]
+            };
+            let upper = if i < DURATION_BUCKETS_MS.len() {
+                DURATION_BUCKETS_MS[i]
+            } else {
+                // Overflow bucket: no true upper bound.
+                DURATION_BUCKETS_MS[DURATION_BUCKETS_MS.len() - 1] * 2
+            };
+            let within = (target - prev_cumulative) as f64 / *count as f64;
+            return lower as f64 + within * (upper - lower) as f64;
+        }
+    }
+    // Unreachable when total > 0, but keep a sane fallback.
+    DURATION_BUCKETS_MS[DURATION_BUCKETS_MS.len() - 1] as f64
 }
 
 #[cfg(test)]
@@ -320,15 +448,15 @@ mod tests {
     #[test]
     fn test_record_classifies_status_codes() {
         let m = ProxyMetrics::default();
-        m.record(101, 1, RequestDestination::Project);
-        m.record(200, 1, RequestDestination::Project);
-        m.record(204, 1, RequestDestination::Project);
-        m.record(301, 1, RequestDestination::Project);
-        m.record(404, 1, RequestDestination::Project);
-        m.record(500, 1, RequestDestination::Project);
-        m.record(503, 1, RequestDestination::Project);
+        m.record(101, 1, None, RequestDestination::Project);
+        m.record(200, 1, None, RequestDestination::Project);
+        m.record(204, 1, None, RequestDestination::Project);
+        m.record(301, 1, None, RequestDestination::Project);
+        m.record(404, 1, None, RequestDestination::Project);
+        m.record(500, 1, None, RequestDestination::Project);
+        m.record(503, 1, None, RequestDestination::Project);
         // Malformed status counts as 5xx.
-        m.record(0, 1, RequestDestination::Project);
+        m.record(0, 1, None, RequestDestination::Project);
 
         let s = m.snapshot();
         assert_eq!(s.status_classes, [1, 2, 1, 1, 3]);
@@ -337,10 +465,10 @@ mod tests {
     #[test]
     fn test_record_buckets_durations() {
         let m = ProxyMetrics::default();
-        m.record(200, 0, RequestDestination::Project); // <= 5ms bucket
-        m.record(200, 5, RequestDestination::Project); // <= 5ms bucket (inclusive bound)
-        m.record(200, 6, RequestDestination::Project); // <= 10ms bucket
-        m.record(200, 99_999, RequestDestination::Project); // overflow bucket
+        m.record(200, 0, None, RequestDestination::Project); // <= 5ms bucket
+        m.record(200, 5, None, RequestDestination::Project); // <= 5ms bucket (inclusive bound)
+        m.record(200, 6, None, RequestDestination::Project); // <= 10ms bucket
+        m.record(200, 99_999, None, RequestDestination::Project); // overflow bucket
 
         let s = m.snapshot();
         assert_eq!(s.duration_buckets[0], 2);
@@ -352,11 +480,11 @@ mod tests {
     #[test]
     fn test_delta_since_subtracts_baseline() {
         let m = ProxyMetrics::default();
-        m.record(200, 10, RequestDestination::Project);
+        m.record(200, 10, None, RequestDestination::Project);
         let first = m.snapshot();
 
-        m.record(200, 10, RequestDestination::Project);
-        m.record(500, 200, RequestDestination::Project);
+        m.record(200, 10, None, RequestDestination::Project);
+        m.record(500, 200, None, RequestDestination::Project);
         let second = m.snapshot();
 
         let delta = second.delta_since(&first);
@@ -369,11 +497,11 @@ mod tests {
     #[test]
     fn test_delta_saturates_instead_of_underflowing() {
         let m = ProxyMetrics::default();
-        m.record(200, 10, RequestDestination::Project);
+        m.record(200, 10, None, RequestDestination::Project);
         let later = m.snapshot();
         let m2 = ProxyMetrics::default();
-        m2.record(200, 1, RequestDestination::Project);
-        m2.record(200, 1, RequestDestination::Project);
+        m2.record(200, 1, None, RequestDestination::Project);
+        m2.record(200, 1, None, RequestDestination::Project);
         let earlier_but_bigger = m2.snapshot();
 
         let delta = later.delta_since(&earlier_but_bigger);
@@ -440,13 +568,13 @@ mod tests {
         // requests recorded since the previous snapshot.
         let m = ProxyMetrics::default();
 
-        m.record(200, 10, RequestDestination::Project);
-        m.record(200, 10, RequestDestination::Console);
+        m.record(200, 10, None, RequestDestination::Project);
+        m.record(200, 10, None, RequestDestination::Console);
         let first_snapshot = m.snapshot();
         let first_delta = first_snapshot.delta_since(&MetricsSnapshot::default());
         assert_eq!(first_delta.total_requests(), 2);
 
-        m.record(503, 40, RequestDestination::Other);
+        m.record(503, 40, None, RequestDestination::Other);
         let second_snapshot = m.snapshot();
         let second_delta = second_snapshot.delta_since(&first_snapshot);
 
@@ -473,12 +601,80 @@ mod tests {
     }
 
     #[test]
+    fn test_upstream_and_self_latency_split() {
+        let m = ProxyMetrics::default();
+        // Proxied: 100ms total, 80ms in the backend -> 20ms proxy self time.
+        m.record(200, 100, Some(80), RequestDestination::Project);
+        // Proxied: 40ms total, 30ms backend -> 10ms self.
+        m.record(200, 40, Some(30), RequestDestination::Project);
+        // Proxy-handled (no upstream): must not affect upstream/self stats.
+        m.record(301, 1, None, RequestDestination::Other);
+
+        let delta = m.snapshot().delta_since(&MetricsSnapshot::default());
+        let samples = delta.samples();
+        let get = |name: &str| {
+            samples
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("missing sample {name}"))
+                .value
+        };
+
+        // Total-duration avg covers all 3 requests; upstream/self only the 2
+        // proxied ones.
+        assert_eq!(get(METRIC_DURATION_AVG), (100.0 + 40.0 + 1.0) / 3.0);
+        assert_eq!(get(METRIC_UPSTREAM_AVG), (80.0 + 30.0) / 2.0);
+        assert_eq!(get(METRIC_SELF_AVG), (20.0 + 10.0) / 2.0);
+
+        // Percentile gauges exist for both new histograms.
+        for name in [
+            METRIC_UPSTREAM_P50,
+            METRIC_UPSTREAM_P95,
+            METRIC_UPSTREAM_P99,
+            METRIC_SELF_P50,
+            METRIC_SELF_P95,
+            METRIC_SELF_P99,
+        ] {
+            assert!(get(name) > 0.0, "{name} should be positive");
+        }
+    }
+
+    #[test]
+    fn test_no_upstream_requests_emit_no_upstream_gauges() {
+        let m = ProxyMetrics::default();
+        m.record(200, 5, None, RequestDestination::Console);
+        let delta = m.snapshot().delta_since(&MetricsSnapshot::default());
+
+        let names: Vec<&str> = delta.samples().iter().map(|s| s.name).collect();
+        assert!(!names.contains(&METRIC_UPSTREAM_AVG));
+        assert!(!names.contains(&METRIC_SELF_AVG));
+        // Total-duration gauges still present.
+        assert!(names.contains(&METRIC_DURATION_AVG));
+    }
+
+    #[test]
+    fn test_upstream_self_clock_inversion_saturates() {
+        let m = ProxyMetrics::default();
+        // Upstream reading slightly larger than total (different clock reads):
+        // self time must clamp to 0, not underflow.
+        m.record(200, 10, Some(12), RequestDestination::Project);
+        let delta = m.snapshot().delta_since(&MetricsSnapshot::default());
+        let samples = delta.samples();
+        let self_avg = samples
+            .iter()
+            .find(|s| s.name == METRIC_SELF_AVG)
+            .expect("self avg present")
+            .value;
+        assert_eq!(self_avg, 0.0);
+    }
+
+    #[test]
     fn test_destination_counters_sum_to_total() {
         let m = ProxyMetrics::default();
-        m.record(200, 1, RequestDestination::Project);
-        m.record(200, 1, RequestDestination::Project);
-        m.record(404, 1, RequestDestination::Console);
-        m.record(301, 1, RequestDestination::Other);
+        m.record(200, 1, None, RequestDestination::Project);
+        m.record(200, 1, None, RequestDestination::Project);
+        m.record(404, 1, None, RequestDestination::Console);
+        m.record(301, 1, None, RequestDestination::Other);
         let delta = m.snapshot().delta_since(&MetricsSnapshot::default());
 
         let samples = delta.samples();
@@ -504,8 +700,8 @@ mod tests {
     #[test]
     fn test_samples_active_interval_emits_gauges() {
         let m = ProxyMetrics::default();
-        m.record(200, 10, RequestDestination::Project);
-        m.record(500, 30, RequestDestination::Project);
+        m.record(200, 10, None, RequestDestination::Project);
+        m.record(500, 30, None, RequestDestination::Project);
         let delta = m.snapshot().delta_since(&MetricsSnapshot::default());
 
         let samples = delta.samples();
@@ -537,7 +733,7 @@ mod tests {
         let m = ProxyMetrics::default();
         // 100 requests all in the (10, 25] bucket.
         for _ in 0..100 {
-            m.record(200, 20, RequestDestination::Project);
+            m.record(200, 20, None, RequestDestination::Project);
         }
         let delta = m.snapshot().delta_since(&MetricsSnapshot::default());
 
@@ -552,12 +748,12 @@ mod tests {
     fn test_percentile_spread_orders_correctly() {
         let m = ProxyMetrics::default();
         for _ in 0..90 {
-            m.record(200, 3, RequestDestination::Project); // fast
+            m.record(200, 3, None, RequestDestination::Project); // fast
         }
         for _ in 0..9 {
-            m.record(200, 400, RequestDestination::Project); // slow
+            m.record(200, 400, None, RequestDestination::Project); // slow
         }
-        m.record(200, 9000, RequestDestination::Project); // overflow tail
+        m.record(200, 9000, None, RequestDestination::Project); // overflow tail
         let delta = m.snapshot().delta_since(&MetricsSnapshot::default());
 
         let p50 = delta.percentile(0.50);
