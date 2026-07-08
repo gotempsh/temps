@@ -1,25 +1,27 @@
 /**
- * ProxyMetrics — charts for the proxy hot-path metrics written by the
- * control-plane node (node id 0).
+ * ProxyMetrics — charts for proxy hot-path traffic.
  *
  * Route: /proxy
  *
- * Sections:
- *   - Summary stat cards (req/s, total requests, error rate, p95) computed
- *     client-side from the same series the charts fetch
- *   - Chart panels: requests by status class, error rate %, latency
- *     percentiles, average duration
- *   - Traffic by project: analytics page-view breakdown per project
+ * Two data sources, switched by the project/environment filter:
+ *   - "All projects" (default): process-wide proxy.* node metrics on the
+ *     control-plane node (id 0). These have no project dimension by design.
+ *   - Project/environment filtered: proxy-log-derived time buckets from
+ *     GET /proxy-logs/stats/time-buckets (request/error counts, avg latency,
+ *     bandwidth). Logs carry no percentiles, so the latency-percentile panel
+ *     is replaced by a bandwidth panel in filtered mode.
  *
- * All data comes from the generated SDK bindings (`GET /nodes/{id}/metrics`
- * and `GET /analytics/general-stats`) — never hand-rolled fetch.
+ * All data comes from generated SDK bindings — never hand-rolled fetch.
  */
 
 import {
+  getEnvironmentsOptions,
   getGeneralStatsOptions,
+  getProjectsOptions,
+  getTimeBucketStatsOptions,
   nodeMetricsGetRangeOptions,
 } from '@/api/client/@tanstack/react-query.gen'
-import { TOOLTIP_CONTENT_STYLE, TOOLTIP_LABEL_STYLE } from '@/lib/chart-tooltip'
+import type { TimeBucketStats } from '@/api/client/types.gen'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -28,6 +30,13 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Table,
@@ -39,6 +48,7 @@ import {
 } from '@/components/ui/table'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { TOOLTIP_CONTENT_STYLE, TOOLTIP_LABEL_STYLE } from '@/lib/chart-tooltip'
 import { useQueries, useQuery } from '@tanstack/react-query'
 import { useEffect, useMemo, useState } from 'react'
 import {
@@ -74,18 +84,19 @@ const RANGE_SECONDS: Record<RangeValue, number> = {
   '7d': 604_800,
 }
 
-/** One line in a chart panel: metric name + display label + stroke color. */
-type SeriesDef = {
-  metric: string
-  label: string
-  color: string
+/** Bucket steps matching the node-metric endpoint's per-range resolution. */
+const RANGE_BUCKET_INTERVAL: Record<RangeValue, string> = {
+  '1h': '1 minute',
+  '6h': '5 minutes',
+  '24h': '15 minutes',
+  '7d': '1 hour',
 }
 
-type PanelDef = {
-  title: string
-  description: string
-  series: SeriesDef[]
-  valueFormatter: (v: number) => string
+/** One line in a chart panel: data key + display label + stroke color. */
+type SeriesDef = {
+  dataKey: string
+  label: string
+  color: string
 }
 
 const formatCount = (v: number) =>
@@ -100,15 +111,53 @@ const formatPercent = (v: number) => `${v.toFixed(2)}%`
 const formatMs = (v: number) =>
   v >= 1_000 ? `${(v / 1_000).toFixed(2)}s` : `${v.toFixed(1)}ms`
 
-const PANELS: PanelDef[] = [
+const formatBytesShort = (v: number) => {
+  if (v >= 1_073_741_824) return `${(v / 1_073_741_824).toFixed(2)} GB`
+  if (v >= 1_048_576) return `${(v / 1_048_576).toFixed(1)} MB`
+  if (v >= 1_024) return `${(v / 1_024).toFixed(1)} KB`
+  return `${Math.round(v)} B`
+}
+
+// ---------------------------------------------------------------------------
+// Node-metric panels (unfiltered "All projects" view)
+// ---------------------------------------------------------------------------
+
+type NodePanelDef = {
+  title: string
+  description: string
+  series: (SeriesDef & { metric: string })[]
+  valueFormatter: (v: number) => string
+}
+
+const NODE_PANELS: NodePanelDef[] = [
   {
     title: 'Requests by status class',
     description: 'Per-interval request count, split by response status class',
     series: [
-      { metric: 'proxy.requests', label: 'Total', color: '#2563eb' },
-      { metric: 'proxy.requests_2xx', label: '2xx', color: '#16a34a' },
-      { metric: 'proxy.requests_4xx', label: '4xx', color: '#d97706' },
-      { metric: 'proxy.requests_5xx', label: '5xx', color: '#dc2626' },
+      {
+        metric: 'proxy.requests',
+        dataKey: 'proxy.requests',
+        label: 'Total',
+        color: '#2563eb',
+      },
+      {
+        metric: 'proxy.requests_2xx',
+        dataKey: 'proxy.requests_2xx',
+        label: '2xx',
+        color: '#16a34a',
+      },
+      {
+        metric: 'proxy.requests_4xx',
+        dataKey: 'proxy.requests_4xx',
+        label: '4xx',
+        color: '#d97706',
+      },
+      {
+        metric: 'proxy.requests_5xx',
+        dataKey: 'proxy.requests_5xx',
+        label: '5xx',
+        color: '#dc2626',
+      },
     ],
     valueFormatter: formatCount,
   },
@@ -118,6 +167,7 @@ const PANELS: PanelDef[] = [
     series: [
       {
         metric: 'proxy.error_rate_percent',
+        dataKey: 'proxy.error_rate_percent',
         label: 'Error rate',
         color: '#dc2626',
       },
@@ -130,16 +180,19 @@ const PANELS: PanelDef[] = [
     series: [
       {
         metric: 'proxy.request_duration_p50_ms',
+        dataKey: 'proxy.request_duration_p50_ms',
         label: 'p50',
         color: '#16a34a',
       },
       {
         metric: 'proxy.request_duration_p95_ms',
+        dataKey: 'proxy.request_duration_p95_ms',
         label: 'p95',
         color: '#d97706',
       },
       {
         metric: 'proxy.request_duration_p99_ms',
+        dataKey: 'proxy.request_duration_p99_ms',
         label: 'p99',
         color: '#dc2626',
       },
@@ -152,6 +205,7 @@ const PANELS: PanelDef[] = [
     series: [
       {
         metric: 'proxy.request_duration_avg_ms',
+        dataKey: 'proxy.request_duration_avg_ms',
         label: 'avg',
         color: '#2563eb',
       },
@@ -163,6 +217,12 @@ const PANELS: PanelDef[] = [
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/** Active filter selection. Null project means "All projects" (node metrics). */
+type ProxyFilter = {
+  projectId: number | null
+  environmentId: number | null
+}
 
 /** Whether an error is the endpoint's 503 "metrics store not available". */
 function isMetricsUnavailable(err: unknown): boolean {
@@ -200,6 +260,312 @@ function toAnalyticsDate(d: Date): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
 }
 
+/** Memoized window bounds for the selected range (stable query keys). */
+function useWindowBounds(range: RangeValue) {
+  return useMemo(() => {
+    const end = new Date()
+    const start = new Date(end.getTime() - RANGE_SECONDS[range] * 1000)
+    return {
+      startIso: start.toISOString(),
+      endIso: end.toISOString(),
+      startAnalytics: toAnalyticsDate(start),
+      endAnalytics: toAnalyticsDate(end),
+    }
+  }, [range])
+}
+
+/**
+ * Proxy-log time buckets for the filtered view. Identical options across the
+ * stat cards and every chart panel, so React Query dedupes to one request.
+ */
+function useBucketStats(range: RangeValue, filter: ProxyFilter) {
+  const { startIso, endIso } = useWindowBounds(range)
+  return useQuery({
+    ...getTimeBucketStatsOptions({
+      query: {
+        start_time: startIso,
+        end_time: endIso,
+        bucket_interval: RANGE_BUCKET_INTERVAL[range],
+        project_id: filter.projectId ?? undefined,
+        environment_id: filter.environmentId ?? undefined,
+      },
+    }),
+    enabled: filter.projectId != null,
+    staleTime: 15_000,
+    refetchInterval: 30_000,
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Shared presentational chart panel
+// ---------------------------------------------------------------------------
+
+type ChartPanelProps = {
+  title: string
+  description: string
+  series: SeriesDef[]
+  data: Record<string, string | number | null>[]
+  valueFormatter: (v: number) => string
+  isPending: boolean
+  errorText?: string | null
+  emptyText: string
+}
+
+function ChartPanel({
+  title,
+  description,
+  series,
+  data,
+  valueFormatter,
+  isPending,
+  errorText,
+  emptyText,
+}: ChartPanelProps) {
+  return (
+    <Card>
+      <CardHeader className="pb-2">
+        <CardTitle className="text-base">{title}</CardTitle>
+        <CardDescription>{description}</CardDescription>
+      </CardHeader>
+      <CardContent>
+        {isPending ? (
+          <Skeleton className="h-[220px] w-full" />
+        ) : errorText ? (
+          <div className="flex h-[220px] items-center justify-center px-6 text-center text-sm text-muted-foreground">
+            {errorText}
+          </div>
+        ) : data.length === 0 ? (
+          <div className="flex h-[220px] items-center justify-center px-6 text-center text-sm text-muted-foreground">
+            {emptyText}
+          </div>
+        ) : (
+          <div className="h-[220px]">
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart
+                data={data}
+                margin={{ top: 4, right: 24, left: 0, bottom: 0 }}
+              >
+                <CartesianGrid
+                  strokeDasharray="3 3"
+                  stroke="rgba(128,128,128,0.15)"
+                  vertical={false}
+                />
+                <XAxis
+                  dataKey="label"
+                  tick={{ fontSize: 10, fill: 'rgba(156,163,175,0.9)' }}
+                  tickLine={false}
+                  axisLine={false}
+                  interval="preserveStartEnd"
+                />
+                <YAxis
+                  tick={{ fontSize: 10, fill: 'rgba(156,163,175,0.9)' }}
+                  tickLine={false}
+                  axisLine={false}
+                  width={60}
+                  tickFormatter={valueFormatter}
+                />
+                <Tooltip
+                  wrapperStyle={{ zIndex: 50 }}
+                  allowEscapeViewBox={{ x: true, y: true }}
+                  contentStyle={TOOLTIP_CONTENT_STYLE}
+                  labelStyle={TOOLTIP_LABEL_STYLE}
+                  cursor={{ stroke: 'rgba(128,128,128,0.3)', strokeWidth: 1 }}
+                  formatter={(v: number, name: string) => [
+                    valueFormatter(v),
+                    name,
+                  ]}
+                />
+                {series.map((s) => (
+                  <Line
+                    key={s.dataKey}
+                    type="monotone"
+                    dataKey={s.dataKey}
+                    name={s.label}
+                    dot={false}
+                    strokeWidth={2}
+                    stroke={s.color}
+                    connectNulls
+                    isAnimationActive={false}
+                  />
+                ))}
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        )}
+        {series.length > 1 && (
+          <div className="mt-2 flex flex-wrap items-center gap-3">
+            {series.map((s) => (
+              <span
+                key={s.dataKey}
+                className="flex items-center gap-1.5 text-xs text-muted-foreground"
+              >
+                <span
+                  className="inline-block h-2 w-2 rounded-full"
+                  style={{ backgroundColor: s.color }}
+                />
+                {s.label}
+              </span>
+            ))}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Node-metric panel (unfiltered) — one query per series, merged on timestamp
+// ---------------------------------------------------------------------------
+
+function NodeMetricPanel({
+  panel,
+  range,
+}: {
+  panel: NodePanelDef
+  range: RangeValue
+}) {
+  const results = useQueries({
+    queries: panel.series.map((s) => proxySeriesQuery(s.metric, range)),
+  })
+
+  const isPending = results.some((r) => r.isPending)
+  const errors = results.filter((r) => r.isError).map((r) => r.error)
+  const allFailed = errors.length === results.length && errors.length > 0
+  const errorText = allFailed
+    ? errors.every(isMetricsUnavailable)
+      ? 'Metric collection is not enabled on this server.'
+      : 'Failed to load proxy metrics'
+    : null
+
+  // Merge per-series point arrays into one row per timestamp. Recomputed per
+  // render — a few hundred points at most, not worth an unstable memo dep.
+  const rows = new Map<string, Record<string, string | number | null>>()
+  results.forEach((r, i) => {
+    const key = panel.series[i].metric
+    for (const p of r.data ?? []) {
+      const row = rows.get(p.time) ?? {
+        time: p.time,
+        label: formatTimeLabel(p.time, range),
+      }
+      row[key] = p.value
+      rows.set(p.time, row)
+    }
+  })
+  const chartData = [...rows.values()].sort((a, b) =>
+    String(a.time).localeCompare(String(b.time))
+  )
+
+  return (
+    <ChartPanel
+      title={panel.title}
+      description={panel.description}
+      series={panel.series}
+      data={chartData}
+      valueFormatter={panel.valueFormatter}
+      isPending={isPending}
+      errorText={errorText}
+      emptyText="No proxy metrics yet — data appears within a minute of traffic"
+    />
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Filtered charts (proxy-log time buckets)
+// ---------------------------------------------------------------------------
+
+function bucketChartRows(stats: TimeBucketStats[], range: RangeValue) {
+  return stats.map((b) => ({
+    time: b.bucket,
+    label: formatTimeLabel(b.bucket, range),
+    request_count: b.request_count,
+    error_count: b.error_count,
+    error_rate:
+      b.request_count > 0 ? (b.error_count / b.request_count) * 100 : 0,
+    avg_response_time_ms: b.avg_response_time_ms,
+    total_request_bytes: b.total_request_bytes,
+    total_response_bytes: b.total_response_bytes,
+  }))
+}
+
+function FilteredCharts({
+  range,
+  filter,
+}: {
+  range: RangeValue
+  filter: ProxyFilter
+}) {
+  const q = useBucketStats(range, filter)
+  const stats = q.data?.stats ?? []
+  const data = bucketChartRows(stats, range)
+
+  const shared = {
+    data,
+    isPending: q.isPending,
+    errorText: q.isError ? 'Failed to load proxy log statistics' : null,
+    emptyText: 'No proxy logs for this selection in the window',
+  }
+
+  return (
+    <div className="space-y-2">
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+        <ChartPanel
+          title="Requests"
+          description="Requests and errors (status ≥ 400) per interval, from proxy logs"
+          series={[
+            { dataKey: 'request_count', label: 'Requests', color: '#2563eb' },
+            { dataKey: 'error_count', label: 'Errors', color: '#dc2626' },
+          ]}
+          valueFormatter={formatCount}
+          {...shared}
+        />
+        <ChartPanel
+          title="Error rate"
+          description="Errors (status ≥ 400) as a share of requests per interval"
+          series={[
+            { dataKey: 'error_rate', label: 'Error rate', color: '#dc2626' },
+          ]}
+          valueFormatter={formatPercent}
+          {...shared}
+        />
+        <ChartPanel
+          title="Average duration"
+          description="Mean response time per interval, from proxy logs"
+          series={[
+            {
+              dataKey: 'avg_response_time_ms',
+              label: 'avg',
+              color: '#2563eb',
+            },
+          ]}
+          valueFormatter={formatMs}
+          {...shared}
+        />
+        <ChartPanel
+          title="Bandwidth"
+          description="Request and response bytes per interval"
+          series={[
+            {
+              dataKey: 'total_request_bytes',
+              label: 'Request bytes',
+              color: '#16a34a',
+            },
+            {
+              dataKey: 'total_response_bytes',
+              label: 'Response bytes',
+              color: '#2563eb',
+            },
+          ]}
+          valueFormatter={formatBytesShort}
+          {...shared}
+        />
+      </div>
+      <p className="text-xs text-muted-foreground">
+        Percentile latency is only available for all traffic.
+      </p>
+    </div>
+  )
+}
+
 // ---------------------------------------------------------------------------
 // Summary stat cards
 // ---------------------------------------------------------------------------
@@ -231,7 +597,8 @@ function StatCard({ title, value, isPending }: StatCardProps) {
   )
 }
 
-function SummaryStats({ range }: { range: RangeValue }) {
+/** Unfiltered stats — computed from the process-wide node metric series. */
+function NodeSummaryStats({ range }: { range: RangeValue }) {
   // Same query keys the chart panels use — React Query dedupes the fetches.
   const [requests, errors5xx, p95] = useQueries({
     queries: [
@@ -254,14 +621,17 @@ function SummaryStats({ range }: { range: RangeValue }) {
     .find((p) => p.value != null)?.value
 
   const hasRequests = !requests.isPending && !requests.isError
-  const reqPerSec = totalRequests / RANGE_SECONDS[range]
 
   return (
     <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
       <StatCard
         title="Requests/s"
         isPending={requests.isPending}
-        value={hasRequests ? `${reqPerSec.toFixed(2)}/s` : null}
+        value={
+          hasRequests
+            ? `${(totalRequests / RANGE_SECONDS[range]).toFixed(2)}/s`
+            : null
+        }
       />
       <StatCard
         title="Total requests"
@@ -286,140 +656,143 @@ function SummaryStats({ range }: { range: RangeValue }) {
   )
 }
 
-// ---------------------------------------------------------------------------
-// Chart panel — fetches one query per series and merges them on timestamp
-// ---------------------------------------------------------------------------
-
-type PanelProps = {
-  panel: PanelDef
+/** Filtered stats — computed from the proxy-log time buckets. */
+function FilteredSummaryStats({
+  range,
+  filter,
+}: {
   range: RangeValue
-}
+  filter: ProxyFilter
+}) {
+  const q = useBucketStats(range, filter)
+  const stats = q.data?.stats ?? []
 
-function MetricPanel({ panel, range }: PanelProps) {
-  const results = useQueries({
-    queries: panel.series.map((s) => proxySeriesQuery(s.metric, range)),
-  })
+  const totalRequests = stats.reduce((acc, b) => acc + b.request_count, 0)
+  const totalErrors = stats.reduce((acc, b) => acc + b.error_count, 0)
+  // Weighted average of per-bucket means by request count.
+  const weightedAvg =
+    totalRequests > 0
+      ? stats.reduce(
+          (acc, b) => acc + b.avg_response_time_ms * b.request_count,
+          0
+        ) / totalRequests
+      : null
 
-  const isPending = results.some((r) => r.isPending)
-  const errors = results.filter((r) => r.isError).map((r) => r.error)
-  const unavailable =
-    errors.length === results.length &&
-    errors.length > 0 &&
-    errors.every(isMetricsUnavailable)
-  const allFailed = errors.length === results.length && errors.length > 0
-
-  // Merge the per-series point arrays into one row per timestamp so recharts
-  // can render them as aligned lines. Recomputed per render — a few hundred
-  // points at most, so memoization isn't worth an unstable dependency list.
-  const rows = new Map<string, Record<string, string | number | null>>()
-  results.forEach((r, i) => {
-    const key = panel.series[i].metric
-    for (const p of r.data ?? []) {
-      const row = rows.get(p.time) ?? {
-        time: p.time,
-        label: formatTimeLabel(p.time, range),
-      }
-      row[key] = p.value
-      rows.set(p.time, row)
-    }
-  })
-  const chartData = [...rows.values()].sort((a, b) =>
-    String(a.time).localeCompare(String(b.time))
-  )
+  const ok = !q.isPending && !q.isError
 
   return (
-    <Card>
-      <CardHeader className="pb-2">
-        <CardTitle className="text-base">{panel.title}</CardTitle>
-        <CardDescription>{panel.description}</CardDescription>
-      </CardHeader>
-      <CardContent>
-        {isPending ? (
-          <Skeleton className="h-[220px] w-full" />
-        ) : unavailable ? (
-          <div className="flex h-[220px] items-center justify-center px-6 text-center text-sm text-muted-foreground">
-            Metric collection is not enabled on this server.
-          </div>
-        ) : allFailed ? (
-          <div className="flex h-[220px] items-center justify-center px-6 text-center text-sm text-rose-500">
-            Failed to load proxy metrics
-          </div>
-        ) : chartData.length === 0 ? (
-          <div className="flex h-[220px] items-center justify-center px-6 text-center text-sm text-muted-foreground">
-            No proxy metrics yet — data appears within a minute of traffic
-          </div>
-        ) : (
-          <div className="h-[220px]">
-            <ResponsiveContainer width="100%" height="100%">
-              <LineChart
-                data={chartData}
-                margin={{ top: 4, right: 24, left: 0, bottom: 0 }}
-              >
-                <CartesianGrid
-                  strokeDasharray="3 3"
-                  stroke="rgba(128,128,128,0.15)"
-                  vertical={false}
-                />
-                <XAxis
-                  dataKey="label"
-                  tick={{ fontSize: 10, fill: 'rgba(156,163,175,0.9)' }}
-                  tickLine={false}
-                  axisLine={false}
-                  interval="preserveStartEnd"
-                />
-                <YAxis
-                  tick={{ fontSize: 10, fill: 'rgba(156,163,175,0.9)' }}
-                  tickLine={false}
-                  axisLine={false}
-                  width={52}
-                  tickFormatter={panel.valueFormatter}
-                />
-                <Tooltip
-                  wrapperStyle={{ zIndex: 50 }}
-                  allowEscapeViewBox={{ x: true, y: true }}
-                  contentStyle={TOOLTIP_CONTENT_STYLE}
-                  labelStyle={TOOLTIP_LABEL_STYLE}
-                  cursor={{ stroke: 'rgba(128,128,128,0.3)', strokeWidth: 1 }}
-                  formatter={(v: number, name: string) => [
-                    panel.valueFormatter(v),
-                    name,
-                  ]}
-                />
-                {panel.series.map((s) => (
-                  <Line
-                    key={s.metric}
-                    type="monotone"
-                    dataKey={s.metric}
-                    name={s.label}
-                    dot={false}
-                    strokeWidth={2}
-                    stroke={s.color}
-                    connectNulls
-                    isAnimationActive={false}
-                  />
-                ))}
-              </LineChart>
-            </ResponsiveContainer>
-          </div>
-        )}
-        {panel.series.length > 1 && (
-          <div className="mt-2 flex flex-wrap items-center gap-3">
-            {panel.series.map((s) => (
-              <span
-                key={s.metric}
-                className="flex items-center gap-1.5 text-xs text-muted-foreground"
-              >
-                <span
-                  className="inline-block h-2 w-2 rounded-full"
-                  style={{ backgroundColor: s.color }}
-                />
-                {s.label}
-              </span>
+    <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
+      <StatCard
+        title="Requests/s"
+        isPending={q.isPending}
+        value={
+          ok ? `${(totalRequests / RANGE_SECONDS[range]).toFixed(2)}/s` : null
+        }
+      />
+      <StatCard
+        title="Total requests"
+        isPending={q.isPending}
+        value={ok ? formatCount(totalRequests) : null}
+      />
+      <StatCard
+        title="4xx+5xx rate"
+        isPending={q.isPending}
+        value={
+          ok && totalRequests > 0
+            ? formatPercent((totalErrors / totalRequests) * 100)
+            : null
+        }
+      />
+      <StatCard
+        title="Avg latency"
+        isPending={q.isPending}
+        value={ok && weightedAvg != null ? formatMs(weightedAvg) : null}
+      />
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Filter bar (project + environment selects)
+// ---------------------------------------------------------------------------
+
+const ALL_SENTINEL = 'all'
+
+function FilterBar({
+  filter,
+  onChange,
+}: {
+  filter: ProxyFilter
+  onChange: (f: ProxyFilter) => void
+}) {
+  const projectsQ = useQuery({
+    ...getProjectsOptions({ query: { page: 1, per_page: 100 } }),
+    staleTime: 60_000,
+  })
+  const environmentsQ = useQuery({
+    ...getEnvironmentsOptions({
+      path: { project_id: filter.projectId ?? 0 },
+    }),
+    enabled: filter.projectId != null,
+    staleTime: 60_000,
+  })
+
+  const projects = projectsQ.data?.projects ?? []
+  const environments = environmentsQ.data ?? []
+
+  return (
+    <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
+      <Select
+        value={
+          filter.projectId != null ? String(filter.projectId) : ALL_SENTINEL
+        }
+        onValueChange={(v) =>
+          onChange({
+            projectId: v === ALL_SENTINEL ? null : Number(v),
+            environmentId: null,
+          })
+        }
+      >
+        <SelectTrigger className="w-full sm:w-[200px]">
+          <SelectValue placeholder="All projects" />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value={ALL_SENTINEL}>All projects</SelectItem>
+          {projects.map((p) => (
+            <SelectItem key={p.id} value={String(p.id)}>
+              {p.name}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+      {filter.projectId != null && (
+        <Select
+          value={
+            filter.environmentId != null
+              ? String(filter.environmentId)
+              : ALL_SENTINEL
+          }
+          onValueChange={(v) =>
+            onChange({
+              ...filter,
+              environmentId: v === ALL_SENTINEL ? null : Number(v),
+            })
+          }
+        >
+          <SelectTrigger className="w-full sm:w-[180px]">
+            <SelectValue placeholder="All environments" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value={ALL_SENTINEL}>All environments</SelectItem>
+            {environments.map((e) => (
+              <SelectItem key={e.id} value={String(e.id)}>
+                {e.name}
+              </SelectItem>
             ))}
-          </div>
-        )}
-      </CardContent>
-    </Card>
+          </SelectContent>
+        </Select>
+      )}
+    </div>
   )
 }
 
@@ -457,24 +830,25 @@ const BREAKDOWN_COLUMNS: {
   { key: 'bounce_rate', label: 'Bounce rate', numeric: true, secondary: true },
 ]
 
-function TrafficByProject({ range }: { range: RangeValue }) {
+function TrafficByProject({
+  range,
+  filter,
+}: {
+  range: RangeValue
+  filter: ProxyFilter
+}) {
   const [sortKey, setSortKey] = useState<BreakdownSortKey>('total_page_views')
   const [sortDesc, setSortDesc] = useState(true)
-
-  // Stable per range selection — an inline `new Date()` in the query options
-  // would change the query key every render and refetch forever.
-  const { startDate, endDate } = useMemo(() => {
-    const end = new Date()
-    const start = new Date(end.getTime() - RANGE_SECONDS[range] * 1000)
-    return { startDate: toAnalyticsDate(start), endDate: toAnalyticsDate(end) }
-  }, [range])
+  const { startAnalytics, endAnalytics } = useWindowBounds(range)
 
   const q = useQuery({
     ...getGeneralStatsOptions({
       query: {
-        start_date: startDate,
-        end_date: endDate,
+        start_date: startAnalytics,
+        end_date: endAnalytics,
         include_project_breakdown: true,
+        project_ids: filter.projectId != null ? [filter.projectId] : undefined,
+        environment_id: filter.environmentId ?? undefined,
       },
     }),
     staleTime: 30_000,
@@ -589,12 +963,18 @@ function TrafficByProject({ range }: { range: RangeValue }) {
 export default function ProxyMetrics() {
   const { setBreadcrumbs } = useBreadcrumbs()
   const [range, setRange] = useState<RangeValue>('1h')
+  const [filter, setFilter] = useState<ProxyFilter>({
+    projectId: null,
+    environmentId: null,
+  })
 
   useEffect(() => {
     setBreadcrumbs([{ label: 'Proxy' }])
   }, [setBreadcrumbs])
 
   usePageTitle('Proxy')
+
+  const isFiltered = filter.projectId != null
 
   // Full-width like Monitoring.tsx — the app layout wrapper supplies the
   // outer padding, so no container/max-w here.
@@ -608,29 +988,44 @@ export default function ProxyMetrics() {
               Hot-path traffic and latency metrics for the control-plane proxy
             </p>
           </div>
-          <div className="flex items-center gap-1">
-            {RANGE_OPTIONS.map((opt) => (
-              <Button
-                key={opt.value}
-                variant={range === opt.value ? 'default' : 'outline'}
-                size="sm"
-                onClick={() => setRange(opt.value)}
-              >
-                {opt.label}
-              </Button>
-            ))}
+          <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
+            <FilterBar filter={filter} onChange={setFilter} />
+            <div className="flex items-center gap-1">
+              {RANGE_OPTIONS.map((opt) => (
+                <Button
+                  key={opt.value}
+                  variant={range === opt.value ? 'default' : 'outline'}
+                  size="sm"
+                  onClick={() => setRange(opt.value)}
+                >
+                  {opt.label}
+                </Button>
+              ))}
+            </div>
           </div>
         </div>
 
-        <SummaryStats range={range} />
+        {isFiltered ? (
+          <>
+            <FilteredSummaryStats range={range} filter={filter} />
+            <FilteredCharts range={range} filter={filter} />
+          </>
+        ) : (
+          <>
+            <NodeSummaryStats range={range} />
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+              {NODE_PANELS.map((panel) => (
+                <NodeMetricPanel
+                  key={panel.title}
+                  panel={panel}
+                  range={range}
+                />
+              ))}
+            </div>
+          </>
+        )}
 
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-          {PANELS.map((panel) => (
-            <MetricPanel key={panel.title} panel={panel} range={range} />
-          ))}
-        </div>
-
-        <TrafficByProject range={range} />
+        <TrafficByProject range={range} filter={filter} />
       </div>
     </div>
   )
