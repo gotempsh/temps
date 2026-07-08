@@ -12,6 +12,7 @@ use tracing::{error, warn};
 
 use crate::error::OtelError;
 use crate::ingest::auth::{IngestAuth, OtelAuthService, ProjectAuth};
+use crate::ingest::quota_cache::{QuotaCache, QUOTA_CACHE_TTL};
 use crate::ingest::rate_limit::RateLimiter;
 use crate::storage::OtelStorage;
 use crate::types::*;
@@ -28,6 +29,10 @@ pub struct OtelService {
     /// container pushes every ~10–30s), so the ceiling exists only to cap a
     /// runaway/compromised exporter, not to shape normal traffic.
     service_rate_limiter: Arc<RateLimiter>,
+    /// TTL cache of per-project storage quota, avoiding a `COUNT(*)` scan
+    /// over the OTel hypertables on every ingest request. See
+    /// [`crate::ingest::quota_cache`].
+    quota_cache: Arc<QuotaCache>,
     stats: PipelineStatsAtomic,
 }
 
@@ -85,6 +90,7 @@ impl OtelService {
                 SERVICE_INGEST_MAX_REQUESTS,
                 SERVICE_INGEST_WINDOW,
             )),
+            quota_cache: Arc::new(QuotaCache::new(QUOTA_CACHE_TTL)),
             stats: PipelineStatsAtomic::default(),
         }
     }
@@ -141,9 +147,23 @@ impl OtelService {
     }
 
     /// Check storage quota for a project.
+    ///
+    /// Storage quota is backed by an exact `COUNT(*)` scan over the OTel
+    /// hypertables (see `TimescaleDbStorage::get_storage_quota`), which is
+    /// too expensive to run on every ingest request under load. Reuse the
+    /// cached result within [`QUOTA_CACHE_TTL`] and only hit storage once
+    /// that expires.
     pub async fn check_quota(&self, project_id: i32) -> Result<(), OtelError> {
-        if self.storage.check_quota(project_id).await? {
-            let quota = self.storage.get_storage_quota(project_id).await?;
+        let quota = match self.quota_cache.get(project_id) {
+            Some(quota) => quota,
+            None => {
+                let quota = self.storage.get_storage_quota(project_id).await?;
+                self.quota_cache.put(project_id, quota.clone());
+                quota
+            }
+        };
+
+        if quota.usage_pct >= 100.0 {
             return Err(OtelError::QuotaExceeded {
                 project_id,
                 used_bytes: quota.total_bytes,
@@ -777,6 +797,60 @@ mod tests {
         assert!(svc.check_rate_limit(1).is_ok());
         assert!(svc.check_rate_limit(1).is_ok());
         assert!(svc.check_rate_limit(1).is_err());
+    }
+
+    // ── quota check caching (avoid per-request COUNT(*) under load) ────────
+
+    #[tokio::test]
+    async fn test_check_quota_reuses_cached_result_within_ttl() {
+        let (svc, storage) = make_service(MockOtelStorage::new());
+
+        for _ in 0..5 {
+            assert!(svc.check_quota(1).await.is_ok());
+        }
+
+        // 5 checks for the same project should only hit storage once — the
+        // rest are served from the quota cache.
+        assert_eq!(storage.get_storage_quota_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_check_quota_is_cached_per_project() {
+        let (svc, storage) = make_service(MockOtelStorage::new());
+
+        assert!(svc.check_quota(1).await.is_ok());
+        assert!(svc.check_quota(2).await.is_ok());
+        assert!(svc.check_quota(1).await.is_ok());
+        assert!(svc.check_quota(2).await.is_ok());
+
+        // Each distinct project gets its own cache entry, so two projects
+        // still means exactly two storage calls, not four.
+        assert_eq!(storage.get_storage_quota_call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_check_quota_rejects_when_over_limit() {
+        let mock = MockOtelStorage::new();
+        *mock.quota_override.lock().unwrap() = Some(StorageQuota {
+            project_id: 42,
+            metrics_bytes: 0,
+            traces_bytes: 0,
+            logs_bytes: 0,
+            total_bytes: 200,
+            limit_bytes: 100,
+            usage_pct: 200.0,
+        });
+        let (svc, _storage) = make_service(mock);
+
+        let result = svc.check_quota(42).await;
+        assert!(matches!(
+            result,
+            Err(OtelError::QuotaExceeded {
+                project_id: 42,
+                used_bytes: 200,
+                limit_bytes: 100,
+            })
+        ));
     }
 
     #[tokio::test]

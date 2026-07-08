@@ -5,5 +5,6 @@
 
 pub mod auth;
 pub mod decode;
+pub mod quota_cache;
 pub mod rate_limit;
 pub mod sampler;
