@@ -280,10 +280,13 @@ function proxySeriesQuery(metric: string, range: RangeValue) {
   }
 }
 
-/** Format a Date as the analytics API's "YYYY-MM-DD HH:MM:SS". */
+/**
+ * Format a Date for the analytics API. Despite the OpenAPI description
+ * saying "YYYY-MM-DD HH:MM:SS", the server rejects that and requires
+ * ISO 8601 "YYYY-MM-DDTHH:MM:SSZ" (no fractional seconds).
+ */
 function toAnalyticsDate(d: Date): string {
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+  return d.toISOString().replace(/\.\d{3}Z$/, 'Z')
 }
 
 /** Memoized window bounds for the selected range (stable query keys). */
