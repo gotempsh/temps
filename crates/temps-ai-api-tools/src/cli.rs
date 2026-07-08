@@ -471,7 +471,23 @@ fn coerce(s: &str) -> Value {
     match s {
         "true" => Value::Bool(true),
         "false" => Value::Bool(false),
-        _ => Value::String(s.to_string()),
+        _ => {
+            // Object/array-shaped flag values (e.g. `--parameters {"database":"app"}`)
+            // are real JSON, not opaque strings — a body param typed as a map/array
+            // must actually deserialize as one downstream, not as a JSON string
+            // containing braces. Only object/array literals are attempted here;
+            // a bare `"true"`/number-looking string inside quotes still falls
+            // through to the String arm below like any other scalar.
+            let trimmed = s.trim();
+            if (trimmed.starts_with('{') && trimmed.ends_with('}'))
+                || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+            {
+                if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+                    return v;
+                }
+            }
+            Value::String(s.to_string())
+        }
     }
 }
 
@@ -518,6 +534,29 @@ mod tests {
     #[test]
     fn parse_flags_rejects_bare_positional() {
         assert!(parse_flags(&["oops".into()]).is_err());
+    }
+
+    #[test]
+    fn parse_flags_coerces_object_and_array_flag_values() {
+        let v = parse_flags(&[
+            "--parameters".into(),
+            r#"{"database":"app","username":"app"}"#.into(),
+            "--members".into(),
+            r#"[{"role":"primary"}]"#.into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            v["parameters"],
+            serde_json::json!({"database": "app", "username": "app"})
+        );
+        assert_eq!(v["members"], serde_json::json!([{"role": "primary"}]));
+    }
+
+    #[test]
+    fn parse_flags_keeps_malformed_brace_string_as_string() {
+        // Not valid JSON — must fall back to a plain string rather than error.
+        let v = parse_flags(&["--name".into(), "{not json}".into()]).unwrap();
+        assert_eq!(v["name"], Value::from("{not json}"));
     }
 
     #[test]
