@@ -21,6 +21,16 @@ pub struct AppState {
     pub audit_service: Arc<dyn AuditLogger>,
     pub template_service: Arc<TemplateService>,
     pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
+    /// Optional checker enforcing team-based project access for human sessions.
+    ///
+    /// `None` when no plugin implementing this check is registered — the
+    /// `project_access_guard!` macro is a strict synchronous no-op in that
+    /// case, matching the behaviour of `deployment_gate` in `temps-deployments`.
+    /// Resolved once in `configure_routes` via
+    /// `context.get_service::<dyn temps_core::ProjectAccessChecker>()`, which
+    /// is guaranteed to see all registered services because `configure_routes`
+    /// runs after every plugin's `initialize_plugin_services` has completed.
+    pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
 }
 
 // Domain-related types

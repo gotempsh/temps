@@ -15,7 +15,7 @@ use axum::{
 };
 use std::sync::Arc;
 use temps_auth::RequireAuth;
-use temps_auth::{permission_guard, project_scope_guard};
+use temps_auth::{permission_guard, project_access_guard, project_scope_guard};
 use temps_core::RequestMetadata;
 use tracing::{debug, error, info};
 
@@ -313,8 +313,9 @@ pub async fn get_project(
     Path(id): Path<i32>,
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, ProjectsRead);
-    project_scope_guard!(auth, id);
+    permission_guard!(auth, ProjectsRead); // 1. instance-wide role check
+    project_scope_guard!(auth, id); // 2. deployment-token IDOR check
+    project_access_guard!(auth, id, state.project_access_checker); // 3. team-based access
 
     info!("get project called with id: {}", id);
     let project = state
