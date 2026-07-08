@@ -2279,6 +2279,12 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                             //    account-global domain create/delete excluded) ──
                             "add_environment_domain",
                             "delete_environment_domain",
+                            // ── Managed external services (databases, caches, etc.) —
+                            //    provisioning a new container and linking an existing
+                            //    one to a project. Both reversible (a service can be
+                            //    unlinked / left running unused; nothing is deleted).
+                            "create_service",
+                            "link_service_to_project",
                         ]
                         .iter()
                         .map(|s| s.to_string())
