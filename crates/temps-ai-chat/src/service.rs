@@ -1170,16 +1170,7 @@ impl ConversationService {
 ///
 /// Returns a readable string result that goes back to the model as the tool
 /// result — always, even on internal errors (never panics).
-///
-/// Public so other in-process agent tool-belts can stage the exact same kind
-/// of confirm-gated proposal without duplicating the parse/validate/stage
-/// orchestration (e.g. VibeTemps's `temps_write` MCP tool, which reuses the
-/// shared `WriteApiToolsHandle`/`PendingActionService` DI services the same
-/// way `temps-ee-sre` reuses the read-only `ApiToolsHandle`). `conversation_id`
-/// is just an indexed tag column (no FK) — callers outside temps-ai-chat's own
-/// conversation model can pass any stable i64 (e.g. a session id) to group
-/// their own proposals.
-pub async fn dispatch_write_tool(
+async fn dispatch_write_tool(
     arguments: &str,
     project_id: i32,
     conversation_id: i64,
