@@ -447,6 +447,10 @@ pub struct LoadBalancer {
     /// to the console — see `request_filter`. When `None`, gate enforcement
     /// is skipped entirely (used by older test harnesses).
     admin_gate: Option<temps_core::admin_gate::AdminGateHandle>,
+    /// Lock-free hot-path request counters (status classes + duration
+    /// histogram). Updated on every completed/failed request; drained by the
+    /// background `ProxyMetricsSampler`, never read on the request path.
+    proxy_metrics: Arc<crate::metrics::ProxyMetrics>,
 }
 
 impl LoadBalancer {
@@ -487,7 +491,14 @@ impl LoadBalancer {
             file_store: None,
             preview_auth_limiter: Arc::new(PreviewAuthLimiter::new()),
             admin_gate: None,
+            proxy_metrics: Arc::new(crate::metrics::ProxyMetrics::default()),
         }
+    }
+
+    /// Handle to the hot-path metrics counters, for the background sampler.
+    /// The returned `Arc` shares the counters this instance records into.
+    pub fn proxy_metrics(&self) -> Arc<crate::metrics::ProxyMetrics> {
+        Arc::clone(&self.proxy_metrics)
     }
 
     /// Wire the shared admin-gate handle. When set, `request_filter`
@@ -868,6 +879,12 @@ impl LoadBalancer {
 
         self.log_request(session, upstream_response, ctx).await?;
         self.add_response_timing(upstream_response, ctx)?;
+
+        // Hot-path metrics: a few relaxed atomic adds, no I/O.
+        self.proxy_metrics.record(
+            upstream_response.status.as_u16(),
+            ctx.start_time.elapsed().as_millis() as u64,
+        );
 
         Ok(())
     }
@@ -1473,6 +1490,13 @@ impl LoadBalancer {
         error_message: Option<String>,
         response_size: Option<i64>,
     ) {
+        // Count every static response in the hot-path metrics, including the
+        // assets excluded from per-request logging below.
+        self.proxy_metrics.record(
+            status_code.max(0) as u16,
+            ctx.start_time.elapsed().as_millis() as u64,
+        );
+
         // Only log HTML pages (skip .js, .css, .svg, etc.)
         if !Self::should_log_static_request(&ctx.path) {
             return;
@@ -4224,6 +4248,10 @@ impl ProxyHttp for LoadBalancer {
             // Non-blocking enqueue; shed with rate-limited accounting when full.
             self.proxy_log_handle.send_or_drop(proxy_log_request);
         }
+
+        // Failed requests never reach finalize_response, so count them here.
+        self.proxy_metrics
+            .record(error_code, ctx.start_time.elapsed().as_millis() as u64);
 
         FailToProxy {
             error_code,

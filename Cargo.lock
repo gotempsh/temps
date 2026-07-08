@@ -12571,6 +12571,7 @@ dependencies = [
  "temps-entities",
  "temps-file-store",
  "temps-geo",
+ "temps-metrics",
  "temps-migrations",
  "temps-presets",
  "temps-routes",

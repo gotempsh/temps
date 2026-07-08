@@ -195,6 +195,7 @@ const CliLogin = lazy(() =>
   import('./pages/CliLogin').then((m) => ({ default: m.CliLogin }))
 )
 const ProxyLogs = lazy(() => import('./pages/ProxyLogs'))
+const ProxyMetrics = lazy(() => import('./pages/ProxyMetrics'))
 const ProxyLogDetail = lazy(() => import('./pages/ProxyLogDetail'))
 const IpGeolocationDetail = lazy(() => import('./pages/IpGeolocationDetail'))
 const CrossProjectTraceDetail = lazy(
@@ -458,6 +459,7 @@ const FullAppRoutes = () => {
                   path="/traces/global/:traceId"
                   element={<CrossProjectTraceDetail />}
                 />
+                <Route path="/proxy" element={<ProxyMetrics />} />
                 <Route path="/proxy-logs" element={<ProxyLogs />} />
                 <Route path="/proxy-logs/:id" element={<ProxyLogDetail />} />
                 <Route path="/audit-logs" element={<AuditLogs />} />

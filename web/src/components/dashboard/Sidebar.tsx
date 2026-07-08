@@ -145,6 +145,7 @@ const navWorkflow: PlatformNavItem[] = [
 // Observability section
 const navObservability = [
   { title: 'Monitoring', url: '/monitoring', icon: Gauge },
+  { title: 'Proxy', url: '/proxy', icon: Activity },
   { title: 'Proxy Logs', url: '/proxy-logs', icon: Network },
   { title: 'Audit Logs', url: '/audit-logs', icon: ScrollText },
 ]

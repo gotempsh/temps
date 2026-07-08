@@ -18,6 +18,7 @@ temps-entities = { path = "../temps-entities" }
 temps-file-store = { path = "../temps-file-store" }
 temps-geo = { path = "../temps-geo" }
 temps-routes = { path = "../temps-routes" }
+temps-metrics = { path = "../temps-metrics" }
 temps-migrations = { path = "../temps-migrations" }
 serde = { workspace = true }
 tokio = { workspace = true }
