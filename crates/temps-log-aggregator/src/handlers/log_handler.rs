@@ -309,6 +309,12 @@ async fn search_logs(
     Json(request): Json<SearchLogsRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, LogsRead);
+    // `project_id` is ignored when `external_service_id` is set (external
+    // service logs aren't project-scoped), so only guard on it in the mode
+    // where it's actually the resource being accessed.
+    if request.external_service_id.is_none() {
+        project_access_guard!(auth, request.project_id, app_state.project_access_checker);
+    }
 
     let now = Utc::now();
     let start_time = request
@@ -422,6 +428,12 @@ async fn tail_logs(
     Query(request): Query<TailLogsRequest>,
 ) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, Problem> {
     permission_guard!(auth, LogsRead);
+    // `project_id` is ignored when `external_service_id` is set (external
+    // service logs aren't project-scoped), so only guard on it in the mode
+    // where it's actually the resource being accessed.
+    if request.external_service_id.is_none() {
+        project_access_guard!(auth, request.project_id, app_state.project_access_checker);
+    }
 
     let levels: Vec<LogLevel> = request
         .levels
