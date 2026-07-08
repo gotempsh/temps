@@ -19,12 +19,12 @@
     "test:watch": "vitest --watch",
     "test:coverage": "vitest --coverage",
     "build": "tsc -p tsconfig.build.json",
-    "generate": "npx @hey-api/openapi-ts@0.82.4 -i ./scripts/openapi.json -o src/client -c @hey-api/client-fetch",
+    "generate": "npx @hey-api/openapi-ts@0.99.0 -i ./scripts/openapi.json -o src/client -c @hey-api/client-fetch",
     "prepublishOnly": "npm run build",
     "clean": "rm -rf dist"
   },
   "devDependencies": {
-    "@hey-api/openapi-ts": "^0.82.4",
+    "@hey-api/openapi-ts": "^0.99.0",
     "@types/bun": "latest",
     "@types/node": "^24.10.1",
     "@vitest/coverage-v8": "^4.1.0",

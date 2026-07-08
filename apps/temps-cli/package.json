@@ -23,7 +23,7 @@
     "link": "bun link"
   },
   "devDependencies": {
-    "@hey-api/openapi-ts": "^0.88.0",
+    "@hey-api/openapi-ts": "^0.99.0",
     "@types/bun": "latest",
     "@types/react": "^19.2.9",
     "react-devtools-core": "^7.0.1"
