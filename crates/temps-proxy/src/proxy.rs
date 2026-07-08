@@ -4258,16 +4258,10 @@ impl ProxyHttp for LoadBalancer {
             .map(|resp| resp.status.as_u16())
             .unwrap_or(0);
 
-        let destination = if ctx.project.is_some() {
-            crate::metrics::RequestDestination::Project
-        } else if ctx.routing_status == "no_project" {
-            // Route lookup found no project — served by the console fallback.
-            crate::metrics::RequestDestination::Console
-        } else {
-            // Handled by the proxy itself: redirects, ACME, password walls,
-            // admin-gate denials, provisioning errors, ...
-            crate::metrics::RequestDestination::Other
-        };
+        let destination = crate::metrics::RequestDestination::classify(
+            ctx.project.is_some(),
+            &ctx.routing_status,
+        );
 
         // Hot path: 4 relaxed atomic adds, no locks, no I/O.
         self.proxy_metrics.record(

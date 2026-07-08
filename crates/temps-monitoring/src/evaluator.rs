@@ -1540,4 +1540,24 @@ mod tests {
         // to a project; the alarm is still stored under the sentinel project.
         assert_eq!(service_id, None);
     }
+
+    /// Node-scoped rules (proxy metrics) have no project/service/deployment
+    /// context — they must resolve to the sentinel context without issuing any
+    /// DB queries (the MockDatabase has no results queued; a lookup would
+    /// error, not return the sentinel).
+    #[tokio::test]
+    async fn resolve_alarm_context_node_rule_uses_sentinel_without_queries() {
+        let rule = make_rule_with_node(None, None, Some(0));
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let evaluator = evaluator_with_db(db);
+
+        let (project_id, environment_id, deployment_id, service_id) =
+            evaluator.resolve_alarm_context(&rule).await;
+
+        assert_eq!(project_id, 0);
+        assert_eq!(environment_id, None);
+        assert_eq!(deployment_id, None);
+        assert_eq!(service_id, None);
+    }
 }

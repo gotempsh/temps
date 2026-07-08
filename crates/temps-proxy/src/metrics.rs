@@ -58,6 +58,25 @@ pub enum RequestDestination {
 
 const NUM_DESTINATIONS: usize = 3;
 
+impl RequestDestination {
+    /// Classify a finished request from its routing outcome.
+    ///
+    /// `has_project` wins over everything: a request that resolved a project
+    /// counts as project traffic even when a later step rewrote
+    /// `routing_status` (password walls, previews, wake states). Without a
+    /// project, the `"no_project"` status marks the console-fallback path;
+    /// anything else was handled by the proxy itself.
+    pub fn classify(has_project: bool, routing_status: &str) -> Self {
+        if has_project {
+            RequestDestination::Project
+        } else if routing_status == "no_project" {
+            RequestDestination::Console
+        } else {
+            RequestDestination::Other
+        }
+    }
+}
+
 /// Lock-free per-process proxy request counters.
 ///
 /// All mutation goes through [`ProxyMetrics::record`]; all reads go through
@@ -368,6 +387,89 @@ mod tests {
         let samples = delta.samples();
         assert_eq!(samples.len(), 9);
         assert!(samples.iter().all(|s| s.is_counter && s.value == 0.0));
+    }
+
+    #[test]
+    fn test_classify_project_wins_over_routing_status() {
+        // A resolved project counts as project traffic regardless of the
+        // final routing_status (password walls, previews, wake states, ...).
+        assert_eq!(
+            RequestDestination::classify(true, "no_project"),
+            RequestDestination::Project
+        );
+        assert_eq!(
+            RequestDestination::classify(true, "routed"),
+            RequestDestination::Project
+        );
+        assert_eq!(
+            RequestDestination::classify(true, "password_wall"),
+            RequestDestination::Project
+        );
+    }
+
+    #[test]
+    fn test_classify_console_fallback() {
+        assert_eq!(
+            RequestDestination::classify(false, "no_project"),
+            RequestDestination::Console
+        );
+    }
+
+    #[test]
+    fn test_classify_proxy_handled_paths_are_other() {
+        for status in [
+            "acme_challenge",
+            "admin_gate_denied",
+            "http_to_https_redirect",
+            "on_demand_cert_provisioning",
+            "captcha_wasm",
+            "error",
+            "pending",
+        ] {
+            assert_eq!(
+                RequestDestination::classify(false, status),
+                RequestDestination::Other,
+                "status {status} should classify as Other"
+            );
+        }
+    }
+
+    #[test]
+    fn test_multi_interval_deltas_do_not_double_count() {
+        // Simulates two sampler cycles: each delta must contain only the
+        // requests recorded since the previous snapshot.
+        let m = ProxyMetrics::default();
+
+        m.record(200, 10, RequestDestination::Project);
+        m.record(200, 10, RequestDestination::Console);
+        let first_snapshot = m.snapshot();
+        let first_delta = first_snapshot.delta_since(&MetricsSnapshot::default());
+        assert_eq!(first_delta.total_requests(), 2);
+
+        m.record(503, 40, RequestDestination::Other);
+        let second_snapshot = m.snapshot();
+        let second_delta = second_snapshot.delta_since(&first_snapshot);
+
+        // Second interval sees ONLY the one new request.
+        assert_eq!(second_delta.total_requests(), 1);
+        let samples = second_delta.samples();
+        let get = |name: &str| {
+            samples
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("missing sample {name}"))
+                .value
+        };
+        assert_eq!(get(METRIC_REQUESTS), 1.0);
+        assert_eq!(get(METRIC_REQUESTS_5XX), 1.0);
+        assert_eq!(get(METRIC_REQUESTS_PROJECT), 0.0);
+        assert_eq!(get(METRIC_REQUESTS_CONSOLE), 0.0);
+        assert_eq!(get(METRIC_REQUESTS_OTHER), 1.0);
+        assert_eq!(get(METRIC_ERROR_RATE), 100.0);
+
+        // An idle third interval produces zero counters.
+        let third_delta = m.snapshot().delta_since(&second_snapshot);
+        assert_eq!(third_delta.total_requests(), 0);
     }
 
     #[test]
