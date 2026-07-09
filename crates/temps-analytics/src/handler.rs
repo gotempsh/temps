@@ -816,9 +816,10 @@ pub async fn enrich_visitor(
 
 #[utoipa::path(
     get,
-    path = "/projects/{project_id}/has-events",
+    path = "/analytics/has-events",
     params(
-        ("project_id" = i32, Path, description = "Project ID")
+        ("project_id" = i32, Query, description = "Project ID"),
+        ("environment_id" = Option<i32>, Query, description = "Environment ID (optional)")
     ),
     responses(
         (status = 200, description = "Analytics events existence check", body = HasAnalyticsEventsResponse),
