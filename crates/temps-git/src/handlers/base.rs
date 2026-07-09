@@ -989,10 +989,13 @@ pub async fn list_repositories_by_provider(
     // First verify the provider exists
     state.git_provider_manager.get_provider(provider_id).await?;
 
-    // Use the repository service to get repositories
+    // Scoped to the caller's own connection(s) to this provider — provider_id
+    // is a shared, platform-level resource, not a per-user one, so an
+    // unscoped query would leak every other user's repositories.
+    let user_id = auth.user_id();
     let repositories = state
         .repository_service
-        .list_repositories_by_provider(provider_id)
+        .list_repositories_by_provider(provider_id, user_id)
         .await?;
 
     let response: Vec<RepositoryResponse> = repositories

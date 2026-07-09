@@ -287,10 +287,16 @@ impl RepositoryService {
             .collect())
     }
 
-    /// List all repositories linked to a specific git provider
+    /// List repositories linked to a specific git provider through the
+    /// caller's own connection(s) to that provider. `provider_id` identifies
+    /// a shared, platform-level OAuth app/PAT config — many users can each
+    /// have their own `git_provider_connections` row against the same
+    /// provider, so this must stay scoped to `user_id` or it leaks every
+    /// other user's repositories (names, clone/SSH URLs, private flag).
     pub async fn list_repositories_by_provider(
         &self,
         provider_id: i32,
+        user_id: i32,
     ) -> Result<Vec<RepositoryModel>, RepositoryServiceError> {
         let repositories = repositories::Entity::find()
             .join(
@@ -298,6 +304,7 @@ impl RepositoryService {
                 repositories::Relation::GitProviderConnection.def(),
             )
             .filter(git_provider_connections::Column::ProviderId.eq(provider_id))
+            .filter(git_provider_connections::Column::UserId.eq(user_id))
             .all(self.db.as_ref())
             .await?;
 
@@ -327,5 +334,139 @@ impl RepositoryService {
                 git_provider_connection_id: repo.git_provider_connection_id,
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use sea_orm::{ActiveModelTrait, Set};
+    use temps_database::test_utils::TestDatabase;
+    use temps_entities::{git_providers, repositories, users};
+
+    /// `provider_id` is a shared, platform-level resource — many users can
+    /// each hold their own `git_provider_connections` row against the same
+    /// provider. Regression test for the IDOR this method used to have:
+    /// querying by `provider_id` alone returned every user's repositories,
+    /// not just the caller's.
+    #[tokio::test]
+    async fn list_repositories_by_provider_is_scoped_to_caller() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+        let now = Utc::now();
+
+        let make_user = |email: &str| users::ActiveModel {
+            email: Set(email.to_string()),
+            password_hash: Set(Some("hash".to_string())),
+            name: Set("Test User".to_string()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        };
+        let user_a = make_user("a@example.com")
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+        let user_b = make_user("b@example.com")
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+
+        let provider = git_providers::ActiveModel {
+            name: Set("shared-provider".to_string()),
+            provider_type: Set("github".to_string()),
+            base_url: Set(None),
+            api_url: Set(None),
+            auth_method: Set("oauth".to_string()),
+            auth_config: Set(serde_json::json!({})),
+            webhook_secret: Set(None),
+            is_active: Set(true),
+            is_default: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let make_connection = |user_id: i32, account: &str| git_provider_connections::ActiveModel {
+            provider_id: Set(provider.id),
+            user_id: Set(Some(user_id)),
+            account_name: Set(account.to_string()),
+            account_type: Set("User".to_string()),
+            access_token: Set(None),
+            refresh_token: Set(None),
+            token_expires_at: Set(None),
+            refresh_token_expires_at: Set(None),
+            installation_id: Set(None),
+            metadata: Set(None),
+            is_active: Set(true),
+            is_expired: Set(false),
+            syncing: Set(false),
+            last_synced_at: Set(None),
+            ..Default::default()
+        };
+        let connection_a = make_connection(user_a.id, "user-a-account")
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+        let connection_b = make_connection(user_b.id, "user-b-account")
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+
+        let make_repo = |connection_id: i32, name: &str| repositories::ActiveModel {
+            git_provider_connection_id: Set(connection_id),
+            owner: Set("owner".to_string()),
+            name: Set(name.to_string()),
+            full_name: Set(format!("owner/{name}")),
+            description: Set(None),
+            private: Set(true),
+            fork: Set(false),
+            created_at: Set(now),
+            updated_at: Set(now),
+            pushed_at: Set(now),
+            size: Set(0),
+            stargazers_count: Set(0),
+            watchers_count: Set(0),
+            language: Set(None),
+            default_branch: Set("main".to_string()),
+            open_issues_count: Set(0),
+            topics: Set("[]".to_string()),
+            repo_object: Set("{}".to_string()),
+            installation_id: Set(None),
+            clone_url: Set(None),
+            ssh_url: Set(Some(format!("git@example.com:owner/{name}.git"))),
+            preset: Set(None),
+            ..Default::default()
+        };
+        make_repo(connection_a.id, "user-a-private-repo")
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+        make_repo(connection_b.id, "user-b-private-repo")
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+
+        let service = RepositoryService::new(db.clone());
+
+        let repos_for_a = service
+            .list_repositories_by_provider(provider.id, user_a.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            repos_for_a.len(),
+            1,
+            "caller must only see their own repositories for this provider"
+        );
+        assert_eq!(repos_for_a[0].name, "user-a-private-repo");
+
+        let repos_for_b = service
+            .list_repositories_by_provider(provider.id, user_b.id)
+            .await
+            .unwrap();
+        assert_eq!(repos_for_b.len(), 1);
+        assert_eq!(repos_for_b[0].name, "user-b-private-repo");
     }
 }
