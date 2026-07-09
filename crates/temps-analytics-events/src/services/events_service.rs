@@ -1521,6 +1521,95 @@ WHERE project_id = $1
             None
         };
 
+        // Session row self-heal (non-fatal side-effect).
+        //
+        // The proxy's `ProxyLogBatchWriter` flushes `request_sessions` rows
+        // asynchronously, with up to 500ms batching lag.  An event arriving
+        // here before that flush has no matching `request_sessions` row,
+        // which causes two downstream breakages:
+        //
+        //  1. `get_visitor_sessions_by_id` uses LEFT JOIN → rs.id comes back
+        //     NULL → sea-orm tries to decode NULL into `i32` → hard decode
+        //     error that kills the whole request (fixed defensively in Fix 2,
+        //     but better to prevent the missing row entirely).
+        //  2. `get_visitor_journey` uses INNER JOIN → silently excludes every
+        //     event whose session has no `request_sessions` row, producing an
+        //     empty journey response even for visitors with real events.
+        //
+        // Additionally, if the proxy's own `upsert_visitor` failed for a
+        // visitor in a batch (non-fatal there), that visitor never enters the
+        // FK cache, so the corresponding `request_sessions` row gets created
+        // with `visitor_id = NULL`.  We detect that case (existing row with
+        // NULL visitor_id) and backfill it using COALESCE in the ON CONFLICT
+        // clause so the session is permanently healed.
+        //
+        // We clone the UTM/referrer/channel locals here because they are
+        // moved into `events::ActiveModel` below.  Non-fatal: on failure the
+        // event still records; only the session attribution is missing.
+        if let Some(ref session_id_str) = session_id {
+            let session_lookup = {
+                use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+                use temps_entities::request_sessions;
+                request_sessions::Entity::find()
+                    .filter(request_sessions::Column::SessionId.eq(session_id_str.clone()))
+                    .one(self.db.as_ref())
+                    .await
+            };
+            match session_lookup {
+                Err(e) => {
+                    tracing::error!(
+                        session_id = %session_id_str,
+                        project_id,
+                        error = %e,
+                        "Failed to look up request_sessions; session self-heal skipped"
+                    );
+                }
+                Ok(Some(ref session)) if session.visitor_id.is_some() => {
+                    // Row exists with visitor_id already populated — nothing to do.
+                }
+                Ok(maybe_session) => {
+                    // Row is missing (None) OR exists with visitor_id = NULL.
+                    let is_heal = maybe_session.is_some();
+                    match self
+                        .upsert_session_on_miss(
+                            session_id_str,
+                            visitor_id_i32,
+                            referrer.clone(),
+                            referrer_hostname.clone(),
+                            Some(channel.to_string()),
+                            utm_source.clone(),
+                            utm_medium.clone(),
+                            utm_campaign.clone(),
+                            utm_term.clone(),
+                            utm_content.clone(),
+                        )
+                        .await
+                    {
+                        Ok(()) => {
+                            tracing::info!(
+                                session_id = %session_id_str,
+                                project_id,
+                                visitor_id = ?visitor_id_i32,
+                                is_heal,
+                                "Self-healed request_sessions row from event ingest \
+                                 (proxy async flush had not landed yet, or row had NULL visitor_id)"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                session_id = %session_id_str,
+                                project_id,
+                                visitor_id = ?visitor_id_i32,
+                                error = %e,
+                                "Failed to self-heal request_sessions row; \
+                                 event records without session attribution"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         // Browser/OS fields from the user agent parsed above.
         let browser = parsed_ua.browser;
         let browser_version = parsed_ua.browser_version;
@@ -1681,6 +1770,70 @@ WHERE project_id = $1
             )))
         })?;
         row.try_get::<i32>("", "id").map_err(EventsError::Database)
+    }
+
+    /// Upsert a `request_sessions` row when an ingested event's session has no
+    /// matching row yet (proxy async flush lag) or has one with `visitor_id =
+    /// NULL` (prior proxy-side FK-cache miss).
+    ///
+    /// Mirrors the proxy's own `ProxyLogBatchWriter::upsert_session` SQL
+    /// (same columns, same `ON CONFLICT (session_id)` key) but extends the
+    /// `DO UPDATE` clause with a `COALESCE` so a previously-NULL `visitor_id`
+    /// gets backfilled atomically without a separate UPDATE round-trip.
+    ///
+    /// Unlike the proxy's version (which deliberately avoids overwriting
+    /// `visitor_id` on every conflict to prevent racing writers from clobbering
+    /// each other), this version is called only when we already know the
+    /// existing row has `visitor_id = NULL`, so the COALESCE is safe: it
+    /// preserves any non-NULL value that might arrive concurrently.
+    #[allow(clippy::too_many_arguments)]
+    async fn upsert_session_on_miss(
+        &self,
+        session_id: &str,
+        visitor_id: Option<i32>,
+        referrer: Option<String>,
+        referrer_hostname: Option<String>,
+        channel: Option<String>,
+        utm_source: Option<String>,
+        utm_medium: Option<String>,
+        utm_campaign: Option<String>,
+        utm_term: Option<String>,
+        utm_content: Option<String>,
+    ) -> Result<(), EventsError> {
+        use sea_orm::ConnectionTrait;
+
+        let now = chrono::Utc::now();
+        let stmt = Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"INSERT INTO request_sessions (
+                session_id, started_at, last_accessed_at, visitor_id,
+                referrer, referrer_hostname,
+                utm_source, utm_medium, utm_campaign, utm_content, utm_term,
+                channel, data
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, '{}'
+            )
+            ON CONFLICT (session_id) DO UPDATE SET
+                last_accessed_at = EXCLUDED.last_accessed_at,
+                visitor_id = COALESCE(request_sessions.visitor_id, EXCLUDED.visitor_id)"#,
+            [
+                session_id.to_string().into(),
+                now.into(),
+                now.into(),
+                visitor_id.into(),
+                referrer.into(),
+                referrer_hostname.into(),
+                utm_source.into(),
+                utm_medium.into(),
+                utm_campaign.into(),
+                utm_content.into(),
+                utm_term.into(),
+                channel.into(),
+            ],
+        );
+
+        self.db.execute(stmt).await.map_err(EventsError::Database)?;
+        Ok(())
     }
 }
 
@@ -3111,6 +3264,272 @@ mod tests {
         assert_eq!(second_event.visitor_id, event.visitor_id);
 
         println!("✅ record_event visitor-race regression test passed!");
+    }
+
+    /// Regression test: `record_event` must self-heal the `request_sessions`
+    /// table when the proxy's async `ProxyLogBatchWriter` hasn't flushed the
+    /// session row yet (timing miss), or when it created one with
+    /// `visitor_id = NULL` due to a prior FK-cache failure.
+    ///
+    /// Without this fix:
+    ///  - `get_visitor_sessions_by_id` (LEFT JOIN on rs.id, decoded into a
+    ///    non-optional i32) crashes with a type-decode error.
+    ///  - `get_visitor_journey` (INNER JOIN) silently returns an empty journey.
+    #[tokio::test]
+    async fn test_record_event_creates_session_on_lookup_miss() {
+        use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+        use temps_database::test_utils::TestDatabase;
+        use temps_entities::{
+            deployments, environments, projects, request_sessions, source_type::SourceType,
+            upstream_config::UpstreamList,
+        };
+
+        let test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+
+        // Minimal project + environment + deployment needed for record_event.
+        let project = projects::ActiveModel {
+            name: Set("session-race-test".to_string()),
+            repo_name: Set("session-race-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            preset_config: Set(None),
+            deployment_config: Set(None),
+            slug: Set("session-race-test".to_string()),
+            is_deleted: Set(false),
+            deleted_at: Set(None),
+            last_deployment: Set(None),
+            is_public_repo: Set(false),
+            git_url: Set(None),
+            git_provider_connection_id: Set(None),
+            attack_mode: Set(false),
+            enable_preview_environments: Set(false),
+            source_type: Set(SourceType::Git),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert test project");
+
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".to_string()),
+            branch: Set(Some("main".to_string())),
+            slug: Set("production".to_string()),
+            subdomain: Set("prod-session-race".to_string()),
+            host: Set(String::new()),
+            upstreams: Set(UpstreamList::new()),
+            is_preview: Set(false),
+            current_deployment_id: Set(None),
+            deleted_at: Set(None),
+            deployment_config: Set(None),
+            last_deployment: Set(None),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert test environment");
+
+        let deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set(format!("test-deploy-{}", uuid::Uuid::new_v4())),
+            state: Set("ready".to_string()),
+            metadata: Set(Some(deployments::DeploymentMetadata::default())),
+            deploying_at: Set(None),
+            ready_at: Set(Some(chrono::Utc::now())),
+            started_at: Set(Some(chrono::Utc::now())),
+            finished_at: Set(Some(chrono::Utc::now())),
+            context_vars: Set(None),
+            branch_ref: Set(Some("main".to_string())),
+            tag_ref: Set(None),
+            commit_sha: Set(None),
+            commit_message: Set(None),
+            commit_author: Set(None),
+            commit_json: Set(None),
+            cancelled_reason: Set(None),
+            static_dir_location: Set(None),
+            screenshot_location: Set(None),
+            image_name: Set(None),
+            deployment_config: Set(None),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert test deployment");
+
+        let service = AnalyticsEventsService::new(db.clone());
+
+        // ── Case (a): no request_sessions row exists yet ─────────────────────
+        // Simulates a brand-new session whose first event beats the proxy's
+        // async ProxyLogBatchWriter flush (up to 500ms lag).
+        let fresh_session_id = uuid::Uuid::new_v4().to_string();
+        let fresh_visitor_id = uuid::Uuid::new_v4().to_string();
+
+        assert!(
+            request_sessions::Entity::find()
+                .filter(request_sessions::Column::SessionId.eq(fresh_session_id.clone()))
+                .one(db.as_ref())
+                .await
+                .expect("precondition query failed")
+                .is_none(),
+            "test precondition: no request_sessions row should exist yet for this session_id"
+        );
+
+        let event_a = service
+            .record_event(
+                project.id,
+                Some(environment.id),
+                Some(deployment.id),
+                Some(fresh_session_id.clone()),
+                Some(fresh_visitor_id.clone()),
+                "page_view",
+                serde_json::json!({}),
+                "/",
+                "?utm_source=newsletter&utm_medium=email&utm_campaign=launch",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("https://news.ycombinator.com/".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("record_event must succeed for a brand-new session");
+
+        let created_session = request_sessions::Entity::find()
+            .filter(request_sessions::Column::SessionId.eq(fresh_session_id.clone()))
+            .one(db.as_ref())
+            .await
+            .expect("query request_sessions after create")
+            .expect("request_sessions row must be created by record_event when the row is missing");
+
+        assert_eq!(
+            created_session.visitor_id, event_a.visitor_id,
+            "created request_sessions.visitor_id must match the resolved event.visitor_id"
+        );
+        assert!(
+            created_session.visitor_id.is_some(),
+            "created request_sessions.visitor_id must not be NULL"
+        );
+        assert_eq!(
+            created_session.referrer_hostname.as_deref(),
+            Some("news.ycombinator.com"),
+            "referrer_hostname must be populated on the created session row"
+        );
+        assert_eq!(
+            created_session.utm_source.as_deref(),
+            Some("newsletter"),
+            "utm_source must propagate to the created session row"
+        );
+
+        // ── Case (b): session exists with visitor_id = NULL ──────────────────
+        // Simulates a session row created by the proxy with visitor_id = NULL
+        // because its visitor FK-cache lookup failed (non-fatal proxy error).
+        // The next event from the same visitor must backfill visitor_id.
+        let null_session_id = uuid::Uuid::new_v4().to_string();
+        let null_visitor_id = uuid::Uuid::new_v4().to_string();
+
+        // Insert a request_sessions row with visitor_id = NULL directly.
+        request_sessions::ActiveModel {
+            session_id: Set(null_session_id.clone()),
+            started_at: Set(chrono::Utc::now()),
+            last_accessed_at: Set(chrono::Utc::now()),
+            visitor_id: Set(None), // deliberately orphaned
+            data: Set("{}".to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert orphaned request_sessions row");
+
+        // Verify the row starts with visitor_id = NULL.
+        let orphaned = request_sessions::Entity::find()
+            .filter(request_sessions::Column::SessionId.eq(null_session_id.clone()))
+            .one(db.as_ref())
+            .await
+            .expect("query orphaned session")
+            .expect("orphaned row must exist");
+        assert!(
+            orphaned.visitor_id.is_none(),
+            "precondition: visitor_id must be NULL"
+        );
+
+        let event_b = service
+            .record_event(
+                project.id,
+                Some(environment.id),
+                Some(deployment.id),
+                Some(null_session_id.clone()),
+                Some(null_visitor_id.clone()),
+                "page_view",
+                serde_json::json!({}),
+                "/about",
+                "",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("record_event must succeed for a session with NULL visitor_id");
+
+        assert!(
+            event_b.visitor_id.is_some(),
+            "event.visitor_id must be resolved even when the session row existed with NULL visitor_id"
+        );
+
+        let healed = request_sessions::Entity::find()
+            .filter(request_sessions::Column::SessionId.eq(null_session_id.clone()))
+            .one(db.as_ref())
+            .await
+            .expect("query healed session")
+            .expect("healed request_sessions row must still exist");
+
+        assert_eq!(
+            healed.visitor_id, event_b.visitor_id,
+            "healed request_sessions.visitor_id must match the resolved event.visitor_id"
+        );
+        assert!(
+            healed.visitor_id.is_some(),
+            "orphaned request_sessions.visitor_id must be backfilled by record_event"
+        );
+
+        println!("✅ record_event session-race regression test passed!");
     }
 
     /// Regression test for the dashboard "visitors in last 24h" trend badge showing
