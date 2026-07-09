@@ -1437,28 +1437,78 @@ WHERE project_id = $1
                 .await
                 .map_err(EventsError::Database)?;
 
-            // Keep `visitor.last_seen` fresh on every ingested event so the
-            // "live visitors" list (which queries `visitor.last_seen`) stays
-            // in sync with the active-visitor badge (which queries
-            // `events.timestamp`). Without this, only requests that traverse
-            // the proxy bump `last_seen`, so JS-driven heartbeats/page_leave
-            // events would tick the badge but leave the detail list empty.
-            // `has_activity` is stamped on the first event per visitor.
-            if let Some(ref v) = visitor_record {
-                let mut active_visitor: visitor::ActiveModel = v.clone().into();
-                active_visitor.last_seen = sea_orm::ActiveValue::Set(chrono::Utc::now());
-                if !v.has_activity {
-                    active_visitor.has_activity = sea_orm::ActiveValue::Set(true);
-                }
-                // Flag the visitor as a crawler once any bot-UA event is seen.
-                // Only escalate (false -> true), never clear it.
-                if is_crawler && !v.is_crawler {
-                    active_visitor.is_crawler = sea_orm::ActiveValue::Set(true);
-                }
-                let _ = active_visitor.update(self.db.as_ref()).await;
-            }
+            match visitor_record {
+                Some(v) => {
+                    // Keep `visitor.last_seen` fresh on every ingested event so
+                    // the "live visitors" list (which queries
+                    // `visitor.last_seen`) stays in sync with the
+                    // active-visitor badge (which queries `events.timestamp`).
+                    // Without this, only requests that traverse the proxy bump
+                    // `last_seen`, so JS-driven heartbeats/page_leave events
+                    // would tick the badge but leave the detail list empty.
+                    // `has_activity` is stamped on the first event per visitor.
+                    let mut active_visitor: visitor::ActiveModel = v.clone().into();
+                    active_visitor.last_seen = sea_orm::ActiveValue::Set(chrono::Utc::now());
+                    if !v.has_activity {
+                        active_visitor.has_activity = sea_orm::ActiveValue::Set(true);
+                    }
+                    // Flag the visitor as a crawler once any bot-UA event is seen.
+                    // Only escalate (false -> true), never clear it.
+                    if is_crawler && !v.is_crawler {
+                        active_visitor.is_crawler = sea_orm::ActiveValue::Set(true);
+                    }
+                    let _ = active_visitor.update(self.db.as_ref()).await;
 
-            visitor_record.map(|v| v.id)
+                    Some(v.id)
+                }
+                None => {
+                    // The cookie decrypted to a valid UUID, but no row exists
+                    // for it yet. The proxy creates this row asynchronously
+                    // (`ProxyLogBatchWriter`, flushed every 500ms) -- a
+                    // brand-new visitor's very first pageview can race ahead
+                    // of that flush and land here first. Without this
+                    // fallback, the event keeps `visitor_id = NULL` forever
+                    // (no retry, no backfill exists), which silently drops it
+                    // from every `COUNT(DISTINCT visitor_id)` metric. `ON
+                    // CONFLICT` makes this idempotent with the proxy's own
+                    // upsert: whichever writer lands first creates the row,
+                    // the other just bumps `last_seen`.
+                    match self
+                        .upsert_visitor_on_miss(
+                            visitor_id,
+                            project_id,
+                            // `visitor.environment_id` is NOT NULL; the proxy's
+                            // own upsert defaults to 0 for "no environment"
+                            // (see `TrackingEvent.environment_id: i32` in
+                            // temps-proxy), so mirror that here rather than
+                            // trying to insert NULL.
+                            environment_id.unwrap_or(0),
+                            user_agent.clone(),
+                            ip_geolocation_id,
+                            is_crawler,
+                            crawler_name.clone(),
+                            referrer.clone(),
+                            referrer_hostname.clone(),
+                            Some(channel.to_string()),
+                            utm_source.clone(),
+                            utm_medium.clone(),
+                            utm_campaign.clone(),
+                        )
+                        .await
+                    {
+                        Ok(id) => Some(id),
+                        Err(e) => {
+                            tracing::error!(
+                                visitor_id = %visitor_id,
+                                project_id,
+                                error = %e,
+                                "Failed to upsert visitor on lookup miss; event will record with visitor_id=NULL"
+                            );
+                            None
+                        }
+                    }
+                }
+            }
         } else {
             None
         };
@@ -1555,6 +1605,74 @@ WHERE project_id = $1
         }
 
         Ok(result)
+    }
+
+    /// Upsert a visitor row when an ingested event's cookie doesn't yet have a
+    /// matching row in the `visitor` table. Mirrors the proxy's own
+    /// `ProxyLogBatchWriter::upsert_visitor` upsert exactly (same columns,
+    /// same `ON CONFLICT (visitor_id, project_id)` key) so whichever async
+    /// writer -- the proxy's batch flush or this event -- lands first creates
+    /// the canonical row; the other just bumps `last_seen`.
+    #[allow(clippy::too_many_arguments)]
+    async fn upsert_visitor_on_miss(
+        &self,
+        visitor_id: &str,
+        project_id: i32,
+        environment_id: i32,
+        user_agent: Option<String>,
+        ip_address_id: Option<i32>,
+        is_crawler: bool,
+        crawler_name: Option<String>,
+        referrer: Option<String>,
+        referrer_hostname: Option<String>,
+        channel: Option<String>,
+        utm_source: Option<String>,
+        utm_medium: Option<String>,
+        utm_campaign: Option<String>,
+    ) -> Result<i32, EventsError> {
+        use sea_orm::ConnectionTrait;
+
+        let now = chrono::Utc::now();
+        let stmt = Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"INSERT INTO visitor (
+                visitor_id, project_id, environment_id,
+                first_seen, last_seen,
+                user_agent, ip_address_id, is_crawler, crawler_name, has_activity,
+                first_referrer, first_referrer_hostname, first_channel,
+                first_utm_source, first_utm_medium, first_utm_campaign
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, true,
+                $10, $11, $12, $13, $14, $15
+            )
+            ON CONFLICT (visitor_id, project_id) DO UPDATE SET
+                last_seen = EXCLUDED.last_seen
+            RETURNING id"#,
+            [
+                visitor_id.to_string().into(),
+                project_id.into(),
+                environment_id.into(),
+                now.into(),
+                now.into(),
+                user_agent.into(),
+                ip_address_id.into(),
+                is_crawler.into(),
+                crawler_name.into(),
+                referrer.into(),
+                referrer_hostname.into(),
+                channel.into(),
+                utm_source.into(),
+                utm_medium.into(),
+                utm_campaign.into(),
+            ],
+        );
+
+        let row = self.db.query_one(stmt).await?.ok_or_else(|| {
+            EventsError::Database(sea_orm::DbErr::RecordNotFound(format!(
+                "visitor upsert for visitor_id={visitor_id} project_id={project_id} returned no row"
+            )))
+        })?;
+        row.try_get::<i32>("", "id").map_err(EventsError::Database)
     }
 }
 
@@ -2764,6 +2882,227 @@ mod tests {
         );
 
         println!("✅ record_event crawler-flag persistence test passed!");
+    }
+
+    /// Regression test for the visitor/event race condition: a brand-new
+    /// visitor's very first pageview can reach `record_event` before the
+    /// proxy's async `ProxyLogBatchWriter` has flushed the matching `visitor`
+    /// row (up to 500ms lag). Previously the lookup simply missed and the
+    /// event kept `visitor_id = NULL` forever, permanently excluding that
+    /// visitor from every `COUNT(DISTINCT visitor_id)` metric. `record_event`
+    /// must now self-heal: insert the visitor row itself, carrying the same
+    /// enrichment (UA, referrer, channel, UTM) the proxy would have written.
+    #[tokio::test]
+    async fn test_record_event_creates_visitor_on_lookup_miss() {
+        use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+        use temps_database::test_utils::TestDatabase;
+        use temps_entities::{
+            deployments, environments, projects, source_type::SourceType,
+            upstream_config::UpstreamList, visitor,
+        };
+
+        let test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+
+        let project = projects::ActiveModel {
+            name: Set("visitor-race-test".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            preset_config: Set(None),
+            deployment_config: Set(None),
+            slug: Set("visitor-race-test".to_string()),
+            is_deleted: Set(false),
+            deleted_at: Set(None),
+            last_deployment: Set(None),
+            is_public_repo: Set(false),
+            git_url: Set(None),
+            git_provider_connection_id: Set(None),
+            attack_mode: Set(false),
+            enable_preview_environments: Set(false),
+            source_type: Set(SourceType::Git),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert test project");
+
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".to_string()),
+            branch: Set(Some("main".to_string())),
+            slug: Set("production".to_string()),
+            subdomain: Set("prod-visitor-race".to_string()),
+            host: Set(String::new()),
+            upstreams: Set(UpstreamList::new()),
+            is_preview: Set(false),
+            current_deployment_id: Set(None),
+            deleted_at: Set(None),
+            deployment_config: Set(None),
+            last_deployment: Set(None),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert test environment");
+
+        let deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set(format!("test-deploy-{}", uuid::Uuid::new_v4())),
+            state: Set("ready".to_string()),
+            metadata: Set(Some(deployments::DeploymentMetadata::default())),
+            deploying_at: Set(None),
+            ready_at: Set(Some(chrono::Utc::now())),
+            started_at: Set(Some(chrono::Utc::now())),
+            finished_at: Set(Some(chrono::Utc::now())),
+            context_vars: Set(None),
+            branch_ref: Set(Some("main".to_string())),
+            tag_ref: Set(None),
+            commit_sha: Set(None),
+            commit_message: Set(None),
+            commit_author: Set(None),
+            commit_json: Set(None),
+            cancelled_reason: Set(None),
+            static_dir_location: Set(None),
+            screenshot_location: Set(None),
+            image_name: Set(None),
+            deployment_config: Set(None),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert test deployment");
+
+        let service = AnalyticsEventsService::new(db.clone());
+
+        // No `visitor` row exists yet for this UUID -- simulates a brand-new
+        // visitor whose very first pageview beats the proxy's async batch
+        // upsert.
+        let fresh_visitor_uuid = uuid::Uuid::new_v4().to_string();
+        assert!(
+            visitor::Entity::find()
+                .filter(visitor::Column::VisitorId.eq(fresh_visitor_uuid.clone()))
+                .one(db.as_ref())
+                .await
+                .expect("query visitor")
+                .is_none(),
+            "test precondition: no visitor row should exist yet"
+        );
+
+        let human_ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+                         AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+        let event = service
+            .record_event(
+                project.id,
+                Some(environment.id),
+                Some(deployment.id),
+                Some("race-session".to_string()),
+                Some(fresh_visitor_uuid.clone()),
+                "page_view",
+                serde_json::json!({}),
+                "/",
+                "?utm_source=newsletter&utm_medium=email&utm_campaign=launch",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(human_ua.to_string()),
+                Some("https://news.ycombinator.com/".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("Failed to record event for brand-new visitor");
+
+        assert!(
+            event.visitor_id.is_some(),
+            "event.visitor_id must resolve on first pageview, not stay NULL"
+        );
+
+        let visitor_row = visitor::Entity::find()
+            .filter(visitor::Column::VisitorId.eq(fresh_visitor_uuid.clone()))
+            .one(db.as_ref())
+            .await
+            .expect("query visitor")
+            .expect("record_event must create the visitor row on lookup miss");
+
+        assert_eq!(visitor_row.id, event.visitor_id.unwrap());
+        assert_eq!(visitor_row.project_id, project.id);
+        assert!(
+            visitor_row.has_activity,
+            "a visitor created because an event just arrived should start with has_activity = true"
+        );
+        assert!(!visitor_row.is_crawler);
+        assert_eq!(visitor_row.user_agent, Some(human_ua.to_string()));
+        assert_eq!(
+            visitor_row.first_referrer,
+            Some("https://news.ycombinator.com/".to_string())
+        );
+        assert_eq!(
+            visitor_row.first_referrer_hostname,
+            Some("news.ycombinator.com".to_string())
+        );
+        assert_eq!(visitor_row.first_utm_source, Some("newsletter".to_string()));
+        assert_eq!(visitor_row.first_utm_medium, Some("email".to_string()));
+        assert_eq!(visitor_row.first_utm_campaign, Some("launch".to_string()));
+
+        // A second event from the same visitor must resolve to the *same*
+        // visitor row (idempotent lookup, no duplicate insert attempt).
+        let second_event = service
+            .record_event(
+                project.id,
+                Some(environment.id),
+                Some(deployment.id),
+                Some("race-session".to_string()),
+                Some(fresh_visitor_uuid.clone()),
+                "page_view",
+                serde_json::json!({}),
+                "/pricing",
+                "",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(human_ua.to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("Failed to record second event");
+
+        assert_eq!(second_event.visitor_id, event.visitor_id);
+
+        println!("✅ record_event visitor-race regression test passed!");
     }
 
     /// Regression test for the dashboard "visitors in last 24h" trend badge showing
