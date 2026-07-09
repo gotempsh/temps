@@ -56,13 +56,48 @@ fn extract_encrypted_cookie(
     None
 }
 
+/// Normalise a decrypted session cookie value to a bare UUID.
+///
+/// The proxy writes session cookies as a v2 payload (`v2|<uuid>|<unix_secs>`)
+/// so it can check session freshness in-process without a database round-trip.
+/// The proxy's own `parse_session_cookie` (in `temps-proxy::cookie_codec`)
+/// already strips the prefix before storing `request_sessions.session_id` as
+/// a bare UUID.  The analytics ingest path previously called only
+/// `extract_encrypted_cookie`, which returned the full raw plaintext including
+/// the prefix — making every `JOIN request_sessions rs ON rs.session_id =
+/// e.session_id` a permanent miss (`'v2|uuid|ts' ≠ 'uuid'`).
+///
+/// This function mirrors the same parsing rule:
+/// - `v2|<uuid>|<ts>` → returns `Some(uuid)` (extracted middle segment)
+/// - bare UUID (legacy cookies) → returns `Some(plaintext)` unchanged
+/// - malformed v2 (missing uuid segment) → returns `None` (proxy rejects these too)
+pub fn normalize_session_cookie(plaintext: String) -> Option<String> {
+    if !plaintext.starts_with("v2|") {
+        // Legacy bare-UUID cookie or unknown format — accept as-is.
+        return Some(plaintext);
+    }
+    // Format: "v2|<uuid>|<ts_secs>"
+    let mut parts = plaintext.splitn(3, '|');
+    let _prefix = parts.next(); // "v2"
+    match parts.next() {
+        Some(uuid) if !uuid.is_empty() => Some(uuid.to_string()),
+        _ => None, // malformed v2: proxy rejects these too
+    }
+}
+
 /// Build a `RequestMetadata` value from the incoming request. Used by the
 /// middleware below, and also reusable from tests that synthesize requests.
 pub fn build_from_request(req: &Request, crypto: &CookieCrypto) -> RequestMetadata {
     let headers = req.headers();
 
     let visitor_id_cookie = extract_encrypted_cookie(headers, VISITOR_ID_COOKIE_NAME, crypto);
-    let session_id_cookie = extract_encrypted_cookie(headers, SESSION_ID_COOKIE_NAME, crypto);
+    // Decrypt the session cookie then normalise from the v2 payload format
+    // (`v2|<uuid>|<unix_secs>`) to a bare UUID. The proxy's own
+    // `parse_session_cookie` already does this normalisation before writing
+    // `request_sessions.session_id`, so the analytics JOIN key and the
+    // events column must agree.
+    let session_id_cookie = extract_encrypted_cookie(headers, SESSION_ID_COOKIE_NAME, crypto)
+        .and_then(normalize_session_cookie);
 
     let raw_host = headers
         .get("host")
@@ -184,6 +219,56 @@ mod tests {
         let key = [42u8; 32];
         Arc::new(CookieCrypto::from_bytes(&key))
     }
+
+    // ── normalize_session_cookie ─────────────────────────────────────────────
+
+    #[test]
+    fn normalize_session_cookie_v2_format_extracts_uuid() {
+        let uuid = "c172f0b5-986f-47dc-b6c6-9198761519e0";
+        let plaintext = format!("v2|{}|1783631315", uuid);
+        assert_eq!(
+            normalize_session_cookie(plaintext),
+            Some(uuid.to_string()),
+            "v2 payload must be normalised to bare UUID so it can JOIN request_sessions.session_id"
+        );
+    }
+
+    #[test]
+    fn normalize_session_cookie_bare_uuid_passthrough() {
+        let uuid = "c172f0b5-986f-47dc-b6c6-9198761519e0".to_string();
+        assert_eq!(
+            normalize_session_cookie(uuid.clone()),
+            Some(uuid),
+            "legacy bare-UUID cookie must pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn normalize_session_cookie_malformed_v2_returns_none() {
+        // Missing UUID segment — proxy rejects this too
+        assert_eq!(
+            normalize_session_cookie("v2|".to_string()),
+            None,
+            "v2 prefix with empty UUID segment must return None"
+        );
+    }
+
+    #[test]
+    fn normalize_session_cookie_v2_missing_ts_still_extracts_uuid() {
+        // v2 with UUID but no timestamp segment: we only need the UUID, ts is
+        // not required for analytics purposes.
+        let uuid = "c172f0b5-986f-47dc-b6c6-9198761519e0";
+        // splitn(3, '|') on "v2|uuid" yields ["v2", "uuid"]: the third split
+        // (ts) is absent, but we only care about the second (uuid).
+        let plaintext = format!("v2|{}", uuid);
+        assert_eq!(
+            normalize_session_cookie(plaintext),
+            Some(uuid.to_string()),
+            "v2 without ts segment must still extract the UUID"
+        );
+    }
+
+    // ── host_without_port ────────────────────────────────────────────────────
 
     #[test]
     fn strips_port_when_present() {

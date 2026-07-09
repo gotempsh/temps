@@ -1143,7 +1143,16 @@ impl Analytics for AnalyticsService {
                     ) as is_engaged
                 FROM events e
                 LEFT JOIN request_logs rl ON rl.session_id = e.id AND rl.project_id = e.project_id
-                LEFT JOIN request_sessions rs ON rs.session_Id = e.session_id
+                -- Tolerate both the bare-UUID format (new events, after the
+                -- session-cookie normalisation fix) and the legacy v2|uuid|ts
+                -- format stored by older versions of the analytics ingest path.
+                -- split_part(e.session_id, '|', 2) extracts the UUID segment
+                -- from 'v2|<uuid>|<ts>'; the LIKE guard avoids a false match
+                -- on empty strings when e.session_id has no '|' delimiters.
+                LEFT JOIN request_sessions rs ON (
+                    rs.session_id = e.session_id
+                    OR (e.session_id LIKE 'v2|%' AND rs.session_id = split_part(e.session_id, '|', 2))
+                )
                 WHERE e.visitor_id = $1 AND e.session_id IS NOT NULL
                 GROUP BY rs.id
             )
@@ -1168,7 +1177,12 @@ impl Analytics for AnalyticsService {
 
         #[derive(FromQueryResult)]
         struct SessionResult {
-            session_id: i32,
+            // Nullable because the query uses LEFT JOIN request_sessions: when no
+            // matching row exists yet (proxy async flush hasn't landed), rs.id comes
+            // back NULL. Decoding NULL into a non-optional i32 causes a hard
+            // type-decode error that kills the whole request. We filter these out
+            // below so SessionSummary.session_id remains non-optional.
+            session_id: Option<i32>,
             started_at: UtcDateTime,
             ended_at: Option<UtcDateTime>,
             duration_seconds: i64,
@@ -1191,25 +1205,43 @@ impl Analytics for AnalyticsService {
         .all(self.db.as_ref())
         .await?;
 
-        let total_sessions = results.first().map(|r| r.total_sessions).unwrap_or(0);
+        // The window-function total (pre-LIMIT, pre-filter) is the correct
+        // pagination baseline. Subtract the count of NULL-session groups so the
+        // displayed total never exceeds the visible list.
+        let raw_total = results.first().map(|r| r.total_sessions).unwrap_or(0);
+        let mut null_count = 0i64;
 
         let sessions = results
             .into_iter()
-            .map(|r| crate::types::responses::SessionSummary {
-                session_id: r.session_id,
-                started_at: r.started_at,
-                ended_at: r.ended_at,
-                duration_seconds: r.duration_seconds,
-                page_views: r.page_views,
-                events_count: r.events_count,
-                requests_count: r.requests_count,
-                entry_path: r.entry_path,
-                exit_path: r.exit_path,
-                referrer: r.referrer,
-                is_bounced: r.is_bounced,
-                is_engaged: r.is_engaged,
+            .filter_map(|r| {
+                let sid = match r.session_id {
+                    Some(id) => id,
+                    None => {
+                        // No request_sessions row for this e.session_id yet
+                        // (timing race or prior proxy error). Drop this group
+                        // from the visible list and deduct it from the total.
+                        null_count += 1;
+                        return None;
+                    }
+                };
+                Some(crate::types::responses::SessionSummary {
+                    session_id: sid,
+                    started_at: r.started_at,
+                    ended_at: r.ended_at,
+                    duration_seconds: r.duration_seconds,
+                    page_views: r.page_views,
+                    events_count: r.events_count,
+                    requests_count: r.requests_count,
+                    entry_path: r.entry_path,
+                    exit_path: r.exit_path,
+                    referrer: r.referrer,
+                    is_bounced: r.is_bounced,
+                    is_engaged: r.is_engaged,
+                })
             })
             .collect();
+
+        let total_sessions = raw_total.saturating_sub(null_count);
 
         Ok(Some(VisitorSessionsResponse {
             visitor_id: visitor.visitor_id,
@@ -1257,7 +1289,12 @@ impl Analytics for AnalyticsService {
                     BOOL_OR(e.is_bounce) as is_bounced,
                     COUNT(*) FILTER (WHERE e.event_type NOT IN ('page_view', 'page_leave', 'heartbeat', 'web_vitals')) > 0 as is_engaged
                 FROM events e
-                JOIN request_sessions rs ON rs.session_id = e.session_id
+                -- Tolerate both bare-UUID and legacy v2|uuid|ts formats in
+                -- events.session_id (see get_visitor_sessions_by_id comment).
+                JOIN request_sessions rs ON (
+                    rs.session_id = e.session_id
+                    OR (e.session_id LIKE 'v2|%' AND rs.session_id = split_part(e.session_id, '|', 2))
+                )
                 WHERE e.visitor_id = $1
                   AND e.project_id = $2
                   AND e.session_id IS NOT NULL
@@ -1365,7 +1402,12 @@ impl Analytics for AnalyticsService {
                     COALESCE(e.props, e.event_data::jsonb, '{{}}'::jsonb) as event_data,
                     rs.id as rs_id
                 FROM events e
-                JOIN request_sessions rs ON rs.session_id = e.session_id
+                -- Tolerate both bare-UUID and legacy v2|uuid|ts formats in
+                -- events.session_id (see get_visitor_sessions_by_id comment).
+                JOIN request_sessions rs ON (
+                    rs.session_id = e.session_id
+                    OR (e.session_id LIKE 'v2|%' AND rs.session_id = split_part(e.session_id, '|', 2))
+                )
                 WHERE e.visitor_id = $1
                   AND e.project_id = $2
                   AND rs.id IN ({in_clause})
