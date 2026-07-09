@@ -12,7 +12,10 @@ use axum::{
     Json,
 };
 use std::sync::Arc;
-use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
+use temps_auth::{
+    permission_guard, project_access_guard, project_permission_guard, project_scope_guard,
+    RequireAuth,
+};
 use temps_core::AuditContext;
 use temps_core::RequestMetadata;
 use tracing::{error, info};
@@ -727,9 +730,13 @@ pub async fn create_environment_variable(
     RequireAuth(auth): RequireAuth,
     Json(request): Json<CreateEnvironmentVariableRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, EnvironmentsCreate);
+    project_permission_guard!(
+        auth,
+        EnvironmentsCreate,
+        project_id,
+        state.project_access_checker
+    );
     project_scope_guard!(auth, project_id);
-    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let var = state
         .env_var_service
@@ -787,9 +794,13 @@ pub async fn delete_environment_variable(
     Path((project_id, var_id)): Path<(i32, i32)>,
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, EnvironmentsDelete);
+    project_permission_guard!(
+        auth,
+        EnvironmentsDelete,
+        project_id,
+        state.project_access_checker
+    );
     project_scope_guard!(auth, project_id);
-    project_access_guard!(auth, project_id, state.project_access_checker);
 
     state
         .env_var_service
@@ -822,9 +833,13 @@ pub async fn update_environment_variable(
     RequireAuth(auth): RequireAuth,
     Json(request): Json<UpdateEnvironmentVariableRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, EnvironmentsWrite);
+    project_permission_guard!(
+        auth,
+        EnvironmentsWrite,
+        project_id,
+        state.project_access_checker
+    );
     project_scope_guard!(auth, project_id);
-    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let var = state
         .env_var_service

@@ -217,6 +217,147 @@ macro_rules! project_access_guard {
     };
 }
 
+/// Guard that enforces a *specific* permission within a project's team-scoped
+/// access grant, narrowing what [`permission_guard!`] alone allows.
+///
+/// `permission_guard!` proves the caller's **instance-wide** role has this
+/// permission at all; `project_access_guard!` proves the caller can touch
+/// this **project** at all, but not which actions. Neither answers "does
+/// this user's *role on this specific project* include this permission" —
+/// e.g. a project team member granted a read-only role should not be able to
+/// deploy, even though their instance-wide role and their team membership
+/// both otherwise check out. This macro is the seam that closes that gap.
+///
+/// This macro is **self-contained**: it performs the instance-wide
+/// permission check *and* the project-scoped narrowing in one call, so a
+/// single invocation is the complete gate for a project-scoped, permissioned
+/// action. Do not also call [`permission_guard!`] for the same permission in
+/// the same handler — that would be redundant, not incorrect, but this macro
+/// already does it.
+///
+/// **Call order** in a handler that needs it (replaces the
+/// `permission_guard!` + `project_access_guard!` pair for handlers that need
+/// permission-specific project narrowing; `project_scope_guard!` for
+/// deployment-token IDOR is unaffected and still runs separately):
+///
+/// ```ignore
+/// project_permission_guard!(auth, DeploymentsCreate, project_id, checker); // 1+3 combined
+/// project_scope_guard!(auth, project_id);                                 // 2. deployment-token IDOR
+/// ```
+///
+/// `checker` is the same `Option<Arc<dyn temps_core::ProjectAccessChecker>>`
+/// field `project_access_guard!` takes.
+///
+/// **Precedence — final = instance-wide ∩ project-scoped.** A project role
+/// can only ever *remove* permissions the instance-wide role already grants;
+/// it can never add one. Concretely:
+///
+/// 1. Instance-wide ceiling first — identical to `permission_guard!`. A
+///    caller whose instance-wide role lacks the permission is rejected here,
+///    before any project-scoped lookup — the existing instance-wide
+///    behaviour (e.g. a `user`-role account getting 403 on delete
+///    operations) is unchanged.
+/// 2. Deployment tokens skip project-scoped narrowing (governed by
+///    `project_scope_guard!` instead, and carry no user identity to resolve
+///    project-scoped permissions for) — same as `project_access_guard!`.
+/// 3. Instance Admin / PlatformAdmin bypass project-scoped narrowing
+///    entirely — same bypass `project_access_guard!` grants, for the same
+///    reason (an instance admin who is not a team member must not be locked
+///    out).
+/// 4. Otherwise, `checker.effective_project_permissions(user_id, project_id)`
+///    is consulted:
+///    - `Ok(None)` → unrestricted from this checker's perspective (no plugin
+///      registered, or the project has no team grants) — the instance-wide
+///      result from step 1 stands.
+///    - `Ok(Some(perms))` → the permission must be present in `perms`, else
+///      403. An empty `perms` denies every project-scoped permission.
+///    - `Err(_)` → fail-closed, 500. Never a silent allow.
+#[macro_export]
+macro_rules! project_permission_guard {
+    ($auth:expr, $permission:ident, $project_id:expr, $checker:expr) => {{
+        // Step 1: instance-wide ceiling — identical to permission_guard!.
+        if !$auth.has_permission(&$crate::permissions::Permission::$permission) {
+            return Err(temps_core::error_builder::ErrorBuilder::new(
+                ::axum::http::StatusCode::FORBIDDEN,
+            )
+            .type_("https://temps.sh/probs/insufficient-permissions")
+            .title("Insufficient Permissions")
+            .detail(format!(
+                "This operation requires the {} permission",
+                $crate::permissions::Permission::$permission.to_string()
+            ))
+            .value(
+                "required_permission",
+                $crate::permissions::Permission::$permission.to_string(),
+            )
+            .value("user_role", $auth.effective_role.to_string())
+            .build());
+        }
+
+        // Deployment tokens are governed by project_scope_guard! instead and
+        // carry no user identity — skip project-scoped narrowing entirely.
+        if !$auth.is_deployment_token() {
+            // Instance administrators are never restricted by team membership.
+            if !($auth.is_admin()
+                || $auth.has_role(&$crate::permissions::Role::PlatformAdmin))
+            {
+                if let Some(ref __checker) = $checker {
+                    if let Some(__user_id) = $auth.user_id_opt() {
+                        match __checker
+                            .effective_project_permissions(__user_id, $project_id)
+                            .await
+                        {
+                            // No opinion from this checker — instance-wide result stands.
+                            Ok(None) => {}
+                            Ok(Some(__perms)) => {
+                                let __required =
+                                    $crate::permissions::Permission::$permission.to_string();
+                                if !__perms.iter().any(|__p| __p == &__required) {
+                                    return Err(temps_core::error_builder::ErrorBuilder::new(
+                                        ::axum::http::StatusCode::FORBIDDEN,
+                                    )
+                                    .type_("https://temps.sh/probs/project-permission-denied")
+                                    .title("Project Permission Denied")
+                                    .detail(format!(
+                                        "Your role on this project does not include the {} \
+                                         permission",
+                                        __required
+                                    ))
+                                    .value("required_permission", __required)
+                                    .build());
+                                }
+                            }
+                            Err(__e) => {
+                                ::tracing::error!(
+                                    project_id = $project_id,
+                                    user_id = __user_id,
+                                    error = %__e,
+                                    "ProjectAccessChecker::effective_project_permissions \
+                                     infrastructure failure — denying access"
+                                );
+                                return Err(temps_core::error_builder::ErrorBuilder::new(
+                                    ::axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                )
+                                .type_("https://temps.sh/probs/project-permission-check-failed")
+                                .title("Project Permission Check Failed")
+                                .detail(
+                                    "Could not verify project permissions; please try again",
+                                )
+                                .build());
+                            }
+                        }
+                    }
+                    // user_id_opt() == None here is impossible: deployment tokens
+                    // (the only non-user auth source) are filtered by the outer
+                    // is_deployment_token() check above.
+                }
+                // checker is None → no plugin registered → no-op beyond step 1.
+            }
+            // Admin / PlatformAdmin → unrestricted beyond step 1.
+        }
+    }};
+}
+
 /// Alias for permission_guard! macro for backwards compatibility
 ///
 /// Usage in handler:
@@ -452,6 +593,251 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
+    // project_permission_guard! tests (permission-specific project narrowing)
+    // ---------------------------------------------------------------------------
+
+    type EffectivePermissionsResult =
+        Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// A mock [`ProjectAccessChecker`] whose `effective_project_permissions`
+    /// result is configurable, for `project_permission_guard!` tests.
+    /// `user_can_access_project` is a trivial always-allow stub — these tests
+    /// never exercise it.
+    struct MockPermissionChecker {
+        result: fn() -> EffectivePermissionsResult,
+    }
+
+    impl MockPermissionChecker {
+        fn unrestricted() -> Arc<dyn ProjectAccessChecker> {
+            Arc::new(MockPermissionChecker {
+                result: || Ok(None),
+            })
+        }
+
+        fn with_perms(perms: &'static [&'static str]) -> Arc<dyn ProjectAccessChecker> {
+            // fn pointers can't capture `perms` by closure, so encode the two
+            // fixed sets this test file actually needs directly.
+            if perms == ["deployments:create"] {
+                Arc::new(MockPermissionChecker {
+                    result: || Ok(Some(vec!["deployments:create".to_string()])),
+                })
+            } else {
+                Arc::new(MockPermissionChecker {
+                    result: || Ok(Some(vec!["projects:read".to_string()])),
+                })
+            }
+        }
+
+        fn empty() -> Arc<dyn ProjectAccessChecker> {
+            Arc::new(MockPermissionChecker {
+                result: || Ok(Some(vec![])),
+            })
+        }
+
+        fn error() -> Arc<dyn ProjectAccessChecker> {
+            Arc::new(MockPermissionChecker {
+                result: || Err(Box::new(std::io::Error::other("simulated DB failure"))),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ProjectAccessChecker for MockPermissionChecker {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            _project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(true)
+        }
+
+        async fn effective_project_permissions(
+            &self,
+            _user_id: i32,
+            _project_id: i32,
+        ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
+            (self.result)()
+        }
+    }
+
+    /// Runs `project_permission_guard!` requiring `DeploymentsCreate` and
+    /// returns `Ok(())` or `Err(Problem)`.
+    async fn run_permission_guard(
+        auth: &AuthContext,
+        project_id: i32,
+        checker: Option<Arc<dyn ProjectAccessChecker>>,
+    ) -> Result<(), Problem> {
+        project_permission_guard!(auth, DeploymentsCreate, project_id, checker);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn permission_guard_instance_ceiling_blocks_before_project_lookup() {
+        // Role::User lacks DeploymentsDelete outright — the instance-wide
+        // check must reject before any project-scoped lookup happens, exactly
+        // like permission_guard! does today.
+        let auth = user_auth(Role::User);
+        async fn run_delete_guard(
+            auth: &AuthContext,
+            project_id: i32,
+            checker: Option<Arc<dyn ProjectAccessChecker>>,
+        ) -> Result<(), Problem> {
+            project_permission_guard!(auth, DeploymentsDelete, project_id, checker);
+            Ok(())
+        }
+        // Even a checker that would grant everything must not matter — the
+        // instance ceiling is checked first.
+        let checker = Some(MockPermissionChecker::unrestricted());
+        let result = run_delete_guard(&auth, 1, checker).await;
+        let err = result.expect_err("instance-wide ceiling must reject before project lookup");
+        assert_eq!(err.status_code, axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn permission_guard_viewer_blocked_from_deploy() {
+        // The reproduced hole: instance role `user` (has DeploymentsCreate
+        // instance-wide) + a project-scoped role whose resolved permission
+        // set does NOT include deployments:create → must be denied.
+        let auth = user_auth(Role::User);
+        let checker = Some(MockPermissionChecker::with_perms(&["projects:read"]));
+        let result = run_permission_guard(&auth, 1, checker).await;
+        let err = result.expect_err("a project role without deployments:create must be denied");
+        assert_eq!(err.status_code, axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(
+            err.body.get("type").and_then(|v| v.as_str()),
+            Some("https://temps.sh/probs/project-permission-denied")
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_guard_deployer_allowed_deploy() {
+        let auth = user_auth(Role::User);
+        let checker = Some(MockPermissionChecker::with_perms(&["deployments:create"]));
+        let result = run_permission_guard(&auth, 1, checker).await;
+        assert!(
+            result.is_ok(),
+            "a project role that includes deployments:create must be allowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_guard_empty_perms_denies() {
+        let auth = user_auth(Role::User);
+        let checker = Some(MockPermissionChecker::empty());
+        let result = run_permission_guard(&auth, 1, checker).await;
+        assert!(
+            result.is_err(),
+            "an empty project-scoped permission set must deny every action"
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_guard_unrestricted_falls_through_to_instance_wide() {
+        // Ok(None) means "no opinion" — the instance-wide result (which
+        // already passed) stands.
+        let auth = user_auth(Role::User);
+        let checker = Some(MockPermissionChecker::unrestricted());
+        let result = run_permission_guard(&auth, 1, checker).await;
+        assert!(
+            result.is_ok(),
+            "Ok(None) must fall through to the instance-wide result"
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_guard_resolver_error_returns_500() {
+        let auth = user_auth(Role::User);
+        let checker = Some(MockPermissionChecker::error());
+        let result = run_permission_guard(&auth, 1, checker).await;
+        let err = result.expect_err("infrastructure error must deny, never allow");
+        assert_eq!(
+            err.status_code,
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_guard_no_checker_registered_is_instance_wide_only() {
+        let auth = user_auth(Role::User);
+        let result = run_permission_guard(&auth, 1, None).await;
+        assert!(
+            result.is_ok(),
+            "no checker registered must reduce to the instance-wide check only"
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_guard_admin_bypasses_project_narrowing() {
+        let auth = user_auth(Role::Admin);
+        // Even a deny-everything checker must not block an instance admin.
+        let checker = Some(MockPermissionChecker::empty());
+        let result = run_permission_guard(&auth, 1, checker).await;
+        assert!(
+            result.is_ok(),
+            "instance Admin must bypass project narrowing"
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_guard_platform_admin_bypasses_project_narrowing() {
+        // PlatformAdmin's instance-wide role deliberately excludes
+        // Deployments{Create,Write,Delete} (read-only on deployments) — use
+        // DeploymentsRead here so this test isolates the bypass behaviour
+        // instead of tripping the (correct, separate) instance-wide ceiling.
+        async fn run_read_guard(
+            auth: &AuthContext,
+            project_id: i32,
+            checker: Option<Arc<dyn ProjectAccessChecker>>,
+        ) -> Result<(), Problem> {
+            project_permission_guard!(auth, DeploymentsRead, project_id, checker);
+            Ok(())
+        }
+        let auth = user_auth(Role::PlatformAdmin);
+        let checker = Some(MockPermissionChecker::empty());
+        let result = run_read_guard(&auth, 1, checker).await;
+        assert!(
+            result.is_ok(),
+            "instance PlatformAdmin must bypass project narrowing"
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_guard_deployment_token_bypasses_project_narrowing() {
+        // `AuthContext::has_permission` deliberately only bridges deployment
+        // tokens to a small explicit whitelist of `Permission` variants
+        // (AnalyticsRead/AnalyticsWrite/EmailsSend) — DeploymentsCreate is
+        // not one of them by design ("no implicit bridge from
+        // deployment-token permissions to general control-plane
+        // permissions"), so no deployment token can ever pass step 1 for
+        // that permission, with or without this macro. Use AnalyticsRead
+        // (one of the bridged permissions) so this test isolates what it's
+        // actually testing: that project-scoped narrowing is skipped for
+        // deployment tokens, once step 1 passes.
+        async fn run_analytics_guard(
+            auth: &AuthContext,
+            project_id: i32,
+            checker: Option<Arc<dyn ProjectAccessChecker>>,
+        ) -> Result<(), Problem> {
+            project_permission_guard!(auth, AnalyticsRead, project_id, checker);
+            Ok(())
+        }
+        let auth = AuthContext::new_deployment_token(
+            7,
+            None,
+            None,
+            1,
+            "deploy-token".to_string(),
+            vec![temps_entities::deployment_tokens::DeploymentTokenPermission::AnalyticsRead],
+        );
+        let checker = Some(MockPermissionChecker::empty());
+        let result = run_analytics_guard(&auth, 7, checker).await;
+        assert!(
+            result.is_ok(),
+            "deployment tokens are governed by project_scope_guard! instead"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
     // ADR-028 Phase B: Coverage enumeration
     //
     // Every Rust source file that contains `project_scope_guard!` must also
@@ -617,6 +1003,94 @@ mod tests {
             extra_found.is_empty(),
             "These crates use `project_access_guard!` but are not listed in the coverage \
              snapshot — add them to `expected_crates` (sorted alphabetically):\n{}",
+            extra_found.join("\n")
+        );
+    }
+
+    /// v1 coverage snapshot for `project_permission_guard!` (permission-specific
+    /// project narrowing, distinct from `project_access_guard!`'s coarser
+    /// "can touch this project at all" check).
+    ///
+    /// v1 deliberately covers only the highest-risk project-scoped actions
+    /// (deployment create/trigger, project delete/settings, environment
+    /// variable create/write/delete, domain create/write/delete) — see the
+    /// ADR for the full rationale on what's deferred and why. This test is
+    /// the "reviewed allowlist" that ADR calls for: it does NOT enumerate
+    /// every handler function (that's noted as a mechanical follow-up once
+    /// the seam is proven), but it does pin which CRATES are expected to use
+    /// the guard, the same granularity `project_access_guard_coverage_snapshot`
+    /// already uses. Bidirectional for the same reason that one is: catches
+    /// both accidental removal and silent, unreviewed expansion.
+    #[test]
+    fn project_permission_guard_coverage_snapshot() {
+        let expected_crates: &[&str] =
+            &["temps-deployments", "temps-environments", "temps-projects"];
+
+        let mut sorted = expected_crates.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(
+            expected_crates,
+            sorted.as_slice(),
+            "keep the coverage snapshot sorted alphabetically"
+        );
+
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workspace_root = manifest_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("cannot resolve workspace root");
+        let crates_dir = workspace_root.join("crates");
+
+        let mut found_crates: std::collections::BTreeSet<String> = Default::default();
+
+        for entry in walkdir::WalkDir::new(&crates_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("rs"))
+        {
+            let path = entry.path();
+            let contents = match std::fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            if contents.contains("macro_rules! project_permission_guard") {
+                continue;
+            }
+            if contents.contains("project_permission_guard!(") {
+                let mut dir = path.parent();
+                while let Some(d) = dir {
+                    if d.join("Cargo.toml").exists() {
+                        if let Some(name) = d.file_name().and_then(|n| n.to_str()) {
+                            found_crates.insert(name.to_string());
+                        }
+                        break;
+                    }
+                    dir = d.parent();
+                }
+            }
+        }
+
+        for expected in expected_crates {
+            assert!(
+                found_crates.contains(*expected),
+                "Crate `{}` is in the project_permission_guard! coverage snapshot but no \
+                 usage was found in its source — was it accidentally removed?",
+                expected
+            );
+        }
+
+        let expected_set: std::collections::BTreeSet<&str> =
+            expected_crates.iter().copied().collect();
+        let extra_found: Vec<&str> = found_crates
+            .iter()
+            .filter(|c| !expected_set.contains(c.as_str()))
+            .map(|s| s.as_str())
+            .collect();
+        assert!(
+            extra_found.is_empty(),
+            "These crates use `project_permission_guard!` but are not listed in the coverage \
+             snapshot — add them to `expected_crates` (sorted alphabetically) after reviewing \
+             the new usage:\n{}",
             extra_found.join("\n")
         );
     }

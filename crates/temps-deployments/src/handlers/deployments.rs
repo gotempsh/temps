@@ -21,7 +21,9 @@ use futures::stream::{self, StreamExt};
 use futures::SinkExt;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use temps_auth::RequireAuth;
-use temps_auth::{permission_guard, project_access_guard, project_scope_guard};
+use temps_auth::{
+    permission_guard, project_access_guard, project_permission_guard, project_scope_guard,
+};
 use temps_core::{AuditContext, RequestMetadata};
 use tracing::{debug, error, info, warn};
 use utoipa::OpenApi;
@@ -426,8 +428,12 @@ pub async fn rollback_to_deployment(
     RequireAuth(auth): RequireAuth,
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, DeploymentsCreate);
-    project_access_guard!(auth, project_id, state.project_access_checker);
+    project_permission_guard!(
+        auth,
+        DeploymentsCreate,
+        project_id,
+        state.project_access_checker
+    );
 
     let deployment = state
         .deployment_service
@@ -479,8 +485,12 @@ pub async fn promote_deployment(
     Extension(metadata): Extension<RequestMetadata>,
     Json(request): Json<PromoteDeploymentRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, DeploymentsCreate);
-    project_access_guard!(auth, project_id, state.project_access_checker);
+    project_permission_guard!(
+        auth,
+        DeploymentsCreate,
+        project_id,
+        state.project_access_checker
+    );
 
     info!(
         "Promoting deployment {} to environment {} (project {})",
@@ -533,8 +543,12 @@ pub async fn pause_deployment(
     RequireAuth(auth): RequireAuth,
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, DeploymentsDelete);
-    project_access_guard!(auth, project_id, state.project_access_checker);
+    project_permission_guard!(
+        auth,
+        DeploymentsDelete,
+        project_id,
+        state.project_access_checker
+    );
     info!("Pausing deployment: {:?}", deployment_id);
 
     state
@@ -585,8 +599,12 @@ pub async fn resume_deployment(
     RequireAuth(auth): RequireAuth,
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, DeploymentsCreate);
-    project_access_guard!(auth, project_id, state.project_access_checker);
+    project_permission_guard!(
+        auth,
+        DeploymentsCreate,
+        project_id,
+        state.project_access_checker
+    );
 
     state
         .deployment_service
@@ -637,8 +655,12 @@ pub async fn cancel_deployment(
     RequireAuth(auth): RequireAuth,
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, DeploymentsDelete);
-    project_access_guard!(auth, project_id, state.project_access_checker);
+    project_permission_guard!(
+        auth,
+        DeploymentsDelete,
+        project_id,
+        state.project_access_checker
+    );
 
     info!(
         "API request to cancel deployment {} for project {} from user",
@@ -698,8 +720,12 @@ pub async fn teardown_deployment(
     RequireAuth(auth): RequireAuth,
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, DeploymentsDelete);
-    project_access_guard!(auth, project_id, state.project_access_checker);
+    project_permission_guard!(
+        auth,
+        DeploymentsDelete,
+        project_id,
+        state.project_access_checker
+    );
 
     info!(
         "Tearing down deployment {} for project: {}",
@@ -753,8 +779,12 @@ pub async fn teardown_environment(
     RequireAuth(auth): RequireAuth,
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, DeploymentsDelete);
-    project_access_guard!(auth, project_id, state.project_access_checker);
+    project_permission_guard!(
+        auth,
+        DeploymentsDelete,
+        project_id,
+        state.project_access_checker
+    );
 
     info!(
         "Tearing down environment {} for project: {}",

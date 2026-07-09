@@ -49,4 +49,38 @@ pub trait ProjectAccessChecker: Send + Sync {
         user_id: i32,
         project_id: i32,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Returns the set of permission strings (matching
+    /// `temps_auth::permissions::Permission::to_string()`, e.g.
+    /// `"deployments:create"`) `user_id` holds *within* `project_id`, for
+    /// callers that need a specific-action check rather than the coarse
+    /// "can touch this project at all" answer `user_can_access_project`
+    /// gives. See [`project_permission_guard!`](temps_auth::project_permission_guard).
+    ///
+    /// # Semantics
+    ///
+    /// - `Ok(None)` — this checker has no project-scoped, per-permission
+    ///   opinion (the default): either no team-scoped permission model
+    ///   applies, or the project has zero access grants. The guard falls
+    ///   through to the instance-wide permission check only — this is what
+    ///   keeps a binary with no checker registered, or a binary whose
+    ///   checker hasn't overridden this method yet, behaviourally unchanged.
+    /// - `Ok(Some(perms))` — the exact permission strings the user holds in
+    ///   this project. An **empty** vec means "holds nothing here" — every
+    ///   project-scoped permission check denies, which is how a
+    ///   non-member's binary deny is expressed at this finer granularity.
+    /// - `Err(_)` — infrastructure failure. The caller treats this as a
+    ///   denial (fail-closed), never a silent allow — identical contract to
+    ///   `user_can_access_project`.
+    ///
+    /// Defaults to `Ok(None)` so existing implementations of this trait
+    /// (compiled against an older version of it) keep behaving exactly as
+    /// they do today without needing to implement this method.
+    async fn effective_project_permissions(
+        &self,
+        _user_id: i32,
+        _project_id: i32,
+    ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(None)
+    }
 }

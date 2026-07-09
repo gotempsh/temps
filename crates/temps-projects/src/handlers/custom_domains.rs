@@ -11,7 +11,7 @@ use axum::{
 };
 use sea_orm::EntityTrait;
 use std::sync::Arc;
-use temps_auth::{permission_guard, project_access_guard, RequireAuth};
+use temps_auth::{permission_guard, project_access_guard, project_permission_guard, RequireAuth};
 use temps_core::problemdetails;
 use temps_core::problemdetails::Problem;
 use temps_entities::{domains, environments, project_custom_domains};
@@ -66,8 +66,12 @@ pub async fn create_custom_domain(
     Path(project_id): Path<i32>,
     Json(request): Json<CustomDomainRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, ProjectsWrite);
-    project_access_guard!(auth, project_id, state.project_access_checker);
+    project_permission_guard!(
+        auth,
+        ProjectsWrite,
+        project_id,
+        state.project_access_checker
+    );
 
     info!(
         "Creating custom domain: {} for project: {}",
@@ -235,8 +239,12 @@ pub async fn update_custom_domain(
     Path((project_id, domain_id)): Path<(i32, i32)>,
     Json(request): Json<UpdateCustomDomainRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, ProjectsWrite);
-    project_access_guard!(auth, project_id, state.project_access_checker);
+    project_permission_guard!(
+        auth,
+        ProjectsWrite,
+        project_id,
+        state.project_access_checker
+    );
 
     info!(
         "Updating custom domain: {} for project: {}",
@@ -335,8 +343,12 @@ pub async fn delete_custom_domain(
     State(state): State<Arc<AppState>>,
     Path((project_id, domain_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, ProjectsDelete);
-    project_access_guard!(auth, project_id, state.project_access_checker);
+    project_permission_guard!(
+        auth,
+        ProjectsDelete,
+        project_id,
+        state.project_access_checker
+    );
 
     info!(
         "Deleting custom domain: {} for project: {}",
@@ -393,8 +405,12 @@ pub async fn link_custom_domain_to_certificate(
     State(state): State<Arc<AppState>>,
     Path((project_id, domain_id, certificate_id)): Path<(i32, i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, ProjectsWrite);
-    project_access_guard!(auth, project_id, state.project_access_checker);
+    project_permission_guard!(
+        auth,
+        ProjectsWrite,
+        project_id,
+        state.project_access_checker
+    );
 
     info!(
         "Linking custom domain: {} to certificate: {} for project: {}",

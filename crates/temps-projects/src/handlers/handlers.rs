@@ -15,7 +15,9 @@ use axum::{
 };
 use std::sync::Arc;
 use temps_auth::RequireAuth;
-use temps_auth::{permission_guard, project_access_guard, project_scope_guard};
+use temps_auth::{
+    permission_guard, project_access_guard, project_permission_guard, project_scope_guard,
+};
 use temps_core::RequestMetadata;
 use tracing::{debug, error, info};
 
@@ -386,9 +388,8 @@ pub async fn update_project(
     Extension(metadata): Extension<RequestMetadata>,
     Json(project): Json<CreateProjectRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, ProjectsWrite);
+    project_permission_guard!(auth, ProjectsWrite, id, state.project_access_checker);
     project_scope_guard!(auth, id);
-    project_access_guard!(auth, id, state.project_access_checker);
 
     let project_req = crate::services::types::CreateProjectRequest {
         name: project.name.clone(),
@@ -530,9 +531,8 @@ pub async fn delete_project(
     RequireAuth(auth): RequireAuth,
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, ProjectsDelete);
+    project_permission_guard!(auth, ProjectsDelete, id, state.project_access_checker);
     project_scope_guard!(auth, id);
-    project_access_guard!(auth, id, state.project_access_checker);
 
     // Get project details before deletion
     let project = state.project_service.get_project(id).await?;
