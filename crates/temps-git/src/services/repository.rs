@@ -41,6 +41,15 @@ pub struct RepositoryModel {
 #[derive(Debug, Clone, Default)]
 pub struct RepositoryFilter {
     pub git_provider_connection_id: Option<i32>,
+    pub provider_id: Option<i32>,
+    /// Scopes `provider_id` lookups to a single caller's own
+    /// `git_provider_connections` row(s) — `provider_id` identifies a
+    /// shared, platform-level OAuth app/PAT config that many users can each
+    /// have their own connection to, so a `provider_id`-only filter would
+    /// return every user's repositories. Ignored when `provider_id` is
+    /// unset (`git_provider_connection_id`-scoped lookups already resolve
+    /// to a single connection).
+    pub user_id: Option<i32>,
     pub search: Option<String>,
     pub owner: Option<String>,
     pub language: Option<String>,
@@ -68,6 +77,19 @@ impl RepositoryService {
         // Apply filters
         if let Some(connection_id) = filter.git_provider_connection_id {
             query = query.filter(repositories::Column::GitProviderConnectionId.eq(connection_id));
+        }
+
+        if let Some(provider_id) = filter.provider_id {
+            query = query
+                .join(
+                    JoinType::InnerJoin,
+                    repositories::Relation::GitProviderConnection.def(),
+                )
+                .filter(git_provider_connections::Column::ProviderId.eq(provider_id));
+
+            if let Some(user_id) = filter.user_id {
+                query = query.filter(git_provider_connections::Column::UserId.eq(user_id));
+            }
         }
 
         if let Some(search) = &filter.search {
@@ -286,55 +308,6 @@ impl RepositoryService {
             })
             .collect())
     }
-
-    /// List repositories linked to a specific git provider through the
-    /// caller's own connection(s) to that provider. `provider_id` identifies
-    /// a shared, platform-level OAuth app/PAT config — many users can each
-    /// have their own `git_provider_connections` row against the same
-    /// provider, so this must stay scoped to `user_id` or it leaks every
-    /// other user's repositories (names, clone/SSH URLs, private flag).
-    pub async fn list_repositories_by_provider(
-        &self,
-        provider_id: i32,
-        user_id: i32,
-    ) -> Result<Vec<RepositoryModel>, RepositoryServiceError> {
-        let repositories = repositories::Entity::find()
-            .join(
-                JoinType::InnerJoin,
-                repositories::Relation::GitProviderConnection.def(),
-            )
-            .filter(git_provider_connections::Column::ProviderId.eq(provider_id))
-            .filter(git_provider_connections::Column::UserId.eq(user_id))
-            .all(self.db.as_ref())
-            .await?;
-
-        Ok(repositories
-            .into_iter()
-            .map(|repo| RepositoryModel {
-                id: repo.id,
-                owner: repo.owner,
-                name: repo.name,
-                full_name: repo.full_name,
-                description: repo.description,
-                private: repo.private,
-                fork: repo.fork,
-                created_at: repo.created_at,
-                updated_at: repo.updated_at,
-                pushed_at: repo.pushed_at,
-                size: repo.size,
-                stargazers_count: repo.stargazers_count,
-                watchers_count: repo.watchers_count,
-                language: repo.language,
-                default_branch: repo.default_branch,
-                open_issues_count: repo.open_issues_count,
-                topics: repo.topics,
-                clone_url: repo.clone_url,
-                ssh_url: repo.ssh_url,
-                preset: repo.preset,
-                git_provider_connection_id: repo.git_provider_connection_id,
-            })
-            .collect())
-    }
 }
 
 #[cfg(test)]
@@ -451,8 +424,14 @@ mod tests {
 
         let service = RepositoryService::new(db.clone());
 
+        let filter_for = |user_id: i32| RepositoryFilter {
+            provider_id: Some(provider.id),
+            user_id: Some(user_id),
+            ..Default::default()
+        };
+
         let repos_for_a = service
-            .list_repositories_by_provider(provider.id, user_a.id)
+            .list_repositories(filter_for(user_a.id))
             .await
             .unwrap();
         assert_eq!(
@@ -463,7 +442,7 @@ mod tests {
         assert_eq!(repos_for_a[0].name, "user-a-private-repo");
 
         let repos_for_b = service
-            .list_repositories_by_provider(provider.id, user_b.id)
+            .list_repositories(filter_for(user_b.id))
             .await
             .unwrap();
         assert_eq!(repos_for_b.len(), 1);
