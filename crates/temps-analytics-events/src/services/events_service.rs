@@ -1496,7 +1496,15 @@ WHERE project_id = $1
                         )
                         .await
                     {
-                        Ok(id) => Some(id),
+                        Ok(id) => {
+                            tracing::info!(
+                                visitor_id = %visitor_id,
+                                project_id,
+                                visitor_row_id = id,
+                                "Created visitor row from event ingest (lookup miss -- proxy's async upsert hadn't landed yet)"
+                            );
+                            Some(id)
+                        }
                         Err(e) => {
                             tracing::error!(
                                 visitor_id = %visitor_id,
