@@ -184,7 +184,7 @@ impl BackupEngine for S3MirrorEngine {
 
         let spec = OneShotSpec {
             image: MC_IMAGE.to_string(),
-            name: format!("temps-s3mirror-{}", &backup_uuid),
+            name: format!("temps-s3mirror-{}", backup_uuid),
             engine: ENGINE_KEY,
             backup_id,
             entrypoint: vec!["sh".to_string(), "-c".to_string()],

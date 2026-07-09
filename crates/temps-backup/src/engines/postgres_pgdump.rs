@@ -145,7 +145,7 @@ impl BackupEngine for PostgresPgDumpEngine {
 
         let spec = OneShotSpec {
             image: pg.docker_image.clone(),
-            name: format!("temps-pgdump-{}", &backup_uuid),
+            name: format!("temps-pgdump-{}", backup_uuid),
             engine: ENGINE_KEY,
             backup_id,
             entrypoint: vec!["sh".to_string(), "-c".to_string()],

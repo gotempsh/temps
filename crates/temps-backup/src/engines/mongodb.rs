@@ -183,7 +183,7 @@ impl BackupEngine for MongodbEngine {
 
         let spec = OneShotSpec {
             image: MONGO_SIDECAR_IMAGE.to_string(),
-            name: format!("temps-mongodump-{}", &backup_uuid),
+            name: format!("temps-mongodump-{}", backup_uuid),
             engine: ENGINE_KEY,
             backup_id,
             entrypoint: vec!["sh".to_string(), "-c".to_string()],
