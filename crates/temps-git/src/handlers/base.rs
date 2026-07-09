@@ -1539,6 +1539,10 @@ pub fn configure_routes() -> axum::Router<Arc<AppState>> {
             get(get_provider_connections),
         )
         .route(
+            "/git-providers/{provider_id}/repositories",
+            get(list_repositories_by_provider),
+        )
+        .route(
             "/repositories/{owner}/{repo}/branches",
             get(get_repository_branches),
         )
@@ -1788,6 +1792,7 @@ fn parse_auth_method(method_type: &str, config: serde_json::Value) -> Result<Aut
         get_provider_connections,
         sync_repositories,
         list_repositories_by_connection,
+        list_repositories_by_provider,
         list_synced_repositories,
         get_repository_preset_live,
         get_repository_preset_by_name,
