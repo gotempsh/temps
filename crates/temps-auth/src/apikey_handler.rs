@@ -37,42 +37,60 @@ pub struct ApiKeyState {
     pub audit_service: Arc<dyn temps_core::AuditLogger>,
 }
 
-/// Privilege-escalation ceiling: a custom-permission API key must never
-/// grant more than the creating user's own effective permissions.
+/// Privilege-escalation ceiling: an API key must never grant more than the
+/// creating user's own effective permissions — whether requested as an
+/// explicit `role_type: "custom"` permission list, or as a predefined role
+/// name (`role_type: "admin"`, `"platform_admin"`, etc.).
 ///
 /// Without this check, any role holding `ApiKeysCreate` (e.g. the standard
 /// `Role::User`) could mint a key carrying `Permission::SystemAdmin` or any
 /// other permission outside its own role — a full privilege escalation,
-/// since `ApiKeyService::create_api_key` only validates that the requested
-/// permission strings parse, not that the requester holds them. Unparsable
-/// strings are left to that existing validation, which returns 400.
-fn enforce_custom_permission_ceiling(
+/// since `ApiKeyService::create_api_key` only validates that requested
+/// custom permission strings parse, and for predefined roles only that the
+/// role name is one of the known roles — neither path checks that the
+/// requester actually holds the permissions being granted. Unparsable
+/// custom permission strings and unrecognized role names are left to that
+/// existing validation, which returns 400.
+fn enforce_permission_ceiling(
     auth: &crate::context::AuthContext,
     request: &CreateApiKeyRequest,
 ) -> Result<(), Problem> {
-    if request.role_type != "custom" {
+    if request.role_type == "custom" {
+        let Some(ref permissions) = request.permissions else {
+            return Ok(());
+        };
+        for perm_str in permissions {
+            if let Some(perm) = crate::permissions::Permission::from_str(perm_str) {
+                if !auth.has_permission(&perm) {
+                    return Err(permission_ceiling_exceeded(perm_str));
+                }
+            }
+        }
         return Ok(());
     }
-    let Some(ref permissions) = request.permissions else {
-        return Ok(());
-    };
-    for perm_str in permissions {
-        if let Some(perm) = crate::permissions::Permission::from_str(perm_str) {
-            if !auth.has_permission(&perm) {
-                return Err(
-                    temps_core::error_builder::ErrorBuilder::new(StatusCode::FORBIDDEN)
-                        .type_("https://temps.sh/probs/permission-ceiling-exceeded")
-                        .title("Forbidden")
-                        .detail(format!(
-                            "Cannot grant permission '{perm_str}': it exceeds your own permissions"
-                        ))
-                        .value("error_code", "PERMISSION_CEILING_EXCEEDED")
-                        .build(),
-                );
+
+    // Predefined role type: the minted key inherits that role's ENTIRE
+    // permission set, so every permission the role carries must also be
+    // held by the requester — not just some of them.
+    if let Some(role) = crate::permissions::Role::from_str(&request.role_type) {
+        for perm in role.permissions() {
+            if !auth.has_permission(perm) {
+                return Err(permission_ceiling_exceeded(&perm.to_string()));
             }
         }
     }
     Ok(())
+}
+
+fn permission_ceiling_exceeded(perm_str: &str) -> Problem {
+    temps_core::error_builder::ErrorBuilder::new(StatusCode::FORBIDDEN)
+        .type_("https://temps.sh/probs/permission-ceiling-exceeded")
+        .title("Forbidden")
+        .detail(format!(
+            "Cannot grant permission '{perm_str}': it exceeds your own permissions"
+        ))
+        .value("error_code", "PERMISSION_CEILING_EXCEEDED")
+        .build()
 }
 
 #[utoipa::path(
@@ -100,7 +118,7 @@ pub async fn create_api_key(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ApiKeysCreate);
 
-    enforce_custom_permission_ceiling(&auth, &request)?;
+    enforce_permission_ceiling(&auth, &request)?;
 
     // Capture audit fields before request is moved into the service call.
     let role_type = request.role_type.clone();
@@ -508,7 +526,7 @@ mod tests {
     fn custom_role_cannot_grant_permission_actor_does_not_hold() {
         let auth = user_auth(Role::User);
         let req = custom_request(vec!["system:admin"]);
-        let err = enforce_custom_permission_ceiling(&auth, &req).unwrap_err();
+        let err = enforce_permission_ceiling(&auth, &req).unwrap_err();
         assert_eq!(err.status_code, StatusCode::FORBIDDEN);
     }
 
@@ -518,7 +536,7 @@ mod tests {
     fn custom_role_can_grant_permission_actor_holds() {
         let auth = user_auth(Role::User);
         let req = custom_request(vec!["projects:read"]);
-        assert!(enforce_custom_permission_ceiling(&auth, &req).is_ok());
+        assert!(enforce_permission_ceiling(&auth, &req).is_ok());
     }
 
     /// `Role::Admin` holds every permission, including `SystemAdmin` —
@@ -527,21 +545,57 @@ mod tests {
     fn admin_can_grant_any_permission() {
         let auth = user_auth(Role::Admin);
         let req = custom_request(vec!["system:admin", "users:delete"]);
-        assert!(enforce_custom_permission_ceiling(&auth, &req).is_ok());
+        assert!(enforce_permission_ceiling(&auth, &req).is_ok());
     }
 
-    /// Non-custom role types (predefined roles) bypass the ceiling check
-    /// entirely — they don't carry an arbitrary permission list to bound.
-    #[test]
-    fn predefined_role_type_skips_ceiling_check() {
-        let auth = user_auth(Role::User);
-        let req = CreateApiKeyRequest {
+    fn predefined_request(role_type: &str) -> CreateApiKeyRequest {
+        CreateApiKeyRequest {
             name: "test-key".to_string(),
-            role_type: "admin".to_string(),
+            role_type: role_type.to_string(),
             permissions: None,
             expires_at: None,
-        };
-        assert!(enforce_custom_permission_ceiling(&auth, &req).is_ok());
+        }
+    }
+
+    /// `Role::User` does not hold every permission `Role::Admin` carries —
+    /// self-minting a key with `role_type: "admin"` is the predefined-role
+    /// counterpart of the custom-permission escalation above, and must be
+    /// denied the same way.
+    #[test]
+    fn predefined_role_type_cannot_grant_role_actor_does_not_hold() {
+        let auth = user_auth(Role::User);
+        let req = predefined_request("admin");
+        let err = enforce_permission_ceiling(&auth, &req).unwrap_err();
+        assert_eq!(err.status_code, StatusCode::FORBIDDEN);
+    }
+
+    /// A user requesting a predefined role that is a subset of (or equal
+    /// to) their own permissions — the common case of a `Role::User`
+    /// minting a `role_type: "user"` key — must succeed.
+    #[test]
+    fn predefined_role_type_can_grant_role_actor_holds() {
+        let auth = user_auth(Role::User);
+        let req = predefined_request("user");
+        assert!(enforce_permission_ceiling(&auth, &req).is_ok());
+    }
+
+    /// `Role::Admin` holds every permission, including everything
+    /// `Role::Admin` itself carries — confirms the predefined-role check is
+    /// a real ceiling, not a blanket denial.
+    #[test]
+    fn admin_can_grant_predefined_admin_role() {
+        let auth = user_auth(Role::Admin);
+        let req = predefined_request("admin");
+        assert!(enforce_permission_ceiling(&auth, &req).is_ok());
+    }
+
+    /// An unrecognized role name is left to the service layer's existing
+    /// validation (400), not rejected here as a ceiling violation.
+    #[test]
+    fn unrecognized_role_type_is_not_a_ceiling_violation() {
+        let auth = user_auth(Role::User);
+        let req = predefined_request("not-a-real-role");
+        assert!(enforce_permission_ceiling(&auth, &req).is_ok());
     }
 
     /// An unparsable permission string is left to the service layer's
@@ -550,6 +604,6 @@ mod tests {
     fn unparsable_permission_string_is_not_a_ceiling_violation() {
         let auth = user_auth(Role::User);
         let req = custom_request(vec!["not-a-real-permission"]);
-        assert!(enforce_custom_permission_ceiling(&auth, &req).is_ok());
+        assert!(enforce_permission_ceiling(&auth, &req).is_ok());
     }
 }
