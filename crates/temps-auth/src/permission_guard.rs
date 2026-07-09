@@ -346,10 +346,24 @@ macro_rules! project_permission_guard {
                                 .build());
                             }
                         }
+                    } else {
+                        // user_id_opt() == None here is impossible today:
+                        // deployment tokens (the only non-user auth source) are
+                        // filtered by the outer is_deployment_token() check
+                        // above, and every other AuthSource carries a user. If
+                        // a future AuthSource variant broke that invariant,
+                        // fail closed rather than silently skipping the
+                        // project-scoped check.
+                        return Err(temps_core::error_builder::ErrorBuilder::new(
+                            ::axum::http::StatusCode::FORBIDDEN,
+                        )
+                        .type_("https://temps.sh/probs/insufficient-permissions")
+                        .title("Insufficient Permissions")
+                        .detail(
+                            "Could not resolve caller identity for project permission check",
+                        )
+                        .build());
                     }
-                    // user_id_opt() == None here is impossible: deployment tokens
-                    // (the only non-user auth source) are filtered by the outer
-                    // is_deployment_token() check above.
                 }
                 // checker is None → no plugin registered → no-op beyond step 1.
             }
@@ -615,11 +629,15 @@ mod tests {
         }
 
         fn with_perms(perms: &'static [&'static str]) -> Arc<dyn ProjectAccessChecker> {
-            // fn pointers can't capture `perms` by closure, so encode the two
+            // fn pointers can't capture `perms` by closure, so encode the
             // fixed sets this test file actually needs directly.
             if perms == ["deployments:create"] {
                 Arc::new(MockPermissionChecker {
                     result: || Ok(Some(vec!["deployments:create".to_string()])),
+                })
+            } else if perms == ["deployments:delete"] {
+                Arc::new(MockPermissionChecker {
+                    result: || Ok(Some(vec!["deployments:delete".to_string()])),
                 })
             } else {
                 Arc::new(MockPermissionChecker {
@@ -691,6 +709,40 @@ mod tests {
         let result = run_delete_guard(&auth, 1, checker).await;
         let err = result.expect_err("instance-wide ceiling must reject before project lookup");
         assert_eq!(err.status_code, axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn permission_guard_project_grant_cannot_widen_past_instance_ceiling() {
+        // Narrowing-only invariant: a project-scoped checker can only ever
+        // remove permissions the instance-wide role grants, never add ones it
+        // didn't. Role::User lacks DeploymentsDelete outright (see
+        // permission_guard_instance_ceiling_blocks_before_project_lookup), so
+        // even a checker that explicitly grants "deployments:delete" at the
+        // project level must not resurrect it — step 1 rejects before the
+        // checker is ever consulted.
+        let auth = user_auth(Role::User);
+        async fn run_delete_guard(
+            auth: &AuthContext,
+            project_id: i32,
+            checker: Option<Arc<dyn ProjectAccessChecker>>,
+        ) -> Result<(), Problem> {
+            project_permission_guard!(auth, DeploymentsDelete, project_id, checker);
+            Ok(())
+        }
+        let checker = Some(MockPermissionChecker::with_perms(&["deployments:delete"]));
+        let result = run_delete_guard(&auth, 1, checker).await;
+        let err = result.expect_err(
+            "a project-level grant must never widen permissions past the instance ceiling",
+        );
+        assert_eq!(err.status_code, axum::http::StatusCode::FORBIDDEN);
+        // Must be the instance-wide rejection, proving the checker was never
+        // reached — not the project-scoped "project-permission-denied" type,
+        // which would imply the checker was consulted and (correctly) denied
+        // it there instead of at the ceiling.
+        assert_eq!(
+            err.body.get("type").and_then(|v| v.as_str()),
+            Some("https://temps.sh/probs/insufficient-permissions")
+        );
     }
 
     #[tokio::test]
