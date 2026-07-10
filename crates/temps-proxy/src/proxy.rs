@@ -24,8 +24,9 @@ use crate::handler::preview_wall::{
 use crate::on_demand::OnDemandManager;
 use crate::preview_auth::{
     build_set_cookie_sandbox, check_preview_auth, encode_preview_cookie_subject,
-    parse_preview_host, verify_argon2, PreviewAuthLimiter, PreviewAuthOutcome, PreviewHost,
-    PreviewSandboxLookup, SandboxLookupCache, PREVIEW_GATEWAY_PEER,
+    parse_preview_host, preview_peer_group_key, verify_argon2, PreviewAuthLimiter,
+    PreviewAuthOutcome, PreviewHost, PreviewSandboxLookup, SandboxLookupCache,
+    PREVIEW_GATEWAY_PEER,
 };
 use crate::service::cert_host_cache::CertHostCache;
 use crate::service::challenge_service::ChallengeService;
@@ -4044,8 +4045,16 @@ impl ProxyHttp for LoadBalancer {
         // Workspace preview gateway: skip the route table and forward straight
         // to the local gateway. The host header is preserved so the gateway
         // can decode `ws-<sid>-<port>` and pick the right sandbox container.
-        if ctx.preview_route.is_some() {
+        //
+        // Every preview target shares this same physical peer address, so
+        // `group_key` MUST be set per-target — otherwise Pingora's
+        // connection pool considers all sandboxes' requests interchangeable
+        // and can hand a connection opened for one sandbox back out to
+        // serve a different sandbox's request (see `preview_peer_group_key`
+        // doc comment for the full mechanism).
+        if let Some(host) = &ctx.preview_route {
             let mut peer = Box::new(HttpPeer::new(PREVIEW_GATEWAY_PEER, false, String::new()));
+            peer.group_key = preview_peer_group_key(host);
             peer.options.connection_timeout = Some(std::time::Duration::from_secs(5));
             peer.options.read_timeout = Some(io_timeout);
             peer.options.write_timeout = Some(io_timeout);
