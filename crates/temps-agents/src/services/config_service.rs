@@ -391,9 +391,7 @@ impl AgentConfigService {
                 trigger_config: Set(trigger_config),
                 prompt: Set(request.prompt),
                 ai_provider: Set(request.ai_provider.unwrap_or(default_provider)),
-                ai_model: Set(request
-                    .ai_model
-                    .and_then(|m| if m.is_empty() { None } else { Some(m) })),
+                ai_model: Set(request.ai_model.filter(|m| !m.is_empty())),
                 api_key_encrypted: Set(encrypted_key),
                 ai_provider_key_id: Set(request.ai_provider_key_id),
                 max_turns: Set(request.max_turns.unwrap_or(10)),
@@ -551,9 +549,7 @@ impl AgentConfigService {
             trigger_config: Set(trigger_config),
             prompt: Set(request.prompt),
             ai_provider: Set(request.ai_provider.unwrap_or(default_provider)),
-            ai_model: Set(request
-                .ai_model
-                .and_then(|m| if m.is_empty() { None } else { Some(m) })),
+            ai_model: Set(request.ai_model.filter(|m| !m.is_empty())),
             api_key_encrypted: Set(encrypted_key),
             ai_provider_key_id: Set(request.ai_provider_key_id),
             max_turns: Set(request.max_turns.unwrap_or(25)),

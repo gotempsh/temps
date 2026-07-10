@@ -1479,18 +1479,11 @@ impl Analytics for AnalyticsService {
         let mut total_events: i64 = 0;
         for row in event_rows {
             total_events += 1;
-            let time_on_page =
-                if row.event_type == "page_view" {
-                    row.computed_time_on_page.and_then(|t| {
-                        if t > 0 && t < 1800 {
-                            Some(t)
-                        } else {
-                            None
-                        }
-                    })
-                } else {
-                    None
-                };
+            let time_on_page = if row.event_type == "page_view" {
+                row.computed_time_on_page.filter(|&t| t > 0 && t < 1800)
+            } else {
+                None
+            };
 
             let event_data = if row.event_data == serde_json::json!({}) {
                 None

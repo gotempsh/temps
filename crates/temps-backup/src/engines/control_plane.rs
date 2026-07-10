@@ -139,7 +139,7 @@ impl BackupEngine for ControlPlaneEngine {
 
         let spec = OneShotSpec {
             image: image_tag,
-            name: format!("temps-cp-backup-{}", &backup_uuid),
+            name: format!("temps-cp-backup-{}", backup_uuid),
             engine: ENGINE_KEY,
             backup_id,
             entrypoint: vec!["sh".to_string(), "-c".to_string()],
