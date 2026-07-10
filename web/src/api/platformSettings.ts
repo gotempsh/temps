@@ -197,7 +197,16 @@ export async function updatePlatformSettings(
     build_limits: updated.build_limits,
     monitoring: updated.monitoring,
   }
-  await updateSettings({ body })
+  const result = await updateSettings({ body })
+  if (result.error) {
+    // The generated client resolves (rather than throws) on non-2xx
+    // responses, so a failed save must be surfaced explicitly here —
+    // otherwise the caller sees a resolved promise and reports "saved"
+    // for a change that was actually rejected (e.g. a validation error).
+    const detail =
+      (result.error as { detail?: string })?.detail || 'Failed to save settings'
+    throw new Error(detail)
+  }
 
   // The PATCH endpoint returns only an ack message, so we hand back our
   // merged view. Callers that need the absolute server state should refetch.
