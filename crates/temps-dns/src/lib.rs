@@ -51,7 +51,8 @@ pub use plugin::DnsPlugin;
 pub use providers::{
     CloudflareCredentials, CloudflareProvider, DnsProvider, DnsProviderCapabilities,
     DnsProviderType, DnsRecord, DnsRecordContent, DnsRecordRequest, DnsRecordType, DnsZone,
-    ManualDnsProvider, NamecheapCredentials, NamecheapProvider, ProviderCredentials,
+    ManualDnsProvider, NamecheapCredentials, NamecheapProvider, PebbleCredentials,
+    PebbleDnsProvider, ProviderCredentials,
 };
 pub use services::{
     ChangeSet, DeploymentDnsPublisher, DnsOperationResult, DnsProviderService, DnsRecordService,

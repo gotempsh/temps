@@ -132,6 +132,20 @@ pub struct AzureCredentials {
     pub resource_group: String,
 }
 
+/// Pebble challtestsrv credentials (LOCAL DEV/TEST ONLY)
+///
+/// `pebble-challtestsrv` has no authentication -- the only thing needed is
+/// its management API base URL (default `http://localhost:8055` when run
+/// per the upstream Pebble docs). Never point this at anything but a local
+/// Pebble test setup: it has no zone ownership model and will claim it can
+/// manage any domain.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PebbleCredentials {
+    /// Base URL of pebble-challtestsrv's management API
+    #[schema(example = "http://localhost:8055")]
+    pub management_url: String,
+}
+
 /// Unified provider credentials enum
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -142,6 +156,7 @@ pub enum ProviderCredentials {
     DigitalOcean(DigitalOceanCredentials),
     Gcp(GcpCredentials),
     Azure(AzureCredentials),
+    Pebble(PebbleCredentials),
 }
 
 impl ProviderCredentials {
@@ -194,6 +209,14 @@ impl ProviderCredentials {
                     "client_secret": "***",
                     "subscription_id": mask_string(&c.subscription_id),
                     "resource_group": c.resource_group.clone(),
+                })
+            }
+            ProviderCredentials::Pebble(c) => {
+                // No secret to mask -- the management URL is not sensitive
+                // (it only makes sense pointed at a local Pebble instance).
+                serde_json::json!({
+                    "type": "pebble",
+                    "management_url": c.management_url.clone(),
                 })
             }
         }

@@ -9,6 +9,7 @@ pub mod credentials;
 pub mod digitalocean;
 pub mod gcp;
 pub mod namecheap;
+pub mod pebble;
 pub mod route53;
 pub mod traits;
 
@@ -17,11 +18,12 @@ pub use azure::AzureProvider;
 pub use cloudflare::CloudflareProvider;
 pub use credentials::{
     AzureCredentials, CloudflareCredentials, DigitalOceanCredentials, GcpCredentials,
-    NamecheapCredentials, ProviderCredentials, Route53Credentials,
+    NamecheapCredentials, PebbleCredentials, ProviderCredentials, Route53Credentials,
 };
 pub use digitalocean::DigitalOceanProvider;
 pub use gcp::GcpProvider;
 pub use namecheap::NamecheapProvider;
+pub use pebble::PebbleDnsProvider;
 pub use route53::Route53Provider;
 pub use traits::{
     DnsProvider, DnsProviderCapabilities, DnsProviderType, DnsRecord, DnsRecordContent,

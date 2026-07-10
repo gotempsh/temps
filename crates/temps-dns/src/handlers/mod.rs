@@ -26,7 +26,8 @@ use utoipa::{OpenApi, ToSchema};
 use crate::errors::DnsError;
 use crate::providers::{
     AzureCredentials, CloudflareCredentials, DigitalOceanCredentials, DnsProviderType, DnsRecord,
-    DnsZone, GcpCredentials, NamecheapCredentials, ProviderCredentials, Route53Credentials,
+    DnsZone, GcpCredentials, NamecheapCredentials, PebbleCredentials, ProviderCredentials,
+    Route53Credentials,
 };
 use crate::services::{
     AddManagedDomainRequest, CreateProviderRequest, DnsProviderService, DnsRecordService,
@@ -121,6 +122,11 @@ pub enum DnsProviderCredentials {
         #[schema(example = "my-resource-group")]
         resource_group: String,
     },
+    /// Pebble challtestsrv mock DNS (LOCAL DEV/TEST ONLY)
+    Pebble {
+        #[schema(example = "http://localhost:8055")]
+        management_url: String,
+    },
 }
 
 impl From<DnsProviderCredentials> for ProviderCredentials {
@@ -180,6 +186,9 @@ impl From<DnsProviderCredentials> for ProviderCredentials {
                 subscription_id,
                 resource_group,
             }),
+            DnsProviderCredentials::Pebble { management_url } => {
+                ProviderCredentials::Pebble(PebbleCredentials { management_url })
+            }
         }
     }
 }
