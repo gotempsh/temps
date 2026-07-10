@@ -61,6 +61,16 @@ impl TempsPlugin for DomainsPlugin {
             let notification_service =
                 context.get_service::<dyn temps_core::notifications::NotificationService>();
 
+            // Required so background renewals can read `letsencrypt.email` (see
+            // `TlsService::get_acme_email`) -- without this, auto-renewal always fails
+            // with "User email is required" regardless of what's configured.
+            let config_service = context.require_service::<temps_config::ConfigService>();
+
+            // Get DnsProviderService (requires dns plugin to be registered first). Also
+            // wired into the TLS service so DNS-01 background renewals can auto-publish
+            // the challenge TXT record when a DNS provider manages the domain's zone.
+            let dns_provider_service = context.require_service::<DnsProviderService>();
+
             // Create domain service first so the TLS service can drive the order-based
             // ACME flow during background HTTP-01 renewals (keeps auto-renewals
             // recoverable from the UI). DomainService does not depend on TlsService, so
@@ -81,7 +91,9 @@ impl TempsPlugin for DomainsPlugin {
                     plugin_name: "domains".to_string(),
                     error: format!("Failed to create TLS service: {}", e),
                 })?
-                .with_domain_service(domain_service.clone());
+                .with_domain_service(domain_service.clone())
+                .with_config_service(config_service.clone())
+                .with_dns_provider_service(dns_provider_service.clone());
 
             // Add notification service if available
             if let Some(notif_service) = notification_service {
@@ -98,9 +110,6 @@ impl TempsPlugin for DomainsPlugin {
 
             // Note: Certificate renewal scheduler is started in console.rs
             // The scheduler handles both initial check and daily scheduled checks
-
-            // Get DnsProviderService (requires dns plugin to be registered first)
-            let dns_provider_service = context.require_service::<DnsProviderService>();
 
             // Get audit service
             let audit_service = context.require_service::<dyn temps_core::AuditLogger>();

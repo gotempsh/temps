@@ -33,6 +33,12 @@ pub struct TlsService {
     /// validate immediately is recoverable from the certificate management UI via
     /// the "Verify & finalize" action, instead of silently expiring.
     domain_service: Option<Arc<crate::DomainService>>,
+    /// DNS provider service used to auto-publish the `_acme-challenge` TXT record
+    /// during background DNS-01 renewals when the certificate's base domain has an
+    /// `auto_manage`-enabled `dns_managed_domains` row. When absent, or when no
+    /// provider manages the domain, DNS-01 renewals fall back to the manual
+    /// "add this TXT record yourself" notification.
+    dns_provider_service: Option<Arc<temps_dns::services::DnsProviderService>>,
 }
 
 impl TlsService {
@@ -67,6 +73,7 @@ impl TlsService {
             config_service: None,
             db: None,
             domain_service: None,
+            dns_provider_service: None,
         }
     }
 
@@ -85,6 +92,14 @@ impl TlsService {
 
     pub fn with_db(mut self, db: Arc<temps_database::DbConnection>) -> Self {
         self.db = Some(db);
+        self
+    }
+
+    pub fn with_dns_provider_service(
+        mut self,
+        dns_provider_service: Arc<temps_dns::services::DnsProviderService>,
+    ) -> Self {
+        self.dns_provider_service = Some(dns_provider_service);
         self
     }
 
@@ -467,8 +482,12 @@ impl TlsService {
                     error: e.to_string(),
                     verification_method: cert.verification_method.clone(),
                 });
-                self.send_renewal_failure_notification(&cert.domain, &e.to_string())
-                    .await;
+                self.send_renewal_failure_notification(
+                    &cert.domain,
+                    &e.to_string(),
+                    &cert.verification_method,
+                )
+                .await;
                 return;
             }
         }
@@ -495,8 +514,12 @@ impl TlsService {
                     error: e.to_string(),
                     verification_method: cert.verification_method.clone(),
                 });
-                self.send_renewal_failure_notification(&cert.domain, &e.to_string())
-                    .await;
+                self.send_renewal_failure_notification(
+                    &cert.domain,
+                    &e.to_string(),
+                    &cert.verification_method,
+                )
+                .await;
             }
         }
     }
@@ -523,8 +546,12 @@ impl TlsService {
                     error: e.to_string(),
                     verification_method: cert.verification_method.clone(),
                 });
-                self.send_renewal_failure_notification(&cert.domain, &e.to_string())
-                    .await;
+                self.send_renewal_failure_notification(
+                    &cert.domain,
+                    &e.to_string(),
+                    &cert.verification_method,
+                )
+                .await;
                 return;
             }
         };
@@ -560,13 +587,37 @@ impl TlsService {
                     error: e.to_string(),
                     verification_method: cert.verification_method.clone(),
                 });
-                self.send_renewal_failure_notification(&cert.domain, &e.to_string())
-                    .await;
+                self.send_renewal_failure_notification(
+                    &cert.domain,
+                    &e.to_string(),
+                    &cert.verification_method,
+                )
+                .await;
             }
         }
     }
 
+    /// DNS-01 certificates auto-renew when a DNS provider manages the domain's zone
+    /// (`dns_managed_domains.auto_manage = true`); otherwise they fall back to the
+    /// "add this TXT record yourself" manual notification.
     async fn handle_dns01_notification(&self, cert: &Certificate, report: &mut RenewalReport) {
+        if let (Some(domain_service), Some(dns_provider_service)) = (
+            self.domain_service.clone(),
+            self.dns_provider_service.clone(),
+        ) {
+            if self
+                .try_dns01_renewal_with_provider(
+                    cert,
+                    &domain_service,
+                    &dns_provider_service,
+                    report,
+                )
+                .await
+            {
+                return;
+            }
+        }
+
         let days_remaining = cert.days_until_expiry();
 
         info!(
@@ -582,6 +633,194 @@ impl TlsService {
 
         // Send notification to user
         self.send_manual_renewal_notification(cert).await;
+    }
+
+    /// Order-based DNS-01 auto-renewal, attempted only when a verified, `auto_manage`
+    /// DNS provider covers the certificate's base domain (see
+    /// `DnsProviderService::find_provider_for_domain`). Mirrors
+    /// `handle_http01_renewal_order_based`: `request_challenge` creates and persists a
+    /// fresh ACME order, the DNS provider auto-publishes the `_acme-challenge` TXT
+    /// record(s) (same helper the manual "Setup DNS" endpoint uses), then
+    /// `complete_challenge` accepts the challenge and finalizes. On any failure the
+    /// order is left in place for a manual "Verify & finalize" retry from the UI.
+    ///
+    /// Returns `true` once a DNS provider was found for this domain (success or
+    /// failure is recorded on `report` either way) so the caller does not also send
+    /// the manual-renewal notification. Returns `false` when no provider manages the
+    /// domain, so the caller falls back to that manual flow.
+    async fn try_dns01_renewal_with_provider(
+        &self,
+        cert: &Certificate,
+        domain_service: &Arc<crate::DomainService>,
+        dns_provider_service: &Arc<temps_dns::services::DnsProviderService>,
+        report: &mut RenewalReport,
+    ) -> bool {
+        let (provider, _managed_domain) = match dns_provider_service
+            .find_provider_for_domain(&cert.domain)
+            .await
+        {
+            Ok(Some(found)) => found,
+            Ok(None) => return false,
+            Err(e) => {
+                warn!("Failed to look up DNS provider for {}: {}", cert.domain, e);
+                return false;
+            }
+        };
+
+        let provider_instance = match dns_provider_service.create_provider_instance(&provider) {
+            Ok(instance) => instance,
+            Err(e) => {
+                warn!(
+                    "Failed to initialize DNS provider {} for {}: {}",
+                    provider.name, cert.domain, e
+                );
+                return false;
+            }
+        };
+
+        let base_domain = crate::handlers::domain_handler::extract_base_domain(&cert.domain);
+
+        info!(
+            "🔄 Auto-renewing DNS-01 certificate for {} via DNS provider {}",
+            cert.domain, provider.name
+        );
+
+        let email = self.get_acme_email().await;
+
+        // Step 1: Create + persist a new ACME order (sets domain to `challenge_requested`).
+        let challenge = match domain_service.request_challenge(&cert.domain, &email).await {
+            Ok(challenge) => challenge,
+            Err(e) => {
+                error!(
+                    "❌ Failed to initiate DNS-01 renewal for {}: {}",
+                    cert.domain, e
+                );
+                report.renewal_failed.push(RenewalFailure {
+                    domain: cert.domain.clone(),
+                    error: e.to_string(),
+                    verification_method: cert.verification_method.clone(),
+                });
+                self.send_renewal_failure_notification(
+                    &cert.domain,
+                    &e.to_string(),
+                    &cert.verification_method,
+                )
+                .await;
+                return true;
+            }
+        };
+
+        // A cached/valid authorization can yield a certificate immediately.
+        if challenge.status == "completed" {
+            info!("✅ Successfully renewed certificate for {}", cert.domain);
+            report.auto_renewed.push(cert.domain.clone());
+            return true;
+        }
+
+        if challenge.txt_records.is_empty() {
+            let error_msg = "ACME order did not return any DNS TXT records".to_string();
+            error!(
+                "❌ DNS-01 renewal for {} failed: {}",
+                cert.domain, error_msg
+            );
+            report.renewal_failed.push(RenewalFailure {
+                domain: cert.domain.clone(),
+                error: error_msg.clone(),
+                verification_method: cert.verification_method.clone(),
+            });
+            self.send_renewal_failure_notification(
+                &cert.domain,
+                &error_msg,
+                &cert.verification_method,
+            )
+            .await;
+            return true;
+        }
+
+        // Step 2: Auto-publish the TXT record(s) via the configured DNS provider (same
+        // helper used by the manual "Setup DNS" endpoint).
+        let dns_txt_records: Vec<(String, String)> = challenge
+            .txt_records
+            .iter()
+            .map(|record| (record.name.clone(), record.value.clone()))
+            .collect();
+
+        let (results, records_created) = crate::handlers::domain_handler::setup_dns_txt_records(
+            provider_instance.as_ref(),
+            &base_domain,
+            &dns_txt_records,
+        )
+        .await;
+
+        if (records_created as usize) < dns_txt_records.len() {
+            let failed_detail = results
+                .iter()
+                .filter(|result| !result.success)
+                .map(|result| format!("{}: {}", result.name, result.message))
+                .collect::<Vec<_>>()
+                .join("; ");
+            let error_msg = format!(
+                "Failed to publish {} of {} DNS TXT record(s) via provider {}: {}",
+                dns_txt_records.len() - records_created as usize,
+                dns_txt_records.len(),
+                provider.name,
+                failed_detail
+            );
+            error!(
+                "❌ DNS-01 renewal for {} failed: {}",
+                cert.domain, error_msg
+            );
+            report.renewal_failed.push(RenewalFailure {
+                domain: cert.domain.clone(),
+                error: error_msg.clone(),
+                verification_method: cert.verification_method.clone(),
+            });
+            self.send_renewal_failure_notification(
+                &cert.domain,
+                &error_msg,
+                &cert.verification_method,
+            )
+            .await;
+            return true;
+        }
+
+        // Step 3: Give DNS a moment to propagate before asking Let's Encrypt to validate.
+        info!(
+            "Waiting for DNS propagation before validating DNS-01 challenge for {}...",
+            cert.domain
+        );
+        tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+
+        // Step 4: Accept the challenge and finalize the persisted order.
+        match domain_service
+            .complete_challenge(&cert.domain, &email)
+            .await
+        {
+            Ok(_renewed) => {
+                info!("✅ Successfully renewed certificate for {}", cert.domain);
+                report.auto_renewed.push(cert.domain.clone());
+            }
+            Err(e) => {
+                // The order remains persisted (pending) and recoverable from the UI.
+                error!(
+                    "❌ Failed to complete DNS-01 renewal for {} (order left pending for manual retry): {}",
+                    cert.domain, e
+                );
+                report.renewal_failed.push(RenewalFailure {
+                    domain: cert.domain.clone(),
+                    error: e.to_string(),
+                    verification_method: cert.verification_method.clone(),
+                });
+                self.send_renewal_failure_notification(
+                    &cert.domain,
+                    &e.to_string(),
+                    &cert.verification_method,
+                )
+                .await;
+            }
+        }
+
+        true
     }
 
     async fn send_renewal_summary(&self, report: &RenewalReport) {
@@ -669,7 +908,12 @@ impl TlsService {
         }
     }
 
-    async fn send_renewal_failure_notification(&self, domain: &str, error: &str) {
+    async fn send_renewal_failure_notification(
+        &self,
+        domain: &str,
+        error: &str,
+        verification_method: &str,
+    ) {
         let Some(notif_service) = &self.notification_service else {
             return;
         };
@@ -688,7 +932,10 @@ impl TlsService {
             metadata: std::collections::HashMap::from([
                 ("domain".to_string(), domain.to_string()),
                 ("error".to_string(), error.to_string()),
-                ("verification_method".to_string(), "http-01".to_string()),
+                (
+                    "verification_method".to_string(),
+                    verification_method.to_string(),
+                ),
             ]),
             bypass_throttling: true,
         };
@@ -1970,5 +2217,66 @@ mod tests {
         assert!(not_found.is_none());
 
         println!("✅ ACME account persistence test passed!");
+    }
+
+    fn test_server_config() -> Arc<temps_config::ServerConfig> {
+        Arc::new(
+            temps_config::ServerConfig::new(
+                "127.0.0.1:3000".to_string(),
+                "postgres://test:test@localhost/test".to_string(),
+                None,
+                None,
+            )
+            .expect("failed to build test ServerConfig"),
+        )
+    }
+
+    /// Regression test for the auto-renewal bug: `TlsService` built without
+    /// `.with_config_service(...)` always resolves an empty ACME contact email
+    /// (`get_acme_email` returns `String::new()`), so every background renewal
+    /// failed with "User email is required for Let's Encrypt certificate
+    /// provisioning" even when an operator had configured `letsencrypt.email`.
+    #[tokio::test]
+    async fn test_get_acme_email_reads_configured_letsencrypt_email() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password("test"));
+        let repo = Arc::new(DefaultCertificateRepository::new(
+            db.clone(),
+            encryption_service,
+        ));
+        let provider = Arc::new(MockCertificateProvider::new());
+
+        let config_service = Arc::new(temps_config::ConfigService::new(test_server_config(), db));
+        config_service
+            .update_settings(temps_core::AppSettings {
+                letsencrypt: temps_core::LetsEncryptSettings {
+                    email: Some("ops@example.com".to_string()),
+                    environment: "production".to_string(),
+                },
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let service = TlsService::new(repo, provider).with_config_service(config_service.clone());
+
+        assert_eq!(service.get_acme_email().await, "ops@example.com");
+    }
+
+    /// Without a wired `config_service` (the pre-fix state), the ACME contact
+    /// email must be empty, not a placeholder -- callers use emptiness to
+    /// refuse issuance rather than register a bogus contact.
+    #[tokio::test]
+    async fn test_get_acme_email_empty_without_config_service() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password("test"));
+        let repo = Arc::new(DefaultCertificateRepository::new(db, encryption_service));
+        let provider = Arc::new(MockCertificateProvider::new());
+
+        let service = TlsService::new(repo, provider);
+
+        assert_eq!(service.get_acme_email().await, "");
     }
 }
