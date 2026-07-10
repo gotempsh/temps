@@ -564,6 +564,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # workflow_dispatch dry-runs must not mint a real Release object
+          # under the dispatched branch name — everything above this step
+          # (artifact download, formula/checksum/notes generation) still
+          # runs and is inspectable in the job logs/artifacts.
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.dry_run }}" == "true" ]]; then
+            echo "Dry-run (workflow_dispatch): skipping actual GitHub Release creation for ${{ github.ref_name }}"
+            exit 0
+          fi
+
           echo "Creating release ${{ github.ref_name }}..."
 
           if [[ "${{ steps.channel.outputs.is_prerelease }}" == "true" ]]; then
@@ -661,7 +670,12 @@ jobs:
           context: .
           file: ./Dockerfile.release
           platforms: ${{ matrix.platform }}
-          push: true
+          # Dry-run: build but don't push. Same guard used by the sandbox
+          # and preview-gateway image jobs below — without it, every
+          # workflow_dispatch (dry-run or not) overwrites the real
+          # `:beta-<platform>` tags, which create-docker-manifest then
+          # merges into the `:beta` channel operators pin to.
+          push: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
           # Per-platform intermediate tags. The manifest-merge job below
           # combines amd64+arm64 into the final multi-arch refs. Channel tag
           # (`latest` for stable, `beta` for prereleases) keeps stable users
@@ -681,6 +695,10 @@ jobs:
   create-docker-manifest:
     name: Create Docker Manifest
     needs: [build-and-push-docker, create-release]
+    # Merges per-platform tags that build-and-push-docker only pushes on a
+    # real run. On a workflow_dispatch dry-run those source tags don't
+    # exist, so skip the merge too (would otherwise fail on a missing tag).
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
