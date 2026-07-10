@@ -42,16 +42,46 @@ pub struct PebbleDnsProvider {
     management_url: String,
 }
 
+/// Env var that must be set to `1` for this provider to be constructible.
+///
+/// `PebbleDnsProvider` has no authentication and, unlike every other
+/// provider in this crate, is intentionally allowed to target loopback and
+/// private addresses -- it exists solely to drive a local Pebble test
+/// instance. Gating it behind an explicit opt-in keeps it out of production
+/// instances by default (mirrors the existing `ACME_INSECURE` precedent).
+const ALLOW_PEBBLE_PROVIDER_ENV: &str = "TEMPS_ALLOW_PEBBLE_PROVIDER";
+
 impl PebbleDnsProvider {
     pub fn new(credentials: PebbleCredentials) -> Result<Self, DnsError> {
+        if std::env::var(ALLOW_PEBBLE_PROVIDER_ENV).as_deref() != Ok("1") {
+            return Err(DnsError::Validation(format!(
+                "PebbleDnsProvider is disabled: it has no authentication and is intended only \
+                 for local ACME testing against a Pebble instance. Set {}=1 to enable it.",
+                ALLOW_PEBBLE_PROVIDER_ENV
+            )));
+        }
+
+        let management_url = credentials.management_url.trim_end_matches('/').to_string();
+
+        temps_core::url_validation::validate_loopback_or_private_url(&management_url).map_err(
+            |e| {
+                DnsError::Validation(format!(
+                    "Invalid Pebble management_url: {} (must be a loopback or private address -- \
+                     this provider only ever talks to a local Pebble instance)",
+                    e
+                ))
+            },
+        )?;
+
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| DnsError::ApiError(format!("Failed to create HTTP client: {}", e)))?;
 
         Ok(Self {
             client,
-            management_url: credentials.management_url.trim_end_matches('/').to_string(),
+            management_url,
         })
     }
 
@@ -81,9 +111,15 @@ impl PebbleDnsProvider {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
+            tracing::debug!(
+                "challtestsrv /set-txt for host '{}' returned status {}: {}",
+                host,
+                status,
+                body.chars().take(500).collect::<String>()
+            );
             return Err(DnsError::ApiError(format!(
-                "challtestsrv /set-txt returned status {}: {}",
-                status, body
+                "challtestsrv /set-txt failed for host '{}' with status {}",
+                host, status
             )));
         }
         Ok(())
@@ -102,9 +138,15 @@ impl PebbleDnsProvider {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
+            tracing::debug!(
+                "challtestsrv /clear-txt for host '{}' returned status {}: {}",
+                host,
+                status,
+                body.chars().take(500).collect::<String>()
+            );
             return Err(DnsError::ApiError(format!(
-                "challtestsrv /clear-txt returned status {}: {}",
-                status, body
+                "challtestsrv /clear-txt failed for host '{}' with status {}",
+                host, status
             )));
         }
         Ok(())
@@ -126,6 +168,24 @@ impl DnsProvider for PebbleDnsProvider {
     }
 
     async fn test_connection(&self) -> Result<bool, DnsError> {
+        // management_url's literal-IP case was already validated synchronously
+        // in new(); a hostname needs its resolved IPs checked here, same as
+        // validate_external_url/validate_domain_async's split in temps-webhooks.
+        if let Ok(parsed) = reqwest::Url::parse(&self.management_url) {
+            if let Some(host) = parsed.host_str() {
+                if host.parse::<std::net::IpAddr>().is_err() {
+                    temps_core::url_validation::validate_loopback_or_private_domain_async(host)
+                        .await
+                        .map_err(|e| {
+                            DnsError::Validation(format!(
+                                "Pebble management_url host '{}' failed validation: {}",
+                                host, e
+                            ))
+                        })?;
+                }
+            }
+        }
+
         // challtestsrv has no health endpoint; a throwaway set-txt/clear-txt
         // round trip is the simplest liveness probe available.
         let probe_host = "_temps-pebble-probe.invalid.";
@@ -235,6 +295,7 @@ impl DnsProvider for PebbleDnsProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn fqdn_appends_dot_and_joins_name() {
@@ -249,15 +310,55 @@ mod tests {
         assert_eq!(PebbleDnsProvider::fqdn("example.com", "@"), "example.com.");
         assert_eq!(PebbleDnsProvider::fqdn("example.com", ""), "example.com.");
     }
+
+    // These tests mutate the process-wide TEMPS_ALLOW_PEBBLE_PROVIDER env var,
+    // so they (and integration_tests, which also constructs providers) must
+    // not run concurrently with each other.
+    #[test]
+    #[serial(pebble_env_gate)]
+    fn new_rejects_when_gate_env_unset() {
+        std::env::remove_var(ALLOW_PEBBLE_PROVIDER_ENV);
+        let result = PebbleDnsProvider::new(PebbleCredentials {
+            management_url: "http://localhost:8055".to_string(),
+        });
+        assert!(matches!(result, Err(DnsError::Validation(_))));
+    }
+
+    #[test]
+    #[serial(pebble_env_gate)]
+    fn new_rejects_public_management_url_even_when_gated() {
+        std::env::set_var(ALLOW_PEBBLE_PROVIDER_ENV, "1");
+        let result = PebbleDnsProvider::new(PebbleCredentials {
+            management_url: "http://93.184.216.34:8055".to_string(),
+        });
+        std::env::remove_var(ALLOW_PEBBLE_PROVIDER_ENV);
+        assert!(matches!(result, Err(DnsError::Validation(_))));
+    }
+
+    #[test]
+    #[serial(pebble_env_gate)]
+    fn new_accepts_loopback_url_when_gated() {
+        std::env::set_var(ALLOW_PEBBLE_PROVIDER_ENV, "1");
+        let result = PebbleDnsProvider::new(PebbleCredentials {
+            management_url: "http://localhost:8055".to_string(),
+        });
+        std::env::remove_var(ALLOW_PEBBLE_PROVIDER_ENV);
+        assert!(result.is_ok());
+    }
 }
 
 #[cfg(test)]
 mod integration_tests {
     use super::*;
+    use serial_test::serial;
     use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn provider_for(mock_server: &MockServer) -> PebbleDnsProvider {
+        // Safety gate is opt-in (see ALLOW_PEBBLE_PROVIDER_ENV); these tests
+        // exercise the provider directly against a loopback wiremock server,
+        // which is exactly the intended use, so enable it for the process.
+        std::env::set_var(ALLOW_PEBBLE_PROVIDER_ENV, "1");
         PebbleDnsProvider::new(PebbleCredentials {
             management_url: mock_server.uri(),
         })
@@ -265,6 +366,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    #[serial(pebble_env_gate)]
     async fn create_record_publishes_txt_via_set_txt() {
         let mock_server = MockServer::start().await;
 
@@ -298,6 +400,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    #[serial(pebble_env_gate)]
     async fn create_record_rejects_non_txt_content() {
         let mock_server = MockServer::start().await;
         let provider = provider_for(&mock_server);
@@ -320,6 +423,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    #[serial(pebble_env_gate)]
     async fn remove_record_calls_clear_txt_directly_without_listing() {
         let mock_server = MockServer::start().await;
 
@@ -340,6 +444,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    #[serial(pebble_env_gate)]
     async fn remove_record_is_noop_for_non_txt_types() {
         let mock_server = MockServer::start().await;
         // No mock registered for /clear-txt -- if the provider called it,
@@ -353,6 +458,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    #[serial(pebble_env_gate)]
     async fn set_txt_error_response_surfaces_as_api_error() {
         let mock_server = MockServer::start().await;
 
@@ -381,6 +487,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    #[serial(pebble_env_gate)]
     async fn can_manage_domain_always_true() {
         let mock_server = MockServer::start().await;
         let provider = provider_for(&mock_server);

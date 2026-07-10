@@ -210,6 +210,11 @@ fn validate_seed_url(url: &str, kind: &str) -> Result<(), SandboxError> {
                 "host points to a private, loopback, or metadata address".to_string()
             }
             UrlValidationError::DnsResolutionFailed(m) => format!("dns: {m}"),
+            // Only ever returned by validate_loopback_or_private_url/_async
+            // (the inverse check used by local-only providers), never by
+            // validate_external_url -- unreachable here, kept explicit so
+            // this match stays exhaustive as the shared enum grows.
+            UrlValidationError::NotLocalOrPrivate => "unexpected validation error".to_string(),
         };
         SandboxError::Validation {
             message: format!("{kind} source: {detail}"),
