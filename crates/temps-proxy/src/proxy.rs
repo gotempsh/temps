@@ -389,6 +389,11 @@ pub struct ProxyContext {
     /// unlike the `Content-Length` header, this is always populated even for
     /// chunked-encoded request bodies.
     pub client_body_bytes_received: usize,
+    /// Proxy log entry built in `log_request` (response-header time), held
+    /// here rather than sent immediately because `upstream_body_bytes_received`
+    /// isn't fully accumulated until the response body finishes streaming.
+    /// The `logging` hook patches in the final byte count and sends it.
+    pub pending_proxy_log: Option<CreateProxyLogRequest>,
     /// Whether the client requested a Markdown response via `Accept: text/markdown`
     pub wants_markdown: bool,
     /// Accumulated body bytes for HTML-to-Markdown conversion
@@ -1348,7 +1353,7 @@ impl LoadBalancer {
         &self,
         _session: &PingoraSession,
         upstream_response: &ResponseHeader,
-        ctx: &ProxyContext,
+        ctx: &mut ProxyContext,
     ) -> Result<()> {
         // Skip logging for internal temps API routes
         if ctx.path.starts_with(ROUTE_PREFIX_TEMPS) {
@@ -1359,11 +1364,11 @@ impl LoadBalancer {
 
         // Asynchronously log to proxy_logs table via batch writer (skip static assets)
         if Self::should_log_request(&ctx.path) {
-            // Prefer bytes actually streamed through the proxy (accumulated in
-            // request_body_filter/response_body_filter) — Content-Length is
-            // absent for chunked/streamed bodies, which are common and would
-            // otherwise always log as 0. Fall back to Content-Length only for
-            // requests whose body never reached the filter (e.g. HEAD).
+            // Request body has already fully streamed through request_body_filter
+            // by the time response headers arrive (the client finishes sending
+            // before the upstream replies), so the accumulated count is reliable
+            // here. Fall back to Content-Length only for bodies that never
+            // reached the filter (e.g. HEAD).
             let request_size = if ctx.client_body_bytes_received > 0 {
                 Some(ctx.client_body_bytes_received as i64)
             } else {
@@ -1373,14 +1378,17 @@ impl LoadBalancer {
                     .and_then(|v| v.parse::<i64>().ok())
             };
 
-            let response_size = if ctx.upstream_body_bytes_received > 0 {
-                Some(ctx.upstream_body_bytes_received as i64)
-            } else {
-                ctx.response_headers
-                    .as_ref()
-                    .and_then(|h| h.get("content-length"))
-                    .and_then(|v| v.parse::<i64>().ok())
-            };
+            // This function runs when response *headers* arrive — the response
+            // body hasn't streamed through response_body_filter yet, so
+            // upstream_body_bytes_received is always 0 here. Content-Length is
+            // the best information available now; the `logging` hook (true
+            // end-of-request, after the body has fully streamed) overwrites
+            // this with the accumulated byte count before the entry is sent.
+            let response_size = ctx
+                .response_headers
+                .as_ref()
+                .and_then(|h| h.get("content-length"))
+                .and_then(|v| v.parse::<i64>().ok());
 
             // Extract cache status from response headers
             let cache_status = ctx
@@ -1436,10 +1444,10 @@ impl LoadBalancer {
                 error_group_id: None,
             };
 
-            // Non-blocking enqueue; sheds the entry when the writer is behind.
-            // Never spawn-and-await a send here: each parked send future pins
-            // the full log struct and the task list becomes an unbounded queue.
-            self.proxy_log_handle.send_or_drop(proxy_log_request);
+            // Stash rather than send: the `logging` hook fires after the
+            // response body has fully streamed and patches response_size_bytes
+            // with the accurate accumulated count before enqueueing.
+            ctx.pending_proxy_log = Some(proxy_log_request);
         }
 
         Ok(())
@@ -2299,6 +2307,7 @@ impl ProxyHttp for LoadBalancer {
             sni_hostname: None,
             upstream_body_bytes_received: 0,
             client_body_bytes_received: 0,
+            pending_proxy_log: None,
             wants_markdown: false,
             markdown_buffer: Vec::new(),
             upstream_connect_tries: 0,
@@ -4362,6 +4371,18 @@ impl ProxyHttp for LoadBalancer {
             ctx.upstream_response_time_ms,
             destination,
         );
+
+        // The response body has now fully streamed through response_body_filter
+        // (this hook fires in Pingora's finish(), after every body task), so
+        // upstream_body_bytes_received holds the real byte count. Patch it into
+        // the entry log_request stashed at header-time and send it now — this
+        // is the only place a proxied response's byte count is accurate.
+        if let Some(mut pending) = ctx.pending_proxy_log.take() {
+            if ctx.upstream_body_bytes_received > 0 {
+                pending.response_size_bytes = Some(ctx.upstream_body_bytes_received as i64);
+            }
+            self.proxy_log_handle.send_or_drop(pending);
+        }
     }
 }
 
@@ -4649,6 +4670,7 @@ mod markdown_tests {
             sni_hostname: None,
             upstream_body_bytes_received: 0,
             client_body_bytes_received: 0,
+            pending_proxy_log: None,
             wants_markdown: false,
             markdown_buffer: Vec::new(),
             upstream_connect_tries: 0,
@@ -5191,6 +5213,7 @@ mod markdown_pipeline_tests {
             sni_hostname: None,
             upstream_body_bytes_received: 0,
             client_body_bytes_received: 0,
+            pending_proxy_log: None,
             wants_markdown: false,
             markdown_buffer: Vec::new(),
             upstream_connect_tries: 0,
