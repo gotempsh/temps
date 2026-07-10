@@ -379,8 +379,16 @@ pub struct ProxyContext {
     pub tls_cipher: Option<String>,
     /// SNI hostname from TLS handshake (for SNI-based routing)
     pub sni_hostname: Option<String>,
-    /// Upstream response body bytes received (tracked by Pingora 0.8.0)
+    /// Upstream response body bytes actually forwarded to the client,
+    /// accumulated per-chunk in `response_body_filter`. Authoritative source
+    /// for response bandwidth — unlike the `Content-Length` header, this is
+    /// always populated even for chunked/streamed responses.
     pub upstream_body_bytes_received: usize,
+    /// Client request body bytes received, accumulated per-chunk in
+    /// `request_body_filter`. Authoritative source for request bandwidth —
+    /// unlike the `Content-Length` header, this is always populated even for
+    /// chunked-encoded request bodies.
+    pub client_body_bytes_received: usize,
     /// Whether the client requested a Markdown response via `Accept: text/markdown`
     pub wants_markdown: bool,
     /// Accumulated body bytes for HTML-to-Markdown conversion
@@ -1351,19 +1359,28 @@ impl LoadBalancer {
 
         // Asynchronously log to proxy_logs table via batch writer (skip static assets)
         if Self::should_log_request(&ctx.path) {
-            // Extract request size from Content-Length header
-            let request_size = ctx
-                .request_headers
-                .as_ref()
-                .and_then(|h| h.get("content-length"))
-                .and_then(|v| v.parse::<i64>().ok());
+            // Prefer bytes actually streamed through the proxy (accumulated in
+            // request_body_filter/response_body_filter) — Content-Length is
+            // absent for chunked/streamed bodies, which are common and would
+            // otherwise always log as 0. Fall back to Content-Length only for
+            // requests whose body never reached the filter (e.g. HEAD).
+            let request_size = if ctx.client_body_bytes_received > 0 {
+                Some(ctx.client_body_bytes_received as i64)
+            } else {
+                ctx.request_headers
+                    .as_ref()
+                    .and_then(|h| h.get("content-length"))
+                    .and_then(|v| v.parse::<i64>().ok())
+            };
 
-            // Extract response size from Content-Length header
-            let response_size = ctx
-                .response_headers
-                .as_ref()
-                .and_then(|h| h.get("content-length"))
-                .and_then(|v| v.parse::<i64>().ok());
+            let response_size = if ctx.upstream_body_bytes_received > 0 {
+                Some(ctx.upstream_body_bytes_received as i64)
+            } else {
+                ctx.response_headers
+                    .as_ref()
+                    .and_then(|h| h.get("content-length"))
+                    .and_then(|v| v.parse::<i64>().ok())
+            };
 
             // Extract cache status from response headers
             let cache_status = ctx
@@ -2142,6 +2159,102 @@ fn ephemeral_redirect_location(
     Some(location)
 }
 
+/// Core response-body-filter logic (SSE/WebSocket passthrough, buffered
+/// Markdown conversion, default passthrough). Split out as a free function
+/// so `response_body_filter` can wrap it with byte-counting that applies
+/// uniformly to every exit path — see `ProxyContext::upstream_body_bytes_received`.
+fn response_body_filter_inner(
+    body: &mut Option<Bytes>,
+    end_of_stream: bool,
+    ctx: &mut ProxyContext,
+) -> Result<Option<std::time::Duration>> {
+    // For SSE or WebSocket responses, pass through immediately without buffering
+    if ctx.is_sse || ctx.is_websocket {
+        if let Some(chunk) = body {
+            let stream_type = if ctx.is_sse { "SSE" } else { "WebSocket" };
+            debug!("Streaming {} chunk: {} bytes", stream_type, chunk.len());
+        }
+        return Ok(None);
+    }
+
+    // HTML-to-Markdown conversion: buffer chunks, convert on end_of_stream.
+    if ctx.wants_markdown {
+        if let Some(chunk) = body.take() {
+            // Enforce 2 MB limit — mirrors Cloudflare's Markdown for Agents constraint.
+            if ctx.markdown_buffer.len() + chunk.len() > MAX_MARKDOWN_BODY_BYTES {
+                warn!(
+                    "Response body exceeds 2 MB markdown conversion limit for path={}, \
+                     falling back to passthrough",
+                    ctx.path
+                );
+                // Disable markdown, flush the buffer + current chunk as-is.
+                ctx.wants_markdown = false;
+                let mut flushed = std::mem::take(&mut ctx.markdown_buffer);
+                flushed.extend_from_slice(&chunk);
+                *body = Some(Bytes::from(flushed));
+                return Ok(None);
+            }
+            ctx.markdown_buffer.extend_from_slice(&chunk);
+        }
+
+        if end_of_stream {
+            let html = String::from_utf8_lossy(&ctx.markdown_buffer);
+            // Parse the document once — reuse it for both meta extraction
+            // and content extraction.
+            let document = scraper::Html::parse_document(&html);
+            let meta = extract_page_meta(&document);
+            // Extract <main> (or <body> fallback), stripping script/style.
+            let content = extract_content_html(&document);
+            let markdown = match htmd::convert(&content) {
+                Ok(md) => md,
+                Err(e) => {
+                    warn!(
+                        "HTML-to-Markdown conversion failed for path={}: {}",
+                        ctx.path, e
+                    );
+                    // Fall back to the original HTML bytes so the client gets something.
+                    let original = std::mem::take(&mut ctx.markdown_buffer);
+                    *body = Some(Bytes::from(original));
+                    return Ok(None);
+                }
+            };
+
+            let token_estimate = estimate_markdown_tokens(&markdown);
+            debug!(
+                "Markdown conversion complete for path={}: {} bytes, ~{} tokens",
+                ctx.path,
+                markdown.len(),
+                token_estimate
+            );
+
+            // The x-markdown-tokens header must be a trailer because the response
+            // headers have already been sent. Pingora does not support HTTP trailers
+            // for regular HTTP/1.1 clients, so we log the value and skip injecting it
+            // into headers here — the header is set in response_filter instead via
+            // a sentinel value once we know the body size upfront (not possible when
+            // streaming).  Best-effort: we set it here anyway; Pingora will silently
+            // drop it if trailers are unsupported.
+            // Note: if you need reliable x-markdown-tokens delivery, switch to a
+            // buffered response pattern (write_response_* directly in request_filter).
+
+            // Prepend YAML front-matter built from <head> meta tags,
+            // matching Cloudflare's Markdown for Agents output format.
+            let final_markdown = match meta.to_frontmatter() {
+                Some(fm) => fm + &markdown,
+                None => markdown,
+            };
+
+            ctx.markdown_buffer = Vec::new(); // free memory
+            *body = Some(Bytes::from(final_markdown));
+        }
+        // Suppress intermediate chunks — only emit on end_of_stream.
+        return Ok(None);
+    }
+
+    // Default: pass all responses through without buffering
+    Ok(None)
+}
+
 #[async_trait]
 impl ProxyHttp for LoadBalancer {
     type CTX = ProxyContext;
@@ -2185,6 +2298,7 @@ impl ProxyHttp for LoadBalancer {
             tls_cipher: None,
             sni_hostname: None,
             upstream_body_bytes_received: 0,
+            client_body_bytes_received: 0,
             wants_markdown: false,
             markdown_buffer: Vec::new(),
             upstream_connect_tries: 0,
@@ -3771,6 +3885,30 @@ impl ProxyHttp for LoadBalancer {
         Ok(())
     }
 
+    /// Accumulate request body bytes as they stream in. The only reliable
+    /// way to measure upload size — chunked-encoded request bodies carry no
+    /// `Content-Length` header and would otherwise log as 0 (see `log_request`).
+    async fn request_body_filter(
+        &self,
+        _session: &mut PingoraSession,
+        body: &mut Option<Bytes>,
+        _end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        if let Some(chunk) = body.as_ref() {
+            ctx.client_body_bytes_received += chunk.len();
+        }
+        Ok(())
+    }
+
+    /// Thin wrapper over `response_body_filter_inner` that accumulates the
+    /// bytes actually forwarded to the client on every exit path (passthrough,
+    /// SSE/WebSocket, and the buffered Markdown conversion below). Chunked
+    /// responses carry no `Content-Length` header, so this accumulated count
+    /// is the only reliable source for response bandwidth (see `log_request`).
     fn response_body_filter(
         &self,
         _session: &mut PingoraSession,
@@ -3781,91 +3919,11 @@ impl ProxyHttp for LoadBalancer {
     where
         Self::CTX: Send + Sync,
     {
-        // For SSE or WebSocket responses, pass through immediately without buffering
-        if ctx.is_sse || ctx.is_websocket {
-            if let Some(chunk) = body {
-                let stream_type = if ctx.is_sse { "SSE" } else { "WebSocket" };
-                debug!("Streaming {} chunk: {} bytes", stream_type, chunk.len());
-            }
-            return Ok(None);
+        let result = response_body_filter_inner(body, end_of_stream, ctx);
+        if let Some(chunk) = body.as_ref() {
+            ctx.upstream_body_bytes_received += chunk.len();
         }
-
-        // HTML-to-Markdown conversion: buffer chunks, convert on end_of_stream.
-        if ctx.wants_markdown {
-            if let Some(chunk) = body.take() {
-                // Enforce 2 MB limit — mirrors Cloudflare's Markdown for Agents constraint.
-                if ctx.markdown_buffer.len() + chunk.len() > MAX_MARKDOWN_BODY_BYTES {
-                    warn!(
-                        "Response body exceeds 2 MB markdown conversion limit for path={}, \
-                         falling back to passthrough",
-                        ctx.path
-                    );
-                    // Disable markdown, flush the buffer + current chunk as-is.
-                    ctx.wants_markdown = false;
-                    let mut flushed = std::mem::take(&mut ctx.markdown_buffer);
-                    flushed.extend_from_slice(&chunk);
-                    *body = Some(Bytes::from(flushed));
-                    return Ok(None);
-                }
-                ctx.markdown_buffer.extend_from_slice(&chunk);
-            }
-
-            if end_of_stream {
-                let html = String::from_utf8_lossy(&ctx.markdown_buffer);
-                // Parse the document once — reuse it for both meta extraction
-                // and content extraction.
-                let document = scraper::Html::parse_document(&html);
-                let meta = extract_page_meta(&document);
-                // Extract <main> (or <body> fallback), stripping script/style.
-                let content = extract_content_html(&document);
-                let markdown = match htmd::convert(&content) {
-                    Ok(md) => md,
-                    Err(e) => {
-                        warn!(
-                            "HTML-to-Markdown conversion failed for path={}: {}",
-                            ctx.path, e
-                        );
-                        // Fall back to the original HTML bytes so the client gets something.
-                        let original = std::mem::take(&mut ctx.markdown_buffer);
-                        *body = Some(Bytes::from(original));
-                        return Ok(None);
-                    }
-                };
-
-                let token_estimate = estimate_markdown_tokens(&markdown);
-                debug!(
-                    "Markdown conversion complete for path={}: {} bytes, ~{} tokens",
-                    ctx.path,
-                    markdown.len(),
-                    token_estimate
-                );
-
-                // The x-markdown-tokens header must be a trailer because the response
-                // headers have already been sent. Pingora does not support HTTP trailers
-                // for regular HTTP/1.1 clients, so we log the value and skip injecting it
-                // into headers here — the header is set in response_filter instead via
-                // a sentinel value once we know the body size upfront (not possible when
-                // streaming).  Best-effort: we set it here anyway; Pingora will silently
-                // drop it if trailers are unsupported.
-                // Note: if you need reliable x-markdown-tokens delivery, switch to a
-                // buffered response pattern (write_response_* directly in request_filter).
-
-                // Prepend YAML front-matter built from <head> meta tags,
-                // matching Cloudflare's Markdown for Agents output format.
-                let final_markdown = match meta.to_frontmatter() {
-                    Some(fm) => fm + &markdown,
-                    None => markdown,
-                };
-
-                ctx.markdown_buffer = Vec::new(); // free memory
-                *body = Some(Bytes::from(final_markdown));
-            }
-            // Suppress intermediate chunks — only emit on end_of_stream.
-            return Ok(None);
-        }
-
-        // Default: pass all responses through without buffering
-        Ok(None)
+        result
     }
 
     async fn response_filter(
@@ -4206,12 +4264,16 @@ impl ProxyHttp for LoadBalancer {
 
         // Asynchronously log failed proxy request (skip static assets)
         if Self::should_log_request(&ctx.path) {
-            // Extract request size from Content-Length header
-            let request_size = ctx
-                .request_headers
-                .as_ref()
-                .and_then(|h| h.get("content-length"))
-                .and_then(|v| v.parse::<i64>().ok());
+            // Prefer bytes actually received from the client (see log_request);
+            // fall back to Content-Length if the body never reached the filter.
+            let request_size = if ctx.client_body_bytes_received > 0 {
+                Some(ctx.client_body_bytes_received as i64)
+            } else {
+                ctx.request_headers
+                    .as_ref()
+                    .and_then(|h| h.get("content-length"))
+                    .and_then(|v| v.parse::<i64>().ok())
+            };
 
             // For failed requests, response size is the error message size
             let response_size = Some(SERVICE_UNAVAILABLE_BODY.len() as i64);
@@ -4586,6 +4648,7 @@ mod markdown_tests {
             tls_cipher: None,
             sni_hostname: None,
             upstream_body_bytes_received: 0,
+            client_body_bytes_received: 0,
             wants_markdown: false,
             markdown_buffer: Vec::new(),
             upstream_connect_tries: 0,
@@ -5127,6 +5190,7 @@ mod markdown_pipeline_tests {
             tls_cipher: None,
             sni_hostname: None,
             upstream_body_bytes_received: 0,
+            client_body_bytes_received: 0,
             wants_markdown: false,
             markdown_buffer: Vec::new(),
             upstream_connect_tries: 0,
