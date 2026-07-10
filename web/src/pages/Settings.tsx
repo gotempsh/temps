@@ -33,6 +33,7 @@ import {
   Loader2,
   RefreshCw,
   Save,
+  ShieldCheck,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
@@ -40,7 +41,11 @@ import { toast } from 'sonner'
 
 type SettingsFormData = Pick<
   PlatformSettings,
-  'external_url' | 'internal_url' | 'preview_domain' | 'screenshots'
+  | 'external_url'
+  | 'internal_url'
+  | 'preview_domain'
+  | 'screenshots'
+  | 'letsencrypt'
 >
 
 export function Settings() {
@@ -66,10 +71,18 @@ export function Settings() {
         provider: 'local',
         url: '',
       },
+      letsencrypt: {
+        email: '',
+        environment: 'production',
+      },
     },
   })
 
   const screenshots = useWatch({ control, name: 'screenshots' })
+  const letsencryptEnvironment = useWatch({
+    control,
+    name: 'letsencrypt.environment',
+  })
 
   useEffect(() => {
     setBreadcrumbs([{ label: 'Settings' }])
@@ -88,6 +101,10 @@ export function Settings() {
           provider: 'local',
           url: '',
         },
+        letsencrypt: {
+          email: settings.letsencrypt?.email || '',
+          environment: settings.letsencrypt?.environment || 'production',
+        },
       })
     }
   }, [settings, reset])
@@ -98,7 +115,10 @@ export function Settings() {
       reset(data)
       toast.success('Settings saved successfully')
     } catch (err: any) {
-      const detail = err?.body?.detail || err?.message || 'Failed to save settings. Please try again.'
+      const detail =
+        err?.body?.detail ||
+        err?.message ||
+        'Failed to save settings. Please try again.'
       toast.error(detail)
     }
   }
@@ -147,11 +167,16 @@ export function Settings() {
                   if (!value) return true // optional
                   const trimmed = value.trim()
                   if (!trimmed) return true
-                  if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://'))
+                  if (
+                    !trimmed.startsWith('http://') &&
+                    !trimmed.startsWith('https://')
+                  )
                     return 'Must start with http:// or https://'
                   if (trimmed.includes('#') || trimmed.includes('?'))
                     return 'Must not contain # or ? characters'
-                  try { new URL(trimmed) } catch {
+                  try {
+                    new URL(trimmed)
+                  } catch {
                     return 'Must be a valid URL'
                   }
                   return true
@@ -159,7 +184,9 @@ export function Settings() {
               })}
             />
             {errors.external_url && (
-              <p className="text-sm text-destructive">{errors.external_url.message}</p>
+              <p className="text-sm text-destructive">
+                {errors.external_url.message}
+              </p>
             )}
             <p className="text-sm text-muted-foreground">
               Used for OAuth callbacks, webhooks, and external integrations
@@ -177,11 +204,16 @@ export function Settings() {
                   if (!value) return true // optional — falls back to default
                   const trimmed = value.trim()
                   if (!trimmed) return true
-                  if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://'))
+                  if (
+                    !trimmed.startsWith('http://') &&
+                    !trimmed.startsWith('https://')
+                  )
                     return 'Must start with http:// or https://'
                   if (trimmed.includes('#') || trimmed.includes('?'))
                     return 'Must not contain # or ? characters'
-                  try { new URL(trimmed) } catch {
+                  try {
+                    new URL(trimmed)
+                  } catch {
                     return 'Must be a valid URL'
                   }
                   return true
@@ -189,12 +221,17 @@ export function Settings() {
               })}
             />
             {errors.internal_url && (
-              <p className="text-sm text-destructive">{errors.internal_url.message}</p>
+              <p className="text-sm text-destructive">
+                {errors.internal_url.message}
+              </p>
             )}
             <p className="text-sm text-muted-foreground">
               How service containers reach the Temps API from inside the Docker
               network (OTLP metrics ingest, agent callbacks). Leave blank to use{' '}
-              <code className="font-mono text-xs">http://host.docker.internal:&lt;proxy-port&gt;</code>.
+              <code className="font-mono text-xs">
+                http://host.docker.internal:&lt;proxy-port&gt;
+              </code>
+              .
             </p>
           </div>
         </CardContent>
@@ -222,6 +259,80 @@ export function Settings() {
             <p className="text-sm text-muted-foreground">
               Deployments will be accessible at subdomain.
               {settings?.preview_domain || 'localho.st'}
+            </p>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <ShieldCheck className="h-5 w-5" />
+            Let&apos;s Encrypt
+          </CardTitle>
+          <CardDescription>
+            Contact email for automatic TLS certificate issuance and renewal
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="space-y-2">
+            <Label htmlFor="letsencrypt-email">Contact Email</Label>
+            <Input
+              id="letsencrypt-email"
+              type="email"
+              placeholder="ops@your-domain.com"
+              {...register('letsencrypt.email', {
+                validate: (value) => {
+                  if (!value) return true // optional, but renewals will fail without it
+                  const trimmed = value.trim()
+                  if (!trimmed) return true
+                  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed))
+                    return 'Must be a valid email address'
+                  return true
+                },
+              })}
+            />
+            {errors.letsencrypt?.email && (
+              <p className="text-sm text-destructive">
+                {errors.letsencrypt.email.message}
+              </p>
+            )}
+            {!settings?.letsencrypt?.email && (
+              <p className="text-sm text-amber-600 dark:text-amber-500">
+                No contact email configured — certificate issuance and automatic
+                renewal will fail until this is set.
+              </p>
+            )}
+            <p className="text-sm text-muted-foreground">
+              Let&apos;s Encrypt requires a real contact email to register an
+              ACME account. Used for all certificate provisioning and background
+              auto-renewal (HTTP-01 and DNS-01).
+            </p>
+          </div>
+
+          <div className="space-y-2 pt-4">
+            <Label htmlFor="letsencrypt-environment">Environment</Label>
+            <Select
+              value={letsencryptEnvironment}
+              onValueChange={(value: 'production' | 'staging') =>
+                setValue('letsencrypt.environment', value, {
+                  shouldDirty: true,
+                })
+              }
+            >
+              <SelectTrigger id="letsencrypt-environment">
+                <SelectValue placeholder="Select environment" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="production">Production</SelectItem>
+                <SelectItem value="staging">
+                  Staging (testing, avoids rate limits)
+                </SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-sm text-muted-foreground">
+              Staging certificates are not trusted by browsers — use only for
+              testing to avoid Let&apos;s Encrypt&apos;s production rate limits.
             </p>
           </div>
         </CardContent>
@@ -312,8 +423,9 @@ export function Settings() {
             Route Table
           </CardTitle>
           <CardDescription>
-            Manually refresh the proxy route table from the database. Use this if
-            routes appear out of sync after deployments or configuration changes.
+            Manually refresh the proxy route table from the database. Use this
+            if routes appear out of sync after deployments or configuration
+            changes.
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -329,8 +441,7 @@ export function Settings() {
                   security: [{ scheme: 'bearer', type: 'http' }],
                 })
                 const data = response.data as
-                  | { route_count: number; message: string }
-                  | undefined
+                  { route_count: number; message: string } | undefined
                 toast.success(
                   data?.message || 'Route table refreshed successfully'
                 )
@@ -362,7 +473,11 @@ export function Settings() {
             <p className="text-sm text-muted-foreground">
               You have unsaved changes
             </p>
-            <Button type="submit" disabled={isSubmitting} className="w-full sm:w-auto">
+            <Button
+              type="submit"
+              disabled={isSubmitting}
+              className="w-full sm:w-auto"
+            >
               {isSubmitting ? (
                 <>
                   <Loader2 className="mr-2 h-4 w-4 animate-spin" />
