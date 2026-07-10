@@ -434,7 +434,16 @@ jobs:
 
       - name: Generate Homebrew formula
         run: |
-          VERSION="${GITHUB_REF#refs/tags/v}"
+          # workflow_dispatch runs against a branch, not a tag, so GITHUB_REF
+          # is refs/heads/<branch> and the prefix-strip below leaves it
+          # untouched -- if the branch name contains a `/` (as most do),
+          # that lands in VERSION and breaks the `sed -e "s/.../.../"` call
+          # below (VERSION's `/` collides with sed's own delimiter).
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            VERSION="dryrun-${{ github.run_id }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          fi
           SHA256_LINUX_AMD64=$(awk '{print $1}' release/temps-linux-amd64.tar.gz.sha256)
           SHA256_LINUX_ARM64=$(awk '{print $1}' release/temps-linux-arm64.tar.gz.sha256)
           SHA256_DARWIN_AMD64=$(awk '{print $1}' release/temps-darwin-amd64.tar.gz.sha256)
@@ -653,7 +662,15 @@ jobs:
       - name: Extract version
         id: version
         run: |
-          VERSION="${GITHUB_REF#refs/tags/v}"
+          # See the matching comment in create-release's "Generate Homebrew
+          # formula" step: workflow_dispatch runs against a branch ref, so
+          # this would otherwise leave a `/`-containing string in VERSION,
+          # which is invalid in a Docker tag component.
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            VERSION="dryrun-${{ github.run_id }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Version: $VERSION"
 
@@ -714,7 +731,15 @@ jobs:
       - name: Extract version
         id: version
         run: |
-          VERSION="${GITHUB_REF#refs/tags/v}"
+          # See the matching comment in create-release's "Generate Homebrew
+          # formula" step: workflow_dispatch runs against a branch ref, so
+          # this would otherwise leave a `/`-containing string in VERSION,
+          # which is invalid in a Docker tag component.
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            VERSION="dryrun-${{ github.run_id }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Version: $VERSION"
 
