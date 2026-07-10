@@ -593,6 +593,8 @@ mod tests {
             mfa_recovery_codes: None,
             oidc_subject: None,
             oidc_provider_id: None,
+            saml_provider_id: None,
+            saml_subject: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

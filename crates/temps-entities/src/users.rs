@@ -29,6 +29,8 @@ pub struct Model {
     pub mfa_recovery_codes: Option<String>,
     pub oidc_subject: Option<String>,
     pub oidc_provider_id: Option<i32>,
+    pub saml_subject: Option<String>,
+    pub saml_provider_id: Option<i32>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }
@@ -49,6 +51,14 @@ pub enum Relation {
         on_delete = "SetNull"
     )]
     OidcProvider,
+    #[sea_orm(
+        belongs_to = "super::saml_providers::Entity",
+        from = "Column::SamlProviderId",
+        to = "super::saml_providers::Column::Id",
+        on_update = "NoAction",
+        on_delete = "SetNull"
+    )]
+    SamlProvider,
 }
 
 impl Related<super::sessions::Entity> for Entity {
@@ -72,6 +82,12 @@ impl Related<super::user_roles::Entity> for Entity {
 impl Related<super::oidc_providers::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::OidcProvider.def()
+    }
+}
+
+impl Related<super::saml_providers::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::SamlProvider.def()
     }
 }
 

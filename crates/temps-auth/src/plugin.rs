@@ -131,6 +131,7 @@ impl TempsPlugin for AuthPlugin {
         // Use the existing configure_routes function which includes all endpoints
         let auth_routes = handlers::configure_routes()
             .merge(crate::oidc_handler::configure_oidc_routes())
+            .merge(crate::saml_handler::configure_saml_routes())
             .with_state(auth_state);
         Some(PluginRoutes::new(auth_routes))
     }
@@ -144,6 +145,7 @@ impl TempsPlugin for AuthPlugin {
         let auth_schema = <handlers::AuthApiDoc as OpenApiTrait>::openapi();
         let user_schema = <handlers::UserApiDoc as OpenApiTrait>::openapi();
         let oidc_schema = <crate::oidc_handler::OidcApiDoc as OpenApiTrait>::openapi();
+        let saml_schema = <crate::saml_handler::SamlApiDoc as OpenApiTrait>::openapi();
 
         // Create a new combined OpenAPI schema
         let mut combined = OpenApiBuilder::new()
@@ -170,13 +172,17 @@ impl TempsPlugin for AuthPlugin {
         for (path, path_item) in oidc_schema.paths.paths {
             combined.paths.paths.insert(path, path_item);
         }
+        for (path, path_item) in saml_schema.paths.paths {
+            combined.paths.paths.insert(path, path_item);
+        }
 
-        // Merge components from auth, user, and OIDC schemas.
+        // Merge components from auth, user, OIDC, and SAML schemas.
         let mut merged_components = ComponentsBuilder::new();
         for schema_source in [
             auth_schema.components.as_ref(),
             user_schema.components.as_ref(),
             oidc_schema.components.as_ref(),
+            saml_schema.components.as_ref(),
         ]
         .into_iter()
         .flatten()

@@ -218,6 +218,55 @@ pub struct OidcRoleMappingDeletedAudit {
     pub mapping_id: i32,
 }
 
+// SAML provider configuration audits -- same rationale as the OIDC audits
+// above (ADR 0013): SSO provider config controls who can log in and with
+// what role, so every mutation gets a row.
+#[derive(Debug, Clone, Serialize)]
+pub struct SamlProviderCreatedAudit {
+    pub context: AuditContext,
+    pub provider_id: i32,
+    pub name: String,
+    pub idp_entity_id: String,
+    pub template: String,
+    pub enabled: bool,
+    pub jit_provisioning: bool,
+    /// See `OidcProviderCreatedAudit::trust_idp_email` -- same rationale,
+    /// though SAML's field defaults `true` rather than `false` (ADR 0013 §3).
+    pub trust_idp_email: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SamlProviderUpdatedAudit {
+    pub context: AuditContext,
+    pub provider_id: i32,
+    pub name: String,
+    pub fields_changed: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SamlProviderDeletedAudit {
+    pub context: AuditContext,
+    pub provider_id: i32,
+    pub name: String,
+    pub idp_entity_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SamlRoleMappingCreatedAudit {
+    pub context: AuditContext,
+    pub provider_id: i32,
+    pub mapping_id: i32,
+    pub idp_group: String,
+    pub role: String,
+    pub priority: i32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SamlRoleMappingDeletedAudit {
+    pub context: AuditContext,
+    pub mapping_id: i32,
+}
+
 // Implement AuditOperation for each struct
 impl AuditOperation for LoginAudit {
     fn operation_type(&self) -> String {
@@ -642,4 +691,9 @@ impl_oidc_audit_op!(OidcProviderCreatedAudit, "OIDC_PROVIDER_CREATED");
 impl_oidc_audit_op!(OidcProviderUpdatedAudit, "OIDC_PROVIDER_UPDATED");
 impl_oidc_audit_op!(OidcProviderDeletedAudit, "OIDC_PROVIDER_DELETED");
 impl_oidc_audit_op!(OidcRoleMappingCreatedAudit, "OIDC_ROLE_MAPPING_CREATED");
+impl_oidc_audit_op!(SamlProviderCreatedAudit, "SAML_PROVIDER_CREATED");
+impl_oidc_audit_op!(SamlProviderUpdatedAudit, "SAML_PROVIDER_UPDATED");
+impl_oidc_audit_op!(SamlProviderDeletedAudit, "SAML_PROVIDER_DELETED");
+impl_oidc_audit_op!(SamlRoleMappingCreatedAudit, "SAML_ROLE_MAPPING_CREATED");
+impl_oidc_audit_op!(SamlRoleMappingDeletedAudit, "SAML_ROLE_MAPPING_DELETED");
 impl_oidc_audit_op!(OidcRoleMappingDeletedAudit, "OIDC_ROLE_MAPPING_DELETED");

@@ -41,6 +41,15 @@ urlencoding = { workspace = true }
 tracing = { workspace = true }
 openidconnect = { workspace = true }
 reqwest = { workspace = true }
+# SAML 2.0 SP-initiated SSO. `xmlsec` (default feature) binds to libxmlsec1
+# via FFI for XML-DSig signature verification -- chosen over a hand-rolled
+# or pure-Rust alternative because XML-DSig/C14N is the root cause of
+# numerous real-world SAML SP auth-bypass CVEs when implemented without a
+# hardened, battle-tested library. Requires libxmlsec1(-dev), libxml2,
+# libclang, openssl, pkg-config at build time; Alpine's runtime package is
+# named `xmlsec` (see Dockerfile).
+samael = { version = "=0.0.18", features = ["xmlsec"] }
+openssl = "0.10"
 
 [dev-dependencies]
 temps-migrations = { path = "../temps-migrations" }

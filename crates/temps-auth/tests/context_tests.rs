@@ -20,6 +20,8 @@ fn create_mock_user() -> users::Model {
         mfa_recovery_codes: None,
         oidc_subject: None,
         oidc_provider_id: None,
+        saml_subject: None,
+        saml_provider_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }

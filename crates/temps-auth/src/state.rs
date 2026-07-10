@@ -28,6 +28,8 @@ pub struct AuthState {
     pub deployment_token_service: Arc<DeploymentTokenValidationService>,
     /// OIDC SSO service
     pub oidc_service: Arc<crate::oidc_service::OidcService>,
+    /// SAML SSO service
+    pub saml_service: Arc<crate::saml_service::SamlService>,
     /// Anonymous product telemetry reporter
     pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
 }
@@ -51,6 +53,10 @@ impl AuthState {
             encryption_service.clone(),
             user_service.clone(),
         ));
+        let saml_service = Arc::new(crate::saml_service::SamlService::new(
+            db.clone(),
+            user_service.clone(),
+        ));
         Self {
             db,
             auth_service,
@@ -61,6 +67,7 @@ impl AuthState {
             cookie_crypto,
             deployment_token_service,
             oidc_service,
+            saml_service,
             telemetry,
         }
     }

@@ -274,6 +274,8 @@ async fn ensure_system_user(db: &sea_orm::DatabaseConnection) -> anyhow::Result<
             mfa_recovery_codes: Set(None),
             oidc_subject: Set(None),
             oidc_provider_id: Set(None),
+            saml_subject: Set(None),
+            saml_provider_id: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
         };

@@ -85,10 +85,13 @@ RUN test -f /app/temps || { \
 FROM alpine:3.20
 
 # Install runtime dependencies
+# xmlsec: SAML 2.0 XML-DSig signature verification (ADR 0013). Alpine's
+# package is named `xmlsec`, not `libxmlsec1` as in Debian/Ubuntu.
 RUN apk add --no-cache \
     ca-certificates \
     libssl3 \
-    postgresql-client
+    postgresql-client \
+    xmlsec
 
 # Create app user
 RUN addgroup -g 1001 -S appgroup && \

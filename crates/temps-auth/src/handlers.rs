@@ -401,6 +401,11 @@ pub fn configure_routes() -> Router<Arc<AuthState>> {
             "/auth/oidc/callback",
             get(crate::oidc_handler::oidc_callback),
         )
+        .route(
+            "/auth/saml/login/{slug}",
+            get(crate::saml_handler::start_saml_login_by_slug),
+        )
+        .route("/auth/saml/acs", post(crate::saml_handler::saml_acs))
         .layer(axum::Extension(rate_limiter))
         .layer(axum::middleware::from_fn(auth_rate_limit_middleware));
 
@@ -2029,9 +2034,11 @@ mod tests {
             super::configure_routes();
         let oidc_routes: axum::Router<std::sync::Arc<crate::state::AuthState>> =
             crate::oidc_handler::configure_oidc_routes();
+        let saml_routes: axum::Router<std::sync::Arc<crate::state::AuthState>> =
+            crate::saml_handler::configure_saml_routes();
         // This call panics if any route overlaps. Just performing the merge
         // is the assertion — no need to inspect the result.
-        let _merged = auth_routes.merge(oidc_routes);
+        let _merged = auth_routes.merge(oidc_routes).merge(saml_routes);
     }
 
     /// The login handler must return a constant 401 detail for both
