@@ -22,8 +22,12 @@
 //!
 //! Backfill of pre-existing data is handled by `run_post_migration_backfill()`
 //! in temps-database (a `CALL refresh_continuous_aggregate()` cannot run
-//! inside the migration transaction); until it completes, real-time
-//! aggregation still answers queries correctly, just at raw-scan cost.
+//! inside the migration transaction). It refreshes in 1-day windows, newest
+//! first, so recent dashboard ranges become correct within the first chunk
+//! and no single refresh transaction has to chew through the whole retention
+//! window at once. Regions the backfill hasn't reached yet under-report once
+//! the refresh policy has advanced the watermark; that window is transient
+//! and self-heals as the chunks complete.
 
 use sea_orm_migration::prelude::*;
 

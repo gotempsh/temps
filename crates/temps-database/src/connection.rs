@@ -558,16 +558,57 @@ pub async fn get_pending_migration_names(db: &DbConnection) -> ServiceResult<Vec
 ///
 /// Run this on a long-lived runtime (e.g. via `tokio::spawn`) so it never blocks
 /// startup; it is decoupled from `establish_connection` for exactly that reason.
+/// One continuous-aggregate refresh window: optional start (`None` = NULL,
+/// i.e. unbounded) and end, both as SQL expressions.
+type RefreshWindow = (Option<String>, String);
+
 pub async fn run_post_migration_backfill(db: &DatabaseConnection) -> ServiceResult<()> {
-    // (view name, refresh window end). Each window end mirrors the
-    // aggregate's own refresh-policy end_offset so the backfill never
-    // overlaps the region the policy is responsible for.
-    let aggregates: [(&str, &str); 2] = [
-        ("events_hourly", "NOW() - INTERVAL '1 hour'"),
-        ("proxy_logs_stats_1m", "NOW() - INTERVAL '1 minute'"),
+    // Refresh windows per aggregate, executed in order. `None` as a bound
+    // means unbounded (NULL). Window ends mirror each aggregate's
+    // refresh-policy end_offset so the backfill never overlaps the region
+    // the policy is responsible for.
+    //
+    // `proxy_logs_stats_1m` is chunked into 1-day windows, NEWEST FIRST,
+    // instead of one unbounded call, for two reasons on large installs
+    // (100M+ retained rows):
+    //   * Each `CALL refresh_continuous_aggregate()` is one transaction; a
+    //     single 30-day refresh over that volume is a multi-minute
+    //     transaction with heavy WAL churn. Day-sized chunks keep each
+    //     transaction small.
+    //   * Once the every-minute refresh policy runs, the aggregate's
+    //     watermark advances and real-time aggregation stops covering
+    //     older, still-unmaterialized regions — queries would under-report
+    //     history until the backfill reaches it. Newest-first chunking
+    //     makes the dashboard's common windows (1h/6h/24h) correct after
+    //     the first chunk, then works backwards.
+    // The final unbounded window sweeps anything older than the loop
+    // covers (e.g. rows the 30-day retention hasn't dropped yet); it is a
+    // no-op when empty.
+    let proxy_stats_windows: Vec<RefreshWindow> = (1..=30)
+        .map(|d| {
+            let start = Some(format!("NOW() - INTERVAL '{d} days'"));
+            let end = if d == 1 {
+                "NOW() - INTERVAL '1 minute'".to_string()
+            } else {
+                format!("NOW() - INTERVAL '{} days'", d - 1)
+            };
+            (start, end)
+        })
+        .chain(std::iter::once((
+            None,
+            "NOW() - INTERVAL '30 days'".to_string(),
+        )))
+        .collect();
+
+    let aggregates: [(&str, Vec<RefreshWindow>); 2] = [
+        (
+            "events_hourly",
+            vec![(None, "NOW() - INTERVAL '1 hour'".to_string())],
+        ),
+        ("proxy_logs_stats_1m", proxy_stats_windows),
     ];
 
-    for (view_name, window_end) in aggregates {
+    for (view_name, windows) in aggregates {
         // Check the aggregate exists before attempting backfill (it may not
         // if the creating migration hasn't run on this install yet).
         let check_sql = format!(
@@ -597,21 +638,35 @@ pub async fn run_post_migration_backfill(db: &DatabaseConnection) -> ServiceResu
         }
 
         debug!("Backfilling {view_name} continuous aggregate");
-        let backfill_sql =
-            format!("CALL refresh_continuous_aggregate('{view_name}', NULL, {window_end})");
-        if let Err(e) = db
-            .execute(Statement::from_string(
-                sea_orm::DatabaseBackend::Postgres,
-                backfill_sql,
-            ))
-            .await
-        {
-            // Log but don't fail startup — the refresh policy will catch up
-            tracing::warn!(
-                "Failed to backfill {view_name} aggregate (refresh policy will catch up): {e}"
+        let mut failed = 0usize;
+        for (window_start, window_end) in &windows {
+            let start_sql = window_start.as_deref().unwrap_or("NULL");
+            let backfill_sql = format!(
+                "CALL refresh_continuous_aggregate('{view_name}', {start_sql}, {window_end})"
             );
-        } else {
+            if let Err(e) = db
+                .execute(Statement::from_string(
+                    sea_orm::DatabaseBackend::Postgres,
+                    backfill_sql,
+                ))
+                .await
+            {
+                // Log but keep going — later windows are independent, and
+                // the refresh policy will eventually catch up regardless.
+                failed += 1;
+                tracing::warn!(
+                    "Failed to backfill {view_name} window [{start_sql}, {window_end}] \
+                     (refresh policy will catch up): {e}"
+                );
+            }
+        }
+        if failed == 0 {
             debug!("{view_name} continuous aggregate backfill complete");
+        } else {
+            tracing::warn!(
+                "{view_name} continuous aggregate backfill finished with {failed} of {} windows failed",
+                windows.len()
+            );
         }
     }
 
