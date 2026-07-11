@@ -559,48 +559,59 @@ pub async fn get_pending_migration_names(db: &DbConnection) -> ServiceResult<Vec
 /// Run this on a long-lived runtime (e.g. via `tokio::spawn`) so it never blocks
 /// startup; it is decoupled from `establish_connection` for exactly that reason.
 pub async fn run_post_migration_backfill(db: &DatabaseConnection) -> ServiceResult<()> {
-    // Check if the events_hourly continuous aggregate exists before attempting backfill
-    let check_sql = r#"
-        SELECT EXISTS (
-            SELECT 1 FROM timescaledb_information.continuous_aggregates
-            WHERE view_name = 'events_hourly'
-        ) as exists
-    "#;
+    // (view name, refresh window end). Each window end mirrors the
+    // aggregate's own refresh-policy end_offset so the backfill never
+    // overlaps the region the policy is responsible for.
+    let aggregates: [(&str, &str); 2] = [
+        ("events_hourly", "NOW() - INTERVAL '1 hour'"),
+        ("proxy_logs_stats_1m", "NOW() - INTERVAL '1 minute'"),
+    ];
 
-    let row = db
-        .query_one(Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            check_sql,
-        ))
-        .await
-        .map_err(|e| {
-            ServiceError::Database(format!(
-                "Failed to check for events_hourly aggregate: {}",
-                e
+    for (view_name, window_end) in aggregates {
+        // Check the aggregate exists before attempting backfill (it may not
+        // if the creating migration hasn't run on this install yet).
+        let check_sql = format!(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM timescaledb_information.continuous_aggregates
+                WHERE view_name = '{view_name}'
+            ) as exists
+            "#
+        );
+
+        let row = db
+            .query_one(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                check_sql,
             ))
-        })?;
+            .await
+            .map_err(|e| {
+                ServiceError::Database(format!("Failed to check for {view_name} aggregate: {e}"))
+            })?;
 
-    if let Some(row) = row {
-        let exists: bool = row.try_get("", "exists").unwrap_or(false);
-        if exists {
-            debug!("Backfilling events_hourly continuous aggregate");
-            let backfill_sql =
-                "CALL refresh_continuous_aggregate('events_hourly', NULL, NOW() - INTERVAL '1 hour')";
-            if let Err(e) = db
-                .execute(Statement::from_string(
-                    sea_orm::DatabaseBackend::Postgres,
-                    backfill_sql,
-                ))
-                .await
-            {
-                // Log but don't fail startup — the refresh policy will catch up
-                tracing::warn!(
-                    "Failed to backfill events_hourly aggregate (refresh policy will catch up): {}",
-                    e
-                );
-            } else {
-                debug!("events_hourly continuous aggregate backfill complete");
-            }
+        let exists = row
+            .map(|r| r.try_get("", "exists").unwrap_or(false))
+            .unwrap_or(false);
+        if !exists {
+            continue;
+        }
+
+        debug!("Backfilling {view_name} continuous aggregate");
+        let backfill_sql =
+            format!("CALL refresh_continuous_aggregate('{view_name}', NULL, {window_end})");
+        if let Err(e) = db
+            .execute(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                backfill_sql,
+            ))
+            .await
+        {
+            // Log but don't fail startup — the refresh policy will catch up
+            tracing::warn!(
+                "Failed to backfill {view_name} aggregate (refresh policy will catch up): {e}"
+            );
+        } else {
+            debug!("{view_name} continuous aggregate backfill complete");
         }
     }
 
