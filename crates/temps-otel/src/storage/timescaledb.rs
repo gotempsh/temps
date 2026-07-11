@@ -119,7 +119,9 @@ pub struct TimescaleDbStorage {
     /// rationale.
     #[allow(dead_code)]
     retention_days: u32,
-    quota_bytes_per_project: u64,
+    /// Per-project storage quota. `None` disables quota enforcement: ingest
+    /// never runs the per-project usage estimate (see `get_storage_quota`).
+    quota_bytes_per_project: Option<u64>,
 }
 
 /// S3 log archiver configuration.
@@ -235,7 +237,7 @@ impl TimescaleDbStorage {
             db,
             s3_client,
             retention_days: 7,
-            quota_bytes_per_project: 10 * 1024 * 1024 * 1024,
+            quota_bytes_per_project: None,
         }
     }
 
@@ -244,7 +246,7 @@ impl TimescaleDbStorage {
         db: Arc<DatabaseConnection>,
         s3_client: Option<Arc<S3LogArchiver>>,
         retention_days: u32,
-        quota_bytes_per_project: u64,
+        quota_bytes_per_project: Option<u64>,
     ) -> Self {
         Self {
             db,
@@ -2257,7 +2259,7 @@ impl OtelStorage for TimescaleDbStorage {
             None => 0,
         };
 
-        let limit_bytes: u64 = self.quota_bytes_per_project;
+        let limit_bytes: u64 = self.quota_bytes_per_project.unwrap_or(0);
         let usage_pct = if limit_bytes > 0 {
             (total_bytes as f64 / limit_bytes as f64) * 100.0
         } else {
@@ -2276,6 +2278,13 @@ impl OtelStorage for TimescaleDbStorage {
     }
 
     async fn check_quota(&self, project_id: i32) -> StorageResult<bool> {
+        // Quota is opt-in. With no limit configured, skip the per-project
+        // usage estimate entirely — it runs on every ingest request and its
+        // three per-project COUNT(*) hypertable scans are far too expensive
+        // to pay for a check whose answer is always "not exceeded".
+        if self.quota_bytes_per_project.is_none() {
+            return Ok(false);
+        }
         let quota = self.get_storage_quota(project_id).await?;
         Ok(quota.usage_pct >= 100.0)
     }

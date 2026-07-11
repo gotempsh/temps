@@ -485,12 +485,22 @@ async fn test_storage_quota() {
         return;
     };
 
+    // Default storage has no quota configured: usage is still reported but
+    // there is no limit, and check_quota short-circuits to "not exceeded".
     let quota = storage.get_storage_quota(1).await.unwrap();
     assert_eq!(quota.project_id, 1);
-    assert_eq!(quota.limit_bytes, 10 * 1024 * 1024 * 1024); // 10 GB
-    assert!(quota.usage_pct >= 0.0);
+    assert_eq!(quota.limit_bytes, 0);
+    assert_eq!(quota.usage_pct, 0.0);
 
     let exceeded = storage.check_quota(1).await.unwrap();
+    assert!(!exceeded);
+
+    // With an explicit quota, the check runs for real against a fresh DB.
+    let storage_with_quota =
+        TimescaleDbStorage::with_config(_db.db.clone(), None, 7, Some(10 * 1024 * 1024 * 1024));
+    let quota = storage_with_quota.get_storage_quota(1).await.unwrap();
+    assert_eq!(quota.limit_bytes, 10 * 1024 * 1024 * 1024);
+    let exceeded = storage_with_quota.check_quota(1).await.unwrap();
     assert!(!exceeded); // Fresh DB, should not be exceeded
 }
 
