@@ -18,6 +18,8 @@ pub struct Model {
     pub country_code: Option<String>,
     pub timezone: Option<String>,
     pub is_eu: bool,
+    pub asn_org: Option<String>,
+    pub is_hosting_provider: Option<bool>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }
