@@ -200,7 +200,6 @@ pub fn sign_node_csr(
     }
     csr.params.subject_alt_names = sans;
 
-
     let leaf = csr.signed_by(&issuer).map_err(|e| PkiError::CsrSign {
         reason: e.to_string(),
     })?;
