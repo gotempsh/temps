@@ -101,7 +101,7 @@
     "@hey-api/client-fetch": "^0.13.1",
     "@hey-api/openapi-ts": "0.99.0",
     "@rsbuild/core": "^2.1.4",
-    "@rsbuild/plugin-react": "^1.4.0",
+    "@rsbuild/plugin-react": "^2.1.0",
     "@tailwindcss/typography": "^0.5.20",
     "@types/react": "^19.1.12",
     "@types/react-dom": "^19.2.3",
