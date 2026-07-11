@@ -708,8 +708,8 @@ function MetricChart({ serviceId, metricName, range }: MetricChartProps) {
           labelStyle={TOOLTIP_LABEL_STYLE}
           itemStyle={{ color: CHART_LINE_COLOR }}
           cursor={{ stroke: 'rgba(128,128,128,0.3)', strokeWidth: 1 }}
-          formatter={(v: number) => [
-            formatMetricValue(metricName, v),
+          formatter={(v) => [
+            formatMetricValue(metricName, Number(v)),
             labelForMetric(metricName),
           ]}
         />

@@ -427,10 +427,7 @@ function ChartPanel({
                   contentStyle={TOOLTIP_CONTENT_STYLE}
                   labelStyle={TOOLTIP_LABEL_STYLE}
                   cursor={{ stroke: 'rgba(128,128,128,0.3)', strokeWidth: 1 }}
-                  formatter={(v: number, name: string) => [
-                    valueFormatter(v),
-                    name,
-                  ]}
+                  formatter={(v, name) => [valueFormatter(Number(v)), name]}
                 />
                 {series.map((s) => (
                   <Line
