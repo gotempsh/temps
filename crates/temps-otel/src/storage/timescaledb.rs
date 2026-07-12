@@ -2219,6 +2219,23 @@ impl OtelStorage for TimescaleDbStorage {
     }
 
     async fn get_storage_quota(&self, project_id: i32) -> StorageResult<StorageQuota> {
+        // Quota is opt-in. With no limit configured, skip the usage estimate
+        // entirely and report zeros: this method sits on the ingest hot path
+        // (`OtelService::check_quota` calls it on every quota-cache miss), and
+        // its three per-project COUNT(*) hypertable scans are far too
+        // expensive to pay for a limit that is never enforced.
+        let Some(limit_bytes) = self.quota_bytes_per_project else {
+            return Ok(StorageQuota {
+                project_id,
+                metrics_bytes: 0,
+                traces_bytes: 0,
+                logs_bytes: 0,
+                total_bytes: 0,
+                limit_bytes: 0,
+                usage_pct: 0.0,
+            });
+        };
+
         // Per-project storage is estimated as
         //   table_size * (rows for project / total rows in table).
         // The per-project numerator must be exact, but the whole-table
@@ -2259,7 +2276,6 @@ impl OtelStorage for TimescaleDbStorage {
             None => 0,
         };
 
-        let limit_bytes: u64 = self.quota_bytes_per_project.unwrap_or(0);
         let usage_pct = if limit_bytes > 0 {
             (total_bytes as f64 / limit_bytes as f64) * 100.0
         } else {
@@ -2278,13 +2294,8 @@ impl OtelStorage for TimescaleDbStorage {
     }
 
     async fn check_quota(&self, project_id: i32) -> StorageResult<bool> {
-        // Quota is opt-in. With no limit configured, skip the per-project
-        // usage estimate entirely — it runs on every ingest request and its
-        // three per-project COUNT(*) hypertable scans are far too expensive
-        // to pay for a check whose answer is always "not exceeded".
-        if self.quota_bytes_per_project.is_none() {
-            return Ok(false);
-        }
+        // With no quota configured, get_storage_quota short-circuits to zeros
+        // without touching the database, so this is always "not exceeded".
         let quota = self.get_storage_quota(project_id).await?;
         Ok(quota.usage_pct >= 100.0)
     }

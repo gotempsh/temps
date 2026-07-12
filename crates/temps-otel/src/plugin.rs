@@ -8,7 +8,7 @@ use std::time::Duration;
 use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
 };
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
@@ -120,9 +120,16 @@ impl OtelConfig {
             }
         }
         if let Ok(v) = std::env::var("TEMPS_OTEL_QUOTA_GB") {
-            if let Ok(gb) = v.parse::<u64>() {
+            match v.parse::<u64>() {
                 // 0 keeps quotas disabled, same as leaving the var unset.
-                config.quota_bytes_per_project = (gb > 0).then(|| gb * 1024 * 1024 * 1024);
+                Ok(gb) => {
+                    config.quota_bytes_per_project = (gb > 0).then(|| gb * 1024 * 1024 * 1024)
+                }
+                Err(_) => warn!(
+                    value = %v,
+                    "TEMPS_OTEL_QUOTA_GB is set but is not a non-negative integer; \
+                     storage quota stays disabled"
+                ),
             }
         }
         if let Ok(v) = std::env::var("TEMPS_OTEL_ENABLE_HEALTH_COMPUTE") {
