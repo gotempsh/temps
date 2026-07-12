@@ -11780,6 +11780,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "temps-auth",
  "temps-config",
  "temps-core",
  "temps-entities",

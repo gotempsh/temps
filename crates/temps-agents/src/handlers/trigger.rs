@@ -248,6 +248,18 @@ pub struct WebhookTriggerResponse {
     pub status: String,
 }
 
+/// Constant-time byte comparison to prevent timing attacks on webhook tokens.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// Public webhook endpoint. Authenticated via `X-Webhook-Token` header.
 ///
 /// `POST /api/agents/webhook/{webhook_id}`
@@ -307,15 +319,7 @@ pub async fn webhook_trigger(
             .with_detail("This agent does not have webhook triggers enabled")
     })?;
 
-    // Constant-time comparison to prevent timing attacks
-    if provided_token.len() != expected_token.len()
-        || !provided_token
-            .as_bytes()
-            .iter()
-            .zip(expected_token.as_bytes())
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-            == 0
-    {
+    if !constant_time_eq(provided_token.as_bytes(), expected_token.as_bytes()) {
         return Err(problemdetails::new(StatusCode::UNAUTHORIZED)
             .with_title("Invalid Webhook Token")
             .with_detail("The provided X-Webhook-Token does not match"));
@@ -983,6 +987,41 @@ pub async fn save_agent_token(
         .map_err(|e| Problem::from(AgentError::Database(e)))?;
 
     Ok(Json(SaveAgentTokenResponse { saved: true }))
+}
+
+#[cfg(test)]
+mod webhook_token_tests {
+    use super::constant_time_eq;
+
+    #[test]
+    fn accepts_matching_tokens() {
+        assert!(constant_time_eq(b"whsec_abc123", b"whsec_abc123"));
+    }
+
+    #[test]
+    fn rejects_mismatched_tokens_of_equal_length() {
+        // Regression test: an earlier version of this check used
+        // `!fold(..) == 0`, which parses as `(!fold(..)) == 0` due to Rust's
+        // precedence rules (`!` on a `u8` is bitwise NOT, not logical NOT).
+        // That accepted every wrong token whose XOR-accumulation wasn't
+        // exactly 255, i.e. almost all wrong tokens. Every case below must
+        // be rejected.
+        assert!(!constant_time_eq(b"whsec_abc123", b"whsec_abc124"));
+        assert!(!constant_time_eq(b"whsec_abc123", b"whsec_xyz123"));
+        assert!(!constant_time_eq(b"aaaaaaaaaaaa", b"bbbbbbbbbbbb"));
+        assert!(!constant_time_eq(b"\0\0\0\0", b"\x01\x01\x01\x01"));
+    }
+
+    #[test]
+    fn rejects_different_length_tokens() {
+        assert!(!constant_time_eq(b"short", b"much_longer_token"));
+        assert!(!constant_time_eq(b"", b"nonempty"));
+    }
+
+    #[test]
+    fn empty_tokens_are_equal() {
+        assert!(constant_time_eq(b"", b""));
+    }
 }
 
 // `list_available_models` was retired in favour of the per-provider
