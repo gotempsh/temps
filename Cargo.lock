@@ -12158,7 +12158,6 @@ dependencies = [
  "aws-config",
  "aws-credential-types",
  "aws-sdk-s3",
- "bson 3.1.0",
  "chrono",
  "clickhouse",
  "libc",
