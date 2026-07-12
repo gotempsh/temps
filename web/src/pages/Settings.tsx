@@ -44,11 +44,9 @@ type SettingsFormData = Pick<
   | 'external_url'
   | 'internal_url'
   | 'preview_domain'
+  | 'edge_target'
   | 'screenshots'
   | 'letsencrypt'
->
-
-  'external_url' | 'internal_url' | 'preview_domain' | 'edge_target' | 'screenshots'
 >
 
 function optionalString(value: string | null | undefined): string | null {
@@ -121,8 +119,6 @@ export function Settings() {
 
   const onSubmit = async (data: SettingsFormData) => {
     try {
-      await updateSettings.mutateAsync(data)
-      reset(data)
       const normalized: SettingsFormData = {
         ...data,
         edge_target: optionalString(data.edge_target),
@@ -352,6 +348,10 @@ export function Settings() {
             <p className="text-sm text-muted-foreground">
               Staging certificates are not trusted by browsers — use only for
               testing to avoid Let&apos;s Encrypt&apos;s production rate limits.
+            </p>
+          </div>
+
+          <div className="space-y-2 pt-4">
             <Label htmlFor="edge-target">Edge target (for DNS sync)</Label>
             <Input
               id="edge-target"

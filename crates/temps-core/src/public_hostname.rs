@@ -196,7 +196,7 @@ fn sanitize_label(label: &str) -> String {
 
 fn short_hash(seed: &str) -> String {
     let digest = Sha256::digest(seed.as_bytes());
-    format!("{digest:x}").chars().take(SHORT_HASH_LEN).collect()
+    hex::encode(digest).chars().take(SHORT_HASH_LEN).collect()
 }
 
 #[cfg(test)]

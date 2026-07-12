@@ -24,7 +24,6 @@ use temps_auth::RequireAuth;
 use temps_auth::{
     permission_guard, project_access_guard, project_permission_guard, project_scope_guard,
 };
-use temps_core::{AuditContext, RequestMetadata};
 use temps_core::{AppSettings, AuditContext, PublicHostnameStrategy, RequestMetadata};
 use tracing::{debug, error, info, warn};
 use utoipa::OpenApi;
@@ -909,28 +908,10 @@ pub async fn list_containers(
         .await
         .ok()
         .flatten();
-    let preview_domain = settings_row
+    let app_settings = settings_row
         .as_ref()
-        .and_then(|s| {
-            s.data
-                .get("preview_domain")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        })
-        .unwrap_or_else(|| "localho.st".to_string());
-    // Derive the URL scheme from external_url so HTTP-only installs
-    // (sslip.io quick/local modes) don't emit dead https:// links.
-    let url_scheme = settings_row
-        .as_ref()
-        .and_then(|s| s.data.get("external_url").and_then(|v| v.as_str()))
-        .map(|u| {
-            if u.starts_with("http://") {
-                "http"
-            } else {
-                "https"
-            }
-        })
-        .unwrap_or("https");
+        .map(|s| AppSettings::from_json(s.data.clone()))
+        .unwrap_or_default();
 
     let env_subdomain = temps_entities::environments::Entity::find_by_id(environment_id)
         .one(state.db.as_ref())
@@ -974,15 +955,6 @@ pub async fn list_containers(
                 if !is_public {
                     return None;
                 }
-                env_subdomain.as_ref().map(|sub| {
-                    let label = format!("{}-{}", svc, sub);
-                    let label = if label.len() > 63 {
-                        label[..63].trim_end_matches('-').to_string()
-                    } else {
-                        label
-                    };
-                    format!("{}://{}.{}", url_scheme, label, preview_domain)
-                })
                 env_subdomain
                     .as_ref()
                     .map(|sub| public_service_url(&app_settings, hostname_strategy, sub, svc))
@@ -1727,26 +1699,10 @@ pub async fn get_container_detail(
                 .await
                 .ok()
                 .flatten();
-            let preview_domain = settings_row2
+            let app_settings = settings_row2
                 .as_ref()
-                .and_then(|s| {
-                    s.data
-                        .get("preview_domain")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                })
-                .unwrap_or_else(|| "localho.st".to_string());
-            let url_scheme2 = settings_row2
-                .as_ref()
-                .and_then(|s| s.data.get("external_url").and_then(|v| v.as_str()))
-                .map(|u| {
-                    if u.starts_with("http://") {
-                        "http"
-                    } else {
-                        "https"
-                    }
-                })
-                .unwrap_or("https");
+                .map(|s| AppSettings::from_json(s.data.clone()))
+                .unwrap_or_default();
 
             let env_subdomain = temps_entities::environments::Entity::find_by_id(environment_id)
                 .one(state.db.as_ref())
@@ -1755,15 +1711,6 @@ pub async fn get_container_detail(
                 .flatten()
                 .map(|e| e.subdomain);
 
-            env_subdomain.map(|sub| {
-                let label = format!("{}-{}", svc_name, sub);
-                let label = if label.len() > 63 {
-                    label[..63].trim_end_matches('-').to_string()
-                } else {
-                    label
-                };
-                format!("{}://{}.{}", url_scheme2, label, preview_domain)
-            })
             let hostname_strategy = state
                 .hostname_resolver
                 .strategy_for(&app_settings.preview_domain)

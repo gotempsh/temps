@@ -909,8 +909,8 @@ impl ConfigService {
         };
         // Deployment hostnames are identical across hostname strategies (single
         // label below the base domain), so no per-domain resolution is needed here.
-        let hostname = PublicHostnameStrategy::Standard
-            .deployment_hostname(&settings.preview_domain, deployment_slug);
+        let hostname =
+            PublicHostnameStrategy::Standard.deployment_hostname(&preview_domain, deployment_slug);
 
         // Construct the URL as [protocol]://{slug}.{preview_domain}[:port]
         // Only include port if it's non-standard (not 443 for https, not 80 for http)
@@ -918,15 +918,12 @@ impl ConfigService {
             let is_standard_port =
                 (protocol == "https" && port == 443) || (protocol == "http" && port == 80);
             if is_standard_port {
-                format!("{}://{}.{}", protocol, deployment_slug, preview_domain)
+                format!("{}://{}", protocol, hostname)
             } else {
-                format!(
-                    "{}://{}.{}:{}",
-                    protocol, deployment_slug, preview_domain, port
-                )
+                format!("{}://{}:{}", protocol, hostname, port)
             }
         } else {
-            format!("{}://{}.{}", protocol, deployment_slug, preview_domain)
+            format!("{}://{}", protocol, hostname)
         };
 
         Ok(url)

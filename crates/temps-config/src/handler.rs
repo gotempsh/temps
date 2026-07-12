@@ -794,6 +794,8 @@ fn sanitize_optional_url(
     }
 
     Ok(Some(trimmed))
+}
+
 /// Normalize the edge target: trim whitespace and treat an empty string as
 /// `None` so an operator clearing the field disables DNS record sync.
 fn normalize_edge_target(settings: &mut AppSettings) {
