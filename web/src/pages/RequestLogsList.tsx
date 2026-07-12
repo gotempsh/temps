@@ -11,8 +11,17 @@ export default function RequestLogsList({
 }: RequestLogsListProps) {
   const navigate = useNavigate()
 
-  const handleRowClick = (logId: number) => {
-    navigate(`/projects/${projectResponse.slug}/logs/${logId}`)
+  const handleRowClick = (
+    logId: number,
+    _projectId: number,
+    timestamp: string
+  ) => {
+    // The row's timestamp lets the detail endpoint bound its hypertable
+    // lookup to the right chunks instead of scanning the whole retention
+    // window.
+    navigate(
+      `/projects/${projectResponse.slug}/logs/${logId}?ts=${encodeURIComponent(timestamp)}`
+    )
   }
 
   return (

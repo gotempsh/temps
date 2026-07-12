@@ -21,7 +21,7 @@ use axum::{
 use chrono::Utc;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, Set};
 use serde::{Deserialize, Serialize};
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{permission_guard, project_access_guard, project_permission_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
 use temps_core::{AuditContext, DeploymentCreatedJob, Job, RequestMetadata, UtcDateTime};
 use temps_entities::deployments::DeploymentMetadata;
@@ -309,7 +309,12 @@ pub async fn deploy_from_image(
     Extension(metadata): Extension<RequestMetadata>,
     Json(req): Json<DeployFromImageRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, DeploymentsCreate);
+    project_permission_guard!(
+        auth,
+        DeploymentsCreate,
+        project_id,
+        state.project_access_checker
+    );
 
     // Validate optional deploy-time health-check path override up front
     if let Some(ref path) = req.health_check_path {
@@ -595,7 +600,12 @@ pub async fn deploy_from_static(
     Extension(metadata): Extension<RequestMetadata>,
     Json(req): Json<DeployFromStaticRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, DeploymentsCreate);
+    project_permission_guard!(
+        auth,
+        DeploymentsCreate,
+        project_id,
+        state.project_access_checker
+    );
 
     // Validate optional deploy-time health-check path override up front
     if let Some(ref path) = req.health_check_path {
@@ -865,7 +875,12 @@ pub async fn deploy_from_image_upload(
     Query(query): Query<DeployFromImageUploadQuery>,
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, DeploymentsCreate);
+    project_permission_guard!(
+        auth,
+        DeploymentsCreate,
+        project_id,
+        state.project_access_checker
+    );
 
     // Validate optional deploy-time health-check path override up front
     if let Some(ref path) = query.health_check_path {
@@ -1260,7 +1275,12 @@ pub async fn upload_static_bundle(
     Extension(request_metadata): Extension<RequestMetadata>,
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, DeploymentsCreate);
+    project_permission_guard!(
+        auth,
+        DeploymentsCreate,
+        project_id,
+        state.project_access_checker
+    );
 
     debug!("Uploading static bundle for project {}", project_id);
 
@@ -1581,6 +1601,7 @@ pub async fn register_external_image(
     Json(req): Json<RegisterImageRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsCreate);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     debug!(
         "Registering external image for project {}: {}",
@@ -1661,6 +1682,7 @@ pub async fn list_remote_external_images(
     Query(query): Query<PaginationQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let (images, total) = state
         .remote_deployment_service
@@ -1704,9 +1726,10 @@ pub async fn list_remote_external_images(
 pub async fn get_remote_external_image(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
-    Path((_project_id, image_id)): Path<(i32, i32)>,
+    Path((project_id, image_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let image = state
         .remote_deployment_service
@@ -1750,6 +1773,7 @@ pub async fn delete_external_image(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsDelete);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     state
         .remote_deployment_service
@@ -1810,6 +1834,7 @@ pub async fn list_static_bundles(
     Query(query): Query<PaginationQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let (bundles, total) = state
         .remote_deployment_service
@@ -1853,9 +1878,10 @@ pub async fn list_static_bundles(
 pub async fn get_static_bundle(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
-    Path((_project_id, bundle_id)): Path<(i32, i32)>,
+    Path((project_id, bundle_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let bundle = state
         .remote_deployment_service
@@ -1899,6 +1925,7 @@ pub async fn delete_static_bundle(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsDelete);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     state
         .remote_deployment_service

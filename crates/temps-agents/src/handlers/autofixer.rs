@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::ToSchema;
 
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::audit::{AuditContext, AuditOperation};
 use temps_core::problemdetails::Problem;
 use temps_core::RequestMetadata;
@@ -250,6 +250,8 @@ pub async fn start_analysis(
     Json(request): Json<StartAnalysisRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     if request.error_group_id <= 0 {
         return Err(Problem::from(AgentError::Validation {
@@ -324,6 +326,8 @@ pub async fn get_run(
     Path((project_id, run_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsRead);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     app_state
         .run_service
@@ -372,6 +376,8 @@ pub async fn stream_events(
     Path((project_id, run_id)): Path<(i32, i32)>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, Problem> {
     permission_guard!(auth, ProjectsRead);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     app_state
         .run_service
@@ -483,6 +489,8 @@ pub async fn add_context(
     Json(request): Json<AddContextRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     app_state
         .run_service
@@ -532,6 +540,8 @@ pub async fn start_fix(
     Path((project_id, run_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     app_state
         .run_service
@@ -617,6 +627,8 @@ pub async fn create_pr(
     Path((project_id, run_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     app_state
         .run_service
@@ -695,6 +707,8 @@ pub async fn re_analyze(
     Path((project_id, run_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     app_state
         .run_service
@@ -753,6 +767,8 @@ pub async fn cancel(
     Path((project_id, run_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     app_state
         .run_service

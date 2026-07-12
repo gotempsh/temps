@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use temps_database::DbConnection;
 use temps_entities::deployment_tokens::{
-    DeploymentTokenPermission, Entity as DeploymentTokenEntity,
+    DeploymentTokenPermission, Entity as DeploymentTokenEntity, Model as DeploymentTokenModel,
 };
 use thiserror::Error;
 use tracing::warn;
@@ -43,11 +43,20 @@ pub struct ValidatedDeploymentToken {
 
 pub struct DeploymentTokenValidationService {
     db: Arc<DbConnection>,
+    /// Throttles `last_used_at` writes so repeated validations of the same
+    /// token within the window skip the DB write entirely. See
+    /// [`crate::last_used_throttle`].
+    last_used_throttle: crate::last_used_throttle::LastUsedThrottle,
 }
 
 impl DeploymentTokenValidationService {
     pub fn new(db: Arc<DbConnection>) -> Self {
-        Self { db }
+        Self {
+            db,
+            last_used_throttle: crate::last_used_throttle::LastUsedThrottle::new(
+                crate::last_used_throttle::LAST_USED_UPDATE_INTERVAL,
+            ),
+        }
     }
 
     /// Validate a deployment token and return its details
@@ -102,8 +111,13 @@ impl DeploymentTokenValidationService {
             vec![]
         };
 
-        // Update last_used_at (fire and forget - don't fail validation if this fails)
-        let _ = self.update_last_used(token_model.id).await;
+        // Update last_used_at, throttled so repeated validations of the
+        // same token within LAST_USED_UPDATE_INTERVAL skip the DB write.
+        // Best-effort: errors are swallowed so a write failure never blocks
+        // validation.
+        if self.last_used_throttle.should_update(token_model.id) {
+            let _ = self.update_last_used(&token_model).await;
+        }
 
         Ok(ValidatedDeploymentToken {
             token_id: token_model.id,
@@ -115,27 +129,18 @@ impl DeploymentTokenValidationService {
         })
     }
 
-    /// Update the last_used_at timestamp
-    async fn update_last_used(&self, token_id: i32) -> Result<(), sea_orm::DbErr> {
+    /// Update the last_used_at timestamp, reusing the already-fetched
+    /// token row instead of re-querying it.
+    async fn update_last_used(
+        &self,
+        token_model: &DeploymentTokenModel,
+    ) -> Result<(), sea_orm::DbErr> {
         use sea_orm::{ActiveModelTrait, Set};
         use temps_entities::deployment_tokens::ActiveModel;
 
-        let mut token_active = ActiveModel {
-            id: Set(token_id),
-            ..Default::default()
-        };
-        token_active.last_used_at = Set(Some(Utc::now()));
-
-        // Use update, but we need to handle partial updates properly
-        // Actually, sea-orm requires all fields for update, so we need to fetch first
-        if let Some(existing) = DeploymentTokenEntity::find_by_id(token_id)
-            .one(self.db.as_ref())
-            .await?
-        {
-            let mut active: ActiveModel = existing.into();
-            active.last_used_at = Set(Some(Utc::now()));
-            active.update(self.db.as_ref()).await?;
-        }
+        let mut active: ActiveModel = token_model.clone().into();
+        active.last_used_at = Set(Some(Utc::now()));
+        active.update(self.db.as_ref()).await?;
 
         Ok(())
     }
@@ -367,47 +372,29 @@ mod tests {
         hasher.update(token.as_bytes());
         let token_hash = hex::encode(hasher.finalize());
 
+        let model = temps_entities::deployment_tokens::Model {
+            id: 42,
+            project_id: 100,
+            environment_id: Some(200),
+            deployment_id: None,
+            name: "valid-token".to_string(),
+            token_hash,
+            token_prefix,
+            permissions: Some(serde_json::json!(["visitors:enrich", "emails:send"])),
+            is_active: true,
+            expires_at: Some(expires_at),
+            last_used_at: None,
+            created_at: now,
+            updated_at: now,
+            created_by: Some(1),
+            encrypted_token: None,
+        };
+
+        // Postgres supports `UPDATE ... RETURNING`, so `ActiveModel::update`
+        // goes through the query path (not `execute`/exec_results) — one
+        // query batch for the lookup, one for the update-and-return-updated.
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results(vec![vec![temps_entities::deployment_tokens::Model {
-                id: 42,
-                project_id: 100,
-                environment_id: Some(200),
-                deployment_id: None,
-                name: "valid-token".to_string(),
-                token_hash,
-                token_prefix,
-                permissions: Some(serde_json::json!(["visitors:enrich", "emails:send"])),
-                is_active: true,
-                expires_at: Some(expires_at),
-                last_used_at: None,
-                created_at: now,
-                updated_at: now,
-                created_by: Some(1),
-                encrypted_token: None,
-            }]])
-            // For finding token again to update last_used_at
-            .append_query_results(vec![vec![temps_entities::deployment_tokens::Model {
-                id: 42,
-                project_id: 100,
-                environment_id: Some(200),
-                deployment_id: None,
-                name: "valid-token".to_string(),
-                token_hash: "hash".to_string(),
-                token_prefix: "dt_valid".to_string(),
-                permissions: Some(serde_json::json!(["visitors:enrich", "emails:send"])),
-                is_active: true,
-                expires_at: Some(expires_at),
-                last_used_at: None,
-                created_at: now,
-                updated_at: now,
-                created_by: Some(1),
-                encrypted_token: None,
-            }]])
-            // For the update
-            .append_exec_results(vec![MockExecResult {
-                last_insert_id: 42,
-                rows_affected: 1,
-            }])
+            .append_query_results(vec![vec![model.clone()], vec![model]])
             .into_connection();
 
         let service = create_service_with_mock(db);
@@ -421,6 +408,69 @@ mod tests {
         assert_eq!(validated.environment_id, Some(200));
         assert_eq!(validated.name, "valid-token");
         assert_eq!(validated.permissions.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_validate_token_repeat_call_skips_last_used_update() {
+        let now = chrono::Utc::now();
+        let expires_at = now + chrono::Duration::days(30);
+        let token = "dt_validtoken12345678";
+        let token_prefix: String = token.chars().take(8).collect();
+
+        let mut hasher = Sha256::new();
+        hasher.update(token.as_bytes());
+        let token_hash = hex::encode(hasher.finalize());
+
+        let model = || temps_entities::deployment_tokens::Model {
+            id: 42,
+            project_id: 100,
+            environment_id: Some(200),
+            deployment_id: None,
+            name: "valid-token".to_string(),
+            token_hash: token_hash.clone(),
+            token_prefix: token_prefix.clone(),
+            permissions: Some(serde_json::json!(["visitors:enrich", "emails:send"])),
+            is_active: true,
+            expires_at: Some(expires_at),
+            last_used_at: None,
+            created_at: now,
+            updated_at: now,
+            created_by: Some(1),
+            encrypted_token: None,
+        };
+
+        // Errors from the last_used_at write are swallowed by validate_token
+        // (`let _ = self.update_last_used(...).await;`), so a call
+        // succeeding doesn't prove a write was attempted or skipped —
+        // asserting on the mock's transaction log is the only reliable way
+        // to verify the throttle actually prevented a second write.
+        //
+        // Statements needed if the throttle works correctly: call 1's
+        // lookup, call 1's update-and-return-updated (RETURNING), call 2's
+        // lookup. Call 2's update must NOT happen — if it did, it would
+        // need a 4th query batch that isn't provided, and (since that
+        // statement is logged before the mock realizes its results buffer
+        // is empty) the transaction log would show 4 entries instead of 3.
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![model()], vec![model()], vec![model()]])
+                .into_connection(),
+        );
+
+        let service = DeploymentTokenValidationService::new(db.clone());
+
+        assert!(service.validate_token(token).await.is_ok());
+        assert!(service.validate_token(token).await.is_ok());
+
+        drop(service);
+        let statement_count = Arc::try_unwrap(db)
+            .expect("service dropped, so this is the only remaining ref")
+            .into_transaction_log()
+            .len();
+        assert_eq!(
+            statement_count, 3,
+            "expected exactly 2 lookups + 1 throttled last_used_at write, got {statement_count} statements"
+        );
     }
 
     #[tokio::test]

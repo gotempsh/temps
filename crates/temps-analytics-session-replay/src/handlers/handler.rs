@@ -12,7 +12,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::{deny_deployment_token, permission_guard, project_scope_guard, RequireAuth};
+use temps_auth::{
+    deny_deployment_token, permission_guard, project_access_guard, project_scope_guard, RequireAuth,
+};
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::Problem;
 use temps_core::RequestMetadata;
@@ -406,6 +408,7 @@ pub async fn get_project_session_replays(
 ) -> Result<Json<GetProjectSessionReplaysResponse>, Problem> {
     permission_guard!(auth, AnalyticsRead);
     project_scope_guard!(auth, query.project_id);
+    project_access_guard!(auth, query.project_id, state.project_access_checker);
 
     debug!("Getting session replays for project: {}", query.project_id);
 

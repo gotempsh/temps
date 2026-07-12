@@ -748,6 +748,50 @@ fn preserve_self_recorded_fields(incoming: &mut AppSettings, current: &AppSettin
     incoming.console_version = current.console_version.clone();
 }
 
+/// Trim and validate an optional URL setting (`external_url`/`internal_url`).
+/// A blank value (after trimming) means "unset" and is normalized to `None`
+/// rather than rejected -- `external_url` previously validated the raw
+/// `Some("")` a client sends for a cleared field and rejected it with
+/// "must start with http:// or https://", which made every settings save
+/// fail with a 400 on any instance that had never configured it. Kept as a
+/// small pure helper (shared by both URL fields) so the two can't drift
+/// apart again and the invariant is unit-testable.
+fn sanitize_optional_url(
+    field_label: &str,
+    url: Option<String>,
+) -> Result<Option<String>, Problem> {
+    let Some(raw) = url else {
+        return Ok(None);
+    };
+
+    let trimmed = raw.trim().trim_end_matches('/').to_string();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .detail(format!(
+                "{field_label} URL must start with http:// or https://"
+            ))
+            .build());
+    }
+    if trimmed.contains('#') || trimmed.contains('?') {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .detail(format!(
+                "{field_label} URL must not contain '#' or '?' characters"
+            ))
+            .build());
+    }
+    if url::Url::parse(&trimmed).is_err() {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .detail(format!("{field_label} URL is not a valid URL"))
+            .build());
+    }
+
+    Ok(Some(trimmed))
+}
+
 /// Update application settings
 #[utoipa::path(
     tag = "Settings",
@@ -927,50 +971,8 @@ async fn update_settings(
         }
     }
 
-    // Validate and sanitize external_url
-    if let Some(ref mut ext_url) = settings.external_url {
-        *ext_url = ext_url.trim().to_string();
-        *ext_url = ext_url.trim_end_matches('/').to_string();
-        if !ext_url.starts_with("http://") && !ext_url.starts_with("https://") {
-            return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
-                .detail("External URL must start with http:// or https://")
-                .build());
-        }
-        if ext_url.contains('#') || ext_url.contains('?') {
-            return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
-                .detail("External URL must not contain '#' or '?' characters")
-                .build());
-        }
-        if url::Url::parse(ext_url).is_err() {
-            return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
-                .detail("External URL is not a valid URL")
-                .build());
-        }
-    }
-
-    // Validate and sanitize internal_url (same rules as external_url)
-    if let Some(ref mut int_url) = settings.internal_url {
-        *int_url = int_url.trim().trim_end_matches('/').to_string();
-        if int_url.is_empty() {
-            settings.internal_url = None;
-        } else {
-            if !int_url.starts_with("http://") && !int_url.starts_with("https://") {
-                return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
-                    .detail("Internal URL must start with http:// or https://")
-                    .build());
-            }
-            if int_url.contains('#') || int_url.contains('?') {
-                return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
-                    .detail("Internal URL must not contain '#' or '?' characters")
-                    .build());
-            }
-            if url::Url::parse(int_url).is_err() {
-                return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
-                    .detail("Internal URL is not a valid URL")
-                    .build());
-            }
-        }
-    }
+    settings.external_url = sanitize_optional_url("External", settings.external_url)?;
+    settings.internal_url = sanitize_optional_url("Internal", settings.internal_url)?;
 
     match app_state.config_service.update_settings(settings).await {
         Ok(_) => {
@@ -1272,6 +1274,50 @@ async fn refresh_route_table(
 mod tests {
     use super::*;
     use temps_core::{AgentSandboxSettings, AppSettings, ProviderConfig};
+
+    // Regression: a client round-tripping a never-configured external_url
+    // sends `Some("")` (the form's empty-string default), which previously
+    // fell through straight to the http/https prefix check and rejected
+    // every settings save with a 400 on any instance that had never set it.
+    #[test]
+    fn sanitize_optional_url_treats_blank_as_unset() {
+        assert_eq!(
+            sanitize_optional_url("External", Some(String::new())).unwrap(),
+            None
+        );
+        assert_eq!(
+            sanitize_optional_url("External", Some("   ".to_string())).unwrap(),
+            None
+        );
+        assert_eq!(sanitize_optional_url("External", None).unwrap(), None);
+    }
+
+    #[test]
+    fn sanitize_optional_url_trims_and_strips_trailing_slash() {
+        assert_eq!(
+            sanitize_optional_url("External", Some("  https://example.com/  ".to_string()))
+                .unwrap(),
+            Some("https://example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_optional_url_rejects_missing_scheme() {
+        let err = sanitize_optional_url("External", Some("example.com".to_string())).unwrap_err();
+        let detail = err.body.get("detail").and_then(|v| v.as_str()).unwrap();
+        assert!(detail.contains("must start with http:// or https://"));
+    }
+
+    #[test]
+    fn sanitize_optional_url_rejects_query_or_fragment() {
+        assert!(
+            sanitize_optional_url("External", Some("https://example.com?a=1".to_string())).is_err()
+        );
+        assert!(
+            sanitize_optional_url("External", Some("https://example.com#frag".to_string()))
+                .is_err()
+        );
+    }
 
     // Regression: the GET /api/settings response must surface agent_sandbox,
     // ai_config, preview_gateway, multi_node, and insecure_tls so the UI can

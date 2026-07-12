@@ -4,13 +4,17 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { ArrowLeft } from 'lucide-react'
 import { useEffect } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 
 export default function ProxyLogDetailPage() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
   const { setBreadcrumbs } = useBreadcrumbs()
   const logId = parseInt(id || '0', 10)
+  // Row timestamp forwarded by list links; bounds the backend's hypertable
+  // lookup. Absent on bare deep-links, which fall back to a wider scan.
+  const ts = searchParams.get('ts') ?? undefined
 
   useEffect(() => {
     setBreadcrumbs([
@@ -64,7 +68,7 @@ export default function ProxyLogDetailPage() {
         </div>
 
         {/* Detail Component */}
-        <ProxyLogDetail logId={logId} />
+        <ProxyLogDetail logId={logId} timestamp={ts} />
       </div>
     </div>
   )

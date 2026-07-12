@@ -40,8 +40,12 @@ impl TempsPlugin for FunnelsPlugin {
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         let funnel_service = context.get_service::<crate::services::FunnelService>()?;
 
+        let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
         let routes = crate::handlers::handler::configure_routes().with_state(Arc::new(
-            crate::handlers::types::AppState { funnel_service },
+            crate::handlers::types::AppState {
+                funnel_service,
+                project_access_checker,
+            },
         ));
 
         Some(PluginRoutes::new(routes))

@@ -175,12 +175,16 @@ async fn collect_snapshot(conn_str: &str) -> Option<MariadbBinlogHealth> {
         .await
         .ok()?;
 
-    let log_bin = fetch_on_off_variable(&pool, "log_bin")
-        .await
-        .unwrap_or(false);
-    let binlog_format = fetch_string_variable(&pool, "binlog_format")
-        .await
-        .unwrap_or_default();
+    // log_bin/binlog_format drive the two most consequential warnings
+    // (BinlogDisabled is Critical severity; NonRowBinlogFormat degrades PITR
+    // fidelity) -- a transient query failure right after a MariaDB restart
+    // (docker-entrypoint restarts the server once to apply CLI flags like
+    // --log-bin) must not be silently read as "off"/"" and reported as a
+    // confident but wrong warning. Treat it the same as a connection
+    // failure: return None for the whole probe rather than a snapshot built
+    // on defaulted-away data.
+    let log_bin = fetch_on_off_variable(&pool, "log_bin").await?;
+    let binlog_format = fetch_string_variable(&pool, "binlog_format").await?;
     let binlog_expire_logs_seconds = fetch_numeric_variable(&pool, "binlog_expire_logs_seconds")
         .await
         .unwrap_or(0);
@@ -215,8 +219,16 @@ async fn collect_snapshot(conn_str: &str) -> Option<MariadbBinlogHealth> {
 /// `SHOW VARIABLES LIKE '<name>'` returns a two-column (`Variable_name`,
 /// `Value`) result. Read the `Value` as a string.
 async fn fetch_variable_value(pool: &sqlx::MySqlPool, name: &str) -> Option<String> {
-    let row = sqlx::query("SHOW VARIABLES LIKE ?")
-        .bind(name)
+    // `SHOW VARIABLES LIKE ?` is not valid in the prepared/binary protocol
+    // MariaDB uses for bound parameters -- `PREPARE stmt FROM 'SHOW
+    // VARIABLES LIKE ?'` fails with "You have an error in your SQL syntax"
+    // (confirmed against mariadb:lts). `sqlx::query(..).bind(..)` always
+    // goes through that protocol, so every call here has silently failed
+    // and returned `None` since this probe was written -- masked by `.ok()`
+    // here and `.unwrap_or(..)` at every call site. `name` is always one of
+    // this module's own hardcoded variable-name constants, never external
+    // input, so interpolating it directly into the query text is safe.
+    let row = sqlx::query(&format!("SHOW VARIABLES LIKE '{name}'"))
         .fetch_optional(pool)
         .await
         .ok()??;

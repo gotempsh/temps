@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -63,7 +63,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -78,7 +78,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Bun
         uses: oven-sh/setup-bun@v2
@@ -106,7 +106,7 @@ jobs:
     continue-on-error: true
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -146,9 +146,28 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   # ---------------------------------------------------------------------------
-  # Build all test binaries once, then cache for parallel test jobs
+  # Build every test binary exactly once, archive it, share across all
+  # downstream test jobs.
   # ---------------------------------------------------------------------------
-  build-tests:
+  # Two archives, not one: `cargo nextest archive --workspace` unifies
+  # features the same way for every crate in a given invocation, so as long
+  # as every consumer of an archive selects tests via `-E 'package(...)'`
+  # (not `-p`, which nextest rejects alongside --archive-file anyway) against
+  # THIS SAME invocation's output, there's no resolver-scope mismatch and
+  # nothing needs to recompile downstream (verified locally: archiving a
+  # subset, then `cargo nextest run --archive-file ... -E 'package(x)'` for
+  # an even narrower selection produces zero "Compiling" output).
+  #
+  # temps-providers/temps-backup's docker-tests feature can't be baked into
+  # one shared archive unconditionally, though: GitHub's ubuntu-latest
+  # runners have a live Docker daemon by default, so if unit-tests' runner
+  # executed those Docker-heavy tests (S3 backup/restore, pg17/pg18 major
+  # upgrades) they would NOT gracefully no-op like they do on a
+  # Docker-less host -- they'd actually run, against none of the shared
+  # service containers integration-tests sets up. Building a second
+  # archive with docker-tests on, used only by the groups that actually
+  # provision Docker/DB services, keeps that boundary intact.
+  build-test-binaries:
     name: Build Test Binaries
     runs-on: ubuntu-latest
     steps:
@@ -159,161 +178,182 @@ jobs:
           sudo apt-get autoremove -y && sudo apt-get clean
 
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          # Use a shared cache key so test jobs can restore
-          shared-key: test-build
+          # This is now the only job that compiles anything -- every
+          # downstream job runs pre-built binaries from the archives below,
+          # so there's no cross-scope resolver mismatch to worry about (see
+          # the removed per-group cache keys this replaces).
+          shared-key: nextest-archive
           save-if: true
-
-      - name: Cache wasm-pack binary
-        uses: actions/cache@v6
-        with:
-          path: ~/.cargo/bin/wasm-pack
-          key: ${{ runner.os }}-wasm-pack-0.13
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
-      - name: Install wasm-pack and Build WASM
-        run: |
-          if [ ! -f ~/.cargo/bin/wasm-pack ]; then
-            cargo install wasm-pack
-          fi
-          cd crates/temps-captcha-wasm
-          bun run build
-
-      - name: Build all test binaries
-        run: cargo test --no-run --workspace --all-features
+      - name: Archive default-feature test binaries
+        # Used by unit-tests (both groups) and the docker-deployments
+        # integration group -- none of them need temps-providers/temps-backup's
+        # docker-tests feature.
+        run: cargo nextest archive --workspace --all-targets --archive-file test-binaries-default.tar.zst
         env:
           CARGO_INCREMENTAL: 0
+
+      - name: Archive docker-tests test binaries
+        # Used by docker-providers/docker-backups/postgres-upgrades and
+        # mariadb-pitr-e2e. `docker-tests = []` on both crates (no optional
+        # deps), so this only recompiles temps-providers/temps-backup
+        # themselves on top of the previous step's already-built dependency
+        # graph, not the whole workspace again.
+        run: cargo nextest archive --workspace --all-targets --features temps-providers/docker-tests,temps-backup/docker-tests --archive-file test-binaries-docker-tests.tar.zst
+        env:
+          CARGO_INCREMENTAL: 0
+
+      - name: Upload default-feature archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-binaries-default
+          path: test-binaries-default.tar.zst
+          retention-days: 1
+
+      - name: Upload docker-tests archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-binaries-docker-tests
+          path: test-binaries-docker-tests.tar.zst
+          retention-days: 1
 
   # ---------------------------------------------------------------------------
   # Phase 1: Unit tests (fast, no Docker containers needed)
   # ---------------------------------------------------------------------------
-  # Runs all workspace tests WITHOUT the docker-tests feature.
-  # This executes all pure unit tests across every crate quickly.
-  # For temps-providers, Docker-heavy tests are gated behind the
-  # `docker-tests` feature flag and will NOT run here.
+  # Runs all workspace tests WITHOUT the docker-tests feature. Both groups
+  # only download the archive and run it -- no compilation happens here.
   unit-tests:
     name: "Unit Tests (${{ matrix.group }})"
     runs-on: ubuntu-latest
-    needs: build-tests
+    needs: build-test-binaries
     strategy:
       fail-fast: false
       matrix:
         include:
           - group: unit-a
-            crates: >-
-              -p temps-providers
-              -p temps-presets
-              -p temps-auth
-              -p temps-core
-              -p temps-monitoring
-              -p temps-kv
-              -p temps-analytics-funnels
-              -p temps-webhooks
-              -p temps-infra
-              -p temps-captcha-wasm
-              -p temps-geo
-              -p temps-environments
-              -p temps-audit
-              -p temps-analytics-performance
+            # kind(=lib): the old `--lib` flag excluded tests/*.rs integration
+            # test files. Some of those files (e.g. temps-providers' Docker
+            # integration tests) were never run by ANY CI job and aren't
+            # necessarily green -- switching the shared archive to
+            # --all-targets pulled them in by accident once (see PR
+            # discussion), so every group that used to pass --lib keeps that
+            # exact scope here via kind(=lib) instead.
+            filter: >-
+              (package(temps-providers) or package(temps-presets) or
+              package(temps-auth) or package(temps-core) or
+              package(temps-monitoring) or package(temps-kv) or
+              package(temps-analytics-funnels) or package(temps-webhooks) or
+              package(temps-infra) or package(temps-captcha-wasm) or
+              package(temps-geo) or package(temps-environments) or
+              package(temps-audit) or package(temps-analytics-performance))
+              and kind(=lib)
           - group: unit-b
-            crates: >-
-              -p temps-proxy
-              -p temps-error-tracking
-              -p temps-git
-              -p temps-screenshots
-              -p temps-routes
-              -p temps-entities
-              -p temps-cli
-              -p temps-status-page
-              -p temps-import
-              -p temps-queue
-              -p temps-query
-              -p temps-analytics-session-replay
-              -p temps-dns
-              -p temps-email
-              -p temps-analytics
-              -p temps-analytics-events
-              -p temps-otel
+            filter: >-
+              (package(temps-proxy) or package(temps-error-tracking) or
+              package(temps-git) or package(temps-screenshots) or
+              package(temps-routes) or package(temps-entities) or
+              package(temps-cli) or package(temps-status-page) or
+              package(temps-import) or package(temps-queue) or
+              package(temps-query) or package(temps-analytics-session-replay) or
+              package(temps-dns) or package(temps-email) or
+              package(temps-analytics) or package(temps-analytics-events) or
+              package(temps-otel)) and kind(=lib)
 
     steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          sudo apt-get autoremove -y && sudo apt-get clean
+
+      # TestDatabase::new() (crates/temps-database/src/test_utils.rs) falls
+      # back to lazily booting its own TimescaleDB container via a
+      # process-local `OnceCell` when TEMPS_TEST_DATABASE_URL isn't set --
+      # reused across tests only within the SAME process. Nextest runs every
+      # test in its own fresh process by design (its core isolation
+      # feature), so that OnceCell resets before every single test: instead
+      # of one container booted once per crate (cargo test's per-binary
+      # model), nextest was trying to cold-boot a brand new container for
+      # EVERY test, which starved connect_with_retry's budget (tuned for "an
+      # already-warm container", not "just called .start() this instant")
+      # and caused Docker port-allocation races from the extra churn.
+      # Pointing at one externally-started, already-running TimescaleDB via
+      # TEMPS_TEST_DATABASE_URL (matching integration-tests/mariadb-pitr-e2e
+      # below) sidesteps that: TestDatabase connects and isolates via a
+      # unique schema per test instead of booting a container at all, which
+      # is exactly what those other jobs already do safely across many
+      # separate processes hitting one shared instance (see
+      # run_migrations_with_retry's deadlock-retry logic in test_utils.rs).
+      - name: Start TimescaleDB (background workers disabled)
+        run: |
+          docker run -d --name timescaledb \
+            -e POSTGRES_DB=test_db \
+            -e POSTGRES_USER=test_user \
+            -e POSTGRES_PASSWORD=test_password \
+            -e POSTGRES_HOST_AUTH_METHOD=trust \
+            -p 5432:5432 \
+            timescale/timescaledb-ha:pg18 \
+            postgres -c timescaledb.max_background_workers=0
+
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install Bun
-        uses: oven-sh/setup-bun@v2
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Download test binaries
+        uses: actions/download-artifact@v4
         with:
-          bun-version: latest
+          name: test-binaries-default
 
-      - name: Restore build cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: test-build
-          save-if: false
-
-      - name: Cache wasm-pack binary
-        uses: actions/cache@v6
-        with:
-          path: ~/.cargo/bin/wasm-pack
-          key: ${{ runner.os }}-wasm-pack-0.13
-
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-
-      - name: Install wasm-pack and Build WASM
+      - name: Verify TimescaleDB is ready
         run: |
-          if [ ! -f ~/.cargo/bin/wasm-pack ]; then
-            cargo install wasm-pack
-          fi
-          cd crates/temps-captcha-wasm
-          bun run build
+          timeout 60 bash -c 'until docker exec timescaledb pg_isready -U test_user -d test_db; do sleep 1; done'
+          echo "TimescaleDB is ready"
 
       - name: Run unit tests
         env:
-          CARGO_TERM_COLOR: never
           RUST_BACKTRACE: 1
-          CARGO_INCREMENTAL: 0
+          TEMPS_TEST_DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db
         # Many crates' tests spin up a real Postgres/TimescaleDB-backed
         # TestDatabase, and their DDL/DML against the one shared TimescaleDB
         # instance can genuinely deadlock (Postgres error 40P01) -- confirmed
         # across multiple CI runs hitting different tests in different crates
-        # each time. `-- --test-threads=1` alone wasn't enough: cargo runs
-        # *each crate's* test binary as its own process and doesn't fully
-        # serialize them by default, so separate crates' binaries were still
-        # racing each other even with each individually single-threaded.
-        # `--jobs 1` forces cargo to run one test binary at a time too.
-        # Matches the trade-off already made for the docker-backups/
-        # postgres-upgrades integration-test groups: slower, but eliminates
-        # cross-test DB contention instead of chasing it test-by-test.
-        run: cargo test --no-fail-fast --jobs 1 --lib ${{ matrix.crates }} -- --test-threads=1
+        # each time. Nextest runs every selected test through one global
+        # scheduler regardless of which binary it came from, so
+        # --test-threads=1 alone fully serializes execution here -- there's
+        # no separate build-concurrency flag to accidentally collide with,
+        # since nothing is being compiled in this job at all.
+        run: cargo nextest run --archive-file test-binaries-default.tar.zst --workspace-remap . -E '${{ matrix.filter }}' --test-threads=1
 
   # ---------------------------------------------------------------------------
   # Phase 2: Integration tests (Docker + Database required)
   # ---------------------------------------------------------------------------
-  # Runs tests that need Docker daemon and/or a real database.
-  # - temps-providers runs with --features docker-tests to include
-  #   Docker-heavy tests (backup/restore, container lifecycle, etc.)
-  # - Other crates that use TestDatabase (testcontainers) run here too.
+  # Runs tests that need Docker daemon and/or a real database. Runs
+  # alongside unit-tests (both only need build-test-binaries), not after it --
+  # nothing here depends on unit-tests' result anymore since a compile
+  # failure would already fail build-test-binaries before either starts.
   integration-tests:
     name: "Integration Tests (${{ matrix.group }})"
     runs-on: ubuntu-latest
-    needs: [build-tests, unit-tests]
+    needs: build-test-binaries
     # 90 min headroom for the postgres-upgrades group, which can spike past
     # 45 min when pg17/pg18 image pulls land on a cold runner and several
     # orchestrator tests recover serially. Other groups still finish well
@@ -322,11 +362,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Each entry splits the test command into cargo-level args
-        # (crate, features, filters) and libtest-level args (--skip,
-        # --nocapture, --test-threads), assembled as:
-        #
-        #   <cargo_args> -- <test_args>
         include:
           - group: docker-providers
             # temps-providers with Docker tests enabled.
@@ -336,17 +371,16 @@ jobs:
             # Skip them here so this group stays fast.
             # --test-threads=1: this group's tests hit the shared `services:
             # timescaledb` container just like docker-backups/postgres-upgrades/
-            # docker-deployments below, and the default multi-threaded libtest
-            # runner was racing against it -- observed as a Postgres deadlock
-            # (40P01) and background-worker exhaustion (e.g. test_delete_service).
-            # Match the same serial fix already applied to the other groups.
-            cargo_args: >-
-              test --no-fail-fast --lib
-              -p temps-providers --features docker-tests
-            test_args: >-
-              --skip orchestrator_
-              --skip backup_and_restore_to_s3
-              --test-threads=1
+            # docker-deployments below, and the default multi-threaded runner
+            # was racing against it -- observed as a Postgres deadlock (40P01)
+            # and background-worker exhaustion (e.g. test_delete_service).
+            # kind(=lib): matches the old --lib flag -- excludes
+            # tests/*.rs integration test files (e.g. temps-providers'
+            # mariadb_binlog_health_integration.rs), which no CI job has ever
+            # run and aren't necessarily green yet.
+            archive: docker-tests
+            filter: package(temps-providers) and kind(=lib) and not test(orchestrator_) and not test(backup_and_restore_to_s3)
+            test_threads: "1"
           - group: docker-backups
             # Heavyweight S3 backup/restore integration tests
             # (test_{mongodb,postgres,redis,s3}_backup_and_restore_to_s3). Each
@@ -354,58 +388,40 @@ jobs:
             # real wal-g/mongodump backup, so running them in parallel saturates
             # Docker and races for host ports (`port is already allocated`),
             # causing 300s hangs. --test-threads=1 guarantees serial execution.
-            cargo_args: >-
-              test --no-fail-fast --lib
-              -p temps-providers --features docker-tests
-              backup_and_restore_to_s3
-            test_args: >-
-              --nocapture
-              --test-threads=1
+            archive: docker-tests
+            filter: package(temps-providers) and kind(=lib) and test(backup_and_restore_to_s3)
+            extra_args: --no-capture
+            test_threads: "1"
           - group: postgres-upgrades
             # PostgreSQL major-version upgrade orchestrator integration tests.
             # Each test pulls pg17 + pg18 images and runs a real dump/restore,
             # so they're 2–6 min apiece and must not contend for Docker.
             # --test-threads=1 guarantees serial execution.
-            cargo_args: >-
-              test --no-fail-fast --lib
-              -p temps-providers --features docker-tests
-              orchestrator_
-            test_args: >-
-              --nocapture
-              --test-threads=1
+            archive: docker-tests
+            filter: package(temps-providers) and kind(=lib) and test(orchestrator_)
+            extra_args: --no-capture
+            test_threads: "1"
           - group: docker-deployments
             # Crates that use TestDatabase and/or Docker. Like unit-tests
-            # above, this fans out across many crates in one `cargo test`
-            # invocation against the single shared `services: timescaledb`
-            # container below -- same shape that made cross-binary/cross-test
-            # Postgres deadlocks (40P01) show up in unit-tests, just missing
-            # the same fix here. Reproduced locally: without --test-threads=1,
-            # a plain INSERT in temps-deployments' test setup deadlocked
-            # against a concurrently-running test in the same shared DB within
-            # a couple of runs; with --jobs 1 --test-threads=1 the full
-            # 18-crate suite ran clean.
-            cargo_args: >-
-              test --no-fail-fast --jobs 1
-              -p temps-deployments
-              -p temps-backup
-              -p temps-vulnerability-scanner
-              -p temps-import-docker
-              -p temps-migrations
-              -p temps-database
-              -p temps-blob
-              -p temps-query-s3
-              -p temps-query-redis
-              -p temps-query-mongodb
-              -p temps-query-postgres
-              -p temps-embeddings
-              -p temps-config
-              -p temps-notifications
-              -p temps-deployer
-              -p temps-logs
-              -p temps-domains
-              -p temps-projects
-            test_args: >-
-              --test-threads=1
+            # above, this fans out across many crates in one run against the
+            # single shared `services: timescaledb` container below -- same
+            # shape that made cross-binary/cross-test Postgres deadlocks
+            # (40P01) show up in unit-tests. Reproduced locally: without
+            # --test-threads=1, a plain INSERT in temps-deployments' test
+            # setup deadlocked against a concurrently-running test in the
+            # same shared DB within a couple of runs.
+            archive: default
+            filter: >-
+              package(temps-deployments) or package(temps-backup) or
+              package(temps-vulnerability-scanner) or package(temps-import-docker) or
+              package(temps-migrations) or package(temps-database) or
+              package(temps-blob) or package(temps-query-s3) or
+              package(temps-query-redis) or package(temps-query-mongodb) or
+              package(temps-query-postgres) or package(temps-embeddings) or
+              package(temps-config) or package(temps-notifications) or
+              package(temps-deployer) or package(temps-logs) or
+              package(temps-domains) or package(temps-projects)
+            test_threads: "1"
 
     steps:
       - name: Free up disk space
@@ -420,16 +436,15 @@ jobs:
       # its own hypertables/continuous aggregates (with refresh policies)
       # in a fresh, short-lived schema against this one shared instance.
       # TimescaleDB's background worker launcher polls for due jobs every
-      # ~60s independent of cargo test's own concurrency, and if its scan
-      # lands while one of those schemas is still alive, it launches a
-      # real background worker that races the test's own foreground
-      # transaction -- the same root cause fixed for TestDatabase's own
-      # containers in #196, just needed here too since this job never
-      # goes through that Rust code path. `max_background_workers=0`
-      # still allows CREATE EXTENSION / create_hypertable /
-      # add_continuous_aggregate_policy to succeed; it only stops the
-      # launcher from ever executing scheduled jobs, which no test here
-      # relies on.
+      # ~60s independent of test concurrency, and if its scan lands while
+      # one of those schemas is still alive, it launches a real background
+      # worker that races the test's own foreground transaction -- the same
+      # root cause fixed for TestDatabase's own containers in #196, just
+      # needed here too since this job never goes through that Rust code
+      # path. `max_background_workers=0` still allows CREATE EXTENSION /
+      # create_hypertable / add_continuous_aggregate_policy to succeed; it
+      # only stops the launcher from ever executing scheduled jobs, which no
+      # test here relies on.
       - name: Start TimescaleDB (background workers disabled)
         run: |
           docker run -d --name timescaledb \
@@ -442,38 +457,18 @@ jobs:
             postgres -c timescaledb.max_background_workers=0
 
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install Bun
-        uses: oven-sh/setup-bun@v2
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Download test binaries
+        uses: actions/download-artifact@v4
         with:
-          bun-version: latest
-
-      - name: Restore build cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: test-build
-          save-if: false
-
-      - name: Cache wasm-pack binary
-        uses: actions/cache@v6
-        with:
-          path: ~/.cargo/bin/wasm-pack
-          key: ${{ runner.os }}-wasm-pack-0.13
-
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-
-      - name: Install wasm-pack and Build WASM
-        run: |
-          if [ ! -f ~/.cargo/bin/wasm-pack ]; then
-            cargo install wasm-pack
-          fi
-          cd crates/temps-captcha-wasm
-          bun run build
+          name: test-binaries-${{ matrix.archive }}
 
       - name: Verify TimescaleDB is ready
         run: |
@@ -489,20 +484,20 @@ jobs:
 
       - name: Run integration tests
         env:
-          CARGO_TERM_COLOR: never
           RUST_BACKTRACE: 1
-          CARGO_INCREMENTAL: 0
           TEMPS_TEST_DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db
-        run: cargo ${{ matrix.cargo_args }} -- ${{ matrix.test_args }}
+        run: cargo nextest run --archive-file test-binaries-${{ matrix.archive }}.tar.zst --workspace-remap . -E '${{ matrix.filter }}' --test-threads=${{ matrix.test_threads }} ${{ matrix.extra_args }}
   # ---------------------------------------------------------------------------
   # Phase 2b: MariaDB PITR full-chain E2E
   # ---------------------------------------------------------------------------
   # Keep this heavyweight single test out of the generic Docker matrix so it can
   # start immediately, and so Actions shows each expensive phase (image pull,
-  # test build, test run, diagnostics) separately.
+  # test run, diagnostics) separately. Runs alongside unit-tests/
+  # integration-tests -- only needs build-test-binaries.
   mariadb-pitr-e2e:
     name: "MariaDB PITR E2E"
     runs-on: ubuntu-latest
+    needs: build-test-binaries
     timeout-minutes: 35
 
     services:
@@ -530,19 +525,18 @@ jobs:
           df -h
 
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Restore build cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: test-build
-          save-if: false
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
 
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Download test binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: test-binaries-docker-tests
 
       - name: Verify TimescaleDB is ready
         run: |
@@ -561,21 +555,12 @@ jobs:
           timeout 10m docker pull mariadb:lts
           docker image ls | grep -E '^(minio/minio|mariadb)\s' || true
 
-      - name: Build MariaDB PITR E2E binary
-        env:
-          CARGO_TERM_COLOR: never
-          CARGO_INCREMENTAL: 0
-        run: |
-          cargo test -p temps-backup --features docker-tests mariadb_pitr_full_chain_e2e --no-run
-
       - name: Run MariaDB PITR E2E
         env:
-          CARGO_TERM_COLOR: never
           RUST_BACKTRACE: 1
-          CARGO_INCREMENTAL: 0
           TEMPS_TEST_DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db
         run: |
-          timeout --foreground 20m bash -lc 'set -o pipefail; cargo test -p temps-backup --features docker-tests mariadb_pitr_full_chain_e2e -- --nocapture --test-threads=1 2>&1 | tee /tmp/mariadb-pitr-e2e.log'
+          timeout --foreground 20m bash -lc 'set -o pipefail; cargo nextest run --archive-file test-binaries-docker-tests.tar.zst --workspace-remap . -E "package(temps-backup) and test(mariadb_pitr_full_chain_e2e)" --test-threads=1 --no-capture 2>&1 | tee /tmp/mariadb-pitr-e2e.log'
 
       - name: Summarize MariaDB PITR E2E diagnostics
         if: always()
@@ -598,7 +583,7 @@ jobs:
 
       - name: Upload MariaDB PITR E2E log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: mariadb-pitr-e2e-log
           path: /tmp/mariadb-pitr-e2e.log

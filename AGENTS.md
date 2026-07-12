@@ -78,6 +78,14 @@ The shortest way to spot a missing step: TypeScript compile errors
 in `web/src/` that say "Module ... has no exported member ...". That
 means the SDK is stale.
 
+## Scope Docker usage on shared hosts
+
+This host may already be running a live Temps instance or other
+operator-owned Docker resources. Do not stop, remove, prune, rebuild,
+retag, or otherwise mutate existing containers, images, volumes, or
+networks. Docker-backed tests may create uniquely named temporary
+resources and must clean up only the resources created by that test run.
+
 ## Pre-commit hooks run cargo fmt and cargo clippy
 
 Hooks **will** reformat your files and **will** fail the commit if
@@ -126,6 +134,24 @@ the binary itself), env vars are still fine — but the bar is "this
 setting can only have one value per running process, ever". Almost
 nothing meets that bar. If you're tempted to add `TEMPS_FOO_BAR=1`,
 ask first whether `entity.foo_bar bool` would do the job.
+
+## New features must scale on small resources
+
+Temps runs as a single binary on small machines (reference: 3 vCPU /
+4 GB RAM) while the proxy path may see 100k+ req/s. Every new feature
+must be designed for that from the start — efficiency is a
+requirement, not a follow-up optimization. The full rules live in
+[`CLAUDE.md` → Scalability & Efficiency](./CLAUDE.md#scalability--efficiency);
+the short version:
+
+- Classify your code: **hot path** (per-request/per-event) vs
+  **control plane** (handlers, background jobs).
+- Hot path: no locks, no per-operation I/O, no unbounded channels or
+  cardinality — aggregate with atomics and flush in batches.
+- Everywhere: stream instead of buffering unbounded data, batch DB
+  writes, make background loops O(changes) not O(total rows).
+- PRs touching the hot path or high-volume data flows must state
+  expected load, memory bound, and behaviour at saturation.
 
 ## Don't sweep unrelated dirty files into your commits
 

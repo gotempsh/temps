@@ -20,8 +20,10 @@ use axum::{
 use futures::stream::{self, StreamExt};
 use futures::SinkExt;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-use temps_auth::permission_guard;
 use temps_auth::RequireAuth;
+use temps_auth::{
+    permission_guard, project_access_guard, project_permission_guard, project_scope_guard,
+};
 use temps_core::{AuditContext, RequestMetadata};
 use tracing::{debug, error, info, warn};
 use utoipa::OpenApi;
@@ -36,6 +38,22 @@ use crate::handlers::types::{
 };
 use temps_core::problemdetails;
 use temps_core::problemdetails::Problem;
+
+// ADR-028 guard pattern note for this file
+//
+// All handlers in this module use `permission_guard!` with Deployments* or
+// Environments* permissions (DeploymentsRead, DeploymentsCreate, DeploymentsDelete,
+// DeploymentsWrite, EnvironmentsRead, EnvironmentsWrite). None of these
+// permissions are bridged from deployment-token permissions in
+// `AuthContext::has_permission` — only AnalyticsRead, AnalyticsWrite, and
+// EmailsSend have token-to-permission mappings. A deployment token therefore
+// fails `permission_guard!` before reaching any handler in this file.
+//
+// `project_scope_guard!` is intentionally omitted from all handlers EXCEPT
+// `get_last_deployment` and `get_project_deployments`, which carry it as a
+// defence-in-depth measure for the ADR-028 Phase B rollout. Adding the guard
+// to every handler in this file would be redundant noise: the token is already
+// rejected by the earlier `permission_guard!` call.
 
 #[derive(OpenApi)]
 #[openapi(
@@ -294,6 +312,8 @@ pub async fn get_last_deployment(
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_scope_guard!(auth, id);
+    project_access_guard!(auth, id, state.project_access_checker);
 
     debug!("Getting last deployment for project with id: {}", id);
     let deployment = state.deployment_service.get_last_deployment(id).await?;
@@ -326,6 +346,8 @@ pub async fn get_project_deployments(
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_scope_guard!(auth, id);
+    project_access_guard!(auth, id, state.project_access_checker);
 
     let list_response = state
         .deployment_service
@@ -369,6 +391,7 @@ pub async fn get_deployment(
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     debug!(
         "Getting deployment {} for project: {}",
@@ -405,7 +428,12 @@ pub async fn rollback_to_deployment(
     RequireAuth(auth): RequireAuth,
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, DeploymentsCreate);
+    project_permission_guard!(
+        auth,
+        DeploymentsCreate,
+        project_id,
+        state.project_access_checker
+    );
 
     let deployment = state
         .deployment_service
@@ -457,7 +485,12 @@ pub async fn promote_deployment(
     Extension(metadata): Extension<RequestMetadata>,
     Json(request): Json<PromoteDeploymentRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, DeploymentsCreate);
+    project_permission_guard!(
+        auth,
+        DeploymentsCreate,
+        project_id,
+        state.project_access_checker
+    );
 
     info!(
         "Promoting deployment {} to environment {} (project {})",
@@ -510,7 +543,12 @@ pub async fn pause_deployment(
     RequireAuth(auth): RequireAuth,
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, DeploymentsDelete);
+    project_permission_guard!(
+        auth,
+        DeploymentsDelete,
+        project_id,
+        state.project_access_checker
+    );
     info!("Pausing deployment: {:?}", deployment_id);
 
     state
@@ -561,7 +599,12 @@ pub async fn resume_deployment(
     RequireAuth(auth): RequireAuth,
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, DeploymentsCreate);
+    project_permission_guard!(
+        auth,
+        DeploymentsCreate,
+        project_id,
+        state.project_access_checker
+    );
 
     state
         .deployment_service
@@ -612,7 +655,12 @@ pub async fn cancel_deployment(
     RequireAuth(auth): RequireAuth,
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, DeploymentsDelete);
+    project_permission_guard!(
+        auth,
+        DeploymentsDelete,
+        project_id,
+        state.project_access_checker
+    );
 
     info!(
         "API request to cancel deployment {} for project {} from user",
@@ -672,7 +720,12 @@ pub async fn teardown_deployment(
     RequireAuth(auth): RequireAuth,
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, DeploymentsDelete);
+    project_permission_guard!(
+        auth,
+        DeploymentsDelete,
+        project_id,
+        state.project_access_checker
+    );
 
     info!(
         "Tearing down deployment {} for project: {}",
@@ -726,7 +779,12 @@ pub async fn teardown_environment(
     RequireAuth(auth): RequireAuth,
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, DeploymentsDelete);
+    project_permission_guard!(
+        auth,
+        DeploymentsDelete,
+        project_id,
+        state.project_access_checker
+    );
 
     info!(
         "Tearing down environment {} for project: {}",
@@ -781,6 +839,7 @@ pub async fn list_containers(
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     info!(
         "Listing containers for environment {} of project: {}",
@@ -930,6 +989,7 @@ pub async fn get_container_logs_by_id(
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     debug!(
         "WebSocket request for container {} logs in environment {} of project: {}",
@@ -1093,6 +1153,7 @@ pub async fn get_container_logs(
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     debug!(
         "WebSocket request for container logs in environment {} of project: {}",
@@ -1228,9 +1289,10 @@ async fn handle_filtered_container_logs_socket(
 pub async fn get_deployment_jobs(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
-    Path((_project_id, deployment_id)): Path<(i32, i32)>,
+    Path((project_id, deployment_id)): Path<(i32, i32)>,
 ) -> Result<Json<DeploymentJobsResponse>, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let jobs = state
         .deployment_service
@@ -1268,9 +1330,10 @@ pub async fn get_deployment_jobs(
 pub async fn get_deployment_job_logs(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
-    Path((_project_id, deployment_id, job_id)): Path<(i32, i32, String)>,
+    Path((project_id, deployment_id, job_id)): Path<(i32, i32, String)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     // Get the job to verify it exists and get its log_id
     let jobs = state
@@ -1325,6 +1388,7 @@ pub async fn list_deployment_container_logs(
     Path((project_id, deployment_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let logs = state
         .deployment_service
@@ -1364,6 +1428,7 @@ pub async fn get_deployment_container_log_content(
     Path((project_id, deployment_id, log_id)): Path<(i32, i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let (row, content) = state
         .deployment_service
@@ -1417,10 +1482,11 @@ pub async fn get_deployment_container_log_content(
 pub async fn tail_deployment_job_logs(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
-    Path((_project_id, deployment_id, job_id)): Path<(i32, i32, String)>,
+    Path((project_id, deployment_id, job_id)): Path<(i32, i32, String)>,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     debug!(
         "WebSocket request for tailing logs for job {} in deployment {}",
@@ -1519,6 +1585,7 @@ pub async fn get_container_detail(
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let (container, _) = state
         .deployment_service
@@ -1714,6 +1781,7 @@ pub async fn stop_container(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsWrite);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     state
         .deployment_service
@@ -1769,6 +1837,7 @@ pub async fn start_container(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsWrite);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     state
         .deployment_service
@@ -1824,6 +1893,7 @@ pub async fn restart_container(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsWrite);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     state
         .deployment_service
@@ -1878,6 +1948,7 @@ pub async fn get_container_metrics(
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let stats = state
         .deployment_service
@@ -1929,6 +2000,7 @@ pub async fn stream_container_metrics(
     Problem,
 > {
     permission_guard!(auth, EnvironmentsRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let interval_ms = params
         .get("interval")
@@ -2063,6 +2135,7 @@ pub async fn purge_asset_cache(
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsWrite);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let deleted = state
         .deployment_service
@@ -2095,6 +2168,7 @@ pub async fn purge_environment_asset_cache(
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsWrite);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let deleted = state
         .deployment_service
@@ -3286,6 +3360,7 @@ mod tests {
                     .unwrap_or_else(|_| bollard::Docker::connect_with_defaults().unwrap()),
             ),
             deployment_gate: None,
+            project_access_checker: None,
         })
     }
 

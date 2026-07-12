@@ -107,7 +107,7 @@ fn openapi_does_not_advertise_unknown_paths() {
     let expected: std::collections::HashSet<_> = expected_sdk_paths().into_iter().collect();
     let got = &api.paths.paths;
 
-    for (path, _) in got.iter() {
+    for path in got.keys() {
         assert!(
             expected.contains(path.as_str()),
             "OpenAPI doc exposes path '{}' not in the Vercel SDK surface — \

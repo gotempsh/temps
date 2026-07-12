@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::ToSchema;
 
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::audit::{AuditContext, AuditOperation};
 use temps_core::problemdetails::{self, Problem};
 use temps_core::RequestMetadata;
@@ -262,6 +262,8 @@ pub async fn list_skills(
     Path(project_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsRead);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     let items = app_state
         .definition_service
@@ -300,6 +302,8 @@ pub async fn get_skill(
     Path((project_id, slug)): Path<(i32, String)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsRead);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     let skill = app_state
         .definition_service
@@ -330,6 +334,8 @@ pub async fn create_skill(
     Json(request): Json<CreateSkillRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     let skill = app_state
         .definition_service
@@ -390,6 +396,8 @@ pub async fn update_skill(
     Json(request): Json<UpdateSkillRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     let skill = app_state
         .definition_service
@@ -445,6 +453,8 @@ pub async fn delete_skill(
     Path((project_id, slug)): Path<(i32, String)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     app_state
         .definition_service
@@ -488,6 +498,8 @@ pub async fn list_mcps(
     Path(project_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsRead);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     let items = app_state
         .definition_service
@@ -523,6 +535,8 @@ pub async fn get_mcp(
     Path((project_id, slug)): Path<(i32, String)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsRead);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     let mcp = app_state
         .definition_service
@@ -553,6 +567,8 @@ pub async fn create_mcp(
     Json(request): Json<CreateMcpRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     let mcp = app_state
         .definition_service
@@ -609,6 +625,8 @@ pub async fn update_mcp(
     Json(request): Json<UpdateMcpRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     let mcp = app_state
         .definition_service
@@ -663,6 +681,8 @@ pub async fn delete_mcp(
     Path((project_id, slug)): Path<(i32, String)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     app_state
         .definition_service
@@ -1202,6 +1222,8 @@ pub async fn upload_skill(
     multipart: Multipart,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     let request = parse_skill_multipart(multipart).await?;
     let skill = app_state
@@ -1299,6 +1321,8 @@ pub async fn download_skill_archive(
     Path((project_id, slug)): Path<(i32, String)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsRead);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     let skill = app_state
         .definition_service

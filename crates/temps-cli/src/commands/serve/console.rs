@@ -865,6 +865,30 @@ pub struct ConsoleApiParams {
     /// Pre-built admin-gate handle. When `None`, the console derives one
     /// from the freshly-constructed service above.
     pub admin_gate_handle: Option<temps_core::admin_gate::AdminGateHandle>,
+    /// Shared retention-resolver slot (see `temps_core::retention`). Owned by
+    /// the caller (`commands/serve/mod.rs`) so the SAME instance can also be
+    /// handed to `start_proxy_server` — the live Pingora proxy builds its own
+    /// isolated plugin context (`temps-proxy/src/server.rs::setup_proxy_plugins`,
+    /// only `ConfigPlugin`+`GeoPlugin`) and can never see a resolver registered
+    /// here via the console's plugin manager otherwise. Pre-registered into the
+    /// service registry below (before any plugin's `register_services` runs) so
+    /// `ProxyPlugin` uses this exact object rather than creating its own.
+    ///
+    /// **Security guardrail — shared-slot pattern:**
+    /// This is the only object that is deliberately pre-registered in the
+    /// console's service registry AND passed directly to `start_proxy_server` as
+    /// a constructor argument. That cross-context sharing is necessary here
+    /// because the Pingora proxy runs in a wholly separate plugin context and
+    /// cannot reach anything registered in the console's registry.
+    ///
+    /// This pattern MUST NOT be used for any object that affects the proxy's
+    /// security decisions (authentication, TLS/cert issuance, IP blocklists,
+    /// rate limiting, or routing). It is acceptable for `RetentionResolverSlot`
+    /// exclusively because its sole effect is a per-row metadata value
+    /// (`retention_days`) with no bearing on request routing, authorization, or
+    /// connection handling. Any future object shared this same way requires an
+    /// explicit security review before being added here.
+    pub retention_resolver_slot: Arc<temps_core::RetentionResolverSlot>,
 }
 
 /// Build a ClickHouse-backed metrics store from the server config, or `None`
@@ -977,6 +1001,287 @@ fn health_router(ready: Arc<std::sync::atomic::AtomicBool>) -> Router {
         .route("/readyz", get(readyz))
 }
 
+/// ALLOWLIST for the AI `call_api` read tool — opt-in / secure by default.
+/// The model may call ONLY these read-only GET operations; every other
+/// endpoint (including any newly added one) is invisible to it. This is
+/// deliberately an allowlist, not a denylist: GET endpoints across the
+/// platform return decrypted secrets (service params → DB passwords,
+/// env-var reveals, notification configs → Slack/SMTP/Cloudflare creds, S3
+/// credentials, …), and a hand-maintained denylist can't be kept exhaustive.
+/// Curated for the SRE/debugging use case: observability, runtime/deploy
+/// status, errors, and MASKED metadata. Adding an entry is a security
+/// decision — verify the operation's response contains NO decrypted
+/// secret/token/key.
+///
+/// Analytics `custom_data`/`event_data` (freeform JSON on visitors/events)
+/// is an ACCEPTED risk, not an oversight: it's developer-controlled data the
+/// project operator already sends themselves, gated by the same
+/// AnalyticsRead + project scope as every other analytics tool below — not
+/// a platform secret. Raw HTTP request/response headers (session logs) and
+/// session-replay DOM/keystroke capture are excluded on purpose; those can
+/// carry Authorization/Cookie values or typed passwords and are a different
+/// risk class entirely.
+///
+/// Extracted into its own function (rather than an inline literal at the
+/// call site) so tests can assert every entry resolves to a real OpenAPI
+/// operation_id without duplicating the list — see `ai_tool_allowlist_tests`
+/// at the bottom of this file.
+fn ai_read_allowlist() -> Vec<String> {
+    [
+        // ── OpenTelemetry: metrics / traces / logs / health ──
+        "query_metrics",
+        "list_metric_names",
+        "list_metric_label_keys",
+        "list_metric_label_values",
+        "query_traces",
+        "query_trace_summaries",
+        "get_trace",
+        "query_genai_traces",
+        "get_genai_trace",
+        "query_logs",
+        "list_insights",
+        "get_health",
+        "get_quota",
+        "get_pipeline_stats",
+        // ── Container runtime: logs + metrics (no secrets) ──
+        "get_container_metrics",
+        "get_container_logs",
+        "get_container_logs_by_id",
+        "get_container_info",
+        "get_container_detail",
+        "list_containers",
+        // ── Deployments: status / jobs / history ──
+        "get_deployment",
+        "get_last_deployment",
+        "get_project_deployments",
+        // Manual-deploy discovery: registered external images the
+        // AI can deploy by id/ref (metadata only — no registry
+        // credentials). Static bundles are frontend-only, so their
+        // read ops are intentionally excluded here.
+        "list_external_images",
+        "get_external_image",
+        "get_deployment_jobs",
+        "get_deployment_operations",
+        "get_deployment_operation_status",
+        "get_activity_graph",
+        "get_deployment_job_logs",
+        "list_deployment_container_logs",
+        "get_deployment_container_log_content",
+        // ── Environments: metadata + MASKED env-var lists only ──
+        // (the *_value reveal endpoints are intentionally excluded)
+        "get_environments",
+        "get_environment",
+        "get_environment_domains",
+        "get_environment_crons",
+        "get_cron_by_id",
+        "get_cron_executions",
+        "get_environment_variables",
+        "get_resolved_environment_variables",
+        // ── Error tracking ──
+        "get_error_dashboard_stats",
+        "get_error_event",
+        "get_error_group",
+        "get_error_stats",
+        "get_error_time_series",
+        "has_error_groups",
+        "list_error_events",
+        "list_error_groups",
+        "list_alert_rules",
+        "get_alert_rule",
+        // ── Service status / health / types (NOT params/env) ──
+        "get_service_health_status",
+        "list_service_health_statuses",
+        "get_service_stats",
+        "get_service_runtime",
+        "list_project_services",
+        "list_service_projects",
+        "get_service_types",
+        "get_service_type_parameters",
+        "get_cluster_health",
+        "get_cluster_member",
+        "getPostgresWalHealth",
+        "ExternalServiceMetricsGetLatest",
+        "ExternalServiceMetricsGetRange",
+        "ExternalServiceMetricsStatus",
+        "ExternalServiceMetricsByDatabase",
+        "ExternalServiceMetricsGetAlertRules",
+        "DeploymentMetricsGetRange",
+        "DeploymentMetricsGetLatest",
+        "NodeMetricsGetRange",
+        // ── Domains: metadata (no challenge tokens) ──
+        "list_domains",
+        "get_domain",
+        "get_domain_by_name",
+        "get_domain_dns_records",
+        "list_custom_domains_for_project",
+        "get_custom_domain",
+        "check_domain_status",
+        "list_managed_domains",
+        "get_on_demand_cert_status",
+        // ── Platform / monitor status ──
+        "get_status_overview",
+        "get_disk_status",
+        "get_current_monitor_status",
+        "get_projects_health",
+        "get_projects_monitor_health",
+        "get_project_statistics",
+        // ── Backups: metadata only (NOT s3 credentials/source) ──
+        "get_backup",
+        "get_backup_schedule",
+        "list_backup_schedules",
+        "list_backups_for_schedule",
+        "list_external_service_backups",
+        "list_source_backups",
+        "list_schedule_runs",
+        "list_restore_runs_for_service",
+        "get_restore_capabilities",
+        // ── Audit trail ──
+        "list_audit_logs",
+        "get_audit_log",
+        // ── Analytics (the user's own traffic data) ──
+        "get_general_stats",
+        "get_visitor_stats",
+        "get_visitors",
+        "get_today_stats",
+        "get_recent_activity",
+        "get_events_timeline",
+        "get_events_count",
+        "get_page_paths",
+        "get_performance_metrics",
+        // Aggregates / counts / booleans — no PII, no secrets
+        "get_analytics_events_count",
+        "get_event_detail",
+        "get_visitor_facets",
+        "check_analytics_has_events",
+        "get_page_path_detail",
+        "get_page_hourly_sessions",
+        "get_page_paths_sparklines",
+        "get_page_flow",
+        "has_analytics_events",
+        "get_event_type_breakdown",
+        "get_active_visitors",
+        "get_hourly_visits",
+        "get_unique_counts",
+        "get_aggregated_buckets",
+        "get_dashboard_projects_analytics",
+        "get_metrics_over_time",
+        "get_grouped_page_metrics",
+        "has_performance_metrics",
+        "get_funnel_metrics",
+        "list_funnels",
+        "get_unique_events",
+        // Per-visitor/session metadata — same risk class as
+        // get_visitors/get_visitor_stats above (IP, geolocation,
+        // user_agent, is_crawler, custom_data/event_data)
+        "get_event_visitors",
+        "get_visitor_details",
+        "get_visitor_info",
+        "get_analytics_visitor_sessions",
+        "get_visitor_journey",
+        "get_session_details",
+        "get_session_events",
+        "get_page_path_visitors",
+        "get_analytics_active_visitors",
+        "get_live_visitors_list",
+        "get_visitor_by_id",
+        "get_visitor_by_guid",
+        // Excluded on purpose: get_property_breakdown /
+        // get_property_timeline (developer custom-property VALUES
+        // by name — held pending explicit review), get_session_logs
+        // (raw request/response headers), and all
+        // temps-analytics-session-replay reads (raw DOM/keystroke
+        // capture) — see allowlist comment above.
+        //
+        // ── Auth / API keys / OIDC (masked keys/secrets only) ──
+        "list_api_keys",
+        "get_api_key",
+        "list_public_providers",
+        "list_oidc_providers",
+        "list_oidc_provider_users",
+        "list_oidc_role_mappings",
+        "get_current_user",
+        // ── Webhooks (no signing secrets — those are excluded) ──
+        "list_webhooks",
+        "get_webhook",
+        "list_deliveries",
+        "get_delivery",
+        "list_event_types",
+        // ── KV / Blob: status only, no connection strings ──
+        "kv_status",
+        "blob_status",
+        "blob_list",
+        // ── Email: stats/tracking/DNS, no provider credentials ──
+        "list_emails",
+        "get_email",
+        "get_email_stats",
+        "list_email_domains",
+        "get_global_event_stats",
+        "get_global_events",
+        "get_email_tracking",
+        "get_email_events",
+        "get_email_links",
+        // ── Git: provider/connection/repo metadata, no OAuth tokens ──
+        "list_git_providers",
+        "get_git_provider",
+        "list_connections",
+        "list_repositories_by_connection",
+        "list_repositories_by_provider",
+        "list_synced_repositories",
+        "get_repository_preset_by_name",
+        "get_repository_by_name",
+        "get_public_branches",
+        "get_public_repository",
+        // ── Agents / skills / MCP / sandbox — config + run status ──
+        "list_agents",
+        "get_agent",
+        "list_skills",
+        "get_skill",
+        "list_mcps",
+        "get_mcp",
+        "list_global_skills",
+        "get_global_skill",
+        "list_global_mcps",
+        "get_global_mcp",
+        "get_run",
+        "get_cli_status",
+        "get_sandbox_status",
+        "get_global_sandbox_status",
+        // ── AI Gateway: masked keys, usage/cost stats, conversations ──
+        "list_models",
+        "get_usage_summary",
+        "get_usage_by_provider",
+        "get_usage_timeseries",
+        "get_usage_top_models",
+        "get_usage_recent",
+        "get_conversations",
+        "get_conversation_detail",
+        "get_pricing",
+        "list_provider_keys",
+        // ── Status page: monitors/incidents/uptime ──
+        "list_monitors",
+        "get_monitor",
+        "get_uptime_history",
+        "get_bucketed_status",
+        "list_incidents",
+        "get_incident",
+        "get_incident_updates",
+        "get_bucketed_incidents",
+        // ── Vulnerability scanning: results, no credentials ──
+        "list_project_scans",
+        "get_scan",
+        "get_scan_vulnerabilities",
+        "get_latest_scan",
+        "get_latest_scans_per_environment",
+        "get_scan_by_deployment",
+        // ── Import ──
+        "list_sources",
+        "get_import_status",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
 /// Initialize and start the console API server
 pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let ConsoleApiParams {
@@ -992,6 +1297,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         extra_plugins,
         admin_gate_service: provided_admin_gate_service,
         admin_gate_handle: provided_admin_gate_handle,
+        retention_resolver_slot,
     } = params;
 
     // Readiness flag for the `/readyz` probe. Starts `false` (not ready) and is
@@ -1073,6 +1379,10 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     service_context.register_service(encryption_service.clone());
     service_context.register_service(cookie_crypto.clone());
     service_context.register_service(docker.clone());
+    // Pre-registered before any plugin runs so ProxyPlugin uses this exact
+    // slot instance instead of creating its own — see the field doc on
+    // `ConsoleApiParams::retention_resolver_slot`.
+    service_context.register_service(retention_resolver_slot.clone());
 
     // Register the shared route table (created in serve/mod.rs)
     // This is used by analytics-events and other plugins that need to resolve hosts
@@ -1944,283 +2254,38 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                     // We clone it here so InternalApiCaller can replay synthetic
                     // requests through it without consuming the original.
                     //
-                    // ALLOWLIST for the AI `call_api` tool — opt-in / secure by
-                    // default. The model may call ONLY these read-only GET
-                    // operations; every other endpoint (including any newly added
-                    // one) is invisible to it. This is deliberately an allowlist,
-                    // not a denylist: GET endpoints across the platform return
-                    // decrypted secrets (service params → DB passwords, env-var
-                    // reveals, notification configs → Slack/SMTP/Cloudflare creds,
-                    // S3 credentials, …), and a hand-maintained denylist can't be
-                    // kept exhaustive. Curated for the SRE/debugging use case:
-                    // observability, runtime/deploy status, errors, and MASKED
-                    // metadata. Adding an entry is a security decision — verify the
-                    // operation's response contains NO decrypted secret/token/key.
-                    //
-                    // Analytics `custom_data`/`event_data` (freeform JSON on
-                    // visitors/events) is an ACCEPTED risk, not an oversight: it's
-                    // developer-controlled data the project operator already sends
-                    // themselves, gated by the same AnalyticsRead + project scope
-                    // as every other analytics tool below — not a platform secret.
-                    // Raw HTTP request/response headers (session logs) and
-                    // session-replay DOM/keystroke capture are excluded on purpose;
-                    // those can carry Authorization/Cookie values or typed
-                    // passwords and are a different risk class entirely.
-                    let allowlist: Vec<String> = [
-                        // ── OpenTelemetry: metrics / traces / logs / health ──
-                        "query_metrics",
-                        "list_metric_names",
-                        "list_metric_label_keys",
-                        "list_metric_label_values",
-                        "query_traces",
-                        "query_trace_summaries",
-                        "get_trace",
-                        "query_genai_traces",
-                        "get_genai_trace",
-                        "query_logs",
-                        "list_insights",
-                        "get_health",
-                        "get_quota",
-                        "get_pipeline_stats",
-                        // ── Container runtime: logs + metrics (no secrets) ──
-                        "get_container_metrics",
-                        "get_container_logs",
-                        "get_container_logs_by_id",
-                        "get_container_info",
-                        "get_container_detail",
-                        "list_containers",
-                        // ── Deployments: status / jobs / history ──
-                        "get_deployment",
-                        "get_last_deployment",
-                        "get_project_deployments",
-                        // Manual-deploy discovery: registered external images the
-                        // AI can deploy by id/ref (metadata only — no registry
-                        // credentials). Static bundles are frontend-only, so their
-                        // read ops are intentionally excluded here.
-                        "list_external_images",
-                        "get_external_image",
-                        "get_deployment_jobs",
-                        "get_deployment_operations",
-                        "get_deployment_operation_status",
-                        "get_activity_graph",
-                        "get_deployment_job_logs",
-                        "list_deployment_container_logs",
-                        "get_deployment_container_log_content",
-                        // ── Environments: metadata + MASKED env-var lists only ──
-                        // (the *_value reveal endpoints are intentionally excluded)
-                        "get_environments",
-                        "get_environment",
-                        "get_environment_domains",
-                        "get_environment_crons",
-                        "get_cron_by_id",
-                        "get_cron_executions",
-                        "get_environment_variables",
-                        "get_resolved_environment_variables",
-                        // ── Error tracking ──
-                        "get_error_dashboard_stats",
-                        "get_error_event",
-                        "get_error_group",
-                        "get_error_stats",
-                        "get_error_time_series",
-                        "has_error_groups",
-                        "list_error_events",
-                        "list_error_groups",
-                        "list_alert_rules",
-                        "get_alert_rule",
-                        // ── Service status / health / types (NOT params/env) ──
-                        "get_service_health_status",
-                        "list_service_health_statuses",
-                        "get_service_stats",
-                        "get_service_runtime",
-                        "list_project_services",
-                        "list_service_projects",
-                        "get_service_types",
-                        "get_service_type_parameters",
-                        "get_cluster_health",
-                        "get_cluster_member",
-                        "getPostgresWalHealth",
-                        "ExternalServiceMetricsGetLatest",
-                        "ExternalServiceMetricsGetRange",
-                        "ExternalServiceMetricsStatus",
-                        "ExternalServiceMetricsByDatabase",
-                        "ExternalServiceMetricsGetAlertRules",
-                        // ── Domains: metadata (no challenge tokens) ──
-                        "list_domains",
-                        "get_domain",
-                        "get_domain_by_name",
-                        "get_domain_dns_records",
-                        "list_custom_domains_for_project",
-                        "get_custom_domain",
-                        "check_domain_status",
-                        "list_managed_domains",
-                        "get_on_demand_cert_status",
-                        // ── Platform / monitor status ──
-                        "get_status_overview",
-                        "get_disk_status",
-                        "get_current_monitor_status",
-                        "get_projects_health",
-                        "get_projects_monitor_health",
-                        "get_project_statistics",
-                        // ── Backups: metadata only (NOT s3 credentials/source) ──
-                        "get_backup",
-                        "get_backup_schedule",
-                        "list_backup_schedules",
-                        "list_backups_for_schedule",
-                        "list_external_service_backups",
-                        "list_source_backups",
-                        "list_schedule_runs",
-                        "list_restore_runs_for_service",
-                        "get_restore_capabilities",
-                        // ── Audit trail ──
-                        "list_audit_logs",
-                        "get_audit_log",
-                        // ── Analytics (the user's own traffic data) ──
-                        "get_general_stats",
-                        "get_visitor_stats",
-                        "get_visitors",
-                        "get_today_stats",
-                        "get_recent_activity",
-                        "get_events_timeline",
-                        "get_events_count",
-                        "get_page_paths",
-                        "get_performance_metrics",
-                        // Aggregates / counts / booleans — no PII, no secrets
-                        "get_analytics_events_count",
-                        "get_event_detail",
-                        "get_visitor_facets",
-                        "check_analytics_has_events",
-                        "get_page_path_detail",
-                        "get_page_hourly_sessions",
-                        "get_page_paths_sparklines",
-                        "get_page_flow",
-                        "has_analytics_events",
-                        "get_event_type_breakdown",
-                        "get_active_visitors",
-                        "get_hourly_visits",
-                        "get_unique_counts",
-                        "get_aggregated_buckets",
-                        "get_dashboard_projects_analytics",
-                        "get_metrics_over_time",
-                        "get_grouped_page_metrics",
-                        "has_performance_metrics",
-                        "get_funnel_metrics",
-                        "list_funnels",
-                        "get_unique_events",
-                        // Per-visitor/session metadata — same risk class as
-                        // get_visitors/get_visitor_stats above (IP, geolocation,
-                        // user_agent, is_crawler, custom_data/event_data)
-                        "get_event_visitors",
-                        "get_visitor_details",
-                        "get_visitor_info",
-                        "get_analytics_visitor_sessions",
-                        "get_visitor_journey",
-                        "get_session_details",
-                        "get_session_events",
-                        "get_page_path_visitors",
-                        "get_analytics_active_visitors",
-                        "get_live_visitors_list",
-                        "get_visitor_by_id",
-                        "get_visitor_by_guid",
-                        // Excluded on purpose: get_property_breakdown /
-                        // get_property_timeline (developer custom-property VALUES
-                        // by name — held pending explicit review), get_session_logs
-                        // (raw request/response headers), and all
-                        // temps-analytics-session-replay reads (raw DOM/keystroke
-                        // capture) — see allowlist comment above.
-                        //
-                        // ── Auth / API keys / OIDC (masked keys/secrets only) ──
-                        "list_api_keys",
-                        "get_api_key",
-                        "list_public_providers",
-                        "list_oidc_providers",
-                        "list_oidc_provider_users",
-                        "list_oidc_role_mappings",
-                        "get_current_user",
-                        // ── Webhooks (no signing secrets — those are excluded) ──
-                        "list_webhooks",
-                        "get_webhook",
-                        "list_deliveries",
-                        "get_delivery",
-                        "list_event_types",
-                        // ── KV / Blob: status only, no connection strings ──
-                        "kv_status",
-                        "blob_status",
-                        "blob_list",
-                        // ── Email: stats/tracking/DNS, no provider credentials ──
-                        "list_emails",
-                        "get_email",
-                        "get_email_stats",
-                        "list_email_domains",
-                        "get_global_event_stats",
-                        "get_global_events",
-                        "get_email_tracking",
-                        "get_email_events",
-                        "get_email_links",
-                        // ── Git: provider/connection/repo metadata, no OAuth tokens ──
-                        "list_git_providers",
-                        "get_git_provider",
-                        "list_connections",
-                        "list_repositories_by_connection",
-                        "list_repositories_by_provider",
-                        "list_synced_repositories",
-                        "get_repository_preset_by_name",
-                        "get_repository_by_name",
-                        "get_public_branches",
-                        "get_public_repository",
-                        // ── Agents / skills / MCP / sandbox — config + run status ──
-                        "list_agents",
-                        "get_agent",
-                        "list_skills",
-                        "get_skill",
-                        "list_mcps",
-                        "get_mcp",
-                        "list_global_skills",
-                        "get_global_skill",
-                        "list_global_mcps",
-                        "get_global_mcp",
-                        "get_run",
-                        "get_cli_status",
-                        "get_sandbox_status",
-                        "get_global_sandbox_status",
-                        // ── AI Gateway: masked keys, usage/cost stats, conversations ──
-                        "list_models",
-                        "get_usage_summary",
-                        "get_usage_by_provider",
-                        "get_usage_timeseries",
-                        "get_usage_top_models",
-                        "get_usage_recent",
-                        "get_conversations",
-                        "get_conversation_detail",
-                        "get_pricing",
-                        "list_provider_keys",
-                        // ── Status page: monitors/incidents/uptime ──
-                        "list_monitors",
-                        "get_monitor",
-                        "get_uptime_history",
-                        "get_bucketed_status",
-                        "list_incidents",
-                        "get_incident",
-                        "get_incident_updates",
-                        "get_bucketed_incidents",
-                        // ── Vulnerability scanning: results, no credentials ──
-                        "list_project_scans",
-                        "get_scan",
-                        "get_scan_vulnerabilities",
-                        "get_latest_scan",
-                        "get_latest_scans_per_environment",
-                        "get_scan_by_deployment",
-                        // ── Import ──
-                        "list_sources",
-                        "get_import_status",
-                    ]
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect();
+                    // ALLOWLIST for the AI `call_api` tool — see
+                    // `ai_read_allowlist()` below for the full curated list and
+                    // the security rationale behind what is/isn't included.
+                    let allowlist: Vec<String> = ai_read_allowlist();
                     let caller = temps_ai_api_tools::InternalApiCaller::new_allowlisted(
                         split.admin.clone(),
                         &openapi,
-                        allowlist,
+                        allowlist.clone(),
                     );
+                    // Diagnostic: report which allowlist entries actually
+                    // resolved to a real operation in the OpenAPI doc, and
+                    // loudly flag any that did not (a typo or a wrong
+                    // method/operation_id silently drops the op otherwise) —
+                    // mirrors the same check already done for the write
+                    // allowlist below.
+                    let resolved = caller.indexed_operation_ids();
+                    let unresolved: Vec<&String> = allowlist
+                        .iter()
+                        .filter(|id| !resolved.contains(id))
+                        .collect();
+                    info!(
+                        resolved_count = resolved.len(),
+                        allowlist_count = allowlist.len(),
+                        "AI read tool: indexed read operations"
+                    );
+                    if !unresolved.is_empty() {
+                        tracing::warn!(
+                            ?unresolved,
+                            "AI read tool: allowlisted read operations did NOT resolve to \
+                             an OpenAPI operation and are unavailable — check the operation_id"
+                        );
+                    }
                     handle.set(caller);
                     debug!("ADR-024: InternalApiCaller populated in ApiToolsHandle");
 
@@ -2279,6 +2344,12 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                             //    account-global domain create/delete excluded) ──
                             "add_environment_domain",
                             "delete_environment_domain",
+                            // ── Managed external services (databases, caches, etc.) —
+                            //    provisioning a new container and linking an existing
+                            //    one to a project. Both reversible (a service can be
+                            //    unlinked / left running unused; nothing is deleted).
+                            "create_service",
+                            "link_service_to_project",
                         ]
                         .iter()
                         .map(|s| s.to_string())
@@ -2581,6 +2652,82 @@ mod health_tests {
         assert_eq!(
             get_status(flag, "/readyz").await,
             StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+}
+
+#[cfg(test)]
+mod ai_tool_allowlist_tests {
+    use super::*;
+    use temps_ai_api_tools::ReadOnlyApiIndex;
+    use temps_providers::handlers::metrics_handlers::MetricsApiDoc;
+    use utoipa::OpenApi;
+
+    /// The AI read allowlist must never contain duplicate entries — a repeat
+    /// is dead weight in the model's tool catalogue and a signal something
+    /// was pasted twice while merging.
+    #[test]
+    fn ai_read_allowlist_has_no_duplicate_entries() {
+        let allowlist = ai_read_allowlist();
+        let mut seen = std::collections::HashSet::new();
+        for entry in &allowlist {
+            assert!(
+                seen.insert(entry.as_str()),
+                "duplicate allowlist entry: {entry}"
+            );
+        }
+    }
+
+    /// PR #265 added `DeploymentMetricsGetRange`/`DeploymentMetricsGetLatest`/
+    /// `NodeMetricsGetRange` to the allowlist as bare strings — nothing
+    /// type-checks them against the real `operation_id`s declared via
+    /// `#[utoipa::path]` in `metrics_handlers.rs`. This proves each one
+    /// actually resolves through the same
+    /// `ReadOnlyApiIndex::from_openapi_allowlist` the production
+    /// `InternalApiCaller` uses, so a future typo or renamed handler fails a
+    /// test instead of silently vanishing from the AI's tool catalogue — the
+    /// exact failure mode PR #265 itself was fixing (see the allowlist doc
+    /// comment on `ai_read_allowlist`).
+    #[test]
+    fn deployment_and_node_metrics_tools_resolve_against_real_openapi() {
+        let openapi = MetricsApiDoc::openapi();
+        let allowlist = ai_read_allowlist();
+        let allowlist_refs: Vec<&str> = allowlist.iter().map(String::as_str).collect();
+        let index = ReadOnlyApiIndex::from_openapi_allowlist(&openapi, &allowlist_refs);
+
+        for tool in [
+            "DeploymentMetricsGetRange",
+            "DeploymentMetricsGetLatest",
+            "NodeMetricsGetRange",
+        ] {
+            assert!(
+                index.get(tool).is_some(),
+                "AI read allowlist claims to expose `{tool}` but it does not resolve \
+                 against the real MetricsApiDoc operation_id — check for a typo or a \
+                 renamed handler"
+            );
+        }
+    }
+
+    /// The companion write operation `DeploymentMetricsToggle` (a PATCH) must
+    /// never become callable through the read-only index, even though it is
+    /// declared in the same `MetricsApiDoc` — `from_openapi_allowlist` only
+    /// ever indexes `GET` operations, so this is a structural guarantee, not
+    /// just an allowlist-membership check. Matches the PR #265 description's
+    /// own stated intent: "DeploymentMetricsToggle ... is intentionally left
+    /// out, consistent with the existing pattern of excluding all write
+    /// operations from the read allowlist."
+    #[test]
+    fn deployment_metrics_toggle_write_op_is_never_read_callable() {
+        let openapi = MetricsApiDoc::openapi();
+        let allowlist = ai_read_allowlist();
+        let allowlist_refs: Vec<&str> = allowlist.iter().map(String::as_str).collect();
+        let index = ReadOnlyApiIndex::from_openapi_allowlist(&openapi, &allowlist_refs);
+
+        assert!(
+            index.get("DeploymentMetricsToggle").is_none(),
+            "DeploymentMetricsToggle is a write (PATCH) operation and must never be \
+             resolvable via the read-only AI tool allowlist"
         );
     }
 }

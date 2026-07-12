@@ -24,8 +24,9 @@ use crate::handler::preview_wall::{
 use crate::on_demand::OnDemandManager;
 use crate::preview_auth::{
     build_set_cookie_sandbox, check_preview_auth, encode_preview_cookie_subject,
-    parse_preview_host, verify_argon2, PreviewAuthLimiter, PreviewAuthOutcome, PreviewHost,
-    PreviewSandboxLookup, SandboxLookupCache, PREVIEW_GATEWAY_PEER,
+    parse_preview_host, preview_peer_group_key, verify_argon2, PreviewAuthLimiter,
+    PreviewAuthOutcome, PreviewHost, PreviewSandboxLookup, SandboxLookupCache,
+    PREVIEW_GATEWAY_PEER,
 };
 use crate::service::cert_host_cache::CertHostCache;
 use crate::service::challenge_service::ChallengeService;
@@ -378,8 +379,21 @@ pub struct ProxyContext {
     pub tls_cipher: Option<String>,
     /// SNI hostname from TLS handshake (for SNI-based routing)
     pub sni_hostname: Option<String>,
-    /// Upstream response body bytes received (tracked by Pingora 0.8.0)
+    /// Upstream response body bytes actually forwarded to the client,
+    /// accumulated per-chunk in `response_body_filter`. Authoritative source
+    /// for response bandwidth — unlike the `Content-Length` header, this is
+    /// always populated even for chunked/streamed responses.
     pub upstream_body_bytes_received: usize,
+    /// Client request body bytes received, accumulated per-chunk in
+    /// `request_body_filter`. Authoritative source for request bandwidth —
+    /// unlike the `Content-Length` header, this is always populated even for
+    /// chunked-encoded request bodies.
+    pub client_body_bytes_received: usize,
+    /// Proxy log entry built in `log_request` (response-header time), held
+    /// here rather than sent immediately because `upstream_body_bytes_received`
+    /// isn't fully accumulated until the response body finishes streaming.
+    /// The `logging` hook patches in the final byte count and sends it.
+    pub pending_proxy_log: Option<CreateProxyLogRequest>,
     /// Whether the client requested a Markdown response via `Accept: text/markdown`
     pub wants_markdown: bool,
     /// Accumulated body bytes for HTML-to-Markdown conversion
@@ -388,6 +402,13 @@ pub struct ProxyContext {
     pub upstream_connect_tries: usize,
     /// Time upstream took to accept the request body (upload diagnostics, Pingora 0.8.0)
     pub upstream_write_pending_time_ms: Option<i32>,
+    /// When `upstream_peer` started resolving/connecting the upstream. Basis
+    /// for the backend-latency metric; `None` for requests the proxy answered
+    /// itself (static files, redirects, walls).
+    pub upstream_start_time: Option<Instant>,
+    /// Backend latency: `upstream_start_time` → first upstream response
+    /// header (connect + request + upstream processing + TTFB).
+    pub upstream_response_time_ms: Option<u64>,
     /// Set when the request matched a workspace preview hostname and passed
     /// auth — `upstream_peer` will route it to the local preview gateway.
     pub preview_route: Option<PreviewHost>,
@@ -447,6 +468,10 @@ pub struct LoadBalancer {
     /// to the console — see `request_filter`. When `None`, gate enforcement
     /// is skipped entirely (used by older test harnesses).
     admin_gate: Option<temps_core::admin_gate::AdminGateHandle>,
+    /// Lock-free hot-path request counters (status classes + duration
+    /// histogram). Updated on every completed/failed request; drained by the
+    /// background `ProxyMetricsSampler`, never read on the request path.
+    proxy_metrics: Arc<crate::metrics::ProxyMetrics>,
 }
 
 impl LoadBalancer {
@@ -487,7 +512,14 @@ impl LoadBalancer {
             file_store: None,
             preview_auth_limiter: Arc::new(PreviewAuthLimiter::new()),
             admin_gate: None,
+            proxy_metrics: Arc::new(crate::metrics::ProxyMetrics::default()),
         }
+    }
+
+    /// Handle to the hot-path metrics counters, for the background sampler.
+    /// The returned `Arc` shares the counters this instance records into.
+    pub fn proxy_metrics(&self) -> Arc<crate::metrics::ProxyMetrics> {
+        Arc::clone(&self.proxy_metrics)
     }
 
     /// Wire the shared admin-gate handle. When set, `request_filter`
@@ -1321,7 +1353,7 @@ impl LoadBalancer {
         &self,
         _session: &PingoraSession,
         upstream_response: &ResponseHeader,
-        ctx: &ProxyContext,
+        ctx: &mut ProxyContext,
     ) -> Result<()> {
         // Skip logging for internal temps API routes
         if ctx.path.starts_with(ROUTE_PREFIX_TEMPS) {
@@ -1332,14 +1364,26 @@ impl LoadBalancer {
 
         // Asynchronously log to proxy_logs table via batch writer (skip static assets)
         if Self::should_log_request(&ctx.path) {
-            // Extract request size from Content-Length header
-            let request_size = ctx
-                .request_headers
-                .as_ref()
-                .and_then(|h| h.get("content-length"))
-                .and_then(|v| v.parse::<i64>().ok());
+            // Request body has already fully streamed through request_body_filter
+            // by the time response headers arrive (the client finishes sending
+            // before the upstream replies), so the accumulated count is reliable
+            // here. Fall back to Content-Length only for bodies that never
+            // reached the filter (e.g. HEAD).
+            let request_size = if ctx.client_body_bytes_received > 0 {
+                Some(ctx.client_body_bytes_received as i64)
+            } else {
+                ctx.request_headers
+                    .as_ref()
+                    .and_then(|h| h.get("content-length"))
+                    .and_then(|v| v.parse::<i64>().ok())
+            };
 
-            // Extract response size from Content-Length header
+            // This function runs when response *headers* arrive — the response
+            // body hasn't streamed through response_body_filter yet, so
+            // upstream_body_bytes_received is always 0 here. Content-Length is
+            // the best information available now; the `logging` hook (true
+            // end-of-request, after the body has fully streamed) overwrites
+            // this with the accumulated byte count before the entry is sent.
             let response_size = ctx
                 .response_headers
                 .as_ref()
@@ -1400,10 +1444,10 @@ impl LoadBalancer {
                 error_group_id: None,
             };
 
-            // Non-blocking enqueue; sheds the entry when the writer is behind.
-            // Never spawn-and-await a send here: each parked send future pins
-            // the full log struct and the task list becomes an unbounded queue.
-            self.proxy_log_handle.send_or_drop(proxy_log_request);
+            // Stash rather than send: the `logging` hook fires after the
+            // response body has fully streamed and patches response_size_bytes
+            // with the accurate accumulated count before enqueueing.
+            ctx.pending_proxy_log = Some(proxy_log_request);
         }
 
         Ok(())
@@ -2123,6 +2167,102 @@ fn ephemeral_redirect_location(
     Some(location)
 }
 
+/// Core response-body-filter logic (SSE/WebSocket passthrough, buffered
+/// Markdown conversion, default passthrough). Split out as a free function
+/// so `response_body_filter` can wrap it with byte-counting that applies
+/// uniformly to every exit path — see `ProxyContext::upstream_body_bytes_received`.
+fn response_body_filter_inner(
+    body: &mut Option<Bytes>,
+    end_of_stream: bool,
+    ctx: &mut ProxyContext,
+) -> Result<Option<std::time::Duration>> {
+    // For SSE or WebSocket responses, pass through immediately without buffering
+    if ctx.is_sse || ctx.is_websocket {
+        if let Some(chunk) = body {
+            let stream_type = if ctx.is_sse { "SSE" } else { "WebSocket" };
+            debug!("Streaming {} chunk: {} bytes", stream_type, chunk.len());
+        }
+        return Ok(None);
+    }
+
+    // HTML-to-Markdown conversion: buffer chunks, convert on end_of_stream.
+    if ctx.wants_markdown {
+        if let Some(chunk) = body.take() {
+            // Enforce 2 MB limit — mirrors Cloudflare's Markdown for Agents constraint.
+            if ctx.markdown_buffer.len() + chunk.len() > MAX_MARKDOWN_BODY_BYTES {
+                warn!(
+                    "Response body exceeds 2 MB markdown conversion limit for path={}, \
+                     falling back to passthrough",
+                    ctx.path
+                );
+                // Disable markdown, flush the buffer + current chunk as-is.
+                ctx.wants_markdown = false;
+                let mut flushed = std::mem::take(&mut ctx.markdown_buffer);
+                flushed.extend_from_slice(&chunk);
+                *body = Some(Bytes::from(flushed));
+                return Ok(None);
+            }
+            ctx.markdown_buffer.extend_from_slice(&chunk);
+        }
+
+        if end_of_stream {
+            let html = String::from_utf8_lossy(&ctx.markdown_buffer);
+            // Parse the document once — reuse it for both meta extraction
+            // and content extraction.
+            let document = scraper::Html::parse_document(&html);
+            let meta = extract_page_meta(&document);
+            // Extract <main> (or <body> fallback), stripping script/style.
+            let content = extract_content_html(&document);
+            let markdown = match htmd::convert(&content) {
+                Ok(md) => md,
+                Err(e) => {
+                    warn!(
+                        "HTML-to-Markdown conversion failed for path={}: {}",
+                        ctx.path, e
+                    );
+                    // Fall back to the original HTML bytes so the client gets something.
+                    let original = std::mem::take(&mut ctx.markdown_buffer);
+                    *body = Some(Bytes::from(original));
+                    return Ok(None);
+                }
+            };
+
+            let token_estimate = estimate_markdown_tokens(&markdown);
+            debug!(
+                "Markdown conversion complete for path={}: {} bytes, ~{} tokens",
+                ctx.path,
+                markdown.len(),
+                token_estimate
+            );
+
+            // The x-markdown-tokens header must be a trailer because the response
+            // headers have already been sent. Pingora does not support HTTP trailers
+            // for regular HTTP/1.1 clients, so we log the value and skip injecting it
+            // into headers here — the header is set in response_filter instead via
+            // a sentinel value once we know the body size upfront (not possible when
+            // streaming).  Best-effort: we set it here anyway; Pingora will silently
+            // drop it if trailers are unsupported.
+            // Note: if you need reliable x-markdown-tokens delivery, switch to a
+            // buffered response pattern (write_response_* directly in request_filter).
+
+            // Prepend YAML front-matter built from <head> meta tags,
+            // matching Cloudflare's Markdown for Agents output format.
+            let final_markdown = match meta.to_frontmatter() {
+                Some(fm) => fm + &markdown,
+                None => markdown,
+            };
+
+            ctx.markdown_buffer = Vec::new(); // free memory
+            *body = Some(Bytes::from(final_markdown));
+        }
+        // Suppress intermediate chunks — only emit on end_of_stream.
+        return Ok(None);
+    }
+
+    // Default: pass all responses through without buffering
+    Ok(None)
+}
+
 #[async_trait]
 impl ProxyHttp for LoadBalancer {
     type CTX = ProxyContext;
@@ -2166,10 +2306,14 @@ impl ProxyHttp for LoadBalancer {
             tls_cipher: None,
             sni_hostname: None,
             upstream_body_bytes_received: 0,
+            client_body_bytes_received: 0,
+            pending_proxy_log: None,
             wants_markdown: false,
             markdown_buffer: Vec::new(),
             upstream_connect_tries: 0,
             upstream_write_pending_time_ms: None,
+            upstream_start_time: None,
+            upstream_response_time_ms: None,
             preview_route: None,
         }
     }
@@ -3698,6 +3842,14 @@ impl ProxyHttp for LoadBalancer {
         Self::CTX: Send + Sync,
     {
         debug!("Upstream response filter headers: {:?}", upstream_response);
+
+        // First upstream header = backend latency (connect + upstream time).
+        if ctx.upstream_response_time_ms.is_none() {
+            if let Some(start) = ctx.upstream_start_time {
+                ctx.upstream_response_time_ms = Some(start.elapsed().as_millis() as u64);
+            }
+        }
+
         ctx.upstream_response_headers = Some(upstream_response.clone());
 
         let headers_map: HashMap<String, String> = upstream_response
@@ -3742,6 +3894,30 @@ impl ProxyHttp for LoadBalancer {
         Ok(())
     }
 
+    /// Accumulate request body bytes as they stream in. The only reliable
+    /// way to measure upload size — chunked-encoded request bodies carry no
+    /// `Content-Length` header and would otherwise log as 0 (see `log_request`).
+    async fn request_body_filter(
+        &self,
+        _session: &mut PingoraSession,
+        body: &mut Option<Bytes>,
+        _end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        if let Some(chunk) = body.as_ref() {
+            ctx.client_body_bytes_received += chunk.len();
+        }
+        Ok(())
+    }
+
+    /// Thin wrapper over `response_body_filter_inner` that accumulates the
+    /// bytes actually forwarded to the client on every exit path (passthrough,
+    /// SSE/WebSocket, and the buffered Markdown conversion below). Chunked
+    /// responses carry no `Content-Length` header, so this accumulated count
+    /// is the only reliable source for response bandwidth (see `log_request`).
     fn response_body_filter(
         &self,
         _session: &mut PingoraSession,
@@ -3752,91 +3928,11 @@ impl ProxyHttp for LoadBalancer {
     where
         Self::CTX: Send + Sync,
     {
-        // For SSE or WebSocket responses, pass through immediately without buffering
-        if ctx.is_sse || ctx.is_websocket {
-            if let Some(chunk) = body {
-                let stream_type = if ctx.is_sse { "SSE" } else { "WebSocket" };
-                debug!("Streaming {} chunk: {} bytes", stream_type, chunk.len());
-            }
-            return Ok(None);
+        let result = response_body_filter_inner(body, end_of_stream, ctx);
+        if let Some(chunk) = body.as_ref() {
+            ctx.upstream_body_bytes_received += chunk.len();
         }
-
-        // HTML-to-Markdown conversion: buffer chunks, convert on end_of_stream.
-        if ctx.wants_markdown {
-            if let Some(chunk) = body.take() {
-                // Enforce 2 MB limit — mirrors Cloudflare's Markdown for Agents constraint.
-                if ctx.markdown_buffer.len() + chunk.len() > MAX_MARKDOWN_BODY_BYTES {
-                    warn!(
-                        "Response body exceeds 2 MB markdown conversion limit for path={}, \
-                         falling back to passthrough",
-                        ctx.path
-                    );
-                    // Disable markdown, flush the buffer + current chunk as-is.
-                    ctx.wants_markdown = false;
-                    let mut flushed = std::mem::take(&mut ctx.markdown_buffer);
-                    flushed.extend_from_slice(&chunk);
-                    *body = Some(Bytes::from(flushed));
-                    return Ok(None);
-                }
-                ctx.markdown_buffer.extend_from_slice(&chunk);
-            }
-
-            if end_of_stream {
-                let html = String::from_utf8_lossy(&ctx.markdown_buffer);
-                // Parse the document once — reuse it for both meta extraction
-                // and content extraction.
-                let document = scraper::Html::parse_document(&html);
-                let meta = extract_page_meta(&document);
-                // Extract <main> (or <body> fallback), stripping script/style.
-                let content = extract_content_html(&document);
-                let markdown = match htmd::convert(&content) {
-                    Ok(md) => md,
-                    Err(e) => {
-                        warn!(
-                            "HTML-to-Markdown conversion failed for path={}: {}",
-                            ctx.path, e
-                        );
-                        // Fall back to the original HTML bytes so the client gets something.
-                        let original = std::mem::take(&mut ctx.markdown_buffer);
-                        *body = Some(Bytes::from(original));
-                        return Ok(None);
-                    }
-                };
-
-                let token_estimate = estimate_markdown_tokens(&markdown);
-                debug!(
-                    "Markdown conversion complete for path={}: {} bytes, ~{} tokens",
-                    ctx.path,
-                    markdown.len(),
-                    token_estimate
-                );
-
-                // The x-markdown-tokens header must be a trailer because the response
-                // headers have already been sent. Pingora does not support HTTP trailers
-                // for regular HTTP/1.1 clients, so we log the value and skip injecting it
-                // into headers here — the header is set in response_filter instead via
-                // a sentinel value once we know the body size upfront (not possible when
-                // streaming).  Best-effort: we set it here anyway; Pingora will silently
-                // drop it if trailers are unsupported.
-                // Note: if you need reliable x-markdown-tokens delivery, switch to a
-                // buffered response pattern (write_response_* directly in request_filter).
-
-                // Prepend YAML front-matter built from <head> meta tags,
-                // matching Cloudflare's Markdown for Agents output format.
-                let final_markdown = match meta.to_frontmatter() {
-                    Some(fm) => fm + &markdown,
-                    None => markdown,
-                };
-
-                ctx.markdown_buffer = Vec::new(); // free memory
-                *body = Some(Bytes::from(final_markdown));
-            }
-            // Suppress intermediate chunks — only emit on end_of_stream.
-            return Ok(None);
-        }
-
-        // Default: pass all responses through without buffering
-        Ok(None)
+        result
     }
 
     async fn response_filter(
@@ -3992,6 +4088,10 @@ impl ProxyHttp for LoadBalancer {
         session: &mut PingoraSession,
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
+        // Backend-latency basis. On connect retries this is re-stamped, so the
+        // metric measures the attempt that actually served the response.
+        ctx.upstream_start_time = Some(Instant::now());
+
         // WebSocket upgrades legitimately sit silent for minutes (idle
         // terminals, push-only feeds). Cap them at 1h instead of the 60s
         // default that HTTP uses, otherwise Pingora RSTs the socket every
@@ -4012,8 +4112,16 @@ impl ProxyHttp for LoadBalancer {
         // Workspace preview gateway: skip the route table and forward straight
         // to the local gateway. The host header is preserved so the gateway
         // can decode `ws-<sid>-<port>` and pick the right sandbox container.
-        if ctx.preview_route.is_some() {
+        //
+        // Every preview target shares this same physical peer address, so
+        // `group_key` MUST be set per-target — otherwise Pingora's
+        // connection pool considers all sandboxes' requests interchangeable
+        // and can hand a connection opened for one sandbox back out to
+        // serve a different sandbox's request (see `preview_peer_group_key`
+        // doc comment for the full mechanism).
+        if let Some(host) = &ctx.preview_route {
             let mut peer = Box::new(HttpPeer::new(PREVIEW_GATEWAY_PEER, false, String::new()));
+            peer.group_key = preview_peer_group_key(host);
             peer.options.connection_timeout = Some(std::time::Duration::from_secs(5));
             peer.options.read_timeout = Some(io_timeout);
             peer.options.write_timeout = Some(io_timeout);
@@ -4165,12 +4273,16 @@ impl ProxyHttp for LoadBalancer {
 
         // Asynchronously log failed proxy request (skip static assets)
         if Self::should_log_request(&ctx.path) {
-            // Extract request size from Content-Length header
-            let request_size = ctx
-                .request_headers
-                .as_ref()
-                .and_then(|h| h.get("content-length"))
-                .and_then(|v| v.parse::<i64>().ok());
+            // Prefer bytes actually received from the client (see log_request);
+            // fall back to Content-Length if the body never reached the filter.
+            let request_size = if ctx.client_body_bytes_received > 0 {
+                Some(ctx.client_body_bytes_received as i64)
+            } else {
+                ctx.request_headers
+                    .as_ref()
+                    .and_then(|h| h.get("content-length"))
+                    .and_then(|v| v.parse::<i64>().ok())
+            };
 
             // For failed requests, response size is the error message size
             let response_size = Some(SERVICE_UNAVAILABLE_BODY.len() as i64);
@@ -4228,6 +4340,48 @@ impl ProxyHttp for LoadBalancer {
         FailToProxy {
             error_code,
             can_reuse_downstream,
+        }
+    }
+
+    /// End-of-request hook — Pingora calls this exactly once for EVERY
+    /// request, whether it was proxied, served directly from `request_filter`
+    /// (redirects, password walls, ACME challenges, static files), or failed.
+    /// This is therefore the single record site for hot-path metrics, which
+    /// guarantees the destination counters sum to `proxy.requests`.
+    async fn logging(&self, session: &mut PingoraSession, _e: Option<&Error>, ctx: &mut Self::CTX)
+    where
+        Self::CTX: Send + Sync,
+    {
+        // No response written (client abort / connect failure with no reply)
+        // has no status; 0 falls into the 5xx class, which is the honest read.
+        let status_code = session
+            .response_written()
+            .map(|resp| resp.status.as_u16())
+            .unwrap_or(0);
+
+        let destination = crate::metrics::RequestDestination::classify(
+            ctx.project.is_some(),
+            &ctx.routing_status,
+        );
+
+        // Hot path: a handful of relaxed atomic adds, no locks, no I/O.
+        self.proxy_metrics.record(
+            status_code,
+            ctx.start_time.elapsed().as_millis() as u64,
+            ctx.upstream_response_time_ms,
+            destination,
+        );
+
+        // The response body has now fully streamed through response_body_filter
+        // (this hook fires in Pingora's finish(), after every body task), so
+        // upstream_body_bytes_received holds the real byte count. Patch it into
+        // the entry log_request stashed at header-time and send it now — this
+        // is the only place a proxied response's byte count is accurate.
+        if let Some(mut pending) = ctx.pending_proxy_log.take() {
+            if ctx.upstream_body_bytes_received > 0 {
+                pending.response_size_bytes = Some(ctx.upstream_body_bytes_received as i64);
+            }
+            self.proxy_log_handle.send_or_drop(pending);
         }
     }
 }
@@ -4515,10 +4669,14 @@ mod markdown_tests {
             tls_cipher: None,
             sni_hostname: None,
             upstream_body_bytes_received: 0,
+            client_body_bytes_received: 0,
+            pending_proxy_log: None,
             wants_markdown: false,
             markdown_buffer: Vec::new(),
             upstream_connect_tries: 0,
             upstream_write_pending_time_ms: None,
+            upstream_start_time: None,
+            upstream_response_time_ms: None,
             preview_route: None,
         }
     }
@@ -5054,10 +5212,14 @@ mod markdown_pipeline_tests {
             tls_cipher: None,
             sni_hostname: None,
             upstream_body_bytes_received: 0,
+            client_body_bytes_received: 0,
+            pending_proxy_log: None,
             wants_markdown: false,
             markdown_buffer: Vec::new(),
             upstream_connect_tries: 0,
             upstream_write_pending_time_ms: None,
+            upstream_start_time: None,
+            upstream_response_time_ms: None,
             preview_route: None,
         }
     }

@@ -18,7 +18,8 @@ use tracing::{debug, error, info};
 use crate::errors::DnsError;
 use crate::providers::{
     AzureProvider, CloudflareProvider, DigitalOceanProvider, DnsProvider, DnsProviderType,
-    GcpProvider, ManualDnsProvider, NamecheapProvider, ProviderCredentials, Route53Provider,
+    GcpProvider, ManualDnsProvider, NamecheapProvider, PebbleDnsProvider, ProviderCredentials,
+    Route53Provider,
 };
 
 /// Service for managing DNS providers
@@ -196,6 +197,21 @@ impl DnsProviderService {
                 debug!("Manual provider - skipping connection test");
                 return Ok(());
             }
+            DnsProviderType::Pebble => match credentials {
+                ProviderCredentials::Pebble(pebble_creds) => {
+                    let pebble_provider =
+                        PebbleDnsProvider::new(pebble_creds.clone()).map_err(|e| {
+                            error!("Failed to create Pebble provider for testing: {}", e);
+                            e
+                        })?;
+                    Box::new(pebble_provider)
+                }
+                _ => {
+                    return Err(DnsError::InvalidCredentials(
+                        "Expected Pebble credentials".to_string(),
+                    ))
+                }
+            },
         };
 
         // Test the connection
@@ -420,6 +436,22 @@ impl DnsProviderService {
                 }
             }
             DnsProviderType::Manual => Ok(Box::new(ManualDnsProvider::new())),
+            DnsProviderType::Pebble => {
+                let credentials: ProviderCredentials = serde_json::from_str(&credentials_json)?;
+                match credentials {
+                    ProviderCredentials::Pebble(pebble_creds) => {
+                        let pebble_provider =
+                            PebbleDnsProvider::new(pebble_creds).map_err(|e| {
+                                error!("Failed to create Pebble provider: {}", e);
+                                e
+                            })?;
+                        Ok(Box::new(pebble_provider))
+                    }
+                    _ => Err(DnsError::InvalidCredentials(
+                        "Expected Pebble credentials".to_string(),
+                    )),
+                }
+            }
         }
     }
 

@@ -132,6 +132,14 @@ impl AlertEvaluator {
             warn!("AlertEvaluator: failed to back-seed default rules on startup: {e}");
         }
 
+        // Seed default proxy alert rules for the control-plane node. The
+        // proxy metrics sampler writes `proxy.*` points for node 0 on every
+        // install, so the defaults always have data to evaluate. Idempotent
+        // via ON CONFLICT DO NOTHING on (node_id, metric_name).
+        if let Err(e) = seed_default_proxy_rules(self.db.as_ref()).await {
+            warn!("AlertEvaluator: failed to seed default proxy rules on startup: {e}");
+        }
+
         loop {
             if let Err(e) = self.run_cycle().await {
                 error!("AlertEvaluator: cycle failed: {e}");
@@ -299,16 +307,22 @@ impl AlertEvaluator {
         let mut invalid_rules: Vec<i32> = Vec::new();
 
         for rule in &rules {
-            match (rule.service_id, rule.deployment_id) {
-                (Some(svc_id), None) => {
+            match (rule.service_id, rule.deployment_id, rule.node_id) {
+                (Some(svc_id), None, None) => {
                     source_groups
                         .entry((SourceKind::Database.as_str().to_string(), svc_id))
                         .or_default()
                         .push(rule);
                 }
-                (None, Some(dep_id)) => {
+                (None, Some(dep_id), None) => {
                     source_groups
                         .entry((SourceKind::Deployment.as_str().to_string(), dep_id))
+                        .or_default()
+                        .push(rule);
+                }
+                (None, None, Some(node_id)) => {
+                    source_groups
+                        .entry((SourceKind::Node.as_str().to_string(), node_id))
                         .or_default()
                         .push(rule);
                 }
@@ -321,7 +335,7 @@ impl AlertEvaluator {
         for rule_id in invalid_rules {
             warn!(
                 rule_id,
-                "AlertEvaluator: rule has invalid target (both or neither service_id/deployment_id set); skipping"
+                "AlertEvaluator: rule has invalid target (exactly one of service_id/deployment_id/node_id must be set); skipping"
             );
         }
 
@@ -646,9 +660,10 @@ fn compare(lhs: f64, rhs: f64, comparator: &str) -> bool {
 
 /// Map a rule to the most appropriate [`AlarmType`].
 fn alarm_type_for_rule(rule: &monitoring_alert_rules::Model) -> AlarmType {
-    match (rule.service_id, rule.deployment_id) {
-        (Some(_), None) => AlarmType::DatabaseMetricThreshold,
-        (None, Some(_)) => AlarmType::DeploymentMetricThreshold,
+    match (rule.service_id, rule.deployment_id, rule.node_id) {
+        (Some(_), None, None) => AlarmType::DatabaseMetricThreshold,
+        (None, Some(_), None) => AlarmType::DeploymentMetricThreshold,
+        (None, None, Some(_)) => AlarmType::NodeMetricThreshold,
         _ => AlarmType::DatabaseMetricThreshold,
     }
 }
@@ -769,6 +784,46 @@ pub async fn seed_default_container_rules(
         deployment_id,
         "seed_default_container_rules: seeded default container alert rules (ON CONFLICT DO NOTHING)"
     );
+
+    Ok(())
+}
+
+/// Synthetic node ID of the control plane (mirrors `CONTROL_PLANE_NODE_ID`
+/// in temps-deployments' nodes handler and the proxy metrics sampler).
+const CONTROL_PLANE_NODE_ID: i32 = 0;
+
+/// Insert default proxy alert rules for the control-plane node if none exist.
+///
+/// Uses `INSERT … ON CONFLICT DO NOTHING` against the unique index
+/// `(node_id, metric_name)` so concurrent calls are safe.
+pub async fn seed_default_proxy_rules(db: &DatabaseConnection) -> Result<(), MetricsError> {
+    let seeds = proxy_default_seeds();
+
+    use sea_orm::ConnectionTrait;
+    for seed in &seeds {
+        let sql = format!(
+            "INSERT INTO monitoring_alert_rules \
+             (service_id, deployment_id, node_id, name, metric_name, threshold, comparator, severity, for_duration_secs, enabled) \
+             VALUES (NULL, NULL, {node_id}, '{name}', '{metric_name}', {threshold}, '{comparator}', '{severity}', {for_duration}, true) \
+             ON CONFLICT (node_id, metric_name) WHERE node_id IS NOT NULL DO NOTHING",
+            node_id = CONTROL_PLANE_NODE_ID,
+            name = seed.name.replace('\'', "''"),
+            metric_name = seed.metric_name.replace('\'', "''"),
+            threshold = seed.threshold,
+            comparator = seed.comparator.replace('\'', "''"),
+            severity = seed.severity.replace('\'', "''"),
+            for_duration = seed.for_duration_secs,
+        );
+
+        db.execute(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            sql,
+        ))
+        .await
+        .map_err(MetricsError::DatabaseError)?;
+    }
+
+    info!("seed_default_proxy_rules: seeded default proxy alert rules (ON CONFLICT DO NOTHING)");
 
     Ok(())
 }
@@ -1037,6 +1092,35 @@ fn rustfs_default_seeds() -> Vec<RuleSeed> {
     ]
 }
 
+/// Default alert rules over the proxy hot-path metrics written by the proxy
+/// metrics sampler (`proxy.*`, `SourceKind::Node`, control-plane node).
+/// Thresholds are rate/latency based — never absolute request counts — so
+/// they hold at any traffic volume.
+///
+/// One rule per metric name: the `uidx_monitoring_alert_rules_node_metric`
+/// unique index (mirroring the service/deployment indexes) makes a second
+/// seed on the same metric a silent ON CONFLICT no-op.
+fn proxy_default_seeds() -> Vec<RuleSeed> {
+    vec![
+        RuleSeed {
+            name: "High proxy error rate",
+            metric_name: "proxy.error_rate_percent",
+            threshold: 20.0,
+            comparator: ">",
+            severity: "warning",
+            for_duration_secs: 300,
+        },
+        RuleSeed {
+            name: "Slow proxy responses (p99)",
+            metric_name: "proxy.request_duration_p99_ms",
+            threshold: 5000.0,
+            comparator: ">",
+            severity: "warning",
+            for_duration_secs: 300,
+        },
+    ]
+}
+
 fn container_default_seeds() -> Vec<RuleSeed> {
     vec![
         RuleSeed {
@@ -1165,10 +1249,19 @@ mod tests {
         service_id: Option<i32>,
         deployment_id: Option<i32>,
     ) -> monitoring_alert_rules::Model {
+        make_rule_with_node(service_id, deployment_id, None)
+    }
+
+    fn make_rule_with_node(
+        service_id: Option<i32>,
+        deployment_id: Option<i32>,
+        node_id: Option<i32>,
+    ) -> monitoring_alert_rules::Model {
         monitoring_alert_rules::Model {
             id: 1,
             service_id,
             deployment_id,
+            node_id,
             name: "test".into(),
             metric_name: "pg.connections_active".into(),
             threshold: 80.0,
@@ -1196,6 +1289,35 @@ mod tests {
             alarm_type_for_rule(&rule).as_str(),
             "deployment_metric_threshold"
         );
+    }
+
+    #[test]
+    fn alarm_type_node_rule_is_node() {
+        let rule = make_rule_with_node(None, None, Some(0));
+        assert_eq!(alarm_type_for_rule(&rule).as_str(), "node_metric_threshold");
+    }
+
+    #[test]
+    fn proxy_default_seeds_are_rate_based_and_unique_per_metric() {
+        let seeds = proxy_default_seeds();
+        assert_eq!(seeds.len(), 2);
+        let mut names = std::collections::HashSet::new();
+        for s in &seeds {
+            assert!(s.metric_name.starts_with("proxy."));
+            // Rules must be rate/latency based, never absolute counts.
+            assert!(
+                s.metric_name.contains("percent") || s.metric_name.contains("_ms"),
+                "seed {} is not rate/latency based",
+                s.metric_name
+            );
+            // One rule per metric: (node_id, metric_name) is a unique index,
+            // a duplicate metric would be a silent ON CONFLICT no-op.
+            assert!(
+                names.insert(s.metric_name),
+                "duplicate seed metric {}",
+                s.metric_name
+            );
+        }
     }
 
     // ── default rule builders ──────────────────────────────────────────────────
@@ -1416,6 +1538,26 @@ mod tests {
         assert_eq!(deployment_id, None);
         // service_id is None here because the fallback path can't attribute it
         // to a project; the alarm is still stored under the sentinel project.
+        assert_eq!(service_id, None);
+    }
+
+    /// Node-scoped rules (proxy metrics) have no project/service/deployment
+    /// context — they must resolve to the sentinel context without issuing any
+    /// DB queries (the MockDatabase has no results queued; a lookup would
+    /// error, not return the sentinel).
+    #[tokio::test]
+    async fn resolve_alarm_context_node_rule_uses_sentinel_without_queries() {
+        let rule = make_rule_with_node(None, None, Some(0));
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let evaluator = evaluator_with_db(db);
+
+        let (project_id, environment_id, deployment_id, service_id) =
+            evaluator.resolve_alarm_context(&rule).await;
+
+        assert_eq!(project_id, 0);
+        assert_eq!(environment_id, None);
+        assert_eq!(deployment_id, None);
         assert_eq!(service_id, None);
     }
 }

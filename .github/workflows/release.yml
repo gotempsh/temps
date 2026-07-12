@@ -26,29 +26,25 @@ permissions:
   packages: write
 
 jobs:
-  build-linux-amd64:
-    name: Build Linux AMD64
+  build-web-assets:
+    name: Build web assets (WASM + dist)
+    # The web console + captcha WASM are pure static output with no
+    # platform/arch dependency, but crates/temps-cli/build.rs rebuilds them
+    # on every `cargo build --release` invocation. Build them once here and
+    # hand the compiled dist/ to each platform job (via SKIP_WEB_BUILD)
+    # instead of paying bun install + wasm-pack + rsbuild build 4x — the
+    # most expensive repeat was the macOS Intel job's wasm-pack step alone
+    # (7m26s on the last release), on top of a redundant rsbuild build in
+    # each of the other 3 jobs.
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake pkg-config libssl-dev protobuf-compiler
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-gnu
-
-      - name: Cache dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: linux-amd64-release
 
       - name: Install Bun
         uses: oven-sh/setup-bun@v2
@@ -74,10 +70,56 @@ jobs:
           cd crates/temps-captcha-wasm
           bun run build
 
+      - name: Build web dist
+        run: |
+          cd web
+          bun run build
+        env:
+          RSBUILD_OUTPUT_PATH: ${{ github.workspace }}/crates/temps-cli/dist
+          TEMPS_VERSION: ${{ github.ref_name }}
+
+      - name: Upload web dist artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: web-dist
+          path: crates/temps-cli/dist
+          retention-days: 1
+
+  build-linux-amd64:
+    name: Build Linux AMD64
+    needs: build-web-assets
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake pkg-config libssl-dev protobuf-compiler
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-amd64-release
+
+      - name: Download web dist artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: web-dist
+          path: crates/temps-cli/dist
+
       - name: Build release binary
         run: cargo build --release --bin temps
         env:
-          FORCE_WEB_BUILD: 1
+          SKIP_WEB_BUILD: 1
           CARGO_INCREMENTAL: 0
           TEMPS_VERSION: ${{ github.ref_name }}
 
@@ -112,12 +154,13 @@ jobs:
 
   build-linux-arm64:
     name: Build Linux ARM64
+    needs: build-web-assets
     runs-on: ubuntu-24.04-arm
     permissions:
       contents: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install build dependencies
         run: |
@@ -134,34 +177,16 @@ jobs:
         with:
           key: linux-arm64-release
 
-      - name: Install Bun
-        uses: oven-sh/setup-bun@v2
+      - name: Download web dist artifact
+        uses: actions/download-artifact@v8
         with:
-          bun-version: latest
-
-      - name: Cache Bun dependencies
-        uses: actions/cache@v6
-        with:
-          path: web/node_modules
-          key: ${{ runner.os }}-arm64-bun-${{ hashFiles('web/bun.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-arm64-bun-
-
-      - name: Install web dependencies
-        run: |
-          cd web
-          bun install
-
-      - name: Install wasm-pack and Build WASM
-        run: |
-          cargo install wasm-pack
-          cd crates/temps-captcha-wasm
-          bun run build
+          name: web-dist
+          path: crates/temps-cli/dist
 
       - name: Build release binary
         run: cargo build --release --bin temps
         env:
-          FORCE_WEB_BUILD: 1
+          SKIP_WEB_BUILD: 1
           CARGO_INCREMENTAL: 0
           TEMPS_VERSION: ${{ github.ref_name }}
           # jemalloc bakes max page size at build time; aarch64 kernels vary
@@ -199,12 +224,22 @@ jobs:
 
   build-darwin-amd64:
     name: Build macOS AMD64
-    runs-on: macos-15-intel
+    needs: build-web-assets
+    # Cross-compiled from Apple Silicon (same host as build-darwin-arm64),
+    # not run natively on Intel hardware. GitHub's Intel macOS pool is
+    # smaller/older and measured ~2x the wall-clock of the arm64 pool for
+    # this job (72m46s vs 40m52s on the last release). x86_64-apple-darwin is
+    # a well-supported cross target from an aarch64-apple-darwin host: the
+    # same Xcode toolchain/SDK provides both arch slices, and this
+    # workspace's native deps (openssl via openssl-src, jemalloc via cc-rs)
+    # build from source per-target rather than linking a host-arch system
+    # lib, so there's no arch-mismatch risk at link time.
+    runs-on: macos-14
     permissions:
       contents: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -216,37 +251,19 @@ jobs:
         with:
           key: darwin-amd64-release
 
-      - name: Install Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-
-      - name: Cache Bun dependencies
-        uses: actions/cache@v6
-        with:
-          path: web/node_modules
-          key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-bun-
-
-      - name: Install web dependencies
-        run: |
-          cd web
-          bun install
-
       - name: Install system dependencies
         run: brew install protobuf
 
-      - name: Install wasm-pack and Build WASM
-        run: |
-          cargo install wasm-pack
-          cd crates/temps-captcha-wasm
-          bun run build
+      - name: Download web dist artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: web-dist
+          path: crates/temps-cli/dist
 
       - name: Build release binary
         run: cargo build --release --bin temps --target x86_64-apple-darwin
         env:
-          FORCE_WEB_BUILD: 1
+          SKIP_WEB_BUILD: 1
           CARGO_INCREMENTAL: 0
           TEMPS_VERSION: ${{ github.ref_name }}
 
@@ -281,44 +298,27 @@ jobs:
 
   build-darwin-arm64:
     name: Build macOS ARM64
+    needs: build-web-assets
     runs-on: macos-14
     permissions:
       contents: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
 
-      - name: Install Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-
-      - name: Cache Bun dependencies
-        uses: actions/cache@v6
-        with:
-          path: web/node_modules
-          key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-bun-
-
-      - name: Install web dependencies
-        run: |
-          cd web
-          bun install
-
       - name: Install system dependencies
         run: brew install protobuf
 
-      - name: Install wasm-pack and Build WASM
-        run: |
-          cargo install wasm-pack
-          cd crates/temps-captcha-wasm
-          bun run build
+      - name: Download web dist artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: web-dist
+          path: crates/temps-cli/dist
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
@@ -328,7 +328,7 @@ jobs:
       - name: Build release binary
         run: cargo build --release --bin temps --target aarch64-apple-darwin
         env:
-          FORCE_WEB_BUILD: 1
+          SKIP_WEB_BUILD: 1
           CARGO_INCREMENTAL: 0
           TEMPS_VERSION: ${{ github.ref_name }}
 
@@ -379,7 +379,7 @@ jobs:
       channel_tag: ${{ steps.channel.outputs.channel_tag }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Determine release channel
         id: channel
@@ -434,7 +434,16 @@ jobs:
 
       - name: Generate Homebrew formula
         run: |
-          VERSION="${GITHUB_REF#refs/tags/v}"
+          # workflow_dispatch runs against a branch, not a tag, so GITHUB_REF
+          # is refs/heads/<branch> and the prefix-strip below leaves it
+          # untouched -- if the branch name contains a `/` (as most do),
+          # that lands in VERSION and breaks the `sed -e "s/.../.../"` call
+          # below (VERSION's `/` collides with sed's own delimiter).
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            VERSION="dryrun-${{ github.run_id }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          fi
           SHA256_LINUX_AMD64=$(awk '{print $1}' release/temps-linux-amd64.tar.gz.sha256)
           SHA256_LINUX_ARM64=$(awk '{print $1}' release/temps-linux-arm64.tar.gz.sha256)
           SHA256_DARWIN_AMD64=$(awk '{print $1}' release/temps-darwin-amd64.tar.gz.sha256)
@@ -564,6 +573,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # workflow_dispatch dry-runs must not mint a real Release object
+          # under the dispatched branch name — everything above this step
+          # (artifact download, formula/checksum/notes generation) still
+          # runs and is inspectable in the job logs/artifacts.
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.dry_run }}" == "true" ]]; then
+            echo "Dry-run (workflow_dispatch): skipping actual GitHub Release creation for ${{ github.ref_name }}"
+            exit 0
+          fi
+
           echo "Creating release ${{ github.ref_name }}..."
 
           if [[ "${{ steps.channel.outputs.is_prerelease }}" == "true" ]]; then
@@ -615,7 +633,7 @@ jobs:
             tarball: temps-linux-arm64.tar.gz
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Download binary artifact
         uses: actions/download-artifact@v8
@@ -632,7 +650,7 @@ jobs:
           file temps
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v4
@@ -644,7 +662,15 @@ jobs:
       - name: Extract version
         id: version
         run: |
-          VERSION="${GITHUB_REF#refs/tags/v}"
+          # See the matching comment in create-release's "Generate Homebrew
+          # formula" step: workflow_dispatch runs against a branch ref, so
+          # this would otherwise leave a `/`-containing string in VERSION,
+          # which is invalid in a Docker tag component.
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            VERSION="dryrun-${{ github.run_id }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Version: $VERSION"
 
@@ -661,7 +687,12 @@ jobs:
           context: .
           file: ./Dockerfile.release
           platforms: ${{ matrix.platform }}
-          push: true
+          # Dry-run: build but don't push. Same guard used by the sandbox
+          # and preview-gateway image jobs below — without it, every
+          # workflow_dispatch (dry-run or not) overwrites the real
+          # `:beta-<platform>` tags, which create-docker-manifest then
+          # merges into the `:beta` channel operators pin to.
+          push: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
           # Per-platform intermediate tags. The manifest-merge job below
           # combines amd64+arm64 into the final multi-arch refs. Channel tag
           # (`latest` for stable, `beta` for prereleases) keeps stable users
@@ -681,6 +712,10 @@ jobs:
   create-docker-manifest:
     name: Create Docker Manifest
     needs: [build-and-push-docker, create-release]
+    # Merges per-platform tags that build-and-push-docker only pushes on a
+    # real run. On a workflow_dispatch dry-run those source tags don't
+    # exist, so skip the merge too (would otherwise fail on a missing tag).
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -696,7 +731,15 @@ jobs:
       - name: Extract version
         id: version
         run: |
-          VERSION="${GITHUB_REF#refs/tags/v}"
+          # See the matching comment in create-release's "Generate Homebrew
+          # formula" step: workflow_dispatch runs against a branch ref, so
+          # this would otherwise leave a `/`-containing string in VERSION,
+          # which is invalid in a Docker tag component.
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            VERSION="dryrun-${{ github.run_id }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Version: $VERSION"
 
@@ -743,7 +786,7 @@ jobs:
       gateway_version: ${{ steps.version.outputs.gateway_version }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -850,7 +893,7 @@ jobs:
         uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v4
@@ -930,13 +973,13 @@ jobs:
       IS_PRERELEASE: ${{ needs.create-release.outputs.is_prerelease }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v4

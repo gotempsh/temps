@@ -2021,7 +2021,7 @@ async fn setup_dns_challenge(
 }
 
 /// Extract the base domain from a full domain name (e.g., "sub.example.com" -> "example.com")
-fn extract_base_domain(domain: &str) -> String {
+pub(crate) fn extract_base_domain(domain: &str) -> String {
     // Handle wildcard domains
     let domain = domain.strip_prefix("*.").unwrap_or(domain);
 
@@ -2052,7 +2052,7 @@ fn acme_txt_record_name(base_domain: &str, name: &str) -> String {
 /// in the batch is created: a wildcard order publishes two TXT records under the same
 /// `_acme-challenge` name (one per authorization), so removing per-record (interleaved
 /// with creation) would delete a sibling record this same batch just created.
-async fn setup_dns_txt_records(
+pub(crate) async fn setup_dns_txt_records(
     provider: &dyn temps_dns::providers::DnsProvider,
     base_domain: &str,
     dns_txt_records: &[(String, String)],

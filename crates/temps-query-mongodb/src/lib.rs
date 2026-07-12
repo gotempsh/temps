@@ -408,7 +408,7 @@ impl temps_query::Queryable for MongoDBSource {
                     let mut doc = Document::new();
                     for (key, value) in map {
                         // Convert JSON value to BSON value
-                        if let Ok(bson_value) = mongodb::bson::to_bson(&value) {
+                        if let Ok(bson_value) = mongodb::bson::serialize_to_bson(&value) {
                             doc.insert(key, bson_value);
                         }
                     }
@@ -566,7 +566,7 @@ impl temps_query::Queryable for MongoDBSource {
                 serde_json::Value::Object(map) => {
                     let mut doc = Document::new();
                     for (key, value) in map {
-                        if let Ok(bson_value) = mongodb::bson::to_bson(&value) {
+                        if let Ok(bson_value) = mongodb::bson::serialize_to_bson(&value) {
                             doc.insert(key, bson_value);
                         }
                     }

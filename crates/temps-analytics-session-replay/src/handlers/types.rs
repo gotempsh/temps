@@ -8,4 +8,6 @@ pub struct AppState {
     pub audit_service: Arc<dyn temps_core::AuditLogger>,
     pub route_table: Arc<CachedPeerTable>,
     pub telemetry: std::sync::Arc<dyn temps_core::telemetry::TelemetryReporter>,
+    /// Optional checker for team-based project access (human sessions only).
+    pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
 }

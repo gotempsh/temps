@@ -1143,7 +1143,16 @@ impl Analytics for AnalyticsService {
                     ) as is_engaged
                 FROM events e
                 LEFT JOIN request_logs rl ON rl.session_id = e.id AND rl.project_id = e.project_id
-                LEFT JOIN request_sessions rs ON rs.session_Id = e.session_id
+                -- Tolerate both the bare-UUID format (new events, after the
+                -- session-cookie normalisation fix) and the legacy v2|uuid|ts
+                -- format stored by older versions of the analytics ingest path.
+                -- split_part(e.session_id, '|', 2) extracts the UUID segment
+                -- from 'v2|<uuid>|<ts>'; the LIKE guard avoids a false match
+                -- on empty strings when e.session_id has no '|' delimiters.
+                LEFT JOIN request_sessions rs ON (
+                    rs.session_id = e.session_id
+                    OR (e.session_id LIKE 'v2|%' AND rs.session_id = split_part(e.session_id, '|', 2))
+                )
                 WHERE e.visitor_id = $1 AND e.session_id IS NOT NULL
                 GROUP BY rs.id
             )
@@ -1168,7 +1177,12 @@ impl Analytics for AnalyticsService {
 
         #[derive(FromQueryResult)]
         struct SessionResult {
-            session_id: i32,
+            // Nullable because the query uses LEFT JOIN request_sessions: when no
+            // matching row exists yet (proxy async flush hasn't landed), rs.id comes
+            // back NULL. Decoding NULL into a non-optional i32 causes a hard
+            // type-decode error that kills the whole request. We filter these out
+            // below so SessionSummary.session_id remains non-optional.
+            session_id: Option<i32>,
             started_at: UtcDateTime,
             ended_at: Option<UtcDateTime>,
             duration_seconds: i64,
@@ -1191,25 +1205,43 @@ impl Analytics for AnalyticsService {
         .all(self.db.as_ref())
         .await?;
 
-        let total_sessions = results.first().map(|r| r.total_sessions).unwrap_or(0);
+        // The window-function total (pre-LIMIT, pre-filter) is the correct
+        // pagination baseline. Subtract the count of NULL-session groups so the
+        // displayed total never exceeds the visible list.
+        let raw_total = results.first().map(|r| r.total_sessions).unwrap_or(0);
+        let mut null_count = 0i64;
 
         let sessions = results
             .into_iter()
-            .map(|r| crate::types::responses::SessionSummary {
-                session_id: r.session_id,
-                started_at: r.started_at,
-                ended_at: r.ended_at,
-                duration_seconds: r.duration_seconds,
-                page_views: r.page_views,
-                events_count: r.events_count,
-                requests_count: r.requests_count,
-                entry_path: r.entry_path,
-                exit_path: r.exit_path,
-                referrer: r.referrer,
-                is_bounced: r.is_bounced,
-                is_engaged: r.is_engaged,
+            .filter_map(|r| {
+                let sid = match r.session_id {
+                    Some(id) => id,
+                    None => {
+                        // No request_sessions row for this e.session_id yet
+                        // (timing race or prior proxy error). Drop this group
+                        // from the visible list and deduct it from the total.
+                        null_count += 1;
+                        return None;
+                    }
+                };
+                Some(crate::types::responses::SessionSummary {
+                    session_id: sid,
+                    started_at: r.started_at,
+                    ended_at: r.ended_at,
+                    duration_seconds: r.duration_seconds,
+                    page_views: r.page_views,
+                    events_count: r.events_count,
+                    requests_count: r.requests_count,
+                    entry_path: r.entry_path,
+                    exit_path: r.exit_path,
+                    referrer: r.referrer,
+                    is_bounced: r.is_bounced,
+                    is_engaged: r.is_engaged,
+                })
             })
             .collect();
+
+        let total_sessions = raw_total.saturating_sub(null_count);
 
         Ok(Some(VisitorSessionsResponse {
             visitor_id: visitor.visitor_id,
@@ -1257,7 +1289,12 @@ impl Analytics for AnalyticsService {
                     BOOL_OR(e.is_bounce) as is_bounced,
                     COUNT(*) FILTER (WHERE e.event_type NOT IN ('page_view', 'page_leave', 'heartbeat', 'web_vitals')) > 0 as is_engaged
                 FROM events e
-                JOIN request_sessions rs ON rs.session_id = e.session_id
+                -- Tolerate both bare-UUID and legacy v2|uuid|ts formats in
+                -- events.session_id (see get_visitor_sessions_by_id comment).
+                JOIN request_sessions rs ON (
+                    rs.session_id = e.session_id
+                    OR (e.session_id LIKE 'v2|%' AND rs.session_id = split_part(e.session_id, '|', 2))
+                )
                 WHERE e.visitor_id = $1
                   AND e.project_id = $2
                   AND e.session_id IS NOT NULL
@@ -1365,7 +1402,12 @@ impl Analytics for AnalyticsService {
                     COALESCE(e.props, e.event_data::jsonb, '{{}}'::jsonb) as event_data,
                     rs.id as rs_id
                 FROM events e
-                JOIN request_sessions rs ON rs.session_id = e.session_id
+                -- Tolerate both bare-UUID and legacy v2|uuid|ts formats in
+                -- events.session_id (see get_visitor_sessions_by_id comment).
+                JOIN request_sessions rs ON (
+                    rs.session_id = e.session_id
+                    OR (e.session_id LIKE 'v2|%' AND rs.session_id = split_part(e.session_id, '|', 2))
+                )
                 WHERE e.visitor_id = $1
                   AND e.project_id = $2
                   AND rs.id IN ({in_clause})
@@ -1479,18 +1521,11 @@ impl Analytics for AnalyticsService {
         let mut total_events: i64 = 0;
         for row in event_rows {
             total_events += 1;
-            let time_on_page =
-                if row.event_type == "page_view" {
-                    row.computed_time_on_page.and_then(|t| {
-                        if t > 0 && t < 1800 {
-                            Some(t)
-                        } else {
-                            None
-                        }
-                    })
-                } else {
-                    None
-                };
+            let time_on_page = if row.event_type == "page_view" {
+                row.computed_time_on_page.filter(|&t| t > 0 && t < 1800)
+            } else {
+                None
+            };
 
             let event_data = if row.event_data == serde_json::json!({}) {
                 None
@@ -1571,15 +1606,32 @@ impl Analytics for AnalyticsService {
                 EXTRACT(EPOCH FROM (rs.last_accessed_at - rs.started_at))::bigint as duration_seconds,
                 rs.referrer,
 
-                -- Get entry and exit paths
-                (SELECT e.page_path FROM events e WHERE e.session_id = rs.session_id ORDER BY e.timestamp ASC LIMIT 1) as entry_path,
-                (SELECT e.page_path FROM events e WHERE e.session_id = rs.session_id ORDER BY e.timestamp DESC LIMIT 1) as exit_path,
+                -- Get entry and exit paths.
+                -- Each subquery matches both bare-UUID (new events) and the
+                -- legacy v2|uuid|ts format written by older server versions.
+                -- rs.session_id is always a bare UUID; e.session_id may be
+                -- either format (see normalise_session_cookie fix in
+                -- temps-core::request_metadata).
+                (SELECT e.page_path FROM events e
+                    WHERE (e.session_id = rs.session_id
+                           OR (e.session_id LIKE 'v2|%' AND split_part(e.session_id, '|', 2) = rs.session_id))
+                    ORDER BY e.timestamp ASC LIMIT 1) as entry_path,
+                (SELECT e.page_path FROM events e
+                    WHERE (e.session_id = rs.session_id
+                           OR (e.session_id LIKE 'v2|%' AND split_part(e.session_id, '|', 2) = rs.session_id))
+                    ORDER BY e.timestamp DESC LIMIT 1) as exit_path,
 
                 -- Count page views
-                (SELECT COUNT(*) FROM events e WHERE e.session_id = rs.session_id AND COALESCE(e.event_name, e.event_type, 'page_view') = 'page_view') as page_views,
+                (SELECT COUNT(*) FROM events e
+                    WHERE (e.session_id = rs.session_id
+                           OR (e.session_id LIKE 'v2|%' AND split_part(e.session_id, '|', 2) = rs.session_id))
+                    AND COALESCE(e.event_name, e.event_type, 'page_view') = 'page_view') as page_views,
 
                 -- Calculate bounce (1 or fewer page views)
-                (SELECT COUNT(*) FROM events e WHERE e.session_id = rs.session_id AND COALESCE(e.event_name, e.event_type, 'page_view') = 'page_view') <= 1 as is_bounced,
+                (SELECT COUNT(*) FROM events e
+                    WHERE (e.session_id = rs.session_id
+                           OR (e.session_id LIKE 'v2|%' AND split_part(e.session_id, '|', 2) = rs.session_id))
+                    AND COALESCE(e.event_name, e.event_type, 'page_view') = 'page_view') <= 1 as is_bounced,
 
                 -- Engaged if the visitor spent >= 10s of measured time, OR
                 -- fired a genuine interaction event. Auto-fired view events
@@ -1587,7 +1639,9 @@ impl Analytics for AnalyticsService {
                 -- from intersection observers for bots too.
                 (
                     EXTRACT(EPOCH FROM (rs.last_accessed_at - rs.started_at)) >= 10
-                    OR (SELECT COUNT(*) > 0 FROM events e WHERE e.session_id = rs.session_id
+                    OR (SELECT COUNT(*) > 0 FROM events e
+                        WHERE (e.session_id = rs.session_id
+                               OR (e.session_id LIKE 'v2|%' AND split_part(e.session_id, '|', 2) = rs.session_id))
                         AND COALESCE(e.event_name, e.event_type, '') NOT IN ('page_view', 'page_leave', '')
                         AND COALESCE(e.event_name, e.event_type, '') NOT LIKE '%\_viewed' ESCAPE '\')
                 ) as is_engaged
@@ -2751,6 +2805,8 @@ WHERE project_id = $1
             WHERE v.project_id = $1
               AND ($2::int IS NULL OR v.environment_id = $2)
               AND v.last_seen >= NOW() - INTERVAL '1 minute' * $3
+              AND v.is_crawler = false
+              AND COALESCE(ig.is_hosting_provider, false) = false
             ORDER BY v.last_seen DESC
         "#;
 
@@ -4630,5 +4686,152 @@ mod tests {
 
         // If this test compiles, it proves our parameterized query pattern is correct
         // No assertion needed - compilation itself is the test
+    }
+
+    /// Regression test: `get_session_details` must return correct
+    /// entry_path / exit_path / page_views / is_bounced / is_engaged for a
+    /// session whose events are stored with the legacy `v2|<uuid>|<ts>` format
+    /// in `events.session_id`.
+    ///
+    /// Prior to the fix, all five correlated subqueries used
+    /// `e.session_id = rs.session_id`.  Because `rs.session_id` is always a
+    /// bare UUID but `events.session_id` stored the full v2 payload, every
+    /// subquery returned NULL / 0, producing silently wrong
+    /// entry_path=NULL, page_views=0, is_bounced=true for real sessions.
+    #[tokio::test]
+    async fn test_get_session_details_with_legacy_v2_session_id() -> anyhow::Result<()> {
+        use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+        use temps_entities::{
+            deployments, environments, events, projects, request_sessions, visitor,
+        };
+
+        let (service, db, _container) =
+            create_test_analytics_service!("test_get_session_details_v2_session_id");
+
+        // Re-use the project, environment, and deployment created by insert_test_data.
+        let project = projects::Entity::find()
+            .filter(projects::Column::Slug.eq("test_project"))
+            .one(db.as_ref())
+            .await?
+            .expect("test project must exist from insert_test_data");
+
+        let environment = environments::Entity::find()
+            .filter(environments::Column::ProjectId.eq(project.id))
+            .one(db.as_ref())
+            .await?
+            .expect("test environment must exist from insert_test_data");
+
+        let deployment = deployments::Entity::find()
+            .filter(deployments::Column::ProjectId.eq(project.id))
+            .one(db.as_ref())
+            .await?
+            .expect("test deployment must exist from insert_test_data");
+
+        // The bare UUID is what the proxy stores in request_sessions.session_id.
+        let bare_uuid = "c172f0b5-986f-47dc-b6c6-9198761519e0";
+        // The v2 payload is what the old analytics ingest path wrote to
+        // events.session_id before the normalize_session_cookie fix landed.
+        let v2_session_id = format!("v2|{}|1783631315", bare_uuid);
+
+        let test_visitor = visitor::ActiveModel {
+            visitor_id: Set("v2-session-test-visitor".to_string()),
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            first_seen: Set(chrono::Utc::now()),
+            last_seen: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        // request_sessions always stores the bare UUID (proxy's parse_session_cookie
+        // strips the v2| prefix before inserting).
+        let session_started = chrono::Utc::now() - chrono::Duration::minutes(10);
+        let session_ended = chrono::Utc::now();
+        let session_row = request_sessions::ActiveModel {
+            session_id: Set(bare_uuid.to_string()),
+            started_at: Set(session_started),
+            last_accessed_at: Set(session_ended),
+            visitor_id: Set(Some(test_visitor.id)),
+            data: Set("{}".to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        // Insert two page_view events using the LEGACY v2|uuid|ts format.
+        // entry event (earlier timestamp)
+        events::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(Some(environment.id)),
+            deployment_id: Set(Some(deployment.id)),
+            visitor_id: Set(Some(test_visitor.id)),
+            session_id: Set(Some(v2_session_id.clone())),
+            event_type: Set("page_view".to_string()),
+            page_path: Set("/entry-page".to_string()),
+            hostname: Set("example.com".to_string()),
+            pathname: Set("/entry-page".to_string()),
+            href: Set("https://example.com/entry-page".to_string()),
+            timestamp: Set(session_started + chrono::Duration::seconds(5)),
+            is_bounce: Set(false),
+            is_crawler: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        // exit event (later timestamp)
+        events::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(Some(environment.id)),
+            deployment_id: Set(Some(deployment.id)),
+            visitor_id: Set(Some(test_visitor.id)),
+            session_id: Set(Some(v2_session_id.clone())),
+            event_type: Set("page_view".to_string()),
+            page_path: Set("/exit-page".to_string()),
+            hostname: Set("example.com".to_string()),
+            pathname: Set("/exit-page".to_string()),
+            href: Set("https://example.com/exit-page".to_string()),
+            timestamp: Set(session_started + chrono::Duration::minutes(5)),
+            is_bounce: Set(false),
+            is_crawler: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let details = service
+            .get_session_details(session_row.id, project.id, None)
+            .await?
+            .expect("get_session_details must return Some for an existing session");
+
+        // All five correlated subqueries must match via the v2-tolerant condition:
+        assert_eq!(
+            details.entry_path.as_deref(),
+            Some("/entry-page"),
+            "entry_path must be populated from legacy v2|uuid|ts events (subquery 1)"
+        );
+        assert_eq!(
+            details.exit_path.as_deref(),
+            Some("/exit-page"),
+            "exit_path must be populated from legacy v2|uuid|ts events (subquery 2)"
+        );
+        assert_eq!(
+            details.page_views, 2,
+            "page_views must count both legacy-format page_view events (subquery 3)"
+        );
+        assert!(
+            !details.is_bounced,
+            "is_bounced must be false when page_views > 1 (subquery 4)"
+        );
+        // session duration is 10 minutes >= 10s, so is_engaged = true even
+        // with only page_view events (which don't count as interactions)
+        assert!(
+            details.is_engaged,
+            "is_engaged must be true when session duration >= 10s (subquery 5)"
+        );
+
+        cleanup_test_analytics!(db);
+        Ok(())
     }
 }

@@ -4,8 +4,8 @@ use axum::{
     response::{IntoResponse, Json},
 };
 use std::sync::Arc;
-use temps_auth::permission_guard;
 use temps_auth::RequireAuth;
+use temps_auth::{permission_guard, project_access_guard};
 
 use super::types::{
     AppState, CreateFunnelRequest, CreateFunnelResponse, CreateFunnelStep, EventType,
@@ -44,6 +44,7 @@ pub async fn create_funnel(
     Json(request): Json<CreateFunnelRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, FunnelWrite);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     // Map HTTP request to service request
     let service_request = ServiceCreateFunnelRequest {
         name: request.name,
@@ -110,6 +111,7 @@ pub async fn get_funnel_metrics(
     Query(query): Query<GetFunnelMetricsQuery>,
 ) -> Result<Json<FunnelMetricsResponse>, Problem> {
     permission_guard!(auth, FunnelRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     // Parse dates if provided
 
     let filter = FunnelFilter {
@@ -190,6 +192,7 @@ pub async fn list_funnels(
     Path(project_id): Path<i32>,
 ) -> Result<Json<Vec<FunnelResponse>>, Problem> {
     permission_guard!(auth, FunnelRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     match state.funnel_service.list_funnels(project_id).await {
         Ok(funnels) => {
             let funnel_responses: Vec<FunnelResponse> = funnels
@@ -243,6 +246,7 @@ pub async fn update_funnel(
     Json(request): Json<CreateFunnelRequest>,
 ) -> Result<Json<serde_json::Value>, Problem> {
     permission_guard!(auth, FunnelWrite);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     // Map HTTP request to service request
     let service_request = ServiceCreateFunnelRequest {
         name: request.name,
@@ -305,6 +309,7 @@ pub async fn delete_funnel(
     Path((project_id, funnel_id)): Path<(i32, i32)>,
 ) -> Result<Json<serde_json::Value>, Problem> {
     permission_guard!(auth, FunnelWrite);
+    project_access_guard!(auth, project_id, state.project_access_checker);
     match state
         .funnel_service
         .delete_funnel(project_id, funnel_id)
@@ -354,6 +359,7 @@ pub async fn get_unique_events(
     Query(query): Query<GetUniqueEventsQuery>,
 ) -> Result<Json<EventTypesResponse>, Problem> {
     permission_guard!(auth, FunnelRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     match state
         .funnel_service
@@ -410,6 +416,7 @@ pub async fn preview_funnel_metrics(
     Json(request): Json<CreateFunnelRequest>,
 ) -> Result<Json<FunnelMetricsResponse>, Problem> {
     permission_guard!(auth, FunnelRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let filter = FunnelFilter {
         project_id: Some(project_id),

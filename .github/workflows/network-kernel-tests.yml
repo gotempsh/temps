@@ -22,7 +22,7 @@ jobs:
     name: Unit tests (Linux)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -35,7 +35,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: unit
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Verify Docker is available
         run: docker version
       - name: Run single-node DinD harness
@@ -46,7 +46,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: single-node-kernel
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Verify Docker is available
         run: docker version
       - name: Run two-node DinD harness

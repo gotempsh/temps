@@ -1,6 +1,6 @@
 {
   "name": "@temps-sdk/blob",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "Blob storage SDK for the Temps platform",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

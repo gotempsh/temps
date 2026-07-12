@@ -11,7 +11,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{permission_guard, project_access_guard, RequireAuth};
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::Problem;
 use temps_core::{AuditContext, AuditLogger, AuditOperation, RequestMetadata};
@@ -22,6 +22,8 @@ use utoipa::{OpenApi, ToSchema};
 pub struct WebhookState {
     pub webhook_service: Arc<WebhookService>,
     pub audit_service: Arc<dyn AuditLogger>,
+    /// Optional checker for team-based project access (human sessions only).
+    pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
 }
 
 impl WebhookState {
@@ -29,6 +31,7 @@ impl WebhookState {
         Self {
             webhook_service,
             audit_service,
+            project_access_checker: None,
         }
     }
 }
@@ -233,6 +236,7 @@ async fn list_webhooks(
     Query(pagination): Query<temps_core::PaginationParams>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, WebhooksRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let (page, page_size) = pagination.normalize();
 
@@ -279,6 +283,7 @@ async fn get_webhook(
     Path((project_id, webhook_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, WebhooksRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     match state.webhook_service.get_webhook(webhook_id).await {
         Ok(Some(webhook)) => {
@@ -329,6 +334,7 @@ async fn create_webhook(
     Json(body): Json<CreateWebhookRequestBody>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, WebhooksCreate);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     // Parse event types
     let events: Vec<WebhookEventType> = body
@@ -409,6 +415,7 @@ async fn update_webhook(
     Json(body): Json<UpdateWebhookRequestBody>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, WebhooksWrite);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     // Verify webhook belongs to project
     if let Ok(Some(existing)) = state.webhook_service.get_webhook(webhook_id).await {
@@ -495,6 +502,7 @@ async fn delete_webhook(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, WebhooksDelete);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     // Verify webhook belongs to project
     if let Ok(Some(existing)) = state.webhook_service.get_webhook(webhook_id).await {
@@ -563,6 +571,7 @@ async fn list_deliveries(
     Query(query): Query<ListDeliveriesQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, WebhooksRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     // Verify webhook belongs to project
     if let Ok(Some(existing)) = state.webhook_service.get_webhook(webhook_id).await {
@@ -621,6 +630,7 @@ async fn get_delivery(
     Path((project_id, webhook_id, delivery_id)): Path<(i32, i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, WebhooksRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     // Verify webhook belongs to project
     if let Ok(Some(existing)) = state.webhook_service.get_webhook(webhook_id).await {
@@ -679,10 +689,11 @@ async fn get_delivery(
 async fn retry_delivery(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<WebhookState>>,
-    Path((_project_id, webhook_id, delivery_id)): Path<(i32, i32, i32)>,
+    Path((project_id, webhook_id, delivery_id)): Path<(i32, i32, i32)>,
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, WebhooksWrite);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     match state.webhook_service.retry_delivery(delivery_id).await {
         Ok(result) => {

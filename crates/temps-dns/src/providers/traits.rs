@@ -29,6 +29,11 @@ pub enum DnsProviderType {
     Azure,
     /// Manual DNS (user sets records manually)
     Manual,
+    /// Pebble challtestsrv mock DNS (LOCAL DEV/TEST ONLY -- publishes to
+    /// `pebble-challtestsrv` instead of a real registrar, so DNS-01
+    /// auto-renewal can be exercised against a local Pebble ACME server with
+    /// no real domain or DNS account)
+    Pebble,
 }
 
 impl std::fmt::Display for DnsProviderType {
@@ -41,6 +46,7 @@ impl std::fmt::Display for DnsProviderType {
             DnsProviderType::Gcp => write!(f, "gcp"),
             DnsProviderType::Azure => write!(f, "azure"),
             DnsProviderType::Manual => write!(f, "manual"),
+            DnsProviderType::Pebble => write!(f, "pebble"),
         }
     }
 }
@@ -56,6 +62,7 @@ impl DnsProviderType {
             "gcp" | "google" | "googlecloud" | "google-cloud" => Ok(DnsProviderType::Gcp),
             "azure" | "az" => Ok(DnsProviderType::Azure),
             "manual" => Ok(DnsProviderType::Manual),
+            "pebble" | "challtestsrv" => Ok(DnsProviderType::Pebble),
             _ => Err(DnsError::InvalidProviderType(s.to_string())),
         }
     }
@@ -78,6 +85,7 @@ impl DnsProviderType {
                 ]
             }
             DnsProviderType::Manual => vec![],
+            DnsProviderType::Pebble => vec!["management_url"],
         }
     }
 
@@ -91,6 +99,7 @@ impl DnsProviderType {
             DnsProviderType::Gcp => vec![],
             DnsProviderType::Azure => vec![],
             DnsProviderType::Manual => vec![],
+            DnsProviderType::Pebble => vec![],
         }
     }
 }
@@ -553,6 +562,14 @@ mod tests {
             DnsProviderType::from_str("manual").unwrap(),
             DnsProviderType::Manual
         );
+        assert_eq!(
+            DnsProviderType::from_str("pebble").unwrap(),
+            DnsProviderType::Pebble
+        );
+        assert_eq!(
+            DnsProviderType::from_str("challtestsrv").unwrap(),
+            DnsProviderType::Pebble
+        );
         assert!(DnsProviderType::from_str("invalid").is_err());
     }
 
@@ -622,6 +639,7 @@ mod tests {
         assert_eq!(DnsProviderType::Gcp.to_string(), "gcp");
         assert_eq!(DnsProviderType::Azure.to_string(), "azure");
         assert_eq!(DnsProviderType::Manual.to_string(), "manual");
+        assert_eq!(DnsProviderType::Pebble.to_string(), "pebble");
     }
 
     #[test]
@@ -657,6 +675,10 @@ mod tests {
             ]
         );
         assert!(DnsProviderType::Manual.required_credentials().is_empty());
+        assert_eq!(
+            DnsProviderType::Pebble.required_credentials(),
+            vec!["management_url"]
+        );
     }
 
     #[test]

@@ -44,6 +44,9 @@ pub enum UrlValidationError {
 
     #[error("Domain resolves to a blocked IP address")]
     DomainResolvesToBlockedIp,
+
+    #[error("URL must resolve to a loopback or private address (this is a local-only tool)")]
+    NotLocalOrPrivate,
 }
 
 /// Validates a URL for external webhook/HTTP requests
@@ -105,6 +108,112 @@ pub fn validate_external_url(url: &str) -> Result<Url, UrlValidationError> {
     }
 
     Ok(parsed)
+}
+
+/// Validates a URL for LOCAL-ONLY tools that must never reach the public
+/// internet or cloud metadata services (e.g. a dev-only DNS provider whose
+/// "API" is actually a loopback test server). This is the inverse of
+/// [`validate_external_url`]: it REQUIRES the host to be loopback or RFC 1918
+/// private, and rejects everything else -- including link-local (where cloud
+/// metadata endpoints live) and public addresses.
+///
+/// Like `validate_external_url`, this only definitively validates literal
+/// IPs and `localhost`. For a non-literal hostname, callers MUST also await
+/// [`validate_loopback_or_private_domain_async`] to resolve and check the
+/// actual IP(s) -- mirrors the `validate_external_url` +
+/// `validate_domain_async` composition already used by the webhook service.
+///
+/// # Examples
+///
+/// ```
+/// use temps_core::url_validation::validate_loopback_or_private_url;
+///
+/// // Valid: loopback
+/// assert!(validate_loopback_or_private_url("http://127.0.0.1:8055").is_ok());
+/// assert!(validate_loopback_or_private_url("http://localhost:8055").is_ok());
+///
+/// // Valid: RFC 1918 private
+/// assert!(validate_loopback_or_private_url("http://192.168.1.10:8055").is_ok());
+///
+/// // Invalid: public address
+/// assert!(validate_loopback_or_private_url("http://8.8.8.8").is_err());
+///
+/// // Invalid: cloud metadata (link-local, not private)
+/// assert!(validate_loopback_or_private_url("http://169.254.169.254").is_err());
+/// ```
+pub fn validate_loopback_or_private_url(url: &str) -> Result<Url, UrlValidationError> {
+    let parsed =
+        Url::parse(url).map_err(|e| UrlValidationError::InvalidFormat(format!("{}", e)))?;
+
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(UrlValidationError::InvalidScheme);
+    }
+
+    if let Some(host) = parsed.host() {
+        match host {
+            url::Host::Ipv4(ip) => {
+                if !(ip.is_loopback() || ip.is_private()) {
+                    return Err(UrlValidationError::NotLocalOrPrivate);
+                }
+            }
+            url::Host::Ipv6(ip) => {
+                if !(ip.is_loopback() || is_unique_local_ipv6(&ip)) {
+                    return Err(UrlValidationError::NotLocalOrPrivate);
+                }
+            }
+            url::Host::Domain(_domain) => {
+                // A hostname isn't inherently unsafe -- only its resolved
+                // IP is. Full validation happens in the async resolver;
+                // don't reject here (mirrors validate_external_url).
+            }
+        }
+    } else {
+        return Err(UrlValidationError::InvalidFormat(
+            "URL must have a valid host".to_string(),
+        ));
+    }
+
+    Ok(parsed)
+}
+
+/// Asynchronous DNS resolution and validation for [`validate_loopback_or_private_url`]'s
+/// domain-name case: resolves `domain` and requires every resolved IP to be
+/// loopback or RFC 1918 private, rejecting the domain if any resolved IP is
+/// public, link-local, or otherwise not local.
+pub async fn validate_loopback_or_private_domain_async(
+    domain: &str,
+) -> Result<(), UrlValidationError> {
+    let lookup_result = tokio::net::lookup_host(format!("{}:443", domain)).await;
+
+    let addrs = match lookup_result {
+        Ok(addrs) => addrs,
+        Err(e) => {
+            return Err(UrlValidationError::DnsResolutionFailed(format!(
+                "Failed to resolve {}: {}",
+                domain, e
+            )));
+        }
+    };
+
+    let mut has_valid_ip = false;
+    for addr in addrs {
+        let is_local_or_private = match addr.ip() {
+            IpAddr::V4(ip) => ip.is_loopback() || ip.is_private(),
+            IpAddr::V6(ip) => ip.is_loopback() || is_unique_local_ipv6(&ip),
+        };
+        if !is_local_or_private {
+            return Err(UrlValidationError::NotLocalOrPrivate);
+        }
+        has_valid_ip = true;
+    }
+
+    if !has_valid_ip {
+        return Err(UrlValidationError::DnsResolutionFailed(
+            "No valid IP addresses found for domain".to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 /// Validates an IPv4 address for external access
@@ -386,6 +495,65 @@ mod tests {
         assert!(validate_external_url("https://example.com").is_ok());
         assert!(validate_external_url("http://example.com/webhook").is_ok());
         assert!(validate_external_url("https://api.github.com/webhooks").is_ok());
+    }
+
+    // ── validate_loopback_or_private_url: the inverse allow-list ─────────
+
+    #[test]
+    fn test_loopback_or_private_allows_loopback() {
+        assert!(validate_loopback_or_private_url("http://127.0.0.1:8055").is_ok());
+        assert!(validate_loopback_or_private_url("http://localhost:8055").is_ok());
+        assert!(validate_loopback_or_private_url("http://[::1]:8055").is_ok());
+    }
+
+    #[test]
+    fn test_loopback_or_private_allows_rfc1918_private() {
+        assert!(validate_loopback_or_private_url("http://10.0.0.5:8055").is_ok());
+        assert!(validate_loopback_or_private_url("http://172.20.0.3:8055").is_ok());
+        assert!(validate_loopback_or_private_url("http://192.168.1.10:8055").is_ok());
+    }
+
+    #[test]
+    fn test_loopback_or_private_rejects_public_ip() {
+        assert!(validate_loopback_or_private_url("http://8.8.8.8").is_err());
+        assert!(validate_loopback_or_private_url("http://1.1.1.1").is_err());
+    }
+
+    #[test]
+    fn test_loopback_or_private_rejects_cloud_metadata_and_link_local() {
+        // Cloud metadata lives in link-local space (169.254.0.0/16), which is
+        // neither loopback nor RFC 1918 private -- must stay rejected even
+        // though this validator's whole point is to allow "local" addresses.
+        assert!(validate_loopback_or_private_url("http://169.254.169.254").is_err());
+        assert!(validate_loopback_or_private_url("http://169.254.1.1").is_err());
+    }
+
+    #[test]
+    fn test_loopback_or_private_rejects_bad_scheme() {
+        assert!(validate_loopback_or_private_url("file:///etc/passwd").is_err());
+        assert!(validate_loopback_or_private_url("ftp://127.0.0.1").is_err());
+    }
+
+    #[test]
+    fn test_loopback_or_private_domain_name_passes_through_sync_check() {
+        // A non-literal hostname can't be judged synchronously -- the sync
+        // check must not reject it (that's what the async resolver is for).
+        assert!(validate_loopback_or_private_url("http://challtestsrv:8055").is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_loopback_or_private_domain_async_rejects_public_domain() {
+        // example.com resolves publicly -- must be rejected by the allow-list.
+        assert!(validate_loopback_or_private_domain_async("example.com")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_loopback_or_private_domain_async_allows_localhost() {
+        assert!(validate_loopback_or_private_domain_async("localhost")
+            .await
+            .is_ok());
     }
 
     #[test]

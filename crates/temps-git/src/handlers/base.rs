@@ -904,6 +904,8 @@ pub async fn list_repositories_by_connection(
     };
     let filter = RepositoryFilter {
         git_provider_connection_id: Some(connection_id),
+        provider_id: None,
+        user_id: None,
         search: query.search.clone(),
         owner: query.owner.clone(),
         language: query.language.clone(),
@@ -919,6 +921,8 @@ pub async fn list_repositories_by_connection(
     // For total count, we need to make a separate call without pagination
     let count_filter = RepositoryFilter {
         git_provider_connection_id: Some(connection_id),
+        provider_id: None,
+        user_id: None,
         search: query.search.clone(),
         owner: query.owner.clone(),
         language: query.language.clone(),
@@ -962,11 +966,22 @@ pub async fn list_repositories_by_connection(
 }
 
 /// List all repositories for a specific provider
+///
+/// Lists repositories synced to the database across every connection under
+/// this provider, with the same pagination/filtering as `/repositories`.
 #[utoipa::path(
     get,
     path = "/git-providers/{provider_id}/repositories",
     params(
-        ("provider_id" = i32, Path, description = "Provider ID")
+        ("provider_id" = i32, Path, description = "Provider ID"),
+        ("page" = Option<u64>, Query, description = "Page number for pagination"),
+        ("per_page" = Option<u64>, Query, description = "Number of items per page (max 100)"),
+        ("sort" = Option<String>, Query, description = "Sort field (name, created_at, updated_at, stars, watchers, size, issues)"),
+        ("direction" = Option<String>, Query, description = "Sort direction (asc, desc)"),
+        ("search" = Option<String>, Query, description = "Search term to filter repositories"),
+        ("owner" = Option<String>, Query, description = "Filter by repository owner"),
+        ("language" = Option<String>, Query, description = "Filter by programming language"),
+        ("private" = Option<bool>, Query, description = "Filter by private status (true/false)")
     ),
     responses(
         (status = 200, description = "List of repositories", body = RepositoryListResponse),
@@ -983,17 +998,73 @@ pub async fn list_repositories_by_provider(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path(provider_id): Path<i32>,
+    Query(query): Query<SyncedRepositoryListQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, Permission::GitRepositoriesRead);
 
     // First verify the provider exists
     state.git_provider_manager.get_provider(provider_id).await?;
 
-    // Use the repository service to get repositories
-    let repositories = state
+    let page = query.page.unwrap_or(1).max(1);
+    let per_page = query.per_page.unwrap_or(30).min(100);
+
+    let sort = match (
+        query.sort.as_deref().unwrap_or("updated_at"),
+        query.direction.as_deref().unwrap_or("desc"),
+    ) {
+        ("name", "asc") => Some("name".to_string()),
+        ("name", "desc") => Some("name_desc".to_string()),
+        ("created_at", "asc") => Some("created".to_string()),
+        ("created_at", "desc") => Some("created_desc".to_string()),
+        ("updated_at", "asc") => Some("updated".to_string()),
+        ("updated_at", "desc") => Some("updated_desc".to_string()),
+        ("stars", "asc") => Some("stars".to_string()),
+        ("stars", "desc") => Some("stars_desc".to_string()),
+        ("watchers", "asc") => Some("watchers".to_string()),
+        ("watchers", "desc") => Some("watchers_desc".to_string()),
+        ("size", "asc") => Some("size".to_string()),
+        ("size", "desc") => Some("size_desc".to_string()),
+        ("issues", "asc") => Some("issues".to_string()),
+        ("issues", "desc") => Some("issues_desc".to_string()),
+        _ => Some("updated_desc".to_string()), // Default
+    };
+
+    // provider_id identifies a shared, platform-level OAuth app/PAT config --
+    // many users can each have their own git_provider_connections row against
+    // the same provider, so this must stay scoped to the caller's own user_id
+    // or it leaks every other user's repositories (names, clone/SSH URLs,
+    // private flag).
+    let user_id = auth.user_id();
+    let filter = RepositoryFilter {
+        provider_id: Some(provider_id),
+        user_id: Some(user_id),
+        search: query.search.clone(),
+        owner: query.owner.clone(),
+        language: query.language.clone(),
+        private: query.private,
+        sort,
+        limit: Some(per_page),
+        offset: Some((page - 1) * per_page),
+        ..Default::default()
+    };
+
+    let repositories = state.repository_service.list_repositories(filter).await?;
+
+    // For total count, make a separate call without pagination.
+    let count_filter = RepositoryFilter {
+        provider_id: Some(provider_id),
+        user_id: Some(user_id),
+        search: query.search.clone(),
+        owner: query.owner.clone(),
+        language: query.language.clone(),
+        private: query.private,
+        ..Default::default()
+    };
+    let total_count = state
         .repository_service
-        .list_repositories_by_provider(provider_id)
-        .await?;
+        .list_repositories(count_filter)
+        .await?
+        .len();
 
     let response: Vec<RepositoryResponse> = repositories
         .into_iter()
@@ -1015,7 +1086,10 @@ pub async fn list_repositories_by_provider(
             git_provider_connection_id: r.git_provider_connection_id,
         })
         .collect();
-    Ok(Json(response))
+    Ok(Json(RepositoryListResponse {
+        repositories: response,
+        total_count,
+    }))
 }
 
 /// List synced repositories with advanced filtering
@@ -1080,6 +1154,8 @@ pub async fn list_synced_repositories(
 
     let filter = RepositoryFilter {
         git_provider_connection_id: query.git_provider_connection_id,
+        provider_id: None,
+        user_id: None,
         search: query.search.clone(),
         owner: query.owner.clone(),
         language: query.language.clone(),
@@ -1095,6 +1171,8 @@ pub async fn list_synced_repositories(
     // For total count, we need to make a separate call without pagination
     let count_filter = RepositoryFilter {
         git_provider_connection_id: query.git_provider_connection_id,
+        provider_id: None,
+        user_id: None,
         search: query.search.clone(),
         owner: query.owner.clone(),
         language: query.language.clone(),
@@ -1539,6 +1617,10 @@ pub fn configure_routes() -> axum::Router<Arc<AppState>> {
             get(get_provider_connections),
         )
         .route(
+            "/git-providers/{provider_id}/repositories",
+            get(list_repositories_by_provider),
+        )
+        .route(
             "/repositories/{owner}/{repo}/branches",
             get(get_repository_branches),
         )
@@ -1788,6 +1870,7 @@ fn parse_auth_method(method_type: &str, config: serde_json::Value) -> Result<Aut
         get_provider_connections,
         sync_repositories,
         list_repositories_by_connection,
+        list_repositories_by_provider,
         list_synced_repositories,
         get_repository_preset_live,
         get_repository_preset_by_name,

@@ -133,6 +133,19 @@ pub struct EmailVerifiedAudit {
     pub email: String,
 }
 
+// API key creation audit. Custom-permission keys are the highest-impact
+// variant -- capturing role_type and the granted permission strings lets an
+// auditor spot an over-broad grant after the fact without needing to
+// correlate against the key's current (mutable) state.
+#[derive(Debug, Clone, Serialize)]
+pub struct ApiKeyCreatedAudit {
+    pub context: AuditContext,
+    pub api_key_id: i32,
+    pub api_key_name: String,
+    pub role_type: String,
+    pub permissions: Option<Vec<String>>,
+}
+
 // API key rotation audit. Rotation invalidates the old secret and mints a new
 // one for the same key record -- an auditor needs the key's id/name to tie
 // this event to the credential's lifecycle without seeing the secret itself.
@@ -530,6 +543,29 @@ impl AuditOperation for PasswordChangedAudit {
 impl AuditOperation for EmailVerifiedAudit {
     fn operation_type(&self) -> String {
         "EMAIL_VERIFIED".to_string()
+    }
+
+    fn user_id(&self) -> i32 {
+        self.context.user_id
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+impl AuditOperation for ApiKeyCreatedAudit {
+    fn operation_type(&self) -> String {
+        "API_KEY_CREATED".to_string()
     }
 
     fn user_id(&self) -> i32 {

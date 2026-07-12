@@ -620,14 +620,48 @@ impl ProxyLogService {
         .await
     }
 
-    /// Get a single proxy log by ID
+    /// Get a single proxy log by ID.
+    ///
+    /// `proxy_logs` is a TimescaleDB hypertable partitioned by `timestamp`
+    /// (1-day chunks, compressed after 7 days), so a bare `WHERE id = $1`
+    /// cannot exclude any chunk and must decompress every compressed chunk —
+    /// observed as multi-second lookups. When the caller knows the row's event
+    /// time (the list endpoint returns it), a ±1-day bound reduces the lookup
+    /// to the couple of chunks that can contain the row. Without a timestamp,
+    /// the recent uncompressed window is probed first and the unbounded scan
+    /// only runs as a last resort so bare deep-links keep resolving.
     pub async fn get_by_id(
         &self,
         id: i32,
+        timestamp: Option<UtcDateTime>,
     ) -> Result<Option<proxy_logs::Model>, ProxyLogServiceError> {
         if let Some(storage) = &self.storage {
-            return storage.get_by_id(id).await;
+            return storage.get_by_id(id, timestamp).await;
         }
+
+        if let Some(ts) = timestamp {
+            let log = proxy_logs::Entity::find()
+                .filter(proxy_logs::Column::Id.eq(id))
+                .filter(proxy_logs::Column::Timestamp.gte(ts - chrono::Duration::days(1)))
+                .filter(proxy_logs::Column::Timestamp.lte(ts + chrono::Duration::days(1)))
+                .one(self.db.as_ref())
+                .await?;
+            return Ok(log);
+        }
+
+        // Compression policy compresses chunks older than 7 days; probing the
+        // uncompressed window first keeps the common case (recent log, no
+        // timestamp supplied) off the decompression path.
+        let recent_cutoff = Utc::now() - chrono::Duration::days(7);
+        let log = proxy_logs::Entity::find()
+            .filter(proxy_logs::Column::Id.eq(id))
+            .filter(proxy_logs::Column::Timestamp.gte(recent_cutoff))
+            .one(self.db.as_ref())
+            .await?;
+        if log.is_some() {
+            return Ok(log);
+        }
+
         let log = proxy_logs::Entity::find_by_id(id)
             .one(self.db.as_ref())
             .await?;
@@ -693,6 +727,20 @@ impl ProxyLogService {
             )));
         }
 
+        // Serve from the 1-minute continuous aggregate when it can answer
+        // this query: every set filter is a grouping column of the aggregate
+        // and the interval is a whole multiple of its 1-minute buckets. That
+        // reads O(minutes × series) pre-aggregated rows instead of every raw
+        // request in the window.
+        if Self::cagg_serves_filters(filters.as_ref())
+            && Self::is_minute_multiple_interval(&bucket_interval)
+            && self.stats_cagg_exists().await
+        {
+            return self
+                .get_time_bucket_stats_from_cagg(start_time, end_time, bucket_interval, filters)
+                .await;
+        }
+
         // Build the base WHERE clause for filters
         let mut where_clauses = vec!["timestamp >= $1".to_string(), "timestamp < $2".to_string()];
         let mut param_index = 3;
@@ -717,8 +765,8 @@ impl ProxyLogService {
                 COALESCE(count, 0) as request_count,
                 COALESCE(avg_response_time, 0)::float8 as avg_response_time_ms,
                 COALESCE(error_count, 0) as error_count,
-                COALESCE(total_request_bytes, 0) as total_request_bytes,
-                COALESCE(total_response_bytes, 0) as total_response_bytes
+                COALESCE(total_request_bytes, 0)::bigint as total_request_bytes,
+                COALESCE(total_response_bytes, 0)::bigint as total_response_bytes
             FROM (
                 SELECT
                     time_bucket_gapfill(${}::interval, timestamp) AS bucket,
@@ -754,11 +802,91 @@ impl ProxyLogService {
 
         let results = self.db.query_all(stmt).await?;
 
-        // Parse results
-        let stats = results
+        Ok(Self::rows_to_time_bucket_stats(&results, start_time))
+    }
+
+    /// [`Self::get_time_bucket_stats`] served from the `proxy_logs_stats_1m`
+    /// continuous aggregate. Only called when the filter set is representable
+    /// on the aggregate (see [`Self::cagg_serves_filters`]) — under that
+    /// precondition [`Self::build_filter_sql`] emits only `project_id` /
+    /// `environment_id` / `is_bot` / `project_id IS [NOT] NULL` clauses, all
+    /// of which are grouping columns of the aggregate, so the raw-table
+    /// filter helpers are reused unchanged.
+    async fn get_time_bucket_stats_from_cagg(
+        &self,
+        start_time: UtcDateTime,
+        end_time: UtcDateTime,
+        bucket_interval: String,
+        filters: Option<StatsFilters>,
+    ) -> Result<Vec<TimeBucketStats>, ProxyLogServiceError> {
+        let mut where_clauses = vec!["bucket >= $1".to_string(), "bucket < $2".to_string()];
+        let mut param_index = 3;
+
+        if let Some(ref f) = filters {
+            Self::build_filter_sql(f, &mut param_index, &mut where_clauses);
+        }
+
+        let where_clause = format!("WHERE {}", where_clauses.join(" AND "));
+        let bucket_param_index = param_index;
+
+        // `GROUP BY 1` instead of `GROUP BY bucket`: the aggregate has a real
+        // `bucket` column, which Postgres prefers over the gapfill output
+        // alias — naming it would silently group at 1-minute resolution
+        // regardless of the requested interval.
+        let sql = format!(
+            r#"
+            SELECT
+                bucket::timestamptz as bucket,
+                COALESCE(count, 0)::bigint as request_count,
+                COALESCE(avg_response_time, 0)::float8 as avg_response_time_ms,
+                COALESCE(error_count, 0)::bigint as error_count,
+                COALESCE(total_request_bytes, 0)::bigint as total_request_bytes,
+                COALESCE(total_response_bytes, 0)::bigint as total_response_bytes
+            FROM (
+                SELECT
+                    time_bucket_gapfill(${}::interval, bucket) AS bucket,
+                    SUM(request_count) as count,
+                    SUM(sum_response_time_ms)::float8
+                        / NULLIF(SUM(response_time_count), 0)::float8 as avg_response_time,
+                    SUM(error_4xx_plus_count) as error_count,
+                    SUM(sum_request_bytes) as total_request_bytes,
+                    SUM(sum_response_bytes) as total_response_bytes
+                FROM proxy_logs_stats_1m
+                {}
+                GROUP BY 1
+            ) sub
+            ORDER BY bucket ASC
+            "#,
+            bucket_param_index, where_clause
+        );
+
+        let mut values: Vec<sea_orm::Value> = vec![start_time.into(), end_time.into()];
+        if let Some(ref f) = filters {
+            Self::add_filter_values(&mut values, f);
+        }
+        values.push(bucket_interval.into());
+
+        let stmt = sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            &sql,
+            values,
+        );
+        let results = self.db.query_all(stmt).await?;
+
+        Ok(Self::rows_to_time_bucket_stats(&results, start_time))
+    }
+
+    /// Map raw query rows (shared column shape of the raw-table and
+    /// aggregate time-bucket queries) into [`TimeBucketStats`].
+    fn rows_to_time_bucket_stats(
+        results: &[sea_orm::QueryResult],
+        fallback_bucket: UtcDateTime,
+    ) -> Vec<TimeBucketStats> {
+        results
             .iter()
             .map(|row| {
-                let bucket: chrono::DateTime<Utc> = row.try_get("", "bucket").unwrap_or(start_time);
+                let bucket: chrono::DateTime<Utc> =
+                    row.try_get("", "bucket").unwrap_or(fallback_bucket);
                 let request_count: i64 = row.try_get("", "request_count").unwrap_or(0);
                 let avg_response_time_ms: f64 =
                     row.try_get("", "avg_response_time_ms").unwrap_or(0.0);
@@ -776,9 +904,7 @@ impl ProxyLogService {
                     total_response_bytes,
                 }
             })
-            .collect();
-
-        Ok(stats)
+            .collect()
     }
 
     /// Get health summaries for multiple projects in a single query
@@ -814,21 +940,48 @@ impl ProxyLogService {
             None => (String::new(), None),
         };
 
-        let sql = format!(
-            r#"
-            SELECT
-                project_id,
-                COALESCE(COUNT(*), 0) as total_requests,
-                COALESCE(SUM(CASE WHEN status_code >= 500 THEN 1 ELSE 0 END), 0) as total_errors,
-                COALESCE(AVG(response_time_ms)::float8, 0) as avg_response_time_ms
-            FROM proxy_logs
-            WHERE timestamp >= $1
-              AND timestamp < $2
-              AND project_id IN ({}){}
-            GROUP BY project_id
-            "#,
-            placeholders_str, bot_clause
-        );
+        // Prefer the pre-aggregated 1-minute continuous aggregate: it reads
+        // O(minutes × projects) rows instead of every raw request in the
+        // window, which on high-traffic installs (millions of rows per hour)
+        // is the difference between milliseconds and a 20s+ scan. Both
+        // queries take the identical parameter list, so only the SQL differs.
+        let sql = if self.stats_cagg_exists().await {
+            format!(
+                r#"
+                SELECT
+                    project_id,
+                    COALESCE(SUM(request_count), 0)::bigint as total_requests,
+                    COALESCE(SUM(error_5xx_plus_count), 0)::bigint as total_errors,
+                    COALESCE(
+                        SUM(sum_response_time_ms)::float8
+                            / NULLIF(SUM(response_time_count), 0)::float8,
+                        0
+                    ) as avg_response_time_ms
+                FROM proxy_logs_stats_1m
+                WHERE bucket >= $1
+                  AND bucket < $2
+                  AND project_id IN ({}){}
+                GROUP BY project_id
+                "#,
+                placeholders_str, bot_clause
+            )
+        } else {
+            format!(
+                r#"
+                SELECT
+                    project_id,
+                    COALESCE(COUNT(*), 0) as total_requests,
+                    COALESCE(SUM(CASE WHEN status_code >= 500 THEN 1 ELSE 0 END), 0) as total_errors,
+                    COALESCE(AVG(response_time_ms)::float8, 0) as avg_response_time_ms
+                FROM proxy_logs
+                WHERE timestamp >= $1
+                  AND timestamp < $2
+                  AND project_id IN ({}){}
+                GROUP BY project_id
+                "#,
+                placeholders_str, bot_clause
+            )
+        };
 
         let db_backend = sea_orm::DatabaseBackend::Postgres;
         let mut values: Vec<sea_orm::Value> = vec![start_time.into(), end_time.into()];
@@ -1095,6 +1248,72 @@ impl ProxyLogService {
 
         // Verify second part is a valid unit
         valid_units.contains(&parts[1])
+    }
+
+    /// True when the `proxy_logs_stats_1m` continuous aggregate exists.
+    ///
+    /// Checked per call (one cheap catalog lookup, dwarfed by the stats query
+    /// it guards) so behaviour is correct both before the creating migration
+    /// has run and immediately after, without process-lifetime caching. On
+    /// lookup failure the caller falls back to the raw-table path.
+    async fn stats_cagg_exists(&self) -> bool {
+        let stmt = sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT to_regclass('proxy_logs_stats_1m') IS NOT NULL as cagg_exists".to_string(),
+        );
+        match self.db.query_one(stmt).await {
+            Ok(Some(row)) => row.try_get::<bool>("", "cagg_exists").unwrap_or(false),
+            Ok(None) => false,
+            Err(e) => {
+                tracing::debug!(
+                    "proxy_logs_stats_1m existence check failed ({e}); using raw proxy_logs path"
+                );
+                false
+            }
+        }
+    }
+
+    /// True when every set filter dimension is a grouping column of
+    /// `proxy_logs_stats_1m` (`project_id`, `environment_id`, `is_bot`,
+    /// `has_project`). Any other filter forces the raw-table path.
+    fn cagg_serves_filters(filters: Option<&StatsFilters>) -> bool {
+        let Some(f) = filters else { return true };
+        f.method.is_none()
+            && f.client_ip.is_none()
+            && f.deployment_id.is_none()
+            && f.host.is_none()
+            && f.status_code.is_none()
+            && f.status_code_class.is_none()
+            && f.routing_status.is_none()
+            && f.request_source.is_none()
+            && f.device_type.is_none()
+    }
+
+    /// True for intervals that are whole multiples of the aggregate's
+    /// 1-minute buckets ("5 minutes", "1 hour", …). Calendar units (month,
+    /// year) qualify too: minute-truncated buckets never straddle a calendar
+    /// boundary. Sub-minute units ("30 seconds") do not align and take the
+    /// raw-table path. Assumes [`Self::is_valid_interval`] already passed.
+    fn is_minute_multiple_interval(interval: &str) -> bool {
+        let parts: Vec<&str> = interval.split_whitespace().collect();
+        let Some(unit) = parts.get(1) else {
+            return false;
+        };
+        matches!(
+            *unit,
+            "minute"
+                | "minutes"
+                | "hour"
+                | "hours"
+                | "day"
+                | "days"
+                | "week"
+                | "weeks"
+                | "month"
+                | "months"
+                | "year"
+                | "years"
+        )
     }
 
     /// Aggregate AI-agent traffic for a project over a time window.
@@ -2118,7 +2337,263 @@ mod tests {
         assert!(filters.device_type.is_none());
     }
 
-    // Note: Integration tests that require a database connection should be added
-    // to test get_today_count and get_time_bucket_stats methods.
-    // These would need a test database setup with sample data.
+    #[test]
+    fn test_cagg_serves_filters_eligible_dimensions() {
+        // No filters at all — the aggregate always serves.
+        assert!(ProxyLogService::cagg_serves_filters(None));
+
+        // Every grouping-column dimension set at once — still eligible.
+        let f = StatsFilters {
+            project_id: Some(1),
+            environment_id: Some(2),
+            is_bot: Some(false),
+            has_project: Some(true),
+            ..Default::default()
+        };
+        assert!(ProxyLogService::cagg_serves_filters(Some(&f)));
+    }
+
+    #[test]
+    fn test_cagg_serves_filters_rejects_raw_only_dimensions() {
+        let raw_only: Vec<StatsFilters> = vec![
+            StatsFilters {
+                method: Some("GET".to_string()),
+                ..Default::default()
+            },
+            StatsFilters {
+                client_ip: Some("10.0.0.1".to_string()),
+                ..Default::default()
+            },
+            StatsFilters {
+                deployment_id: Some(7),
+                ..Default::default()
+            },
+            StatsFilters {
+                host: Some("example.com".to_string()),
+                ..Default::default()
+            },
+            StatsFilters {
+                status_code: Some(500),
+                ..Default::default()
+            },
+            StatsFilters {
+                status_code_class: Some("5xx".to_string()),
+                ..Default::default()
+            },
+            StatsFilters {
+                routing_status: Some("routed".to_string()),
+                ..Default::default()
+            },
+            StatsFilters {
+                request_source: Some("proxy".to_string()),
+                ..Default::default()
+            },
+            StatsFilters {
+                device_type: Some("mobile".to_string()),
+                ..Default::default()
+            },
+        ];
+        for f in &raw_only {
+            assert!(
+                !ProxyLogService::cagg_serves_filters(Some(f)),
+                "filter should force the raw path: {f:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_minute_multiple_interval() {
+        assert!(ProxyLogService::is_minute_multiple_interval("1 minute"));
+        assert!(ProxyLogService::is_minute_multiple_interval("5 minutes"));
+        assert!(ProxyLogService::is_minute_multiple_interval("1 hour"));
+        assert!(ProxyLogService::is_minute_multiple_interval("15 minutes"));
+        assert!(ProxyLogService::is_minute_multiple_interval("1 day"));
+        assert!(ProxyLogService::is_minute_multiple_interval("2 weeks"));
+        assert!(ProxyLogService::is_minute_multiple_interval("1 month"));
+        assert!(ProxyLogService::is_minute_multiple_interval("1 year"));
+
+        assert!(!ProxyLogService::is_minute_multiple_interval("30 seconds"));
+        assert!(!ProxyLogService::is_minute_multiple_interval(
+            "500 milliseconds"
+        ));
+        assert!(!ProxyLogService::is_minute_multiple_interval(
+            "1 microsecond"
+        ));
+        assert!(!ProxyLogService::is_minute_multiple_interval(""));
+        assert!(!ProxyLogService::is_minute_multiple_interval("garbage"));
+    }
+
+    /// Full pipeline against a real TimescaleDB: raw rows → the
+    /// `proxy_logs_stats_1m` continuous aggregate (via real-time
+    /// aggregation, no manual refresh) → the health-summary and
+    /// time-bucket queries. Cross-checks the aggregate-served result
+    /// against the raw-table path. Skips gracefully when no test
+    /// Postgres is available, per the repo's Docker-test convention.
+    #[tokio::test]
+    async fn test_stats_served_from_cagg_match_raw_path() {
+        use temps_database::test_utils::TestDatabase;
+
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Test database not available, skipping: {e}");
+                return;
+            }
+        };
+        let db = test_db.connection_arc().clone();
+
+        std::env::set_var("TEMPS_GEO_MOCK", "true");
+        let geoip = Arc::new(temps_geo::GeoIpService::new().expect("mock GeoIpService for tests"));
+        let ip_service = Arc::new(temps_geo::IpAddressService::new(db.clone(), geoip));
+        let service = ProxyLogService::new(db.clone(), ip_service);
+
+        // The migration must have created the aggregate.
+        assert!(
+            service.stats_cagg_exists().await,
+            "proxy_logs_stats_1m must exist after migrations"
+        );
+
+        // Parent rows for proxy_logs' project FK.
+        for (id, name) in [(1, "cagg-p1"), (2, "cagg-p2"), (3, "cagg-p3")] {
+            let stmt = sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "INSERT INTO projects (id, name, repo_name, repo_owner, directory, \
+                 main_branch, preset, created_at, updated_at, slug) \
+                 VALUES ($1, $2, 'repo', 'owner', '.', 'main', 'nodejs', now(), now(), $2)",
+                vec![id.into(), name.into()],
+            );
+            db.execute(stmt).await.expect("insert project row");
+        }
+
+        async fn insert_log(
+            db: &DatabaseConnection,
+            ts: chrono::DateTime<Utc>,
+            n: i32,
+            project_id: i32,
+            status: i16,
+            rt_ms: i32,
+            is_bot: bool,
+        ) {
+            let stmt = sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                r#"INSERT INTO proxy_logs
+                    (timestamp, method, path, host, status_code, response_time_ms,
+                     request_source, is_system_request, routing_status, project_id,
+                     request_id, is_bot, request_size_bytes, response_size_bytes,
+                     created_date)
+                   VALUES ($1, 'GET', '/', 'test.local', $2, $3, 'proxy', false,
+                           'routed', $4, $5, $6, 100, 200, $7)"#,
+                vec![
+                    ts.into(),
+                    status.into(),
+                    rt_ms.into(),
+                    project_id.into(),
+                    format!("cagg-test-{n}").into(),
+                    is_bot.into(),
+                    ts.date_naive().into(),
+                ],
+            );
+            db.execute(stmt).await.expect("insert proxy_logs row");
+        }
+
+        // All rows a few minutes in the past: inside the window, and served
+        // by real-time aggregation (the refresh policy hasn't materialized
+        // them yet — exactly the state right after deploy).
+        let ts = Utc::now() - chrono::Duration::minutes(5);
+        insert_log(&db, ts, 1, 1, 200, 100, false).await;
+        insert_log(&db, ts, 2, 1, 404, 50, false).await;
+        insert_log(&db, ts, 3, 1, 500, 30, false).await;
+        insert_log(&db, ts, 4, 1, 200, 20, true).await; // bot row
+        insert_log(&db, ts, 5, 2, 200, 10, false).await;
+
+        let start = Utc::now() - chrono::Duration::hours(1);
+        let end = Utc::now() + chrono::Duration::minutes(1);
+
+        // ── Health summary (aggregate path) ───────────────────────────────
+        let health = service
+            .get_projects_health_summary(&[1, 2, 3], start, end, None)
+            .await
+            .expect("health summary");
+        assert_eq!(health.len(), 3);
+
+        let p1 = health.iter().find(|h| h.project_id == 1).expect("p1");
+        assert_eq!(p1.total_requests, 4);
+        assert_eq!(p1.total_errors, 1); // only the 500 counts (>= 500)
+        assert!((p1.avg_response_time_ms - 50.0).abs() < 1e-9); // (100+50+30+20)/4
+        assert_eq!(p1.status, "degraded"); // 25% error rate
+
+        let p2 = health.iter().find(|h| h.project_id == 2).expect("p2");
+        assert_eq!(p2.total_requests, 1);
+        assert_eq!(p2.total_errors, 0);
+        assert_eq!(p2.status, "healthy");
+
+        let p3 = health.iter().find(|h| h.project_id == 3).expect("p3");
+        assert_eq!(p3.total_requests, 0);
+        assert_eq!(p3.status, "unknown");
+
+        // is_bot filter narrows to human traffic.
+        let health_human = service
+            .get_projects_health_summary(&[1], start, end, Some(false))
+            .await
+            .expect("health summary human-only");
+        assert_eq!(health_human[0].total_requests, 3);
+        assert!((health_human[0].avg_response_time_ms - 60.0).abs() < 1e-9);
+
+        // ── Time buckets: aggregate path vs raw path must agree ───────────
+        let cagg_filters = StatsFilters {
+            project_id: Some(1),
+            ..Default::default()
+        };
+        assert!(ProxyLogService::cagg_serves_filters(Some(&cagg_filters)));
+        let via_cagg = service
+            .get_time_bucket_stats(start, end, "1 hour".to_string(), Some(cagg_filters))
+            .await
+            .expect("time buckets via aggregate");
+
+        // Adding `method` makes the filter unrepresentable on the aggregate,
+        // forcing the raw path; every inserted row is a GET, so the numbers
+        // must be identical.
+        let raw_filters = StatsFilters {
+            project_id: Some(1),
+            method: Some("GET".to_string()),
+            ..Default::default()
+        };
+        assert!(!ProxyLogService::cagg_serves_filters(Some(&raw_filters)));
+        let via_raw = service
+            .get_time_bucket_stats(start, end, "1 hour".to_string(), Some(raw_filters))
+            .await
+            .expect("time buckets via raw table");
+
+        let sum = |stats: &[TimeBucketStats]| {
+            stats.iter().fold((0i64, 0i64, 0i64, 0i64), |acc, b| {
+                (
+                    acc.0 + b.request_count,
+                    acc.1 + b.error_count,
+                    acc.2 + b.total_request_bytes,
+                    acc.3 + b.total_response_bytes,
+                )
+            })
+        };
+        let (cagg_reqs, cagg_errs, cagg_req_bytes, cagg_resp_bytes) = sum(&via_cagg);
+        assert_eq!(cagg_reqs, 4);
+        assert_eq!(cagg_errs, 2); // 404 + 500 (time-bucket errors are >= 400)
+        assert_eq!(cagg_req_bytes, 400);
+        assert_eq!(cagg_resp_bytes, 800);
+        assert_eq!(
+            sum(&via_raw),
+            (cagg_reqs, cagg_errs, cagg_req_bytes, cagg_resp_bytes)
+        );
+
+        // The populated bucket carries the same average on both paths.
+        let cagg_busy = via_cagg
+            .iter()
+            .find(|b| b.request_count > 0)
+            .expect("populated aggregate bucket");
+        let raw_busy = via_raw
+            .iter()
+            .find(|b| b.request_count > 0)
+            .expect("populated raw bucket");
+        assert!((cagg_busy.avg_response_time_ms - 50.0).abs() < 1e-9);
+        assert!((cagg_busy.avg_response_time_ms - raw_busy.avg_response_time_ms).abs() < 1e-9);
+    }
 }

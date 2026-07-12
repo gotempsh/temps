@@ -19,7 +19,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{permission_guard, project_access_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
@@ -28,9 +28,10 @@ use crate::filters::{clamp_limit, parse_kinds, EventFilters};
 use crate::service::{FullError, FullEvent, FullRequest, ObservabilityService};
 use crate::types::{ErrorRow, EventKind, ObservabilityEvent, RequestRow, RevenueRow, SpanRow};
 
-#[derive(Clone)]
 pub struct ObservabilityState {
     pub service: Arc<ObservabilityService>,
+    /// Optional checker for team-based project access (human sessions only).
+    pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
 }
 
 #[derive(OpenApi)]
@@ -117,6 +118,7 @@ pub async fn observability_list_events(
     Query(query): Query<EventsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, LogsRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let kinds = parse_kinds(query.kinds.as_deref())?;
     let limit = clamp_limit(query.limit);
@@ -201,6 +203,7 @@ pub async fn observability_full_event(
     Path((project_id, kind, event_id)): Path<(i32, EventKind, String)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, LogsRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let event = state
         .service

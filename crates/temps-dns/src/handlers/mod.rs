@@ -26,7 +26,8 @@ use utoipa::{OpenApi, ToSchema};
 use crate::errors::DnsError;
 use crate::providers::{
     AzureCredentials, CloudflareCredentials, DigitalOceanCredentials, DnsProviderType, DnsRecord,
-    DnsZone, GcpCredentials, NamecheapCredentials, ProviderCredentials, Route53Credentials,
+    DnsZone, GcpCredentials, NamecheapCredentials, PebbleCredentials, ProviderCredentials,
+    Route53Credentials,
 };
 use crate::services::{
     AddManagedDomainRequest, CreateProviderRequest, DnsProviderService, DnsRecordService,
@@ -121,6 +122,11 @@ pub enum DnsProviderCredentials {
         #[schema(example = "my-resource-group")]
         resource_group: String,
     },
+    /// Pebble challtestsrv mock DNS (LOCAL DEV/TEST ONLY)
+    Pebble {
+        #[schema(example = "http://localhost:8055")]
+        management_url: String,
+    },
 }
 
 impl From<DnsProviderCredentials> for ProviderCredentials {
@@ -180,6 +186,9 @@ impl From<DnsProviderCredentials> for ProviderCredentials {
                 subscription_id,
                 resource_group,
             }),
+            DnsProviderCredentials::Pebble { management_url } => {
+                ProviderCredentials::Pebble(PebbleCredentials { management_url })
+            }
         }
     }
 }
@@ -452,6 +461,11 @@ async fn get_dns_provider(
 }
 
 /// Update a DNS provider
+///
+/// If new credentials are supplied, they are tested before the update is
+/// persisted (same as creation) -- otherwise a provider's credentials (and,
+/// for Pebble, its target URL) could be swapped for something invalid or
+/// unsafe without ever going through validation.
 #[utoipa::path(
     tag = "DNS Providers",
     put,
@@ -474,13 +488,24 @@ async fn update_provider(
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, Permission::SettingsWrite);
 
+    let credentials: Option<ProviderCredentials> = request.credentials.map(|c| c.into());
+
+    if let Some(credentials) = &credentials {
+        let existing = state.provider_service.get(id).await?;
+        let provider_type = DnsProviderType::from_str(&existing.provider_type)?;
+        state
+            .provider_service
+            .test_credentials(&provider_type, credentials)
+            .await?;
+    }
+
     let provider = state
         .provider_service
         .update(
             id,
             UpdateProviderRequest {
                 name: request.name,
-                credentials: request.credentials.map(|c| c.into()),
+                credentials,
                 description: request.description,
                 is_active: request.is_active,
             },

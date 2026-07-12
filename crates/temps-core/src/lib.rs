@@ -15,7 +15,10 @@ pub mod on_demand;
 pub mod openapi;
 pub mod plugin;
 pub mod problemdetails;
+pub mod project_access;
+pub mod retention;
 pub mod retry;
+pub mod secrets_manager;
 pub mod telemetry;
 pub mod tls;
 pub mod traces;
@@ -50,6 +53,11 @@ pub use error::*;
 pub use error_builder::*;
 pub use jobs::*;
 pub use on_demand::*;
+pub use project_access::ProjectAccessChecker;
+pub use retention::{
+    FixedRetentionResolver, RetentionResolver, RetentionResolverSlot, RetentionTable,
+};
+pub use secrets_manager::SecretsManagerResolver;
 pub use telemetry::{NoopTelemetryReporter, TelemetryEvent, TelemetryEventKind, TelemetryReporter};
 pub use traces::{
     TraceQueryFilter, TraceReader, TraceReaderError, TraceSpanDto, TraceSpanEventDto,

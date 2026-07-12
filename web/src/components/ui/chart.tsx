@@ -1,5 +1,6 @@
 import * as React from 'react'
 import * as RechartsPrimitive from 'recharts'
+import type { LegendPayload, TooltipContentProps } from 'recharts'
 
 import { cn } from '@/lib/utils'
 
@@ -107,8 +108,18 @@ const ChartTooltip = RechartsPrimitive.Tooltip
 
 const ChartTooltipContent = React.forwardRef<
   HTMLDivElement,
-  React.ComponentProps<typeof RechartsPrimitive.Tooltip> &
+  // recharts v3 injects the tooltip state (active, payload, label, ...) into the
+  // `content` element; they are optional here because the element is created
+  // without them (e.g. `content={<ChartTooltipContent />}`).
+  Partial<
+    Pick<
+      TooltipContentProps,
+      'active' | 'payload' | 'label' | 'labelFormatter' | 'formatter'
+    >
+  > &
     React.ComponentProps<'div'> & {
+      labelClassName?: string
+      color?: string
       hideLabel?: boolean
       hideIndicator?: boolean
       indicator?: 'line' | 'dot' | 'dashed'
@@ -195,7 +206,7 @@ const ChartTooltipContent = React.forwardRef<
 
             return (
               <div
-                key={item.dataKey}
+                key={`${key}-${index}`}
                 className={cn(
                   'flex w-full flex-wrap items-stretch gap-2 [&>svg]:h-2.5 [&>svg]:w-2.5 [&>svg]:text-muted-foreground',
                   indicator === 'dot' && 'items-center'
@@ -263,11 +274,14 @@ const ChartLegend = RechartsPrimitive.Legend
 
 const ChartLegendContent = React.forwardRef<
   HTMLDivElement,
-  React.ComponentProps<'div'> &
-    Pick<RechartsPrimitive.LegendProps, 'payload' | 'verticalAlign'> & {
-      hideIcon?: boolean
-      nameKey?: string
-    }
+  // recharts v3 injects `payload` into the legend `content` element; optional
+  // for the same reason as ChartTooltipContent above.
+  React.ComponentProps<'div'> & {
+    payload?: LegendPayload[]
+    verticalAlign?: 'top' | 'middle' | 'bottom'
+    hideIcon?: boolean
+    nameKey?: string
+  }
 >(
   (
     { className, hideIcon = false, payload, verticalAlign = 'bottom', nameKey },

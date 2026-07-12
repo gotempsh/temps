@@ -550,6 +550,7 @@ mod proxy_logs {
             error_group_id: r.error_group_id,
             // Source timestamp ms as the dedup version — stable across re-runs.
             _version: ms as u64,
+            retention_days: temps_core::RetentionTable::ProxyLogs.default_days(),
         }
     }
 
@@ -671,6 +672,7 @@ mod traces {
             events: r.events.clone().unwrap_or_else(|| "[]".into()),
             // Source start_time ms as the dedup version — stable across re-runs.
             _version: r.start_time.timestamp_millis() as u64,
+            retention_days: temps_core::RetentionTable::Spans.default_days(),
         }
     }
 

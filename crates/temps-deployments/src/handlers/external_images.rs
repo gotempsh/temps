@@ -12,7 +12,7 @@ use axum::{
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
 use temps_core::{AuditContext, RequestMetadata, UtcDateTime};
 use tracing::{debug, error, info};
@@ -108,6 +108,8 @@ pub async fn push_external_image(
     Json(req): Json<PushImageRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsCreate);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     debug!(
         "Pushing external image for project {}: {}",
@@ -185,6 +187,8 @@ pub async fn list_external_images(
     Path(project_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     debug!("Listing external images for project {}", project_id);
 
@@ -217,6 +221,8 @@ pub async fn get_external_image(
     Path((project_id, image_id)): Path<(i32, String)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     debug!(
         "Getting external image {} for project {}",
@@ -255,6 +261,8 @@ pub async fn execute_deployment_operation(
     Json(req): Json<ExecuteOperationRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsWrite);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     debug!(
         "Executing operation {} for deployment {} in project {}",
@@ -342,6 +350,8 @@ pub async fn get_deployment_operations(
     Path((project_id, deployment_id)): Path<(i32, String)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     debug!(
         "Getting operations for deployment {} in project {}",
@@ -383,6 +393,8 @@ pub async fn get_deployment_operation_status(
     Path((project_id, deployment_id, operation_type)): Path<(i32, String, String)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     debug!(
         "Getting {} operation status for deployment {} in project {}",

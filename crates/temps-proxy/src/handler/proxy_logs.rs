@@ -170,12 +170,24 @@ pub async fn get_proxy_logs(
     Ok(Json(response))
 }
 
+/// Query parameters for the single proxy-log lookup
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct ProxyLogByIdQuery {
+    /// Event time of the log row (ISO 8601). When provided, the lookup is
+    /// bounded to the hypertable chunks around this instant instead of
+    /// scanning (and decompressing) the whole retention window. The list
+    /// endpoint already returns this value per row — always pass it when
+    /// navigating from a list.
+    pub timestamp: Option<DateTime>,
+}
+
 /// Get a single proxy log by ID
 #[utoipa::path(
     get,
     path = "/proxy-logs/{id}",
     params(
-        ("id" = i32, Path, description = "Proxy log ID")
+        ("id" = i32, Path, description = "Proxy log ID"),
+        ProxyLogByIdQuery
     ),
     responses(
         (status = 200, description = "Proxy log found", body = ProxyLogResponse),
@@ -187,9 +199,10 @@ pub async fn get_proxy_logs(
 pub async fn get_proxy_log_by_id(
     State(service): State<Arc<ProxyLogService>>,
     Path(id): Path<i32>,
+    Query(query): Query<ProxyLogByIdQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let log = service
-        .get_by_id(id)
+        .get_by_id(id, query.timestamp.map(|t| t.into()))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 

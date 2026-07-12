@@ -42,14 +42,14 @@ const CHANNEL_ICONS: Record<string, LucideIcon> = {
 }
 
 const CHANNEL_COLORS: Record<string, string> = {
-  Direct: 'hsl(var(--chart-1))',
-  Organic: 'hsl(var(--chart-2))',
-  'Organic Search': 'hsl(var(--chart-2))',
-  Paid: 'hsl(var(--chart-3))',
-  'Paid Search': 'hsl(var(--chart-3))',
-  Social: 'hsl(var(--chart-4))',
-  Referral: 'hsl(var(--chart-5))',
-  Email: 'hsl(var(--chart-1))',
+  Direct: 'var(--chart-1)',
+  Organic: 'var(--chart-2)',
+  'Organic Search': 'var(--chart-2)',
+  Paid: 'var(--chart-3)',
+  'Paid Search': 'var(--chart-3)',
+  Social: 'var(--chart-4)',
+  Referral: 'var(--chart-5)',
+  Email: 'var(--chart-1)',
 }
 
 function ReferrerIcon({

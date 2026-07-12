@@ -85,7 +85,16 @@ pub trait ProxyLogStorage: Send + Sync {
     ) -> Result<(Vec<proxy_logs::Model>, u64), ProxyLogServiceError>;
 
     /// Fetch a single proxy log by its serial id.
-    async fn get_by_id(&self, id: i32) -> Result<Option<proxy_logs::Model>, ProxyLogServiceError>;
+    ///
+    /// `timestamp` is the row's known event time (the list endpoint returns it
+    /// per row). On the TimescaleDB hypertable it bounds the lookup to the
+    /// chunks around that instant instead of scanning — and decompressing —
+    /// the entire retention window.
+    async fn get_by_id(
+        &self,
+        id: i32,
+        timestamp: Option<UtcDateTime>,
+    ) -> Result<Option<proxy_logs::Model>, ProxyLogServiceError>;
 
     /// Fetch a single proxy log by its (unique) request id, for tracing joins.
     async fn get_by_request_id(
@@ -184,6 +193,7 @@ pub fn build_proxy_log_storage(
     config: &ServerConfig,
     db: Arc<DatabaseConnection>,
     ip_service: Arc<temps_geo::IpAddressService>,
+    resolver: Arc<dyn temps_core::RetentionResolver>,
 ) -> Arc<dyn ProxyLogStorage> {
     if config.is_clickhouse_enabled() {
         // is_clickhouse_enabled() guarantees all four fields are Some.
@@ -193,7 +203,7 @@ pub fn build_proxy_log_storage(
             config.clickhouse_user.clone().unwrap_or_default(),
             config.clickhouse_password.clone().unwrap_or_default(),
         );
-        let store = ClickHouseProxyLogStore::new(cfg);
+        let store = ClickHouseProxyLogStore::new(cfg, resolver);
 
         // Apply migrations off the startup path. Cloning the client is cheap
         // (Arc-backed internally).

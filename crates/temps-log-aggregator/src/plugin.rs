@@ -548,7 +548,16 @@ impl TempsPlugin for LogAggregatorPlugin {
     }
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
-        let app_state = context.require_service::<LogAggregatorAppState>();
+        let old = context.require_service::<LogAggregatorAppState>();
+        let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
+        let app_state = Arc::new(LogAggregatorAppState {
+            search_service: old.search_service.clone(),
+            metadata_service: old.metadata_service.clone(),
+            tail_service: old.tail_service.clone(),
+            retention_service: old.retention_service.clone(),
+            audit_service: old.audit_service.clone(),
+            project_access_checker,
+        });
         let routes = handlers::configure_routes().with_state(app_state);
 
         Some(PluginRoutes::new(routes))

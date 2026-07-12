@@ -117,6 +117,7 @@ impl TempsPlugin for AiChatPlugin {
                 db,
                 audit_service,
                 pending_actions,
+                project_access_checker: None,
             });
             context.register_plugin_state("ai_chat", app_state);
 
@@ -126,7 +127,15 @@ impl TempsPlugin for AiChatPlugin {
     }
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
-        let app_state = context.get_plugin_state::<AppState>("ai_chat")?;
+        let old = context.get_plugin_state::<AppState>("ai_chat")?;
+        let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
+        let app_state = Arc::new(AppState {
+            service: old.service.clone(),
+            db: old.db.clone(),
+            audit_service: old.audit_service.clone(),
+            pending_actions: old.pending_actions.clone(),
+            project_access_checker,
+        });
         let router = handlers::configure_routes().with_state(app_state);
         Some(PluginRoutes::new(router))
     }

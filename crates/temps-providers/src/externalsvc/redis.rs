@@ -271,10 +271,15 @@ impl RedisService {
     /// it). The container name is deterministic, so a failed attempt must be
     /// removed before retrying or the next attempt's "already exists" check
     /// short-circuits without picking a new port.
+    ///
+    /// `config` is taken by mutable reference so a retry's port change is
+    /// written back to the caller — otherwise the caller (and anything it
+    /// persists to the database) keeps referencing the original port even
+    /// though the container actually ended up bound to a different one.
     async fn create_container(
         &self,
         docker: &Docker,
-        config: &RedisConfig,
+        config: &mut RedisConfig,
         password: &str,
         resource_limits: &ServiceResourceLimits,
     ) -> Result<()> {
@@ -285,7 +290,10 @@ impl RedisService {
                 .create_container_once(docker, &attempt_config, password, resource_limits)
                 .await
             {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    *config = attempt_config;
+                    return Ok(());
+                }
                 Err(e) if attempt < MAX_ATTEMPTS && is_port_conflict_error(&e.to_string()) => {
                     warn!(
                         "Port {} for Redis container was already allocated (attempt {}/{}), retrying with a fresh port: {}",
@@ -1352,7 +1360,7 @@ impl ExternalService for RedisService {
         }
 
         // Parse input config and transform to runtime config
-        let redis_config = self.get_redis_config(config)?;
+        let mut redis_config = self.get_redis_config(config)?;
 
         info!(
             "Redis init - storing config: port={}, password_len={}",
@@ -1361,6 +1369,7 @@ impl ExternalService for RedisService {
         );
 
         // Store runtime config and limits so `start()` recreates correctly.
+        // Gets overwritten below once the real container port is known.
         *self.config.write().await = Some(redis_config.clone());
         *self.resource_limits.write().await = resource_limits.clone();
 
@@ -1368,14 +1377,15 @@ impl ExternalService for RedisService {
 
         if redis_config.container_name.is_none() {
             // Create Docker container (but don't start it yet)
-            // Note: Connection will be established in start() method
-            self.create_container(
-                &self.docker,
-                &redis_config,
-                &redis_config.password,
-                &resource_limits,
-            )
-            .await?;
+            // Note: Connection will be established in start() method.
+            // `create_container` may retry on a different host port than
+            // requested (see its docs); it writes that back into
+            // `redis_config`, so everything below reflects the port the
+            // container is actually bound to.
+            let password = redis_config.password.clone();
+            self.create_container(&self.docker, &mut redis_config, &password, &resource_limits)
+                .await?;
+            *self.config.write().await = Some(redis_config.clone());
             info!("Redis container created, connection will be established on start");
         } else {
             info!(
@@ -1701,7 +1711,7 @@ impl ExternalService for RedisService {
             .await?;
 
         if containers.is_empty() {
-            let config =
+            let mut config =
                 existing_config.ok_or_else(|| anyhow::anyhow!("Redis configuration not found"))?;
             if config.container_name.is_some() {
                 return Err(anyhow::anyhow!(
@@ -1710,8 +1720,10 @@ impl ExternalService for RedisService {
                 ));
             }
             let limits = self.resource_limits.read().await.clone();
-            self.create_container(&self.docker, &config, &config.password, &limits)
+            let password = config.password.clone();
+            self.create_container(&self.docker, &mut config, &password, &limits)
                 .await?;
+            *self.config.write().await = Some(config);
         } else {
             self.docker
                 .start_container(
@@ -2082,7 +2094,7 @@ impl ExternalService for RedisService {
         info!("Starting Redis upgrade");
 
         let _old_redis_config = self.get_redis_config(old_config)?;
-        let new_redis_config = self.get_redis_config(new_config)?;
+        let mut new_redis_config = self.get_redis_config(new_config)?;
 
         // Verify the new image can be pulled BEFORE stopping the old container
         info!(
@@ -2100,13 +2112,10 @@ impl ExternalService for RedisService {
         // Create container with new image (keeping the same volume for data persistence)
         info!("Starting Redis container with new image");
         let limits = self.resource_limits.read().await.clone();
-        self.create_container(
-            &self.docker,
-            &new_redis_config,
-            &new_redis_config.password,
-            &limits,
-        )
-        .await?;
+        let password = new_redis_config.password.clone();
+        self.create_container(&self.docker, &mut new_redis_config, &password, &limits)
+            .await?;
+        *self.config.write().await = Some(new_redis_config);
 
         info!("Redis upgrade completed successfully");
         Ok(())

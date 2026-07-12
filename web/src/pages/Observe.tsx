@@ -181,7 +181,7 @@ export default function Observe({ project }: ObserveProps) {
         {query.isPending ? (
           <ListSkeleton />
         ) : query.isError ? (
-          <ErrorState message={query.error.message} />
+          <ErrorState message={query.error} />
         ) : events.length === 0 ? (
           <EmptyState />
         ) : (

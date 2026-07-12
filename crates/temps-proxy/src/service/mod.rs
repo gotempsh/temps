@@ -4,6 +4,7 @@ pub mod connection_filter_service;
 pub mod cookie_codec;
 pub mod ip_access_control_service;
 pub mod lb_service;
+pub mod metrics_sampler;
 pub mod proxy_log_batch_writer;
 pub mod proxy_log_service;
 pub mod static_asset_lookup;

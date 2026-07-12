@@ -8,6 +8,7 @@ import {
 import type {
   CrossProjectSiblingRef,
   LogRecord,
+  ProblemDetails,
   ProjectRef,
   SpanRecord,
 } from '@/api/client/types.gen'
@@ -677,7 +678,12 @@ export default function TraceDetail({ project }: TraceDetailProps) {
         <Card>
           <CardContent className="flex items-center gap-3 p-6 text-destructive">
             <AlertCircle className="h-5 w-5" />
-            <span>Failed to load trace: {(error as Error).message}</span>
+            <span>
+              Failed to load trace:{' '}
+              {(error as ProblemDetails)?.detail ??
+                (error as ProblemDetails)?.title ??
+                'Unknown error'}
+            </span>
           </CardContent>
         </Card>
       </div>

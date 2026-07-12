@@ -8,7 +8,7 @@ use std::time::Duration;
 use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
 };
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
@@ -51,8 +51,10 @@ pub struct OtelConfig {
     pub rate_limit_requests: u32,
     pub rate_limit_window_secs: u64,
 
-    // Quota
-    pub quota_bytes_per_project: u64,
+    // Quota. `None` (the default) disables per-project storage quotas
+    // entirely — ingest skips the quota check and its expensive per-project
+    // usage estimate. Set `TEMPS_OTEL_QUOTA_GB` to opt in.
+    pub quota_bytes_per_project: Option<u64>,
 
     // Background tasks
     pub enable_health_compute: bool,
@@ -72,7 +74,7 @@ impl Default for OtelConfig {
             retention_check_interval_secs: 3600, // 1 hour
             rate_limit_requests: 1000,
             rate_limit_window_secs: 60,
-            quota_bytes_per_project: 10 * 1024 * 1024 * 1024, // 10 GB
+            quota_bytes_per_project: None, // quota disabled unless configured
             enable_health_compute: true,
             enable_anomaly_detection: true,
         }
@@ -118,8 +120,16 @@ impl OtelConfig {
             }
         }
         if let Ok(v) = std::env::var("TEMPS_OTEL_QUOTA_GB") {
-            if let Ok(gb) = v.parse::<u64>() {
-                config.quota_bytes_per_project = gb * 1024 * 1024 * 1024;
+            match v.parse::<u64>() {
+                // 0 keeps quotas disabled, same as leaving the var unset.
+                Ok(gb) => {
+                    config.quota_bytes_per_project = (gb > 0).then(|| gb * 1024 * 1024 * 1024)
+                }
+                Err(_) => warn!(
+                    value = %v,
+                    "TEMPS_OTEL_QUOTA_GB is set but is not a non-negative integer; \
+                     storage quota stays disabled"
+                ),
             }
         }
         if let Ok(v) = std::env::var("TEMPS_OTEL_ENABLE_HEALTH_COMPUTE") {
@@ -270,11 +280,23 @@ pub struct OtelApiDoc;
 // ── Plugin ──────────────────────────────────────────────────────────
 
 /// OTel Plugin for Temps.
-pub struct OtelPlugin;
+pub struct OtelPlugin {
+    /// Handle to the ClickHouse storage's `RetentionResolver` slot, captured
+    /// in `register_services` (before the storage is moved into `Arc<dyn
+    /// OtelStorage>`) and written into from `initialize_plugin_services`,
+    /// which runs only after every plugin has registered its services.
+    /// `register_services` runs in plugin-registration order and this plugin
+    /// registers before any later-registered plugin (e.g. one implementing
+    /// per-project retention) gets a chance to provide a resolver — same
+    /// two-phase handoff `DeploymentsPlugin` uses for `DeploymentGate`.
+    retention_resolver_slot: tokio::sync::OnceCell<Arc<temps_core::RetentionResolverSlot>>,
+}
 
 impl OtelPlugin {
     pub fn new() -> Self {
-        Self
+        Self {
+            retention_resolver_slot: tokio::sync::OnceCell::new(),
+        }
     }
 }
 
@@ -357,9 +379,17 @@ impl TempsPlugin for OtelPlugin {
                     database = %ch_cfg.database,
                     "ClickHouse OTel backend enabled (ADR-016) — applying migrations"
                 );
+                // Slot defaults to FixedRetentionResolver; a plugin (e.g. one
+                // implementing per-project data retention policies) is wired
+                // in later from `initialize_plugin_services` — see the
+                // `retention_resolver_slot` field doc for why a direct
+                // `get_service` call here would never find it.
+                let retention_slot = Arc::new(temps_core::RetentionResolverSlot::new_default());
+                let _ = self.retention_resolver_slot.set(retention_slot.clone());
                 let ch_storage = Arc::new(ClickHouseOtelStorage::new(
                     ch_cfg.clone(),
                     timescale_storage,
+                    retention_slot as Arc<dyn temps_core::RetentionResolver>,
                 ));
                 // Run migrations in a background task so plugin init
                 // returns promptly. If migrations fail, the first
@@ -507,7 +537,8 @@ impl TempsPlugin for OtelPlugin {
                 ))
             };
 
-            // Create app state for handlers
+            // Create app state for handlers. The `project_access_checker` is
+            // injected in `configure_routes` (after all services register).
             let app_state = OtelAppState {
                 otel_service: otel_service.clone(),
                 metrics_store: Some(metrics_store.clone()),
@@ -518,6 +549,7 @@ impl TempsPlugin for OtelPlugin {
                 audit_service: audit_service.clone(),
                 trace_hint_tx: Some(trace_hint_tx),
                 cross_project_service: cross_project_service.clone(),
+                project_access_checker: None,
             };
             context.register_service(Arc::new(app_state.clone()));
 
@@ -662,9 +694,37 @@ impl TempsPlugin for OtelPlugin {
         })
     }
 
+    fn initialize_plugin_services<'a>(
+        &'a self,
+        context: &'a PluginContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
+        Box::pin(async move {
+            // Runs after every plugin has registered its services, so this is
+            // the first point at which an optional plugin-provided
+            // RetentionResolver (e.g. from a plugin implementing per-project
+            // retention) can actually be found.
+            if let Some(slot) = self.retention_resolver_slot.get() {
+                if let Some(resolver) = context.get_service::<dyn temps_core::RetentionResolver>() {
+                    if slot.set(resolver) {
+                        debug!("otel: RetentionResolver wired in from a registered plugin");
+                    } else {
+                        tracing::warn!(
+                            "otel: RetentionResolver slot was already claimed; \
+                             this plugin's resolver was NOT installed. \
+                             Check plugin registration order."
+                        );
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         let app_state_arc = context.require_service::<OtelAppState>();
-        let app_state: OtelAppState = app_state_arc.as_ref().clone();
+        let mut app_state: OtelAppState = app_state_arc.as_ref().clone();
+        app_state.project_access_checker =
+            context.get_service::<dyn temps_core::ProjectAccessChecker>();
 
         let router = handlers::configure_routes().with_state(app_state);
 
@@ -730,7 +790,7 @@ mod tests {
 
     #[test]
     fn test_otel_plugin_default() {
-        let plugin = OtelPlugin;
+        let plugin = OtelPlugin::default();
         assert_eq!(plugin.name(), "otel");
     }
 
@@ -740,7 +800,7 @@ mod tests {
         assert_eq!(config.retention_days, 7);
         assert_eq!(config.rate_limit_requests, 1000);
         assert_eq!(config.rate_limit_window_secs, 60);
-        assert_eq!(config.quota_bytes_per_project, 10 * 1024 * 1024 * 1024);
+        assert_eq!(config.quota_bytes_per_project, None);
         assert!(!config.has_s3_config());
         assert!(config.enable_health_compute);
         assert!(config.enable_anomaly_detection);

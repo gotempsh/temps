@@ -239,10 +239,15 @@ impl S3Service {
     /// it). The container name is deterministic, so a failed attempt must be
     /// removed before retrying or the next attempt's "already exists" check
     /// short-circuits without picking a new port.
+    ///
+    /// `config` is taken by mutable reference so a retry's port change is
+    /// written back to the caller — otherwise the caller (and anything it
+    /// persists to the database) keeps referencing the original port even
+    /// though the container actually ended up bound to a different one.
     async fn create_container(
         &self,
         docker: &Docker,
-        config: &S3Config,
+        config: &mut S3Config,
         resource_limits: &ServiceResourceLimits,
     ) -> Result<()> {
         const MAX_ATTEMPTS: u32 = 3;
@@ -252,7 +257,10 @@ impl S3Service {
                 .create_container_once(docker, &attempt_config, resource_limits)
                 .await
             {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    *config = attempt_config;
+                    return Ok(());
+                }
                 Err(e) if attempt < MAX_ATTEMPTS && is_port_conflict_error(&e.to_string()) => {
                     warn!(
                         "Port {} for MinIO container was already allocated (attempt {}/{}), retrying with a fresh port: {}",
@@ -774,19 +782,24 @@ impl ExternalService for S3Service {
         *self.resource_limits.write().await = resource_limits.clone();
 
         // Parse input config and transform to runtime config
-        let s3_config = self.get_s3_config(config)?;
+        let mut s3_config = self.get_s3_config(config)?;
         info!(
             "S3 runtime config (host={}, port={}, region={}, image={})",
             s3_config.host, s3_config.port, s3_config.region, s3_config.docker_image
         );
 
-        // Store runtime config
+        // Store runtime config. Gets overwritten below once the real
+        // container port is known.
         *self.config.write().await = Some(s3_config.clone());
 
         if s3_config.container_name.is_none() {
-            // Create Docker container
-            self.create_container(&self.docker, &s3_config, &resource_limits)
+            // Create Docker container. `create_container` may retry on a
+            // different host port than requested (see its docs); it writes
+            // that back into `s3_config`, so everything below reflects the
+            // port the container is actually bound to.
+            self.create_container(&self.docker, &mut s3_config, &resource_limits)
                 .await?;
+            *self.config.write().await = Some(s3_config.clone());
         } else {
             info!(
                 "S3/MinIO service '{}' is imported from container '{}'; skipping container creation",
@@ -1006,10 +1019,11 @@ impl ExternalService for S3Service {
         }
 
         if containers.is_empty() {
-            let config =
+            let mut config =
                 existing_config.ok_or_else(|| anyhow::anyhow!("S3 configuration not found"))?;
             let limits = self.resource_limits.read().await.clone();
-            self.create_container(docker, &config, &limits).await?;
+            self.create_container(docker, &mut config, &limits).await?;
+            *self.config.write().await = Some(config);
         } else {
             docker
                 .start_container(
@@ -1875,10 +1889,15 @@ impl ExternalService for S3Service {
         *new_service.resource_limits.write().await = cloned_limits.clone();
 
         // Provision the new container (image pull, volume, port binding, health check).
+        // `create_container` writes any port-conflict retry back into
+        // `new_config`, so the `mc mirror` connection below (and the final
+        // parameters returned to the orchestrator) target the port the
+        // container actually bound to.
         new_service
-            .create_container(&self.docker, &new_config, &cloned_limits)
+            .create_container(&self.docker, &mut new_config, &cloned_limits)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to create new S3/MinIO container: {}", e))?;
+        *new_service.config.write().await = Some(new_config.clone());
 
         // The orchestrator already decrypted these into the plaintext copy
         // of s3_source it hands us via RestoreContext. Passing them straight
@@ -2244,7 +2263,7 @@ impl ExternalService for S3Service {
         info!("Starting S3/MinIO upgrade");
 
         let _old_s3_config = self.get_s3_config(old_config)?;
-        let new_s3_config = self.get_s3_config(new_config)?;
+        let mut new_s3_config = self.get_s3_config(new_config)?;
 
         // Verify the new image can be pulled BEFORE stopping the old container
         info!(
@@ -2262,8 +2281,9 @@ impl ExternalService for S3Service {
         // Create container with new image (keeping the same volume for data persistence)
         info!("Starting S3/MinIO container with new image");
         let limits = self.resource_limits.read().await.clone();
-        self.create_container(&self.docker, &new_s3_config, &limits)
+        self.create_container(&self.docker, &mut new_s3_config, &limits)
             .await?;
+        *self.config.write().await = Some(new_s3_config);
 
         info!("S3/MinIO upgrade completed successfully");
         Ok(())

@@ -10,7 +10,9 @@ use axum::{
     Json, Router,
 };
 use temps_auth::RequireAuth;
-use temps_auth::{deny_deployment_token, permission_guard, project_scope_guard};
+use temps_auth::{
+    deny_deployment_token, permission_guard, project_access_guard, project_scope_guard,
+};
 use temps_core::{
     error_builder::{
         bad_request, conflict, forbidden, internal_server_error, not_found, ErrorBuilder,
@@ -1846,6 +1848,7 @@ async fn list_project_services(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     let (page, page_size) = pagination.normalize();
 
@@ -1888,6 +1891,7 @@ async fn get_service_environment_variable(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
     super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
 
     match app_state
@@ -1932,6 +1936,7 @@ async fn get_service_environment_variables(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
     super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
 
     let options = EnvironmentVariableOptions {
@@ -1981,6 +1986,7 @@ async fn get_project_service_environment_variables(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     match app_state
         .external_service_manager

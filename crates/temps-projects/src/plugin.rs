@@ -77,12 +77,19 @@ impl TempsPlugin for ProjectsPlugin {
         let telemetry = context
             .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
             .unwrap_or_else(|| Arc::new(temps_core::telemetry::NoopTelemetryReporter));
+        // Optional: team-based project access checker registered by a plugin.
+        // `configure_routes` runs after all plugins have completed
+        // `initialize_plugin_services`, so a checker registered by another
+        // plugin is guaranteed to be present in the registry by this point.
+        // When absent (plain OSS binary), project_access_guard! is a no-op.
+        let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
         let app_state = Arc::new(crate::handlers::AppState {
             project_service,
             custom_domain_service,
             audit_service,
             template_service,
             telemetry,
+            project_access_checker,
         });
         let routes = crate::handlers::configure_routes().with_state(app_state);
         Some(PluginRoutes::new(routes))

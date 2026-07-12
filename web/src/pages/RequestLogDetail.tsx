@@ -1,4 +1,4 @@
-import { useParams, useNavigate } from 'react-router-dom'
+import { useParams, useNavigate, useSearchParams } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { getProxyLogByIdOptions } from '@/api/client/@tanstack/react-query.gen'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -26,6 +26,10 @@ export default function RequestLogDetail({
 }: RequestLogDetailProps) {
   const { logId } = useParams<{ logId: string }>()
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
+  // Row timestamp forwarded by the list; bounds the backend's hypertable
+  // lookup. Absent on bare deep-links, which fall back to a wider scan.
+  const ts = searchParams.get('ts')
 
   const {
     data: logDetail,
@@ -36,6 +40,7 @@ export default function RequestLogDetail({
       path: {
         id: parseInt(logId || '0'),
       },
+      query: ts ? { timestamp: ts } : undefined,
     }),
     enabled: !!logId,
   })

@@ -1,6 +1,6 @@
 {
 	"name": "@temps-sdk/react-analytics",
-	"version": "0.0.3",
+	"version": "0.0.4",
 	"private": false,
 	"main": "./dist/index.js",
 	"types": "./dist/index.d.ts",

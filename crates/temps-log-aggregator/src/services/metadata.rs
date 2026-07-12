@@ -322,6 +322,28 @@ impl LogMetadataService {
         Ok(events)
     }
 
+    /// Return all project IDs that have linked this external service via `project_services`.
+    ///
+    /// Used by the access guard in log handlers: when `external_service_id` is
+    /// supplied the normal project-based `project_access_guard!` cannot be used,
+    /// so the handler looks up the owning project(s) and checks team membership
+    /// against those instead.
+    ///
+    /// An empty `Vec` means the external service has no project association
+    /// (orphaned). Callers **must** treat that as a denial — there is no
+    /// legitimate use case for reading logs of an unlinked external service, and
+    /// defaulting to fail-open on an anomalous state would be an IDOR.
+    pub async fn find_owning_project_ids(
+        &self,
+        external_service_id: i32,
+    ) -> Result<Vec<i32>, LogAggregatorError> {
+        let rows = temps_entities::project_services::Entity::find()
+            .filter(temps_entities::project_services::Column::ServiceId.eq(external_service_id))
+            .all(self.db.as_ref())
+            .await?;
+        Ok(rows.into_iter().map(|ps| ps.project_id).collect())
+    }
+
     /// Find chunks older than a given timestamp for retention cleanup.
     pub async fn find_expired_chunks(
         &self,
