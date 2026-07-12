@@ -2,7 +2,9 @@ import { useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { ArrowRight, ExternalLink, Github, Gitlab, Loader2 } from 'lucide-react'
+import { ArrowRight, ExternalLink, Loader2 } from 'lucide-react'
+import GithubIcon from '@/icons/Github'
+import GitlabIcon from '@/icons/Gitlab'
 import {
   createGithubPatProviderMutation,
   createGitlabPatProviderMutation,
@@ -129,13 +131,13 @@ export function InlineGitConnect() {
       <Tabs value={kind} onValueChange={(v) => setKind(v as ProviderKind)}>
         <TabsList className="grid w-full grid-cols-2">
           <TabsTrigger value="github" className="gap-1.5">
-            <Github className="h-4 w-4" />
+            <GithubIcon className="h-4 w-4" />
             GitHub
           </TabsTrigger>
           <TabsTrigger value="gitlab" className="gap-1.5">
-            {/* GitLab brand accent (tangerine ~#FC6D26). orange-500/400 reads as
-                the GitLab mark and stays legible in both light and dark mode. */}
-            <Gitlab className="h-4 w-4 text-orange-500 dark:text-orange-400" />
+            {/* GitlabIcon (@/icons/Gitlab) bakes in the GitLab brand accent
+                (tangerine #FC6D26) itself, so no extra color className needed. */}
+            <GitlabIcon className="h-4 w-4" />
             GitLab
           </TabsTrigger>
         </TabsList>
@@ -196,12 +198,9 @@ export function InlineGitConnect() {
         ) : (
           <>
             {kind === 'github' ? (
-              <Github className="h-4 w-4" />
+              <GithubIcon className="h-4 w-4" />
             ) : (
-              // GitLab accent on the primary button. orange-500 keeps enough
-              // contrast on both the light (dark button) and dark (light
-              // button) primary surfaces.
-              <Gitlab className="h-4 w-4 text-orange-500" />
+              <GitlabIcon className="h-4 w-4" />
             )}
             Connect {kind === 'github' ? 'GitHub' : 'GitLab'}
             <ArrowRight className="h-4 w-4" />

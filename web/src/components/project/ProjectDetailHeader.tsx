@@ -7,7 +7,8 @@ import { ReloadableImage } from '@/components/utils/ReloadableImage'
 import { cn } from '@/lib/utils'
 import { useDashboardHealth } from '@/hooks/useDashboardHealth'
 import { useQuery } from '@tanstack/react-query'
-import { Github, ExternalLink, Users } from 'lucide-react'
+import { ExternalLink, Users } from 'lucide-react'
+import GithubIcon from '@/icons/Github'
 import { Link, useNavigate } from 'react-router-dom'
 
 const healthDotColors: Record<string, string> = {
@@ -127,7 +128,7 @@ export function ProjectDetailHeader({
                 className="p-2 hover:bg-accent rounded-md transition-colors"
                 title="View repository"
               >
-                <Github className="h-4 w-4" />
+                <GithubIcon className="h-4 w-4" />
               </Link>
             )}
             {lastDeploymentUrl && !isLoadingLastDeployment && (
