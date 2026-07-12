@@ -825,7 +825,10 @@ async fn add_managed_domain(
         )
         .await?;
 
-    Ok((StatusCode::CREATED, Json(ManagedDomainResponse::from(managed))))
+    Ok((
+        StatusCode::CREATED,
+        Json(ManagedDomainResponse::from(managed)),
+    ))
 }
 
 /// List managed domains for a provider
@@ -850,8 +853,10 @@ async fn list_managed_domains(
 
     let domains = state.provider_service.list_managed_domains(id).await?;
 
-    let responses: Vec<ManagedDomainResponse> =
-        domains.into_iter().map(ManagedDomainResponse::from).collect();
+    let responses: Vec<ManagedDomainResponse> = domains
+        .into_iter()
+        .map(ManagedDomainResponse::from)
+        .collect();
 
     Ok(Json(responses))
 }
@@ -958,7 +963,15 @@ async fn update_managed_domain(
         )
         .await?;
 
-    log_managed_domain_audit(&state, &auth, &metadata, provider_id, &domain, "DNS_MANAGED_DOMAIN_UPDATED").await;
+    log_managed_domain_audit(
+        &state,
+        &auth,
+        &metadata,
+        provider_id,
+        &domain,
+        "DNS_MANAGED_DOMAIN_UPDATED",
+    )
+    .await;
 
     Ok(Json(ManagedDomainResponse::from(updated)))
 }
@@ -1047,10 +1060,21 @@ async fn apply_hostname_mode(
         }))
         .await
     {
-        tracing::error!("Failed to enqueue route reload after hostname mode change: {}", e);
+        tracing::error!(
+            "Failed to enqueue route reload after hostname mode change: {}",
+            e
+        );
     }
 
-    log_managed_domain_audit(&state, &auth, &metadata, provider_id, &domain, "DNS_HOSTNAME_MODE_APPLIED").await;
+    log_managed_domain_audit(
+        &state,
+        &auth,
+        &metadata,
+        provider_id,
+        &domain,
+        "DNS_HOSTNAME_MODE_APPLIED",
+    )
+    .await;
 
     Ok(Json(HostnamePreviewResponse::from(result)))
 }

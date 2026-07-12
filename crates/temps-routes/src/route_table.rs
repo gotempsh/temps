@@ -25,7 +25,6 @@ use sqlx::postgres::{PgListener, PgPool};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use temps_core::DeploymentMode;
 use temps_core::public_hostname_resolver::match_strategy;
 use temps_core::{AppSettings, DeploymentMode, PublicHostnameStrategy};
 use temps_entities::custom_routes::RouteType;
@@ -544,19 +543,10 @@ impl CachedPeerTable {
         // Node cache: maps node_id -> private_address for multi-node routing
         let mut nodes_cache: HashMap<i32, String> = HashMap::new();
 
-        // Fetch preview_domain from settings
-        let preview_domain = settings::Entity::find()
+        // Fetch preview-domain and hostname settings once per rebuild.
+        let app_settings = settings::Entity::find()
             .one(self.db.as_ref())
             .await?
-            .and_then(|s| {
-                s.data
-                    .get("preview_domain")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-            })
-            .unwrap_or_else(|| "localho.st".to_string());
-
-        debug!("Loaded preview_domain from settings: {}", preview_domain);
             .map(|s| AppSettings::from_json(s.data))
             .unwrap_or_default();
         let preview_domain = app_settings.preview_domain.clone();
@@ -1005,9 +995,8 @@ impl CachedPeerTable {
                         deployment_id,
                         wake_timeout_seconds: wake_timeout,
                     });
-                    let full_domain = format!("{}.{}", main_url, preview_domain);
-                    let full_domain =
-                        PublicHostnameStrategy::Standard.environment_hostname(&preview_domain, main_url);
+                    let full_domain = PublicHostnameStrategy::Standard
+                        .environment_hostname(&preview_domain, main_url);
                     sleeping_environments.push(SleepingEnvironmentEntry {
                         domain: full_domain,
                         environment_id: env.id,
@@ -1206,9 +1195,8 @@ impl CachedPeerTable {
                     }
 
                     // Also add route with preview_domain suffix if configured
-                    let full_domain = format!("{}.{}", main_url, preview_domain);
-                    let full_domain =
-                        PublicHostnameStrategy::Standard.environment_hostname(&preview_domain, main_url);
+                    let full_domain = PublicHostnameStrategy::Standard
+                        .environment_hostname(&preview_domain, main_url);
                     if !routes.contains_key(&full_domain) {
                         routes.insert(
                             full_domain.clone(),
@@ -1361,15 +1349,6 @@ impl CachedPeerTable {
                                     cert_eligible: true,
                                 };
 
-                                // Route: {service}-{env_subdomain}.{preview_domain}
-                                // DNS labels must be ≤63 chars, truncate if needed
-                                let svc_label = format!("{}-{}", pub_service, main_url);
-                                let svc_label = if svc_label.len() > 63 {
-                                    svc_label[..63].trim_end_matches('-').to_string()
-                                } else {
-                                    svc_label
-                                };
-                                let svc_domain = format!("{}.{}", svc_label, preview_domain);
                                 let svc_strategy =
                                     match_strategy(&hostname_strategies, &preview_domain);
                                 let svc_domain = svc_strategy.service_hostname(
@@ -1489,9 +1468,8 @@ impl CachedPeerTable {
 
                     // Generate a fallback route using deployment slug if no other routes exist
                     // This ensures every active deployment is accessible
-                    let fallback_domain = format!("{}.{}", deployment.slug, preview_domain);
-                    let fallback_domain =
-                        PublicHostnameStrategy::Standard.deployment_hostname(&preview_domain, &deployment.slug);
+                    let fallback_domain = PublicHostnameStrategy::Standard
+                        .deployment_hostname(&preview_domain, &deployment.slug);
 
                     if !routes.contains_key(&fallback_domain) {
                         routes.insert(

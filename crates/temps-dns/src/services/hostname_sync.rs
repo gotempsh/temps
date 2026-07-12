@@ -518,7 +518,10 @@ mod tests {
 
     #[test]
     fn desired_content_picks_record_type() {
-        assert!(matches!(desired_content("35.163.83.53").0, DnsRecordType::A));
+        assert!(matches!(
+            desired_content("35.163.83.53").0,
+            DnsRecordType::A
+        ));
         assert!(matches!(
             desired_content("2001:db8::1").0,
             DnsRecordType::AAAA
@@ -544,17 +547,16 @@ mod tests {
     async fn reconcile_never_deletes_untagged_records() {
         let base = "careowner.com";
         let provider = MockProvider::new(vec![
-            record("app", base, "10.0.0.1", false),           // prod, other VM
-            record("www", base, "10.0.0.2", false),           // user record
-            record("sentry", base, "10.0.0.3", false),        // user record
+            record("app", base, "10.0.0.1", false),    // prod, other VM
+            record("www", base, "10.0.0.2", false),    // user record
+            record("sentry", base, "10.0.0.3", false), // user record
             record("careowner-staging.cp", base, "9.9.9.9", false), // stale generated, untagged
         ]);
         let desired = vec![host("careowner-staging.cp.careowner.com")];
 
-        let changes =
-            reconcile_zone_records(&provider, base, &desired, "35.163.83.53", false)
-                .await
-                .unwrap();
+        let changes = reconcile_zone_records(&provider, base, &desired, "35.163.83.53", false)
+            .await
+            .unwrap();
 
         // Only the staging record is updated; nothing is deleted.
         assert!(changes.iter().all(|c| c.action != "delete"), "{changes:?}");
@@ -564,7 +566,11 @@ mod tests {
 
         // app / www / sentry survive untouched.
         let fqdns = provider.fqdns();
-        for keep in ["app.careowner.com", "www.careowner.com", "sentry.careowner.com"] {
+        for keep in [
+            "app.careowner.com",
+            "www.careowner.com",
+            "sentry.careowner.com",
+        ] {
             assert!(fqdns.contains(&keep.to_string()), "{keep} was removed!");
         }
         assert_eq!(
@@ -573,7 +579,9 @@ mod tests {
         );
         // staging now points at the edge.
         assert_eq!(
-            provider.value_of("careowner-staging.cp.careowner.com").as_deref(),
+            provider
+                .value_of("careowner-staging.cp.careowner.com")
+                .as_deref(),
             Some("35.163.83.53")
         );
     }
@@ -591,10 +599,9 @@ mod tests {
             host("careowner-preview.cp.careowner.com"), // new → create
         ];
 
-        let changes =
-            reconcile_zone_records(&provider, base, &desired, "35.163.83.53", false)
-                .await
-                .unwrap();
+        let changes = reconcile_zone_records(&provider, base, &desired, "35.163.83.53", false)
+            .await
+            .unwrap();
 
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].action, "create");
@@ -611,10 +618,9 @@ mod tests {
         let before = provider.fqdns();
         let desired = vec![host("careowner-staging.cp.careowner.com")];
 
-        let changes =
-            reconcile_zone_records(&provider, base, &desired, "35.163.83.53", true)
-                .await
-                .unwrap();
+        let changes = reconcile_zone_records(&provider, base, &desired, "35.163.83.53", true)
+            .await
+            .unwrap();
 
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].action, "create");
@@ -626,15 +632,14 @@ mod tests {
     async fn reconcile_deletes_only_tagged_stale_records() {
         let base = "careowner.com";
         let provider = MockProvider::new(vec![
-            record("app", base, "10.0.0.1", false),       // untagged → keep
+            record("app", base, "10.0.0.1", false), // untagged → keep
             record("old-preview.cp", base, "9.9.9.9", true), // tagged + not desired → delete
         ]);
         let desired = vec![host("careowner-staging.cp.careowner.com")];
 
-        let changes =
-            reconcile_zone_records(&provider, base, &desired, "35.163.83.53", false)
-                .await
-                .unwrap();
+        let changes = reconcile_zone_records(&provider, base, &desired, "35.163.83.53", false)
+            .await
+            .unwrap();
 
         assert!(changes
             .iter()

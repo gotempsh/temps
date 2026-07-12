@@ -21,9 +21,7 @@ use crate::providers::{
     GcpProvider, ManualDnsProvider, NamecheapProvider, PebbleDnsProvider, ProviderCredentials,
     Route53Provider,
 };
-use crate::services::hostname_sync::{
-    self, HostnameModeResult,
-};
+use crate::services::hostname_sync::{self, HostnameModeResult};
 use temps_core::{AppSettings, PublicHostnameStrategy};
 
 /// Service for managing DNS providers
@@ -544,7 +542,10 @@ impl DnsProviderService {
 
         // Normalize the requested mode; unknown values fall back to standard.
         let mode = temps_core::PublicHostnameStrategy::from_db_str(
-            request.generated_hostname_mode.as_deref().unwrap_or("standard"),
+            request
+                .generated_hostname_mode
+                .as_deref()
+                .unwrap_or("standard"),
         )
         .as_db_str()
         .to_string();
@@ -681,8 +682,9 @@ impl DnsProviderService {
 
         let mut active: dns_managed_domains::ActiveModel = managed.into();
         if let Some(mode) = request.generated_hostname_mode {
-            active.generated_hostname_mode =
-                Set(PublicHostnameStrategy::from_db_str(&mode).as_db_str().to_string());
+            active.generated_hostname_mode = Set(PublicHostnameStrategy::from_db_str(&mode)
+                .as_db_str()
+                .to_string());
         }
         if let Some(sync) = request.sync_generated_records {
             active.sync_generated_records = Set(sync);
