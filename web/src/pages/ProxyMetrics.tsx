@@ -16,6 +16,7 @@
 
 import {
   getEnvironmentsOptions,
+  getProjectOptions,
   getProjectsHealthOptions,
   getProjectsOptions,
   getTimeBucketStatsOptions,
@@ -50,7 +51,7 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { TOOLTIP_CONTENT_STYLE, TOOLTIP_LABEL_STYLE } from '@/lib/chart-tooltip'
 import { useQueries, useQuery } from '@tanstack/react-query'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   CartesianGrid,
   Line,
@@ -939,6 +940,8 @@ function StatusBadge({ status }: { status: string }) {
   )
 }
 
+const TRAFFIC_PAGE_SIZE = 20
+
 function TrafficByProject({
   range,
   filter,
@@ -948,18 +951,62 @@ function TrafficByProject({
 }) {
   const [sortKey, setSortKey] = useState<TrafficSortKey>('total_requests')
   const [sortDesc, setSortDesc] = useState(true)
+  const [page, setPage] = useState(1)
   const { startIso, endIso } = useWindowBounds(range)
 
-  // Same options FilterBar uses — React Query dedupes the fetch.
-  const projectsQ = useQuery({
-    ...getProjectsOptions({ query: { page: 1, per_page: 100 } }),
+  // Defer fetching until the card is actually scrolled into view — on the
+  // unfiltered view it sits below the node metrics panels, so a page load
+  // that never scrolls this far shouldn't pay for it.
+  const containerRef = useRef<HTMLDivElement>(null)
+  const [visible, setVisible] = useState(false)
+  useEffect(() => {
+    const node = containerRef.current
+    if (!node || visible) return
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) {
+          setVisible(true)
+          observer.disconnect()
+        }
+      },
+      { rootMargin: '200px 0px', threshold: 0 }
+    )
+    observer.observe(node)
+    return () => observer.disconnect()
+  }, [visible])
+
+  // Reset to page 1 when the project filter changes, without an extra
+  // render-then-effect round trip (react.dev/learn/you-might-not-need-an-effect).
+  const [prevFilterProjectId, setPrevFilterProjectId] = useState(
+    filter.projectId
+  )
+  if (filter.projectId !== prevFilterProjectId) {
+    setPrevFilterProjectId(filter.projectId)
+    setPage(1)
+  }
+
+  const isFilteredToOneProject = filter.projectId != null
+
+  // Filtered to one project: fetch that project directly instead of paging
+  // through the full list looking for it. Unfiltered: page through projects
+  // TRAFFIC_PAGE_SIZE at a time instead of pulling up to 100 at once.
+  const singleProjectQ = useQuery({
+    ...getProjectOptions({ path: { id: filter.projectId ?? 0 } }),
+    enabled: visible && isFilteredToOneProject,
+  })
+  const projectsPageQ = useQuery({
+    ...getProjectsOptions({ query: { page, per_page: TRAFFIC_PAGE_SIZE } }),
+    enabled: visible && !isFilteredToOneProject,
     staleTime: 60_000,
   })
-  const allProjects = projectsQ.data?.projects ?? []
-  const projects =
-    filter.projectId != null
-      ? allProjects.filter((p) => p.id === filter.projectId)
-      : allProjects
+
+  const projects = isFilteredToOneProject
+    ? singleProjectQ.data
+      ? [singleProjectQ.data]
+      : []
+    : (projectsPageQ.data?.projects ?? [])
+  const total = projectsPageQ.data?.total ?? 0
+  const totalPages = Math.max(1, Math.ceil(total / TRAFFIC_PAGE_SIZE))
 
   const idsParam = projects.map((p) => p.id).join(',')
   const healthQ = useQuery({
@@ -970,7 +1017,7 @@ function TrafficByProject({
         end_time: endIso,
       },
     }),
-    enabled: projects.length > 0,
+    enabled: visible && projects.length > 0,
     staleTime: 30_000,
     refetchInterval: 60_000,
   })
@@ -1008,11 +1055,17 @@ function TrafficByProject({
     }
   }
 
+  const isLoadingProjects = isFilteredToOneProject
+    ? singleProjectQ.isPending
+    : projectsPageQ.isPending
+  const hasError =
+    (isFilteredToOneProject ? singleProjectQ.isError : projectsPageQ.isError) ||
+    healthQ.isError
   const isPending =
-    projectsQ.isPending || (projects.length > 0 && healthQ.isPending)
+    !visible || isLoadingProjects || (projects.length > 0 && healthQ.isPending)
 
   return (
-    <Card>
+    <Card ref={containerRef}>
       <CardHeader className="pb-2">
         <CardTitle className="text-base">Traffic by project</CardTitle>
         <CardDescription>
@@ -1026,7 +1079,7 @@ function TrafficByProject({
             <Skeleton className="h-8 w-full" />
             <Skeleton className="h-8 w-full" />
           </div>
-        ) : projectsQ.isError || healthQ.isError ? (
+        ) : hasError ? (
           <div className="py-8 text-center text-sm text-rose-500">
             Failed to load project traffic
           </div>
@@ -1035,63 +1088,88 @@ function TrafficByProject({
             No projects yet
           </div>
         ) : (
-          <div className="overflow-x-auto">
-            <Table className="min-w-[480px]">
-              <TableHeader>
-                <TableRow>
-                  {TRAFFIC_COLUMNS.map((col) => (
-                    <TableHead
-                      key={col.key}
+          <>
+            <div className="overflow-x-auto">
+              <Table className="min-w-[480px]">
+                <TableHeader>
+                  <TableRow>
+                    {TRAFFIC_COLUMNS.map((col) => (
+                      <TableHead
+                        key={col.key}
+                        className={
+                          (col.numeric ? 'text-right ' : '') +
+                          (col.secondary ? 'hidden md:table-cell' : '')
+                        }
+                      >
+                        <button
+                          type="button"
+                          onClick={() => onSort(col.key)}
+                          className="inline-flex items-center gap-1 hover:text-foreground"
+                        >
+                          {col.label}
+                          {sortKey === col.key && (
+                            <span aria-hidden>{sortDesc ? '↓' : '↑'}</span>
+                          )}
+                        </button>
+                      </TableHead>
+                    ))}
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {sorted.map((row) => (
+                    <TableRow
+                      key={row.project_id}
                       className={
-                        (col.numeric ? 'text-right ' : '') +
-                        (col.secondary ? 'hidden md:table-cell' : '')
+                        row.total_requests === 0 ? 'text-muted-foreground' : ''
                       }
                     >
-                      <button
-                        type="button"
-                        onClick={() => onSort(col.key)}
-                        className="inline-flex items-center gap-1 hover:text-foreground"
-                      >
-                        {col.label}
-                        {sortKey === col.key && (
-                          <span aria-hidden>{sortDesc ? '↓' : '↑'}</span>
-                        )}
-                      </button>
-                    </TableHead>
+                      <TableCell className="font-medium">
+                        {row.project_name}
+                      </TableCell>
+                      <TableCell className="text-right tabular-nums">
+                        {formatCount(row.total_requests)}
+                      </TableCell>
+                      <TableCell className="hidden text-right tabular-nums md:table-cell">
+                        {formatCount(row.total_errors)}
+                      </TableCell>
+                      <TableCell className="text-right tabular-nums">
+                        {formatPercent(row.error_rate)}
+                      </TableCell>
+                      <TableCell className="hidden text-right tabular-nums md:table-cell">
+                        {formatMs(row.avg_response_time_ms)}
+                      </TableCell>
+                      <TableCell>
+                        <StatusBadge status={row.status} />
+                      </TableCell>
+                    </TableRow>
                   ))}
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {sorted.map((row) => (
-                  <TableRow
-                    key={row.project_id}
-                    className={
-                      row.total_requests === 0 ? 'text-muted-foreground' : ''
-                    }
-                  >
-                    <TableCell className="font-medium">
-                      {row.project_name}
-                    </TableCell>
-                    <TableCell className="text-right tabular-nums">
-                      {formatCount(row.total_requests)}
-                    </TableCell>
-                    <TableCell className="hidden text-right tabular-nums md:table-cell">
-                      {formatCount(row.total_errors)}
-                    </TableCell>
-                    <TableCell className="text-right tabular-nums">
-                      {formatPercent(row.error_rate)}
-                    </TableCell>
-                    <TableCell className="hidden text-right tabular-nums md:table-cell">
-                      {formatMs(row.avg_response_time_ms)}
-                    </TableCell>
-                    <TableCell>
-                      <StatusBadge status={row.status} />
-                    </TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </div>
+                </TableBody>
+              </Table>
+            </div>
+            {!isFilteredToOneProject && total > TRAFFIC_PAGE_SIZE && (
+              <div className="mt-4 flex items-center justify-center gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setPage((p) => Math.max(1, p - 1))}
+                  disabled={page === 1}
+                >
+                  Previous
+                </Button>
+                <span className="text-sm text-muted-foreground">
+                  Page {page} of {totalPages}
+                </span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                  disabled={page >= totalPages}
+                >
+                  Next
+                </Button>
+              </div>
+            )}
+          </>
         )}
       </CardContent>
     </Card>
