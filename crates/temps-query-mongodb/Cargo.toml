@@ -6,8 +6,10 @@ edition = "2021"
 [dependencies]
 temps-query = { path = "../temps-query" }
 
-# MongoDB driver
-mongodb = "3.7.0"
+# MongoDB driver - use bson-3 feature so mongodb::bson re-exports bson 3.x,
+# matching our explicit bson = "3.1" dep and avoiding a two-version conflict.
+# The default compat-3-0-0 feature enables bson-2 which we explicitly exclude.
+mongodb = { version = "3.7.0", default-features = false, features = ["bson-3", "compat-3-3-0", "rustls-tls", "dns-resolver"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
