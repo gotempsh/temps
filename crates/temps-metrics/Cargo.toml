@@ -44,3 +44,6 @@ reqwest = { workspace = true }
 
 # Node collector (Linux /proc + statvfs)
 libc = "0.2"
+
+[dev-dependencies]
+testcontainers = { workspace = true }

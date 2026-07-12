@@ -12171,6 +12171,7 @@ dependencies = [
  "temps-config",
  "temps-core",
  "temps-entities",
+ "testcontainers",
  "thiserror 2.0.18",
  "tokio",
  "tokio-postgres",
