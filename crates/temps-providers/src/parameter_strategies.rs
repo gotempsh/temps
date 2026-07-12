@@ -213,6 +213,25 @@ fn validate_service_resource_limits(params: &HashMap<String, JsonValue>) -> Resu
         .map_err(|e| format!("invalid 'resources' block: {}", e))
 }
 
+/// `container_name` is an internal-only field set exclusively by each
+/// provider's `import_from_container()` (never through the public create
+/// API — see `*InputConfig::container_name` doc comments). A client
+/// supplying it at creation time could make Docker operations target an
+/// existing container instead of creating a new one — including another
+/// tenant's container, since Docker names are global and predictable
+/// (`{service}-{slug}`). `validate_for_update` already blocks this via its
+/// updateable-keys allowlist; this closes the matching gap on create.
+fn reject_client_supplied_container_name(
+    params: &HashMap<String, JsonValue>,
+) -> Result<(), String> {
+    if params.contains_key("container_name") {
+        return Err(
+            "'container_name' cannot be set by the client — it is assigned internally only when importing an existing container".to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Strategy for validating and managing parameters for a specific service type
 pub trait ParameterStrategy: Send + Sync {
     /// Validate parameters for service creation - ensures all required parameters are present
@@ -249,6 +268,7 @@ pub struct PostgresParameterStrategy;
 
 impl ParameterStrategy for PostgresParameterStrategy {
     fn validate_for_creation(&self, params: &HashMap<String, JsonValue>) -> Result<(), String> {
+        reject_client_supplied_container_name(params)?;
         if !params.contains_key("database") || is_empty_value(params.get("database")) {
             return Err("'database' is required for PostgreSQL".to_string());
         }
@@ -380,6 +400,7 @@ pub struct MariaDbParameterStrategy;
 
 impl ParameterStrategy for MariaDbParameterStrategy {
     fn validate_for_creation(&self, params: &HashMap<String, JsonValue>) -> Result<(), String> {
+        reject_client_supplied_container_name(params)?;
         validate_mariadb_credentials(params)?;
         mariadb_size_profile_from_params(params)?;
         validate_service_resource_limits(params)?;
@@ -549,7 +570,8 @@ impl ParameterStrategy for MariaDbParameterStrategy {
 pub struct RedisParameterStrategy;
 
 impl ParameterStrategy for RedisParameterStrategy {
-    fn validate_for_creation(&self, _params: &HashMap<String, JsonValue>) -> Result<(), String> {
+    fn validate_for_creation(&self, params: &HashMap<String, JsonValue>) -> Result<(), String> {
+        reject_client_supplied_container_name(params)?;
         // Redis doesn't require parameters for creation
         Ok(())
     }
@@ -642,7 +664,8 @@ impl ParameterStrategy for RedisParameterStrategy {
 pub struct S3ParameterStrategy;
 
 impl ParameterStrategy for S3ParameterStrategy {
-    fn validate_for_creation(&self, _params: &HashMap<String, JsonValue>) -> Result<(), String> {
+    fn validate_for_creation(&self, params: &HashMap<String, JsonValue>) -> Result<(), String> {
+        reject_client_supplied_container_name(params)?;
         // S3/RustFS doesn't require parameters for creation
         Ok(())
     }
@@ -811,7 +834,8 @@ impl ParameterStrategy for S3ParameterStrategy {
 pub struct MinioParameterStrategy;
 
 impl ParameterStrategy for MinioParameterStrategy {
-    fn validate_for_creation(&self, _params: &HashMap<String, JsonValue>) -> Result<(), String> {
+    fn validate_for_creation(&self, params: &HashMap<String, JsonValue>) -> Result<(), String> {
+        reject_client_supplied_container_name(params)?;
         // MinIO doesn't require parameters for creation
         Ok(())
     }
@@ -925,7 +949,8 @@ impl ParameterStrategy for MinioParameterStrategy {
 pub struct RustfsParameterStrategy;
 
 impl ParameterStrategy for RustfsParameterStrategy {
-    fn validate_for_creation(&self, _params: &HashMap<String, JsonValue>) -> Result<(), String> {
+    fn validate_for_creation(&self, params: &HashMap<String, JsonValue>) -> Result<(), String> {
+        reject_client_supplied_container_name(params)?;
         // RustFS doesn't require parameters for creation
         Ok(())
     }
@@ -1089,6 +1114,7 @@ pub struct MongodbParameterStrategy;
 
 impl ParameterStrategy for MongodbParameterStrategy {
     fn validate_for_creation(&self, params: &HashMap<String, JsonValue>) -> Result<(), String> {
+        reject_client_supplied_container_name(params)?;
         if !params.contains_key("database") || is_empty_value(params.get("database")) {
             return Err("'database' is required for MongoDB".to_string());
         }
@@ -1629,6 +1655,136 @@ mod tests {
 
         let ok = pg_params("postgres", "myapp", Some("strong_password_456!"));
         assert!(strategy.validate_for_creation(&ok).is_ok());
+    }
+
+    // ─── container_name IDOR guard ─────────────────────────────────────
+    //
+    // `container_name` is internal-only (set by `import_from_container()`).
+    // A client including it in a create request could redirect every Docker
+    // operation to an existing container — including a different tenant's,
+    // since Docker names are global and predictable (`{service}-{slug}`).
+    // These tests confirm that every strategy's `validate_for_creation`
+    // rejects the field before anything is persisted.
+
+    #[test]
+    fn postgres_rejects_client_supplied_container_name() {
+        let strategy = PostgresParameterStrategy;
+        let mut params = HashMap::new();
+        params.insert(
+            "database".to_string(),
+            JsonValue::String("mydb".to_string()),
+        );
+        params.insert(
+            "username".to_string(),
+            JsonValue::String("user".to_string()),
+        );
+        params.insert(
+            "container_name".to_string(),
+            JsonValue::String("postgres-victim-slug".to_string()),
+        );
+        let err = strategy.validate_for_creation(&params).unwrap_err();
+        assert!(
+            err.contains("container_name"),
+            "error should mention 'container_name', got: {err}"
+        );
+    }
+
+    #[test]
+    fn mariadb_rejects_client_supplied_container_name() {
+        let strategy = MariaDbParameterStrategy;
+        let mut params = HashMap::new();
+        params.insert(
+            "container_name".to_string(),
+            JsonValue::String("mariadb-victim-slug".to_string()),
+        );
+        let err = strategy.validate_for_creation(&params).unwrap_err();
+        assert!(
+            err.contains("container_name"),
+            "error should mention 'container_name', got: {err}"
+        );
+    }
+
+    #[test]
+    fn redis_rejects_client_supplied_container_name() {
+        let strategy = RedisParameterStrategy;
+        let mut params = HashMap::new();
+        params.insert(
+            "container_name".to_string(),
+            JsonValue::String("redis-victim-slug".to_string()),
+        );
+        let err = strategy.validate_for_creation(&params).unwrap_err();
+        assert!(
+            err.contains("container_name"),
+            "error should mention 'container_name', got: {err}"
+        );
+    }
+
+    #[test]
+    fn s3_rejects_client_supplied_container_name() {
+        let strategy = S3ParameterStrategy;
+        let mut params = HashMap::new();
+        params.insert(
+            "container_name".to_string(),
+            JsonValue::String("rustfs-victim-slug".to_string()),
+        );
+        let err = strategy.validate_for_creation(&params).unwrap_err();
+        assert!(
+            err.contains("container_name"),
+            "error should mention 'container_name', got: {err}"
+        );
+    }
+
+    #[test]
+    fn minio_rejects_client_supplied_container_name() {
+        let strategy = MinioParameterStrategy;
+        let mut params = HashMap::new();
+        params.insert(
+            "container_name".to_string(),
+            JsonValue::String("minio-victim-slug".to_string()),
+        );
+        let err = strategy.validate_for_creation(&params).unwrap_err();
+        assert!(
+            err.contains("container_name"),
+            "error should mention 'container_name', got: {err}"
+        );
+    }
+
+    #[test]
+    fn rustfs_rejects_client_supplied_container_name() {
+        let strategy = RustfsParameterStrategy;
+        let mut params = HashMap::new();
+        params.insert(
+            "container_name".to_string(),
+            JsonValue::String("rustfs-victim-slug".to_string()),
+        );
+        let err = strategy.validate_for_creation(&params).unwrap_err();
+        assert!(
+            err.contains("container_name"),
+            "error should mention 'container_name', got: {err}"
+        );
+    }
+
+    #[test]
+    fn mongodb_rejects_client_supplied_container_name() {
+        let strategy = MongodbParameterStrategy;
+        let mut params = HashMap::new();
+        params.insert(
+            "database".to_string(),
+            JsonValue::String("mydb".to_string()),
+        );
+        params.insert(
+            "username".to_string(),
+            JsonValue::String("user".to_string()),
+        );
+        params.insert(
+            "container_name".to_string(),
+            JsonValue::String("mongodb-victim-slug".to_string()),
+        );
+        let err = strategy.validate_for_creation(&params).unwrap_err();
+        assert!(
+            err.contains("container_name"),
+            "error should mention 'container_name', got: {err}"
+        );
     }
 
     /// Regression: the UI and the parameter schema both promise users that
