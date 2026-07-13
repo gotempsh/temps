@@ -32,7 +32,7 @@ flate2 = { workspace = true }
 tracing = { workspace = true }
 memchr = "2.7"
 htmd = "0.5"
-scraper = "0.25"
+scraper = "0.27"
 pingora = { version = "0.8.0", features = ["lb"] }
 pingora-core = { version = "0.8.0", features = ["openssl", "connection_filter"] }
 pingora-http = "0.8.0"
