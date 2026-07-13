@@ -24,11 +24,11 @@ import {
   Cloud,
   Mail,
   MoreHorizontal,
-  Slack,
   Webhook,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useForm } from 'react-hook-form'
+import { FaSlack } from 'react-icons/fa'
 import { useNavigate } from 'react-router-dom'
 import { toast } from 'sonner'
 import { ProviderForm } from '@/components/monitoring/ProviderForm'
@@ -73,7 +73,7 @@ const providerOptions: ProviderOption[] = [
     id: 'slack',
     name: 'Slack',
     description: 'Send notifications to Slack channels via webhooks',
-    icon: <Slack className="h-6 w-6" />,
+    icon: <FaSlack className="h-6 w-6" />,
     available: true,
   },
   {

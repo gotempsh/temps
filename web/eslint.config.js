@@ -58,7 +58,10 @@ export default tseslint.config(
     },
     settings: {
       react: {
-        version: 'detect',
+        // 'detect' calls context.getFilename(), which ESLint 10 removed —
+        // eslint-plugin-react 7.37.5 (latest) caps peerDeps at ^9.7 and crashes
+        // under 'detect'. Pin explicitly until upstream ships ESLint 10 support.
+        version: '19.2.7',
       },
     },
     rules: {

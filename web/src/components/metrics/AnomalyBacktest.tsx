@@ -233,8 +233,8 @@ export function AnomalyBacktest({
               <Tooltip
                 contentStyle={{ fontSize: 11 }}
                 labelFormatter={(l) => formatBucketLabel(String(l))}
-                formatter={(v: number, name: string) =>
-                  name === 'band' ? null : [fmtNum(v), name]
+                formatter={(v, name) =>
+                  name === 'band' ? null : [fmtNum(Number(v)), name]
                 }
               />
             </ComposedChart>

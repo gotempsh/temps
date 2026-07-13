@@ -116,6 +116,19 @@ RUN if [ -f GeoLite2-City.mmdb ]; then \
       echo "Note: GeoLite2 database not found in repository. Geolocation features will be disabled."; \
     fi
 
+# Copy GeoLite2 ASN database if available (optional -- powers hosting/VPS-provider
+# detection for datacenter traffic spoofing a real browser user-agent; when absent,
+# that detection silently disables and city/country geolocation still works)
+RUN if [ -f GeoLite2-ASN.mmdb ]; then \
+      cp GeoLite2-ASN.mmdb /app/data/GeoLite2-ASN.mmdb && \
+      chown appuser:appgroup /app/data/GeoLite2-ASN.mmdb; \
+    elif [ -f crates/temps-cli/GeoLite2-ASN.mmdb ]; then \
+      cp crates/temps-cli/GeoLite2-ASN.mmdb /app/data/GeoLite2-ASN.mmdb && \
+      chown appuser:appgroup /app/data/GeoLite2-ASN.mmdb; \
+    else \
+      echo "Note: GeoLite2 ASN database not found in repository. Hosting-provider detection will be disabled."; \
+    fi
+
 # Set permissions
 RUN chmod -R 755 /app/data
 
@@ -218,3 +231,7 @@ CMD ["/app/temps", "serve"]
 #   Download from: https://www.maxmind.com/en/geolite2/geolite2-free-data-sources
 # - Geolocation features will be disabled if database is missing (non-fatal)
 #   The application will continue to run normally with a warning in logs
+# - GeoLite2-ASN.mmdb (same download page) is also optional and follows the same
+#   placement/mount rules. It powers hosting/VPS-provider detection used to keep
+#   scraper/bot traffic out of the live-visitors view. Without it, that detection
+#   is disabled (non-fatal) but city/country geolocation is unaffected.

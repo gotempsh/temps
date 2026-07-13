@@ -52,13 +52,13 @@ import {
   ExternalLink,
   GitBranch,
   GitFork,
-  GithubIcon,
   Globe,
   Key,
   RefreshCw,
   Trash2,
   XCircle,
 } from 'lucide-react'
+import GithubIcon from '@/icons/Github'
 import { useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { toast } from 'sonner'

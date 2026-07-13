@@ -70,7 +70,6 @@ import {
   EyeOff,
   ExternalLink,
   GitBranch,
-  Gitlab,
   Loader2,
   Lock,
   Plus,
@@ -82,6 +81,7 @@ import {
   X,
 } from 'lucide-react'
 import Github from '@/icons/Github'
+import Gitlab from '@/icons/Gitlab'
 
 /**
  * Renders the correct icon for a Git provider type — used in the connection

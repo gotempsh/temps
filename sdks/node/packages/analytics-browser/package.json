@@ -1,6 +1,6 @@
 {
 	"name": "@temps-sdk/analytics-browser",
-	"version": "0.0.1",
+	"version": "0.0.2",
 	"description": "Vanilla JS analytics SDK for Temps. Use as a script tag or import programmatically.",
 	"private": false,
 	"type": "module",

@@ -3,7 +3,7 @@ use sea_orm::{
     prelude::*, ActiveModelTrait, DatabaseBackend, FromQueryResult, QueryFilter, QueryOrder, Set,
     Statement,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_core::UtcDateTime;
 use temps_entities::{performance_metrics, request_sessions, visitor};
@@ -146,18 +146,76 @@ pub struct MetricsOverTimeResponse {
     pub inp_p99: Option<f32>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupBy {
     Path,
     Country,
+    Region,
+    City,
     DeviceType,
     Browser,
     OperatingSystem,
 }
 
+impl GroupBy {
+    /// SQL grouping expression, response `grouped_by` name, and whether the
+    /// dimension needs the `ip_geolocations ig` join.
+    fn sql_parts(self) -> (&'static str, &'static str, bool) {
+        match self {
+            GroupBy::Path => ("COALESCE(pm.pathname, 'Unknown')", "path", false),
+            GroupBy::Country => ("COALESCE(ig.country, 'Unknown')", "country", true),
+            GroupBy::Region => ("COALESCE(ig.region, 'Unknown')", "region", true),
+            GroupBy::City => ("COALESCE(ig.city, 'Unknown')", "city", true),
+            GroupBy::DeviceType => (
+                // device_type stores woothee categories ("pc", "smartphone", ...)
+                "CASE WHEN pm.device_type IN ('smartphone', 'mobilephone') THEN 'Mobile' WHEN pm.device_type = 'pc' THEN 'Desktop' ELSE 'Unknown' END",
+                "device_type",
+                false,
+            ),
+            GroupBy::Browser => ("COALESCE(pm.browser, 'Unknown')", "browser", false),
+            GroupBy::OperatingSystem => (
+                "COALESCE(pm.operating_system, 'Unknown')",
+                "operating_system",
+                false,
+            ),
+        }
+    }
+}
+
+/// Optional segment filters for the performance read endpoints, mirroring
+/// analytics' `VisitorSegmentFilters`. Each filter narrows results to samples
+/// matching the dimension value, so metrics can be scoped to e.g. one page,
+/// one browser, or one country. Geographic filters resolve via
+/// `ip_geolocations`; the rest live directly on `performance_metrics`.
+#[derive(Debug, Deserialize, Clone, Default, ToSchema)]
+pub struct SpeedSegmentFilters {
+    /// Page pathname (matches `performance_metrics.pathname`)
+    pub filter_path: Option<String>,
+    /// Geolocation country (matches `ip_geolocations.country`)
+    pub filter_country: Option<String>,
+    /// Geolocation region (matches `ip_geolocations.region`)
+    pub filter_region: Option<String>,
+    /// Geolocation city (matches `ip_geolocations.city`)
+    pub filter_city: Option<String>,
+    /// Browser name (matches `performance_metrics.browser`)
+    pub filter_browser: Option<String>,
+    /// Operating system (matches `performance_metrics.operating_system`)
+    pub filter_operating_system: Option<String>,
+}
+
+impl SpeedSegmentFilters {
+    fn needs_geo_join(&self) -> bool {
+        self.filter_country.is_some() || self.filter_region.is_some() || self.filter_city.is_some()
+    }
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct GroupedPageMetric {
     pub group_key: String,
+    /// ISO 3166-1 alpha-2 code of the group's country. Populated for the
+    /// geographic dimensions (country/region/city) so clients can match map
+    /// geometries without name-based lookups; null otherwise.
+    pub country_code: Option<String>,
     pub lcp: Option<f32>,
     pub cls: Option<f32>,
     pub inp: Option<f32>,
@@ -193,33 +251,51 @@ impl PerformanceService {
         }
     }
 
-    /// Build the WHERE clause and params for percentile/time-series SQL queries.
-    fn build_percentile_where(
+    /// Build the WHERE clause and params shared by the performance read
+    /// queries. All columns are qualified with the `pm.` alias so the clause
+    /// works with or without the `ip_geolocations ig` join; the returned bool
+    /// says whether that join is required (any geographic filter present, or
+    /// bot exclusion — which checks `ig.is_hosting_provider`).
+    ///
+    /// Unless `include_bots` is set, samples are excluded when the UA parsed
+    /// as a crawler (`pm.is_crawler`) or the IP belongs to a hosting provider
+    /// (`ig.is_hosting_provider`) — headless browsers in datacenters report
+    /// wildly unrepresentative timings but carry normal Chrome user agents,
+    /// so the ASN signal is the one that actually catches them. Nothing is
+    /// dropped at ingest; this is purely a read-time view.
+    #[allow(clippy::too_many_arguments)]
+    fn build_where(
         project_id: i32,
         start_date: UtcDateTime,
         end_date: UtcDateTime,
         environment_id: Option<i32>,
         deployment_id: Option<i32>,
         device_type: Option<String>,
-    ) -> (String, Vec<sea_orm::Value>) {
+        filters: &SpeedSegmentFilters,
+        include_bots: bool,
+    ) -> (String, Vec<sea_orm::Value>, bool) {
         let mut conditions = vec![
-            "project_id = $1".to_string(),
-            "recorded_at >= $2".to_string(),
-            "recorded_at <= $3".to_string(),
+            "pm.project_id = $1".to_string(),
+            "pm.recorded_at >= $2".to_string(),
+            "pm.recorded_at <= $3".to_string(),
         ];
+        if !include_bots {
+            conditions.push("pm.is_crawler = false".to_string());
+            conditions.push("COALESCE(ig.is_hosting_provider, false) = false".to_string());
+        }
         let mut params: Vec<sea_orm::Value> =
             vec![project_id.into(), start_date.into(), end_date.into()];
         let mut idx = 3;
 
         if let Some(env_id) = environment_id {
             idx += 1;
-            conditions.push(format!("environment_id = ${}", idx));
+            conditions.push(format!("pm.environment_id = ${}", idx));
             params.push(env_id.into());
         }
 
         if let Some(dep_id) = deployment_id {
             idx += 1;
-            conditions.push(format!("deployment_id = ${}", idx));
+            conditions.push(format!("pm.deployment_id = ${}", idx));
             params.push(dep_id.into());
         }
 
@@ -233,12 +309,28 @@ impl PerformanceService {
                     format!("${}", idx)
                 })
                 .collect();
-            conditions.push(format!("device_type IN ({})", placeholders.join(", ")));
+            conditions.push(format!("pm.device_type IN ({})", placeholders.join(", ")));
         }
 
-        (conditions.join(" AND "), params)
+        let mut push_eq = |column: &str, value: &Option<String>| {
+            if let Some(v) = value {
+                idx += 1;
+                conditions.push(format!("{} = ${}", column, idx));
+                params.push(v.clone().into());
+            }
+        };
+        push_eq("pm.pathname", &filters.filter_path);
+        push_eq("pm.browser", &filters.filter_browser);
+        push_eq("pm.operating_system", &filters.filter_operating_system);
+        push_eq("ig.country", &filters.filter_country);
+        push_eq("ig.region", &filters.filter_region);
+        push_eq("ig.city", &filters.filter_city);
+
+        let needs_geo_join = filters.needs_geo_join() || !include_bots;
+        (conditions.join(" AND "), params, needs_geo_join)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_metrics(
         &self,
         start_date: UtcDateTime,
@@ -247,15 +339,24 @@ impl PerformanceService {
         environment_id: Option<i32>,
         deployment_id: Option<i32>,
         device_type: Option<String>,
+        filters: &SpeedSegmentFilters,
+        include_bots: bool,
     ) -> Result<PerformanceMetricsResponse, PerformanceError> {
-        let (where_clause, params) = Self::build_percentile_where(
+        let (where_clause, params, needs_geo_join) = Self::build_where(
             project_id,
             start_date,
             end_date,
             environment_id,
             deployment_id,
             device_type,
+            filters,
+            include_bots,
         );
+        let geo_join = if needs_geo_join {
+            "LEFT JOIN ip_geolocations ig ON pm.ip_address_id = ig.id"
+        } else {
+            ""
+        };
 
         // Use SQL percentile_cont to compute all stats in a single query — no data loaded into Rust
         let sql = format!(
@@ -291,10 +392,11 @@ impl PerformanceService {
                 (percentile_cont(0.99) WITHIN GROUP (ORDER BY fcp))::float4 as fcp_p99,
                 (percentile_cont(0.99) WITHIN GROUP (ORDER BY cls))::float4 as cls_p99,
                 (percentile_cont(0.99) WITHIN GROUP (ORDER BY inp))::float4 as inp_p99
-            FROM performance_metrics
+            FROM performance_metrics pm
+            {}
             WHERE {}
             "#,
-            where_clause
+            geo_join, where_clause
         );
 
         #[derive(FromQueryResult)]
@@ -406,6 +508,7 @@ impl PerformanceService {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_metrics_over_time(
         &self,
         start_date: UtcDateTime,
@@ -414,15 +517,24 @@ impl PerformanceService {
         environment_id: Option<i32>,
         deployment_id: Option<i32>,
         device_type: Option<String>,
+        filters: &SpeedSegmentFilters,
+        include_bots: bool,
     ) -> Result<MetricsOverTimeResponse, PerformanceError> {
-        let (where_clause, params) = Self::build_percentile_where(
+        let (where_clause, params, needs_geo_join) = Self::build_where(
             project_id,
             start_date,
             end_date,
             environment_id,
             deployment_id,
             device_type,
+            filters,
+            include_bots,
         );
+        let geo_join = if needs_geo_join {
+            "LEFT JOIN ip_geolocations ig ON pm.ip_address_id = ig.id"
+        } else {
+            ""
+        };
 
         // Single SQL query: percentiles + time-bucketed averages in one round-trip.
         // The percentiles CTE computes aggregates without loading rows into Rust.
@@ -461,19 +573,21 @@ impl PerformanceService {
                     (percentile_cont(0.99) WITHIN GROUP (ORDER BY fcp))::float4 as fcp_p99,
                     (percentile_cont(0.99) WITHIN GROUP (ORDER BY cls))::float4 as cls_p99,
                     (percentile_cont(0.99) WITHIN GROUP (ORDER BY inp))::float4 as inp_p99
-                FROM performance_metrics
+                FROM performance_metrics pm
+                {geo_join}
                 WHERE {where_clause}
             ),
             time_series AS (
                 SELECT
-                    time_bucket('1 hour', recorded_at) as bucket,
+                    time_bucket('1 hour', pm.recorded_at) as bucket,
                     AVG(ttfb)::float4 as ttfb,
                     AVG(lcp)::float4 as lcp,
                     AVG(fid)::float4 as fid,
                     AVG(fcp)::float4 as fcp,
                     AVG(cls)::float4 as cls,
                     AVG(inp)::float4 as inp
-                FROM performance_metrics
+                FROM performance_metrics pm
+                {geo_join}
                 WHERE {where_clause}
                 GROUP BY bucket
                 ORDER BY bucket ASC
@@ -488,6 +602,7 @@ impl PerformanceService {
             FROM time_series ts
             CROSS JOIN percentiles p
             "#,
+            geo_join = geo_join,
             where_clause = where_clause
         );
 
@@ -612,6 +727,7 @@ impl PerformanceService {
         Ok(result)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_grouped_page_metrics(
         &self,
         start_date: UtcDateTime,
@@ -619,77 +735,62 @@ impl PerformanceService {
         project_id: i32,
         environment_id: Option<i32>,
         deployment_id: Option<i32>,
+        device_type: Option<String>,
+        filters: &SpeedSegmentFilters,
+        include_bots: bool,
         group_by: GroupBy,
     ) -> Result<GroupedPageMetricsResponse, PerformanceError> {
-        // Determine the grouping field and column
-        let (group_field, group_by_name) = match group_by {
-            GroupBy::Path => ("rl.request_path", "path"),
-            GroupBy::Country => ("COALESCE(ig.country, 'Unknown')", "country"),
-            GroupBy::DeviceType => (
-                "CASE WHEN rl.is_mobile = true THEN 'Mobile' ELSE 'Desktop' END",
-                "device_type",
-            ),
-            GroupBy::Browser => ("COALESCE(rl.browser, 'Unknown')", "browser"),
-            GroupBy::OperatingSystem => (
-                "COALESCE(rl.operating_system, 'Unknown')",
-                "operating_system",
-            ),
+        // Determine the grouping field and column. Non-geographic dimensions
+        // live directly on performance_metrics; country/region/city need the
+        // ip_geolocations join via pm.ip_address_id — as do any geographic
+        // segment filters, regardless of the grouping dimension.
+        let (group_field, group_by_name, group_needs_geo) = group_by.sql_parts();
+        let (where_clause, params, filters_need_geo) = Self::build_where(
+            project_id,
+            start_date,
+            end_date,
+            environment_id,
+            deployment_id,
+            device_type,
+            filters,
+            include_bots,
+        );
+        let needs_geo_join = group_needs_geo || filters_need_geo;
+        let geo_join = if needs_geo_join {
+            "LEFT JOIN ip_geolocations ig ON pm.ip_address_id = ig.id"
+        } else {
+            ""
+        };
+        // For geographic groupings, surface the ISO country code so clients
+        // (e.g. a world-map view) can match geometries by code, not by name.
+        let country_code_expr = if group_needs_geo {
+            "MIN(ig.country_code)"
+        } else {
+            "NULL"
         };
 
-        // Build the base query with proper grouping
-        let mut where_conditions = vec![
-            format!("pm.project_id = ${}", 1),
-            format!("pm.recorded_at >= ${}", 2),
-            format!("pm.recorded_at <= ${}", 3),
-            "pm.is_crawler = false".to_string(),
-        ];
-        let mut params: Vec<sea_orm::Value> =
-            vec![project_id.into(), start_date.into(), end_date.into()];
-        let mut param_count = 3;
-
-        // Add optional filters
-        if let Some(env_id) = environment_id {
-            param_count += 1;
-            where_conditions.push(format!("pm.environment_id = ${}", param_count));
-            params.push(env_id.into());
-        }
-
-        if let Some(dep_id) = deployment_id {
-            param_count += 1;
-            where_conditions.push(format!("pm.deployment_id = ${}", param_count));
-            params.push(dep_id.into());
-        }
-
-        // Note: proxy_logs doesn't have is_static_file field
-        // Removed static file filter as it's not available in proxy_logs
-
-        // Optimized query using TimescaleDB features with flexible grouping
+        // AVG() over real columns returns double precision in Postgres, so
+        // every aggregate is cast to ::float8 and decoded as f64.
         let query = format!(
             r#"
             SELECT
                 {} as group_key,
-                AVG(pm.lcp) as lcp,
-                AVG(pm.cls) as cls,
-                AVG(pm.inp) as inp,
-                AVG(pm.fcp) as fcp,
-                AVG(pm.ttfb) as ttfb,
+                {} as country_code,
+                AVG(pm.lcp)::float8 as lcp,
+                AVG(pm.cls)::float8 as cls,
+                AVG(pm.inp)::float8 as inp,
+                AVG(pm.fcp)::float8 as fcp,
+                AVG(pm.ttfb)::float8 as ttfb,
                 COUNT(*) as events
             FROM performance_metrics pm
-            LEFT JOIN proxy_logs pl ON (
-                pm.project_id = pl.project_id AND
-                pm.session_id = pl.session_id AND
-                ABS(EXTRACT(EPOCH FROM (pm.recorded_at - pl.timestamp))) <= 300
-            )
-            LEFT JOIN ip_geolocations ig ON pl.client_ip = ig.ip_address
+            {}
             WHERE {}
             GROUP BY {}
             HAVING COUNT(*) >= 1
             ORDER BY events DESC, group_key
             LIMIT 100
             "#,
-            group_field,
-            where_conditions.join(" AND "),
-            group_field
+            group_field, country_code_expr, geo_join, where_clause, group_field
         );
 
         info!("Executing grouped page metrics query: {}", query);
@@ -698,11 +799,12 @@ impl PerformanceService {
         #[derive(FromQueryResult)]
         struct GroupedMetricResult {
             group_key: Option<String>,
-            lcp: Option<f32>,
-            cls: Option<f32>,
-            inp: Option<f32>,
-            fcp: Option<f32>,
-            ttfb: Option<f32>,
+            country_code: Option<String>,
+            lcp: Option<f64>,
+            cls: Option<f64>,
+            inp: Option<f64>,
+            fcp: Option<f64>,
+            ttfb: Option<f64>,
             events: i64,
         }
 
@@ -725,11 +827,12 @@ impl PerformanceService {
             .filter_map(|r| {
                 r.group_key.map(|key| GroupedPageMetric {
                     group_key: key,
-                    lcp: r.lcp,
-                    cls: r.cls,
-                    inp: r.inp,
-                    fcp: r.fcp,
-                    ttfb: r.ttfb,
+                    country_code: r.country_code,
+                    lcp: r.lcp.map(|v| v as f32),
+                    cls: r.cls.map(|v| v as f32),
+                    inp: r.inp.map(|v| v as f32),
+                    fcp: r.fcp.map(|v| v as f32),
+                    ttfb: r.ttfb.map(|v| v as f32),
                     events: r.events,
                 })
             })
@@ -978,5 +1081,125 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(!result.unwrap());
+    }
+
+    #[test]
+    fn test_group_by_sql_parts_reference_valid_aliases() {
+        // Every grouping expression must only reference `pm.` (always in
+        // FROM) or `ig.` (only when the geo join is requested) — a mismatch
+        // here is exactly the "missing FROM-clause entry" class of bug.
+        let all = [
+            GroupBy::Path,
+            GroupBy::Country,
+            GroupBy::Region,
+            GroupBy::City,
+            GroupBy::DeviceType,
+            GroupBy::Browser,
+            GroupBy::OperatingSystem,
+        ];
+        for group_by in all {
+            let (field, name, needs_geo_join) = group_by.sql_parts();
+            assert!(!name.is_empty());
+            if field.contains("ig.") {
+                assert!(
+                    needs_geo_join,
+                    "{name} references ig. but does not request the geo join"
+                );
+            }
+            if !needs_geo_join {
+                assert!(
+                    !field.contains("ig."),
+                    "{name} skips the geo join but references ig."
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_build_where_segment_filters() {
+        use chrono::Utc;
+        let filters = SpeedSegmentFilters {
+            filter_path: Some("/pricing".to_string()),
+            filter_operating_system: Some("Windows 10".to_string()),
+            ..Default::default()
+        };
+        let (clause, params, needs_geo) = PerformanceService::build_where(
+            1,
+            Utc::now(),
+            Utc::now(),
+            Some(2),
+            None,
+            Some("desktop".to_string()),
+            &filters,
+            true, // include bots so no geo join is forced by bot exclusion
+        );
+        assert!(!needs_geo, "pm-only filters must not require the geo join");
+        assert!(clause.contains("pm.pathname = $6"));
+        assert!(clause.contains("pm.operating_system = $7"));
+        assert!(clause.contains("pm.device_type IN ($5)"));
+        assert!(!clause.contains("ig."));
+        assert_eq!(params.len(), 7);
+
+        let geo_filters = SpeedSegmentFilters {
+            filter_country: Some("Spain".to_string()),
+            ..Default::default()
+        };
+        let (clause, params, needs_geo) = PerformanceService::build_where(
+            1,
+            Utc::now(),
+            Utc::now(),
+            None,
+            None,
+            None,
+            &geo_filters,
+            true,
+        );
+        assert!(needs_geo, "geo filters must request the geo join");
+        assert!(clause.contains("ig.country = $4"));
+        assert_eq!(params.len(), 4);
+    }
+
+    #[test]
+    fn test_build_where_excludes_bots_by_default() {
+        use chrono::Utc;
+        let (clause, _, needs_geo) = PerformanceService::build_where(
+            1,
+            Utc::now(),
+            Utc::now(),
+            None,
+            None,
+            None,
+            &SpeedSegmentFilters::default(),
+            false,
+        );
+        assert!(clause.contains("pm.is_crawler = false"));
+        assert!(clause.contains("COALESCE(ig.is_hosting_provider, false) = false"));
+        assert!(needs_geo, "bot exclusion checks ig. and needs the geo join");
+
+        let (clause, _, needs_geo) = PerformanceService::build_where(
+            1,
+            Utc::now(),
+            Utc::now(),
+            None,
+            None,
+            None,
+            &SpeedSegmentFilters::default(),
+            true,
+        );
+        assert!(!clause.contains("is_crawler"));
+        assert!(!clause.contains("is_hosting_provider"));
+        assert!(!needs_geo);
+    }
+
+    #[test]
+    fn test_group_by_geo_dimensions_join_geolocations() {
+        for group_by in [GroupBy::Country, GroupBy::Region, GroupBy::City] {
+            let (_, _, needs_geo_join) = group_by.sql_parts();
+            assert!(needs_geo_join);
+        }
+        for group_by in [GroupBy::Path, GroupBy::DeviceType, GroupBy::Browser] {
+            let (_, _, needs_geo_join) = group_by.sql_parts();
+            assert!(!needs_geo_join);
+        }
     }
 }

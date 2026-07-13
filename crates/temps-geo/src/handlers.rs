@@ -209,6 +209,8 @@ mod tests {
             region: Some("New York".to_string()),
             timezone: Some("America/New_York".to_string()),
             is_eu: false,
+            asn_org: None,
+            is_hosting_provider: None,
         };
 
         let response = GeoLocationResponse::from(("8.8.8.8".to_string(), location));

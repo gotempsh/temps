@@ -865,6 +865,30 @@ pub struct ConsoleApiParams {
     /// Pre-built admin-gate handle. When `None`, the console derives one
     /// from the freshly-constructed service above.
     pub admin_gate_handle: Option<temps_core::admin_gate::AdminGateHandle>,
+    /// Shared retention-resolver slot (see `temps_core::retention`). Owned by
+    /// the caller (`commands/serve/mod.rs`) so the SAME instance can also be
+    /// handed to `start_proxy_server` — the live Pingora proxy builds its own
+    /// isolated plugin context (`temps-proxy/src/server.rs::setup_proxy_plugins`,
+    /// only `ConfigPlugin`+`GeoPlugin`) and can never see a resolver registered
+    /// here via the console's plugin manager otherwise. Pre-registered into the
+    /// service registry below (before any plugin's `register_services` runs) so
+    /// `ProxyPlugin` uses this exact object rather than creating its own.
+    ///
+    /// **Security guardrail — shared-slot pattern:**
+    /// This is the only object that is deliberately pre-registered in the
+    /// console's service registry AND passed directly to `start_proxy_server` as
+    /// a constructor argument. That cross-context sharing is necessary here
+    /// because the Pingora proxy runs in a wholly separate plugin context and
+    /// cannot reach anything registered in the console's registry.
+    ///
+    /// This pattern MUST NOT be used for any object that affects the proxy's
+    /// security decisions (authentication, TLS/cert issuance, IP blocklists,
+    /// rate limiting, or routing). It is acceptable for `RetentionResolverSlot`
+    /// exclusively because its sole effect is a per-row metadata value
+    /// (`retention_days`) with no bearing on request routing, authorization, or
+    /// connection handling. Any future object shared this same way requires an
+    /// explicit security review before being added here.
+    pub retention_resolver_slot: Arc<temps_core::RetentionResolverSlot>,
 }
 
 /// Build a ClickHouse-backed metrics store from the server config, or `None`
@@ -1273,6 +1297,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         extra_plugins,
         admin_gate_service: provided_admin_gate_service,
         admin_gate_handle: provided_admin_gate_handle,
+        retention_resolver_slot,
     } = params;
 
     // Readiness flag for the `/readyz` probe. Starts `false` (not ready) and is
@@ -1354,6 +1379,10 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     service_context.register_service(encryption_service.clone());
     service_context.register_service(cookie_crypto.clone());
     service_context.register_service(docker.clone());
+    // Pre-registered before any plugin runs so ProxyPlugin uses this exact
+    // slot instance instead of creating its own — see the field doc on
+    // `ConsoleApiParams::retention_resolver_slot`.
+    service_context.register_service(retention_resolver_slot.clone());
 
     // Register the shared route table (created in serve/mod.rs)
     // This is used by analytics-events and other plugins that need to resolve hosts

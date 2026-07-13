@@ -22,7 +22,7 @@ utoipa = { workspace = true }
 headless_chrome = {version ="1.0.18", features = ["fetch", "offline"] }
 reqwest = { workspace = true }
 url = { workspace = true }
-base64 = "0.21"
+base64 = "0.22"
 
 temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }

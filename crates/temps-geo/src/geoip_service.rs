@@ -3,7 +3,7 @@ use rand::seq::SliceRandom;
 use serde::Serialize;
 use std::net::IpAddr;
 use thiserror::Error;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Serialize, Clone)]
 pub struct GeoLocation {
@@ -15,6 +15,60 @@ pub struct GeoLocation {
     pub region: Option<String>,
     pub timezone: Option<String>,
     pub is_eu: bool,
+    /// The organization that owns the ASN this IP belongs to (e.g. "Hetzner Online GmbH").
+    /// `None` when the ASN database isn't available or the ASN has no organization on file.
+    pub asn_org: Option<String>,
+    /// Best-effort heuristic: does `asn_org` match a known hosting/cloud/VPS provider
+    /// pattern? Datacenter IPs are never real end-user visitors, so this flags traffic
+    /// (often scrapers spoofing a real browser user-agent) that the user-agent-based
+    /// bot detector in temps-analytics-events can't catch. `None` when the ASN database
+    /// isn't available (can't tell either way).
+    pub is_hosting_provider: Option<bool>,
+}
+
+/// Substring patterns (lowercased) matched against an ASN organization name to
+/// flag traffic originating from hosting/cloud/VPS providers rather than
+/// residential or mobile ISPs. Best-effort: a legitimate visitor tunneling
+/// through a corporate VPN hosted on one of these providers would also match,
+/// so this is a signal for the live-visitors view, not a hard security boundary.
+const HOSTING_ORG_PATTERNS: &[&str] = &[
+    "hosting",
+    "vps",
+    "datacenter",
+    "data center",
+    "colocation",
+    "cloud",
+    "server",
+    "amazon",
+    "aws",
+    "google cloud",
+    "microsoft azure",
+    "digitalocean",
+    "linode",
+    "vultr",
+    "ovh",
+    "hetzner",
+    "leaseweb",
+    "scaleway",
+    "contabo",
+    "packet",
+    "equinix",
+    "choopa",
+    "he.net",
+    "hurricane electric",
+    "subnet digital",
+    "americancloud",
+];
+
+/// Detect whether an ASN organization name belongs to a known hosting/cloud/VPS
+/// provider. Returns `false` for an empty name rather than matching everything.
+fn is_hosting_org(org: &str) -> bool {
+    let trimmed = org.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_lowercase();
+    HOSTING_ORG_PATTERNS.iter().any(|pat| lower.contains(pat))
 }
 
 #[derive(Error, Debug)]
@@ -126,7 +180,7 @@ const MOCK_CITIES: &[MockCity] = &[
 ];
 
 pub enum GeoIpService {
-    MaxMind(MaxMindGeoIpService),
+    MaxMind(Box<MaxMindGeoIpService>),
     Mock(MockGeoIpService),
 }
 
@@ -151,7 +205,31 @@ impl GeoIpService {
                 e
             ))
         })?;
-        Ok(Self::MaxMind(MaxMindGeoIpService { reader }))
+
+        // ASN database is optional: hosting-provider detection degrades gracefully
+        // (asn_org/is_hosting_provider stay None) rather than failing startup when
+        // the operator hasn't provisioned it, same as the City database's own
+        // optional-file convention in Dockerfile/docker-compose.
+        let asn_db_path = std::env::current_dir()?.join("GeoLite2-ASN.mmdb");
+        let asn_reader = match maxminddb::Reader::open_readfile(&asn_db_path) {
+            Ok(reader) => {
+                info!("Loaded MaxMind ASN database from: {:?}", asn_db_path);
+                Some(reader)
+            }
+            Err(e) => {
+                warn!(
+                    "MaxMind ASN database not found at '{}' ({}); hosting-provider detection disabled",
+                    asn_db_path.display(),
+                    e
+                );
+                None
+            }
+        };
+
+        Ok(Self::MaxMind(Box::new(MaxMindGeoIpService {
+            reader,
+            asn_reader,
+        })))
     }
 
     pub async fn geolocate(&self, ip: IpAddr) -> Result<GeoLocation, GeoIpError> {
@@ -164,6 +242,7 @@ impl GeoIpService {
 
 pub struct MaxMindGeoIpService {
     reader: maxminddb::Reader<Vec<u8>>,
+    asn_reader: Option<maxminddb::Reader<Vec<u8>>>,
 }
 
 impl MaxMindGeoIpService {
@@ -177,7 +256,39 @@ impl MaxMindGeoIpService {
             .map_err(|e| GeoIpError::NotFound(format!("Failed to decode city data: {}", e)))?
             .ok_or_else(|| GeoIpError::NotFound(format!("No data found for IP: {}", ip)))?;
 
-        Ok(Self::extract_geo_location(&city_data))
+        let mut geo_location = Self::extract_geo_location(&city_data);
+        let (asn_org, is_hosting_provider) = self.lookup_asn(ip);
+        geo_location.asn_org = asn_org;
+        geo_location.is_hosting_provider = is_hosting_provider;
+
+        Ok(geo_location)
+    }
+
+    /// Look up the ASN organization for `ip` and classify it as a hosting
+    /// provider. Any lookup/decode failure degrades to `(None, None)` rather
+    /// than failing the whole geolocation — the City lookup already succeeded
+    /// and callers shouldn't lose city/country data over an optional signal.
+    fn lookup_asn(&self, ip: IpAddr) -> (Option<String>, Option<bool>) {
+        let Some(asn_reader) = &self.asn_reader else {
+            return (None, None);
+        };
+
+        let asn_data = match asn_reader
+            .lookup(ip)
+            .and_then(|result| result.decode::<geoip2::Asn>())
+        {
+            Ok(Some(data)) => data,
+            Ok(None) => return (None, Some(false)),
+            Err(e) => {
+                debug!("ASN lookup failed for IP {}: {}", ip, e);
+                return (None, None);
+            }
+        };
+
+        let org = asn_data.autonomous_system_organization.map(str::to_string);
+        let is_hosting = org.as_deref().map(is_hosting_org);
+
+        (org, is_hosting)
     }
 
     fn extract_geo_location(city_data: &geoip2::City<'_>) -> GeoLocation {
@@ -210,6 +321,8 @@ impl MaxMindGeoIpService {
             region,
             timezone,
             is_eu,
+            asn_org: None,
+            is_hosting_provider: None,
         }
     }
 }
@@ -246,6 +359,8 @@ impl MockGeoIpService {
             region: Some("Unknown".to_string()),
             timezone: Some("UTC".to_string()),
             is_eu: false,
+            asn_org: None,
+            is_hosting_provider: None,
         })
     }
 
@@ -264,6 +379,8 @@ impl MockGeoIpService {
             region: Some(mock_city.region.to_string()),
             timezone: Some(mock_city.timezone.to_string()),
             is_eu: mock_city.is_eu,
+            asn_org: None,
+            is_hosting_provider: None,
         })
     }
 
@@ -272,5 +389,39 @@ impl MockGeoIpService {
             IpAddr::V4(ipv4) => ipv4.is_private() || ipv4.is_link_local(),
             IpAddr::V6(ipv6) => ipv6.is_loopback() || ipv6.is_unique_local(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_known_hosting_orgs_detected() {
+        assert!(is_hosting_org("EGIHosting"));
+        assert!(is_hosting_org("Subnet Digital LLC (SDL-166)"));
+        assert!(is_hosting_org("Hetzner Online GmbH"));
+        assert!(is_hosting_org("Amazon.com, Inc."));
+        assert!(is_hosting_org("DigitalOcean, LLC"));
+        assert!(is_hosting_org("OVH SAS"));
+    }
+
+    #[test]
+    fn test_residential_isp_not_flagged() {
+        assert!(!is_hosting_org("Comcast Cable Communications, LLC"));
+        assert!(!is_hosting_org("Verizon Communications"));
+        assert!(!is_hosting_org("British Telecommunications PLC"));
+    }
+
+    #[test]
+    fn test_empty_org_not_flagged() {
+        assert!(!is_hosting_org(""));
+        assert!(!is_hosting_org("   "));
+    }
+
+    #[test]
+    fn test_case_insensitive_match() {
+        assert!(is_hosting_org("SUBNET DIGITAL LLC"));
+        assert!(is_hosting_org("subnet digital llc"));
     }
 }

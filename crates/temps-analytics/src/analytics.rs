@@ -2805,6 +2805,8 @@ WHERE project_id = $1
             WHERE v.project_id = $1
               AND ($2::int IS NULL OR v.environment_id = $2)
               AND v.last_seen >= NOW() - INTERVAL '1 minute' * $3
+              AND v.is_crawler = false
+              AND COALESCE(ig.is_hosting_provider, false) = false
             ORDER BY v.last_seen DESC
         "#;
 

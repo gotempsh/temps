@@ -35,12 +35,12 @@ import {
   ChevronLeft,
   Link as LinkIcon,
   Loader2,
-  Gitlab,
   LayoutTemplate,
   Container,
   FolderGit2,
 } from 'lucide-react'
 import Github from '@/icons/Github'
+import Gitlab from '@/icons/Gitlab'
 import { toast } from 'sonner'
 import { Badge } from '@/components/ui/badge'
 

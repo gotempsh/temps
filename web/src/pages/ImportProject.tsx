@@ -10,7 +10,8 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { GitBranchIcon, GithubIcon } from 'lucide-react'
+import { GitBranchIcon } from 'lucide-react'
+import GithubIcon from '@/icons/Github'
 import { useEffect } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { toast } from 'sonner'
@@ -86,7 +87,7 @@ export function ImportProject() {
           <div className="flex items-center justify-between h-16">
             <div className="flex items-center gap-4">
               <div className="flex items-center gap-2">
-                <GithubIcon className="h-5 w-5 text-muted-foreground" />
+                <GithubIcon className="h-5 w-5" />
                 <span className="font-medium">
                   {selectedRepository?.full_name || 'Loading repository…'}
                 </span>

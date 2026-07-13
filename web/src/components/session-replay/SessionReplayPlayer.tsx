@@ -14,6 +14,14 @@ import { Alert, AlertDescription } from '@/components/ui/alert'
 import { format } from 'date-fns'
 import { SessionEventDto } from '@/api/client'
 
+// rrweb-player 2.x types `props.events` as `eventWithTime[]` (from @rrweb/types,
+// a transitive dependency), while the generated SDK ships event data as
+// `unknown`. Derive the event type from the player's own constructor so we
+// don't import from a package we don't directly depend on.
+type RRwebEvent = ConstructorParameters<
+  typeof rrwebPlayer
+>[0]['props']['events'][number]
+
 interface SessionReplayPlayerProps {
   events: SessionEventDto[]
   sessionData?: {
@@ -71,7 +79,7 @@ export function SessionReplayPlayer({
         playerRef.current = new rrwebPlayer({
           target: playerContainerRef.current,
           props: {
-            events: eventData.map((event) => event.data),
+            events: eventData.map((event) => event.data as RRwebEvent),
             width: width,
             height: height,
             autoPlay: false,
