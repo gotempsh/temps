@@ -1317,27 +1317,23 @@ async fn assign_role(
     // the path and body target ids must agree, and callers may not change their
     // own roles.
     let caller_is_admin = app_state.user_service.is_admin(auth.user_id()).await?;
-    let target_user_id = authorize_role_assignment(
-        caller_is_admin,
-        auth.user_id(),
-        user_id,
-        assign_req.user_id,
-    )
-    .map_err(|denied| {
-        error!(
-            "Denied role assignment by user {}: {:?}",
-            auth.user_id(),
-            denied
-        );
-        match denied {
-            RoleChangeDenied::TargetMismatch => temps_core::error_builder::bad_request()
-                .detail("Path user_id and body user_id must match".to_string())
-                .build(),
-            RoleChangeDenied::NotAdmin | RoleChangeDenied::SelfModification => {
-                temps_core::error_builder::forbidden().build()
-            }
-        }
-    })?;
+    let target_user_id =
+        authorize_role_assignment(caller_is_admin, auth.user_id(), user_id, assign_req.user_id)
+            .map_err(|denied| {
+                error!(
+                    "Denied role assignment by user {}: {:?}",
+                    auth.user_id(),
+                    denied
+                );
+                match denied {
+                    RoleChangeDenied::TargetMismatch => temps_core::error_builder::bad_request()
+                        .detail("Path user_id and body user_id must match".to_string())
+                        .build(),
+                    RoleChangeDenied::NotAdmin | RoleChangeDenied::SelfModification => {
+                        temps_core::error_builder::forbidden().build()
+                    }
+                }
+            })?;
 
     // Verify role type is valid
     let role_type = match RoleType::from_str(&assign_req.role_type) {
