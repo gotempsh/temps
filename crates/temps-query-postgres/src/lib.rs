@@ -322,6 +322,32 @@ impl PostgresSource {
                     "Subqueries are not allowed in the data browser".to_string(),
                 ));
             }
+
+            // Block function-call syntax. A keyword denylist cannot be complete:
+            // data-returning functions such as query_to_xml/database_to_xml/
+            // table_to_xml take their SQL payload as a *string literal*, which is
+            // stripped before the denylist runs, so `1=1 AND query_to_xml('select
+            // ... from users', true, false, '') IS NOT NULL` slips through and
+            // exfiltrates other tables. Reject any identifier immediately
+            // preceding `(` (i.e. a function call); only grouping parens and
+            // `IN (...)`/`AND (...)`/`OR (...)`/`NOT (...)` are permitted. With
+            // subqueries, UNION, and function calls all blocked, a WHERE clause
+            // can reference only the current table's columns and constants.
+            const PAREN_ALLOWED_PREFIXES: [&str; 4] = ["in", "and", "or", "not"];
+            for (idx, _) in without_strings.match_indices('(') {
+                let preceding = without_strings[..idx].trim_end();
+                let ident_rev: String = preceding
+                    .chars()
+                    .rev()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                let ident: String = ident_rev.chars().rev().collect();
+                if !ident.is_empty() && !PAREN_ALLOWED_PREFIXES.contains(&ident.as_str()) {
+                    return Err(DataError::InvalidQuery(
+                        "Function calls are not allowed in the data browser".to_string(),
+                    ));
+                }
+            }
         }
 
         // Block SQL comments which can be used to hide attack payloads
@@ -1535,6 +1561,36 @@ mod tests {
     #[test]
     fn test_sql_injection_set_config() {
         assert_sql_rejected("set_config('log_statement', 'all', false)");
+    }
+
+    // Regression for security review finding #4: data-returning functions carry
+    // their SQL payload inside a string literal, which is stripped before the
+    // denylist runs — so these were NOT on the denylist and slipped through.
+    // The structural "no function calls" rule blocks the whole class.
+    #[test]
+    fn test_sql_injection_xml_function_exfiltration() {
+        assert_sql_rejected(
+            "1=1 AND query_to_xml('select * from users', true, false, '') IS NOT NULL",
+        );
+        assert_sql_rejected("database_to_xml(true, false, '') IS NOT NULL");
+        assert_sql_rejected("table_to_xml('users', true, false, '') IS NOT NULL");
+    }
+
+    #[test]
+    fn test_sql_injection_arbitrary_function_call_blocked() {
+        // Any function call is rejected, so we never have to enumerate them.
+        assert_sql_rejected("length(password) > 0");
+        assert_sql_rejected("1=1 AND cast(secret AS text) = 'x'");
+        assert_sql_rejected("upper(name) = 'ADMIN'");
+    }
+
+    #[test]
+    fn test_function_call_block_allows_grouping_and_in_lists() {
+        // The new rule must not break legitimate grouping or IN-lists.
+        assert_sql_allowed("(status = 'active' OR status = 'pending') AND id > 10");
+        assert_sql_allowed("id IN (1, 2, 3)");
+        assert_sql_allowed("id IN (1,2,3) AND NOT (deleted = true)");
+        assert_sql_allowed("age >= 18 AND age <= 65");
     }
 
     #[test]
