@@ -18,10 +18,14 @@ use temps_core::{
 use temps_dns::providers::{DnsProvider, DnsRecordContent, DnsRecordRequest};
 use tracing::{error, info, warn};
 
-use super::audit::{EmailDomainCreatedAudit, EmailDomainDeletedAudit, EmailDomainVerifiedAudit};
+use super::audit::{
+    EmailDomainCreatedAudit, EmailDomainDeletedAudit, EmailDomainFallbackProviderChangedAudit,
+    EmailDomainVerifiedAudit,
+};
 use super::types::{
-    AppState, CreateEmailDomainRequest, DnsRecordResponse, DnsRecordSetupResult,
-    EmailDomainResponse, EmailDomainWithDnsResponse, SetupDnsRequest, SetupDnsResponse,
+    AddFallbackProviderRequest, AppState, CreateEmailDomainRequest, DnsRecordResponse,
+    DnsRecordSetupResult, EmailDomainFallbackProviderResponse, EmailDomainResponse,
+    EmailDomainWithDnsResponse, SetupDnsRequest, SetupDnsResponse,
 };
 use crate::errors::EmailError;
 use crate::services::CreateDomainRequest;
@@ -65,6 +69,10 @@ impl From<EmailError> for Problem {
                     .with_title("Internal Server Error")
                     .with_detail(error.to_string())
             }
+
+            EmailError::SendFailed { .. } => problemdetails::new(StatusCode::BAD_GATEWAY)
+                .with_title("Provider Send Failed")
+                .with_detail(error.to_string()),
         }
     }
 }
@@ -87,6 +95,14 @@ pub fn routes() -> Router<Arc<AppState>> {
         )
         .route("/email-domains/{id}/verify", post(verify_domain))
         .route("/email-domains/{id}/setup-dns", post(setup_dns))
+        .route(
+            "/email-domains/{id}/fallback-providers",
+            get(list_domain_fallback_providers).post(add_domain_fallback_provider),
+        )
+        .route(
+            "/email-domains/{id}/fallback-providers/{provider_id}",
+            axum::routing::delete(remove_domain_fallback_provider),
+        )
 }
 
 /// Create a new email domain
@@ -520,6 +536,159 @@ pub async fn delete_email_domain(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// List a domain's fallback providers (send failover chain, priority order)
+#[utoipa::path(
+    tag = "Email Domains",
+    get,
+    path = "/email-domains/{id}/fallback-providers",
+    responses(
+        (status = 200, description = "Fallback providers in priority order", body = Vec<EmailDomainFallbackProviderResponse>),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Domain not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("id" = i32, Path, description = "Domain ID")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_domain_fallback_providers(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, EmailDomainsRead);
+
+    // 404 if the domain itself doesn't exist, rather than silently
+    // returning an empty list for a nonexistent id.
+    state.domain_service.get(id).await?;
+
+    let links = state.provider_service.list_fallback_providers(id).await?;
+
+    let response: Vec<EmailDomainFallbackProviderResponse> = links
+        .into_iter()
+        .map(|l| EmailDomainFallbackProviderResponse {
+            id: l.id,
+            domain_id: l.domain_id,
+            provider_id: l.provider_id,
+            priority: l.priority,
+            created_at: l.created_at.to_rfc3339(),
+        })
+        .collect();
+
+    Ok(Json(response))
+}
+
+/// Add (or re-prioritize) a fallback provider for a domain's send failover chain
+#[utoipa::path(
+    tag = "Email Domains",
+    post,
+    path = "/email-domains/{id}/fallback-providers",
+    request_body = AddFallbackProviderRequest,
+    responses(
+        (status = 200, description = "Fallback provider added", body = EmailDomainFallbackProviderResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Domain or provider not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("id" = i32, Path, description = "Domain ID")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn add_domain_fallback_provider(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    axum::Extension(metadata): axum::Extension<RequestMetadata>,
+    Path(id): Path<i32>,
+    Json(request): Json<AddFallbackProviderRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, EmailDomainsWrite);
+
+    state.domain_service.get(id).await?;
+
+    let link = state
+        .provider_service
+        .add_fallback_provider(id, request.provider_id, request.priority)
+        .await?;
+
+    let audit = EmailDomainFallbackProviderChangedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        domain_id: id,
+        provider_id: request.provider_id,
+        action: "added".to_string(),
+        priority: Some(request.priority),
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!("Failed to create audit log: {}", e);
+    }
+
+    Ok(Json(EmailDomainFallbackProviderResponse {
+        id: link.id,
+        domain_id: link.domain_id,
+        provider_id: link.provider_id,
+        priority: link.priority,
+        created_at: link.created_at.to_rfc3339(),
+    }))
+}
+
+/// Remove a fallback provider from a domain's send failover chain
+#[utoipa::path(
+    tag = "Email Domains",
+    delete,
+    path = "/email-domains/{id}/fallback-providers/{provider_id}",
+    responses(
+        (status = 204, description = "Fallback provider removed (or wasn't configured)"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Domain not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("id" = i32, Path, description = "Domain ID"),
+        ("provider_id" = i32, Path, description = "Provider ID")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn remove_domain_fallback_provider(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    axum::Extension(metadata): axum::Extension<RequestMetadata>,
+    Path((id, provider_id)): Path<(i32, i32)>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, EmailDomainsWrite);
+
+    state.domain_service.get(id).await?;
+
+    state
+        .provider_service
+        .remove_fallback_provider(id, provider_id)
+        .await?;
+
+    let audit = EmailDomainFallbackProviderChangedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        domain_id: id,
+        provider_id,
+        action: "removed".to_string(),
+        priority: None,
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!("Failed to create audit log: {}", e);
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Setup DNS records for an email domain using a configured DNS provider
 #[utoipa::path(
     tag = "Email Domains",
@@ -587,9 +756,25 @@ pub async fn setup_dns(
     let email_domain = &domain_with_dns.domain.domain;
     let base_domain = extract_base_domain(email_domain);
 
+    // Create each DNS record — except DMARC. Unlike SPF/DKIM/MX, DMARC isn't
+    // additive: publishing `_dmarc.<root-domain>` sets a `p=quarantine`
+    // policy for the *entire* domain, which can affect mail from senders
+    // other than Temps (e.g. the company's regular Google Workspace/M365
+    // mail) if their SPF/DKIM alignment isn't already clean. Bundling that
+    // into the same "create all records" click as the purely-additive
+    // records would be exactly the kind of silent-on-the-user's-behalf
+    // change CLAUDE.md's operator-control rule warns against, so DMARC stays
+    // informational-only here — surfaced for the operator to add manually
+    // once they've confirmed it's safe for their domain.
+    let auto_creatable_records: Vec<_> = domain_with_dns
+        .dns_records
+        .iter()
+        .filter(|r| !r.name.starts_with("_dmarc."))
+        .collect();
+
     info!(
         "Setting up {} DNS records for {} using provider {}",
-        domain_with_dns.dns_records.len(),
+        auto_creatable_records.len(),
         email_domain,
         dns_provider.name
     );
@@ -597,8 +782,7 @@ pub async fn setup_dns(
     let mut results = Vec::new();
     let mut records_created: u32 = 0;
 
-    // Create each DNS record
-    for dns_record in &domain_with_dns.dns_records {
+    for dns_record in auto_creatable_records {
         let result = create_dns_record(provider_instance.as_ref(), &base_domain, dns_record).await;
 
         if result.success {
@@ -608,7 +792,7 @@ pub async fn setup_dns(
         results.push(result);
     }
 
-    let total_records = domain_with_dns.dns_records.len() as u32;
+    let total_records = results.len() as u32;
     let all_success = records_created == total_records;
 
     let message = if all_success {

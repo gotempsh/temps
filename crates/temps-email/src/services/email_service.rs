@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::errors::EmailError;
 use crate::providers::SendEmailRequest as ProviderSendRequest;
-use crate::services::{DomainService, ProviderService, TrackingService};
+use crate::services::{DomainService, ProviderService, SuppressionService, TrackingService};
 
 /// Trait for rewriting HTML to inject tracking (pixel + click links).
 /// Implemented by `temps-email-tracking::HtmlTrackingRewriter`.
@@ -27,6 +27,7 @@ pub struct EmailService {
     domain_service: Arc<DomainService>,
     tracking_rewriter: Option<Arc<dyn TrackingRewriter>>,
     tracking_service: Arc<TrackingService>,
+    suppression_service: Arc<SuppressionService>,
 }
 
 /// Request to send an email
@@ -75,6 +76,7 @@ impl EmailService {
         provider_service: Arc<ProviderService>,
         domain_service: Arc<DomainService>,
         tracking_service: Arc<TrackingService>,
+        suppression_service: Arc<SuppressionService>,
     ) -> Self {
         Self {
             db,
@@ -82,6 +84,7 @@ impl EmailService {
             domain_service,
             tracking_rewriter: None,
             tracking_service,
+            suppression_service,
         }
     }
 
@@ -181,6 +184,62 @@ impl EmailService {
             }
         }
 
+        // Refuse to send to previously hard-bounced/complained addresses —
+        // repeatedly emailing one is exactly what gets a sending domain's
+        // reputation downgraded by receiving mail providers. Checked after
+        // the row is inserted (still visible for debugging) but before any
+        // domain/provider work, since it's independent of both.
+        //
+        // Checks to/cc/bcc together (a suppressed address left in cc/bcc
+        // would otherwise still receive mail), and drops only the
+        // suppressed addresses rather than capturing the whole send — a
+        // suppressed address mixed into `to` alongside legitimate
+        // recipients used to silently deny delivery to everyone on the
+        // email, not just the bad address.
+        let mut all_recipients: Vec<String> = request.to.clone();
+        all_recipients.extend(request.cc.iter().flatten().cloned());
+        all_recipients.extend(request.bcc.iter().flatten().cloned());
+
+        let suppressed = self
+            .suppression_service
+            .suppressed_among(&all_recipients)
+            .await?;
+
+        if !suppressed.is_empty() {
+            info!(
+                "Dropping suppressed recipient(s) from email {}: {:?}",
+                email_id, suppressed
+            );
+        }
+        let (to, cc, bcc) =
+            filter_suppressed_recipients(request.to, request.cc, request.bcc, &suppressed);
+
+        // Nothing left to send to (either every `to` address was
+        // suppressed, or `to` was already empty) — capture instead of
+        // sending an email with no primary recipient.
+        if to.is_empty() {
+            info!(
+                "Refusing to send email {} — all recipient(s) suppressed: {:?}",
+                email_id, suppressed
+            );
+
+            let mut active_model: emails::ActiveModel = email_model.into();
+            active_model.status = Set("captured".to_string());
+            active_model.error_message = Set(Some(format!(
+                "Recipient(s) suppressed (previous hard bounce or complaint): {}",
+                suppressed.join(", ")
+            )));
+            active_model.sent_at = Set(Some(Utc::now()));
+
+            active_model.update(self.db.as_ref()).await?;
+
+            return Ok(SendEmailResponse {
+                id: email_id,
+                status: "captured".to_string(),
+                provider_message_id: None,
+            });
+        }
+
         // If no domain configured, capture email without sending (Mailhog-like behavior)
         let domain = match domain {
             Some(d) => d,
@@ -198,7 +257,7 @@ impl EmailService {
 
                 info!(
                     "Email captured (no domain configured), id: {}, from: {}, to: {:?}",
-                    email_id, request.from, request.to
+                    email_id, request.from, to
                 );
 
                 return Ok(SendEmailResponse {
@@ -233,21 +292,14 @@ impl EmailService {
             });
         }
 
-        // Try to get provider - if not configured, capture email
-        let provider = match self.provider_service.get(domain.provider_id).await {
-            Ok(p) => Some(p),
-            Err(e) => {
-                info!(
-                    "No provider configured for domain '{}', capturing email without sending (Mailhog mode)",
-                    domain.domain
-                );
-                debug!("Provider lookup error: {}", e);
-                None
-            }
-        };
+        // Build the domain's failover chain: primary provider first, then
+        // configured fallbacks in priority order. `get_send_chain` also
+        // drops inactive providers, so disabling a provider now actually
+        // takes it out of the send path instead of only hiding it from
+        // provider-selection UI.
+        let chain = self.provider_service.get_send_chain(&domain).await?;
 
-        // If no provider, mark as captured and return success
-        if provider.is_none() {
+        if chain.is_empty() {
             let mut active_model: emails::ActiveModel = email_model.into();
             active_model.status = Set("captured".to_string());
             active_model.sent_at = Set(Some(Utc::now()));
@@ -256,7 +308,7 @@ impl EmailService {
 
             info!(
                 "Email captured (no provider), id: {}, from: {}, to: {:?}",
-                email_id, request.from, request.to
+                email_id, request.from, to
             );
 
             return Ok(SendEmailResponse {
@@ -266,42 +318,12 @@ impl EmailService {
             });
         }
 
-        let provider = provider.unwrap();
-
-        let provider_instance = match self
-            .provider_service
-            .create_provider_instance(&provider)
-            .await
-        {
-            Ok(instance) => instance,
-            Err(e) => {
-                // Provider exists but failed to create instance - capture email instead of failing
-                info!(
-                    "Failed to create provider instance, capturing email without sending: {}",
-                    e
-                );
-                let mut active_model: emails::ActiveModel = email_model.into();
-                active_model.status = Set("captured".to_string());
-                active_model.error_message = Set(Some(format!("Provider unavailable: {}", e)));
-                active_model.sent_at = Set(Some(Utc::now()));
-                active_model.update(self.db.as_ref()).await?;
-
-                return Ok(SendEmailResponse {
-                    id: email_id,
-                    status: "captured".to_string(),
-                    provider_message_id: None,
-                });
-            }
-        };
-
-        // Use tracked HTML (with open/click tracking injected) if available
-
         let provider_request = ProviderSendRequest {
             from: request.from,
             from_name: request.from_name,
-            to: request.to,
-            cc: request.cc,
-            bcc: request.bcc,
+            to,
+            cc,
+            bcc,
             reply_to: request.reply_to,
             subject: request.subject,
             html: tracked_html,
@@ -309,19 +331,97 @@ impl EmailService {
             headers: request.headers,
         };
 
-        match provider_instance.send(&provider_request).await {
-            Ok(response) => {
-                // Update email with success status
-                let mut active_model: emails::ActiveModel = email_model.clone().into();
+        // Try each provider in the chain in order. Within a provider, retry
+        // once more only if the failure was classified as transient
+        // (`EmailError::is_retryable`) — a permanent rejection (bad
+        // recipient, auth failure, unverified sender) fails identically on
+        // retry, so move straight to the next provider instead of wasting a
+        // second attempt against the same one.
+        const MAX_ATTEMPTS_PER_PROVIDER: u32 = 2;
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+
+        let mut total_attempts: i32 = 0;
+        let mut last_provider_id: Option<i32> = None;
+        let mut last_error: Option<String> = None;
+        let mut sent: Option<crate::providers::SendEmailResponse> = None;
+
+        'chain: for provider in &chain {
+            if !self.provider_service.circuit_allows(provider.id) {
+                debug!(
+                    "Skipping provider {} ({}) for email {} — circuit breaker open",
+                    provider.id, provider.name, email_id
+                );
+                continue;
+            }
+            if !self.provider_service.try_acquire_rate_limit(provider) {
+                debug!(
+                    "Skipping provider {} ({}) for email {} — rate limit exceeded",
+                    provider.id, provider.name, email_id
+                );
+                continue;
+            }
+
+            let provider_instance = match self
+                .provider_service
+                .create_provider_instance(provider)
+                .await
+            {
+                Ok(instance) => instance,
+                Err(e) => {
+                    warn!(
+                        "Failed to create provider instance {} ({}) for email {}: {}",
+                        provider.id, provider.name, email_id, e
+                    );
+                    last_provider_id = Some(provider.id);
+                    last_error = Some(format!("{}: provider unavailable ({})", provider.name, e));
+                    continue;
+                }
+            };
+
+            for attempt in 1..=MAX_ATTEMPTS_PER_PROVIDER {
+                total_attempts += 1;
+                last_provider_id = Some(provider.id);
+
+                match provider_instance.send(&provider_request).await {
+                    Ok(response) => {
+                        self.provider_service.record_send_success(provider.id);
+                        sent = Some(response);
+                        break 'chain;
+                    }
+                    Err(e) => {
+                        let retryable = e.is_retryable();
+                        warn!(
+                            "Send attempt {}/{} via {} ({}) failed for email {}: {}",
+                            attempt, MAX_ATTEMPTS_PER_PROVIDER, provider.name, provider.id,
+                            email_id, e
+                        );
+                        last_error = Some(format!("{}: {}", provider.name, e));
+
+                        if !retryable || attempt == MAX_ATTEMPTS_PER_PROVIDER {
+                            self.provider_service.record_send_failure(provider.id);
+                            break;
+                        }
+                        tokio::time::sleep(RETRY_DELAY).await;
+                    }
+                }
+            }
+        }
+
+        let mut active_model: emails::ActiveModel = email_model.into();
+        active_model.retry_count = Set(total_attempts);
+        active_model.provider_id = Set(last_provider_id);
+
+        match sent {
+            Some(response) => {
                 active_model.status = Set("sent".to_string());
                 active_model.provider_message_id = Set(Some(response.message_id.clone()));
                 active_model.sent_at = Set(Some(Utc::now()));
 
-                let _email_model = active_model.update(self.db.as_ref()).await?;
+                active_model.update(self.db.as_ref()).await?;
 
                 info!(
-                    "Email sent successfully, id: {}, provider_message_id: {}",
-                    email_id, response.message_id
+                    "Email sent successfully, id: {}, provider_message_id: {}, attempts: {}",
+                    email_id, response.message_id, total_attempts
                 );
 
                 Ok(SendEmailResponse {
@@ -330,16 +430,16 @@ impl EmailService {
                     provider_message_id: Some(response.message_id),
                 })
             }
-            Err(e) => {
-                // Provider send failed - capture email instead of failing
+            None => {
+                let reason = last_error
+                    .unwrap_or_else(|| "All providers unavailable (circuit open or rate limited)".to_string());
                 info!(
-                    "Failed to send email via provider, capturing instead: {}",
-                    e
+                    "Failed to send email {} via {} provider(s) in failover chain, capturing instead: {}",
+                    email_id, chain.len(), reason
                 );
 
-                let mut active_model: emails::ActiveModel = email_model.into();
                 active_model.status = Set("captured".to_string());
-                active_model.error_message = Set(Some(format!("Send failed: {}", e)));
+                active_model.error_message = Set(Some(format!("Send failed: {}", reason)));
                 active_model.sent_at = Set(Some(Utc::now()));
 
                 active_model.update(self.db.as_ref()).await?;
@@ -447,6 +547,33 @@ pub struct EmailStats {
     pub captured: u64,
 }
 
+/// Drop suppressed addresses from `to`/`cc`/`bcc`. `suppressed` is the
+/// (already-normalized) output of `SuppressionService::suppressed_among`.
+///
+/// Filters each list independently rather than rejecting the whole send —
+/// a suppressed address mixed into `to` alongside legitimate recipients
+/// must not deny delivery to everyone on the email, just to itself.
+fn filter_suppressed_recipients(
+    to: Vec<String>,
+    cc: Option<Vec<String>>,
+    bcc: Option<Vec<String>>,
+    suppressed: &[String],
+) -> (Vec<String>, Option<Vec<String>>, Option<Vec<String>>) {
+    if suppressed.is_empty() {
+        return (to, cc, bcc);
+    }
+
+    let suppressed_set: std::collections::HashSet<&str> =
+        suppressed.iter().map(String::as_str).collect();
+    let keep = |addr: &String| !suppressed_set.contains(SuppressionService::normalize(addr).as_str());
+
+    (
+        to.into_iter().filter(&keep).collect(),
+        cc.map(|list| list.into_iter().filter(&keep).collect()),
+        bcc.map(|list| list.into_iter().filter(&keep).collect()),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,11 +628,13 @@ mod tests {
             config_service,
             "http://localhost:3000".to_string(),
         ));
+        let suppression_service = Arc::new(SuppressionService::new(db.db.clone()));
         let email_service = EmailService::new(
             db.db.clone(),
             Arc::new(provider_service.clone()),
             Arc::new(domain_service.clone()),
             tracking_service,
+            suppression_service,
         );
         (db, email_service, provider_service, domain_service)
     }
@@ -660,6 +789,81 @@ mod tests {
         let invalid_from = "invalid-email";
         let domain = invalid_from.split('@').nth(1);
         assert!(domain.is_none());
+    }
+
+    #[test]
+    fn filter_suppressed_recipients_passes_through_when_nothing_suppressed() {
+        let (to, cc, bcc) = filter_suppressed_recipients(
+            vec!["a@example.com".to_string()],
+            Some(vec!["b@example.com".to_string()]),
+            None,
+            &[],
+        );
+        assert_eq!(to, vec!["a@example.com"]);
+        assert_eq!(cc, Some(vec!["b@example.com".to_string()]));
+        assert_eq!(bcc, None);
+    }
+
+    #[test]
+    fn filter_suppressed_recipients_drops_only_the_suppressed_cc_address() {
+        // A suppressed address in `cc` used to be invisible to the check
+        // entirely — it must be dropped from the send, and it must not take
+        // the legitimate `to` recipient down with it.
+        let (to, cc, bcc) = filter_suppressed_recipients(
+            vec!["good@example.com".to_string()],
+            Some(vec![
+                "bad@example.com".to_string(),
+                "also-good@example.com".to_string(),
+            ]),
+            None,
+            &["bad@example.com".to_string()],
+        );
+        assert_eq!(to, vec!["good@example.com"]);
+        assert_eq!(cc, Some(vec!["also-good@example.com".to_string()]));
+        assert_eq!(bcc, None);
+    }
+
+    #[test]
+    fn filter_suppressed_recipients_keeps_other_to_addresses() {
+        // One suppressed address mixed into `to` used to capture the whole
+        // send — the other `to` recipients must still get the email.
+        let (to, cc, bcc) = filter_suppressed_recipients(
+            vec![
+                "bad@example.com".to_string(),
+                "good@example.com".to_string(),
+            ],
+            None,
+            None,
+            &["bad@example.com".to_string()],
+        );
+        assert_eq!(to, vec!["good@example.com"]);
+        assert_eq!(cc, None);
+        assert_eq!(bcc, None);
+    }
+
+    #[test]
+    fn filter_suppressed_recipients_matches_case_and_whitespace_insensitively() {
+        // `suppressed_among` returns normalized (trimmed/lowercased) forms
+        // from the DB — the filter must normalize candidates the same way,
+        // not compare raw strings.
+        let (to, _, _) = filter_suppressed_recipients(
+            vec!["  Bad@Example.COM  ".to_string(), "good@example.com".to_string()],
+            None,
+            None,
+            &["bad@example.com".to_string()],
+        );
+        assert_eq!(to, vec!["good@example.com"]);
+    }
+
+    #[test]
+    fn filter_suppressed_recipients_empties_to_when_all_suppressed() {
+        let (to, _, _) = filter_suppressed_recipients(
+            vec!["bad@example.com".to_string()],
+            None,
+            None,
+            &["bad@example.com".to_string()],
+        );
+        assert!(to.is_empty());
     }
 
     #[test]

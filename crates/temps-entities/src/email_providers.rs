@@ -17,6 +17,8 @@ pub struct Model {
     /// Encrypted JSON with provider credentials
     pub credentials: String,
     pub is_active: bool,
+    /// Send-path cap enforced by `ProviderRateLimiter`. `None` = unlimited.
+    pub rate_limit_per_minute: Option<i32>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }

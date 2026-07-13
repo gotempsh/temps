@@ -6,7 +6,7 @@ use sea_orm::{
 };
 use std::sync::Arc;
 use temps_core::EncryptionService;
-use temps_entities::email_providers;
+use temps_entities::{email_domain_fallback_providers, email_domains, email_providers};
 use tracing::{debug, error};
 
 use crate::errors::EmailError;
@@ -14,12 +14,17 @@ use crate::providers::{
     EmailProvider, EmailProviderType, ScalewayCredentials, ScalewayProvider, SesCredentials,
     SesProvider, SmtpCredentials, SmtpProvider,
 };
+use crate::services::resilience::{ProviderCircuitBreaker, ProviderRateLimiter};
 
 /// Service for managing email providers
 #[derive(Clone)]
 pub struct ProviderService {
     db: Arc<DatabaseConnection>,
     encryption_service: Arc<EncryptionService>,
+    /// Per-provider send-path circuit breaker. Lives here (not per-request)
+    /// so failure/success history persists across sends.
+    circuit_breaker: Arc<ProviderCircuitBreaker>,
+    rate_limiter: Arc<ProviderRateLimiter>,
 }
 
 /// Request to create a new email provider
@@ -62,6 +67,10 @@ pub struct UpdateProviderRequest {
     /// how operators rotate `name`/`region` without re-typing secrets.
     pub credentials: Option<ProviderCredentials>,
     pub is_active: Option<bool>,
+    /// Send-path rate cap. Outer `None` leaves the current value untouched;
+    /// `Some(None)` explicitly clears it back to unlimited; `Some(Some(n))`
+    /// sets the cap to `n` sends/minute.
+    pub rate_limit_per_minute: Option<Option<i32>>,
 }
 
 /// Summary of what changed during an update. Used for audit logging.
@@ -89,6 +98,8 @@ impl ProviderService {
         Self {
             db,
             encryption_service,
+            circuit_breaker: Arc::new(ProviderCircuitBreaker::new()),
+            rate_limiter: Arc::new(ProviderRateLimiter::new()),
         }
     }
 
@@ -158,6 +169,154 @@ impl ProviderService {
             .await?;
 
         Ok(providers)
+    }
+
+    /// The ordered list of providers to try for a domain's send: its primary
+    /// provider (`email_domains.provider_id`) first, then its configured
+    /// fallback providers in ascending `priority` order. Inactive providers
+    /// and duplicates (a provider set as both primary and a fallback) are
+    /// dropped — callers loop this and move to the next entry on failure.
+    pub async fn get_send_chain(
+        &self,
+        domain: &email_domains::Model,
+    ) -> Result<Vec<email_providers::Model>, EmailError> {
+        let mut chain = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        if let Ok(primary) = self.get(domain.provider_id).await {
+            if primary.is_active {
+                seen.insert(primary.id);
+                chain.push(primary);
+            }
+        }
+
+        let fallback_links = email_domain_fallback_providers::Entity::find()
+            .filter(email_domain_fallback_providers::Column::DomainId.eq(domain.id))
+            .order_by_asc(email_domain_fallback_providers::Column::Priority)
+            .all(self.db.as_ref())
+            .await?;
+
+        // Batch-fetch every fallback provider in one query instead of one
+        // `self.get(id)` per link, then re-apply the links' priority order —
+        // fallback chains are short today, but this scales with however many
+        // an operator configures instead of being O(n) queries per send.
+        let fallback_provider_ids: Vec<i32> = fallback_links
+            .iter()
+            .map(|link| link.provider_id)
+            .filter(|id| !seen.contains(id))
+            .collect();
+
+        let fallback_providers: std::collections::HashMap<i32, email_providers::Model> =
+            if fallback_provider_ids.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                email_providers::Entity::find()
+                    .filter(email_providers::Column::Id.is_in(fallback_provider_ids))
+                    .all(self.db.as_ref())
+                    .await?
+                    .into_iter()
+                    .map(|p| (p.id, p))
+                    .collect()
+            };
+
+        for link in fallback_links {
+            if seen.contains(&link.provider_id) {
+                continue;
+            }
+            if let Some(provider) = fallback_providers.get(&link.provider_id) {
+                if provider.is_active {
+                    seen.insert(provider.id);
+                    chain.push(provider.clone());
+                }
+            }
+        }
+
+        Ok(chain)
+    }
+
+    /// Add (or re-prioritize, if it already exists) a fallback provider for
+    /// a domain.
+    pub async fn add_fallback_provider(
+        &self,
+        domain_id: i32,
+        provider_id: i32,
+        priority: i32,
+    ) -> Result<email_domain_fallback_providers::Model, EmailError> {
+        // Ensure the provider actually exists — surfaces a clear 404 instead
+        // of a foreign-key violation.
+        self.get(provider_id).await?;
+
+        let existing = email_domain_fallback_providers::Entity::find()
+            .filter(email_domain_fallback_providers::Column::DomainId.eq(domain_id))
+            .filter(email_domain_fallback_providers::Column::ProviderId.eq(provider_id))
+            .one(self.db.as_ref())
+            .await?;
+
+        if let Some(existing) = existing {
+            let mut active_model: email_domain_fallback_providers::ActiveModel = existing.into();
+            active_model.priority = Set(priority);
+            return Ok(active_model.update(self.db.as_ref()).await?);
+        }
+
+        let link = email_domain_fallback_providers::ActiveModel {
+            domain_id: Set(domain_id),
+            provider_id: Set(provider_id),
+            priority: Set(priority),
+            ..Default::default()
+        };
+        Ok(link.insert(self.db.as_ref()).await?)
+    }
+
+    /// List a domain's fallback providers in priority order.
+    pub async fn list_fallback_providers(
+        &self,
+        domain_id: i32,
+    ) -> Result<Vec<email_domain_fallback_providers::Model>, EmailError> {
+        Ok(email_domain_fallback_providers::Entity::find()
+            .filter(email_domain_fallback_providers::Column::DomainId.eq(domain_id))
+            .order_by_asc(email_domain_fallback_providers::Column::Priority)
+            .all(self.db.as_ref())
+            .await?)
+    }
+
+    /// Remove a fallback provider link. A no-op (not an error) if it wasn't
+    /// configured — removing a fallback that's already gone is idempotent.
+    pub async fn remove_fallback_provider(
+        &self,
+        domain_id: i32,
+        provider_id: i32,
+    ) -> Result<(), EmailError> {
+        email_domain_fallback_providers::Entity::delete_many()
+            .filter(email_domain_fallback_providers::Column::DomainId.eq(domain_id))
+            .filter(email_domain_fallback_providers::Column::ProviderId.eq(provider_id))
+            .exec(self.db.as_ref())
+            .await?;
+        Ok(())
+    }
+
+    /// Whether the send path should attempt this provider right now (its
+    /// circuit breaker isn't open from recent consecutive failures).
+    pub fn circuit_allows(&self, provider_id: i32) -> bool {
+        self.circuit_breaker.allow(provider_id)
+    }
+
+    /// Whether this provider is under its configured per-minute send cap.
+    /// Consumes one unit of budget if it returns `true`.
+    pub fn try_acquire_rate_limit(&self, provider: &email_providers::Model) -> bool {
+        self.rate_limiter
+            .try_acquire(provider.id, provider.rate_limit_per_minute)
+    }
+
+    /// Record a successful send against a provider — resets its circuit
+    /// breaker's consecutive-failure count.
+    pub fn record_send_success(&self, provider_id: i32) {
+        self.circuit_breaker.record_success(provider_id);
+    }
+
+    /// Record a failed send attempt against a provider — counts toward
+    /// tripping its circuit breaker open.
+    pub fn record_send_failure(&self, provider_id: i32) {
+        self.circuit_breaker.record_failure(provider_id);
     }
 
     /// Delete a provider
@@ -236,6 +395,13 @@ impl ProviderService {
             if is_active != existing.is_active {
                 active.is_active = Set(is_active);
                 changed_fields.push("is_active".to_string());
+            }
+        }
+
+        if let Some(rate_limit_per_minute) = request.rate_limit_per_minute {
+            if rate_limit_per_minute != existing.rate_limit_per_minute {
+                active.rate_limit_per_minute = Set(rate_limit_per_minute);
+                changed_fields.push("rate_limit_per_minute".to_string());
             }
         }
 
@@ -822,6 +988,7 @@ mod tests {
             region: "us-east-1".to_string(),
             credentials: encrypted,
             is_active: true,
+            rate_limit_per_minute: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -858,6 +1025,7 @@ mod tests {
             region: "fr-par".to_string(),
             credentials: encrypted,
             is_active: true,
+            rate_limit_per_minute: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };

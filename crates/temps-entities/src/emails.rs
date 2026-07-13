@@ -39,6 +39,13 @@ pub struct Model {
     pub click_count: i32,
     pub first_opened_at: Option<DBDateTime>,
     pub first_clicked_at: Option<DBDateTime>,
+    /// Which provider last attempted (or ultimately completed) the send —
+    /// set on both success and exhausted-retry capture, so the UI can show
+    /// which link in the domain's failover chain was used.
+    pub provider_id: Option<i32>,
+    /// Total send attempts across every provider in the domain's failover
+    /// chain, incremented on each retryable failure.
+    pub retry_count: i32,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

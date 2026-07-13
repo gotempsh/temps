@@ -57,10 +57,15 @@ impl DnsVerifier {
 
                     debug!("Found TXT record: {}", txt_data);
 
-                    // Check if the expected value is contained in the TXT record
-                    // For DKIM, we check if the CNAME target matches
-                    // For SPF, we check if the value contains the expected include
-                    if txt_data.contains(expected_value) || expected_value.contains(&txt_data) {
+                    // Only check that the published record contains the expected value
+                    // (DKIM keys/SPF includes are checked as substrings since registrars
+                    // sometimes wrap them with extra text). The reverse check —
+                    // `expected_value.contains(&txt_data)` — used to also be accepted,
+                    // which is a false-positive trap: any short, unrelated TXT record
+                    // (e.g. a single stray character) is trivially a substring of a long
+                    // expected DKIM key, so a domain could be reported "Verified" with a
+                    // DNS record that has nothing to do with the expected value.
+                    if txt_data.contains(expected_value) {
                         return DnsRecordStatus::Verified;
                     }
                 }
@@ -203,6 +208,44 @@ impl DnsVerifier {
             }
             Err(e) => {
                 debug!("SPF lookup failed for {}: {}", domain, e);
+                DnsRecordStatus::Pending
+            }
+        }
+    }
+
+    /// Verify a DMARC policy record: a `_dmarc.<domain>` TXT record starting
+    /// with `v=DMARC1`. Unlike SPF/DKIM/MX, no provider API publishes or
+    /// manages this — it's a plain DNS record the domain owner sets
+    /// independently — so callers generate the expected record themselves
+    /// and use this purely to check whether it's actually live.
+    pub async fn verify_dmarc_record(&self, domain: &str) -> DnsRecordStatus {
+        let name = format!("_dmarc.{}", domain);
+        debug!("Verifying DMARC record: {}", name);
+
+        match self.resolver.txt_lookup(&name).await {
+            Ok(lookup) => {
+                for record in lookup.answers() {
+                    let RData::TXT(txt) = &record.data else {
+                        continue;
+                    };
+                    let txt_data: String = txt
+                        .txt_data
+                        .iter()
+                        .map(|data| String::from_utf8_lossy(data).to_string())
+                        .collect();
+
+                    debug!("Found TXT record: {}", txt_data);
+
+                    if txt_data.starts_with("v=DMARC1") {
+                        return DnsRecordStatus::Verified;
+                    }
+                }
+
+                debug!("No matching DMARC record found for {}", name);
+                DnsRecordStatus::Pending
+            }
+            Err(e) => {
+                debug!("DMARC lookup failed for {}: {}", name, e);
                 DnsRecordStatus::Pending
             }
         }

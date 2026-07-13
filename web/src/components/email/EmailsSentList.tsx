@@ -8,11 +8,9 @@ import {
   type EmailStatsResponse,
   type PaginatedEmailsResponse,
 } from '@/api/client'
-import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { EmptyState } from '@/components/ui/empty-state'
-import { Input } from '@/components/ui/input'
 import {
   Select,
   SelectContent,
@@ -32,7 +30,6 @@ import {
 import { useQuery } from '@tanstack/react-query'
 import { formatDistanceToNow } from 'date-fns'
 import {
-  AlertCircle,
   Archive,
   CheckCircle2,
   ChevronLeft,
@@ -42,25 +39,16 @@ import {
   Mail,
   MailX,
   MousePointerClick,
-  Search,
 } from 'lucide-react'
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { StatusBadge } from './shared'
+import { problemMessage } from './sharedUtils'
 
 // Types (aliases over SDK)
 type PaginatedEmails = PaginatedEmailsResponse
 type EmailStats = EmailStatsResponse
 type EmailDomain = EmailDomainResponse
-
-function problemMessage(error: unknown, fallback: string): string {
-  if (error && typeof error === 'object' && 'detail' in error) {
-    const detail = (error as { detail?: unknown }).detail
-    if (typeof detail === 'string' && detail.length > 0) {
-      return detail
-    }
-  }
-  return fallback
-}
 
 async function fetchEmails(params: {
   domain_id?: number
@@ -91,41 +79,6 @@ async function listEmailDomains(): Promise<EmailDomain[]> {
     throw new Error(problemMessage(response.error, 'Failed to fetch email domains'))
   }
   return response.data ?? []
-}
-
-function StatusBadge({ status }: { status: string }) {
-  switch (status) {
-    case 'sent':
-      return (
-        <Badge variant="default" className="gap-1">
-          <CheckCircle2 className="h-3 w-3" />
-          Sent
-        </Badge>
-      )
-    case 'queued':
-      return (
-        <Badge variant="secondary" className="gap-1">
-          <Clock className="h-3 w-3" />
-          Queued
-        </Badge>
-      )
-    case 'failed':
-      return (
-        <Badge variant="destructive" className="gap-1">
-          <AlertCircle className="h-3 w-3" />
-          Failed
-        </Badge>
-      )
-    case 'captured':
-      return (
-        <Badge variant="outline" className="gap-1 border-blue-500 text-blue-600">
-          <Archive className="h-3 w-3" />
-          Captured
-        </Badge>
-      )
-    default:
-      return <Badge variant="outline">{status}</Badge>
-  }
 }
 
 function StatsCard({
@@ -266,17 +219,7 @@ export function EmailsSentList() {
       )}
 
       {/* Filters */}
-      <div className="flex flex-col sm:flex-row gap-4">
-        <div className="flex-1">
-          <div className="relative">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-            <Input
-              placeholder="Search emails..."
-              className="pl-9"
-              disabled
-            />
-          </div>
-        </div>
+      <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
         <Select
           value={filters.domain_id?.toString() ?? 'all'}
           onValueChange={(value) =>

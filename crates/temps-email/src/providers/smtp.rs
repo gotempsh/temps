@@ -279,7 +279,17 @@ impl EmailProvider for SmtpProvider {
 
         self.transport.send(message).await.map_err(|e| {
             error!("Failed to send email via SMTP: {}", e);
-            EmailError::Smtp(format!("Failed to send email: {}", e))
+            // 4xx SMTP replies (is_transient) and connection-level failures
+            // (is_client/is_timeout/is_transport_shutdown) are worth retrying;
+            // a 5xx permanent reply from the relay will reject the same
+            // message again.
+            let retryable =
+                e.is_transient() || e.is_timeout() || e.is_client() || e.is_transport_shutdown();
+            EmailError::SendFailed {
+                provider: EmailProviderType::Smtp,
+                retryable,
+                reason: format!("Failed to send email: {}", e),
+            }
         })?;
 
         debug!("Email sent via SMTP, message_id: {}", message_id);

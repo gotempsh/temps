@@ -103,7 +103,7 @@ pub async fn probe_mailbox(config: SmtpProbeConfig<'_>) -> SmtpProbe {
 /// MX); a reachable host that rejects the mailbox is still `Ok`.
 async fn probe_single_host(host: &str, config: &SmtpProbeConfig<'_>) -> Result<SmtpProbe, String> {
     let addr = format!("{host}:25");
-    let mut stream = connect(&addr, config).await?;
+    let mut stream = connect(host, &addr, config).await?;
 
     // Greeting.
     let greeting = read_reply(&mut stream, config.timeout).await?;
@@ -213,7 +213,26 @@ fn classify_rcpt_reply(reply: &str) -> RcptOutcome {
 }
 
 /// Open the connection — direct or via SOCKS5 — applying the connect timeout.
-async fn connect(addr: &str, config: &SmtpProbeConfig<'_>) -> Result<SmtpStream, String> {
+///
+/// `host` is a domain's own MX record, resolved from whatever email address
+/// a caller submits for validation — attacker-controlled input. For the
+/// direct (non-proxied) path, the Temps server itself performs the DNS
+/// resolution and TCP connect, so a domain whose MX record points at an
+/// internal/private/link-local/cloud-metadata address would otherwise let an
+/// authenticated user make this server probe its own internal network on
+/// port 25. The proxied path is exempt: that proxy is operator-configured,
+/// not attacker-controlled, and resolution there happens proxy-side.
+///
+/// The direct path resolves `host` exactly once and connects to that pinned
+/// `SocketAddr` — it deliberately does NOT validate via
+/// `validate_domain_async(host)` and then separately `TcpStream::connect(addr)`,
+/// since that would re-resolve the hostname a second time. Because `host` is
+/// attacker-controlled, an attacker's DNS server can answer a public IP for
+/// the first (validation) lookup and a private/internal one for the second
+/// (connect) lookup — a classic DNS-rebinding TOCTOU that fully defeats the
+/// validation. Resolving once and validating the address actually used
+/// closes that window.
+async fn connect(host: &str, addr: &str, config: &SmtpProbeConfig<'_>) -> Result<SmtpStream, String> {
     match config.proxy {
         Some(proxy) => {
             let proxy_addr = format!("{}:{}", proxy.host, proxy.port);
@@ -237,11 +256,40 @@ async fn connect(addr: &str, config: &SmtpProbeConfig<'_>) -> Result<SmtpStream,
                 .map(SmtpStream::Proxied)
                 .map_err(|e| format!("SOCKS5 connect to {addr} failed: {e}"))
         }
-        None => timeout(config.timeout, TcpStream::connect(addr))
+        None => {
+            let resolved: Vec<std::net::SocketAddr> = timeout(
+                config.timeout,
+                tokio::net::lookup_host(addr),
+            )
             .await
-            .map_err(|_| format!("TCP connect to {addr} timed out"))?
-            .map(SmtpStream::Direct)
-            .map_err(|e| format!("TCP connect to {addr} failed: {e}")),
+            .map_err(|_| format!("DNS resolution of {addr} timed out"))?
+            .map_err(|e| format!("Failed to resolve {addr}: {e}"))?
+            .collect();
+
+            if resolved.is_empty() {
+                return Err(format!("No addresses found for {addr}"));
+            }
+
+            // Reject the whole result if any resolved address is
+            // blocked, not just skip it — an attacker's DNS response
+            // mixing a public and a private IP shouldn't get a free
+            // pick of which one validation "sees".
+            for socket_addr in &resolved {
+                let validation = match socket_addr.ip() {
+                    std::net::IpAddr::V4(ip) => temps_core::url_validation::validate_ipv4(&ip),
+                    std::net::IpAddr::V6(ip) => temps_core::url_validation::validate_ipv6(&ip),
+                };
+                if let Err(e) = validation {
+                    return Err(format!("Refusing to probe {host}: {e}"));
+                }
+            }
+
+            timeout(config.timeout, TcpStream::connect(resolved.as_slice()))
+                .await
+                .map_err(|_| format!("TCP connect to {addr} timed out"))?
+                .map(SmtpStream::Direct)
+                .map_err(|e| format!("TCP connect to {addr} failed: {e}"))
+        }
     }
 }
 
@@ -356,6 +404,44 @@ mod tests {
     fn test_random_token_unique() {
         assert_ne!(random_token(), random_token());
         assert_eq!(random_token().len(), 16);
+    }
+
+    fn test_config() -> SmtpProbeConfig<'static> {
+        SmtpProbeConfig {
+            mx_hosts: &[],
+            to_email: "test@example.com",
+            from_email: "noreply@temps.sh",
+            hello_name: "temps.sh",
+            timeout: Duration::from_secs(2),
+            proxy: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_connect_rejects_private_ip_host() {
+        let config = test_config();
+        match connect("10.0.0.5", "10.0.0.5:25", &config).await {
+            Ok(_) => panic!("must refuse an RFC 1918 private host"),
+            Err(e) => assert!(e.contains("Refusing to probe"), "got: {e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_connect_rejects_loopback_host() {
+        let config = test_config();
+        match connect("127.0.0.1", "127.0.0.1:25", &config).await {
+            Ok(_) => panic!("must refuse a loopback host"),
+            Err(e) => assert!(e.contains("Refusing to probe"), "got: {e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_connect_rejects_cloud_metadata_host() {
+        let config = test_config();
+        match connect("169.254.169.254", "169.254.169.254:25", &config).await {
+            Ok(_) => panic!("must refuse the cloud metadata address"),
+            Err(e) => assert!(e.contains("Refusing to probe"), "got: {e}"),
+        }
     }
 
     #[tokio::test]

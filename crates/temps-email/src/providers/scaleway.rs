@@ -32,7 +32,12 @@ impl ScalewayProvider {
 
     /// Create a new Scaleway provider with the given credentials
     pub fn new(credentials: &ScalewayCredentials, region: &str) -> Result<Self, EmailError> {
-        let client = Client::new();
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| {
+                EmailError::Scaleway(format!("Failed to build Scaleway HTTP client: {}", e))
+            })?;
 
         Ok(Self {
             client,
@@ -398,7 +403,14 @@ impl EmailProvider for ScalewayProvider {
             .json(&request)
             .send()
             .await
-            .map_err(|e| EmailError::Scaleway(format!("Failed to send email: {}", e)))?;
+            .map_err(|e| EmailError::SendFailed {
+                provider: EmailProviderType::Scaleway,
+                // A request that never reached Scaleway (DNS/connect/timeout) is
+                // worth retrying — it says nothing about whether the message itself
+                // is deliverable.
+                retryable: true,
+                reason: format!("Failed to send email: {}", e),
+            })?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -407,23 +419,33 @@ impl EmailProvider for ScalewayProvider {
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
             error!("Failed to send email via Scaleway ({}): {}", status, body);
-            return Err(EmailError::Scaleway(format!(
-                "Failed to send email ({}): {}",
-                status, body
-            )));
+            return Err(EmailError::SendFailed {
+                provider: EmailProviderType::Scaleway,
+                // 5xx and 429 are Scaleway-side transient conditions; any other
+                // 4xx (bad request, invalid recipient, auth failure) won't change
+                // on retry.
+                retryable: status.is_server_error() || status.as_u16() == 429,
+                reason: format!("Failed to send email ({}): {}", status, body),
+            });
         }
 
-        let email_response: ScalewayEmailResponse = response
-            .json()
-            .await
-            .map_err(|e| EmailError::Scaleway(format!("Failed to parse email response: {}", e)))?;
+        let email_response: ScalewayEmailResponse =
+            response.json().await.map_err(|e| EmailError::SendFailed {
+                provider: EmailProviderType::Scaleway,
+                retryable: false,
+                reason: format!("Failed to parse email response: {}", e),
+            })?;
 
         let message_id = email_response
             .emails
             .first()
             .and_then(|e| e.message_id.clone())
             .or_else(|| email_response.emails.first().map(|e| e.id.clone()))
-            .ok_or_else(|| EmailError::Scaleway("No message ID returned".to_string()))?;
+            .ok_or_else(|| EmailError::SendFailed {
+                provider: EmailProviderType::Scaleway,
+                retryable: false,
+                reason: "No message ID returned".to_string(),
+            })?;
 
         debug!("Email sent successfully, message_id: {}", message_id);
 

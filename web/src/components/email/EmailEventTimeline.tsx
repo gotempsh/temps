@@ -14,18 +14,15 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import {
-  AlertTriangle,
   ChevronLeft,
   ChevronRight,
-  Eye,
   Globe,
   Mail,
-  MailWarning,
   Monitor,
-  MousePointerClick,
-  Send,
 } from 'lucide-react'
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
+import { EventBadge, EventIcon } from './shared'
+import { parseUserAgent } from './sharedUtils'
 
 interface EmailEvent {
   id: number
@@ -39,96 +36,23 @@ interface EmailEvent {
   created_at: string
 }
 
-interface PaginatedEmailEvents {
-  events: EmailEvent[]
-  total: number
-  page: number
-  page_size: number
-}
-
-async function fetchEmailEvents(
-  emailId: string,
-  params: { event_type?: string; page?: number; page_size?: number }
-): Promise<PaginatedEmailEvents> {
+// NOTE: the `/emails/{id}/tracking/events` endpoint (temps-email's
+// `get_email_events` handler / `EventsQuery`) only supports an `event_type`
+// filter — it has no `page`/`page_size` params and always returns the full
+// event list for the email. Unlike EmailAnalytics.tsx's `fetchAllEvents`
+// (which hits the paginated `/emails/events` endpoint), there is currently
+// no server-side pagination available for a single email's event history.
+// We fetch the full list once per (emailId, eventType) — bounded by the
+// number of tracking events for one email — and paginate over it
+// client-side, without keeping `page` in the query key so switching pages
+// doesn't trigger a redundant network refetch of the same data.
+async function fetchEmailEvents(emailId: string, eventType?: string): Promise<EmailEvent[]> {
   const searchParams = new URLSearchParams()
-  if (params.event_type) searchParams.set('event_type', params.event_type)
+  if (eventType) searchParams.set('event_type', eventType)
 
   const response = await fetch(`/api/emails/${emailId}/tracking/events?${searchParams}`)
   if (!response.ok) throw new Error('Failed to fetch email events')
-  const events: EmailEvent[] = await response.json()
-
-  // Backend returns a flat array; apply client-side pagination
-  const page = params.page ?? 1
-  const pageSize = params.page_size ?? 20
-  const start = (page - 1) * pageSize
-  const paged = events.slice(start, start + pageSize)
-
-  return {
-    events: paged,
-    total: events.length,
-    page,
-    page_size: pageSize,
-  }
-}
-
-function EventIcon({ type }: { type: string }) {
-  switch (type) {
-    case 'open':
-    case 'opened':
-      return <Eye className="h-4 w-4 text-blue-500" />
-    case 'click':
-    case 'clicked':
-      return <MousePointerClick className="h-4 w-4 text-green-500" />
-    case 'delivered':
-      return <Send className="h-4 w-4 text-emerald-500" />
-    case 'bounced':
-      return <MailWarning className="h-4 w-4 text-red-500" />
-    case 'complained':
-      return <AlertTriangle className="h-4 w-4 text-orange-500" />
-    default:
-      return <Mail className="h-4 w-4 text-muted-foreground" />
-  }
-}
-
-function EventBadge({ type }: { type: string }) {
-  const variants: Record<string, { variant: 'default' | 'secondary' | 'destructive' | 'outline'; label: string }> = {
-    open: { variant: 'secondary', label: 'Opened' },
-    opened: { variant: 'secondary', label: 'Opened' },
-    click: { variant: 'default', label: 'Clicked' },
-    clicked: { variant: 'default', label: 'Clicked' },
-    delivered: { variant: 'outline', label: 'Delivered' },
-    bounced: { variant: 'destructive', label: 'Bounced' },
-    complained: { variant: 'destructive', label: 'Complained' },
-  }
-
-  const config = variants[type] || { variant: 'outline' as const, label: type }
-
-  return (
-    <Badge variant={config.variant} className="gap-1 text-xs">
-      <EventIcon type={type} />
-      {config.label}
-    </Badge>
-  )
-}
-
-function parseUserAgent(ua: string): string {
-  // Email image proxies (check first — they masquerade as browsers)
-  if (ua.includes('GoogleImageProxy') || ua.includes('ggpht.com')) return 'Gmail (Google Proxy)'
-  if (ua.includes('YahooMailProxy')) return 'Yahoo Mail (Proxy)'
-  if (ua.includes('Outlook-iOS') || ua.includes('Outlook-Android')) return 'Outlook Mobile'
-  // Email clients
-  if (ua.includes('Gmail')) return 'Gmail'
-  if (ua.includes('Yahoo')) return 'Yahoo Mail'
-  if (ua.includes('Outlook') || ua.includes('Microsoft')) return 'Outlook'
-  if (ua.includes('Thunderbird')) return 'Thunderbird'
-  if (ua.includes('Apple Mail')) return 'Apple Mail'
-  // Browsers
-  if (ua.includes('Chrome') && !ua.includes('Chromium')) return 'Chrome'
-  if (ua.includes('Firefox')) return 'Firefox'
-  if (ua.includes('Safari') && !ua.includes('Chrome')) return 'Safari'
-  if (ua.includes('AppleWebKit')) return 'WebKit'
-  if (ua.length > 50) return ua.substring(0, 50) + '...'
-  return ua
+  return response.json()
 }
 
 export function EmailEventTimeline({ emailId }: { emailId: string }) {
@@ -136,17 +60,25 @@ export function EmailEventTimeline({ emailId }: { emailId: string }) {
   const [page, setPage] = useState(1)
   const pageSize = 20
 
-  const { data, isLoading, error } = useQuery({
-    queryKey: ['email-events', emailId, eventType, page],
-    queryFn: () =>
-      fetchEmailEvents(emailId, {
-        event_type: eventType,
-        page,
-        page_size: pageSize,
-      }),
+  const {
+    data: events,
+    isLoading,
+    error,
+  } = useQuery({
+    queryKey: ['email-events', emailId, eventType],
+    queryFn: () => fetchEmailEvents(emailId, eventType),
   })
 
-  const totalPages = data ? Math.ceil(data.total / pageSize) : 0
+  const total = events?.length ?? 0
+  const totalPages = Math.ceil(total / pageSize)
+  const data = useMemo(() => {
+    if (!events) return undefined
+    const start = (page - 1) * pageSize
+    return {
+      events: events.slice(start, start + pageSize),
+      total,
+    }
+  }, [events, page, total])
 
   if (isLoading) {
     return (
@@ -207,8 +139,8 @@ export function EmailEventTimeline({ emailId }: { emailId: string }) {
             <SelectContent>
               <SelectItem value="all">All events</SelectItem>
               <SelectItem value="delivered">Delivered</SelectItem>
-              <SelectItem value="open">Opened</SelectItem>
-              <SelectItem value="click">Clicked</SelectItem>
+              <SelectItem value="opened">Opened</SelectItem>
+              <SelectItem value="clicked">Clicked</SelectItem>
               <SelectItem value="bounced">Bounced</SelectItem>
               <SelectItem value="complained">Complained</SelectItem>
             </SelectContent>

@@ -59,6 +59,7 @@ import { useEffect, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { toast } from 'sonner'
 import { z } from 'zod'
+import { problemMessage } from './sharedUtils'
 
 // Types for email providers — alias over SDK response
 type EmailProvider = EmailProviderResponse
@@ -127,16 +128,6 @@ const createProviderSchema = z.object({
 })
 
 type CreateProviderFormData = z.infer<typeof createProviderSchema>
-
-function problemMessage(error: unknown, fallback: string): string {
-  if (error && typeof error === 'object' && 'detail' in error) {
-    const detail = (error as { detail?: unknown }).detail
-    if (typeof detail === 'string' && detail.length > 0) {
-      return detail
-    }
-  }
-  return fallback
-}
 
 async function listEmailProviders(): Promise<EmailProvider[]> {
   const response = await listProviders2()

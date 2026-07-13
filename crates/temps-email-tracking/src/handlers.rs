@@ -28,12 +28,14 @@ use uuid::Uuid;
 use crate::event_service::{EmailEventService, EmailEventStats, ListEmailEventsOptions};
 use crate::hmac::verify_tracking_hmac;
 use crate::sns::SnsVerifier;
+use temps_email::SuppressionService;
 
 /// Shared state for tracking handlers
 pub struct TrackingState {
     pub event_service: Arc<EmailEventService>,
     pub sns_verifier: Arc<SnsVerifier>,
     pub hmac_key: Vec<u8>,
+    pub suppression_service: Arc<SuppressionService>,
 }
 
 /// OpenAPI documentation
@@ -157,6 +159,16 @@ async fn click_handler(
         return Redirect::temporary("/").into_response();
     }
 
+    // Reject private/loopback/link-local/cloud-metadata targets — the URL
+    // here comes from whatever HTML the sender submitted (rewritten +
+    // HMAC-signed at send time, not filtered), so without this check a
+    // sender could embed an internal URL and get our own domain to 302
+    // recipients into it. Mirrors the same SSRF check temps-email's
+    // should_track_link() applies at rewrite time instead of redirect time.
+    if temps_core::url_validation::validate_external_url(&url).is_err() {
+        return Redirect::temporary("/").into_response();
+    }
+
     // Fire-and-forget: record click event
     let event_service = state.event_service.clone();
     let ip = extract_ip(&headers);
@@ -220,18 +232,54 @@ async fn ses_webhook_handler(State(state): State<Arc<TrackingState>>, body: Stri
             let provider_message_id = ses_event.mail.message_id.clone();
             let (event_type, metadata, recipients) = SnsVerifier::map_ses_event(&ses_event);
 
+            // Only a *permanent* bounce means the mailbox is really gone —
+            // a transient/soft bounce (mailbox full, greylisting, etc.) is
+            // expected to succeed on a later send and must not suppress it.
+            let is_hard_bounce = ses_event
+                .bounce
+                .as_ref()
+                .map(|b| b.bounce_type == "Permanent")
+                .unwrap_or(false);
+            let is_complaint = event_type == "complained";
+
             // Record an event for each recipient
             let event_service = state.event_service.clone();
+            let suppression_service = state.suppression_service.clone();
             let sns_msg_id = sns_message.message_id.clone();
 
             tokio::spawn(async move {
+                // Correlate to the actual email we sent via its provider
+                // message ID. Falls back to a nil UUID (unmatched) only when
+                // no such email exists in our DB — e.g. it was sent through
+                // this SES account outside Temps' own send() path — or the
+                // lookup itself fails, so the event is still recorded (and
+                // visible to an operator via provider_message_id) rather than
+                // silently dropped.
+                let email_id = match event_service
+                    .find_email_id_by_provider_message_id(&provider_message_id)
+                    .await
+                {
+                    Ok(Some(id)) => id,
+                    Ok(None) => {
+                        warn!(
+                            "No email found for provider_message_id {}, recording {} event unmatched",
+                            provider_message_id, event_type
+                        );
+                        Uuid::nil()
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to look up email for provider_message_id {}: {}",
+                            provider_message_id, e
+                        );
+                        Uuid::nil()
+                    }
+                };
+
                 for recipient in &recipients {
                     if let Err(e) = event_service
                         .record_event(
-                            // Look up email by provider_message_id — for now, use a nil UUID
-                            // since we need a DB lookup. The provider_message_id is stored
-                            // for correlation.
-                            Uuid::nil(),
+                            email_id,
                             &event_type,
                             Some(format!("{}:{}", sns_msg_id, recipient)),
                             Some(recipient.clone()),
@@ -245,6 +293,25 @@ async fn ses_webhook_handler(State(state): State<Arc<TrackingState>>, body: Stri
                             "Failed to record {} event for {}: {}",
                             event_type, provider_message_id, e
                         );
+                    }
+
+                    if is_hard_bounce || is_complaint {
+                        let reason = if is_complaint {
+                            temps_email::SuppressionReason::Complained
+                        } else {
+                            temps_email::SuppressionReason::Bounced
+                        };
+                        let detail = format!(
+                            "SES {} for message {}",
+                            if is_complaint { "complaint" } else { "permanent bounce" },
+                            provider_message_id
+                        );
+                        if let Err(e) = suppression_service
+                            .suppress(recipient, reason, None, Some(detail))
+                            .await
+                        {
+                            warn!("Failed to suppress {}: {}", recipient, e);
+                        }
                     }
                 }
 

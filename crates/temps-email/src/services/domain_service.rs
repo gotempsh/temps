@@ -8,6 +8,7 @@ use std::sync::Arc;
 use temps_entities::email_domains;
 use tracing::{debug, error, info, warn};
 
+use crate::dns::DnsVerifier;
 use crate::errors::EmailError;
 use crate::providers::{DnsRecord, DnsRecordStatus, DomainIdentityDetails, VerificationStatus};
 use crate::services::ProviderService;
@@ -81,6 +82,8 @@ impl DomainService {
         if let Some(mx) = &identity.mx_record {
             dns_records.push(mx.clone());
         }
+
+        dns_records.push(Self::dmarc_record_template(&request.domain));
 
         // Store domain in database
         let domain = email_domains::ActiveModel {
@@ -167,7 +170,9 @@ impl DomainService {
                     records.push(mx);
                 }
 
-                // Compute status based on all DNS records being verified
+                // Compute status based on all DNS records being verified.
+                // DMARC deliberately isn't part of this — see
+                // `dmarc_record_template`'s doc comment.
                 let all_verified = Self::are_all_records_verified(&identity_details);
                 let status = if all_verified {
                     "verified".to_string()
@@ -180,6 +185,8 @@ impl DomainService {
                         "pending".to_string()
                     }
                 };
+
+                records.push(Self::dmarc_record_live(&domain.domain).await);
 
                 (records, status)
             }
@@ -348,7 +355,8 @@ impl DomainService {
             .iter()
             .any(|r| r.status == DnsRecordStatus::Failed);
 
-        // Determine final status based on DNS record verification
+        // Determine final status based on DNS record verification. DMARC is
+        // intentionally excluded — see `dmarc_record_template`'s doc comment.
         let status = if all_dns_verified {
             debug!("All DNS records verified via DNS lookup, marking domain as verified");
             VerificationStatus::Verified
@@ -358,6 +366,8 @@ impl DomainService {
             // Use the provider's overall status for pending/other states
             identity_details.overall_status
         };
+
+        dns_records.push(Self::dmarc_record_live(&domain.domain).await);
 
         // Update domain status in database
         let mut active_model: email_domains::ActiveModel = domain.into();
@@ -431,6 +441,34 @@ impl DomainService {
         Ok(())
     }
 
+    /// The recommended DMARC policy record for a domain. Unlike SPF/DKIM/MX,
+    /// no provider API publishes or manages DMARC — it's a plain DNS TXT
+    /// record the domain owner sets independently — so it's generated here
+    /// rather than surfaced by `EmailProvider::get_identity_details`, and
+    /// deliberately left out of `are_all_records_verified`/failure checks:
+    /// requiring it would regress every already-verified domain the next
+    /// time its status is recomputed. It's informational, not required.
+    fn dmarc_record_template(domain: &str) -> DnsRecord {
+        DnsRecord {
+            record_type: "TXT".to_string(),
+            name: format!("_dmarc.{}", domain),
+            // Quarantine (not reject) by default — a safe starting policy
+            // that won't silently drop mail for a domain that hasn't
+            // fully tuned SPF/DKIM alignment yet.
+            value: "v=DMARC1; p=quarantine; pct=100".to_string(),
+            priority: None,
+            status: DnsRecordStatus::Pending,
+        }
+    }
+
+    /// DMARC record with its live-verified status, for paths that already
+    /// do a live DNS lookup for SPF/DKIM/MX.
+    async fn dmarc_record_live(domain: &str) -> DnsRecord {
+        let mut record = Self::dmarc_record_template(domain);
+        record.status = DnsVerifier::new().verify_dmarc_record(domain).await;
+        record
+    }
+
     /// Build DNS records from stored domain data (fallback when provider API unavailable)
     fn build_dns_records(&self, domain: &email_domains::Model) -> Vec<DnsRecord> {
         let mut records = Vec::new();
@@ -467,6 +505,10 @@ impl DomainService {
                 status: DnsRecordStatus::Unknown,
             });
         }
+
+        let mut dmarc = Self::dmarc_record_template(&domain.domain);
+        dmarc.status = DnsRecordStatus::Unknown;
+        records.push(dmarc);
 
         records
     }
@@ -642,7 +684,7 @@ mod tests {
 
         let records = service.build_dns_records(&domain);
 
-        assert_eq!(records.len(), 3); // SPF, DKIM, MX
+        assert_eq!(records.len(), 4); // SPF, DKIM, MX, DMARC
 
         // Verify SPF record
         let spf = records
@@ -659,6 +701,12 @@ mod tests {
         let mx = records.iter().find(|r| r.record_type == "MX");
         assert!(mx.is_some());
         assert_eq!(mx.unwrap().priority, Some(10));
+
+        // Verify DMARC record — always generated, unlike the provider-supplied
+        // records above, since no provider API manages it.
+        let dmarc = records.iter().find(|r| r.name == "_dmarc.example.com");
+        assert!(dmarc.is_some());
+        assert!(dmarc.unwrap().value.starts_with("v=DMARC1"));
     }
 
     // ========== Integration Tests (require Docker) ==========

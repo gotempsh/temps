@@ -3,6 +3,8 @@
 mod domain_service;
 mod email_service;
 mod provider_service;
+mod resilience;
+mod suppression_service;
 mod tracking_service;
 #[cfg(test)]
 mod tracking_service_integration_tests;
@@ -17,6 +19,7 @@ pub use provider_service::{
     CreateProviderRequest, ProviderCredentials, ProviderService, TestEmailResult,
     UpdateProviderOutcome, UpdateProviderRequest,
 };
+pub use suppression_service::{SuppressionReason, SuppressionService};
 pub use tracking_service::{ExtractedLink, TrackingEvent, TrackingService, TransformResult};
 pub use validation::{
     MiscResult, MxResult, ProxyConfig, ReachabilityStatus, SmtpResult, SyntaxResult,

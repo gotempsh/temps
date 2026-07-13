@@ -4,6 +4,7 @@ import { getEmailOptions } from '@/api/client/@tanstack/react-query.gen'
 import { client } from '@/api/client/client.gen'
 import { EmailResponse } from '@/api/client/types.gen'
 import { EmailEventTimeline } from '@/components/email/EmailEventTimeline'
+import { StatusBadge } from '@/components/email/shared'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -16,10 +17,7 @@ import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import {
   AlertCircle,
-  Archive,
   ArrowLeft,
-  CheckCircle2,
-  Clock,
   Code,
   Eye,
   FileText,
@@ -29,41 +27,6 @@ import {
 } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
-
-function StatusBadge({ status }: { status: string }) {
-  switch (status) {
-    case 'sent':
-      return (
-        <Badge variant="default" className="gap-1">
-          <CheckCircle2 className="h-3 w-3" />
-          Sent
-        </Badge>
-      )
-    case 'queued':
-      return (
-        <Badge variant="secondary" className="gap-1">
-          <Clock className="h-3 w-3" />
-          Queued
-        </Badge>
-      )
-    case 'failed':
-      return (
-        <Badge variant="destructive" className="gap-1">
-          <AlertCircle className="h-3 w-3" />
-          Failed
-        </Badge>
-      )
-    case 'captured':
-      return (
-        <Badge variant="outline" className="gap-1 border-blue-500 text-blue-600">
-          <Archive className="h-3 w-3" />
-          Captured
-        </Badge>
-      )
-    default:
-      return <Badge variant="outline">{status}</Badge>
-  }
-}
 
 function HeadersDisplay({ headers }: { headers: Record<string, string> | null | undefined }) {
   if (!headers || Object.keys(headers).length === 0) {

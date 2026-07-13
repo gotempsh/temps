@@ -50,6 +50,9 @@ pub fn configure_public_routes() -> Router<Arc<AppState>> {
         domains::verify_domain,
         domains::delete_email_domain,
         domains::setup_dns,
+        domains::list_domain_fallback_providers,
+        domains::add_domain_fallback_provider,
+        domains::remove_domain_fallback_provider,
         // Emails
         emails::send_email,
         emails::list_emails,
@@ -86,6 +89,8 @@ pub fn configure_public_routes() -> Router<Arc<AppState>> {
             types::SetupDnsRequest,
             types::SetupDnsResponse,
             types::DnsRecordSetupResult,
+            types::EmailDomainFallbackProviderResponse,
+            types::AddFallbackProviderRequest,
             // Email types
             types::SendEmailRequestBody,
             types::SendEmailResponseBody,

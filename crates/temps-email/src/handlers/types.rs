@@ -172,6 +172,11 @@ pub struct UpdateEmailProviderRequest {
     pub region: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_active: Option<bool>,
+    /// Send-path cap for this provider. Omit to leave unchanged; set to
+    /// clamp throughput (e.g. a rate-limited SMTP relay).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = 120)]
+    pub rate_limit_per_minute: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ses_credentials: Option<SesCredentialsRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -189,6 +194,9 @@ pub struct EmailProviderResponse {
     #[schema(example = "us-east-1")]
     pub region: String,
     pub is_active: bool,
+    /// Send-path cap for this provider, if configured. `null` = unlimited.
+    #[schema(example = 120)]
+    pub rate_limit_per_minute: Option<i32>,
     /// Masked credentials for display
     pub credentials: serde_json::Value,
     #[schema(example = "2025-12-03T10:30:00Z")]
@@ -295,6 +303,27 @@ pub struct EmailDomainResponse {
 pub struct EmailDomainWithDnsResponse {
     pub domain: EmailDomainResponse,
     pub dns_records: Vec<DnsRecordResponse>,
+}
+
+/// A backup provider configured for a domain's send failover chain.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct EmailDomainFallbackProviderResponse {
+    pub id: i32,
+    pub domain_id: i32,
+    pub provider_id: i32,
+    /// Lower priority is tried first, after the domain's primary provider.
+    pub priority: i32,
+    #[schema(example = "2025-12-03T10:30:00Z")]
+    pub created_at: String,
+}
+
+/// Request to add (or re-prioritize) a fallback provider for a domain.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct AddFallbackProviderRequest {
+    pub provider_id: i32,
+    /// Lower priority is tried first, after the domain's primary provider.
+    #[serde(default)]
+    pub priority: i32,
 }
 
 /// Request to setup DNS records using a configured DNS provider

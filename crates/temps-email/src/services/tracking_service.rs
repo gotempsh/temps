@@ -250,7 +250,7 @@ impl TrackingService {
         // Record the event
         let event = email_events::ActiveModel {
             email_id: Set(email_id),
-            event_type: Set("open".to_string()),
+            event_type: Set("opened".to_string()),
             ip_address: Set(ip_address),
             user_agent: Set(user_agent),
             ..Default::default()
@@ -296,7 +296,7 @@ impl TrackingService {
         // Record the event
         let event = email_events::ActiveModel {
             email_id: Set(email_id),
-            event_type: Set("click".to_string()),
+            event_type: Set("clicked".to_string()),
             link_url: Set(Some(redirect_url.clone())),
             link_index: Set(Some(link_index)),
             ip_address: Set(ip_address),
@@ -342,7 +342,8 @@ impl TrackingService {
             email_events::Entity::find().filter(email_events::Column::EmailId.eq(email_id));
 
         if let Some(et) = event_type {
-            query = query.filter(email_events::Column::EventType.eq(et));
+            query = query
+                .filter(email_events::Column::EventType.eq(normalize_event_type_filter(et)));
         }
 
         let events = query
@@ -380,9 +381,9 @@ impl TrackingService {
                     WHERE click_count > 0
                       AND (track_opens = true OR track_clicks = true)) AS emails_with_clicks,
                 (SELECT COUNT(DISTINCT email_id) FROM email_events
-                    WHERE event_type = 'bounce') AS emails_with_bounces,
+                    WHERE event_type = 'bounced') AS emails_with_bounces,
                 (SELECT COUNT(DISTINCT email_id) FROM email_events
-                    WHERE event_type = 'complaint') AS emails_with_complaints
+                    WHERE event_type = 'complained') AS emails_with_complaints
         "#;
 
         let row = StatsRow::find_by_statement(Statement::from_string(
@@ -432,7 +433,8 @@ impl TrackingService {
         let mut query = email_events::Entity::find();
 
         if let Some(et) = event_type {
-            query = query.filter(email_events::Column::EventType.eq(et));
+            query = query
+                .filter(email_events::Column::EventType.eq(normalize_event_type_filter(et)));
         }
 
         let paginator = query
@@ -452,6 +454,63 @@ impl TrackingService {
             .all(self.db.as_ref())
             .await?;
         Ok(links)
+    }
+
+    /// Delete tracking events older than `retention_days`. Each event row
+    /// pins an IP address and user-agent string to an individual open/click
+    /// indefinitely — this is the GDPR-relevant cleanup for that data,
+    /// called on a schedule by `EmailPlugin::initialize_plugin_services`.
+    ///
+    /// Deletes in bounded batches rather than one `DELETE ... WHERE
+    /// created_at < cutoff` — this table previously had no retention policy
+    /// at all, so the first sweep on an existing database could otherwise
+    /// try to delete a very large backlog in a single transaction, holding
+    /// locks and consuming memory disproportionate to the reference 3
+    /// vCPU/4 GB deployment. Returns the total number of rows deleted.
+    pub async fn purge_events_older_than(&self, retention_days: i64) -> Result<u64, EmailError> {
+        use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+        const BATCH_SIZE: i64 = 5_000;
+        let cutoff = Utc::now() - chrono::Duration::days(retention_days);
+        let mut total_deleted: u64 = 0;
+
+        loop {
+            let result = self
+                .db
+                .execute(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "DELETE FROM email_events WHERE id IN \
+                     (SELECT id FROM email_events WHERE created_at < $1 LIMIT $2)",
+                    [cutoff.into(), BATCH_SIZE.into()],
+                ))
+                .await?;
+
+            let deleted = result.rows_affected();
+            total_deleted += deleted;
+
+            if deleted < BATCH_SIZE as u64 {
+                break;
+            }
+            // Brief pause between batches so a large backlog doesn't
+            // monopolize the connection pool on a small deployment.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        Ok(total_deleted)
+    }
+}
+
+/// Map the short, public-facing event-type filter values documented on the
+/// tracking-events endpoints ("open", "click") onto the canonical form
+/// persisted in `email_events.event_type` ("opened", "clicked", ...).
+/// Values already in canonical form pass through unchanged.
+fn normalize_event_type_filter(event_type: &str) -> &str {
+    match event_type {
+        "open" => "opened",
+        "click" => "clicked",
+        "bounce" => "bounced",
+        "complaint" => "complained",
+        other => other,
     }
 }
 

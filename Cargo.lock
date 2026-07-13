@@ -11634,9 +11634,12 @@ dependencies = [
  "hmac 0.13.0",
  "lol_html",
  "reqwest 0.12.28",
+ "rsa",
  "sea-orm",
  "serde",
  "serde_json",
+ "sha1 0.10.6",
+ "sha2 0.10.9",
  "sha2 0.11.0",
  "temps-auth",
  "temps-config",
@@ -11653,6 +11656,7 @@ dependencies = [
  "urlencoding",
  "utoipa",
  "uuid",
+ "x509-parser 0.18.1",
 ]
 
 [[package]]

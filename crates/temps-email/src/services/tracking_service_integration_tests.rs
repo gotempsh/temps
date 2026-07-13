@@ -7,7 +7,7 @@ mod tests {
 
     use sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait};
     use temps_database::test_utils::TestDatabase;
-    use temps_entities::{email_links, emails};
+    use temps_entities::{email_events, email_links, emails};
     use uuid::Uuid;
 
     use crate::services::TrackingService;
@@ -221,7 +221,7 @@ mod tests {
         assert_eq!(email.open_count, 2);
 
         // Verify events recorded
-        let events = tracking.get_events(email_id, Some("open")).await.unwrap();
+        let events = tracking.get_events(email_id, Some("opened")).await.unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].ip_address, Some("1.2.3.4".to_string()));
         assert_eq!(events[1].ip_address, Some("5.6.7.8".to_string()));
@@ -250,7 +250,7 @@ mod tests {
             "Should not increment when tracking disabled"
         );
 
-        let events = tracking.get_events(email_id, Some("open")).await.unwrap();
+        let events = tracking.get_events(email_id, Some("opened")).await.unwrap();
         assert!(
             events.is_empty(),
             "Should not record event when tracking disabled"
@@ -301,7 +301,7 @@ mod tests {
         assert_eq!(links[1].click_count, 1);
 
         // Verify events
-        let events = tracking.get_events(email_id, Some("click")).await.unwrap();
+        let events = tracking.get_events(email_id, Some("clicked")).await.unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].link_index, Some(0));
         assert_eq!(events[1].link_index, Some(1));
@@ -380,11 +380,11 @@ mod tests {
         assert_eq!(all_events.len(), 3);
 
         // Filter opens only
-        let opens = tracking.get_events(email_id, Some("open")).await.unwrap();
+        let opens = tracking.get_events(email_id, Some("opened")).await.unwrap();
         assert_eq!(opens.len(), 2);
 
         // Filter clicks only
-        let clicks = tracking.get_events(email_id, Some("click")).await.unwrap();
+        let clicks = tracking.get_events(email_id, Some("clicked")).await.unwrap();
         assert_eq!(clicks.len(), 1);
     }
 
@@ -418,5 +418,39 @@ mod tests {
 
         // first_clicked_at should be set from first click only
         assert!(email.first_clicked_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_purge_events_older_than_deletes_only_stale_rows() {
+        let (db, tracking) = setup_test_env().await;
+
+        let email_id = create_test_email(&db.db, true, true).await;
+
+        let old_event = email_events::ActiveModel {
+            email_id: Set(email_id),
+            event_type: Set("opened".to_string()),
+            ip_address: Set(Some("1.1.1.1".to_string())),
+            user_agent: Set(Some("old-ua".to_string())),
+            created_at: Set(chrono::Utc::now() - chrono::Duration::days(100)),
+            ..Default::default()
+        };
+        old_event.insert(db.db.as_ref()).await.unwrap();
+
+        let recent_event = email_events::ActiveModel {
+            email_id: Set(email_id),
+            event_type: Set("opened".to_string()),
+            ip_address: Set(Some("2.2.2.2".to_string())),
+            user_agent: Set(Some("recent-ua".to_string())),
+            created_at: Set(chrono::Utc::now() - chrono::Duration::days(1)),
+            ..Default::default()
+        };
+        recent_event.insert(db.db.as_ref()).await.unwrap();
+
+        let deleted = tracking.purge_events_older_than(90).await.unwrap();
+        assert_eq!(deleted, 1, "should only delete the 100-day-old event");
+
+        let remaining = tracking.get_events(email_id, None).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].ip_address.as_deref(), Some("2.2.2.2"));
     }
 }

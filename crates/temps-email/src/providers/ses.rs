@@ -57,6 +57,36 @@ fn extract_ses_error_details<E: std::fmt::Display + std::fmt::Debug>(
     }
 }
 
+/// Classify whether an SES send failure is worth retrying. Network/timeout
+/// failures never reached AWS and are always worth another attempt; service
+/// errors are retryable only when SES itself reports a throttling/capacity
+/// condition (surfaced as an HTTP 429/5xx-equivalent error code) rather than
+/// a message-level rejection (bad recipient, unverified sender, suspended
+/// account, ...) that will fail identically on retry.
+fn is_ses_error_retryable<E: std::fmt::Display + std::fmt::Debug>(
+    e: &aws_sdk_sesv2::error::SdkError<E>,
+) -> bool {
+    use aws_sdk_sesv2::error::SdkError;
+
+    match e {
+        SdkError::TimeoutError(_) => true,
+        SdkError::DispatchFailure(dispatch_err) => {
+            dispatch_err.is_io() || dispatch_err.is_timeout()
+        }
+        SdkError::ResponseError(_) => true,
+        SdkError::ConstructionFailure(_) => false,
+        SdkError::ServiceError(service_err) => {
+            let message = format!("{}", service_err.err()).to_lowercase();
+            message.contains("throttl")
+                || message.contains("too many requests")
+                || message.contains("limit exceeded")
+                || message.contains("service unavailable")
+                || message.contains("internal")
+        }
+        _ => false,
+    }
+}
+
 /// AWS SES credentials configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SesCredentials {
@@ -468,13 +498,26 @@ impl EmailProvider for SesProvider {
         let result = send_request.send().await.map_err(|e| {
             // Extract detailed error information from AWS SDK error
             let error_message = extract_ses_error_details(&e);
-            error!("Failed to send email via SES: {}", error_message);
-            EmailError::AwsSes(error_message)
+            let retryable = is_ses_error_retryable(&e);
+            error!(
+                "Failed to send email via SES ({}): {}",
+                if retryable { "retryable" } else { "permanent" },
+                error_message
+            );
+            EmailError::SendFailed {
+                provider: EmailProviderType::Ses,
+                retryable,
+                reason: error_message,
+            }
         })?;
 
         let message_id = result
             .message_id()
-            .ok_or_else(|| EmailError::AwsSes("No message ID returned".to_string()))?
+            .ok_or_else(|| EmailError::SendFailed {
+                provider: EmailProviderType::Ses,
+                retryable: false,
+                reason: "No message ID returned".to_string(),
+            })?
             .to_string();
 
         debug!("Email sent successfully, message_id: {}", message_id);

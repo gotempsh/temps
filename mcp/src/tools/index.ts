@@ -14,7 +14,7 @@
  *   monitors, containers, users, settings, api-keys, webhooks, audit,
  *   dns-providers, notifications, scans, custom-domains, errors,
  *   proxy-logs, dsn, ip-access, incidents, funnels, presets, platform,
- *   email-domains, email-providers, load-balancer, notification-prefs,
+ *   email-domains, email-providers, emails, load-balancer, notification-prefs,
  *   analytics
  */
 
@@ -47,6 +47,7 @@ import { tools as presetsTools } from './presets.js';
 import { tools as platformTools } from './platform.js';
 import { tools as emailDomainsTools } from './email-domains.js';
 import { tools as emailProvidersTools } from './email-providers.js';
+import { tools as emailsTools } from './emails.js';
 import { tools as loadBalancerTools } from './load-balancer.js';
 import { tools as notificationPrefsTools } from './notification-prefs.js';
 import { tools as analyticsTools } from './analytics.js';
@@ -82,6 +83,7 @@ const categoryRegistry: Record<string, ToolDefinition[]> = {
   platform: platformTools,
   'email-domains': emailDomainsTools,
   'email-providers': emailProvidersTools,
+  emails: emailsTools,
   'load-balancer': loadBalancerTools,
   'notification-prefs': notificationPrefsTools,
   analytics: analyticsTools,
