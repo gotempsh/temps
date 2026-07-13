@@ -260,7 +260,17 @@ pub struct DeploymentConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_request: Option<i32>,
 
-    /// Memory limit in megabytes (e.g., 512 = 512MB)
+    /// Memory limit in megabytes. Three-state semantics:
+    /// - `None`     → inherit the parent layer (env inherits project, project
+    ///   inherits the seeded default); used by the settings UI's "Use default".
+    /// - `Some(0)`  → explicit **uncapped**: stop inheriting and run with no
+    ///   memory limit. This is the deliberate escape hatch for dedicated
+    ///   workloads, distinct from `None`.
+    /// - `Some(n)`  → hard cap of `n` MB.
+    ///
+    /// `merge`/resolution keep `Some(0)` as a present value (it wins precedence
+    /// over a parent cap), and the deployer collapses it to "no limit" before
+    /// talking to Docker.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_limit: Option<i32>,
 
@@ -520,16 +530,18 @@ impl DeploymentConfig {
 
     /// Validate the resource configuration
     pub fn validate(&self) -> Result<(), String> {
-        // CPU request should not exceed CPU limit
+        // CPU request should not exceed CPU limit. A limit of 0 is the explicit
+        // "uncapped" sentinel, so it never constrains the request.
         if let (Some(request), Some(limit)) = (self.cpu_request, self.cpu_limit) {
-            if request > limit {
+            if limit != 0 && request > limit {
                 return Err("CPU request cannot exceed CPU limit".to_string());
             }
         }
 
-        // Memory request should not exceed memory limit
+        // Memory request should not exceed memory limit. A limit of 0 is the
+        // explicit "uncapped" sentinel, so it never constrains the request.
         if let (Some(request), Some(limit)) = (self.memory_request, self.memory_limit) {
-            if request > limit {
+            if limit != 0 && request > limit {
                 return Err("Memory request cannot exceed memory limit".to_string());
             }
         }
@@ -592,16 +604,18 @@ impl DeploymentConfigSnapshot {
 
     /// Validate the resource configuration
     pub fn validate(&self) -> Result<(), String> {
-        // CPU request should not exceed CPU limit
+        // CPU request should not exceed CPU limit. A limit of 0 is the explicit
+        // "uncapped" sentinel, so it never constrains the request.
         if let (Some(request), Some(limit)) = (self.cpu_request, self.cpu_limit) {
-            if request > limit {
+            if limit != 0 && request > limit {
                 return Err("CPU request cannot exceed CPU limit".to_string());
             }
         }
 
-        // Memory request should not exceed memory limit
+        // Memory request should not exceed memory limit. A limit of 0 is the
+        // explicit "uncapped" sentinel, so it never constrains the request.
         if let (Some(request), Some(limit)) = (self.memory_request, self.memory_limit) {
-            if request > limit {
+            if limit != 0 && request > limit {
                 return Err("Memory request cannot exceed memory limit".to_string());
             }
         }
@@ -629,6 +643,45 @@ mod tests {
         assert_eq!(config.automatic_deploy, None);
         assert!(!config.performance_metrics_enabled);
         assert!(!config.session_recording_enabled);
+    }
+
+    #[test]
+    fn uncapped_limit_sentinel_does_not_constrain_request() {
+        // memory_limit/cpu_limit of 0 is the explicit "uncapped" sentinel and
+        // must not trip the request-exceeds-limit validation.
+        let config = DeploymentConfig {
+            cpu_request: Some(500_000),
+            cpu_limit: Some(0),
+            memory_request: Some(128),
+            memory_limit: Some(0),
+            ..DeploymentConfig::default()
+        };
+        assert_eq!(config.validate(), Ok(()));
+    }
+
+    #[test]
+    fn positive_memory_limit_below_request_is_rejected() {
+        let config = DeploymentConfig {
+            memory_request: Some(256),
+            memory_limit: Some(128),
+            ..DeploymentConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn merge_keeps_env_uncapped_over_project_cap() {
+        // An env that explicitly opts into uncapped (Some(0)) must win over a
+        // project-level hard cap rather than inheriting it.
+        let project = DeploymentConfig {
+            memory_limit: Some(512),
+            ..DeploymentConfig::default()
+        };
+        let env = DeploymentConfig {
+            memory_limit: Some(0),
+            ..DeploymentConfig::default()
+        };
+        assert_eq!(project.merge(&env).memory_limit, Some(0));
     }
 
     #[test]
