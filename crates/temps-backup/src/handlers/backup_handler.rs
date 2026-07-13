@@ -91,13 +91,16 @@ impl From<BackupError> for Problem {
                 .with_title("Cleanup Preview Is Stale")
                 .with_detail(error.to_string()),
 
+            BackupError::Unsupported(_) => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Backup Cannot Be Safely Deleted")
+                .with_detail(error.to_string()),
+
             BackupError::Database(_)
             | BackupError::S3(_)
             | BackupError::Configuration(_)
             | BackupError::ExternalService(_)
             | BackupError::Internal { .. }
             | BackupError::NotificationError(_)
-            | BackupError::Unsupported(_)
             | BackupError::Io(_)
             | BackupError::Serialization(_)
             | BackupError::PartialDeletion { .. } => {
@@ -2115,10 +2118,11 @@ async fn run_backup_for_source(
     params(("id" = String, Path, description = "Backup UUID")),
     responses(
         (status = 204, description = "Backup deleted"),
+        (status = 400, description = "Backup artifact cannot be safely attributed", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "Backup not found", body = ProblemDetails),
-        (status = 409, description = "Backup is still running", body = ProblemDetails),
+        (status = 409, description = "Backup is running, referenced, or lacks safe artifact identity", body = ProblemDetails),
         (status = 500, description = "Object storage or database error", body = ProblemDetails),
     ),
     security(("bearer_auth" = []))
@@ -2232,8 +2236,11 @@ struct CleanupExpiredBackupsRequest {
     request_body = CleanupExpiredBackupsRequest,
     responses(
         (status = 200, description = "Retention cleanup completed", body = RetentionCleanupReport),
+        (status = 400, description = "Missing or invalid preview candidate list", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 404, description = "Schedule or backup not found", body = ProblemDetails),
+        (status = 409, description = "Cleanup preview is stale", body = ProblemDetails),
         (status = 500, description = "Cleanup could not be started", body = ProblemDetails),
     ),
     security(("bearer_auth" = []))
@@ -2256,6 +2263,16 @@ async fn cleanup_expired_backups(
 
     permission_guard!(auth, BackupsDelete);
 
+    let expected_backup_ids = request
+        .as_ref()
+        .and_then(|body| body.expected_backup_ids.as_deref())
+        .ok_or_else(|| {
+            Problem::from(BackupError::Validation(
+                "Destructive cleanup requires expected_backup_ids from a dry-run preview"
+                    .to_string(),
+            ))
+        })?;
+
     let audit_context = AuditContext {
         user_id: auth.user_id(),
         ip_address: Some(metadata.ip_address.clone()),
@@ -2263,6 +2280,8 @@ async fn cleanup_expired_backups(
     };
     let attempted = BackupRetentionCleanupAudit {
         context: audit_context.clone(),
+        requested_backup_ids: expected_backup_ids.to_vec(),
+        requested_backup_ids_truncated: false,
         expired: 0,
         deleted: 0,
         failed: 0,
@@ -2285,18 +2304,15 @@ async fn cleanup_expired_backups(
 
     let report = match app_state
         .backup_service
-        .enforce_retention(
-            params.schedule_id,
-            request
-                .as_ref()
-                .and_then(|body| body.expected_backup_ids.as_deref()),
-        )
+        .enforce_retention(params.schedule_id, Some(expected_backup_ids))
         .await
     {
         Ok(report) => report,
         Err(error) => {
             let failed = BackupRetentionCleanupAudit {
                 context: audit_context,
+                requested_backup_ids: expected_backup_ids.to_vec(),
+                requested_backup_ids_truncated: false,
                 expired: 0,
                 deleted: 0,
                 failed: 1,
@@ -2316,6 +2332,8 @@ async fn cleanup_expired_backups(
 
     let audit = BackupRetentionCleanupAudit {
         context: audit_context,
+        requested_backup_ids: expected_backup_ids.to_vec(),
+        requested_backup_ids_truncated: false,
         expired: report.expired,
         deleted: report.deleted,
         failed: report.failed,

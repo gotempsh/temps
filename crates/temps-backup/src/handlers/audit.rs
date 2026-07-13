@@ -76,6 +76,8 @@ pub struct BackupDeletedAudit {
 #[derive(Debug, Clone, Serialize)]
 pub struct BackupRetentionCleanupAudit {
     pub context: AuditContext,
+    pub requested_backup_ids: Vec<String>,
+    pub requested_backup_ids_truncated: bool,
     pub expired: u64,
     pub deleted: u64,
     pub failed: u64,

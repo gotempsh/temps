@@ -1,3 +1,5 @@
+import { client } from '@/api/client/client.gen'
+
 export interface RetentionCleanupFailure {
   backup_id: string
   reason: string
@@ -14,21 +16,15 @@ export interface RetentionCleanupReport {
   candidate_backup_ids_truncated: boolean
 }
 
-async function errorDetail(response: Response): Promise<string> {
-  try {
-    const body = (await response.json()) as { detail?: string; title?: string }
-    return body.detail ?? body.title ?? response.statusText
-  } catch {
-    return response.statusText
-  }
-}
+const BEARER_SECURITY = [{ scheme: 'bearer', type: 'http' }] as const
 
 export async function deleteBackup(backupId: string): Promise<void> {
-  const response = await fetch(`/api/backups/${encodeURIComponent(backupId)}`, {
-    method: 'DELETE',
-    credentials: 'include',
+  await client.delete<unknown, unknown, true>({
+    security: [...BEARER_SECURITY],
+    url: '/backups/{id}',
+    path: { id: backupId },
+    throwOnError: true,
   })
-  if (!response.ok) throw new Error(await errorDetail(response))
 }
 
 export async function cleanupExpiredBackups(options?: {
@@ -36,21 +32,18 @@ export async function cleanupExpiredBackups(options?: {
   scheduleId?: number
   expectedBackupIds?: string[]
 }): Promise<RetentionCleanupReport> {
-  const query = new URLSearchParams()
-  if (options?.dryRun) query.set('dry_run', 'true')
-  if (options?.scheduleId !== undefined) {
-    query.set('schedule_id', String(options.scheduleId))
-  }
-  const suffix = query.size > 0 ? `?${query.toString()}` : ''
-  const hasExpectedCandidates = options?.expectedBackupIds !== undefined
-  const response = await fetch(`/api/backups/cleanup${suffix}`, {
-    method: 'POST',
-    credentials: 'include',
-    headers: hasExpectedCandidates ? { 'Content-Type': 'application/json' } : undefined,
-    body: hasExpectedCandidates
-      ? JSON.stringify({ expected_backup_ids: options.expectedBackupIds })
-      : undefined,
+  const { data } = await client.post<RetentionCleanupReport, unknown, true>({
+    security: [...BEARER_SECURITY],
+    url: '/backups/cleanup',
+    query: {
+      dry_run: options?.dryRun || undefined,
+      schedule_id: options?.scheduleId,
+    },
+    body:
+      options?.expectedBackupIds === undefined
+        ? undefined
+        : { expected_backup_ids: options.expectedBackupIds },
+    throwOnError: true,
   })
-  if (!response.ok) throw new Error(await errorDetail(response))
-  return (await response.json()) as RetentionCleanupReport
+  return data
 }

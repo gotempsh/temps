@@ -1061,11 +1061,37 @@ async function cleanupBackups(options: CleanupBackupsOptions): Promise<void> {
     throw new Error('--schedule-id must be a positive integer')
   }
 
-  if (!options.dryRun && !options.yes) {
+  const preview = await withSpinner('Previewing expired backups...', async () => {
+    const { data, error } = await client.post<RetentionCleanupReport>({
+      url: '/backups/cleanup',
+      query: { dry_run: true, schedule_id: scheduleId },
+    })
+    if (error) throw new Error(getErrorMessage(error))
+    if (!data) throw new Error('Cleanup preview returned no report')
+    return data
+  })
+
+  if (options.dryRun) {
+    if (options.json) {
+      json(preview)
+      return
+    }
+    info(`Dry run: ${preview.expired} backup${preview.expired === 1 ? '' : 's'} would be deleted`)
+    for (const backupId of preview.candidate_backup_ids) info(backupId)
+    if (preview.candidate_backup_ids_truncated) warning('More candidates remain beyond this 100-backup batch')
+    return
+  }
+
+  if (preview.candidate_backup_ids.length === 0) {
+    info('No expired backups found')
+    return
+  }
+
+  if (!options.yes) {
     const confirmed = await promptConfirm({
       message: scheduleId
-        ? `Delete backups expired by schedule ${scheduleId}'s retention policy?`
-        : 'Delete every backup older than its schedule retention period?',
+        ? `Delete ${preview.expired} backup(s) expired by schedule ${scheduleId}'s retention policy?`
+        : `Delete ${preview.expired} backup(s) older than their schedule retention periods?`,
       default: false,
     })
     if (!confirmed) {
@@ -1074,30 +1100,54 @@ async function cleanupBackups(options: CleanupBackupsOptions): Promise<void> {
     }
   }
 
-  const report = await withSpinner(
-    options.dryRun ? 'Previewing expired backups...' : 'Cleaning up expired backups...',
-    async () => {
+  const report: RetentionCleanupReport = {
+    ...preview,
+    dry_run: false,
+    expired: 0,
+    deleted: 0,
+    failed: 0,
+    failures: [],
+    candidate_backup_ids: [],
+    candidate_backup_ids_truncated: false,
+  }
+  let batch = preview
+  while (batch.candidate_backup_ids.length > 0) {
+    const current = batch
+    const result = await withSpinner(
+      `Deleting ${current.candidate_backup_ids.length} previewed backup(s)...`,
+      async () => {
+        const { data, error } = await client.post<RetentionCleanupReport>({
+          url: '/backups/cleanup',
+          query: { schedule_id: scheduleId },
+          body: { expected_backup_ids: current.candidate_backup_ids },
+        })
+        if (error) throw new Error(getErrorMessage(error))
+        if (!data) throw new Error('Cleanup returned no report')
+        return data
+      },
+    )
+    report.expired += result.expired
+    report.deleted += result.deleted
+    report.failed += result.failed
+    report.failures.push(...result.failures)
+    const remainingSampleSlots = Math.max(0, 100 - report.candidate_backup_ids.length)
+    report.candidate_backup_ids.push(...result.candidate_backup_ids.slice(0, remainingSampleSlots))
+    report.candidate_backup_ids_truncated ||=
+      result.candidate_backup_ids_truncated || result.candidate_backup_ids.length > remainingSampleSlots
+    if (!current.candidate_backup_ids_truncated || result.failed > 0) break
+    batch = await withSpinner('Previewing the next cleanup batch...', async () => {
       const { data, error } = await client.post<RetentionCleanupReport>({
         url: '/backups/cleanup',
-        query: {
-          dry_run: options.dryRun || undefined,
-          schedule_id: scheduleId,
-        },
+        query: { dry_run: true, schedule_id: scheduleId },
       })
       if (error) throw new Error(getErrorMessage(error))
-      if (!data) throw new Error('Cleanup returned no report')
+      if (!data) throw new Error('Cleanup preview returned no report')
       return data
-    },
-  )
+    })
+  }
 
   if (options.json) {
     json(report)
-    return
-  }
-  if (report.dry_run) {
-    info(`Dry run: ${report.expired} backup${report.expired === 1 ? '' : 's'} would be deleted`)
-    for (const backupId of report.candidate_backup_ids) info(backupId)
-    if (report.candidate_backup_ids_truncated) warning('Candidate list truncated to 100 backups')
     return
   }
   success(`Cleanup finished: ${report.deleted} deleted, ${report.failed} failed`)
