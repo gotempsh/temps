@@ -1287,7 +1287,7 @@ impl ProjectService {
         error_source_context_enabled: Option<bool>,
         error_source_root: Option<String>,
         ai_api_traffic_summary_enabled: Option<bool>,
-        image_retention_hours: Option<i32>,
+        image_retention_hours: Option<Option<i32>>,
     ) -> Result<Project, ProjectError> {
         // Validate preview env on-demand timeouts before touching the DB.
         // Mirrors DeploymentConfig::validate so the project-level defaults are
@@ -1308,7 +1308,7 @@ impl ProjectService {
                 )));
             }
         }
-        if let Some(hours) = image_retention_hours {
+        if let Some(Some(hours)) = image_retention_hours {
             if !(1..=8760).contains(&hours) {
                 return Err(ProjectError::InvalidInput(format!(
                     "image_retention_hours {} is not in valid range (1-8760)",
@@ -1591,7 +1591,7 @@ impl ProjectService {
                 active_project.preview_envs_wake_timeout_seconds = Set(wake);
             }
             if let Some(hours) = image_retention_hours {
-                active_project.image_retention_hours = Set(Some(hours));
+                active_project.image_retention_hours = Set(hours);
             }
 
             active_project.update(self.db.as_ref()).await?;

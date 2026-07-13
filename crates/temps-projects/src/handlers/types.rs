@@ -651,6 +651,17 @@ pub struct UpdateDeploymentConfigRequest {
     pub max_concurrent_connections: Option<i32>,
 }
 
+/// Deserialize a PATCH integer field while preserving the distinction between
+/// an omitted key (`None`) and an explicit JSON null (`Some(None)`).
+fn deserialize_optional_optional_i32<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<i32>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::<i32>::deserialize(deserializer)?))
+}
+
 #[derive(Serialize, Deserialize, Clone, ToSchema)]
 pub struct UpdateProjectSettingsRequest {
     pub slug: Option<String>,
@@ -687,7 +698,8 @@ pub struct UpdateProjectSettingsRequest {
     pub preview_envs_wake_timeout_seconds: Option<i32>,
     /// How long (hours) to retain built Docker images before nightly cleanup removes them.
     /// Set to null to use the system default (48 hours). Valid range: 1–8760.
-    pub image_retention_hours: Option<i32>,
+    #[serde(default, deserialize_with = "deserialize_optional_optional_i32")]
+    pub image_retention_hours: Option<Option<i32>>,
     /// Preset-specific configuration (e.g., Dockerfile path for Docker preset)
     ///
     /// Example for Dockerfile preset:
@@ -1220,5 +1232,16 @@ mod tests {
             ))
         );
         assert_eq!(problem.into_response().status(), StatusCode::CONFLICT);
+    #[test]
+    fn image_retention_patch_distinguishes_omitted_null_and_value() {
+        let omitted: UpdateProjectSettingsRequest = serde_json::from_str("{}").unwrap();
+        let cleared: UpdateProjectSettingsRequest =
+            serde_json::from_str(r#"{"image_retention_hours":null}"#).unwrap();
+        let set: UpdateProjectSettingsRequest =
+            serde_json::from_str(r#"{"image_retention_hours":72}"#).unwrap();
+
+        assert_eq!(omitted.image_retention_hours, None);
+        assert_eq!(cleared.image_retention_hours, Some(None));
+        assert_eq!(set.image_retention_hours, Some(Some(72)));
     }
 }

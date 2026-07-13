@@ -4,6 +4,7 @@
 //! Runs as a background task scheduled at 2 AM UTC daily.
 
 use chrono::Timelike as _;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
@@ -86,7 +87,7 @@ impl DockerClient for DefaultDockerClient {
             .remove_image(
                 image_name,
                 Some(bollard::query_parameters::RemoveImageOptions {
-                    force: true,
+                    force: false,
                     ..Default::default()
                 }),
                 None,
@@ -400,6 +401,27 @@ impl DockerCleanupService {
         self
     }
 
+    fn is_temps_managed_image(image_name: &str) -> bool {
+        image_name.starts_with("temps-") && !image_name.contains('/')
+    }
+
+    fn record_image_retention_eligibility(
+        candidates: &mut HashMap<String, bool>,
+        image_name: &str,
+        referenced_at: chrono::DateTime<chrono::Utc>,
+        cutoff: chrono::DateTime<chrono::Utc>,
+    ) {
+        if !Self::is_temps_managed_image(image_name) {
+            return;
+        }
+
+        let reference_is_expired = referenced_at < cutoff;
+        candidates
+            .entry(image_name.to_string())
+            .and_modify(|eligible| *eligible &= reference_is_expired)
+            .or_insert(reference_is_expired);
+    }
+
     /// Calculate seconds until the next scheduled cleanup
     fn seconds_until_next_cleanup(&self) -> u64 {
         seconds_until_next_cleanup(self.cleanup_hour)
@@ -434,93 +456,85 @@ impl DockerCleanupService {
 
     /// Remove deployment images that are older than their project's retention period.
     ///
-    /// Queries all projects and their successful deployments, then removes the Docker
-    /// image for any deployment whose `created_at` is older than
-    /// `project.image_retention_hours` (falling back to `self.default_image_retention_hours`).
-    /// Images currently referenced by a running container are skipped — Docker will
-    /// return an error and we log a warning rather than failing the whole pass.
+    /// An image is eligible only when every deployment row that references it is older
+    /// than its owning project's retention period. This preserves images reused by a
+    /// newer rollback or promotion. Only Temps-managed local tags are considered;
+    /// registry images are left to Docker's normal cache policy. Docker removal is
+    /// non-forced, so images referenced by any container are retained.
     async fn prune_old_deployment_images(&self) {
         use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
         use temps_entities::{deployments, projects};
 
-        let projects_list = match projects::Entity::find()
-            .filter(projects::Column::IsDeleted.eq(false))
+        let deployment_rows = match deployments::Entity::find()
+            .filter(deployments::Column::ImageName.is_not_null())
+            .find_also_related(projects::Entity)
             .all(self.db.as_ref())
             .await
         {
-            Ok(p) => p,
+            Ok(rows) => rows,
             Err(e) => {
                 error!(
-                    "Failed to query projects for image retention cleanup: {}",
+                    "Failed to query deployment images for retention cleanup: {}",
                     e
                 );
                 return;
             }
         };
 
-        let mut total_removed = 0u64;
-        let total_freed_mb = 0u64;
-
-        for project in projects_list {
+        let now = chrono::Utc::now();
+        let mut candidates = HashMap::new();
+        for (deployment, project) in deployment_rows {
+            let Some(project) = project else {
+                warn!(
+                    deployment_id = deployment.id,
+                    "Skipping deployment image with no owning project"
+                );
+                continue;
+            };
+            let Some(image_name) = deployment.image_name.as_deref() else {
+                continue;
+            };
             let retention_hours = project
                 .image_retention_hours
                 .map(|h| h as i64)
                 .unwrap_or(self.default_image_retention_hours);
+            let cutoff = now - chrono::Duration::hours(retention_hours);
 
-            let cutoff = chrono::Utc::now() - chrono::Duration::hours(retention_hours);
+            Self::record_image_retention_eligibility(
+                &mut candidates,
+                image_name,
+                deployment.created_at,
+                cutoff,
+            );
+        }
 
-            let old_deployments = match deployments::Entity::find()
-                .filter(deployments::Column::ProjectId.eq(project.id))
-                .filter(deployments::Column::ImageName.is_not_null())
-                .filter(deployments::Column::CreatedAt.lt(cutoff))
-                .all(self.db.as_ref())
-                .await
-            {
-                Ok(d) => d,
-                Err(e) => {
-                    error!(
-                        "Failed to query old deployments for project {}: {}",
-                        project.id, e
-                    );
-                    continue;
+        let mut total_removed = 0u64;
+        for (image_name, eligible) in candidates {
+            if !eligible {
+                continue;
+            }
+
+            match self.docker_client.remove_image(&image_name).await {
+                Ok(()) => {
+                    debug!(image_name = %image_name, "Removed expired deployment image");
+                    total_removed += 1;
                 }
-            };
-
-            for deployment in old_deployments {
-                let image_name = match deployment.image_name {
-                    Some(ref name) => name.clone(),
-                    None => continue,
-                };
-
-                match self.docker_client.remove_image(&image_name).await {
-                    Ok(()) => {
-                        debug!(
-                            "Removed old deployment image '{}' (deployment {}, project {})",
-                            image_name, deployment.id, project.id
-                        );
-                        total_removed += 1;
-                    }
-                    Err(e) => {
-                        // Image may already be gone or in use — warn but don't fail
-                        warn!(
-                            "Could not remove deployment image '{}' (deployment {}, project {}): {}",
-                            image_name, deployment.id, project.id, e
-                        );
-                    }
+                Err(e) => {
+                    // Image may already be gone or referenced by a container.
+                    warn!(
+                        image_name = %image_name,
+                        error = %e,
+                        "Could not remove expired deployment image"
+                    );
                 }
             }
         }
 
         if total_removed > 0 {
-            info!(
-                "✅ Removed {} old deployment images, freed ~{} MB",
-                total_removed, total_freed_mb
-            );
+            info!("✅ Removed {} expired deployment images", total_removed);
         } else {
-            debug!("No old deployment images to remove");
+            debug!("No expired deployment images to remove");
         }
-
-        let _ = total_freed_mb; // calculated per-image removal is non-trivial; reported as 0 for now
     }
 
     /// Perform the actual cleanup
@@ -1086,5 +1100,56 @@ mod tests {
             DockerCleanupService::new(Arc::new(DefaultDockerClient), mock_db(), mock_file_store())
                 .with_default_image_retention_hours(72);
         assert_eq!(service.default_image_retention_hours, 72);
+    }
+
+    #[test]
+    fn test_newer_reference_preserves_reused_image() {
+        let now = chrono::Utc::now();
+        let cutoff = now - chrono::Duration::hours(48);
+        let mut candidates = HashMap::new();
+
+        DockerCleanupService::record_image_retention_eligibility(
+            &mut candidates,
+            "temps-demo:42",
+            now - chrono::Duration::hours(72),
+            cutoff,
+        );
+        DockerCleanupService::record_image_retention_eligibility(
+            &mut candidates,
+            "temps-demo:42",
+            now - chrono::Duration::hours(1),
+            cutoff,
+        );
+
+        assert_eq!(candidates.get("temps-demo:42"), Some(&false));
+    }
+
+    #[test]
+    fn test_only_temps_managed_local_images_become_candidates() {
+        let now = chrono::Utc::now();
+        let cutoff = now - chrono::Duration::hours(48);
+        let mut candidates = HashMap::new();
+
+        DockerCleanupService::record_image_retention_eligibility(
+            &mut candidates,
+            "ghcr.io/example/temps-demo:42",
+            now - chrono::Duration::hours(72),
+            cutoff,
+        );
+        DockerCleanupService::record_image_retention_eligibility(
+            &mut candidates,
+            "nginx:latest",
+            now - chrono::Duration::hours(72),
+            cutoff,
+        );
+        DockerCleanupService::record_image_retention_eligibility(
+            &mut candidates,
+            "temps-demo:42",
+            now - chrono::Duration::hours(72),
+            cutoff,
+        );
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates.get("temps-demo:42"), Some(&true));
     }
 }
