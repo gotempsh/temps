@@ -667,6 +667,44 @@ async fn get_delivery(
     }
 }
 
+/// Why a delivery is not in scope for the requested webhook/project path.
+#[derive(Debug, PartialEq, Eq)]
+enum DeliveryScopeError {
+    /// The webhook does not exist or belongs to a different project.
+    WebhookNotInProject,
+    /// The delivery does not exist or belongs to a different webhook.
+    DeliveryNotOnWebhook,
+}
+
+impl DeliveryScopeError {
+    fn detail(&self) -> &'static str {
+        match self {
+            Self::WebhookNotInProject => "Webhook does not belong to this project",
+            Self::DeliveryNotOnWebhook => "Delivery does not belong to this webhook",
+        }
+    }
+}
+
+/// Verify the delivery→webhook→project ownership chain for delivery-scoped
+/// endpoints. `webhook_project_id`/`delivery_webhook_id` are `None` when the
+/// row was not found. Factored out so the IDOR guard can be unit-tested without
+/// a full HTTP + service harness.
+fn verify_delivery_scope(
+    webhook_project_id: Option<i32>,
+    delivery_webhook_id: Option<i32>,
+    path_project_id: i32,
+    path_webhook_id: i32,
+) -> Result<(), DeliveryScopeError> {
+    match webhook_project_id {
+        Some(pid) if pid == path_project_id => {}
+        _ => return Err(DeliveryScopeError::WebhookNotInProject),
+    }
+    match delivery_webhook_id {
+        Some(wid) if wid == path_webhook_id => Ok(()),
+        _ => Err(DeliveryScopeError::DeliveryNotOnWebhook),
+    }
+}
+
 /// Retry a failed delivery
 #[utoipa::path(
     post,
@@ -694,6 +732,42 @@ async fn retry_delivery(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, WebhooksWrite);
     project_access_guard!(auth, project_id, state.project_access_checker);
+
+    // Verify the delivery belongs to this webhook, and the webhook to this
+    // project, before retrying. Without this, a caller with WebhooksWrite on any
+    // one project could replay another tenant's delivery by delivery_id alone and
+    // read back the response (security review finding #5). Mirrors get_delivery.
+    let webhook_project_id = match state.webhook_service.get_webhook(webhook_id).await {
+        Ok(existing) => existing.map(|w| w.project_id),
+        Err(e) => {
+            error!("Failed to load webhook: {}", e);
+            return Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title("Failed to retry delivery")
+                .detail(e.to_string())
+                .build());
+        }
+    };
+    let delivery_webhook_id = match state.webhook_service.get_delivery(delivery_id).await {
+        Ok(existing) => existing.map(|d| d.webhook_id),
+        Err(e) => {
+            error!("Failed to load delivery: {}", e);
+            return Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title("Failed to retry delivery")
+                .detail(e.to_string())
+                .build());
+        }
+    };
+    if let Err(scope_err) = verify_delivery_scope(
+        webhook_project_id,
+        delivery_webhook_id,
+        project_id,
+        webhook_id,
+    ) {
+        return Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
+            .title("Delivery not found")
+            .detail(scope_err.detail())
+            .build());
+    }
 
     match state.webhook_service.retry_delivery(delivery_id).await {
         Ok(result) => {
@@ -820,4 +894,57 @@ pub fn configure_routes() -> Router<Arc<WebhookState>> {
             "/projects/{project_id}/webhooks/{webhook_id}/deliveries/{delivery_id}/retry",
             post(retry_delivery),
         )
+}
+
+#[cfg(test)]
+mod idor_tests {
+    //! Regression tests for the retry_delivery IDOR (security review finding
+    //! #5). retry_delivery looked the delivery up by delivery_id alone, so a
+    //! caller with WebhooksWrite on their own project could replay another
+    //! tenant's delivery. verify_delivery_scope is the extracted ownership check.
+
+    use super::{verify_delivery_scope, DeliveryScopeError};
+
+    // path: /projects/1/webhooks/10/deliveries/... — caller owns project 1.
+    const PATH_PROJECT: i32 = 1;
+    const PATH_WEBHOOK: i32 = 10;
+
+    #[test]
+    fn in_scope_delivery_is_allowed() {
+        // webhook 10 is in project 1, delivery is on webhook 10.
+        assert_eq!(
+            verify_delivery_scope(Some(1), Some(10), PATH_PROJECT, PATH_WEBHOOK),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn cross_project_webhook_is_rejected() {
+        // The exploit: webhook 10 actually belongs to another project (2).
+        assert_eq!(
+            verify_delivery_scope(Some(2), Some(10), PATH_PROJECT, PATH_WEBHOOK),
+            Err(DeliveryScopeError::WebhookNotInProject)
+        );
+    }
+
+    #[test]
+    fn delivery_from_another_webhook_is_rejected() {
+        // The core IDOR: delivery_id belongs to a different webhook (99).
+        assert_eq!(
+            verify_delivery_scope(Some(1), Some(99), PATH_PROJECT, PATH_WEBHOOK),
+            Err(DeliveryScopeError::DeliveryNotOnWebhook)
+        );
+    }
+
+    #[test]
+    fn missing_webhook_or_delivery_is_rejected() {
+        assert_eq!(
+            verify_delivery_scope(None, Some(10), PATH_PROJECT, PATH_WEBHOOK),
+            Err(DeliveryScopeError::WebhookNotInProject)
+        );
+        assert_eq!(
+            verify_delivery_scope(Some(1), None, PATH_PROJECT, PATH_WEBHOOK),
+            Err(DeliveryScopeError::DeliveryNotOnWebhook)
+        );
+    }
 }
