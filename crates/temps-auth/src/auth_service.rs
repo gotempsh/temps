@@ -1304,7 +1304,9 @@ mod tests {
     /// second factor.
     #[tokio::test]
     async fn test_mfa_pending_session_cannot_authenticate_via_verify_session() {
-        let (db, auth_service, _) = setup_test_env().await;
+        let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+            return;
+        };
         let user = create_test_user(&db.db, "mfabypass@example.com", "password").await;
 
         // Token handed to the client as the `mfa_session` cookie.
@@ -1335,19 +1337,23 @@ mod tests {
     /// is ever checked.
     #[tokio::test]
     async fn test_real_session_cannot_be_used_as_mfa_challenge() {
-        let (db, auth_service, _) = setup_test_env().await;
+        let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+            return;
+        };
         let user = create_test_user(&db.db, "notachallenge@example.com", "password").await;
 
         let real_token = auth_service.create_session(user.id).await.unwrap();
 
-        // Even with a bogus code, this must fail because the token is not a
-        // pending challenge -- not because the code is wrong.
         let result = auth_service
             .verify_mfa_challenge(&real_token, "000000")
             .await;
         assert!(
-            result.is_err(),
-            "A real session token must not be usable as an MFA challenge"
+            matches!(
+                result,
+                Err(AuthError::GenericError(ref message))
+                    if message == "Invalid or expired session"
+            ),
+            "A real session token must be rejected before TOTP verification, got: {result:?}"
         );
     }
 
@@ -1355,7 +1361,9 @@ mod tests {
     /// not inflate the concurrent-session count used for login auditing.
     #[tokio::test]
     async fn test_mfa_pending_session_not_counted_as_active() {
-        let (db, auth_service, _) = setup_test_env().await;
+        let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+            return;
+        };
         let user = create_test_user(&db.db, "activecount@example.com", "password").await;
 
         auth_service.create_mfa_session(user.id).await.unwrap();

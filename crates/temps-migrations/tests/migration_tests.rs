@@ -1671,3 +1671,123 @@ async fn test_observe_correlation_migration_survives_concurrent_retention() -> a
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Regression test: the MFA session-purpose migration must fail closed.
+// Pre-upgrade rows are ambiguous, so all are revoked. An old binary may still
+// omit `mfa_pending` during a rolling upgrade; the database default must mark
+// such rows pending rather than authenticate them.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_mfa_pending_migration_revokes_ambiguous_sessions_and_defaults_closed(
+) -> anyhow::Result<()> {
+    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+        println!("⏭️  Skipping MFA session migration test: external database in use");
+        return Ok(());
+    }
+
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            println!("⏭️  Skipping MFA session migration test: {error}");
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db_url = format!("postgresql://postgres:postgres@localhost:{port}/postgres");
+    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    let db = connect_with_retries(&db_url).await?;
+
+    let target = "m20260713_000001_add_mfa_pending_to_sessions";
+    let pre_target_count = Migrator::migrations()
+        .iter()
+        .position(|migration| migration.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found in Migrator"));
+    Migrator::up(&db, Some(pre_target_count as u32)).await?;
+
+    let user = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "INSERT INTO users (name, email, created_at, updated_at) \
+             VALUES ('MFA migration user', 'mfa-migration@example.test', now(), now()) \
+             RETURNING id"
+                .to_string(),
+        ))
+        .await?
+        .expect("inserted user row");
+    let user_id: i32 = user.try_get("", "id")?;
+
+    db.execute_unprepared(&format!(
+        "INSERT INTO sessions (user_id, session_token, expires_at) VALUES \
+         ({user_id}, 'pre-upgrade-real', now() + INTERVAL '7 days'), \
+         ({user_id}, 'pre-upgrade-challenge', now() + INTERVAL '5 minutes')"
+    ))
+    .await?;
+
+    Migrator::up(&db, None).await?;
+
+    let remaining = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*)::int AS count FROM sessions".to_string(),
+        ))
+        .await?
+        .expect("session count row");
+    let remaining_count: i32 = remaining.try_get("", "count")?;
+    assert_eq!(
+        remaining_count, 0,
+        "all ambiguous pre-upgrade sessions must be revoked"
+    );
+
+    let column = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT is_nullable, column_default \
+             FROM information_schema.columns \
+             WHERE table_schema = current_schema() \
+               AND table_name = 'sessions' \
+               AND column_name = 'mfa_pending'"
+                .to_string(),
+        ))
+        .await?
+        .expect("mfa_pending schema row");
+    let is_nullable: String = column.try_get("", "is_nullable")?;
+    let column_default: String = column.try_get("", "column_default")?;
+    assert_eq!(is_nullable, "NO", "mfa_pending must remain mandatory");
+    assert_eq!(
+        column_default, "true",
+        "omitted session purpose must default to MFA-pending"
+    );
+
+    let legacy_insert = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "INSERT INTO sessions (user_id, session_token, expires_at) \
+                 VALUES ({user_id}, 'mixed-version-challenge', now() + INTERVAL '5 minutes') \
+                 RETURNING mfa_pending"
+            ),
+        ))
+        .await?
+        .expect("legacy-style session insert");
+    let defaults_pending: bool = legacy_insert.try_get("", "mfa_pending")?;
+    assert!(
+        defaults_pending,
+        "a mixed-version insert that omits purpose must fail closed"
+    );
+
+    db.execute_unprepared(&format!(
+        "INSERT INTO sessions (user_id, session_token, expires_at, mfa_pending) \
+         VALUES ({user_id}, 'new-real-session', now() + INTERVAL '7 days', FALSE)"
+    ))
+    .await?;
+
+    Ok(())
+}
