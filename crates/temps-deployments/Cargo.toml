@@ -53,7 +53,7 @@ sysinfo = { workspace = true }
 tar = { workspace = true }
 bytes = { workspace = true }
 http-body-util = { workspace = true }
-cron = "0.12"
+cron = "0.15"
 flate2 = { workspace = true }
 zip = { workspace = true }
 rand = { workspace = true }
@@ -69,7 +69,7 @@ rustls-pemfile = { workspace = true }
 [dev-dependencies]
 testcontainers = { workspace = true }
 tokio-test = "0.4"
-mockall = "0.12"
+mockall = "0.13"
 tower = { workspace = true }
 env_logger = "0.11"
 tempfile = "3.8"
