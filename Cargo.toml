@@ -156,7 +156,9 @@ sea-orm-migration = { version = "1.1", features = [
     "sqlx-postgres",
     "runtime-tokio-rustls"
 ] }
-sqlx = { version = "0.9.0", features = ["postgres", "mysql", "runtime-tokio"] }
+# Pinned to 0.8 to match sea-orm 1.1's sqlx: a direct 0.9 dep splits the graph
+# into two sqlx versions and 0.9's SqlSafeStr guard breaks our dynamic queries.
+sqlx = { version = "0.8", features = ["postgres", "mysql", "runtime-tokio"] }
 rusqlite = { version = "0.32.0", features = ["bundled", "trace"] }
 
 # ============================================================================
