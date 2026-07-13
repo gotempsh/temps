@@ -3104,6 +3104,98 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_email_renders_action_button_when_action_url_present() {
+        // Mirrors what the error-tracking plugin attaches: a deep link to the
+        // error group page plus a human-readable label.
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            "_action_url".to_string(),
+            "https://temps.example/projects/demo/errors/42".to_string(),
+        );
+        metadata.insert(
+            "_action_label".to_string(),
+            "View error details".to_string(),
+        );
+
+        let notification = Notification {
+            id: "action-test".to_string(),
+            title: "New error group".to_string(),
+            message: "A new error was detected".to_string(),
+            notification_type: NotificationType::Alert,
+            priority: NotificationPriority::High,
+            severity: None,
+            timestamp: Utc::now(),
+            metadata,
+            bypass_throttling: false,
+        };
+
+        let html = EmailProvider::render_notification_email(&notification);
+
+        assert!(
+            html.contains(r#"href="https://temps.example/projects/demo/errors/42""#),
+            "rendered email must link to the action URL: {html}"
+        );
+        assert!(
+            html.contains("View error details"),
+            "rendered email must show the action label: {html}"
+        );
+        // `_`-prefixed keys are reserved channel payloads, not human-facing
+        // metadata rows — they must not also appear in the details table.
+        assert!(
+            !html.contains("_action_url") && !html.contains("_action_label"),
+            "reserved metadata keys must not leak into the visible details table: {html}"
+        );
+    }
+
+    #[test]
+    fn test_email_omits_action_button_when_action_url_absent() {
+        let notification = Notification::new("New error group", "A new error was detected");
+
+        let html = EmailProvider::render_notification_email(&notification);
+
+        assert!(
+            !html.contains("<a href="),
+            "no CTA button should render when _action_url is not set: {html}"
+        );
+    }
+
+    #[test]
+    fn test_email_action_button_escapes_html_in_url_and_label() {
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            "_action_url".to_string(),
+            r#"https://evil.example/"><script>alert(1)</script>"#.to_string(),
+        );
+        metadata.insert(
+            "_action_label".to_string(),
+            "<script>alert(1)</script>".to_string(),
+        );
+
+        let notification = Notification {
+            id: "action-injection-test".to_string(),
+            title: "New error group".to_string(),
+            message: "A new error was detected".to_string(),
+            notification_type: NotificationType::Alert,
+            priority: NotificationPriority::High,
+            severity: None,
+            timestamp: Utc::now(),
+            metadata,
+            bypass_throttling: false,
+        };
+
+        let html = EmailProvider::render_notification_email(&notification);
+
+        assert!(
+            !html.contains("<script>"),
+            "rendered HTML must not contain an injected script tag: {html}"
+        );
+        assert!(
+            html.contains("&lt;script&gt;"),
+            "injected markup in the action URL/label must be HTML-escaped: {html}"
+        );
+    }
+
     // ── Regression test: HTML injection via message body (ADR-026 Phase 3) ──
     //
     // Attack path: OTel per-series label (e.g., `env=</td><a href="...">`) is
