@@ -5990,21 +5990,6 @@ dependencies = [
 
 [[package]]
 name = "mockall"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43766c2b5203b10de348ffe19f7e54564b64f3d6018ff7648d1e2d6d3a0f0a48"
-dependencies = [
- "cfg-if",
- "downcast",
- "fragile",
- "lazy_static",
- "mockall_derive 0.12.1",
- "predicates",
- "predicates-tree",
-]
-
-[[package]]
-name = "mockall"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39a6bfcc6c8c7eed5ee98b9c3e33adc726054389233e201c95dab2d41a3839d2"
@@ -6012,21 +5997,9 @@ dependencies = [
  "cfg-if",
  "downcast",
  "fragile",
- "mockall_derive 0.13.1",
+ "mockall_derive",
  "predicates",
  "predicates-tree",
-]
-
-[[package]]
-name = "mockall_derive"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af7cbce79ec385a1d4f54baa90a76401eb15d9cab93685f62e7e9f942aa00ae2"
-dependencies = [
- "cfg-if",
- "proc-macro2",
- "quote",
- "syn 2.0.117",
 ]
 
 [[package]]
@@ -11321,7 +11294,7 @@ dependencies = [
  "futures",
  "futures-util",
  "http-body-util",
- "mockall 0.12.1",
+ "mockall",
  "num_cpus",
  "reqwest 0.12.28",
  "sea-orm",
@@ -11365,7 +11338,7 @@ dependencies = [
  "hex",
  "http-body-util",
  "ipnet",
- "mockall 0.12.1",
+ "mockall",
  "octocrab",
  "rand 0.8.6",
  "reqwest 0.12.28",
@@ -11428,7 +11401,7 @@ dependencies = [
  "hex",
  "hickory-resolver",
  "hmac 0.13.0",
- "mockall 0.13.1",
+ "mockall",
  "quick-xml",
  "reqwest 0.12.28",
  "rsa",
@@ -12228,7 +12201,7 @@ dependencies = [
  "futures",
  "ipnet",
  "libc",
- "mockall 0.13.1",
+ "mockall",
  "netlink-packet-core 0.7.0",
  "netlink-packet-route",
  "nix 0.31.3",
