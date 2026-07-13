@@ -144,6 +144,7 @@ mod m20260705_000001_add_visitor_unique_index;
 mod m20260707_000001_add_external_service_to_logs;
 mod m20260707_000002_add_external_services_container_name;
 mod m20260708_000001_add_node_id_to_monitoring_alert_rules;
+mod m20260711_000001_normalize_email_event_types;
 mod m20260711_000002_create_suppressed_recipients;
 
 pub struct Migrator;
@@ -294,6 +295,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260707_000001_add_external_service_to_logs::Migration),
             Box::new(m20260707_000002_add_external_services_container_name::Migration),
             Box::new(m20260708_000001_add_node_id_to_monitoring_alert_rules::Migration),
+            Box::new(m20260711_000001_normalize_email_event_types::Migration),
             Box::new(m20260711_000002_create_suppressed_recipients::Migration),
         ]
     }

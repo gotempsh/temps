@@ -551,9 +551,9 @@ mod tests {
         let events: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0]["event_type"], "open");
+        assert_eq!(events[0]["event_type"], "opened");
         assert_eq!(events[0]["ip_address"], "1.1.1.1");
-        assert_eq!(events[1]["event_type"], "click");
+        assert_eq!(events[1]["event_type"], "clicked");
         assert_eq!(events[1]["ip_address"], "2.2.2.2");
         assert_eq!(events[1]["link_index"], 0);
         assert_eq!(events[1]["link_url"], "https://example.com/page1");
@@ -602,7 +602,7 @@ mod tests {
         let events: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(events.len(), 2, "Should only return open events");
-        assert!(events.iter().all(|e| e["event_type"] == "open"));
+        assert!(events.iter().all(|e| e["event_type"] == "opened"));
     }
 
     // ============================================
@@ -747,10 +747,10 @@ mod tests {
         let events: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0]["event_type"], "open");
+        assert_eq!(events[0]["event_type"], "opened");
         assert_eq!(events[0]["ip_address"], "127.0.0.1"); // from RequestMetadata
         assert_eq!(events[0]["user_agent"], "test-agent");
-        assert_eq!(events[1]["event_type"], "click");
+        assert_eq!(events[1]["event_type"], "clicked");
         assert_eq!(events[1]["link_url"], "https://example.com/page1");
 
         // Step 6: Verify the database state directly

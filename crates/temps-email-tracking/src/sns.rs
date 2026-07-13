@@ -261,17 +261,90 @@ impl SnsVerifier {
         string_to_sign
     }
 
+    /// Extract the RSA public key from a PEM-encoded X.509 certificate body.
+    fn extract_public_key(cert_pem: &[u8]) -> Result<rsa::RsaPublicKey, EmailTrackingError> {
+        use rsa::pkcs8::DecodePublicKey;
+
+        let (_, pem) = x509_parser::pem::parse_x509_pem(cert_pem).map_err(|e| {
+            EmailTrackingError::SnsValidation(format!("Failed to parse cert PEM: {}", e))
+        })?;
+        let cert = pem.parse_x509().map_err(|e| {
+            EmailTrackingError::SnsValidation(format!("Failed to parse X.509 certificate: {}", e))
+        })?;
+
+        rsa::RsaPublicKey::from_public_key_der(cert.tbs_certificate.subject_pki.raw).map_err(|e| {
+            EmailTrackingError::SnsValidation(format!(
+                "Failed to extract RSA public key from certificate: {}",
+                e
+            ))
+        })
+    }
+
+    /// Verify a PKCS#1v1.5 RSA signature over `string_to_sign` against
+    /// `public_key`, for the given AWS `SignatureVersion` ("1" = SHA1, "2" =
+    /// SHA256). Pure/sync so it's unit-testable without a network fetch —
+    /// `verify_signature` below is the thin async wrapper that fetches the
+    /// cert and calls this.
+    fn verify_pkcs1v15(
+        public_key: rsa::RsaPublicKey,
+        signature_version: &str,
+        string_to_sign: &str,
+        signature_bytes: &[u8],
+    ) -> Result<(), EmailTrackingError> {
+        use rsa::pkcs1v15;
+        use rsa::signature::hazmat::PrehashVerifier;
+        use sha2_rsa::Digest;
+
+        let result = match signature_version {
+            "1" => {
+                let hashed = sha1::Sha1::digest(string_to_sign.as_bytes());
+                let signature = pkcs1v15::Signature::try_from(signature_bytes).map_err(|e| {
+                    EmailTrackingError::SnsValidation(format!("Invalid signature: {}", e))
+                })?;
+                pkcs1v15::VerifyingKey::<sha1::Sha1>::new(public_key)
+                    .verify_prehash(&hashed, &signature)
+            }
+            "2" => {
+                let hashed = sha2_rsa::Sha256::digest(string_to_sign.as_bytes());
+                let signature = pkcs1v15::Signature::try_from(signature_bytes).map_err(|e| {
+                    EmailTrackingError::SnsValidation(format!("Invalid signature: {}", e))
+                })?;
+                pkcs1v15::VerifyingKey::<sha2_rsa::Sha256>::new(public_key)
+                    .verify_prehash(&hashed, &signature)
+            }
+            other => {
+                return Err(EmailTrackingError::SnsValidation(format!(
+                    "Unsupported SignatureVersion: {}",
+                    other
+                )))
+            }
+        };
+
+        result.map_err(|e| {
+            EmailTrackingError::SnsValidation(format!("Signature verification failed: {}", e))
+        })?;
+        Ok(())
+    }
+
     /// Verify the signature of an SNS message.
     ///
-    /// Supports SignatureVersion "1" (SHA1) and "2" (SHA256).
+    /// Supports SignatureVersion "1" (SHA1 with RSA — AWS SNS default) and
+    /// "2" (SHA256 with RSA — newer SNS topics). Fetches the signing
+    /// certificate (already SSRF-guarded via `validate_signing_cert_url` in
+    /// `fetch_cert`), extracts its RSA public key, and verifies the
+    /// PKCS#1v1.5 signature against the canonical string-to-sign — this is
+    /// what actually proves the notification came from AWS, not just that
+    /// the cert URL looked legitimate.
     pub async fn verify_signature(&self, message: &SnsMessage) -> Result<(), EmailTrackingError> {
         let cert_url = message.signing_cert_url.as_deref().ok_or_else(|| {
             EmailTrackingError::SnsValidation("Missing SigningCertURL".to_string())
         })?;
 
-        let _cert_pem = self.fetch_cert(cert_url).await?;
-        let _string_to_sign = Self::build_string_to_sign(message);
-        let _signature_bytes = base64::Engine::decode(
+        let cert_pem = self.fetch_cert(cert_url).await?;
+        let public_key = Self::extract_public_key(&cert_pem)?;
+
+        let string_to_sign = Self::build_string_to_sign(message);
+        let signature_bytes = base64::Engine::decode(
             &base64::engine::general_purpose::STANDARD,
             &message.signature,
         )
@@ -279,26 +352,18 @@ impl SnsVerifier {
             EmailTrackingError::SnsValidation(format!("Invalid signature base64: {}", e))
         })?;
 
-        // Verify based on SignatureVersion
-        match message.signature_version.as_str() {
-            "1" => {
-                // SHA1 with RSA — AWS SNS default
-                // Full RSA verification requires ring or rustls-webpki.
-                // For now, we validate the cert URL strictly (SSRF prevention)
-                // and trust the AWS cert chain.
-                debug!("SNS signature verification (SHA1): cert URL validated");
-                Ok(())
-            }
-            "2" => {
-                // SHA256 with RSA — newer SNS topics
-                debug!("SNS signature verification (SHA256): cert URL validated");
-                Ok(())
-            }
-            other => Err(EmailTrackingError::SnsValidation(format!(
-                "Unsupported SignatureVersion: {}",
-                other
-            ))),
-        }
+        Self::verify_pkcs1v15(
+            public_key,
+            &message.signature_version,
+            &string_to_sign,
+            &signature_bytes,
+        )?;
+
+        debug!(
+            "SNS signature verified (SignatureVersion {})",
+            message.signature_version
+        );
+        Ok(())
     }
 
     /// Handle SubscriptionConfirmation by confirming the subscription with retry.
@@ -415,6 +480,100 @@ impl SnsVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Real self-signed RSA-2048 keypair + cert, generated once with:
+    //   openssl genrsa -out key.pem 2048
+    //   openssl req -new -x509 -key key.pem -out cert.pem -days 3650 \
+    //     -subj "/CN=sns.us-east-1.amazonaws.com"
+    // Signatures are over the literal bytes "hello sns test", produced with:
+    //   openssl dgst -sha1/-sha256 -sign key.pem message.txt | base64
+    // Exercises the actual crypto path (extract_public_key + verify_pkcs1v15)
+    // against known-good vectors, not just error-path plumbing.
+    const TEST_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIDLTCCAhWgAwIBAgIUXj+rcBQ6uYyv/nRRRUamAvHUbBUwDQYJKoZIhvcNAQEL\n\
+BQAwJjEkMCIGA1UEAwwbc25zLnVzLWVhc3QtMS5hbWF6b25hd3MuY29tMB4XDTI2\n\
+MDcxMTA4NTU1MloXDTM2MDcwODA4NTU1MlowJjEkMCIGA1UEAwwbc25zLnVzLWVh\n\
+c3QtMS5hbWF6b25hd3MuY29tMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKC\n\
+AQEAsu8cvSBCdR/7h2dRj92q/9lcPOvJcwxN9ltYepB8Yo2Am+OA7BAkZKpSDJBQ\n\
+snjTMdRcl0YyXIUZC3S2+pJQwJOfYHGx+Aj6uO20E03GtmFtjhT7phx2Z0SfvVjd\n\
+1swvqAiz12WRFENJI9KjIpRUM0fZNFCyk0GM6gXkt4+1AW3+vWsaK/sHBqDCOx68\n\
+zO6IDVnQWN9Fst9OO7vGNATlGctX6KCFJ+wbcTyWShaOmfQv4B1rnkn8x46Ks2e8\n\
+yxTWxzzagcyN7DdqnrHUtRROho7vGNJvY5ym4W5N7SNz8puymE6yubCqY/Rk+bNL\n\
+uMSRQKkYluO1wN8YH2CQtWEUpQIDAQABo1MwUTAdBgNVHQ4EFgQUXLZS/RfDvnB3\n\
+z+9ixrxPqt2YRawwHwYDVR0jBBgwFoAUXLZS/RfDvnB3z+9ixrxPqt2YRawwDwYD\n\
+VR0TAQH/BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEAU4SSAcweqT9dEswEO2Q9\n\
+A8/wYz4UGA6yD4HfSPSFVzdaXUVli5iFegaJM2nfBwXb0RhBE31smMyxNZAEjFcS\n\
+FvojwUzVDSFbnR5m80h4M8EpJ9b1UbojX8xmZ696/ZX1PySbNRQwt5reS9RK1z1P\n\
+mW3aiPGIh1X30h5tIBcnlNk99vL+2VD+fmGw6FdyXP8VmDPOXa/lBzw4LGm9mijn\n\
+k4YZJ3XZqxeS5/0tAqqj+XzacraM6mm92nZxQNrF9UkPFwQWxxxBYfKQyU+8bWdO\n\
+NzhDwvguWhmGlUoSFrzbyr3JbHTQCA+zhE5VxqYlcXCPap0dtfw1JxE0gUGJ/WdS\n\
+EQ==\n\
+-----END CERTIFICATE-----\n";
+
+    const TEST_MESSAGE: &str = "hello sns test";
+
+    const TEST_SIG_SHA1_B64: &str = "SXLlWLT4D0tiG/G2gR3sl22QAKuV6CqbbbWy6FWVPAKQv0SmdBU5ck6CspGYGYmB360QAu+zv4nVKJITaiK3GIIindCreDNblABnIMZQdvxgRwIt8ihLwZV0UB1Ont6ex8+hp3s0SaP3YHpUOctz7LxD5ROOBespWgzsam7NH+R9BJvPgykkSVkwpYeK98SX7+5YUBQ5LmMIXm9z4JYFaMGd3YCy0T6EgSPlTNLggTcVq+dkT0al7NkiKv0ysWh8+gsZzq0tSfKhnKBxaJN5S3NkEEmKfGgVFgWOxUa/1tR7Cl+j45OXXPWRKwMMwlC2Q7CAo/b95FUkx9VvPWn+9g==";
+
+    const TEST_SIG_SHA256_B64: &str = "q/jObO/8qo6HPN1FzvllsHpCLr3nEvW3r+HglGD0SfEjj3cng9jNj7xVvt0vFR3YN6YgyZn+Ss7kv8w/Yi90IUGHgx0RPvF1s3Nu9BqONNn8LUFzng+ixJESzGgZi9Czkgk5gob/jBTVoK+CT4sc/37ZJFw3o9rS8BrRm5uvCxP0hJJhlwkpIlMBwVILWJVk+bkGGnfuDF5Pn1OM1/S3L+FK+i3dS7V6pHovp0cINEjw/I3VOXeSuw5JTR6imQB8/OyIjaI3nd1oFuA7Tf9ynFmTMdBdMbpg1D0YyCJUJDOI1n5aEwuV/FIzppEsORYOyuUjB4pkxzVyQ5/UX/jsqA==";
+
+    fn decode_b64(s: &str) -> Vec<u8> {
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s).unwrap()
+    }
+
+    #[test]
+    fn extract_public_key_parses_real_cert() {
+        assert!(SnsVerifier::extract_public_key(TEST_CERT_PEM.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn extract_public_key_rejects_garbage() {
+        assert!(SnsVerifier::extract_public_key(b"not a certificate").is_err());
+    }
+
+    #[test]
+    fn verify_pkcs1v15_accepts_valid_sha1_signature() {
+        let key = SnsVerifier::extract_public_key(TEST_CERT_PEM.as_bytes()).unwrap();
+        let sig = decode_b64(TEST_SIG_SHA1_B64);
+        assert!(SnsVerifier::verify_pkcs1v15(key, "1", TEST_MESSAGE, &sig).is_ok());
+    }
+
+    #[test]
+    fn verify_pkcs1v15_accepts_valid_sha256_signature() {
+        let key = SnsVerifier::extract_public_key(TEST_CERT_PEM.as_bytes()).unwrap();
+        let sig = decode_b64(TEST_SIG_SHA256_B64);
+        assert!(SnsVerifier::verify_pkcs1v15(key, "2", TEST_MESSAGE, &sig).is_ok());
+    }
+
+    #[test]
+    fn verify_pkcs1v15_rejects_tampered_message() {
+        let key = SnsVerifier::extract_public_key(TEST_CERT_PEM.as_bytes()).unwrap();
+        let sig = decode_b64(TEST_SIG_SHA256_B64);
+        assert!(SnsVerifier::verify_pkcs1v15(key, "2", "tampered message", &sig).is_err());
+    }
+
+    #[test]
+    fn verify_pkcs1v15_rejects_sha1_signature_claimed_as_sha256() {
+        // A valid SHA1 signature must not verify under a "2" (SHA256) claim —
+        // this is exactly the kind of algorithm-confusion an attacker would
+        // try if SignatureVersion in the payload weren't cryptographically
+        // bound to the signature itself.
+        let key = SnsVerifier::extract_public_key(TEST_CERT_PEM.as_bytes()).unwrap();
+        let sig = decode_b64(TEST_SIG_SHA1_B64);
+        assert!(SnsVerifier::verify_pkcs1v15(key, "2", TEST_MESSAGE, &sig).is_err());
+    }
+
+    #[test]
+    fn verify_pkcs1v15_rejects_garbage_signature() {
+        let key = SnsVerifier::extract_public_key(TEST_CERT_PEM.as_bytes()).unwrap();
+        assert!(SnsVerifier::verify_pkcs1v15(key, "2", TEST_MESSAGE, b"not-a-signature").is_err());
+    }
+
+    #[test]
+    fn verify_pkcs1v15_rejects_unsupported_signature_version() {
+        let key = SnsVerifier::extract_public_key(TEST_CERT_PEM.as_bytes()).unwrap();
+        let sig = decode_b64(TEST_SIG_SHA256_B64);
+        assert!(SnsVerifier::verify_pkcs1v15(key, "3", TEST_MESSAGE, &sig).is_err());
+    }
 
     #[test]
     fn test_validate_signing_cert_url_valid() {
