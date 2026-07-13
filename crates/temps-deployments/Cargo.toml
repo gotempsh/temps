@@ -53,7 +53,7 @@ sysinfo = { workspace = true }
 tar = { workspace = true }
 bytes = { workspace = true }
 http-body-util = { workspace = true }
-cron = "0.12"
+cron = "0.15"
 flate2 = { workspace = true }
 zip = { workspace = true }
 rand = { workspace = true }
