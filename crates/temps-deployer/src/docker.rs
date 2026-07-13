@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
-use sysinfo::{System, SystemExt};
+use sysinfo::System;
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, error, info, warn};

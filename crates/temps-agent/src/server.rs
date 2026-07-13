@@ -311,24 +311,23 @@ fn spawn_heartbeat_loop(
 
 /// Collect system resource metrics for heartbeat capacity data.
 fn collect_capacity_metrics() -> serde_json::Value {
-    use sysinfo::{CpuExt, DiskExt, SystemExt};
+    use sysinfo::Disks;
 
     let mut sys = sysinfo::System::new();
-    sys.refresh_cpu();
+    sys.refresh_cpu_all();
     sys.refresh_memory();
-    sys.refresh_disks_list();
-    sys.refresh_disks();
+    let disks = Disks::new_with_refreshed_list();
 
     // Use only the root mount point to avoid double-counting overlapping mounts
-    let (disk_used, disk_total) = sys
-        .disks()
+    let (disk_used, disk_total) = disks
+        .list()
         .iter()
         .find(|d| d.mount_point() == std::path::Path::new("/"))
         .map(|d| (d.total_space() - d.available_space(), d.total_space()))
         .unwrap_or((0, 0));
 
     serde_json::json!({
-        "cpu_percent": sys.global_cpu_info().cpu_usage(),
+        "cpu_percent": sys.global_cpu_usage(),
         "memory_used_bytes": sys.used_memory(),
         "memory_total_bytes": sys.total_memory(),
         "disk_used_bytes": disk_used,
