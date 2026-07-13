@@ -32,7 +32,7 @@ flate2 = { workspace = true }
 tracing = { workspace = true }
 memchr = "2.7"
 htmd = "0.5"
-scraper = "0.25"
+scraper = "0.27"
 pingora = { version = "0.8.0", features = ["lb"] }
 pingora-core = { version = "0.8.0", features = ["openssl", "connection_filter"] }
 pingora-http = "0.8.0"
@@ -53,7 +53,7 @@ thiserror = { workspace = true }
 base64 = { workspace = true }
 anyhow = { workspace = true }
 utoipa = { workspace = true }
-sqlx = { version = "0.8", features = ["postgres", "runtime-tokio"] }
+sqlx = { version = "0.9", features = ["postgres", "runtime-tokio"] }
 dashmap = "6"
 futures = { workspace = true }
 parking_lot = "0.12"
@@ -75,7 +75,7 @@ integration = []
 [dev-dependencies]
 tokio-test = "0.4"
 testcontainers = { workspace = true }
-temp-dir = "0.1"
+temp-dir = "0.2"
 hyper = { version = "1.0", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = { workspace = true }
