@@ -408,24 +408,42 @@ export function EnvironmentConfigurationCard({
                     <div>
                       <div className="flex items-center justify-between">
                         <Label>Memory Limit (MB)</Label>
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="sm"
-                          className="h-auto px-1 py-0 text-xs text-muted-foreground"
-                          disabled={formData.memory_limit === ''}
-                          onClick={() =>
-                            setFormData((prev) => ({
-                              ...prev,
-                              memory_limit: '',
-                            }))
-                          }
-                        >
-                          No limit
-                        </Button>
+                        <div className="flex items-center gap-1">
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            className="h-auto px-1 py-0 text-xs text-muted-foreground"
+                            disabled={formData.memory_limit === ''}
+                            onClick={() =>
+                              setFormData((prev) => ({
+                                ...prev,
+                                memory_limit: '',
+                              }))
+                            }
+                          >
+                            Use default
+                          </Button>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            className="h-auto px-1 py-0 text-xs text-muted-foreground"
+                            disabled={formData.memory_limit === '0'}
+                            onClick={() =>
+                              setFormData((prev) => ({
+                                ...prev,
+                                memory_limit: '0',
+                              }))
+                            }
+                          >
+                            Uncapped
+                          </Button>
+                        </div>
                       </div>
                       <Input
                         type="number"
+                        min={0}
                         value={formData.memory_limit}
                         onChange={(e) =>
                           setFormData((prev) => ({
@@ -433,10 +451,12 @@ export function EnvironmentConfigurationCard({
                             memory_limit: e.target.value,
                           }))
                         }
-                        placeholder="No limit"
+                        placeholder="Use default"
                       />
                       <p className="text-xs text-muted-foreground mt-1">
-                        Maximum memory allocation. Leave empty for no limit.
+                        Maximum memory allocation. Leave empty to inherit the
+                        project/default limit, or set <code>0</code> (
+                        <strong>Uncapped</strong>) to run with no memory limit.
                       </p>
                     </div>
                   </div>
