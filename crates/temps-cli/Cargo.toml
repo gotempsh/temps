@@ -111,7 +111,7 @@ urlencoding = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 flate2 = "1.0"
-indicatif = "0.17"
+indicatif = "0.18"
 tar = { workspace = true }
 reqwest = { workspace = true }
 rustls = { workspace = true }
