@@ -111,7 +111,8 @@ async fn setup() -> Option<(ClickHouseOtelStorage, Box<dyn std::any::Any + Send>
     let mock_db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
     let inner = Arc::new(TimescaleDbStorage::new(Arc::new(mock_db), None));
 
-    let storage = ClickHouseOtelStorage::new(config, inner);
+    let storage =
+        ClickHouseOtelStorage::new(config, inner, Arc::new(temps_core::FixedRetentionResolver));
     Some((storage, Box::new(container)))
 }
 

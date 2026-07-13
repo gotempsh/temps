@@ -248,6 +248,15 @@ pub struct ChSpanRow {
     /// OTLP retries of the same span converge to one canonical row via
     /// ReplacingMergeTree (highest _version wins).
     pub _version: u64,
+
+    // ── Retention ───────────────────────────────────────────────────────────
+    /// retention_days  UInt16  DEFAULT 90
+    ///
+    /// Added by migration 0004_retention_days.sql — must remain the last
+    /// field so its position matches the DDL column order (positional binary
+    /// serialization). The TTL expression in 0005_retention_ttl.sql reads
+    /// this column: `toDateTime(start_time) + toIntervalDay(retention_days)`.
+    pub retention_days: u16,
 }
 
 // ── From<&SpanRecord> for ChSpanRow ────────────────────────────────────────
@@ -295,6 +304,9 @@ impl From<&SpanRecord> for ChSpanRow {
             attributes,
             events,
             _version: version,
+            // Callers that hold a RetentionResolver should override this field
+            // after construction. The fixed default matches the DDL DEFAULT.
+            retention_days: temps_core::RetentionTable::Spans.default_days(),
         }
     }
 }
@@ -896,6 +908,10 @@ pub struct ClickHouseOtelStorage {
     /// forwarded here verbatim. Phase 1 will replace span read delegation
     /// with native CH queries one method at a time.
     inner: Arc<TimescaleDbStorage>,
+    /// Resolves the per-project `retention_days` value stamped onto each
+    /// ingested span row. The default [`temps_core::FixedRetentionResolver`]
+    /// always returns 90; a plugin can register an alternative implementation.
+    resolver: Arc<dyn temps_core::RetentionResolver>,
 }
 
 impl ClickHouseOtelStorage {
@@ -906,13 +922,24 @@ impl ClickHouseOtelStorage {
     ///   methods and (during Phase 0) span reads. Callers typically pass
     ///   the same `Arc<TimescaleDbStorage>` they would have registered
     ///   without ClickHouse.
-    pub fn new(config: ClickHouseOtelConfig, inner: Arc<TimescaleDbStorage>) -> Self {
+    /// - `resolver`: resolves per-project `retention_days` at ingest time.
+    ///   Pass `Arc::new(FixedRetentionResolver)` unless a plugin has
+    ///   registered a project-aware implementation.
+    pub fn new(
+        config: ClickHouseOtelConfig,
+        inner: Arc<TimescaleDbStorage>,
+        resolver: Arc<dyn temps_core::RetentionResolver>,
+    ) -> Self {
         let ch = ::clickhouse::Client::default()
             .with_url(&config.url)
             .with_database(&config.database)
             .with_user(&config.user)
             .with_password(&config.password);
-        Self { ch, inner }
+        Self {
+            ch,
+            inner,
+            resolver,
+        }
     }
 
     /// Expose the raw ClickHouse client for migration runners / health checks.
@@ -952,7 +979,10 @@ impl OtelStorage for ClickHouseOtelStorage {
                 .map_err(|e| ch_ingest_err("store_spans (inserter setup)", e))?;
 
             for span in chunk {
-                let row = ChSpanRow::from(span);
+                let mut row = ChSpanRow::from(span);
+                row.retention_days = self
+                    .resolver
+                    .resolve(span.project_id, temps_core::RetentionTable::Spans);
                 inserter
                     .write(&row)
                     .await

@@ -27,7 +27,10 @@ export function useSpeedAnalytics(options: UseSpeedAnalyticsOptions = {}) {
           lcp: initialMetrics.LCP?.value ?? null,
           fid: initialMetrics.FID?.value ?? null,
           fcp: initialMetrics.FCP?.value ?? null,
-          path: window.location.pathname,
+          // The ingest endpoint's field is `pathname`; a `path` key is not
+          // recognized and the page ends up NULL in storage, breaking
+          // per-page performance breakdowns.
+          pathname: window.location.pathname,
           query: window.location.search,
         } as Record<string, JsonValue>;
         sendAnalytics("speed", metricsPayload, "POST", basePath);
@@ -37,7 +40,7 @@ export function useSpeedAnalytics(options: UseSpeedAnalyticsOptions = {}) {
     const sendLateMetric = (metricName: string, value: number) => {
       const payload = {
         [metricName.toLowerCase()]: value,
-        path: window.location.pathname,
+        pathname: window.location.pathname,
         query: window.location.search,
       } as Record<string, JsonValue>;
       sendAnalytics("speed", payload, "POST", basePath);

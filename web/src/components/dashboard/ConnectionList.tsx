@@ -1,16 +1,19 @@
 import { Link } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
-import { ArrowRight, GitBranch, Github, Gitlab } from 'lucide-react'
+import { ArrowRight, GitBranch } from 'lucide-react'
+import GithubIcon from '@/icons/Github'
+import GitlabIcon from '@/icons/Gitlab'
 import {
   listConnectionsOptions,
   listGitProvidersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
-import { cn } from '@/lib/utils'
 
 // Maps a connection's provider type to its mark. github_app shares the GitHub
-// glyph; anything unknown falls back to the generic branch icon.
+// glyph; anything unknown falls back to the generic branch icon. GithubIcon /
+// GitlabIcon (@/icons) already bake in their brand color, so no extra
+// color className is needed here.
 function ProviderIcon({
   type,
   className = 'h-5 w-5',
@@ -19,11 +22,8 @@ function ProviderIcon({
   className?: string
 }) {
   if (type === 'github' || type === 'github_app')
-    return <Github className={className} />
-  if (type === 'gitlab')
-    return (
-      <Gitlab className={cn(className, 'text-orange-500 dark:text-orange-400')} />
-    )
+    return <GithubIcon className={className} />
+  if (type === 'gitlab') return <GitlabIcon className={className} />
   return <GitBranch className={className} />
 }
 

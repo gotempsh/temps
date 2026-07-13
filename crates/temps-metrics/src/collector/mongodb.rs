@@ -39,8 +39,8 @@
 //! the scraper loop is never blocked by a slow or unreachable MongoDB instance.
 
 use async_trait::async_trait;
-use bson::doc;
 use chrono::Utc;
+use mongodb::bson::doc;
 use mongodb::{options::ClientOptions, Client};
 use std::collections::HashMap;
 use tracing::{debug, warn};
@@ -146,7 +146,7 @@ async fn run_server_status(
 }
 
 /// Extract metric points from a `serverStatus` BSON document.
-fn extract_metrics(doc: &bson::Document, config: &CollectorConfig) -> Vec<MetricPoint> {
+fn extract_metrics(doc: &mongodb::bson::Document, config: &CollectorConfig) -> Vec<MetricPoint> {
     let mut points: Vec<MetricPoint> = Vec::with_capacity(16);
     let now = Utc::now();
 
@@ -400,11 +400,11 @@ fn extract_metrics(doc: &bson::Document, config: &CollectorConfig) -> Vec<Metric
 /// the underlying BSON type is `Int32`, `Int64`, or `Double`.
 ///
 /// Returns `None` if the field is absent or cannot be converted to `f64`.
-fn bson_to_f64(doc: &bson::Document, key: &str) -> Option<f64> {
+fn bson_to_f64(doc: &mongodb::bson::Document, key: &str) -> Option<f64> {
     match doc.get(key) {
-        Some(bson::Bson::Int32(v)) => Some(*v as f64),
-        Some(bson::Bson::Int64(v)) => Some(*v as f64),
-        Some(bson::Bson::Double(v)) => Some(*v),
+        Some(mongodb::bson::Bson::Int32(v)) => Some(*v as f64),
+        Some(mongodb::bson::Bson::Int64(v)) => Some(*v as f64),
+        Some(mongodb::bson::Bson::Double(v)) => Some(*v),
         _ => None,
     }
 }
@@ -413,7 +413,7 @@ fn bson_to_f64(doc: &bson::Document, key: &str) -> Option<f64> {
 mod tests {
     use super::*;
     use crate::store::SourceKind;
-    use bson::doc;
+    use mongodb::bson::doc;
     use std::time::Duration;
 
     fn make_config() -> CollectorConfig {

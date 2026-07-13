@@ -54,7 +54,7 @@ uuid = { workspace = true }
 testcontainers = { workspace = true }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 axum-test = "16.3"
-webpki-roots = "0.26"
+webpki-roots = "1.0"
 bollard = { workspace = true }
 futures-util = { workspace = true }
 tar = { workspace = true }

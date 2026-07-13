@@ -118,6 +118,8 @@ impl IpAddressService {
             longitude: Set(geo_data.as_ref().and_then(|d| d.longitude)),
             timezone: Set(geo_data.as_ref().and_then(|d| d.timezone.clone())),
             is_eu: Set(geo_data.as_ref().map(|d| d.is_eu).unwrap_or(false)),
+            asn_org: Set(geo_data.as_ref().and_then(|d| d.asn_org.clone())),
+            is_hosting_provider: Set(geo_data.as_ref().and_then(|d| d.is_hosting_provider)),
             created_at: Set(now),
             updated_at: Set(now),
             ..Default::default()
@@ -170,6 +172,8 @@ impl IpAddressService {
         active_model.longitude = Set(geo_data.longitude);
         active_model.timezone = Set(geo_data.timezone);
         active_model.is_eu = Set(geo_data.is_eu);
+        active_model.asn_org = Set(geo_data.asn_org);
+        active_model.is_hosting_provider = Set(geo_data.is_hosting_provider);
         active_model.updated_at = Set(Utc::now());
 
         let updated = active_model

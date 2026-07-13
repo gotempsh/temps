@@ -119,7 +119,9 @@ pub struct TimescaleDbStorage {
     /// rationale.
     #[allow(dead_code)]
     retention_days: u32,
-    quota_bytes_per_project: u64,
+    /// Per-project storage quota. `None` disables quota enforcement: ingest
+    /// never runs the per-project usage estimate (see `get_storage_quota`).
+    quota_bytes_per_project: Option<u64>,
 }
 
 /// S3 log archiver configuration.
@@ -235,7 +237,7 @@ impl TimescaleDbStorage {
             db,
             s3_client,
             retention_days: 7,
-            quota_bytes_per_project: 10 * 1024 * 1024 * 1024,
+            quota_bytes_per_project: None,
         }
     }
 
@@ -244,7 +246,7 @@ impl TimescaleDbStorage {
         db: Arc<DatabaseConnection>,
         s3_client: Option<Arc<S3LogArchiver>>,
         retention_days: u32,
-        quota_bytes_per_project: u64,
+        quota_bytes_per_project: Option<u64>,
     ) -> Self {
         Self {
             db,
@@ -2217,6 +2219,23 @@ impl OtelStorage for TimescaleDbStorage {
     }
 
     async fn get_storage_quota(&self, project_id: i32) -> StorageResult<StorageQuota> {
+        // Quota is opt-in. With no limit configured, skip the usage estimate
+        // entirely and report zeros: this method sits on the ingest hot path
+        // (`OtelService::check_quota` calls it on every quota-cache miss), and
+        // its three per-project COUNT(*) hypertable scans are far too
+        // expensive to pay for a limit that is never enforced.
+        let Some(limit_bytes) = self.quota_bytes_per_project else {
+            return Ok(StorageQuota {
+                project_id,
+                metrics_bytes: 0,
+                traces_bytes: 0,
+                logs_bytes: 0,
+                total_bytes: 0,
+                limit_bytes: 0,
+                usage_pct: 0.0,
+            });
+        };
+
         // Per-project storage is estimated as
         //   table_size * (rows for project / total rows in table).
         // The per-project numerator must be exact, but the whole-table
@@ -2257,7 +2276,6 @@ impl OtelStorage for TimescaleDbStorage {
             None => 0,
         };
 
-        let limit_bytes: u64 = self.quota_bytes_per_project;
         let usage_pct = if limit_bytes > 0 {
             (total_bytes as f64 / limit_bytes as f64) * 100.0
         } else {
@@ -2276,6 +2294,8 @@ impl OtelStorage for TimescaleDbStorage {
     }
 
     async fn check_quota(&self, project_id: i32) -> StorageResult<bool> {
+        // With no quota configured, get_storage_quota short-circuits to zeros
+        // without touching the database, so this is always "not exceeded".
         let quota = self.get_storage_quota(project_id).await?;
         Ok(quota.usage_pct >= 100.0)
     }

@@ -923,8 +923,8 @@ function LiveMetrics({ serviceId, engine, latestMetrics }: LiveMetricsProps) {
                   labelStyle={TOOLTIP_LABEL_STYLE}
                   itemStyle={{ color: CHART_LINE_COLOR }}
                   cursor={{ stroke: 'rgba(128,128,128,0.3)', strokeWidth: 1 }}
-                  formatter={(v: number) => [
-                    formatMetricValue(selectedMetric, v),
+                  formatter={(v) => [
+                    formatMetricValue(selectedMetric, Number(v)),
                     labelForMetric(selectedMetric),
                   ]}
                 />

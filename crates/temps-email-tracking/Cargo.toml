@@ -49,7 +49,7 @@ url = { workspace = true }
 hmac = "0.13"
 
 # Streaming HTML rewriter for pixel injection + link rewriting
-lol_html = "2"
+lol_html = "3"
 
 # HTTP client for SNS cert fetching + subscription confirmation
 reqwest = { workspace = true }

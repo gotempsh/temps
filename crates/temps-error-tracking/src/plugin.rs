@@ -242,6 +242,7 @@ impl TempsPlugin for ErrorTrackingPlugin {
             dsn_service: dsn_service.clone(),
             audit_service: audit_service.clone(),
             config_service: config_service.clone(),
+            project_access_checker: project_access_checker.clone(),
         });
         let dsn_routes = crate::sentry::dsn_handlers::configure_dsn_routes().with_state(dsn_state);
 

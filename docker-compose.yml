@@ -95,6 +95,9 @@ services:
       # Optional: Mount local GeoLite2 database
       # Uncomment and update path to your local database file
       # - ./GeoLite2-City.mmdb:/app/data/GeoLite2-City.mmdb:ro
+
+      # Optional: Mount local GeoLite2 ASN database (hosting/VPS-provider detection)
+      # - ./GeoLite2-ASN.mmdb:/app/data/GeoLite2-ASN.mmdb:ro
     depends_on:
       postgres:
         condition: service_healthy

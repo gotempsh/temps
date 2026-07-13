@@ -29,9 +29,9 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import {
+  AppWindow,
   ArrowLeft,
   BarChart3,
-  Chrome,
   Globe,
   Hash,
   Link2,
@@ -211,7 +211,7 @@ export function EventDetail({
           {/* Top Browsers */}
           <BreakdownCard
             title="Top Browsers"
-            icon={<Chrome className="h-4 w-4 text-muted-foreground" />}
+            icon={<AppWindow className="h-4 w-4 text-muted-foreground" />}
             items={detailData.browsers.slice(0, 8)}
             renderItem={(browser) => ({
               label: browser.browser,

@@ -2868,6 +2868,11 @@ export const getDnsProviderOptions = (options: Options<GetDnsProviderData>) => q
 
 /**
  * Update a DNS provider
+ *
+ * If new credentials are supplied, they are tested before the update is
+ * persisted (same as creation) -- otherwise a provider's credentials (and,
+ * for Pebble, its target URL) could be swapped for something invalid or
+ * unsafe without ever going through validation.
  */
 export const updateProviderMutation = (options?: Partial<Options<UpdateProviderData>>): UseMutationOptions<UpdateProviderResponse, DefaultError, Options<UpdateProviderData>> => {
     const mutationOptions: UseMutationOptions<UpdateProviderResponse, DefaultError, Options<UpdateProviderData>> = {
@@ -5826,6 +5831,9 @@ export const listRepositoriesByProviderQueryKey = (options: Options<ListReposito
 
 /**
  * List all repositories for a specific provider
+ *
+ * Lists repositories synced to the database across every connection under
+ * this provider, with the same pagination/filtering as `/repositories`.
  */
 export const listRepositoriesByProviderOptions = (options: Options<ListRepositoriesByProviderData>) => queryOptions<ListRepositoriesByProviderResponse, DefaultError, ListRepositoriesByProviderResponse, ReturnType<typeof listRepositoriesByProviderQueryKey>>({
     queryFn: async ({ queryKey, signal }) => {
@@ -5839,6 +5847,39 @@ export const listRepositoriesByProviderOptions = (options: Options<ListRepositor
     },
     queryKey: listRepositoriesByProviderQueryKey(options)
 });
+
+export const listRepositoriesByProviderInfiniteQueryKey = (options: Options<ListRepositoriesByProviderData>): QueryKey<Options<ListRepositoriesByProviderData>> => createQueryKey('listRepositoriesByProvider', options, true);
+
+/**
+ * List all repositories for a specific provider
+ *
+ * Lists repositories synced to the database across every connection under
+ * this provider, with the same pagination/filtering as `/repositories`.
+ */
+export const listRepositoriesByProviderInfiniteOptions = (options: Options<ListRepositoriesByProviderData>) => {
+    const opts = infiniteQueryOptions<ListRepositoriesByProviderResponse, DefaultError, InfiniteData<ListRepositoriesByProviderResponse>, QueryKey<Options<ListRepositoriesByProviderData>>, number | Pick<QueryKey<Options<ListRepositoriesByProviderData>>[0], 'body' | 'headers' | 'path' | 'query'>>(
+    // @ts-ignore
+    {
+        queryFn: async ({ pageParam, queryKey, signal }) => {
+            // @ts-ignore
+            const page: Pick<QueryKey<Options<ListRepositoriesByProviderData>>[0], 'body' | 'headers' | 'path' | 'query'> = typeof pageParam === 'object' ? pageParam : {
+                query: {
+                    page: pageParam
+                }
+            };
+            const params = createInfiniteParams(queryKey, page);
+            const { data } = await listRepositoriesByProvider({
+                ...options,
+                ...params,
+                signal,
+                throwOnError: true
+            });
+            return data;
+        },
+        queryKey: listRepositoriesByProviderInfiniteQueryKey(options)
+    });
+    return opts as Omit<typeof opts, 'initialData'>;
+};
 
 /**
  * Safely delete a git provider (only if no projects are using it)

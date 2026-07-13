@@ -1398,6 +1398,11 @@ export const getDnsProvider = <ThrowOnError extends boolean = false>(options: Op
 
 /**
  * Update a DNS provider
+ *
+ * If new credentials are supplied, they are tested before the update is
+ * persisted (same as creation) -- otherwise a provider's credentials (and,
+ * for Pebble, its target URL) could be swapped for something invalid or
+ * unsafe without ever going through validation.
  */
 export const updateProvider = <ThrowOnError extends boolean = false>(options: Options<UpdateProviderData, ThrowOnError>): RequestResult<UpdateProviderResponses, UpdateProviderErrors, ThrowOnError> => (options.client ?? client).put<UpdateProviderResponses, UpdateProviderErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],
@@ -2868,6 +2873,9 @@ export const startGitProviderOauth = <ThrowOnError extends boolean = false>(opti
 
 /**
  * List all repositories for a specific provider
+ *
+ * Lists repositories synced to the database across every connection under
+ * this provider, with the same pagination/filtering as `/repositories`.
  */
 export const listRepositoriesByProvider = <ThrowOnError extends boolean = false>(options: Options<ListRepositoriesByProviderData, ThrowOnError>): RequestResult<ListRepositoriesByProviderResponses, ListRepositoriesByProviderErrors, ThrowOnError> => (options.client ?? client).get<ListRepositoriesByProviderResponses, ListRepositoriesByProviderErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],

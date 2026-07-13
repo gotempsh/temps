@@ -1,3 +1,4 @@
+use sea_orm::Statement;
 use sea_orm_migration::prelude::*;
 
 /// Migration: add a UNIQUE index on visitor(visitor_id, project_id).
@@ -29,6 +30,12 @@ use sea_orm_migration::prelude::*;
 /// Down removes the index (does NOT restore deleted rows).
 pub struct Migration;
 
+const CREATE_UNIQUE_INDEX_SQL: &str = r#"
+    CREATE UNIQUE INDEX IF NOT EXISTS
+        visitor_visitor_id_project_id_key
+    ON visitor (visitor_id, project_id);
+"#;
+
 impl MigrationName for Migration {
     fn name(&self) -> &str {
         "m20260705_000001_add_visitor_unique_index"
@@ -38,6 +45,38 @@ impl MigrationName for Migration {
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let connection = manager.get_connection();
+        let duplicate_check = connection
+            .query_one(Statement::from_string(
+                manager.get_database_backend(),
+                r#"
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM visitor
+                    GROUP BY visitor_id, project_id
+                    HAVING COUNT(*) > 1
+                ) AS has_duplicates;
+                "#,
+            ))
+            .await?
+            .ok_or_else(|| {
+                DbErr::Custom(
+                    "m20260705_000001: duplicate visitor check returned no row".to_string(),
+                )
+            })?;
+        let has_duplicates: bool = duplicate_check.try_get("", "has_duplicates")?;
+
+        // TimescaleDB may decompress hypertable chunks eagerly for UPDATE even
+        // when the join source is empty. Avoid touching the eight referencing
+        // tables when the visitor table is already unique; otherwise a no-op
+        // migration can exceed the tuple-decompression safety limit.
+        if !has_duplicates {
+            connection
+                .execute_unprepared(CREATE_UNIQUE_INDEX_SQL)
+                .await?;
+            return Ok(());
+        }
+
         // Step 1: Re-point FK references from duplicate visitor rows to the
         // canonical (lowest-id) row for the same (visitor_id, project_id).
         // NULL FK refs first so we don't violate the FK constraint on delete.
@@ -246,13 +285,7 @@ impl MigrationTrait for Migration {
         // running this manually outside a transaction after the migration runs.
         manager
             .get_connection()
-            .execute_unprepared(
-                r#"
-                CREATE UNIQUE INDEX IF NOT EXISTS
-                    visitor_visitor_id_project_id_key
-                ON visitor (visitor_id, project_id);
-                "#,
-            )
+            .execute_unprepared(CREATE_UNIQUE_INDEX_SQL)
             .await?;
 
         Ok(())
