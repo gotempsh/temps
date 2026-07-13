@@ -15450,7 +15450,9 @@ export type UniqueCountsQuery = {
      */
     environment_id?: number | null;
     /**
-     * Metric to count: "sessions" (unique sessions), "visitors" (unique visitors), or "page_views" (total page views) (default: "sessions")
+     * Metric to count: "sessions" (unique sessions), "visitors" (unique visitors),
+     * "returning_visitors" (visitors seen before the range), or "page_views"
+     * (total page views) (default: "sessions")
      */
     metric?: string;
     /**
@@ -40597,7 +40599,7 @@ export type GetUniqueCountsData = {
          */
         deployment_id?: number;
         /**
-         * Metric to count: 'sessions' (unique sessions), 'visitors' (unique visitors), or 'page_views' (total page views) (default: 'sessions')
+         * Metric to count: 'sessions' (unique sessions), 'visitors' (unique visitors), 'returning_visitors' (visitors seen before the range), or 'page_views' (total page views) (default: 'sessions')
          */
         metric: string;
     };

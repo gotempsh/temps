@@ -30,6 +30,7 @@ pub async fn collect_capacity_metrics() -> serde_json::Value {
     let mut sys = System::new_all();
     // Two CPU samples a short interval apart so cpu_percent reflects real load
     // instead of a cold 0 on the first refresh.
+    sys.refresh_cpu_all();
     tokio::time::sleep(CPU_SAMPLE_INTERVAL).await;
     sys.refresh_cpu_usage();
     sys.refresh_memory();
