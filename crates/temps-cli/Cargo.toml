@@ -89,7 +89,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 anyhow = { workspace = true }
-dirs = { version = "5.0" }
+dirs = { version = "6.0" }
 gethostname = "1.1"
 rand = { workspace = true }
 hex = { workspace = true }
