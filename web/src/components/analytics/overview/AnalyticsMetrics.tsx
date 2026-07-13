@@ -2,7 +2,7 @@ import { getUniqueCountsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { ProjectResponse } from '@/api/client/types.gen'
 
 import { useQuery } from '@tanstack/react-query'
-import { Users, MousePointer, FileText } from 'lucide-react'
+import { Users, UserRoundCheck, MousePointer, FileText } from 'lucide-react'
 
 interface AnalyticsMetricsProps {
   project: ProjectResponse
@@ -49,6 +49,22 @@ export function AnalyticsMetrics({
     enabled: !!startDate && !!endDate,
   })
 
+  // Fetch visitors who were seen before the selected range
+  const returningVisitorsQuery = useQuery({
+    ...getUniqueCountsOptions({
+      path: {
+        project_id: project.id,
+      },
+      query: {
+        start_date: startDate ? startDate.toISOString() : '',
+        end_date: endDate ? endDate.toISOString() : '',
+        environment_id: environment,
+        metric: 'returning_visitors',
+      },
+    }),
+    enabled: !!startDate && !!endDate,
+  })
+
   // Fetch unique paths
   const pathsQuery = useQuery({
     ...getUniqueCountsOptions({
@@ -66,9 +82,15 @@ export function AnalyticsMetrics({
   })
 
   const isLoading =
-    visitorsQuery.isLoading || sessionsQuery.isLoading || pathsQuery.isLoading
+    visitorsQuery.isLoading ||
+    returningVisitorsQuery.isLoading ||
+    sessionsQuery.isLoading ||
+    pathsQuery.isLoading
   const hasError =
-    visitorsQuery.error || sessionsQuery.error || pathsQuery.error
+    visitorsQuery.error ||
+    returningVisitorsQuery.error ||
+    sessionsQuery.error ||
+    pathsQuery.error
 
   const metrics = [
     {
@@ -76,6 +98,12 @@ export function AnalyticsMetrics({
       value: visitorsQuery.data?.count ?? 0,
       icon: Users,
       description: 'Total unique visitors',
+    },
+    {
+      label: 'Returning Visitors',
+      value: returningVisitorsQuery.data?.count ?? 0,
+      icon: UserRoundCheck,
+      description: 'Visitors seen before this period',
     },
     {
       label: 'Total Sessions',
@@ -91,8 +119,8 @@ export function AnalyticsMetrics({
     },
   ]
 
-  const gridCols = 'grid-cols-3'
-  const skeletonCount = 3
+  const gridCols = 'grid-cols-2 lg:grid-cols-4'
+  const skeletonCount = 4
 
   return (
     <>
@@ -138,7 +166,9 @@ export function AnalyticsMetrics({
                       ? metric.value.toLocaleString()
                       : metric.value}
                   </p>
-                  <p className="text-xs sm:text-sm text-muted-foreground">{metric.label}</p>
+                  <p className="text-xs sm:text-sm text-muted-foreground">
+                    {metric.label}
+                  </p>
                 </div>
               </div>
             )

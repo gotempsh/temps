@@ -321,7 +321,9 @@ pub struct UniqueCountsQuery {
     pub environment_id: Option<i32>,
     /// Optional deployment filter
     pub deployment_id: Option<i32>,
-    /// Metric to count: "sessions" (unique sessions), "visitors" (unique visitors), or "page_views" (total page views) (default: "sessions")
+    /// Metric to count: "sessions" (unique sessions), "visitors" (unique visitors),
+    /// "returning_visitors" (visitors seen before the range), or "page_views"
+    /// (total page views) (default: "sessions")
     #[serde(default = "default_metric")]
     pub metric: String,
 }

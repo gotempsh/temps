@@ -583,7 +583,7 @@ pub async fn get_property_timeline(
         ("end_date" = String, Query, description = "End date in '%Y-%m-%d %H:%M:%S' format"),
         ("environment_id" = Option<i32>, Query, description = "Filter by environment ID"),
         ("deployment_id" = Option<i32>, Query, description = "Filter by deployment ID"),
-        ("metric" = String, Query, description = "Metric to count: 'sessions' (unique sessions), 'visitors' (unique visitors), or 'page_views' (total page views) (default: 'sessions')")
+        ("metric" = String, Query, description = "Metric to count: 'sessions' (unique sessions), 'visitors' (unique visitors), 'returning_visitors' (visitors seen before the range), or 'page_views' (total page views) (default: 'sessions')")
     ),
     responses(
         (status = 200, description = "Successfully retrieved count", body = UniqueCountsResponse),
