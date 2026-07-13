@@ -75,7 +75,7 @@ integration = []
 [dev-dependencies]
 tokio-test = "0.4"
 testcontainers = { workspace = true }
-temp-dir = "0.1"
+temp-dir = "0.2"
 hyper = { version = "1.0", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = { workspace = true }
