@@ -38,7 +38,7 @@ libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
-mockall = "0.13"
+mockall = "0.15"
 tempfile = "3"
 
 # control_plane integration tests (Postgres-backed allocator)

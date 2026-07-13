@@ -69,7 +69,7 @@ rustls-pemfile = { workspace = true }
 [dev-dependencies]
 testcontainers = { workspace = true }
 tokio-test = "0.4"
-mockall = "0.13"
+mockall = "0.15"
 tower = { workspace = true }
 env_logger = "0.11"
 tempfile = "3.8"

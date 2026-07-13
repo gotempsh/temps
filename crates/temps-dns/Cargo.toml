@@ -72,7 +72,7 @@ testcontainers = { workspace = true }
 temps-migrations = { path = "../temps-migrations" }
 wiremock = "0.6"
 serial_test = "3.2"
-mockall = "0.13"
+mockall = "0.15"
 # ADR-024 integration test: in-process DNS client to query the real
 # control-plane resolver over a UDP socket (mirrors temps-dns-resolver's
 # own end_to_end.rs client).
