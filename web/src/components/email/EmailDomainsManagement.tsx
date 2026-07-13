@@ -78,6 +78,7 @@ import { useForm } from 'react-hook-form'
 import { useNavigate } from 'react-router-dom'
 import { toast } from 'sonner'
 import { z } from 'zod'
+import { problemMessage } from './sharedUtils'
 
 // Types
 type DnsRecordStatus = 'unknown' | 'verified' | 'pending' | 'failed'
@@ -98,16 +99,6 @@ const createDomainSchema = z.object({
 })
 
 type CreateDomainFormData = z.infer<typeof createDomainSchema>
-
-function problemMessage(error: unknown, fallback: string): string {
-  if (error && typeof error === 'object' && 'detail' in error) {
-    const detail = (error as { detail?: unknown }).detail
-    if (typeof detail === 'string' && detail.length > 0) {
-      return detail
-    }
-  }
-  return fallback
-}
 
 // API functions
 async function listEmailDomains(): Promise<EmailDomain[]> {
