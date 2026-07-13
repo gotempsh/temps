@@ -15,7 +15,7 @@ temps-core = { path = "../temps-core" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.0", features = ["full"] }
-config = "0.14"
+config = "0.15"
 dirs = "5.0"
 thiserror = { workspace = true }
 url = { workspace = true }
