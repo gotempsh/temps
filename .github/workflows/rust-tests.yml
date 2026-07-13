@@ -319,7 +319,7 @@ jobs:
         uses: taiki-e/install-action@nextest
 
       - name: Download test binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: test-binaries-default
 
@@ -466,7 +466,7 @@ jobs:
         uses: taiki-e/install-action@nextest
 
       - name: Download test binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: test-binaries-${{ matrix.archive }}
 
@@ -534,7 +534,7 @@ jobs:
         uses: taiki-e/install-action@nextest
 
       - name: Download test binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: test-binaries-docker-tests
 
