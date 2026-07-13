@@ -107,8 +107,10 @@ impl TempsPlugin for ErrorTrackingPlugin {
             {
                 tracing::info!("Error tracking: notification callback wired successfully");
                 let ns = notification_service.clone();
+                let notif_db = db.clone();
                 error_tracking_service.set_notification_callback(Arc::new(move |alert| {
                     let ns = ns.clone();
+                    let db = notif_db.clone();
                     Box::pin(async move {
                         use temps_notifications::types::{Notification, NotificationPriority};
                         let priority = match alert.priority.as_str() {
@@ -136,6 +138,32 @@ impl TempsPlugin for ErrorTrackingPlugin {
                         }
                         if let Some(ref env) = alert.environment_name {
                             notification = notification.with_metadata("environment", env.clone());
+                        }
+
+                        // Deep link to the error group detail page. Uses the
+                        // instance's configured external URL; `_`-prefixed keys
+                        // are reserved channel payloads, rendered as a CTA
+                        // button in emails instead of a plain detail row.
+                        if let Some(ref slug) = alert.project_slug {
+                            use sea_orm::EntityTrait;
+                            let base_url = temps_entities::settings::Entity::find_by_id(1)
+                                .one(db.as_ref())
+                                .await
+                                .ok()
+                                .flatten()
+                                .map(|r| temps_core::AppSettings::from_json(r.data))
+                                .and_then(|s| s.external_url);
+                            if let Some(base_url) = base_url {
+                                let url = format!(
+                                    "{}/projects/{}/errors/{}",
+                                    base_url.trim_end_matches('/'),
+                                    slug,
+                                    alert.group_id
+                                );
+                                notification = notification
+                                    .with_metadata("_action_url", url)
+                                    .with_metadata("_action_label", "View error details");
+                            }
                         }
 
                         if let Err(e) = ns.send_notification(notification).await {

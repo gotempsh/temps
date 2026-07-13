@@ -1077,21 +1077,20 @@ pub async fn health_check(State(state): State<Arc<AgentState>>) -> impl IntoResp
 
 /// Collect real system metrics using sysinfo.
 async fn collect_system_metrics(state: &AgentState) -> NodeHealthReport {
-    use sysinfo::{CpuExt, DiskExt, SystemExt};
+    use sysinfo::Disks;
 
     let mut sys = sysinfo::System::new();
-    sys.refresh_cpu();
+    sys.refresh_cpu_all();
     sys.refresh_memory();
-    sys.refresh_disks_list();
-    sys.refresh_disks();
+    let disks = Disks::new_with_refreshed_list();
 
-    let cpu_percent = sys.global_cpu_info().cpu_usage() as f64;
+    let cpu_percent = sys.global_cpu_usage() as f64;
     let memory_used_bytes = sys.used_memory();
     let memory_total_bytes = sys.total_memory();
 
     // Use only the root mount point to avoid double-counting overlapping mounts
-    let (disk_used, disk_total) = sys
-        .disks()
+    let (disk_used, disk_total) = disks
+        .list()
         .iter()
         .find(|d| d.mount_point() == std::path::Path::new("/"))
         .map(|d| (d.total_space() - d.available_space(), d.total_space()))

@@ -25,28 +25,27 @@ const CPU_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_milli
 /// Async because it samples the CPU twice with a short delay in between — a
 /// single sample would always report 0% on the first refresh.
 pub async fn collect_capacity_metrics() -> serde_json::Value {
-    use sysinfo::{CpuExt, DiskExt, SystemExt};
+    use sysinfo::Disks;
 
     let mut sys = sysinfo::System::new();
     // Two CPU samples a short interval apart so cpu_percent reflects real load
     // instead of a cold 0 on the first refresh.
-    sys.refresh_cpu();
+    sys.refresh_cpu_all();
     tokio::time::sleep(CPU_SAMPLE_INTERVAL).await;
-    sys.refresh_cpu();
+    sys.refresh_cpu_all();
     sys.refresh_memory();
-    sys.refresh_disks_list();
-    sys.refresh_disks();
+    let disks = Disks::new_with_refreshed_list();
 
     // Use only the root mount point to avoid double-counting overlapping mounts.
-    let (disk_used, disk_total) = sys
-        .disks()
+    let (disk_used, disk_total) = disks
+        .list()
         .iter()
         .find(|d| d.mount_point() == std::path::Path::new("/"))
         .map(|d| (d.total_space() - d.available_space(), d.total_space()))
         .unwrap_or((0, 0));
 
     serde_json::json!({
-        "cpu_percent": sys.global_cpu_info().cpu_usage(),
+        "cpu_percent": sys.global_cpu_usage(),
         "memory_used_bytes": sys.used_memory(),
         "memory_total_bytes": sys.total_memory(),
         "disk_used_bytes": disk_used,

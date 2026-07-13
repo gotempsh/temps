@@ -21,7 +21,7 @@ hyper-util = { version = "0.1", features = ["tokio", "client-legacy"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
-tokio-tungstenite = "0.28"
+tokio-tungstenite = "0.29"
 tower = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }

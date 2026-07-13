@@ -339,21 +339,20 @@ pub fn latest_control_plane_metrics() -> Option<CpSample> {
 /// the same shape worker heartbeats use. Cheap; called from the 60s health loop
 /// so the control-plane node shows live metrics like any worker.
 pub fn refresh_control_plane_metrics() {
-    use sysinfo::{CpuExt, DiskExt, SystemExt};
+    use sysinfo::Disks;
 
     let mut sys = sysinfo::System::new();
-    sys.refresh_cpu();
+    sys.refresh_cpu_all();
     sys.refresh_memory();
-    sys.refresh_disks_list();
-    sys.refresh_disks();
+    let disks = Disks::new_with_refreshed_list();
 
-    let cpu_percent = sys.global_cpu_info().cpu_usage() as f64;
+    let cpu_percent = sys.global_cpu_usage() as f64;
     let memory_used_bytes = sys.used_memory();
     let memory_total_bytes = sys.total_memory();
     // Root mount only, to avoid double-counting overlapping mounts (matches the
     // agent's collect_system_metrics).
-    let (disk_used, disk_total) = sys
-        .disks()
+    let (disk_used, disk_total) = disks
+        .list()
         .iter()
         .find(|d| d.mount_point() == std::path::Path::new("/"))
         .map(|d| (d.total_space() - d.available_space(), d.total_space()))
