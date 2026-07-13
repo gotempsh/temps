@@ -87,6 +87,10 @@ impl From<BackupError> for Problem {
                     .with_detail(error.to_string())
             }
 
+            BackupError::CleanupPreviewStale { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Cleanup Preview Is Stale")
+                .with_detail(error.to_string()),
+
             BackupError::Database(_)
             | BackupError::S3(_)
             | BackupError::Configuration(_)
@@ -2203,11 +2207,29 @@ async fn delete_backup(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Run retention immediately using every schedule's configured retention days.
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
+struct CleanupExpiredBackupsParams {
+    /// Return the backups selected by retention without deleting anything.
+    #[serde(default)]
+    dry_run: bool,
+    /// Limit cleanup to one backup schedule.
+    schedule_id: Option<i32>,
+}
+
+#[derive(Debug, Default, Deserialize, ToSchema)]
+struct CleanupExpiredBackupsRequest {
+    /// Exact candidates returned by the dry run. Execution fails if the
+    /// retention selection has changed since preview.
+    expected_backup_ids: Option<Vec<String>>,
+}
+
+/// Preview or run retention using each selected schedule's configured retention days.
 #[utoipa::path(
     tag = "Backups",
     post,
     path = "/backups/cleanup",
+    params(CleanupExpiredBackupsParams),
+    request_body = CleanupExpiredBackupsRequest,
     responses(
         (status = 200, description = "Retention cleanup completed", body = RetentionCleanupReport),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
@@ -2220,7 +2242,18 @@ async fn cleanup_expired_backups(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<BackupAppState>>,
     Extension(metadata): Extension<RequestMetadata>,
+    axum::extract::Query(params): axum::extract::Query<CleanupExpiredBackupsParams>,
+    request: Option<Json<CleanupExpiredBackupsRequest>>,
 ) -> Result<impl IntoResponse, Problem> {
+    if params.dry_run {
+        permission_guard!(auth, BackupsRead);
+        let report = app_state
+            .backup_service
+            .preview_retention(params.schedule_id)
+            .await?;
+        return Ok(Json(report));
+    }
+
     permission_guard!(auth, BackupsDelete);
 
     let audit_context = AuditContext {
@@ -2250,7 +2283,16 @@ async fn cleanup_expired_backups(
         }));
     }
 
-    let report = match app_state.backup_service.enforce_retention().await {
+    let report = match app_state
+        .backup_service
+        .enforce_retention(
+            params.schedule_id,
+            request
+                .as_ref()
+                .and_then(|body| body.expected_backup_ids.as_deref()),
+        )
+        .await
+    {
         Ok(report) => report,
         Err(error) => {
             let failed = BackupRetentionCleanupAudit {

@@ -67,10 +67,21 @@ interface DeleteBackupOptions {
 }
 
 interface RetentionCleanupReport {
+  dry_run: boolean
+  schedule_id: number | null
   expired: number
   deleted: number
   failed: number
   failures: Array<{ backup_id: string; reason: string }>
+  candidate_backup_ids: string[]
+  candidate_backup_ids_truncated: boolean
+}
+
+interface CleanupBackupsOptions {
+  dryRun?: boolean
+  scheduleId?: string
+  yes?: boolean
+  json?: boolean
 }
 
 interface CreateSourceOptions {
@@ -276,6 +287,8 @@ export function registerBackupsCommands(program: Command): void {
   backups
     .command('cleanup')
     .description('Delete backups expired by their schedule retention policy')
+    .option('--dry-run', 'Preview expired backups without deleting them')
+    .option('--schedule-id <id>', 'Limit cleanup to one schedule')
     .option('-y, --yes', 'Skip confirmation prompt')
     .option('--json', 'Output the cleanup report as JSON')
     .action(cleanupBackups)
@@ -1039,13 +1052,20 @@ async function deleteBackup(options: DeleteBackupOptions): Promise<void> {
   success(`Backup ${options.id} deleted`)
 }
 
-async function cleanupBackups(options: { yes?: boolean; json?: boolean }): Promise<void> {
+async function cleanupBackups(options: CleanupBackupsOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  if (!options.yes) {
+  const scheduleId = options.scheduleId ? Number.parseInt(options.scheduleId, 10) : undefined
+  if (options.scheduleId && (!Number.isInteger(scheduleId) || scheduleId! <= 0)) {
+    throw new Error('--schedule-id must be a positive integer')
+  }
+
+  if (!options.dryRun && !options.yes) {
     const confirmed = await promptConfirm({
-      message: 'Delete every backup older than its schedule retention period?',
+      message: scheduleId
+        ? `Delete backups expired by schedule ${scheduleId}'s retention policy?`
+        : 'Delete every backup older than its schedule retention period?',
       default: false,
     })
     if (!confirmed) {
@@ -1054,17 +1074,30 @@ async function cleanupBackups(options: { yes?: boolean; json?: boolean }): Promi
     }
   }
 
-  const report = await withSpinner('Cleaning up expired backups...', async () => {
-    const { data, error } = await client.post<RetentionCleanupReport>({
-      url: '/backups/cleanup',
-    })
-    if (error) throw new Error(getErrorMessage(error))
-    if (!data) throw new Error('Cleanup returned no report')
-    return data
-  })
+  const report = await withSpinner(
+    options.dryRun ? 'Previewing expired backups...' : 'Cleaning up expired backups...',
+    async () => {
+      const { data, error } = await client.post<RetentionCleanupReport>({
+        url: '/backups/cleanup',
+        query: {
+          dry_run: options.dryRun || undefined,
+          schedule_id: scheduleId,
+        },
+      })
+      if (error) throw new Error(getErrorMessage(error))
+      if (!data) throw new Error('Cleanup returned no report')
+      return data
+    },
+  )
 
   if (options.json) {
     json(report)
+    return
+  }
+  if (report.dry_run) {
+    info(`Dry run: ${report.expired} backup${report.expired === 1 ? '' : 's'} would be deleted`)
+    for (const backupId of report.candidate_backup_ids) info(backupId)
+    if (report.candidate_backup_ids_truncated) warning('Candidate list truncated to 100 backups')
     return
   }
   success(`Cleanup finished: ${report.deleted} deleted, ${report.failed} failed`)

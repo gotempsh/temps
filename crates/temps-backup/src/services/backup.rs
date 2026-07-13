@@ -482,6 +482,9 @@ pub enum BackupError {
         deleted_objects: u64,
         reason: String,
     },
+
+    #[error("Cleanup preview is stale: {detail}. Run a new dry-run preview before deleting")]
+    CleanupPreviewStale { detail: String },
 }
 
 #[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
@@ -494,6 +497,10 @@ pub struct RetentionCleanupFailure {
 
 #[derive(Debug, Clone, Default, serde::Serialize, utoipa::ToSchema)]
 pub struct RetentionCleanupReport {
+    /// True when this report is a non-destructive preview.
+    pub dry_run: bool,
+    /// Schedule scope, or `None` when every schedule was considered.
+    pub schedule_id: Option<i32>,
     pub expired: u64,
     pub deleted: u64,
     pub failed: u64,
@@ -504,6 +511,9 @@ pub struct RetentionCleanupReport {
     pub deleted_backup_ids_truncated: bool,
     pub partially_deleted_backup_ids: Vec<String>,
     pub partially_deleted_backup_ids_truncated: bool,
+    /// Capped sample of backups selected by the retention policy.
+    pub candidate_backup_ids: Vec<String>,
+    pub candidate_backup_ids_truncated: bool,
 }
 
 impl From<aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::put_object::PutObjectError>>
@@ -3855,12 +3865,51 @@ impl BackupService {
 
     /// Enforce retention for every backup schedule, including disabled ones.
     /// Deletes backups that are older than each schedule's `retention_period` days.
-    pub async fn enforce_retention(&self) -> Result<RetentionCleanupReport, BackupError> {
-        let schedules = temps_entities::backup_schedules::Entity::find()
-            .all(self.db.as_ref())
-            .await?;
+    pub async fn enforce_retention(
+        &self,
+        schedule_id: Option<i32>,
+        expected_backup_ids: Option<&[String]>,
+    ) -> Result<RetentionCleanupReport, BackupError> {
+        if let Some(expected) = expected_backup_ids {
+            return self
+                .enforce_previewed_retention(schedule_id, expected)
+                .await;
+        }
+        self.run_retention_cleanup(schedule_id, false).await
+    }
 
-        let mut report = RetentionCleanupReport::default();
+    /// Preview retention candidates without deleting S3 objects or database rows.
+    pub async fn preview_retention(
+        &self,
+        schedule_id: Option<i32>,
+    ) -> Result<RetentionCleanupReport, BackupError> {
+        self.run_retention_cleanup(schedule_id, true).await
+    }
+
+    async fn run_retention_cleanup(
+        &self,
+        schedule_id: Option<i32>,
+        dry_run: bool,
+    ) -> Result<RetentionCleanupReport, BackupError> {
+        let mut query = temps_entities::backup_schedules::Entity::find();
+        if let Some(id) = schedule_id {
+            query = query.filter(temps_entities::backup_schedules::Column::Id.eq(id));
+        }
+        let schedules = query.all(self.db.as_ref()).await?;
+        if let Some(id) = schedule_id {
+            if schedules.is_empty() {
+                return Err(BackupError::NotFound {
+                    resource: "BackupSchedule".to_string(),
+                    detail: format!("schedule id {}", id),
+                });
+            }
+        }
+
+        let mut report = RetentionCleanupReport {
+            dry_run,
+            schedule_id,
+            ..RetentionCleanupReport::default()
+        };
 
         for schedule in &schedules {
             if schedule.retention_period > 0 {
@@ -3879,6 +3928,9 @@ impl BackupService {
                     {
                         Ok(backups) => backups,
                         Err(e) => {
+                            if dry_run {
+                                return Err(BackupError::Database(e));
+                            }
                             report.failed += 1;
                             if report.failures.len() < 100 {
                                 report.failures.push(RetentionCleanupFailure {
@@ -3898,6 +3950,14 @@ impl BackupService {
                         last_id = backup.id;
                         report.expired += 1;
                         let backup_uuid = backup.backup_id.clone();
+                        if report.candidate_backup_ids.len() < 100 {
+                            report.candidate_backup_ids.push(backup_uuid.clone());
+                        } else {
+                            report.candidate_backup_ids_truncated = true;
+                        }
+                        if dry_run {
+                            continue;
+                        }
                         match self.delete_backup_model(backup).await {
                             Ok(_) => {
                                 report.deleted += 1;
@@ -3943,6 +4003,134 @@ impl BackupService {
             }
         }
 
+        Ok(report)
+    }
+
+    /// Delete exactly the candidates approved by a prior dry-run preview.
+    /// The candidate query is completed before any deletion begins, so policy
+    /// or cutoff drift cannot expand the destructive set after confirmation.
+    async fn enforce_previewed_retention(
+        &self,
+        schedule_id: Option<i32>,
+        expected_backup_ids: &[String],
+    ) -> Result<RetentionCleanupReport, BackupError> {
+        use std::collections::{HashMap, HashSet};
+
+        if expected_backup_ids.len() > 100 {
+            return Err(BackupError::Validation(
+                "A preview-bound cleanup accepts at most 100 backup IDs".to_string(),
+            ));
+        }
+        let expected: HashSet<&str> = expected_backup_ids.iter().map(String::as_str).collect();
+        if expected.len() != expected_backup_ids.len() {
+            return Err(BackupError::Validation(
+                "Cleanup preview contains duplicate backup IDs".to_string(),
+            ));
+        }
+
+        let mut schedule_query = temps_entities::backup_schedules::Entity::find();
+        if let Some(id) = schedule_id {
+            schedule_query =
+                schedule_query.filter(temps_entities::backup_schedules::Column::Id.eq(id));
+        }
+        let schedules = schedule_query.all(self.db.as_ref()).await?;
+        if let Some(id) = schedule_id {
+            if schedules.is_empty() {
+                return Err(BackupError::NotFound {
+                    resource: "BackupSchedule".to_string(),
+                    detail: format!("schedule id {}", id),
+                });
+            }
+        }
+
+        let schedules_by_id: HashMap<i32, &temps_entities::backup_schedules::Model> = schedules
+            .iter()
+            .map(|schedule| (schedule.id, schedule))
+            .collect();
+        let candidates = temps_entities::backups::Entity::find()
+            .filter(temps_entities::backups::Column::BackupId.is_in(expected_backup_ids.to_vec()))
+            .all(self.db.as_ref())
+            .await?;
+
+        let actual: HashSet<&str> = candidates
+            .iter()
+            .map(|backup| backup.backup_id.as_str())
+            .collect();
+        if actual != expected {
+            return Err(BackupError::CleanupPreviewStale {
+                detail: format!(
+                    "preview approved {} backup(s), but {} still exist",
+                    expected.len(),
+                    actual.len(),
+                ),
+            });
+        }
+        for backup in &candidates {
+            let Some(candidate_schedule_id) = backup.schedule_id else {
+                return Err(BackupError::CleanupPreviewStale {
+                    detail: format!(
+                        "backup {} no longer belongs to a schedule",
+                        backup.backup_id
+                    ),
+                });
+            };
+            let Some(schedule) = schedules_by_id.get(&candidate_schedule_id) else {
+                return Err(BackupError::CleanupPreviewStale {
+                    detail: format!(
+                        "backup {} is no longer in the selected schedule scope",
+                        backup.backup_id
+                    ),
+                });
+            };
+            let cutoff = Utc::now() - Duration::days(schedule.retention_period as i64);
+            if schedule.retention_period <= 0 || backup.started_at >= cutoff {
+                return Err(BackupError::CleanupPreviewStale {
+                    detail: format!(
+                        "backup {} is no longer expired by its retention policy",
+                        backup.backup_id
+                    ),
+                });
+            }
+        }
+
+        let mut report = RetentionCleanupReport {
+            schedule_id,
+            expired: candidates.len() as u64,
+            candidate_backup_ids: candidates
+                .iter()
+                .map(|backup| backup.backup_id.clone())
+                .collect(),
+            ..RetentionCleanupReport::default()
+        };
+        for backup in candidates {
+            let backup_uuid = backup.backup_id.clone();
+            match self.delete_backup_model(backup).await {
+                Ok(_) => {
+                    report.deleted += 1;
+                    report.deleted_backup_ids.push(backup_uuid);
+                }
+                Err(error) => {
+                    report.failed += 1;
+                    let (partial, deleted_objects) = match &error {
+                        BackupError::PartialDeletion {
+                            deleted_objects, ..
+                        } => (true, *deleted_objects),
+                        _ => (false, 0),
+                    };
+                    if partial {
+                        report
+                            .partially_deleted_backup_ids
+                            .push(backup_uuid.clone());
+                    }
+                    report.failures.push(RetentionCleanupFailure {
+                        backup_id: backup_uuid,
+                        reason: error.to_string(),
+                        partial,
+                        deleted_objects,
+                    });
+                }
+            }
+        }
         Ok(report)
     }
 
@@ -6920,7 +7108,7 @@ ORDER BY esb.id ASC
 
             // Enforce retention: delete backups older than the schedule's retention period
             tokio::select! {
-                result = self.enforce_retention() => {
+                result = self.enforce_retention(None, None) => {
                     if let Err(e) = result {
                         error!("Error enforcing backup retention: {}", e);
                     }
@@ -9346,6 +9534,106 @@ mod tests {
             file_count: None,
             tags: "[]".to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn preview_retention_is_schedule_scoped_and_non_destructive() {
+        let schedule = make_test_schedule(7, 1);
+        let mut expired_backup = make_test_backup_model(41);
+        expired_backup.schedule_id = Some(schedule.id);
+        expired_backup.started_at = chrono::Utc::now() - chrono::Duration::days(8);
+
+        // Query sequence: selected schedule, one candidate batch, empty batch.
+        // No transaction, S3-source lookup, or DELETE result is provided; an
+        // accidental destructive call therefore makes this test fail.
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![schedule]])
+                .append_query_results(vec![vec![expired_backup], vec![]])
+                .into_connection(),
+        );
+        let service = BackupService::new(
+            db.clone(),
+            create_mock_external_service_manager(db.clone()),
+            create_mock_notification_service(),
+            create_mock_config_service(),
+            Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
+        );
+
+        let report = service
+            .preview_retention(Some(7))
+            .await
+            .expect("dry run should return retention candidates");
+
+        assert!(report.dry_run);
+        assert_eq!(report.schedule_id, Some(7));
+        assert_eq!(report.expired, 1);
+        assert_eq!(report.deleted, 0);
+        assert_eq!(report.failed, 0);
+        assert_eq!(report.candidate_backup_ids, vec!["uuid-41"]);
+
+        drop(service);
+        let statements = Arc::try_unwrap(db)
+            .expect("service dropped, leaving one database reference")
+            .into_transaction_log();
+        assert_eq!(statements.len(), 3, "preview must only issue SELECTs");
+        let sql = format!("{statements:?}");
+        assert!(
+            sql.contains("backup_schedules") && sql.contains("schedule_id"),
+            "preview queries must retain the requested schedule scope: {sql}"
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_retention_returns_not_found_for_unknown_schedule() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![Vec::<backup_schedules::Model>::new()])
+                .into_connection(),
+        );
+        let service = BackupService::new(
+            db.clone(),
+            create_mock_external_service_manager(db),
+            create_mock_notification_service(),
+            create_mock_config_service(),
+            Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
+        );
+
+        let error = service
+            .preview_retention(Some(999))
+            .await
+            .expect_err("an unknown cleanup scope must be rejected");
+        assert!(matches!(error, BackupError::NotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn preview_bound_cleanup_rejects_candidate_that_is_no_longer_expired() {
+        let schedule = make_test_schedule(7, 1);
+        let mut recent_backup = make_test_backup_model(42);
+        recent_backup.schedule_id = Some(schedule.id);
+        recent_backup.started_at = chrono::Utc::now();
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![schedule]])
+                .append_query_results(vec![vec![recent_backup]])
+                .into_connection(),
+        );
+        let service = BackupService::new(
+            db.clone(),
+            create_mock_external_service_manager(db),
+            create_mock_notification_service(),
+            create_mock_config_service(),
+            Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
+        );
+        let expected = vec!["uuid-42".to_string()];
+
+        let error = service
+            .enforce_retention(Some(7), Some(&expected))
+            .await
+            .expect_err("retention drift must force a new preview");
+
+        assert!(matches!(error, BackupError::CleanupPreviewStale { .. }));
     }
 
     /// Helper: build a minimal `ChildBackupEntry` BTreeMap row for MockDatabase.
