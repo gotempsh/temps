@@ -1239,6 +1239,46 @@ async fn list_users(
     Ok(Json(route_users).into_response())
 }
 
+/// Reason a role-assignment request was denied by [`authorize_role_assignment`].
+#[derive(Debug, PartialEq, Eq)]
+enum RoleChangeDenied {
+    /// Caller is not an admin. `UsersWrite` alone (held by non-admin roles such
+    /// as `PlatformAdmin`) must not be sufficient to grant roles.
+    NotAdmin,
+    /// The path `user_id` and the body `user_id` disagree, leaving the target
+    /// ambiguous. Historically the self-modification guard checked the path id
+    /// while the mutation acted on the body id, so a mismatched pair bypassed it.
+    TargetMismatch,
+    /// Caller attempted to change their own roles.
+    SelfModification,
+}
+
+/// Authorize a role assignment and resolve the single target user id.
+///
+/// This is the security precondition for the `assign_role` endpoint, factored
+/// out so every bypass path can be unit-tested without a full HTTP harness. It
+/// mirrors the guards on the sibling `remove_role`/`delete_user` handlers
+/// (admin-only, no self-modification) and additionally requires the path and
+/// body target ids to agree so there is exactly one, unambiguous target.
+fn authorize_role_assignment(
+    caller_is_admin: bool,
+    caller_id: i32,
+    path_user_id: i32,
+    body_user_id: i32,
+) -> Result<i32, RoleChangeDenied> {
+    if !caller_is_admin {
+        return Err(RoleChangeDenied::NotAdmin);
+    }
+    if path_user_id != body_user_id {
+        return Err(RoleChangeDenied::TargetMismatch);
+    }
+    let target_user_id = path_user_id;
+    if target_user_id == caller_id {
+        return Err(RoleChangeDenied::SelfModification);
+    }
+    Ok(target_user_id)
+}
+
 #[utoipa::path(
     tag = "Users",
     post,
@@ -1271,15 +1311,33 @@ async fn assign_role(
         "Assigning role {} to user {}",
         assign_req.role_type, assign_req.user_id
     );
-    permission_guard!(auth, UsersWrite);
-    // Check if user is trying to modify their own roles
-    if user_id == auth.user_id() {
+
+    // Authorize and resolve the single target: role mutation requires the admin
+    // role (UsersWrite alone is not enough, matching remove_role/delete_user),
+    // the path and body target ids must agree, and callers may not change their
+    // own roles.
+    let caller_is_admin = app_state.user_service.is_admin(auth.user_id()).await?;
+    let target_user_id = authorize_role_assignment(
+        caller_is_admin,
+        auth.user_id(),
+        user_id,
+        assign_req.user_id,
+    )
+    .map_err(|denied| {
         error!(
-            "User {} attempted to modify their own roles",
-            auth.user_id()
+            "Denied role assignment by user {}: {:?}",
+            auth.user_id(),
+            denied
         );
-        return Err(temps_core::error_builder::forbidden().build());
-    }
+        match denied {
+            RoleChangeDenied::TargetMismatch => temps_core::error_builder::bad_request()
+                .detail("Path user_id and body user_id must match".to_string())
+                .build(),
+            RoleChangeDenied::NotAdmin | RoleChangeDenied::SelfModification => {
+                temps_core::error_builder::forbidden().build()
+            }
+        }
+    })?;
 
     // Verify role type is valid
     let role_type = match RoleType::from_str(&assign_req.role_type) {
@@ -1294,15 +1352,15 @@ async fn assign_role(
 
     let user_to_update = app_state
         .user_service
-        .get_user_by_id(assign_req.user_id)
+        .get_user_by_id(target_user_id)
         .await?;
 
     app_state
         .user_service
-        .assign_role_by_type(assign_req.user_id, role_type)
+        .assign_role_by_type(target_user_id, role_type)
         .await?;
 
-    info!("Role successfully assigned to user {}", assign_req.user_id);
+    info!("Role successfully assigned to user {}", target_user_id);
 
     // Create audit log
     let audit_context = AuditContext {
@@ -1313,7 +1371,7 @@ async fn assign_role(
 
     let role_audit = RoleAssignedAudit {
         context: audit_context,
-        target_user_id: assign_req.user_id,
+        target_user_id,
         role: assign_req.role_type.clone(),
         username: user_to_update.name.clone(),
     };
@@ -2010,7 +2068,63 @@ async fn disable_mfa(
 
 #[cfg(test)]
 mod tests {
+    use super::{authorize_role_assignment, RoleChangeDenied};
     use crate::auth_service::UserAuthError;
+
+    // Regression tests for the `assign_role` privilege-escalation hole
+    // (security review finding #2). Two defects combined: (a) the handler only
+    // checked `UsersWrite`, never `is_admin()`, so a non-admin `PlatformAdmin`
+    // could grant the `admin` role; and (b) the self-modification guard checked
+    // the path id while the mutation used the body id, so a mismatched pair
+    // bypassed it. `authorize_role_assignment` is the extracted precondition.
+
+    const ADMIN: bool = true;
+    const NOT_ADMIN: bool = false;
+
+    #[test]
+    fn admin_assigning_to_another_user_is_allowed() {
+        // caller=1 (admin) assigns to user 2, path and body agree.
+        assert_eq!(authorize_role_assignment(ADMIN, 1, 2, 2), Ok(2));
+    }
+
+    #[test]
+    fn defect_a_non_admin_with_userswrite_is_rejected() {
+        // Before the fix, a non-admin (e.g. PlatformAdmin holds UsersWrite)
+        // reached the mutation and could grant `admin`. Now it is denied.
+        assert_eq!(
+            authorize_role_assignment(NOT_ADMIN, 1, 2, 2),
+            Err(RoleChangeDenied::NotAdmin)
+        );
+    }
+
+    #[test]
+    fn defect_b_path_body_mismatch_targeting_self_is_rejected() {
+        // The exploit: caller=1 sets the path to another id (2) so the old
+        // self-guard passed, but the body targets themselves (1), so the
+        // mutation acted on the caller. The mismatch is now rejected outright.
+        assert_eq!(
+            authorize_role_assignment(ADMIN, 1, 2, 1),
+            Err(RoleChangeDenied::TargetMismatch)
+        );
+    }
+
+    #[test]
+    fn self_modification_is_rejected_even_when_ids_agree() {
+        // caller=1, path=body=1 -> still a self-modification.
+        assert_eq!(
+            authorize_role_assignment(ADMIN, 1, 1, 1),
+            Err(RoleChangeDenied::SelfModification)
+        );
+    }
+
+    #[test]
+    fn admin_gate_takes_precedence_over_target_checks() {
+        // A non-admin must be denied regardless of how the ids line up.
+        assert_eq!(
+            authorize_role_assignment(NOT_ADMIN, 1, 2, 1),
+            Err(RoleChangeDenied::NotAdmin)
+        );
+    }
 
     /// Regression test for the CI/CD panic
     /// `Overlapping method route. Handler for "GET /auth/oidc/login/{slug}" already exists`
