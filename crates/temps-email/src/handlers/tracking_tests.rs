@@ -24,8 +24,8 @@ mod tests {
     use crate::handlers::tracking::{public_routes, routes};
     use crate::handlers::types::AppState;
     use crate::services::{
-        DomainService, EmailService, ProviderService, TrackingService, ValidationConfig,
-        ValidationService,
+        DomainService, EmailService, ProviderService, SuppressionService, TrackingService,
+        ValidationConfig, ValidationService,
     };
 
     // ============================================
@@ -120,11 +120,13 @@ mod tests {
             config_service,
             "http://localhost:3000".to_string(),
         ));
+        let suppression_service = Arc::new(SuppressionService::new(db.db.clone()));
         let email_service = Arc::new(EmailService::new(
             db.db.clone(),
             provider_service.clone(),
             domain_service.clone(),
             tracking_service.clone(),
+            suppression_service,
         ));
         let validation_service = Arc::new(ValidationService::new(ValidationConfig::default()));
 

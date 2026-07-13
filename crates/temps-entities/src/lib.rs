@@ -94,6 +94,7 @@ pub mod sessions;
 pub mod source_type;
 pub mod static_asset_cache;
 pub mod static_bundles;
+pub mod suppressed_recipients;
 pub mod tls_acme_certificates;
 pub mod types;
 pub mod upstream_config;

@@ -13,8 +13,8 @@ use utoipa::OpenApi as OpenApiTrait;
 
 use crate::handlers::{self, AppState, EmailApiDoc};
 use crate::services::{
-    DomainService, EmailService, ProviderService, TrackingService, ValidationConfig,
-    ValidationService,
+    DomainService, EmailService, ProviderService, SuppressionService, TrackingService,
+    ValidationConfig, ValidationService,
 };
 use temps_dns::services::DnsProviderService;
 
@@ -61,12 +61,17 @@ impl TempsPlugin for EmailPlugin {
             let tracking_service = Arc::new(TrackingService::new(db.clone(), config_service));
             context.register_service(tracking_service.clone());
 
-            // Create EmailService with tracking support
+            // Create SuppressionService — bounce/complaint do-not-send list
+            let suppression_service = Arc::new(SuppressionService::new(db.clone()));
+            context.register_service(suppression_service.clone());
+
+            // Create EmailService with tracking + suppression support
             let email_service = Arc::new(EmailService::new(
                 db.clone(),
                 provider_service.clone(),
                 domain_service.clone(),
                 tracking_service.clone(),
+                suppression_service.clone(),
             ));
             context.register_service(email_service.clone());
 
