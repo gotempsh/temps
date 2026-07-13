@@ -133,6 +133,17 @@ impl BackupEngine for PostgresWalgEngine {
             })?;
 
         let container_name = format!("postgres-{}", service.name);
+        let container_endpoint = temps_providers::externalsvc::S3Credentials {
+            access_key_id: access_key.clone(),
+            secret_key: secret_key.clone(),
+            region: s3_source.region.clone(),
+            endpoint: s3_source.endpoint.clone(),
+            bucket_name: s3_source.bucket_name.clone(),
+            bucket_path: s3_source.bucket_path.clone(),
+            force_path_style: s3_source.force_path_style.unwrap_or(true),
+        }
+        .resolve_endpoint_for_container(&deps.docker, &container_name)
+        .await;
 
         // WAL-G memory tuning — see v1 notes. Defaults can OOM small containers
         // because each in-flight tar buffer is held fully in RAM. These values
@@ -153,9 +164,9 @@ impl BackupEngine for PostgresWalgEngine {
             "WALG_UPLOAD_QUEUE=2".to_string(),
             "WALG_TAR_SIZE_THRESHOLD=134217728".to_string(),
         ];
-        if let Some(ep) = &s3_source.endpoint {
+        if let Some(ep) = container_endpoint {
             let url = if ep.starts_with("http") {
-                ep.clone()
+                ep
             } else {
                 format!("http://{}", ep)
             };
