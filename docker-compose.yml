@@ -9,13 +9,19 @@ services:
     environment:
       POSTGRES_DB: temps
       POSTGRES_USER: temps
-      POSTGRES_PASSWORD: temps_password_change_me
+      # No default: the deployment must supply POSTGRES_PASSWORD (e.g. in a .env
+      # file). Compose fails fast if it is unset, so no known credential ships.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set (put it in a .env file next to docker-compose.yml)}
       # TimescaleDB specific settings
       TIMESCALEDB_TELEMETRY: off
-      # Connection settings
-      POSTGRES_HOST_AUTH_METHOD: md5
+      # Use SCRAM (not md5) for password hashing and host authentication.
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
     ports:
-      - "5432:5432"
+      # Bind to loopback only — the database is reachable by other services over
+      # the internal temps-network and must not be published to the host's
+      # public interfaces.
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     # NOTE: archive_command is NOT set here on purpose.
@@ -40,15 +46,19 @@ services:
   redis:
     image: redis:8-alpine
     container_name: temps-redis
-    command: redis-server --appendonly yes
+    # Require a password. No default: compose fails fast if REDIS_PASSWORD is unset.
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set (put it in a .env file next to docker-compose.yml)}
+    command: ["sh", "-c", "exec redis-server --appendonly yes --requirepass \"$$REDIS_PASSWORD\""]
     ports:
-      - "6379:6379"
+      # Loopback only — Redis is reachable over the internal temps-network.
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
     networks:
       - temps-network
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -60,14 +70,14 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      args:
-        # Uncomment and set your MaxMind license key to embed GeoLite2 database
-        # MAXMIND_LICENSE_KEY: "your_license_key_here"
+      # Uncomment to embed the GeoLite2 database with your MaxMind license key:
+      # args:
+      #   MAXMIND_LICENSE_KEY: "your_license_key_here"
     container_name: temps-app
     restart: unless-stopped
     environment:
-      # Database configuration
-      TEMPS_DATABASE_URL: postgresql://temps:temps_password_change_me@postgres:5432/temps
+      # Database configuration (password sourced from the same env var as postgres)
+      TEMPS_DATABASE_URL: postgresql://temps:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/temps
 
       # Server configuration
       TEMPS_ADDRESS: 0.0.0.0:3000
@@ -82,12 +92,13 @@ services:
       # Logging
       TEMPS_LOG_LEVEL: info
 
-      # Redis configuration (if needed by services)
-      REDIS_URL: redis://redis:6379
+      # Redis configuration (authenticated; password from REDIS_PASSWORD)
+      REDIS_URL: redis://:${REDIS_PASSWORD:?REDIS_PASSWORD must be set}@redis:6379
     ports:
-      - "3000:3000"      # HTTP API
-      - "3443:3443"      # HTTPS API (if configured)
-      - "9000:9000"      # Console API
+      - "3000:3000"              # HTTP API (public)
+      - "3443:3443"              # HTTPS API (public, if configured)
+      # Console admin API — loopback only, never published to public interfaces.
+      - "127.0.0.1:9000:9000"    # Console API
     volumes:
       # Persistent data directory
       - temps_data:/app/data
