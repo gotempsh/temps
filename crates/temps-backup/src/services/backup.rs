@@ -346,6 +346,68 @@ fn build_s3_key(bucket_path: &str, suffix: &str) -> String {
     }
 }
 
+fn s3_key_from_location(location: &str, expected_bucket: &str) -> Result<String, BackupError> {
+    if let Some(rest) = location.strip_prefix("s3://") {
+        let (bucket, key) = rest.split_once('/').ok_or_else(|| {
+            BackupError::Validation(format!("Invalid S3 backup location: {}", location))
+        })?;
+        if bucket != expected_bucket {
+            return Err(BackupError::Validation(format!(
+                "Backup location bucket '{}' does not match configured bucket '{}'",
+                bucket, expected_bucket
+            )));
+        }
+        if key.is_empty() {
+            return Err(BackupError::Validation(format!(
+                "Backup location {} does not contain an object key",
+                location
+            )));
+        }
+        Ok(key.to_string())
+    } else {
+        let key = location.trim_start_matches('/');
+        if key.is_empty() {
+            return Err(BackupError::Validation(
+                "Backup location does not contain an object key".to_string(),
+            ));
+        }
+        Ok(key.to_string())
+    }
+}
+
+fn validate_retention_period(days: i32) -> Result<(), BackupError> {
+    if days < 1 {
+        return Err(BackupError::Validation(
+            "retention_period must be >= 1".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_mirror_prefix(prefix: &str) -> Result<(), BackupError> {
+    let segments: Vec<&str> = prefix.trim_matches('/').split('/').collect();
+    let marker = segments
+        .windows(2)
+        .position(|window| window[0] == "external_services" && window[1] == "s3")
+        .ok_or_else(|| {
+            BackupError::Validation(format!(
+                "Refusing to delete unsafe S3 mirror prefix '{}'",
+                prefix
+            ))
+        })?;
+    // Required layout: .../external_services/s3/<service>/<snapshot-id>.
+    if segments.len() != marker + 4
+        || segments[marker + 2].is_empty()
+        || Uuid::parse_str(segments[marker + 3]).is_err()
+    {
+        return Err(BackupError::Validation(format!(
+            "Refusing to delete unsafe S3 mirror prefix '{}'",
+            prefix
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Error, Debug)]
 pub enum BackupError {
     #[error("Database error: {0}")]
@@ -404,6 +466,44 @@ pub enum BackupError {
          wait for it to finish before triggering a new run"
     )]
     ScheduleRunAlreadyInFlight { existing_run_id: i64 },
+
+    #[error("Cannot delete backup {backup_id} while it is in state '{state}'; cancel it first and wait for it to become terminal")]
+    BackupNotTerminal { backup_id: String, state: String },
+
+    #[error("Cannot delete backup {backup_id}: it is referenced by {restore_count} restore history record(s)")]
+    BackupHasRestoreHistory {
+        backup_id: String,
+        restore_count: u64,
+    },
+
+    #[error("Backup {backup_id} was only partially deleted: {deleted_objects} object(s) confirmed removed; {reason}")]
+    PartialDeletion {
+        backup_id: String,
+        deleted_objects: u64,
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct RetentionCleanupFailure {
+    pub backup_id: String,
+    pub reason: String,
+    pub partial: bool,
+    pub deleted_objects: u64,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, utoipa::ToSchema)]
+pub struct RetentionCleanupReport {
+    pub expired: u64,
+    pub deleted: u64,
+    pub failed: u64,
+    /// Capped diagnostic sample; `failed` remains the authoritative total.
+    pub failures: Vec<RetentionCleanupFailure>,
+    /// Capped sample of deleted backup UUIDs for audit attribution.
+    pub deleted_backup_ids: Vec<String>,
+    pub deleted_backup_ids_truncated: bool,
+    pub partially_deleted_backup_ids: Vec<String>,
+    pub partially_deleted_backup_ids_truncated: bool,
 }
 
 impl From<aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::put_object::PutObjectError>>
@@ -3536,8 +3636,8 @@ impl BackupService {
         Ok(backups)
     }
 
-    pub async fn delete_backup(&self, backup_id: &str) -> Result<(), BackupError> {
-        info!("Deleting backup: {}", backup_id);
+    pub async fn delete_backup(&self, backup_id: &str) -> Result<(Backup, u64), BackupError> {
+        info!(backup_id, "Deleting backup");
 
         let backup = temps_entities::backups::Entity::find()
             .filter(temps_entities::backups::Column::BackupId.eq(backup_id))
@@ -3545,8 +3645,47 @@ impl BackupService {
             .await?
             .ok_or_else(|| BackupError::NotFound {
                 resource: "Backup".to_string(),
-                detail: "Backup not found".to_string(),
+                detail: format!("backup id {}", backup_id),
             })?;
+
+        self.delete_backup_model(backup).await
+    }
+
+    async fn delete_backup_model(&self, backup: Backup) -> Result<(Backup, u64), BackupError> {
+        use sea_orm::QuerySelect;
+
+        // Hold an exclusive row lock across the remote deletion. Restore-run
+        // inserts acquire a foreign-key key-share lock on this row, so they
+        // cannot race between our history check and object deletion. This is a
+        // rare control-plane operation; correctness is worth the bounded DB
+        // transaction held during S3 I/O.
+        let transaction = self.db.begin().await?;
+        let backup = temps_entities::backups::Entity::find_by_id(backup.id)
+            .lock_exclusive()
+            .one(&transaction)
+            .await?
+            .ok_or_else(|| BackupError::NotFound {
+                resource: "Backup".to_string(),
+                detail: format!("backup id {}", backup.backup_id),
+            })?;
+
+        if matches!(backup.state.as_str(), "pending" | "running") {
+            return Err(BackupError::BackupNotTerminal {
+                backup_id: backup.backup_id.clone(),
+                state: backup.state.clone(),
+            });
+        }
+
+        let restore_count = temps_entities::restore_runs::Entity::find()
+            .filter(temps_entities::restore_runs::Column::SourceBackupId.eq(backup.id))
+            .count(&transaction)
+            .await?;
+        if restore_count > 0 {
+            return Err(BackupError::BackupHasRestoreHistory {
+                backup_id: backup.backup_id.clone(),
+                restore_count,
+            });
+        }
 
         let s3_source = temps_entities::s3_sources::Entity::find_by_id(backup.s3_source_id)
             .one(self.db.as_ref())
@@ -3556,26 +3695,143 @@ impl BackupService {
                 detail: "S3 source not found".to_string(),
             })?;
 
-        // Create S3 client
-        let s3_client = self.create_s3_client(&s3_source).await?;
+        let metadata: serde_json::Value = serde_json::from_str(&backup.metadata)?;
+        let engine = metadata
+            .get("engine")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
 
-        // Delete from S3
-        s3_client
-            .delete_object()
-            .bucket(&s3_source.bucket_name)
-            .key(&backup.s3_location)
-            .send()
-            .await
-            .map_err(|e| BackupError::S3(e.to_string()))?;
+        // WAL-G backups share one repository prefix and WAL chain. Deleting that
+        // prefix for a single DB row would destroy every restore point. A safe
+        // implementation must first persist the WAL-G backup name and invoke
+        // `wal-g delete target`; legacy rows do not contain that identity.
+        if matches!(engine, "postgres_walg" | "postgres_cluster")
+            || backup.s3_location.trim_end_matches('/').ends_with("/walg")
+        {
+            return Err(BackupError::Unsupported(format!(
+                "Backup {} uses a shared WAL-G repository. Individual deletion is unsafe; use WAL-G retention cleanup for this service",
+                backup.backup_id
+            )));
+        }
+
+        let mut deleted_objects = 0_u64;
+        if !backup.s3_location.is_empty() {
+            let s3_client = self.create_s3_client(&s3_source).await?;
+            let key = s3_key_from_location(&backup.s3_location, &s3_source.bucket_name)?;
+            if matches!(engine, "s3_mirror" | "s3" | "rustfs" | "blob" | "minio") {
+                validate_mirror_prefix(&key)?;
+                deleted_objects = self
+                    .delete_s3_prefix(&s3_client, &s3_source.bucket_name, &key, &backup.backup_id)
+                    .await?;
+            } else {
+                if let Err(error) = s3_client
+                    .delete_object()
+                    .bucket(&s3_source.bucket_name)
+                    .key(&key)
+                    .send()
+                    .await
+                {
+                    return Err(BackupError::PartialDeletion {
+                        backup_id: backup.backup_id.clone(),
+                        deleted_objects: 0,
+                        reason: format!(
+                            "Delete result for s3://{}/{} is unknown: {}",
+                            s3_source.bucket_name, key, error
+                        ),
+                    });
+                }
+                deleted_objects = 1;
+            }
+        }
 
         // Delete record from database
-        temps_entities::backups::Entity::delete_many()
-            .filter(temps_entities::backups::Column::BackupId.eq(backup_id))
-            .exec(self.db.as_ref())
-            .await?;
+        let delete_result = temps_entities::backups::Entity::delete_many()
+            .filter(temps_entities::backups::Column::Id.eq(backup.id))
+            .exec(&transaction)
+            .await;
+        if let Err(error) = delete_result {
+            if deleted_objects > 0 {
+                return Err(BackupError::PartialDeletion {
+                    backup_id: backup.backup_id.clone(),
+                    deleted_objects,
+                    reason: format!("Database row deletion failed: {}", error),
+                });
+            }
+            return Err(BackupError::Database(error));
+        }
 
-        info!("Backup deleted successfully");
-        Ok(())
+        if let Err(error) = transaction.commit().await {
+            if deleted_objects > 0 {
+                return Err(BackupError::PartialDeletion {
+                    backup_id: backup.backup_id.clone(),
+                    deleted_objects,
+                    reason: format!("Database commit failed after object deletion: {}", error),
+                });
+            }
+            return Err(BackupError::Database(error));
+        }
+
+        info!(backup_id = %backup.backup_id, "Backup deleted successfully");
+        Ok((backup, deleted_objects))
+    }
+
+    async fn delete_s3_prefix(
+        &self,
+        client: &S3Client,
+        bucket: &str,
+        prefix: &str,
+        backup_id: &str,
+    ) -> Result<u64, BackupError> {
+        let normalized = format!("{}/", prefix.trim_end_matches('/'));
+        let mut continuation: Option<String> = None;
+        let mut deleted_objects = 0_u64;
+        loop {
+            let mut request = client.list_objects_v2().bucket(bucket).prefix(&normalized);
+            if let Some(token) = continuation.take() {
+                request = request.continuation_token(token);
+            }
+            let response = request.send().await.map_err(|e| {
+                let reason = format!(
+                    "Failed to list prefix s3://{}/{}: {}",
+                    bucket, normalized, e
+                );
+                if deleted_objects > 0 {
+                    BackupError::PartialDeletion {
+                        backup_id: backup_id.to_string(),
+                        deleted_objects,
+                        reason,
+                    }
+                } else {
+                    BackupError::S3(format!("{} for backup {}", reason, backup_id))
+                }
+            })?;
+            for object in response.contents() {
+                let Some(key) = object.key() else { continue };
+                if let Err(error) = client.delete_object().bucket(bucket).key(key).send().await {
+                    // S3 may have applied a DeleteObject even when the client
+                    // lost the response, so any failed deletion request is an
+                    // unknown/partial destructive outcome, including the first.
+                    return Err(BackupError::PartialDeletion {
+                        backup_id: backup_id.to_string(),
+                        deleted_objects,
+                        reason: format!(
+                            "Delete result for s3://{}/{} is unknown: {}",
+                            bucket, key, error
+                        ),
+                    });
+                }
+                deleted_objects += 1;
+            }
+            if response.is_truncated().unwrap_or(false) {
+                continuation = response.next_continuation_token().map(str::to_owned);
+                if continuation.is_none() {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        Ok(deleted_objects)
     }
 
     pub async fn cleanup_old_backups(&self, retention_days: i32) -> Result<()> {
@@ -3597,45 +3853,97 @@ impl BackupService {
         Ok(())
     }
 
-    /// Enforce retention for every active backup schedule.
+    /// Enforce retention for every backup schedule, including disabled ones.
     /// Deletes backups that are older than each schedule's `retention_period` days.
-    async fn enforce_retention(&self) -> Result<()> {
+    pub async fn enforce_retention(&self) -> Result<RetentionCleanupReport, BackupError> {
         let schedules = temps_entities::backup_schedules::Entity::find()
-            .filter(temps_entities::backup_schedules::Column::Enabled.eq(true))
             .all(self.db.as_ref())
             .await?;
+
+        let mut report = RetentionCleanupReport::default();
 
         for schedule in &schedules {
             if schedule.retention_period > 0 {
                 let cutoff = Utc::now() - Duration::days(schedule.retention_period as i64);
-                let old_backups = temps_entities::backups::Entity::find()
-                    .filter(temps_entities::backups::Column::ScheduleId.eq(Some(schedule.id)))
-                    .filter(temps_entities::backups::Column::StartedAt.lt(cutoff))
-                    .all(self.db.as_ref())
-                    .await?;
-
-                if !old_backups.is_empty() {
-                    info!(
-                        "Retention cleanup: deleting {} backup(s) older than {} days for schedule {} ({})",
-                        old_backups.len(),
-                        schedule.retention_period,
-                        schedule.id,
-                        schedule.name
-                    );
-                }
-
-                for backup in old_backups {
-                    if let Err(e) = self.delete_backup(&backup.backup_id).await {
-                        error!(
-                            "Failed to delete expired backup {} for schedule {}: {}",
-                            backup.backup_id, schedule.id, e
-                        );
+                let mut last_id = 0;
+                loop {
+                    use sea_orm::QuerySelect;
+                    let old_backups = match temps_entities::backups::Entity::find()
+                        .filter(temps_entities::backups::Column::ScheduleId.eq(Some(schedule.id)))
+                        .filter(temps_entities::backups::Column::StartedAt.lt(cutoff))
+                        .filter(temps_entities::backups::Column::Id.gt(last_id))
+                        .order_by_asc(temps_entities::backups::Column::Id)
+                        .limit(100)
+                        .all(self.db.as_ref())
+                        .await
+                    {
+                        Ok(backups) => backups,
+                        Err(e) => {
+                            report.failed += 1;
+                            if report.failures.len() < 100 {
+                                report.failures.push(RetentionCleanupFailure {
+                                    backup_id: format!("schedule:{}", schedule.id),
+                                    reason: format!("Failed to query expired backups: {}", e),
+                                    partial: false,
+                                    deleted_objects: 0,
+                                });
+                            }
+                            break;
+                        }
+                    };
+                    if old_backups.is_empty() {
+                        break;
+                    }
+                    for backup in old_backups {
+                        last_id = backup.id;
+                        report.expired += 1;
+                        let backup_uuid = backup.backup_id.clone();
+                        match self.delete_backup_model(backup).await {
+                            Ok(_) => {
+                                report.deleted += 1;
+                                if report.deleted_backup_ids.len() < 100 {
+                                    report.deleted_backup_ids.push(backup_uuid);
+                                } else {
+                                    report.deleted_backup_ids_truncated = true;
+                                }
+                            }
+                            Err(e) => {
+                                report.failed += 1;
+                                let (partial, deleted_objects) = match &e {
+                                    BackupError::PartialDeletion {
+                                        deleted_objects, ..
+                                    } => (true, *deleted_objects),
+                                    _ => (false, 0),
+                                };
+                                error!(
+                                    backup_id = %backup_uuid,
+                                    schedule_id = schedule.id,
+                                    error = %e,
+                                    "Failed to delete expired backup"
+                                );
+                                if report.failures.len() < 100 {
+                                    report.failures.push(RetentionCleanupFailure {
+                                        backup_id: backup_uuid.clone(),
+                                        reason: e.to_string(),
+                                        partial,
+                                        deleted_objects,
+                                    });
+                                }
+                                if partial {
+                                    if report.partially_deleted_backup_ids.len() < 100 {
+                                        report.partially_deleted_backup_ids.push(backup_uuid);
+                                    } else {
+                                        report.partially_deleted_backup_ids_truncated = true;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
 
-        Ok(())
+        Ok(report)
     }
 
     /// List all S3 sources
@@ -3931,6 +4239,8 @@ impl BackupService {
         request: CreateBackupScheduleRequest,
     ) -> Result<BackupSchedule, BackupError> {
         use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+
+        validate_retention_period(request.retention_period)?;
 
         // Resolve S3 source: explicit id OR fall back to the default source.
         let s3_source_id = self.resolve_s3_source_id(request.s3_source_id).await?;
@@ -6758,11 +7068,7 @@ ORDER BY esb.id ASC
         }
 
         if let Some(days) = request.retention_period {
-            if days < 1 {
-                return Err(BackupError::Validation(
-                    "retention_period must be >= 1".to_string(),
-                ));
-            }
+            validate_retention_period(days)?;
         }
 
         if let Some(Some(secs)) = request.max_runtime_secs {
@@ -7078,6 +7384,91 @@ mod tests {
             classify_backup_format(loc, Some("postgres")),
             Some("walg".to_string())
         );
+    }
+
+    #[test]
+    fn s3_key_from_uri_strips_matching_bucket() {
+        let key = s3_key_from_location("s3://backups/path/to/archive.sql.gz", "backups")
+            .expect("valid S3 URI should produce a key");
+        assert_eq!(key, "path/to/archive.sql.gz");
+    }
+
+    #[test]
+    fn s3_key_from_location_preserves_plain_key() {
+        let key = s3_key_from_location("/path/to/archive.sql.gz", "backups")
+            .expect("plain S3 key should be accepted");
+        assert_eq!(key, "path/to/archive.sql.gz");
+    }
+
+    #[test]
+    fn s3_key_from_uri_rejects_different_bucket() {
+        let error = s3_key_from_location("s3://other/path/archive.sql.gz", "backups")
+            .expect_err("mismatched bucket must be rejected");
+        assert!(matches!(error, BackupError::Validation(_)));
+        assert!(error
+            .to_string()
+            .contains("does not match configured bucket"));
+    }
+
+    #[test]
+    fn mirror_prefix_validation_requires_scoped_snapshot_path() {
+        assert!(validate_mirror_prefix(
+            "tenant/external_services/s3/assets-prod/4dc29e1a-1234-4abc-8def-123456789abc"
+        )
+        .is_ok());
+        assert!(validate_mirror_prefix("tenant/external_services/s3").is_err());
+        assert!(validate_mirror_prefix("tenant/external_services/s3/assets-prod").is_err());
+        assert!(validate_mirror_prefix("tenant").is_err());
+        assert!(validate_mirror_prefix("").is_err());
+    }
+
+    #[tokio::test]
+    async fn delete_backup_refuses_restore_history_before_object_deletion() {
+        let mut count_row = std::collections::BTreeMap::new();
+        count_row.insert("num_items".to_string(), sea_orm::Value::BigInt(Some(1)));
+        let backup = temps_entities::backups::Model {
+            id: 42,
+            name: "restore-source".to_string(),
+            backup_id: "backup-uuid".to_string(),
+            schedule_id: Some(7),
+            backup_type: "full".to_string(),
+            state: "completed".to_string(),
+            started_at: Utc::now(),
+            finished_at: Some(Utc::now()),
+            size_bytes: Some(100),
+            file_count: None,
+            s3_source_id: 1,
+            s3_location: "backups/archive.sql.gz".to_string(),
+            error_message: None,
+            metadata: r#"{"engine":"postgres_pgdump"}"#.to_string(),
+            checksum: None,
+            compression_type: "gzip".to_string(),
+            created_by: 1,
+            expires_at: None,
+            tags: "[]".to_string(),
+            schedule_run_id: None,
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![backup.clone()]])
+                .append_query_results(vec![vec![count_row]])
+                .into_connection(),
+        );
+        let Ok(service) = build_service_for_mock(db) else {
+            return;
+        };
+
+        let error = service
+            .delete_backup_model(backup)
+            .await
+            .expect_err("restore history must block backup deletion");
+        assert!(matches!(
+            error,
+            BackupError::BackupHasRestoreHistory {
+                backup_id,
+                restore_count: 1
+            } if backup_id == "backup-uuid"
+        ));
     }
 
     #[test]
@@ -8474,6 +8865,16 @@ mod tests {
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
         )
+    }
+
+    #[test]
+    fn retention_validation_rejects_non_positive_days() {
+        let error = validate_retention_period(0).expect_err("zero-day retention must be rejected");
+        assert!(matches!(error, BackupError::Validation(_)));
+        assert!(error.to_string().contains("retention_period must be >= 1"));
+        assert!(validate_retention_period(-1).is_err());
+        assert!(validate_retention_period(1).is_ok());
+        assert!(validate_retention_period(3650).is_ok());
     }
 
     /// The main Temps database always runs on TimescaleDB, so the pg_dump sidecar

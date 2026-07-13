@@ -60,6 +60,19 @@ interface ShowBackupOptions {
   json?: boolean
 }
 
+interface DeleteBackupOptions {
+  id: string
+  force?: boolean
+  yes?: boolean
+}
+
+interface RetentionCleanupReport {
+  expired: number
+  deleted: number
+  failed: number
+  failures: Array<{ backup_id: string; reason: string }>
+}
+
 interface CreateSourceOptions {
   name?: string
   bucket?: string
@@ -250,6 +263,22 @@ export function registerBackupsCommands(program: Command): void {
     .requiredOption('--id <id>', 'Backup ID')
     .option('--json', 'Output in JSON format')
     .action(showBackup)
+
+  backups
+    .command('delete')
+    .alias('rm')
+    .description('Permanently delete one terminal backup')
+    .requiredOption('--id <id>', 'Backup UUID')
+    .option('-f, --force', 'Skip confirmation')
+    .option('-y, --yes', 'Skip confirmation prompts (alias for --force)')
+    .action(deleteBackup)
+
+  backups
+    .command('cleanup')
+    .description('Delete backups expired by their schedule retention policy')
+    .option('-y, --yes', 'Skip confirmation prompt')
+    .option('--json', 'Output the cleanup report as JSON')
+    .action(cleanupBackups)
 
   // Run backup for external service
   backups
@@ -983,6 +1012,67 @@ async function showBackup(options: ShowBackupOptions): Promise<void> {
     console.log(`  ${colors.muted('Error:')} ${colors.error(backup.error_message)}`)
   }
   newline()
+}
+
+async function deleteBackup(options: DeleteBackupOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  if (!options.force && !options.yes) {
+    const confirmed = await promptConfirm({
+      message: `Permanently delete backup ${options.id} from object storage?`,
+      default: false,
+    })
+    if (!confirmed) {
+      info('Cancelled')
+      return
+    }
+  }
+
+  await withSpinner('Deleting backup...', async () => {
+    const { error } = await client.delete({
+      url: '/backups/{id}',
+      path: { id: options.id },
+    })
+    if (error) throw new Error(getErrorMessage(error))
+  })
+  success(`Backup ${options.id} deleted`)
+}
+
+async function cleanupBackups(options: { yes?: boolean; json?: boolean }): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  if (!options.yes) {
+    const confirmed = await promptConfirm({
+      message: 'Delete every backup older than its schedule retention period?',
+      default: false,
+    })
+    if (!confirmed) {
+      info('Cancelled')
+      return
+    }
+  }
+
+  const report = await withSpinner('Cleaning up expired backups...', async () => {
+    const { data, error } = await client.post<RetentionCleanupReport>({
+      url: '/backups/cleanup',
+    })
+    if (error) throw new Error(getErrorMessage(error))
+    if (!data) throw new Error('Cleanup returned no report')
+    return data
+  })
+
+  if (options.json) {
+    json(report)
+    return
+  }
+  success(`Cleanup finished: ${report.deleted} deleted, ${report.failed} failed`)
+  if (report.failed > 0) {
+    for (const failure of report.failures) {
+      warning(`${failure.backup_id}: ${failure.reason}`)
+    }
+  }
 }
 
 // Helpers
