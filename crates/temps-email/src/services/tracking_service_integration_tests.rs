@@ -7,7 +7,7 @@ mod tests {
 
     use sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait};
     use temps_database::test_utils::TestDatabase;
-    use temps_entities::{email_links, emails};
+    use temps_entities::{email_events, email_links, emails};
     use uuid::Uuid;
 
     use crate::services::TrackingService;
@@ -418,5 +418,39 @@ mod tests {
 
         // first_clicked_at should be set from first click only
         assert!(email.first_clicked_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_purge_events_older_than_deletes_only_stale_rows() {
+        let (db, tracking) = setup_test_env().await;
+
+        let email_id = create_test_email(&db.db, true, true).await;
+
+        let old_event = email_events::ActiveModel {
+            email_id: Set(email_id),
+            event_type: Set("opened".to_string()),
+            ip_address: Set(Some("1.1.1.1".to_string())),
+            user_agent: Set(Some("old-ua".to_string())),
+            created_at: Set(chrono::Utc::now() - chrono::Duration::days(100)),
+            ..Default::default()
+        };
+        old_event.insert(db.db.as_ref()).await.unwrap();
+
+        let recent_event = email_events::ActiveModel {
+            email_id: Set(email_id),
+            event_type: Set("opened".to_string()),
+            ip_address: Set(Some("2.2.2.2".to_string())),
+            user_agent: Set(Some("recent-ua".to_string())),
+            created_at: Set(chrono::Utc::now() - chrono::Duration::days(1)),
+            ..Default::default()
+        };
+        recent_event.insert(db.db.as_ref()).await.unwrap();
+
+        let deleted = tracking.purge_events_older_than(90).await.unwrap();
+        assert_eq!(deleted, 1, "should only delete the 100-day-old event");
+
+        let remaining = tracking.get_events(email_id, None).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].ip_address.as_deref(), Some("2.2.2.2"));
     }
 }

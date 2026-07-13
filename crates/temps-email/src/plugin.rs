@@ -3,6 +3,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
@@ -17,6 +18,15 @@ use crate::services::{
     ValidationService,
 };
 use temps_dns::services::DnsProviderService;
+
+/// How often the tracking-data retention sweep runs.
+const RETENTION_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How long an open/click/bounce/complaint event (with its IP address and
+/// user-agent string) is kept before being purged. No per-tenant knob exists
+/// yet for this — matches the same hardcoded-default approach
+/// `temps-log-aggregator`'s `RetentionConfig` uses.
+const TRACKING_EVENT_RETENTION_DAYS: i64 = 90;
 
 /// Email Plugin for managing email providers, domains, and sending emails
 pub struct EmailPlugin;
@@ -100,6 +110,48 @@ impl TempsPlugin for EmailPlugin {
             context.register_service(app_state);
 
             debug!("Email plugin services registered successfully");
+            Ok(())
+        })
+    }
+
+    fn initialize_plugin_services<'a>(
+        &'a self,
+        context: &'a PluginContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
+        Box::pin(async move {
+            let tracking_service = context.require_service::<TrackingService>();
+
+            // ── Tracking-data retention sweep ───────────────────────────
+            // Every open/click/bounce/complaint event pins an IP address and
+            // user-agent to a send indefinitely without this — see
+            // `TrackingService::purge_events_older_than`.
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(RETENTION_INTERVAL);
+                loop {
+                    interval.tick().await;
+                    match tracking_service
+                        .purge_events_older_than(TRACKING_EVENT_RETENTION_DAYS)
+                        .await
+                    {
+                        Ok(deleted) => {
+                            tracing::info!(
+                                deleted = deleted,
+                                retention_days = TRACKING_EVENT_RETENTION_DAYS,
+                                "Tracking event retention sweep completed"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "Tracking event retention sweep failed");
+                        }
+                    }
+                }
+            });
+            tracing::info!(
+                "Tracking event retention scheduler started (interval: {:?}, retention: {}d)",
+                RETENTION_INTERVAL,
+                TRACKING_EVENT_RETENTION_DAYS
+            );
+
             Ok(())
         })
     }
