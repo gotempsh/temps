@@ -446,12 +446,13 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
                           <Input
                             {...field}
                             type="number"
-                            min="1"
+                            min="0"
                             placeholder="e.g., 256"
                           />
                         </FormControl>
                         <FormDescription className="text-muted-foreground">
-                          Maximum memory allocation
+                          Maximum memory allocation. Leave empty to use the
+                          default, or set <code>0</code> to run uncapped.
                         </FormDescription>
                       </FormItem>
                     )}

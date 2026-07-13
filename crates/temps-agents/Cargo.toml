@@ -31,7 +31,7 @@ chrono = { workspace = true }
 axum = { workspace = true }
 axum-macros = { workspace = true }
 http = { workspace = true }
-cron = "0.12"
+cron = "0.15"
 temps-error-tracking = { path = "../temps-error-tracking" }
 temps-agents-mcp-proxy = { path = "../temps-agents-mcp-proxy" }
 anyhow = { workspace = true }
