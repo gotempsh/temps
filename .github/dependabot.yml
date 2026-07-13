@@ -13,6 +13,38 @@ updates:
     labels:
       - "dependencies"
       - "rust"
+    ignore:
+      # Keep sqlx aligned with sea-orm 1.1 (which requires sqlx ^0.8). A minor
+      # bump to 0.9 splits the graph into two sqlx versions, and 0.9's
+      # SqlSafeStr guard breaks our dynamic queries. Patch bumps within 0.8 are
+      # still allowed. Revisit when we move to sea-orm 2.0 (stable).
+      - dependency-name: "sqlx"
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-major"
+      # sea-orm 2.0 (major) is still pre-release and pulls sqlx 0.9; hold on 1.1.
+      - dependency-name: "sea-orm"
+        update-types:
+          - "version-update:semver-major"
+      - dependency-name: "sea-orm-migration"
+        update-types:
+          - "version-update:semver-major"
+      # sea-schema minor/major bumps drift ahead of the pinned sea-orm line.
+      - dependency-name: "sea-schema"
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-major"
+      # aws-config 1.8.17 / aws-sdk-s3 1.134.0 pin aws-smithy-schema ^0.1.0. A
+      # minor bump of these smithy crates pulls aws-smithy-schema 0.2.0 and
+      # breaks aws-config's compile (SharedClientProtocol type mismatch).
+      - dependency-name: "aws-smithy-runtime"
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-major"
+      - dependency-name: "aws-types"
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-major"
     groups:
       # Patch/minor bumps are low-risk and numerous across 51 crates; batching
       # them into one PR keeps the review queue sane. Majors are left

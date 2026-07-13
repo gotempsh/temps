@@ -116,7 +116,7 @@ tar = { workspace = true }
 reqwest = { workspace = true }
 rustls = { workspace = true }
 sha2 = { workspace = true }
-x509-parser = "0.16"
+x509-parser = "0.18"
 glob = "0.3"
 uuid = { workspace = true }
 bytes = { workspace = true }

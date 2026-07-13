@@ -1731,9 +1731,22 @@ impl ContainerDeployer for DockerRuntime {
                 name: Some(Self::map_restart_policy(&request.restart_policy)),
                 ..Default::default()
             }),
+            // A limit of 0 is the explicit "uncapped" sentinel → leave Docker's
+            // memory cap unset (None) so the container runs unlimited.
             memory: request
                 .resource_limits
                 .memory_limit_mb
+                .filter(|&mb| mb > 0)
+                .map(|mb| mb as i64 * 1024 * 1024),
+            // Cap swap at the memory limit so the advertised hard cap is real.
+            // Docker lets a container use swap up to its memory limit when
+            // memory_swap is left unset, which would let a "512 MB" app reach
+            // ~1 GiB of memory+swap.
+            // Setting memory_swap == memory disables swap for the container.
+            memory_swap: request
+                .resource_limits
+                .memory_limit_mb
+                .filter(|&mb| mb > 0)
                 .map(|mb| mb as i64 * 1024 * 1024),
             nano_cpus: request
                 .resource_limits
