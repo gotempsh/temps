@@ -12713,6 +12713,7 @@ dependencies = [
  "rustls",
  "serde_json",
  "temps-query",
+ "testcontainers",
  "thiserror 1.0.69",
  "tokio",
  "tokio-postgres",
