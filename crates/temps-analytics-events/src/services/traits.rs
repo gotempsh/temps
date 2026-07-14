@@ -77,7 +77,7 @@ pub trait AnalyticsEvents: Send + Sync {
         q: HourlyVisitsSpec,
     ) -> Result<Vec<EventTimeline>, EventsError>;
 
-    /// Unique sessions/visitors counts.
+    /// Unique sessions, visitors, returning visitors, or page-view counts.
     async fn query_unique_counts(
         &self,
         q: UniqueCountsSpec,

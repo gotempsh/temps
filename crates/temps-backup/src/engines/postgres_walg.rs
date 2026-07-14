@@ -63,6 +63,7 @@ impl BackupEngine for PostgresWalgEngine {
 
         let service_id = v2_common::require_i32_param(&ctx.params, "service_id")?;
         let s3_source_id = v2_common::require_i32_param(&ctx.params, "s3_source_id")?;
+        let backup_uuid = v2_common::load_backup_uuid(deps.db.as_ref(), backup_id).await?;
 
         // ── Load service + S3 source ─────────────────────────────────────────
         let service = temps_entities::external_services::Entity::find_by_id(service_id)
@@ -133,6 +134,17 @@ impl BackupEngine for PostgresWalgEngine {
             })?;
 
         let container_name = format!("postgres-{}", service.name);
+        let container_endpoint = temps_providers::externalsvc::S3Credentials {
+            access_key_id: access_key.clone(),
+            secret_key: secret_key.clone(),
+            region: s3_source.region.clone(),
+            endpoint: s3_source.endpoint.clone(),
+            bucket_name: s3_source.bucket_name.clone(),
+            bucket_path: s3_source.bucket_path.clone(),
+            force_path_style: s3_source.force_path_style.unwrap_or(true),
+        }
+        .resolve_endpoint_for_container(&deps.docker, &container_name)
+        .await;
 
         // WAL-G memory tuning — see v1 notes. Defaults can OOM small containers
         // because each in-flight tar buffer is held fully in RAM. These values
@@ -153,9 +165,10 @@ impl BackupEngine for PostgresWalgEngine {
             "WALG_UPLOAD_QUEUE=2".to_string(),
             "WALG_TAR_SIZE_THRESHOLD=134217728".to_string(),
         ];
-        if let Some(ep) = &s3_source.endpoint {
+        walg_env.extend(v2_common::walg_identity_env(&backup_uuid));
+        if let Some(ep) = container_endpoint {
             let url = if ep.starts_with("http") {
-                ep.clone()
+                ep
             } else {
                 format!("http://{}", ep)
             };
@@ -236,6 +249,7 @@ impl BackupEngine for PostgresWalgEngine {
             })),
         )
         .await?;
+        v2_common::record_walg_identity(deps.db.as_ref(), backup_id, &backup_uuid).await?;
 
         info!(
             backup_id,
@@ -282,16 +296,16 @@ fn load_postgres_params(config_json: &str) -> PgParams {
     }
 }
 
-struct ExecResult {
-    exit_code: i64,
-    stdout: String,
-    stderr: String,
+pub(crate) struct ExecResult {
+    pub(crate) exit_code: i64,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
 }
 
 /// Run `sh -c <cmd>` inside `container_name` with the given env, capturing
 /// stdout+stderr into ring buffers. Bails early on cancel. Used by both
 /// walg engines (this file and `postgres_cluster.rs`).
-async fn run_walg_exec(
+pub(crate) async fn run_walg_exec(
     docker: &bollard::Docker,
     container_name: &str,
     cmd: &str,

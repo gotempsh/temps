@@ -33,7 +33,6 @@ import {
   ExternalLink,
   GitBranch,
   GitFork,
-  GithubIcon,
   Globe,
   Info,
   Key,
@@ -46,6 +45,7 @@ import {
   Users,
   Zap,
 } from 'lucide-react'
+import GithubIcon from '@/icons/Github'
 import { useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
 

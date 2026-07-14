@@ -664,14 +664,14 @@ export function VisitorGlobePage({ project }: VisitorGlobePageProps) {
           </PopoverTrigger>
           <PopoverContent className="w-auto p-0" align="start">
             <Calendar
-              initialFocus
+              autoFocus
               mode="range"
               defaultMonth={subDays(new Date(), 30)}
               selected={dateFilter.dateRange}
               onSelect={handleCustomDateRange}
               numberOfMonths={2}
               disabled={(date) => date > new Date()}
-              toDate={new Date()}
+              endMonth={new Date()}
             />
           </PopoverContent>
         </Popover>

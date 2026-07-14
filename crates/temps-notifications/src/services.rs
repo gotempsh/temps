@@ -659,6 +659,28 @@ impl EmailProvider {
             })
             .unwrap_or_default();
 
+        // Optional CTA button carried as reserved `_action_url`/`_action_label`
+        // keys (e.g. "View error details" linking to the error group page).
+        let action_html = notification
+            .metadata
+            .get("_action_url")
+            .map(|url| {
+                let label = notification
+                    .metadata
+                    .get("_action_label")
+                    .map(String::as_str)
+                    .unwrap_or("View details");
+                format!(
+                    r#"<tr><td style="padding: 24px 0 0;">
+                        <a href="{}" style="display: inline-block; padding: 10px 20px; background: {}; border-radius: 6px; color: #ffffff; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; font-size: 14px; font-weight: 600; text-decoration: none;">{}</a>
+                    </td></tr>"#,
+                    html_escape(url),
+                    accent_color,
+                    html_escape(label)
+                )
+            })
+            .unwrap_or_default();
+
         let visible_metadata: Vec<(&String, &String)> = notification
             .metadata
             .iter()
@@ -759,6 +781,7 @@ impl EmailProvider {
                         </td></tr>
                         {chart}
                         {metadata}
+                        {action}
                     </table>
                 </td></tr>
 
@@ -785,6 +808,7 @@ impl EmailProvider {
             message = message_html,
             chart = chart_html,
             metadata = metadata_html,
+            action = action_html,
             priority = notification.priority,
         )
     }
@@ -3080,6 +3104,98 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_email_renders_action_button_when_action_url_present() {
+        // Mirrors what the error-tracking plugin attaches: a deep link to the
+        // error group page plus a human-readable label.
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            "_action_url".to_string(),
+            "https://temps.example/projects/demo/errors/42".to_string(),
+        );
+        metadata.insert(
+            "_action_label".to_string(),
+            "View error details".to_string(),
+        );
+
+        let notification = Notification {
+            id: "action-test".to_string(),
+            title: "New error group".to_string(),
+            message: "A new error was detected".to_string(),
+            notification_type: NotificationType::Alert,
+            priority: NotificationPriority::High,
+            severity: None,
+            timestamp: Utc::now(),
+            metadata,
+            bypass_throttling: false,
+        };
+
+        let html = EmailProvider::render_notification_email(&notification);
+
+        assert!(
+            html.contains(r#"href="https://temps.example/projects/demo/errors/42""#),
+            "rendered email must link to the action URL: {html}"
+        );
+        assert!(
+            html.contains("View error details"),
+            "rendered email must show the action label: {html}"
+        );
+        // `_`-prefixed keys are reserved channel payloads, not human-facing
+        // metadata rows — they must not also appear in the details table.
+        assert!(
+            !html.contains("_action_url") && !html.contains("_action_label"),
+            "reserved metadata keys must not leak into the visible details table: {html}"
+        );
+    }
+
+    #[test]
+    fn test_email_omits_action_button_when_action_url_absent() {
+        let notification = Notification::new("New error group", "A new error was detected");
+
+        let html = EmailProvider::render_notification_email(&notification);
+
+        assert!(
+            !html.contains("<a href="),
+            "no CTA button should render when _action_url is not set: {html}"
+        );
+    }
+
+    #[test]
+    fn test_email_action_button_escapes_html_in_url_and_label() {
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            "_action_url".to_string(),
+            r#"https://evil.example/"><script>alert(1)</script>"#.to_string(),
+        );
+        metadata.insert(
+            "_action_label".to_string(),
+            "<script>alert(1)</script>".to_string(),
+        );
+
+        let notification = Notification {
+            id: "action-injection-test".to_string(),
+            title: "New error group".to_string(),
+            message: "A new error was detected".to_string(),
+            notification_type: NotificationType::Alert,
+            priority: NotificationPriority::High,
+            severity: None,
+            timestamp: Utc::now(),
+            metadata,
+            bypass_throttling: false,
+        };
+
+        let html = EmailProvider::render_notification_email(&notification);
+
+        assert!(
+            !html.contains("<script>"),
+            "rendered HTML must not contain an injected script tag: {html}"
+        );
+        assert!(
+            html.contains("&lt;script&gt;"),
+            "injected markup in the action URL/label must be HTML-escaped: {html}"
+        );
+    }
+
     // ── Regression test: HTML injection via message body (ADR-026 Phase 3) ──
     //
     // Attack path: OTel per-series label (e.g., `env=</td><a href="...">`) is
@@ -3190,6 +3306,65 @@ mod tests {
         assert!(
             escaped_message.contains("&lt;https://evil.example|dashboard&gt;"),
             "escaped message must contain the HTML-entity form"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_slack_send_excludes_action_url_metadata_and_html() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let provider = SlackProvider {
+            webhook_url: server.uri(),
+            channel: "#alerts".to_string(),
+        };
+
+        // Mirrors what the error-tracking plugin attaches for the email's CTA
+        // button (`_action_url`/`_action_label`) plus a message containing raw
+        // HTML/mrkdwn-dangerous characters, to prove neither reaches Slack.
+        let notification = Notification::new(
+            "Error alert",
+            "See <a href=\"https://evil.example\">details</a> for env=<!channel>",
+        )
+        .with_metadata(
+            "_action_url",
+            "https://temps.example/projects/demo/errors/42",
+        )
+        .with_metadata("_action_label", "View error details");
+
+        provider.send(&notification).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body = String::from_utf8(requests[0].body.clone()).unwrap();
+
+        assert!(
+            !body.contains("_action_url") && !body.contains("temps.example"),
+            "reserved _action_url metadata must never be sent to Slack: {body}"
+        );
+        assert!(
+            !body.contains("<a href"),
+            "raw HTML anchor tags must never reach Slack unescaped: {body}"
+        );
+        assert!(
+            !body.contains("<!channel>"),
+            "raw mrkdwn @channel mention must be neutralised: {body}"
+        );
+        assert!(
+            body.contains("&lt;a href=") && body.contains("&lt;/a&gt;"),
+            "HTML tags in the message must be escaped to literal entities: {body}"
+        );
+        assert!(
+            body.contains("&lt;!channel&gt;"),
+            "mrkdwn @channel mention must be escaped to literal entities: {body}"
         );
     }
 }

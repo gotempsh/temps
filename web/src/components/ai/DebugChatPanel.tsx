@@ -152,13 +152,10 @@ const toolBlockClasses =
  * plain preformatted block. Height-capped with its own scroll.
  */
 function ToolBlock({ value }: { value: string }) {
-  let json: string | null = null
+  let json: string
   try {
     json = JSON.stringify(JSON.parse(value), null, 2)
   } catch {
-    json = null
-  }
-  if (json === null) {
     return <pre className={toolBlockClasses}>{value}</pre>
   }
   return (

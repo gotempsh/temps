@@ -44,6 +44,8 @@
 //!   strings. The known-agent IN list is server-derived from
 //!   `ai_agent_detector::known_agents()` and is bound as an array regardless.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use serde::{Deserialize, Serialize};
@@ -287,6 +289,13 @@ pub struct ChProxyLogRow {
     pub error_group_id: Option<i32>,
     /// _version UInt64 — Unix-ms dedup key for ReplacingMergeTree.
     pub _version: u64,
+    /// retention_days UInt16 DEFAULT 30
+    ///
+    /// Added by migration 0003_retention_days.sql — must remain the last
+    /// field so its position matches the DDL column order (positional binary
+    /// serialization). The TTL expression in 0004_retention_ttl.sql reads
+    /// this column: `toDateTime(timestamp) + toIntervalDay(retention_days)`.
+    pub retention_days: u16,
 }
 
 impl From<&CreateProxyLogRequest> for ChProxyLogRow {
@@ -351,6 +360,9 @@ impl From<&CreateProxyLogRequest> for ChProxyLogRow {
             trace_id: entry.trace_id.clone().unwrap_or_default(),
             error_group_id: entry.error_group_id,
             _version: now_ms as u64,
+            // Callers that hold a RetentionResolver should override this field
+            // after construction. The fixed default matches the DDL DEFAULT.
+            retention_days: temps_core::RetentionTable::ProxyLogs.default_days(),
         }
     }
 }
@@ -542,18 +554,29 @@ fn ms_to_rfc3339(ms: i64) -> String {
 /// [`super::clickhouse_migrations::apply_migrations`].
 pub struct ClickHouseProxyLogStore {
     client: ::clickhouse::Client,
+    /// Resolves the per-project `retention_days` value stamped onto each
+    /// ingested proxy log row. The default [`temps_core::FixedRetentionResolver`]
+    /// always returns 30; a plugin can register an alternative implementation.
+    resolver: Arc<dyn temps_core::RetentionResolver>,
 }
 
 impl ClickHouseProxyLogStore {
     /// Build a store from connection configuration. Does not validate
     /// connectivity.
-    pub fn new(config: ClickHouseProxyLogConfig) -> Self {
+    ///
+    /// `resolver` is called once per row in `write_batch` to populate
+    /// `retention_days`. Pass `Arc::new(FixedRetentionResolver)` unless a
+    /// plugin has registered a project-aware implementation.
+    pub fn new(
+        config: ClickHouseProxyLogConfig,
+        resolver: Arc<dyn temps_core::RetentionResolver>,
+    ) -> Self {
         let client = ::clickhouse::Client::default()
             .with_url(&config.url)
             .with_database(&config.database)
             .with_user(&config.user)
             .with_password(&config.password);
-        Self { client }
+        Self { client, resolver }
     }
 
     /// Borrow the underlying client (for migrations / health checks).
@@ -887,7 +910,16 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                 })?;
 
             for entry in chunk {
-                let row = ChProxyLogRow::from(entry);
+                let mut row = ChProxyLogRow::from(entry);
+                // Unrouted requests have no project context; use the table
+                // default directly so the resolver is not called with a
+                // fabricated project ID.
+                row.retention_days = match entry.project_id {
+                    Some(pid) => self
+                        .resolver
+                        .resolve(pid, temps_core::RetentionTable::ProxyLogs),
+                    None => temps_core::RetentionTable::ProxyLogs.default_days(),
+                };
                 inserter
                     .write(&row)
                     .await
@@ -2058,12 +2090,10 @@ mod tests {
 
     #[tokio::test]
     async fn write_batch_empty_is_noop() {
-        let store = ClickHouseProxyLogStore::new(ClickHouseProxyLogConfig::new(
-            "http://127.0.0.1:1",
-            "otel",
-            "temps",
-            "temps_dev",
-        ));
+        let store = ClickHouseProxyLogStore::new(
+            ClickHouseProxyLogConfig::new("http://127.0.0.1:1", "otel", "temps", "temps_dev"),
+            Arc::new(temps_core::FixedRetentionResolver),
+        );
         assert!(store.write_batch(vec![]).await.is_ok());
     }
 
@@ -2071,12 +2101,10 @@ mod tests {
     async fn get_by_id_returns_none_under_clickhouse() {
         // No serial id in CH — get_by_id always resolves to None (404) without
         // any I/O, so an unreachable URL still succeeds.
-        let store = ClickHouseProxyLogStore::new(ClickHouseProxyLogConfig::new(
-            "http://127.0.0.1:1",
-            "otel",
-            "temps",
-            "temps_dev",
-        ));
+        let store = ClickHouseProxyLogStore::new(
+            ClickHouseProxyLogConfig::new("http://127.0.0.1:1", "otel", "temps", "temps_dev"),
+            Arc::new(temps_core::FixedRetentionResolver),
+        );
         assert!(store
             .get_by_id(42, None)
             .await
@@ -2086,12 +2114,10 @@ mod tests {
 
     #[tokio::test]
     async fn list_unknown_provider_short_circuits_without_io() {
-        let store = ClickHouseProxyLogStore::new(ClickHouseProxyLogConfig::new(
-            "http://127.0.0.1:1",
-            "otel",
-            "temps",
-            "temps_dev",
-        ));
+        let store = ClickHouseProxyLogStore::new(
+            ClickHouseProxyLogConfig::new("http://127.0.0.1:1", "otel", "temps", "temps_dev"),
+            Arc::new(temps_core::FixedRetentionResolver),
+        );
         let mut filters = empty_query();
         filters.ai_provider = Some("NopeNotReal".into());
         let (rows, total) = store

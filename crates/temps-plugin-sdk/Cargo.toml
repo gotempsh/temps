@@ -33,7 +33,7 @@ tower = { version = "0.5", features = ["util"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 
 # WebSocket support for the platform channel
-tokio-tungstenite = "0.28"
+tokio-tungstenite = "0.29"
 futures = { workspace = true }
 
 # OpenAPI

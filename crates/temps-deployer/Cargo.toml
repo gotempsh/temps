@@ -19,6 +19,7 @@ http-body-util = "0.1"
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -41,7 +42,7 @@ urlencoding = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-env_logger = "0.10"
+env_logger = "0.11"
 tokio-test = "0.4"
-mockall = "0.12"
+mockall = "0.15"
 serial_test = "3.0"

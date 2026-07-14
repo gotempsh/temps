@@ -38,13 +38,13 @@ import {
   EllipsisVertical,
   GitBranch,
   GitFork,
-  GithubIcon,
   Globe,
   Loader2,
   Plus,
   RefreshCw,
   Trash2,
 } from 'lucide-react'
+import GithubIcon from '@/icons/Github'
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { toast } from 'sonner'

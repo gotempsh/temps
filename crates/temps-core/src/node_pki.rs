@@ -168,6 +168,7 @@ pub fn sign_node_csr(
         context: "CA key".into(),
         reason: e.to_string(),
     })?;
+
     let issuer = Issuer::from_ca_cert_pem(ca_cert_pem, ca_key).map_err(|e| PkiError::PemParse {
         context: "CA certificate".into(),
         reason: e.to_string(),

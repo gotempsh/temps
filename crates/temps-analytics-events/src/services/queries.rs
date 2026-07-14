@@ -211,8 +211,9 @@ pub struct HourlyVisitsSpec {
 pub struct UniqueCountsSpec {
     pub range: TimeRange,
     pub scope: AnalyticsScope,
-    /// What to count: `"sessions"`, `"visitors"`, `"events"`. The backend
-    /// validates and returns a Validation error for unknown values.
+    /// What to count: `"sessions"`, `"visitors"`, `"returning_visitors"`, or
+    /// `"page_views"`. The backend validates and returns a Validation error for
+    /// unknown values.
     pub metric: String,
 }
 

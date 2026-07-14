@@ -18,6 +18,11 @@ pub struct Model {
     pub country_code: Option<String>,
     pub timezone: Option<String>,
     pub is_eu: bool,
+    /// The ASN organization name (e.g. "Hetzner Online GmbH"). Maps to the `asn`
+    /// column, which existed in the schema unused/unmapped before this field.
+    #[sea_orm(column_name = "asn")]
+    pub asn_org: Option<String>,
+    pub is_hosting_provider: Option<bool>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }

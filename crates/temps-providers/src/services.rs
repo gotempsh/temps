@@ -585,24 +585,34 @@ fn build_walg_env(
     creds: &crate::S3Credentials,
     walg_s3_prefix: &str,
     resolved_endpoint: Option<&str>,
-) -> Vec<String> {
+) -> Result<Vec<String>, String> {
+    fn export(name: &str, value: &str) -> Result<String, String> {
+        if value.contains(['\r', '\n']) {
+            return Err(format!("{name} must not contain CR or LF characters"));
+        }
+        Ok(format!(
+            "export {name}={}",
+            crate::externalsvc::postgres::shell_escape(value)
+        ))
+    }
+
     let mut env = vec![
-        format!("export WALG_S3_PREFIX='{}'", walg_s3_prefix),
-        format!("export AWS_ACCESS_KEY_ID='{}'", creds.access_key_id),
-        format!("export AWS_SECRET_ACCESS_KEY='{}'", creds.secret_key),
-        format!("export AWS_REGION='{}'", creds.region),
+        export("WALG_S3_PREFIX", walg_s3_prefix)?,
+        export("AWS_ACCESS_KEY_ID", &creds.access_key_id)?,
+        export("AWS_SECRET_ACCESS_KEY", &creds.secret_key)?,
+        export("AWS_REGION", &creds.region)?,
         // Pin the WAL segment compression to lz4 — fast, low CPU,
         // matches the standalone path. Operators who want zstd can
         // override via service parameters in a follow-up.
         "export WALG_COMPRESSION_METHOD='lz4'".to_string(),
     ];
     if let Some(endpoint) = resolved_endpoint {
-        env.push(format!("export AWS_ENDPOINT='{}'", endpoint));
+        env.push(export("AWS_ENDPOINT", endpoint)?);
     }
     if creds.force_path_style {
         env.push("export AWS_S3_FORCE_PATH_STYLE='true'".to_string());
     }
-    env
+    Ok(env)
 }
 
 // ---------------------------------------------------------------------------
@@ -3003,7 +3013,11 @@ impl ExternalServiceManager {
             s3_credentials.endpoint.clone()
         };
 
-        let walg_env = build_walg_env(s3_credentials, &walg_prefix, resolved_endpoint.as_deref());
+        let walg_env = build_walg_env(s3_credentials, &walg_prefix, resolved_endpoint.as_deref())
+            .map_err(|reason| ExternalServiceError::ParameterValidationFailed {
+            service_id: service.id,
+            reason: format!("Invalid WAL-G S3 configuration: {reason}"),
+        })?;
 
         // Write walg.env to every running data member. Cheap (kilobytes
         // per file) and means failover doesn't lose archiving — the
@@ -3403,6 +3417,7 @@ impl ExternalServiceManager {
         service: &external_services::Model,
         walg_s3_prefix: &str,
         s3_credentials: &crate::S3Credentials,
+        target_user_data: Option<&str>,
     ) -> Result<(), ExternalServiceError> {
         info!(
             service_id = service.id,
@@ -3553,6 +3568,7 @@ impl ExternalServiceManager {
                 &primary_volume_name,
                 walg_s3_prefix,
                 s3_credentials,
+                target_user_data,
             )
             .await
         {
@@ -3601,6 +3617,7 @@ impl ExternalServiceManager {
         primary_volume_name: &str,
         walg_s3_prefix: &str,
         s3_credentials: &crate::S3Credentials,
+        target_user_data: Option<&str>,
     ) -> Result<(), ExternalServiceError> {
         use bollard::models::{ContainerCreateBody, HostConfig};
         use bollard::query_parameters::CreateContainerOptionsBuilder;
@@ -3632,7 +3649,19 @@ impl ExternalServiceManager {
         // resolve helper bails to None for non-localhost endpoints
         // anyway.
         let resolved_endpoint = s3_credentials.endpoint.clone();
-        let walg_env = build_walg_env(s3_credentials, walg_s3_prefix, resolved_endpoint.as_deref());
+        let mut walg_env =
+            build_walg_env(s3_credentials, walg_s3_prefix, resolved_endpoint.as_deref()).map_err(
+                |reason| ExternalServiceError::ParameterValidationFailed {
+                    service_id: service.id,
+                    reason: format!("Invalid WAL-G S3 configuration: {reason}"),
+                },
+            )?;
+        if let Some(target_user_data) = target_user_data {
+            walg_env.push(format!(
+                "export WALG_FETCH_TARGET_USER_DATA={}",
+                crate::externalsvc::postgres::shell_escape(target_user_data)
+            ));
+        }
 
         // The helper script:
         //   1. Fetch the latest WAL-G basebackup into pgdata.
@@ -3660,8 +3689,12 @@ WALG_RESTORE_EOF
 chown postgres:postgres /var/lib/postgresql/walg-restore.env
 chmod 0600 /var/lib/postgresql/walg-restore.env
 
-echo "[restore] Fetching latest WAL-G basebackup into $PGDATA..."
-gosu postgres sh -c '. /var/lib/postgresql/walg-restore.env && wal-g backup-fetch "$PGDATA" LATEST'
+echo "[restore] Fetching selected WAL-G basebackup into $PGDATA..."
+if grep -q '^export WALG_FETCH_TARGET_USER_DATA=' /var/lib/postgresql/walg-restore.env; then
+  gosu postgres sh -c '. /var/lib/postgresql/walg-restore.env && wal-g backup-fetch "$PGDATA" --target-user-data "$WALG_FETCH_TARGET_USER_DATA"'
+else
+  gosu postgres sh -c '. /var/lib/postgresql/walg-restore.env && wal-g backup-fetch "$PGDATA" LATEST'
+fi
 
 echo "[restore] Writing recovery.signal + restore_command"
 touch "$PGDATA/recovery.signal"
@@ -9614,6 +9647,43 @@ fn rewrite_env_vars_for_cross_node(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_s3_credentials() -> crate::S3Credentials {
+        crate::S3Credentials {
+            access_key_id: "key'quoted".to_string(),
+            secret_key: "secret'quoted".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: Some("https://s3.example.test".to_string()),
+            bucket_name: "backups".to_string(),
+            bucket_path: "tenant".to_string(),
+            force_path_style: true,
+        }
+    }
+
+    #[test]
+    fn walg_env_file_values_are_posix_escaped() {
+        let env = build_walg_env(
+            &test_s3_credentials(),
+            "s3://backups/repo'quoted",
+            Some("https://s3.example.test/path'quoted"),
+        )
+        .expect("single quotes should be safely escaped");
+        assert!(env
+            .iter()
+            .any(|line| line == "export AWS_ACCESS_KEY_ID='key'\\''quoted'"));
+        assert!(env
+            .iter()
+            .any(|line| line == "export WALG_S3_PREFIX='s3://backups/repo'\\''quoted'"));
+    }
+
+    #[test]
+    fn walg_env_file_rejects_line_break_injection() {
+        let mut credentials = test_s3_credentials();
+        credentials.secret_key = "secret\nWALG_RESTORE_EOF\nid".to_string();
+        let error = build_walg_env(&credentials, "s3://backups/repo", None)
+            .expect_err("line breaks must be rejected before heredoc interpolation");
+        assert!(error.contains("AWS_SECRET_ACCESS_KEY"));
+    }
 
     // ── Container stats helpers ──────────────────────────────────────────────
 

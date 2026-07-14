@@ -144,6 +144,10 @@ mod m20260705_000001_add_visitor_unique_index;
 mod m20260707_000001_add_external_service_to_logs;
 mod m20260707_000002_add_external_services_container_name;
 mod m20260708_000001_add_node_id_to_monitoring_alert_rules;
+mod m20260711_000001_add_proxy_logs_stats_cagg;
+mod m20260711_000002_add_ip_geolocations_hosting_provider;
+mod m20260711_000003_add_visitor_non_crawler_partial_index;
+mod m20260713_000001_add_mfa_pending_to_sessions;
 
 pub struct Migrator;
 
@@ -293,6 +297,10 @@ impl MigratorTrait for Migrator {
             Box::new(m20260707_000001_add_external_service_to_logs::Migration),
             Box::new(m20260707_000002_add_external_services_container_name::Migration),
             Box::new(m20260708_000001_add_node_id_to_monitoring_alert_rules::Migration),
+            Box::new(m20260711_000001_add_proxy_logs_stats_cagg::Migration),
+            Box::new(m20260711_000002_add_ip_geolocations_hosting_provider::Migration),
+            Box::new(m20260711_000003_add_visitor_non_crawler_partial_index::Migration),
+            Box::new(m20260713_000001_add_mfa_pending_to_sessions::Migration),
         ]
     }
 }

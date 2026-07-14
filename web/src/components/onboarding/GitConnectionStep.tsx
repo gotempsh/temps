@@ -17,7 +17,6 @@ import { Badge } from '@/components/ui/badge'
 import { GitProviderFlow } from '@/components/git-providers/GitProviderFlow'
 import {
   CheckCircle2,
-  GithubIcon,
   GitBranch,
   Plus,
   ArrowRight,
@@ -25,6 +24,7 @@ import {
   Building2,
   RefreshCw,
 } from 'lucide-react'
+import GithubIcon from '@/icons/Github'
 import { cn } from '@/lib/utils'
 import { formatDistanceToNow } from 'date-fns'
 

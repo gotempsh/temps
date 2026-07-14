@@ -60,6 +60,10 @@ import { TooltipProvider } from '@/components/ui/tooltip'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
+  cleanupExpiredBackups,
+  type RetentionCleanupReport,
+} from '@/lib/backup-cleanup'
+import {
   listScheduleRunsOptions,
   runScheduleNow,
   type ScheduleRunSummary,
@@ -73,6 +77,7 @@ import {
   ChevronRight,
   Database,
   DatabaseBackup,
+  Eraser,
   HardDrive,
   Loader2,
   MoreHorizontal,
@@ -222,6 +227,8 @@ export function ScheduleDetail() {
   const pageSize = 20
 
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
+  const [showCleanupDialog, setShowCleanupDialog] = useState(false)
+  const [cleanupReport, setCleanupReport] = useState<RetentionCleanupReport | null>(null)
   const [showAttachDialog, setShowAttachDialog] = useState(false)
   const [pendingAttachIds, setPendingAttachIds] = useState<number[]>([])
 
@@ -233,7 +240,7 @@ export function ScheduleDetail() {
   })
 
   const { data: s3Source } = useQuery({
-    ...getS3SourceOptions({ path: { id: schedule?.s3_source_id! } }),
+    ...getS3SourceOptions({ path: { id: schedule?.s3_source_id ?? 0 } }),
     enabled: !!schedule?.s3_source_id,
   })
 
@@ -295,6 +302,43 @@ export function ScheduleDetail() {
     onError: () => toast.error('Failed to delete schedule'),
     onSettled: () => setShowDeleteDialog(false),
   })
+
+  const cleanupPreviewMutation = useMutation({
+    mutationFn: () => cleanupExpiredBackups({ dryRun: true, scheduleId: scheduleId! }),
+    onSuccess: setCleanupReport,
+    onError: (err: unknown) => {
+      const message = err instanceof Error ? err.message : 'Unknown error'
+      toast.error('Cleanup preview failed', { description: message })
+    },
+  })
+
+  const cleanupExecuteMutation = useMutation({
+    mutationFn: (expectedBackupIds: string[]) =>
+      cleanupExpiredBackups({ scheduleId: scheduleId!, expectedBackupIds }),
+    onSuccess: (report) => {
+      setCleanupReport(report)
+      if (report.failed === 0) {
+        toast.success('Expired backups deleted', {
+          description: `${report.deleted} backup${report.deleted === 1 ? '' : 's'} removed by this schedule's retention policy.`,
+        })
+      } else {
+        toast.warning('Cleanup completed with failures', {
+          description: `${report.deleted} deleted, ${report.failed} failed.`,
+        })
+      }
+      void queryClient.invalidateQueries({ queryKey: ['schedule-runs', scheduleId] })
+    },
+    onError: (err: unknown) => {
+      const message = err instanceof Error ? err.message : 'Unknown error'
+      toast.error('Cleanup failed', { description: message })
+    },
+  })
+
+  const openCleanupDialog = () => {
+    setCleanupReport(null)
+    setShowCleanupDialog(true)
+    cleanupPreviewMutation.mutate()
+  }
 
   // ── Service attachment ────────────────────────────────────────────────────
 
@@ -471,7 +515,7 @@ export function ScheduleDetail() {
                   <span>
                     Included{' '}
                     <span className="text-muted-foreground">
-                      (Temps's own database is backed up every run)
+                      (Temps&apos;s own database is backed up every run)
                     </span>
                   </span>
                 ) : (
@@ -626,6 +670,14 @@ export function ScheduleDetail() {
                   }
                 >
                   {schedule.enabled ? 'Disable' : 'Enable'}
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  onClick={openCleanupDialog}
+                  disabled={cleanupPreviewMutation.isPending}
+                >
+                  <Eraser className="mr-2 h-4 w-4" />
+                  Clean up expired backups
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
@@ -879,6 +931,110 @@ export function ScheduleDetail() {
               ) : null}
               Attach
             </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* ── Retention cleanup preview and confirmation ── */}
+      <Dialog
+        open={showCleanupDialog}
+        onOpenChange={(open) => {
+          if (!cleanupExecuteMutation.isPending) setShowCleanupDialog(open)
+        }}
+      >
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Clean up expired backups</DialogTitle>
+            <DialogDescription>
+              Preview backups older than {schedule.retention_period} days for this schedule before
+              permanently removing their stored data and history records.
+            </DialogDescription>
+          </DialogHeader>
+
+          {cleanupPreviewMutation.isPending && !cleanupReport ? (
+            <div className="flex items-center justify-center gap-3 rounded-lg border border-dashed py-10 text-sm text-muted-foreground">
+              <Loader2 className="h-4 w-4 animate-spin" />
+              Checking the retention policy…
+            </div>
+          ) : cleanupReport?.dry_run ? (
+            <div className="space-y-4">
+              <div className="rounded-lg border bg-muted/40 p-4">
+                <p className="text-sm font-medium">
+                  {cleanupReport.expired === 0
+                    ? 'Nothing to clean up'
+                    : `${cleanupReport.expired} expired backup${cleanupReport.expired === 1 ? '' : 's'} found`}
+                </p>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  {cleanupReport.expired === 0
+                    ? 'Every backup is still within this schedule’s retention window.'
+                    : 'This was a dry run. No objects or history records have been changed.'}
+                </p>
+              </div>
+
+              {cleanupReport.candidate_backup_ids.length > 0 && (
+                <div>
+                  <p className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                    Backups to delete
+                  </p>
+                  <ul className="max-h-48 divide-y overflow-y-auto rounded-md border bg-background font-mono text-xs">
+                    {cleanupReport.candidate_backup_ids.map((backupId) => (
+                      <li key={backupId} className="break-all px-3 py-2">
+                        {backupId}
+                      </li>
+                    ))}
+                  </ul>
+                  {cleanupReport.candidate_backup_ids_truncated && (
+                    <p className="mt-2 text-xs text-muted-foreground">
+                      Showing the first 100 candidates. Cleanup removes only the backups shown;
+                      preview again afterward for the remaining backups.
+                    </p>
+                  )}
+                </div>
+              )}
+            </div>
+          ) : cleanupReport ? (
+            <div className="space-y-3 rounded-lg border bg-muted/40 p-4 text-sm">
+              <p className="font-medium">Cleanup finished</p>
+              <p className="text-muted-foreground">
+                {cleanupReport.deleted} deleted, {cleanupReport.failed} failed.
+              </p>
+              {cleanupReport.failures.map((failure) => (
+                <p key={failure.backup_id} className="text-destructive">
+                  {failure.backup_id}: {failure.reason}
+                </p>
+              ))}
+            </div>
+          ) : (
+            <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-4 text-sm text-destructive">
+              The preview could not be loaded. Close this dialog and try again.
+            </div>
+          )}
+
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setShowCleanupDialog(false)}
+              disabled={cleanupExecuteMutation.isPending}
+            >
+              {cleanupReport && !cleanupReport.dry_run ? 'Close' : 'Cancel'}
+            </Button>
+            {cleanupReport?.dry_run && cleanupReport.expired > 0 && (
+              <Button
+                variant="destructive"
+                onClick={() =>
+                  cleanupExecuteMutation.mutate(cleanupReport.candidate_backup_ids)
+                }
+                disabled={cleanupExecuteMutation.isPending}
+              >
+                {cleanupExecuteMutation.isPending ? (
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                ) : (
+                  <Trash2 className="mr-2 h-4 w-4" />
+                )}
+                Delete {cleanupReport.candidate_backup_ids.length} shown backup
+                {cleanupReport.candidate_backup_ids.length === 1 ? '' : 's'}
+              </Button>
+            )}
           </DialogFooter>
         </DialogContent>
       </Dialog>

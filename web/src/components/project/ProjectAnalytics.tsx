@@ -558,7 +558,7 @@ export function AnalyticsFilters({
             </PopoverTrigger>
             <PopoverContent className="w-auto p-0" align="end">
               <Calendar
-                initialFocus
+                autoFocus
                 mode="range"
                 defaultMonth={
                   new Date(new Date().setMonth(new Date().getMonth() - 1))
@@ -570,9 +570,16 @@ export function AnalyticsFilters({
                     ? 1
                     : 2
                 }
-                disabled={(date) => date > new Date()}
-                toDate={new Date()}
-                fromDate={
+                disabled={[
+                  (date) => date > new Date(),
+                  {
+                    before: new Date(
+                      new Date().setMonth(new Date().getMonth() - 1)
+                    ),
+                  },
+                ]}
+                endMonth={new Date()}
+                startMonth={
                   new Date(new Date().setMonth(new Date().getMonth() - 1))
                 }
               />

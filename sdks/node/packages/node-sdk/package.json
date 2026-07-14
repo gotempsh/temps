@@ -1,6 +1,6 @@
 {
   "name": "@temps-sdk/node-sdk",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "private": false,
   "type": "module",
   "main": "./dist/index.js",

@@ -4767,6 +4767,9 @@ export type DnsProviderCredentials = {
     subscription_id: string;
     tenant_id: string;
     type: 'azure';
+} | {
+    management_url: string;
+    type: 'pebble';
 };
 
 /**
@@ -4804,7 +4807,7 @@ export type DnsProviderSettingsMasked = {
 /**
  * Supported DNS provider types
  */
-export type DnsProviderType = 'cloudflare' | 'namecheap' | 'route53' | 'digitalocean' | 'gcp' | 'azure' | 'manual';
+export type DnsProviderType = 'cloudflare' | 'namecheap' | 'route53' | 'digitalocean' | 'gcp' | 'azure' | 'manual' | 'pebble';
 
 /**
  * A DNS record
@@ -7275,6 +7278,12 @@ export type GlobalRevenueSummaryResponse = {
 
 export type GroupedPageMetric = {
     cls?: number | null;
+    /**
+     * ISO 3166-1 alpha-2 code of the group's country. Populated for the
+     * geographic dimensions (country/region/city) so clients can match map
+     * geometries without name-based lookups; null otherwise.
+     */
+    country_code?: string | null;
     events: number;
     fcp?: number | null;
     group_key: string;
@@ -7283,11 +7292,19 @@ export type GroupedPageMetric = {
     ttfb?: number | null;
 };
 
-export type GroupedPageMetricsQuery = {
+export type GroupedPageMetricsQuery = SpeedSegmentFilters & {
     deployment_id?: number | null;
+    /**
+     * Device type filter: "desktop" or "mobile"
+     */
+    device_type?: string | null;
     end_date: string;
     environment_id?: number | null;
     group_by: string;
+    /**
+     * Include crawler/datacenter (bot) samples. Defaults to false.
+     */
+    include_bots?: boolean | null;
     project_id: number;
     start_date: string;
 };
@@ -10519,7 +10536,7 @@ export type PendingActionResponse = {
     summary: string;
 };
 
-export type PerformanceMetricsQuery = {
+export type PerformanceMetricsQuery = SpeedSegmentFilters & {
     deployment_id?: number | null;
     /**
      * Device type filter: "desktop" or "mobile"
@@ -10527,6 +10544,11 @@ export type PerformanceMetricsQuery = {
     device_type?: string | null;
     end_date: string;
     environment_id?: number | null;
+    /**
+     * Include crawler/datacenter (bot) samples. Defaults to false — bots
+     * are excluded from the read view but always stored at ingest.
+     */
+    include_bots?: boolean | null;
     project_id: number;
     start_date: string;
 };
@@ -14505,6 +14527,40 @@ export type SpeedMetricsPayload = {
     viewportWidth?: number | null;
 };
 
+/**
+ * Optional segment filters for the performance read endpoints, mirroring
+ * analytics' `VisitorSegmentFilters`. Each filter narrows results to samples
+ * matching the dimension value, so metrics can be scoped to e.g. one page,
+ * one browser, or one country. Geographic filters resolve via
+ * `ip_geolocations`; the rest live directly on `performance_metrics`.
+ */
+export type SpeedSegmentFilters = {
+    /**
+     * Browser name (matches `performance_metrics.browser`)
+     */
+    filter_browser?: string | null;
+    /**
+     * Geolocation city (matches `ip_geolocations.city`)
+     */
+    filter_city?: string | null;
+    /**
+     * Geolocation country (matches `ip_geolocations.country`)
+     */
+    filter_country?: string | null;
+    /**
+     * Operating system (matches `performance_metrics.operating_system`)
+     */
+    filter_operating_system?: string | null;
+    /**
+     * Page pathname (matches `performance_metrics.pathname`)
+     */
+    filter_path?: string | null;
+    /**
+     * Geolocation region (matches `ip_geolocations.region`)
+     */
+    filter_region?: string | null;
+};
+
 export type StaleSlot = {
     active: boolean;
     retained_bytes: number;
@@ -15394,7 +15450,9 @@ export type UniqueCountsQuery = {
      */
     environment_id?: number | null;
     /**
-     * Metric to count: "sessions" (unique sessions), "visitors" (unique visitors), or "page_views" (total page views) (default: "sessions")
+     * Metric to count: "sessions" (unique sessions), "visitors" (unique visitors),
+     * "returning_visitors" (visitors seen before the range), or "page_views"
+     * (total page views) (default: "sessions")
      */
     metric?: string;
     /**
@@ -27797,7 +27855,40 @@ export type ListRepositoriesByProviderData = {
          */
         provider_id: number;
     };
-    query?: never;
+    query?: {
+        /**
+         * Page number for pagination
+         */
+        page?: number;
+        /**
+         * Number of items per page (max 100)
+         */
+        per_page?: number;
+        /**
+         * Sort field (name, created_at, updated_at, stars, watchers, size, issues)
+         */
+        sort?: string;
+        /**
+         * Sort direction (asc, desc)
+         */
+        direction?: string;
+        /**
+         * Search term to filter repositories
+         */
+        search?: string;
+        /**
+         * Filter by repository owner
+         */
+        owner?: string;
+        /**
+         * Filter by programming language
+         */
+        language?: string;
+        /**
+         * Filter by private status (true/false)
+         */
+        private?: boolean;
+    };
     url: '/git-providers/{provider_id}/repositories';
 };
 
@@ -32195,6 +32286,34 @@ export type GetPerformanceMetricsData = {
          * Device type filter: desktop or mobile (optional)
          */
         device_type?: string;
+        /**
+         * Include crawler/datacenter bot samples (default false)
+         */
+        include_bots?: boolean;
+        /**
+         * Filter to one page pathname (optional)
+         */
+        filter_path?: string;
+        /**
+         * Filter to one country (optional)
+         */
+        filter_country?: string;
+        /**
+         * Filter to one region (optional)
+         */
+        filter_region?: string;
+        /**
+         * Filter to one city (optional)
+         */
+        filter_city?: string;
+        /**
+         * Filter to one browser (optional)
+         */
+        filter_browser?: string;
+        /**
+         * Filter to one operating system (optional)
+         */
+        filter_operating_system?: string;
     };
     url: '/performance/metrics';
 };
@@ -32257,6 +32376,34 @@ export type GetMetricsOverTimeData = {
          * Device type filter: desktop or mobile (optional)
          */
         device_type?: string;
+        /**
+         * Include crawler/datacenter bot samples (default false)
+         */
+        include_bots?: boolean;
+        /**
+         * Filter to one page pathname (optional)
+         */
+        filter_path?: string;
+        /**
+         * Filter to one country (optional)
+         */
+        filter_country?: string;
+        /**
+         * Filter to one region (optional)
+         */
+        filter_region?: string;
+        /**
+         * Filter to one city (optional)
+         */
+        filter_city?: string;
+        /**
+         * Filter to one browser (optional)
+         */
+        filter_browser?: string;
+        /**
+         * Filter to one operating system (optional)
+         */
+        filter_operating_system?: string;
     };
     url: '/performance/metrics-over-time';
 };
@@ -32316,9 +32463,41 @@ export type GetGroupedPageMetricsData = {
          */
         deployment_id?: number;
         /**
-         * Group by: path, country, device_type, browser, operating_system
+         * Group by: path, country, region, city, device_type, browser, operating_system
          */
         group_by: string;
+        /**
+         * Device type filter: desktop or mobile (optional)
+         */
+        device_type?: string;
+        /**
+         * Include crawler/datacenter bot samples (default false)
+         */
+        include_bots?: boolean;
+        /**
+         * Filter to one page pathname (optional)
+         */
+        filter_path?: string;
+        /**
+         * Filter to one country (optional)
+         */
+        filter_country?: string;
+        /**
+         * Filter to one region (optional)
+         */
+        filter_region?: string;
+        /**
+         * Filter to one city (optional)
+         */
+        filter_city?: string;
+        /**
+         * Filter to one browser (optional)
+         */
+        filter_browser?: string;
+        /**
+         * Filter to one operating system (optional)
+         */
+        filter_operating_system?: string;
     };
     url: '/performance/page-metrics';
 };
@@ -40420,7 +40599,7 @@ export type GetUniqueCountsData = {
          */
         deployment_id?: number;
         /**
-         * Metric to count: 'sessions' (unique sessions), 'visitors' (unique visitors), or 'page_views' (total page views) (default: 'sessions')
+         * Metric to count: 'sessions' (unique sessions), 'visitors' (unique visitors), 'returning_visitors' (visitors seen before the range), or 'page_views' (total page views) (default: 'sessions')
          */
         metric: string;
     };

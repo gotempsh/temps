@@ -193,6 +193,7 @@ pub fn build_proxy_log_storage(
     config: &ServerConfig,
     db: Arc<DatabaseConnection>,
     ip_service: Arc<temps_geo::IpAddressService>,
+    resolver: Arc<dyn temps_core::RetentionResolver>,
 ) -> Arc<dyn ProxyLogStorage> {
     if config.is_clickhouse_enabled() {
         // is_clickhouse_enabled() guarantees all four fields are Some.
@@ -202,7 +203,7 @@ pub fn build_proxy_log_storage(
             config.clickhouse_user.clone().unwrap_or_default(),
             config.clickhouse_password.clone().unwrap_or_default(),
         );
-        let store = ClickHouseProxyLogStore::new(cfg);
+        let store = ClickHouseProxyLogStore::new(cfg, resolver);
 
         // Apply migrations off the startup path. Cloning the client is cheap
         // (Arc-backed internally).

@@ -5,6 +5,56 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Daily returning-visitor metric**: The analytics overview now reports visitors active in the selected period who were previously seen in the same project and environment, making daily audience retention visible across TimescaleDB and ClickHouse backends.
+
+### Fixed
+
+- **No-op visitor deduplication migration**: `m20260705_000001_add_visitor_unique_index` now skips bulk foreign-key rewrites when no duplicate `(visitor_id, project_id)` pairs exist, preventing TimescaleDB from eagerly decompressing unrelated hypertable chunks and exceeding `timescaledb.max_tuples_decompressed_per_dml_transaction` during upgrades.
+
+## [0.1.0-beta.46] - 2026-07-12
+
+### Added
+
+- **otel,proxy:** Parameterize ClickHouse retention via per-row retention_days
+- **web:** Add per-dimension web vitals breakdown to speed insights
+- **analytics-performance:** Geo breakdowns and segment filters for speed metrics
+- **web:** World map of web vitals by country on the speed page
+- **analytics-performance:** Read-time bot filtering for speed metrics
+
+### Documentation
+
+- **agents:** Document Docker safety constraints ([#232](https://github.com/gotempsh/temps/issues/232))
+- **retention:** Remove EE mentions from OSS comments
+
+### Fixed
+
+- **web:** Adapt chart and replay types to recharts 3 and rrweb-player 2 ([#277](https://github.com/gotempsh/temps/issues/277))
+- **otel,proxy:** Register RetentionResolver via the service registry
+- **otel,proxy:** Defer RetentionResolver lookup past plugin registration order
+- **analytics:** Exclude bots and datacenter IPs from live-visitors ([#281](https://github.com/gotempsh/temps/issues/281))
+- **proxy:** Thread a shared RetentionResolver into the live Pingora proxy
+- **retention:** Write-once guard on RetentionResolverSlot + guardrail docs
+- **analytics-performance:** Group page metrics on performance_metrics columns
+- **react-analytics:** Send pathname field the speed ingest endpoint expects
+- **security:** Close three unauthenticated-access CRITICALs ([#288](https://github.com/gotempsh/temps/issues/288))
+- **providers:** Reject client-supplied internal-only fields on external-service create ([#287](https://github.com/gotempsh/temps/issues/287))
+
+### Miscellaneous
+
+- **deps-dev:** Bump eslint from 9.37.0 to 10.6.0 in /web ([#213](https://github.com/gotempsh/temps/issues/213))
+- **deps-dev:** Bump @rsbuild/core from 1.5.1 to 2.1.4 in /web ([#209](https://github.com/gotempsh/temps/issues/209))
+- **deps-dev:** Bump @rsbuild/plugin-react from 1.4.0 to 2.1.0 in /web ([#217](https://github.com/gotempsh/temps/issues/217))
+- **sdk:** Bump analytics-browser, kv, blob, node-sdk for npm publish ([#286](https://github.com/gotempsh/temps/issues/286))
+
+### Performance
+
+- **proxy:** Serve proxy-log stats from a 1-minute continuous aggregate ([#278](https://github.com/gotempsh/temps/issues/278))
+- **otel:** Make storage quota opt-in, disabled by default ([#283](https://github.com/gotempsh/temps/issues/283))
+
 ## [0.1.0-beta.45] - 2026-07-11
 
 ### Added

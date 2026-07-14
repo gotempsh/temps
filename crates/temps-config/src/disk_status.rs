@@ -3,8 +3,13 @@
 //! Pure, read-only disk-usage inspection shared between the on-demand HTTP
 //! endpoint (Settings API) and the background `DiskSpaceMonitor` in
 //! `temps-monitoring`. Reading disk usage needs only the configured threshold
-//! (from `ConfigService`) and the data directory — it never sends
-//! notifications, so it has no dependency on the notification service.
+//! (from `ConfigService`) — it never sends notifications, so it has no
+//! dependency on the notification service.
+//!
+//! By default every writable mounted volume is monitored (e.g. a dedicated
+//! `/var/lib/docker` volume), not just the disk backing the data directory.
+//! Setting `disk_space_alert.monitor_path` restricts monitoring to the single
+//! disk backing that path.
 
 use std::path::Path;
 
@@ -70,55 +75,119 @@ pub enum DiskStatusError {
     Configuration { reason: String },
 }
 
-/// Inspect disk usage for all mounts, or only the mount backing `path`.
+/// Raw view of a mounted disk as reported by the OS, before any filtering.
+/// Kept separate from sysinfo so the selection/dedup logic below is
+/// unit-testable without real mounts.
+#[derive(Debug, Clone)]
+struct RawDisk {
+    device: String,
+    mount_point: String,
+    total: u64,
+    available: u64,
+    file_system: String,
+    read_only: bool,
+}
+
+/// File systems that never hold data Temps could fill up and would only
+/// produce false alerts (snap squashfs loops, for example, are permanently
+/// at 100% usage).
+const PSEUDO_FILE_SYSTEMS: &[&str] = &[
+    "squashfs", "erofs", "iso9660", "overlay", "tmpfs", "devtmpfs", "ramfs",
+];
+
+fn collect_raw_disks() -> Vec<RawDisk> {
+    Disks::new_with_refreshed_list()
+        .list()
+        .iter()
+        .map(|disk| RawDisk {
+            device: disk.name().to_string_lossy().to_string(),
+            mount_point: disk.mount_point().to_string_lossy().to_string(),
+            total: disk.total_space(),
+            available: disk.available_space(),
+            file_system: disk.file_system().to_string_lossy().to_string(),
+            read_only: disk.is_read_only(),
+        })
+        .collect()
+}
+
+fn to_disk_info(raw: &RawDisk) -> DiskInfo {
+    let used = raw.total.saturating_sub(raw.available);
+    let usage_percent = if raw.total > 0 {
+        (used as f64 / raw.total as f64) * 100.0
+    } else {
+        0.0
+    };
+    DiskInfo {
+        mount_point: raw.mount_point.clone(),
+        total_bytes: raw.total,
+        used_bytes: used,
+        available_bytes: raw.available,
+        usage_percent,
+        file_system: raw.file_system.clone(),
+    }
+}
+
+/// Inspect disk usage for all mounted volumes, or only the mount backing
+/// `path`.
 ///
 /// When `path` is given, the most specific matching mount point is returned
-/// (longest mount-point prefix wins).
+/// (longest mount-point prefix wins). Without a path, every writable mounted
+/// volume is returned — deduplicated per device and with pseudo file systems
+/// filtered out — so additional volumes (a dedicated `/var/lib/docker`
+/// mount, an attached data disk) are all covered.
 pub fn get_disk_info(path: Option<&str>) -> Vec<DiskInfo> {
-    let disks = Disks::new_with_refreshed_list();
-    let mut disk_infos = Vec::new();
+    build_disk_infos(&collect_raw_disks(), path)
+}
 
-    for disk in disks.list() {
-        let mount_point = disk.mount_point().to_string_lossy().to_string();
-        let total = disk.total_space();
-        let available = disk.available_space();
-        let used = total.saturating_sub(available);
-        let usage_percent = if total > 0 {
-            (used as f64 / total as f64) * 100.0
+fn build_disk_infos(raw_disks: &[RawDisk], path: Option<&str>) -> Vec<DiskInfo> {
+    if let Some(target_path) = path {
+        // Keep only mounts that could contain the target path — the root
+        // mount ("/") is always a candidate as a fallback — then pick the
+        // most specific one (longest mount point).
+        let mut candidates: Vec<&RawDisk> = raw_disks
+            .iter()
+            .filter(|d| target_path.starts_with(&d.mount_point) || d.mount_point == "/")
+            .collect();
+        candidates.sort_by_key(|d| std::cmp::Reverse(d.mount_point.len()));
+        return candidates.into_iter().take(1).map(to_disk_info).collect();
+    }
+
+    // All-disks mode: monitor every real, writable volume. Bind mounts and
+    // btrfs subvolumes surface the same device several times, so keep only
+    // the shortest (primary) mount point per device.
+    let mut by_device: std::collections::BTreeMap<String, &RawDisk> =
+        std::collections::BTreeMap::new();
+    for disk in raw_disks {
+        if disk.total == 0
+            || disk.read_only
+            || PSEUDO_FILE_SYSTEMS.contains(&disk.file_system.to_ascii_lowercase().as_str())
+        {
+            continue;
+        }
+        let key = if disk.device.is_empty() {
+            format!("mount:{}", disk.mount_point)
         } else {
-            0.0
+            disk.device.clone()
         };
-
-        if let Some(target_path) = path {
-            // Keep only mounts that could contain the target path. The root
-            // mount ("/") is always a candidate as a fallback.
-            if !target_path.starts_with(&mount_point) && mount_point != "/" {
-                continue;
+        match by_device.get(key.as_str()) {
+            Some(existing) if existing.mount_point.len() <= disk.mount_point.len() => {}
+            _ => {
+                by_device.insert(key, disk);
             }
         }
-
-        disk_infos.push(DiskInfo {
-            mount_point,
-            total_bytes: total,
-            used_bytes: used,
-            available_bytes: available,
-            usage_percent,
-            file_system: disk.file_system().to_string_lossy().to_string(),
-        });
     }
 
-    // For a specific path with multiple candidate mounts, keep the most
-    // specific one (longest mount point).
-    if path.is_some() && disk_infos.len() > 1 {
-        disk_infos.sort_by_key(|d| std::cmp::Reverse(d.mount_point.len()));
-        disk_infos.truncate(1);
-    }
-
+    let mut disk_infos: Vec<DiskInfo> = by_device.values().map(|d| to_disk_info(d)).collect();
+    disk_infos.sort_by(|a, b| a.mount_point.cmp(&b.mount_point));
     disk_infos
 }
 
-/// Collect the current disk status for the monitored path, evaluating it
-/// against the configured threshold. Read-only — never sends notifications.
+/// Collect the current disk status, evaluating every monitored disk against
+/// the configured threshold. Read-only — never sends notifications.
+///
+/// With no `monitor_path` configured (the default), all mounted writable
+/// volumes are checked; a `monitor_path` restricts the check to the single
+/// disk backing that path.
 pub async fn collect_disk_status(
     config_service: &ConfigService,
 ) -> Result<DiskSpaceCheckResult, DiskStatusError> {
@@ -130,13 +199,7 @@ pub async fn collect_disk_status(
         })?
         .disk_space_alert;
 
-    let data_dir = config_service.data_dir();
-    let monitor_path = settings
-        .monitor_path
-        .clone()
-        .unwrap_or_else(|| data_dir.to_string_lossy().to_string());
-
-    let disks = get_disk_info(Some(&monitor_path));
+    let disks = get_disk_info(settings.monitor_path.as_deref());
 
     let alerts = disks
         .iter()
@@ -237,5 +300,82 @@ mod tests {
             "path query should collapse to a single mount, got {}",
             disks.len()
         );
+    }
+
+    fn raw(device: &str, mount: &str, total: u64, available: u64) -> RawDisk {
+        RawDisk {
+            device: device.to_string(),
+            mount_point: mount.to_string(),
+            total,
+            available,
+            file_system: "ext4".to_string(),
+            read_only: false,
+        }
+    }
+
+    const GB: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn test_all_disks_mode_includes_every_writable_volume() {
+        let disks = vec![
+            raw("/dev/sda1", "/", 40 * GB, 30 * GB),
+            raw("/dev/sdb1", "/var/lib/docker", 500 * GB, 100 * GB),
+            raw("/dev/sdc1", "/mnt/data", 100 * GB, 90 * GB),
+        ];
+
+        let infos = build_disk_infos(&disks, None);
+
+        let mounts: Vec<&str> = infos.iter().map(|d| d.mount_point.as_str()).collect();
+        assert_eq!(mounts, vec!["/", "/mnt/data", "/var/lib/docker"]);
+        let docker = infos.iter().find(|d| d.mount_point == "/var/lib/docker");
+        assert_eq!(docker.unwrap().usage_percent, 80.0);
+    }
+
+    #[test]
+    fn test_all_disks_mode_dedupes_bind_mounts_by_device() {
+        // Same device mounted twice (bind mount / btrfs subvolume): keep the
+        // primary (shortest) mount point only.
+        let disks = vec![
+            raw("/dev/sda1", "/home/user/data", 40 * GB, 30 * GB),
+            raw("/dev/sda1", "/", 40 * GB, 30 * GB),
+        ];
+
+        let infos = build_disk_infos(&disks, None);
+
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].mount_point, "/");
+    }
+
+    #[test]
+    fn test_all_disks_mode_skips_pseudo_and_readonly_mounts() {
+        let mut snap = raw("/dev/loop0", "/snap/core/1234", GB, 0);
+        snap.file_system = "squashfs".to_string();
+        snap.read_only = true;
+        let mut cdrom = raw("/dev/sr0", "/media/cdrom", GB, 0);
+        cdrom.read_only = true;
+        let empty = raw("/dev/sdz1", "/mnt/empty", 0, 0);
+        let disks = vec![raw("/dev/sda1", "/", 40 * GB, 30 * GB), snap, cdrom, empty];
+
+        let infos = build_disk_infos(&disks, None);
+
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].mount_point, "/");
+    }
+
+    #[test]
+    fn test_path_mode_picks_most_specific_mount() {
+        let disks = vec![
+            raw("/dev/sda1", "/", 40 * GB, 30 * GB),
+            raw("/dev/sdb1", "/var/lib/docker", 500 * GB, 100 * GB),
+        ];
+
+        let infos = build_disk_infos(&disks, Some("/var/lib/docker/volumes"));
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].mount_point, "/var/lib/docker");
+
+        // A path on no dedicated mount falls back to the root disk.
+        let infos = build_disk_infos(&disks, Some("/opt/temps"));
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].mount_point, "/");
     }
 }

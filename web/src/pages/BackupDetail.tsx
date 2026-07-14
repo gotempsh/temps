@@ -44,6 +44,7 @@ import { TimeAgo } from '@/components/utils/TimeAgo'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { listBackupChildrenOptions } from '@/lib/backup-children'
+import { deleteBackup } from '@/lib/backup-cleanup'
 import { cancelBackup } from '@/lib/schedule-runs'
 import { cn, formatBytes } from '@/lib/utils'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
@@ -58,10 +59,11 @@ import {
   FileArchive,
   HardDrive,
   Loader2,
+  Trash2,
   XCircle,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams } from 'react-router-dom'
 import { toast } from 'sonner'
 
 type BackupState = 'completed' | 'failed' | 'running' | (string & {})
@@ -98,9 +100,7 @@ function StatusIcon({ state }: { state: BackupState }) {
     case 'failed':
       return <XCircle className={cn(iconClass, 'text-destructive')} />
     case 'running':
-      return (
-        <Loader2 className={cn(iconClass, 'animate-spin text-blue-600')} />
-      )
+      return <Loader2 className={cn(iconClass, 'animate-spin text-blue-600')} />
     default:
       return <Clock className={cn(iconClass, 'text-muted-foreground')} />
   }
@@ -118,7 +118,7 @@ function StatusBadge({ state }: { state: BackupState }) {
           variant="outline"
           className={cn(
             base,
-            'border-emerald-600/30 bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300',
+            'border-emerald-600/30 bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300'
           )}
         >
           <StatusIcon state={state} />
@@ -134,7 +134,7 @@ function StatusBadge({ state }: { state: BackupState }) {
           variant="outline"
           className={cn(
             base,
-            'border-destructive/30 bg-destructive/10 text-destructive dark:bg-destructive/20 dark:text-red-300',
+            'border-destructive/30 bg-destructive/10 text-destructive dark:bg-destructive/20 dark:text-red-300'
           )}
         >
           <StatusIcon state={state} />
@@ -147,7 +147,7 @@ function StatusBadge({ state }: { state: BackupState }) {
           variant="outline"
           className={cn(
             base,
-            'border-blue-600/30 bg-blue-50 text-blue-700 dark:bg-blue-950/40 dark:text-blue-300',
+            'border-blue-600/30 bg-blue-50 text-blue-700 dark:bg-blue-950/40 dark:text-blue-300'
           )}
         >
           <StatusIcon state={state} />
@@ -160,7 +160,7 @@ function StatusBadge({ state }: { state: BackupState }) {
           variant="outline"
           className={cn(
             base,
-            'border-muted-foreground/20 bg-muted/50 text-muted-foreground',
+            'border-muted-foreground/20 bg-muted/50 text-muted-foreground'
           )}
         >
           <StatusIcon state={state} />
@@ -217,7 +217,7 @@ function Detail({
         <div
           className={cn(
             'min-w-0 flex-1 break-all text-sm text-muted-foreground',
-            mono && 'font-mono',
+            mono && 'font-mono'
           )}
         >
           {children}
@@ -232,6 +232,7 @@ function Detail({
 
 export function BackupDetail() {
   const { id, backupId } = useParams<{ id: string; backupId: string }>()
+  const navigate = useNavigate()
   const { setBreadcrumbs } = useBreadcrumbs()
 
   const { data: backup, isLoading } = useQuery({
@@ -295,6 +296,7 @@ export function BackupDetail() {
   // `cancelled: 0` which we treat as a friendly "nothing to do" toast.
   const queryClient = useQueryClient()
   const [showCancelDialog, setShowCancelDialog] = useState(false)
+  const [showDeleteDialog, setShowDeleteDialog] = useState(false)
 
   const cancelMutation = useMutation({
     mutationFn: () => cancelBackup(backup!.id),
@@ -313,6 +315,21 @@ export function BackupDetail() {
     onError: (err: unknown) => {
       const message = err instanceof Error ? err.message : 'Unknown error'
       toast.error('Failed to cancel backup', { description: message })
+    },
+  })
+
+  const deleteMutation = useMutation({
+    mutationFn: () => deleteBackup(backup!.backup_id),
+    onSuccess: () => {
+      toast.success('Backup deleted', {
+        description:
+          'The stored backup data and its history record were removed.',
+      })
+      navigate(`/backups/s3-sources/${id}`)
+    },
+    onError: (err: unknown) => {
+      const message = err instanceof Error ? err.message : 'Unknown error'
+      toast.error('Failed to delete backup', { description: message })
     },
   })
 
@@ -343,9 +360,7 @@ export function BackupDetail() {
 
   const state = backup.state as BackupState
   const startedAt = new Date(backup.started_at)
-  const completedAt = backup.completed_at
-    ? new Date(backup.completed_at)
-    : null
+  const completedAt = backup.completed_at ? new Date(backup.completed_at) : null
   const durationMs = completedAt
     ? completedAt.getTime() - startedAt.getTime()
     : null
@@ -363,8 +378,9 @@ export function BackupDetail() {
   const displaySize = finalSize ?? liveSize
   const isLiveSize = !finalSize && liveSize !== null
 
-  const createdByUser = users?.find((u) => u.user.id === backup.created_by)
-    ?.user
+  const createdByUser = users?.find(
+    (u) => u.user.id === backup.created_by
+  )?.user
   const createdByLabel = createdByUser
     ? createdByUser.name || createdByUser.username || createdByUser.email
     : `User #${backup.created_by}`
@@ -444,6 +460,22 @@ export function BackupDetail() {
                     Cancel
                   </Button>
                 )}
+                {state !== 'pending' && state !== 'running' && (
+                  <Button
+                    variant="destructive"
+                    size="sm"
+                    onClick={() => setShowDeleteDialog(true)}
+                    disabled={deleteMutation.isPending}
+                    className="gap-2"
+                  >
+                    {deleteMutation.isPending ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Trash2 className="h-4 w-4" />
+                    )}
+                    Delete
+                  </Button>
+                )}
               </div>
             </div>
           </CardHeader>
@@ -505,8 +537,7 @@ export function BackupDetail() {
                   )
                 }
                 sub={
-                  backup.compression_type &&
-                  backup.compression_type !== 'none'
+                  backup.compression_type && backup.compression_type !== 'none'
                     ? `${backup.compression_type} compression`
                     : 'Uncompressed'
                 }
@@ -514,9 +545,7 @@ export function BackupDetail() {
               <Stat
                 icon={FileArchive}
                 label="Type"
-                value={
-                  <span className="capitalize">{backup.backup_type}</span>
-                }
+                value={<span className="capitalize">{backup.backup_type}</span>}
                 sub={
                   backup.file_count
                     ? `${backup.file_count.toLocaleString()} files`
@@ -608,8 +637,7 @@ export function BackupDetail() {
                   </span>
                 </Detail>
               ) : null}
-              {typeof backup.attempts === 'number' &&
-              backup.attempts > 1 ? (
+              {typeof backup.attempts === 'number' && backup.attempts > 1 ? (
                 <Detail label="Attempt">
                   {backup.attempts} of {backup.max_attempts ?? '?'}
                 </Detail>
@@ -663,9 +691,15 @@ export function BackupDetail() {
                       <TableHead>Service</TableHead>
                       <TableHead>Type</TableHead>
                       <TableHead>State</TableHead>
-                      <TableHead className="hidden sm:table-cell">Size</TableHead>
-                      <TableHead className="hidden md:table-cell">Duration</TableHead>
-                      <TableHead className="hidden lg:table-cell">Error</TableHead>
+                      <TableHead className="hidden sm:table-cell">
+                        Size
+                      </TableHead>
+                      <TableHead className="hidden md:table-cell">
+                        Duration
+                      </TableHead>
+                      <TableHead className="hidden lg:table-cell">
+                        Error
+                      </TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
@@ -692,7 +726,7 @@ export function BackupDetail() {
                       const effectiveError =
                         child.error_message ??
                         (parentFinalized && childStale
-                          ? backup.error_message ?? null
+                          ? (backup.error_message ?? null)
                           : null)
                       return (
                         <TableRow key={child.id}>
@@ -702,7 +736,9 @@ export function BackupDetail() {
                               className="flex items-center gap-2 hover:underline"
                             >
                               <Database className="h-4 w-4 shrink-0 text-muted-foreground" />
-                              <span className="font-medium">{child.service_name}</span>
+                              <span className="font-medium">
+                                {child.service_name}
+                              </span>
                             </Link>
                           </TableCell>
                           <TableCell>
@@ -759,9 +795,7 @@ export function BackupDetail() {
           <Card>
             <CardHeader>
               <CardTitle>Tags</CardTitle>
-              <CardDescription>
-                Labels attached to this backup.
-              </CardDescription>
+              <CardDescription>Labels attached to this backup.</CardDescription>
             </CardHeader>
             <CardContent>
               <div className="flex flex-wrap gap-2">
@@ -776,6 +810,33 @@ export function BackupDetail() {
         ) : null}
       </div>
 
+      <AlertDialog open={showDeleteDialog} onOpenChange={setShowDeleteDialog}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete this backup permanently?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This removes the backup data from object storage and deletes its
+              history record. This cannot be undone.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deleteMutation.isPending}>
+              Keep backup
+            </AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(event) => {
+                event.preventDefault()
+                deleteMutation.mutate()
+              }}
+              disabled={deleteMutation.isPending}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {deleteMutation.isPending ? 'Deleting…' : 'Delete permanently'}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
       {/* Cancel-confirm dialog. Open via the header "Cancel" button. */}
       <AlertDialog
         open={showCancelDialog}
@@ -788,9 +849,8 @@ export function BackupDetail() {
             <AlertDialogTitle>Cancel this backup?</AlertDialogTitle>
             <AlertDialogDescription>
               The backup will be flipped to <strong>failed</strong>. If the
-              engine is mid-dump it stops on the next heartbeat tick
-              (within ~5 seconds) and any partial S3 object is cleaned up
-              by rollback.
+              engine is mid-dump it stops on the next heartbeat tick (within ~5
+              seconds) and any partial S3 object is cleaned up by rollback.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

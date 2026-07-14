@@ -42,9 +42,10 @@ pub struct DiskSpaceMonitor {
 impl DiskSpaceMonitor {
     /// Create a new disk space monitor.
     ///
-    /// The monitored path is resolved from settings (`disk_space_alert.monitor_path`,
-    /// falling back to the configured data directory) via the shared
-    /// `temps_config::disk_status` collector — no separate data-dir argument is needed.
+    /// The monitored disks are resolved from settings via the shared
+    /// `temps_config::disk_status` collector: all mounted writable volumes by
+    /// default, or only the disk backing `disk_space_alert.monitor_path` when
+    /// that is set.
     pub fn new(
         config_service: Arc<ConfigService>,
         notification_service: Arc<dyn NotificationService>,

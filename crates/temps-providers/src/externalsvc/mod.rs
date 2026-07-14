@@ -913,6 +913,20 @@ pub trait ExternalService: Send + Sync {
         Err(anyhow::anyhow!("Restore not implemented for this service"))
     }
 
+    /// Restore into the existing service with access to the selected backup row.
+    /// Engines that need backup-specific metadata (for example WAL-G user data)
+    /// override this method; the default preserves the legacy restore path.
+    async fn restore_in_place(&self, ctx: RestoreContext<'_>) -> Result<()> {
+        self.restore_from_s3(
+            ctx.s3_client,
+            ctx.s3_credentials,
+            ctx.backup_location,
+            ctx.s3_source,
+            ctx.source_config,
+        )
+        .await
+    }
+
     // -----------------------------------------------------------------------
     // Generic restore framework (Phase 1 of restore/PITR project).
     // Engines override `restore_capabilities` to declare what they support

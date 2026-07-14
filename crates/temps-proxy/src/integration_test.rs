@@ -45,6 +45,7 @@ mod integration_tests {
             create_crypto_cookie_crypto(),
             route_table,
             config,
+            Arc::new(temps_core::FixedRetentionResolver),
         )?;
 
         // Verify the proxy service was created successfully
@@ -91,6 +92,7 @@ mod integration_tests {
             create_crypto_cookie_crypto(),
             route_table,
             config,
+            Arc::new(temps_core::FixedRetentionResolver),
         )?;
 
         // Test custom route resolution
@@ -132,6 +134,7 @@ mod integration_tests {
             create_crypto_cookie_crypto(),
             route_table,
             config,
+            Arc::new(temps_core::FixedRetentionResolver),
         )?;
 
         // Test project context resolution

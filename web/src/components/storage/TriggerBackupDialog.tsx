@@ -70,7 +70,7 @@ export function TriggerBackupDialog({
   // the FormDescription render below ("Defaults to ⭐ Cloudflare …") and
   // as the first-choice preselect in the effect below.
   const defaultSource = s3Sources?.find(
-    (s) => (s as { is_default?: boolean }).is_default === true,
+    (s) => (s as { is_default?: boolean }).is_default === true
   )
 
   // Pre-select a Storage Destination when the dialog opens:
@@ -102,11 +102,13 @@ export function TriggerBackupDialog({
   })
 
   const onSubmit = (values: FormValues) => {
+    const selectedSourceId =
+      values.s3_source_id ?? defaultSource?.id ?? s3Sources?.[0]?.id
     // Backend accepts s3_source_id as Option<i32>; generated client type still requires number.
     const body = {
       backup_type: values.backup_type || 'full',
-      ...(values.s3_source_id !== undefined
-        ? { s3_source_id: values.s3_source_id }
+      ...(selectedSourceId !== undefined
+        ? { s3_source_id: selectedSourceId }
         : {}),
     } as { s3_source_id: number; backup_type: string }
     runBackupMutation.mutate({
@@ -215,7 +217,8 @@ export function TriggerBackupDialog({
                                 </span>
                                 <span className="text-xs text-muted-foreground">
                                   {source.bucket_name}
-                                  {source.bucket_path && `/${source.bucket_path}`}
+                                  {source.bucket_path &&
+                                    `/${source.bucket_path}`}
                                 </span>
                               </div>
                             </SelectItem>

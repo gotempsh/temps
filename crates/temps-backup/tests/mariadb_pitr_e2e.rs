@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use aws_sdk_s3::config::Region;
 use bollard::Docker;
-use sea_orm::{ActiveModelTrait, Set};
+use sea_orm::{ActiveModelTrait, IntoActiveModel, Set};
 use sqlx::mysql::MySqlPoolOptions;
 use temps_backup_core::engine_v2::{BackupContext, BackupEngine};
 use temps_core::EncryptionService;
@@ -459,6 +459,38 @@ async fn run_pitr_flow(
     .await?;
     let s3_source_id = s3_source_model.id;
 
+    // The production executor creates the user-owned parent backup row before
+    // invoking an engine. The engine uses its public UUID as the artifact
+    // directory, so the E2E fixture must exercise that same contract.
+    let user = temps_entities::users::ActiveModel {
+        name: Set("pitr-test-user".to_string()),
+        email: Set(format!(
+            "pitr-{}@example.test",
+            uuid::Uuid::new_v4().simple()
+        )),
+        email_verified: Set(true),
+        mfa_enabled: Set(false),
+        ..Default::default()
+    }
+    .insert(pool)
+    .await?;
+    let parent_backup = temps_entities::backups::ActiveModel {
+        name: Set("pitr-base".to_string()),
+        backup_id: Set(uuid::Uuid::new_v4().to_string()),
+        backup_type: Set("full".to_string()),
+        state: Set("running".to_string()),
+        started_at: Set(chrono::Utc::now()),
+        s3_source_id: Set(s3_source_id),
+        s3_location: Set(String::new()),
+        metadata: Set("{}".to_string()),
+        compression_type: Set("gzip".to_string()),
+        created_by: Set(user.id),
+        tags: Set("[]".to_string()),
+        ..Default::default()
+    }
+    .insert(pool)
+    .await?;
+
     // Seed data: create DB + table, insert batch A.
     let src = mysql_pool(mariadb_port).await?;
     sqlx::query("CREATE DATABASE IF NOT EXISTS appdb")
@@ -489,7 +521,7 @@ async fn run_pitr_flow(
         },
     );
     let ctx = BackupContext {
-        backup_id: 1,
+        backup_id: parent_backup.id,
         engine_key: "mariadb_physical".to_string(),
         params: serde_json::json!({ "service_id": service_id, "s3_source_id": s3_source_id }),
         cancel: CancellationToken::new(),
@@ -499,6 +531,12 @@ async fn run_pitr_flow(
         .run(&ctx)
         .await
         .map_err(|e| anyhow::anyhow!("base backup engine: {e}"))?;
+    let mut completed_backup = parent_backup.into_active_model();
+    completed_backup.state = Set("completed".to_string());
+    completed_backup.finished_at = Set(Some(chrono::Utc::now()));
+    completed_backup.size_bytes = Set(outcome.size_bytes);
+    completed_backup.s3_location = Set(outcome.location.clone());
+    let backup_model = completed_backup.update(pool).await?;
     eprintln!("Base backup landed at key: {}", outcome.location);
     assert!(
         outcome.location.ends_with("base.mbstream.gz"),
@@ -624,40 +662,6 @@ async fn run_pitr_flow(
         bucket_path: String::new(),
         force_path_style: true,
     };
-
-    // `backups.created_by` has an FK to `users.id`, so insert a user first.
-    let user = temps_entities::users::ActiveModel {
-        name: Set("pitr-test-user".to_string()),
-        email: Set(format!(
-            "pitr-{}@example.test",
-            uuid::Uuid::new_v4().simple()
-        )),
-        email_verified: Set(true),
-        mfa_enabled: Set(false),
-        ..Default::default()
-    }
-    .insert(pool)
-    .await?;
-
-    // A `backups` model whose s3_location == the engine's output.
-    let backup_model = temps_entities::backups::ActiveModel {
-        name: Set("pitr-base".to_string()),
-        backup_id: Set(uuid::Uuid::new_v4().to_string()),
-        backup_type: Set("full".to_string()),
-        state: Set("completed".to_string()),
-        started_at: Set(chrono::Utc::now()),
-        finished_at: Set(Some(chrono::Utc::now())),
-        size_bytes: Set(outcome.size_bytes),
-        s3_source_id: Set(s3_source_id),
-        s3_location: Set(outcome.location.clone()),
-        metadata: Set("{}".to_string()),
-        compression_type: Set("gzip".to_string()),
-        created_by: Set(user.id),
-        tags: Set("[]".to_string()),
-        ..Default::default()
-    }
-    .insert(pool)
-    .await?;
 
     let source_config = ServiceConfig {
         name: service_name.to_string(),
