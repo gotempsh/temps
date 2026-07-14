@@ -58,4 +58,30 @@ pub enum DnsError {
 
     #[error("Connection failed: {0}")]
     ConnectionFailed(String),
+
+    #[error("DNS record conflict for {record_type} '{name}' in zone {domain}: {reason}. Temps never overwrites a record it does not manage — import the record into temps management from the domain's DNS settings, or remove it at the provider and retry")]
+    RecordConflict {
+        domain: String,
+        name: String,
+        record_type: String,
+        reason: String,
+    },
+
+    #[error("DNS record {record_type} '{name}' in zone {domain} is owned by temps instance '{owner_instance}', not this one; refusing to modify it")]
+    NotOwnedByInstance {
+        domain: String,
+        name: String,
+        record_type: String,
+        owner_instance: String,
+    },
+
+    #[error("Cannot create proxied record '{fqdn}': it sits {levels} subdomain levels below the zone apex, and Cloudflare Universal SSL only covers one level, so TLS would fail at the edge (error 526) without Advanced Certificate Manager. Use the flat public hostname strategy instead (e.g. '{flat_suggestion}'), or disable proxying for this record")]
+    ProxiedDepthUnsupported {
+        fqdn: String,
+        levels: usize,
+        flat_suggestion: String,
+    },
+
+    #[error("DNS provider '{provider}' does not support proxied records; disable proxying for this record or use a provider with proxy support (e.g. Cloudflare)")]
+    ProxyNotSupportedByProvider { provider: String },
 }

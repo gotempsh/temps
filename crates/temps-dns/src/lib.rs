@@ -40,6 +40,7 @@
 pub mod cp_resolver;
 pub mod errors;
 pub mod handlers;
+pub mod ownership;
 pub mod plugin;
 pub mod providers;
 pub mod services;
@@ -47,6 +48,7 @@ pub mod services;
 // Re-export main types
 pub use cp_resolver::{start_control_plane_resolver, OverlayDnsSlot};
 pub use errors::DnsError;
+pub use ownership::{registry_record_name, OwnershipMarker, OWNERSHIP_REGISTRY_PREFIX};
 pub use plugin::DnsPlugin;
 pub use providers::{
     CloudflareCredentials, CloudflareProvider, DnsProvider, DnsProviderCapabilities,
@@ -56,7 +58,7 @@ pub use providers::{
 };
 pub use services::{
     ChangeSet, DeploymentDnsPublisher, DnsOperationResult, DnsProviderService, DnsRecordService,
-    DnsRegistry, DnsRegistryError, EndpointDraft, ManualDnsInstructions,
-    OwnerKind as InternalOwnerKind, RecordType as InternalRecordType, ResolverHealth,
-    StaleResolver, ZoneSnapshot,
+    DnsRegistry, DnsRegistryError, EndpointDraft, ManagedDnsRecordService, ManualDnsInstructions,
+    OwnerKind as InternalOwnerKind, OwnershipScope, RecordOwnership,
+    RecordType as InternalRecordType, ResolverHealth, StaleResolver, ZoneSnapshot,
 };

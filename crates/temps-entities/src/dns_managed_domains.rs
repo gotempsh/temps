@@ -29,6 +29,12 @@ pub struct Model {
     /// Whether automatic DNS management is enabled for this domain
     pub auto_manage: bool,
 
+    /// Whether records created for this domain should be proxied through the
+    /// provider's CDN by default (Cloudflare orange-cloud). Only meaningful
+    /// when the provider's capabilities report proxy support; callers may
+    /// still override per record (ADR-031).
+    pub proxied_by_default: bool,
+
     /// Whether this domain has been verified (provider can access it)
     pub verified: bool,
 

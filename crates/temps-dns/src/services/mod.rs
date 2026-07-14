@@ -2,9 +2,12 @@
 //!
 //! This module contains two unrelated services:
 //!
-//! - **External-facing** (`provider_service`, `record_service`): manages DNS
-//!   records at third-party providers (Cloudflare, Route53, …) for user
-//!   domains.
+//! - **External-facing** (`provider_service`, `record_service`,
+//!   `managed_records`): manages DNS records at third-party providers
+//!   (Cloudflare, Route53, …) for user domains. `managed_records` is the
+//!   ownership-guarded path for public A/AAAA/CNAME records (ADR-031);
+//!   `record_service` is the raw upsert path kept for ACME challenge TXT
+//!   records temps unambiguously owns.
 //! - **Internal-facing** (`dns_registry`): authoritative store for the
 //!   `*.temps.local` zone served by per-node Hickory resolvers (ADR-011).
 //!
@@ -14,6 +17,7 @@
 
 pub mod deployment_publisher;
 pub mod dns_registry;
+pub mod managed_records;
 pub mod provider_service;
 pub mod record_service;
 
@@ -22,6 +26,7 @@ pub use dns_registry::{
     ChangeSet, DnsRegistry, DnsRegistryError, EndpointDraft, OwnerKind, RecordType, ResolverHealth,
     StaleResolver, ZoneSnapshot,
 };
+pub use managed_records::{ManagedDnsRecordService, OwnershipScope, RecordOwnership};
 pub use provider_service::{
     AddManagedDomainRequest, CreateProviderRequest, DnsProviderService, UpdateProviderRequest,
 };

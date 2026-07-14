@@ -9,6 +9,7 @@
 //! [`dns_sync::DnsSyncAppState`].
 
 pub mod dns_sync;
+pub mod managed_records;
 
 use axum::{
     extract::{Path, State},
@@ -38,6 +39,8 @@ use crate::services::{
 pub struct DnsAppState {
     pub provider_service: Arc<DnsProviderService>,
     pub record_service: Arc<DnsRecordService>,
+    pub managed_record_service: Arc<crate::services::ManagedDnsRecordService>,
+    pub audit_service: Arc<dyn temps_core::AuditLogger>,
 }
 
 // ========================================
@@ -296,6 +299,28 @@ impl From<DnsError> for Problem {
             DnsError::ApiError(msg) => problemdetails::new(StatusCode::BAD_GATEWAY)
                 .with_title("API Error")
                 .with_detail(msg),
+            DnsError::DomainNotManaged(domain) => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Domain Not Managed")
+                .with_detail(format!(
+                    "Domain {} is not managed by any DNS provider; connect a provider and add the domain under its managed domains first",
+                    domain
+                )),
+            DnsError::RecordConflict { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("DNS Record Conflict")
+                .with_detail(error.to_string()),
+            DnsError::NotOwnedByInstance { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Record Owned By Another Temps Install")
+                .with_detail(error.to_string()),
+            DnsError::ProxiedDepthUnsupported { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Proxied Subdomain Depth Not Supported")
+                    .with_detail(error.to_string())
+            }
+            DnsError::ProxyNotSupportedByProvider { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Proxy Not Supported By Provider")
+                    .with_detail(error.to_string())
+            }
             _ => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Internal Error")
                 .with_detail(error.to_string()),
@@ -823,6 +848,20 @@ pub fn configure_routes() -> Router<Arc<DnsAppState>> {
             "/dns-providers/{provider_id}/domains/{domain}/verify",
             post(verify_managed_domain),
         )
+        // Ownership-guarded managed records (ADR-031)
+        .route(
+            "/dns-records",
+            post(managed_records::set_managed_record)
+                .delete(managed_records::remove_managed_record),
+        )
+        .route(
+            "/dns-records/ownership",
+            get(managed_records::get_record_ownership),
+        )
+        .route(
+            "/dns-records/import",
+            post(managed_records::import_managed_record),
+        )
 }
 
 /// Configure internal DNS sync routes (ADR-011).
@@ -860,6 +899,10 @@ pub fn configure_internal_routes() -> Router<Arc<dns_sync::DnsSyncAppState>> {
         list_managed_domains,
         remove_managed_domain,
         verify_managed_domain,
+        managed_records::get_record_ownership,
+        managed_records::set_managed_record,
+        managed_records::remove_managed_record,
+        managed_records::import_managed_record,
         dns_sync::get_dns_changes,
         dns_sync::post_dns_ack,
     ),
@@ -877,6 +920,10 @@ pub fn configure_internal_routes() -> Router<Arc<dns_sync::DnsSyncAppState>> {
             DnsProviderType,
             DnsZone,
             DnsRecord,
+            managed_records::SetManagedRecordRequest,
+            managed_records::ImportManagedRecordRequest,
+            managed_records::RecordOwnershipResponse,
+            managed_records::ImportManagedRecordResponse,
             dns_sync::EndpointDto,
             dns_sync::DnsChangesResponse,
             dns_sync::DnsAckRequest,
@@ -885,6 +932,7 @@ pub fn configure_internal_routes() -> Router<Arc<dns_sync::DnsSyncAppState>> {
     ),
     tags(
         (name = "DNS Providers", description = "DNS provider management endpoints"),
+        (name = "DNS Records", description = "Ownership-guarded managed DNS records (ADR-031)"),
         (name = "Internal DNS", description = "Per-node DNS resolver sync (ADR-011)"),
     )
 )]

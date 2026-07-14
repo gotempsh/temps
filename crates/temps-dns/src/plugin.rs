@@ -17,7 +17,7 @@ use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
 use crate::handlers::{self, dns_sync::DnsSyncAppState, DnsApiDoc, DnsAppState};
-use crate::services::{DnsProviderService, DnsRecordService, DnsRegistry};
+use crate::services::{DnsProviderService, DnsRecordService, DnsRegistry, ManagedDnsRecordService};
 
 /// DNS Plugin for managing DNS providers and automatic DNS record configuration
 pub struct DnsPlugin;
@@ -59,10 +59,22 @@ impl TempsPlugin for DnsPlugin {
             let record_service = Arc::new(DnsRecordService::new(provider_service.clone()));
             context.register_service(record_service.clone());
 
+            // Ownership-guarded record management (ADR-031) — the only path
+            // for public A/AAAA/CNAME records in user zones.
+            let managed_record_service = Arc::new(ManagedDnsRecordService::new(
+                db.clone(),
+                provider_service.clone(),
+            ));
+            context.register_service(managed_record_service.clone());
+
+            let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
+
             // Create DnsAppState for handlers
             let app_state = Arc::new(DnsAppState {
                 provider_service,
                 record_service,
+                managed_record_service,
+                audit_service,
             });
             context.register_service(app_state);
 
