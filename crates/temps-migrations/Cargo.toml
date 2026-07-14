@@ -12,6 +12,7 @@ temps-core = { path = "../temps-core" }
 temps-entities = { path = "../temps-entities" }
 sea-orm-migration = { workspace = true }
 sea-orm = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 testcontainers = { workspace = true }

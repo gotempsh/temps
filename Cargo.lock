@@ -12262,6 +12262,7 @@ dependencies = [
  "temps-entities",
  "testcontainers",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
