@@ -224,6 +224,7 @@ export type AddManagedDomainApiRequest = {
      * Generated hostname layout: `"standard"` (default) or `"flat"`.
      */
     generated_hostname_mode?: string | null;
+    proxied_by_default?: boolean;
     /**
      * Opt in to reconciling generated hostnames into this domain's DNS zone.
      */
@@ -1891,6 +1892,14 @@ export type ChildBackupListResponse = {
      * Zero or more child backup entries ordered by `external_service_backups.id` ASC.
      */
     children: Array<ChildBackupEntryResponse>;
+};
+
+export type CleanupExpiredBackupsRequest = {
+    /**
+     * Exact candidates returned by the dry run. Execution fails if the
+     * retention selection has changed since preview.
+     */
+    expected_backup_ids?: Array<string> | null;
 };
 
 export type CliDeviceApproveRequest = {
@@ -4076,7 +4085,17 @@ export type DeploymentConfig = {
      */
     idleTimeoutSeconds?: number;
     /**
-     * Memory limit in megabytes (e.g., 512 = 512MB)
+     * Memory limit in megabytes. Three-state semantics:
+     * - `None`     → inherit the parent layer (env inherits project, project
+     * inherits the seeded default); used by the settings UI's "Use default".
+     * - `Some(0)`  → explicit **uncapped**: stop inheriting and run with no
+     * memory limit. This is the deliberate escape hatch for dedicated
+     * workloads, distinct from `None`.
+     * - `Some(n)`  → hard cap of `n` MB.
+     *
+     * `merge`/resolution keep `Some(0)` as a present value (it wins precedence
+     * over a parent cap), and the deployer collapses it to "no limit" before
+     * talking to Docker.
      */
     memoryLimit?: number | null;
     /**
@@ -5039,6 +5058,11 @@ export type DnsRecordSetupResult = {
  * DNS record verification status
  */
 export type DnsRecordStatusResponse = 'unknown' | 'verified' | 'pending' | 'failed';
+
+/**
+ * DNS record types
+ */
+export type DnsRecordType = 'A' | 'AAAA' | 'CNAME' | 'TXT' | 'MX' | 'NS' | 'SRV' | 'CAA' | 'PTR';
 
 /**
  * A DNS zone (domain managed by the provider)
@@ -7687,6 +7711,54 @@ export type ImportExternalServiceRequest = {
     version?: string | null;
 };
 
+/**
+ * Request to import (adopt) an existing record into temps management
+ */
+export type ImportManagedRecordRequest = {
+    /**
+     * Domain (any FQDN under a managed zone)
+     */
+    domain: string;
+    /**
+     * Environment this record belongs to (stamped into the ownership marker)
+     */
+    environment_id?: number | null;
+    /**
+     * Record name relative to the zone ("@" for apex)
+     */
+    name: string;
+    /**
+     * Project this record belongs to (stamped into the ownership marker)
+     */
+    project_id?: number | null;
+    /**
+     * Record type
+     */
+    record_type: DnsRecordType;
+};
+
+/**
+ * Result of importing a record into temps management
+ */
+export type ImportManagedRecordResponse = {
+    /**
+     * Environment stamped in the ownership marker
+     */
+    environment_id?: number | null;
+    /**
+     * Record name that was imported
+     */
+    name: string;
+    /**
+     * Project stamped in the ownership marker
+     */
+    project_id?: number | null;
+    /**
+     * Record type that was imported
+     */
+    record_type: string;
+};
+
 export type ImportOutcomeResponse = {
     errors: Array<ImportRowErrorResponse>;
     inserted: number;
@@ -8724,6 +8796,7 @@ export type ManagedDomainResponse = {
     generated_hostname_mode: string;
     id: number;
     provider_id: number;
+    proxied_by_default: boolean;
     /**
      * Whether generated hostnames are reconciled into the provider's DNS zone.
      */
@@ -12043,6 +12116,34 @@ export type RecordListResponse = {
 };
 
 /**
+ * Ownership state of one record, for the conflict/import UI
+ */
+export type RecordOwnershipResponse = {
+    /**
+     * Environment stamped in the ownership marker, when owned
+     */
+    environment_id?: number | null;
+    /**
+     * Owning install's instance ID when owned by a different temps install
+     */
+    owner_instance?: string | null;
+    /**
+     * Project stamped in the ownership marker, when owned
+     */
+    project_id?: number | null;
+    record?: null | DnsRecord;
+    /**
+     * One of: not_found | unmanaged | owned | owned_by_other | orphaned |
+     * blocked_by_other | registry_conflict
+     */
+    status: string;
+    /**
+     * Whether this temps install may modify the record
+     */
+    writable: boolean;
+};
+
+/**
  * Engine-specific recovery target for PITR.
  *
  * Postgres honors all variants; Redis/Mongo/S3 will likely reject non-Time
@@ -12605,6 +12706,43 @@ export type RestoreRunView = {
     status: string;
     target_service_id?: number | null;
     target_service_name?: string | null;
+};
+
+export type RetentionCleanupFailure = {
+    backup_id: string;
+    deleted_objects: number;
+    partial: boolean;
+    reason: string;
+};
+
+export type RetentionCleanupReport = {
+    /**
+     * Capped sample of backups selected by the retention policy.
+     */
+    candidate_backup_ids: Array<string>;
+    candidate_backup_ids_truncated: boolean;
+    deleted: number;
+    /**
+     * Capped sample of deleted backup UUIDs for audit attribution.
+     */
+    deleted_backup_ids: Array<string>;
+    deleted_backup_ids_truncated: boolean;
+    /**
+     * True when this report is a non-destructive preview.
+     */
+    dry_run: boolean;
+    expired: number;
+    failed: number;
+    /**
+     * Capped diagnostic sample; `failed` remains the authoritative total.
+     */
+    failures: Array<RetentionCleanupFailure>;
+    partially_deleted_backup_ids: Array<string>;
+    partially_deleted_backup_ids_truncated: boolean;
+    /**
+     * Schedule scope, or `None` when every schedule was considered.
+     */
+    schedule_id?: number | null;
 };
 
 /**
@@ -14015,6 +14153,41 @@ export type SessionSummary = {
     requests_count: number;
     session_id: number;
     started_at: string;
+};
+
+/**
+ * Request to create or update a managed DNS record
+ */
+export type SetManagedRecordRequest = {
+    /**
+     * Record content (determines the record type)
+     */
+    content: DnsRecordContent;
+    /**
+     * Domain (any FQDN under a managed zone)
+     */
+    domain: string;
+    /**
+     * Environment this record belongs to (stamped into the ownership marker)
+     */
+    environment_id?: number | null;
+    /**
+     * Record name relative to the zone ("@" for apex)
+     */
+    name: string;
+    /**
+     * Project this record belongs to (stamped into the ownership marker)
+     */
+    project_id?: number | null;
+    /**
+     * Proxy through the provider's CDN (Cloudflare orange-cloud). Also
+     * enabled by the managed domain's `proxied_by_default`.
+     */
+    proxied?: boolean | null;
+    /**
+     * TTL in seconds (None = provider default)
+     */
+    ttl?: number | null;
 };
 
 export type SetPreviewPasswordBody = {
@@ -16037,6 +16210,10 @@ export type UpdateManagedDomainApiRequest = {
      * recompute existing hostnames — use the apply endpoint for that.
      */
     generated_hostname_mode?: string | null;
+    /**
+     * Default proxy mode for newly managed records; `false` is an explicit override.
+     */
+    proxied_by_default?: boolean | null;
     /**
      * Toggle DNS record sync for this domain.
      */
@@ -20941,6 +21118,60 @@ export type ListBackupAlertsResponses = {
 
 export type ListBackupAlertsResponse = ListBackupAlertsResponses[keyof ListBackupAlertsResponses];
 
+export type CleanupExpiredBackupsData = {
+    body: CleanupExpiredBackupsRequest;
+    path?: never;
+    query?: {
+        /**
+         * Return the backups selected by retention without deleting anything.
+         */
+        dry_run?: boolean;
+        /**
+         * Limit cleanup to one backup schedule.
+         */
+        schedule_id?: number | null;
+    };
+    url: '/backups/cleanup';
+};
+
+export type CleanupExpiredBackupsErrors = {
+    /**
+     * Missing or invalid preview candidate list
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Schedule or backup not found
+     */
+    404: ProblemDetails;
+    /**
+     * Cleanup preview is stale
+     */
+    409: ProblemDetails;
+    /**
+     * Cleanup could not be started
+     */
+    500: ProblemDetails;
+};
+
+export type CleanupExpiredBackupsError = CleanupExpiredBackupsErrors[keyof CleanupExpiredBackupsErrors];
+
+export type CleanupExpiredBackupsResponses = {
+    /**
+     * Retention cleanup completed
+     */
+    200: RetentionCleanupReport;
+};
+
+export type CleanupExpiredBackupsResponse = CleanupExpiredBackupsResponses[keyof CleanupExpiredBackupsResponses];
+
 export type RunExternalServiceBackupData = {
     body: RunExternalServiceBackupRequest;
     path: {
@@ -21934,6 +22165,56 @@ export type DetachScheduleServiceResponses = {
 };
 
 export type DetachScheduleServiceResponse = DetachScheduleServiceResponses[keyof DetachScheduleServiceResponses];
+
+export type DeleteBackupData = {
+    body?: never;
+    path: {
+        /**
+         * Backup UUID
+         */
+        id: string;
+    };
+    query?: never;
+    url: '/backups/{id}';
+};
+
+export type DeleteBackupErrors = {
+    /**
+     * Backup artifact cannot be safely attributed
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Backup not found
+     */
+    404: ProblemDetails;
+    /**
+     * Backup is running, referenced, or lacks safe artifact identity
+     */
+    409: ProblemDetails;
+    /**
+     * Object storage or database error
+     */
+    500: ProblemDetails;
+};
+
+export type DeleteBackupError = DeleteBackupErrors[keyof DeleteBackupErrors];
+
+export type DeleteBackupResponses = {
+    /**
+     * Backup deleted
+     */
+    204: void;
+};
+
+export type DeleteBackupResponse = DeleteBackupResponses[keyof DeleteBackupResponses];
 
 export type GetBackupData = {
     body?: never;
@@ -23114,6 +23395,172 @@ export type VerifyManagedDomainResponses = {
 };
 
 export type VerifyManagedDomainResponse = VerifyManagedDomainResponses[keyof VerifyManagedDomainResponses];
+
+export type RemoveManagedRecordData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Domain (any FQDN under a managed zone)
+         */
+        domain: string;
+        /**
+         * Record name relative to the zone ("@" for apex)
+         */
+        name: string;
+        /**
+         * Record type
+         */
+        record_type: DnsRecordType;
+    };
+    url: '/dns-records';
+};
+
+export type RemoveManagedRecordErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Domain not managed by any DNS provider
+     */
+    404: unknown;
+    /**
+     * Record is not managed by temps
+     */
+    409: unknown;
+};
+
+export type RemoveManagedRecordResponses = {
+    /**
+     * Record removed (or already absent)
+     */
+    204: void;
+};
+
+export type RemoveManagedRecordResponse = RemoveManagedRecordResponses[keyof RemoveManagedRecordResponses];
+
+export type SetManagedRecordData = {
+    body: SetManagedRecordRequest;
+    path?: never;
+    query?: never;
+    url: '/dns-records';
+};
+
+export type SetManagedRecordErrors = {
+    /**
+     * Validation error (e.g. proxied depth limit)
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Domain not managed by any DNS provider
+     */
+    404: unknown;
+    /**
+     * Record exists and is not managed by temps
+     */
+    409: unknown;
+};
+
+export type SetManagedRecordResponses = {
+    /**
+     * Record set
+     */
+    200: DnsRecord;
+};
+
+export type SetManagedRecordResponse = SetManagedRecordResponses[keyof SetManagedRecordResponses];
+
+export type ImportManagedRecordData = {
+    body: ImportManagedRecordRequest;
+    path?: never;
+    query?: never;
+    url: '/dns-records/import';
+};
+
+export type ImportManagedRecordErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Record or managed domain not found
+     */
+    404: unknown;
+    /**
+     * Record is owned by another temps install
+     */
+    409: unknown;
+};
+
+export type ImportManagedRecordResponses = {
+    /**
+     * Record imported
+     */
+    200: ImportManagedRecordResponse;
+};
+
+export type ImportManagedRecordResponse2 = ImportManagedRecordResponses[keyof ImportManagedRecordResponses];
+
+export type GetRecordOwnershipData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Domain (any FQDN under a managed zone)
+         */
+        domain: string;
+        /**
+         * Record name relative to the zone ("@" for apex)
+         */
+        name: string;
+        /**
+         * Record type
+         */
+        record_type: DnsRecordType;
+    };
+    url: '/dns-records/ownership';
+};
+
+export type GetRecordOwnershipErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Domain not managed by any DNS provider
+     */
+    404: unknown;
+};
+
+export type GetRecordOwnershipResponses = {
+    /**
+     * Ownership state
+     */
+    200: RecordOwnershipResponse;
+};
+
+export type GetRecordOwnershipResponse = GetRecordOwnershipResponses[keyof GetRecordOwnershipResponses];
 
 export type LookupDnsARecordsData = {
     body?: never;
@@ -44367,6 +44814,14 @@ export type AssignRoleErrors = {
      */
     400: unknown;
     /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Admin role required or self-modification forbidden
+     */
+    403: unknown;
+    /**
      * User or role not found
      */
     404: unknown;
@@ -44404,6 +44859,10 @@ export type RemoveRoleErrors = {
      * Invalid role type
      */
     400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
     /**
      * Forbidden - Cannot modify own roles or non-admin attempt
      */

@@ -83,6 +83,11 @@ pub struct OwnershipMarker {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment_id: Option<i32>,
 
+    /// Automation controller that created the record. Signed so one
+    /// reconciler can never claim records belonging to another workflow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller: Option<String>,
+
     /// Marker format version.
     pub v: u32,
 
@@ -101,6 +106,7 @@ impl OwnershipMarker {
         record_fingerprint: &str,
         project_id: Option<i32>,
         environment_id: Option<i32>,
+        controller: Option<&str>,
     ) -> Result<Self, DnsError> {
         let mut marker = Self {
             managed_by: OWNERSHIP_MANAGED_BY.to_string(),
@@ -111,6 +117,7 @@ impl OwnershipMarker {
             record_fingerprint: record_fingerprint.to_string(),
             project_id,
             environment_id,
+            controller: controller.map(str::to_string),
             v: OWNERSHIP_MARKER_VERSION,
             signature: String::new(),
         };
@@ -221,6 +228,7 @@ impl OwnershipMarker {
             record_fingerprint: &'a str,
             project_id: Option<i32>,
             environment_id: Option<i32>,
+            controller: Option<&'a str>,
             v: u32,
         }
 
@@ -233,6 +241,7 @@ impl OwnershipMarker {
             record_fingerprint: &self.record_fingerprint,
             project_id: self.project_id,
             environment_id: self.environment_id,
+            controller: self.controller.as_deref(),
             v: self.v,
         })
         .map_err(DnsError::Serialization)
@@ -343,6 +352,7 @@ mod tests {
             FINGERPRINT,
             Some(7),
             Some(42),
+            None,
         )
         .unwrap()
     }
@@ -366,6 +376,7 @@ mod tests {
             "app",
             DnsRecordType::A,
             FINGERPRINT,
+            None,
             None,
             None,
         )

@@ -123,6 +123,7 @@ const addDomainFormSchema = z.object({
       'Invalid domain format'
     ),
   auto_manage: z.boolean(),
+  proxied_by_default: z.boolean(),
 })
 
 type AddDomainFormData = z.infer<typeof addDomainFormSchema>
@@ -241,7 +242,15 @@ export default function DnsProviderDetail() {
     mutationFn: async (data: AddDomainFormData) => {
       const response = await addManagedDomain({
         path: { id: providerId },
-        body: { domain: data.domain, auto_manage: data.auto_manage },
+        body: {
+          domain: data.domain,
+          auto_manage: data.auto_manage,
+          proxied_by_default: data.proxied_by_default,
+          generated_hostname_mode: data.proxied_by_default
+            ? 'flat'
+            : 'standard',
+          sync_generated_records: data.proxied_by_default,
+        },
       })
       return response.data
     },
@@ -369,6 +378,29 @@ export default function DnsProviderDetail() {
     },
   })
 
+  const proxyToggleMut = useMutation({
+    mutationFn: (vars: { domain: string; enabled: boolean }) =>
+      updateManagedDomain({
+        path: { provider_id: providerId, domain: vars.domain },
+        body: { proxied_by_default: vars.enabled },
+      }).then(({ data, error }) => {
+        if (error) throw error
+        if (!data) throw new Error('Managed domain update returned no data')
+        return data
+      }),
+    onSuccess: (_data, vars) => {
+      toast.success(
+        vars.enabled ? 'Cloudflare proxy enabled' : 'Cloudflare proxy disabled'
+      )
+      refetchDomains()
+    },
+    onError: (err: Error) => {
+      toast.error('Failed to update proxy setting', {
+        description: err.message,
+      })
+    },
+  })
+
   // Forms
   const editForm = useForm<EditFormData>({
     resolver: zodResolver(editFormSchema),
@@ -384,6 +416,7 @@ export default function DnsProviderDetail() {
     defaultValues: {
       domain: '',
       auto_manage: true,
+      proxied_by_default: false,
     },
   })
 
@@ -669,6 +702,11 @@ export default function DnsProviderDetail() {
                         {domain.auto_manage && (
                           <Badge variant="outline">Auto-managed</Badge>
                         )}
+                        {domain.proxied_by_default && (
+                          <Badge className="bg-orange-500 text-white hover:bg-orange-500">
+                            Cloudflare proxied
+                          </Badge>
+                        )}
                         <Badge
                           variant={
                             domain.generated_hostname_mode === 'flat'
@@ -736,7 +774,40 @@ export default function DnsProviderDetail() {
                             />
                             Sync DNS records
                           </label>
+                          {provider.provider_type.toLowerCase() ===
+                            'cloudflare' && (
+                            <label className="flex items-center gap-2 text-sm">
+                              <Switch
+                                checked={domain.proxied_by_default}
+                                onCheckedChange={(checked) => {
+                                  if (
+                                    checked &&
+                                    domain.generated_hostname_mode !== 'flat'
+                                  ) {
+                                    toast.error('Flat hostnames are required', {
+                                      description:
+                                        'Enable Flat hostnames first so Cloudflare Universal SSL covers generated records.',
+                                    })
+                                    return
+                                  }
+                                  proxyToggleMut.mutate({
+                                    domain: domain.domain,
+                                    enabled: checked,
+                                  })
+                                }}
+                                disabled={proxyToggleMut.isPending}
+                              />
+                              Proxy through Cloudflare
+                            </label>
+                          )}
                         </div>
+                      )}
+                      {domain.proxied_by_default && (
+                        <p className="text-xs text-muted-foreground">
+                          Public TLS terminates at Cloudflare; Temps serves a
+                          self-signed origin certificate and skips per-hostname
+                          Let&apos;s Encrypt issuance.
+                        </p>
                       )}
                     </div>
                     <div className="flex shrink-0 items-center gap-2">
@@ -1013,6 +1084,33 @@ export default function DnsProviderDetail() {
                   </FormItem>
                 )}
               />
+
+              {provider.provider_type.toLowerCase() === 'cloudflare' && (
+                <FormField
+                  control={addDomainForm.control}
+                  name="proxied_by_default"
+                  render={({ field }) => (
+                    <FormItem className="flex flex-row items-center justify-between rounded-lg border border-orange-500/30 bg-orange-500/5 p-4">
+                      <div className="space-y-0.5 pr-4">
+                        <FormLabel className="text-base">
+                          Proxy through Cloudflare
+                        </FormLabel>
+                        <FormDescription>
+                          Creates proxied records, enables flat hostnames, and
+                          uses self-signed origin TLS to avoid Let&apos;s
+                          Encrypt rate limits.
+                        </FormDescription>
+                      </div>
+                      <FormControl>
+                        <Switch
+                          checked={field.value}
+                          onCheckedChange={field.onChange}
+                        />
+                      </FormControl>
+                    </FormItem>
+                  )}
+                />
+              )}
 
               <DialogFooter>
                 <Button

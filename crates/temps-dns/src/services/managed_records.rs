@@ -46,7 +46,7 @@
 //! exact record identifier so unrelated values are never removed.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection, EntityTrait};
 use temps_entities::{dns_instance_identity, environments, projects};
@@ -67,6 +67,7 @@ use crate::services::provider_service::DnsProviderService;
 pub struct OwnershipScope {
     pub project_id: Option<i32>,
     pub environment_id: Option<i32>,
+    pub controller: Option<&'static str>,
 }
 
 /// Ownership state of a record at the provider, for the domain UI's
@@ -147,7 +148,7 @@ impl KeyedLocks {
     }
 }
 
-struct KeyedLockLease {
+pub(crate) struct KeyedLockLease {
     owner: Arc<KeyedLocks>,
     key: (String, String),
     handle: Arc<tokio::sync::Mutex<()>>,
@@ -166,6 +167,11 @@ impl Drop for KeyedLockLease {
             map.remove(&self.key);
         }
     }
+}
+
+fn shared_keyed_locks() -> Arc<KeyedLocks> {
+    static LOCKS: OnceLock<Arc<KeyedLocks>> = OnceLock::new();
+    LOCKS.get_or_init(|| Arc::new(KeyedLocks::new())).clone()
 }
 
 /// Ownership-guarded record management on top of [`DnsProviderService`].
@@ -188,7 +194,7 @@ impl ManagedDnsRecordService {
             provider_service,
             signing_key: encryption_service.derive_subkey("temps:dns-ownership:v1"),
             instance_id: tokio::sync::OnceCell::new(),
-            locks: Arc::new(KeyedLocks::new()),
+            locks: shared_keyed_locks(),
         }
     }
 
@@ -199,33 +205,43 @@ impl ManagedDnsRecordService {
     pub async fn instance_id(&self) -> Result<String, DnsError> {
         let id = self
             .instance_id
-            .get_or_try_init(|| async {
-                if let Some(row) = dns_instance_identity::Entity::find()
-                    .one(self.db.as_ref())
-                    .await?
-                {
-                    return Ok::<String, DnsError>(row.instance_id);
-                }
-
-                let fresh = uuid::Uuid::new_v4().to_string();
-                let row = dns_instance_identity::ActiveModel {
-                    id: Set(1),
-                    instance_id: Set(fresh),
-                    ..Default::default()
-                };
-                // Two concurrent first writes can race on the single-row PK;
-                // whoever loses re-reads the winner's ID instead of failing.
-                match row.insert(self.db.as_ref()).await {
-                    Ok(created) => Ok(created.instance_id),
-                    Err(insert_err) => dns_instance_identity::Entity::find()
-                        .one(self.db.as_ref())
-                        .await?
-                        .map(|row| row.instance_id)
-                        .ok_or(DnsError::Database(insert_err)),
-                }
-            })
+            .get_or_try_init(|| Self::load_instance_id(self.db.as_ref()))
             .await?;
         Ok(id.clone())
+    }
+
+    pub(crate) async fn load_instance_id(db: &DatabaseConnection) -> Result<String, DnsError> {
+        if let Some(row) = dns_instance_identity::Entity::find().one(db).await? {
+            return Ok(row.instance_id);
+        }
+
+        let fresh = uuid::Uuid::new_v4().to_string();
+        let row = dns_instance_identity::ActiveModel {
+            id: Set(1),
+            instance_id: Set(fresh),
+            ..Default::default()
+        };
+        // Two concurrent first writes can race on the single-row PK; whoever
+        // loses re-reads the winner's ID instead of failing.
+        match row.insert(db).await {
+            Ok(created) => Ok(created.instance_id),
+            Err(insert_error) => dns_instance_identity::Entity::find()
+                .one(db)
+                .await?
+                .map(|row| row.instance_id)
+                .ok_or(DnsError::Database(insert_error)),
+        }
+    }
+
+    /// Serialize every in-process ownership read/modify/write sequence for an
+    /// exact provider record, including generated-hostname reconciliation.
+    pub(crate) async fn lock_record(zone: &str, name: &str) -> KeyedLockLease {
+        shared_keyed_locks()
+            .acquire(
+                &zone.trim().trim_end_matches('.').to_ascii_lowercase(),
+                &name.trim().trim_end_matches('.').to_ascii_lowercase(),
+            )
+            .await
     }
 
     /// Create or update a managed record, enforcing ownership and proxy
@@ -499,7 +515,7 @@ impl ManagedDnsRecordService {
         })
     }
 
-    async fn ownership_of(
+    pub(crate) async fn ownership_of(
         provider: &dyn DnsProvider,
         zone: &str,
         name: &str,
@@ -545,7 +561,7 @@ impl ManagedDnsRecordService {
         }
     }
 
-    async fn guarded_set(
+    pub(crate) async fn guarded_set(
         provider: &dyn DnsProvider,
         zone: &str,
         request: DnsRecordRequest,
@@ -634,6 +650,7 @@ impl ManagedDnsRecordService {
             &desired_fingerprint,
             scope.project_id,
             scope.environment_id,
+            scope.controller,
         )?;
         let registry_request = Self::marker_request(&registry_name, &marker)?;
 
@@ -657,6 +674,7 @@ impl ManagedDnsRecordService {
                     &actual_fingerprint,
                     scope.project_id,
                     scope.environment_id,
+                    scope.controller,
                 )?;
                 provider
                     .set_record(
@@ -690,7 +708,7 @@ impl ManagedDnsRecordService {
         }
     }
 
-    async fn guarded_remove(
+    pub(crate) async fn guarded_remove(
         provider: &dyn DnsProvider,
         zone: &str,
         name: &str,
@@ -805,7 +823,17 @@ impl ManagedDnsRecordService {
                 ),
             }),
             RegistryState::Absent | RegistryState::Owned(_, _) => {
-                let marker = OwnershipMarker::new_signed(signing_key, instance, zone, name, record_type, &fingerprint, scope.project_id, scope.environment_id)?;
+                let marker = OwnershipMarker::new_signed(
+                    signing_key,
+                    instance,
+                    zone,
+                    name,
+                    record_type,
+                    &fingerprint,
+                    scope.project_id,
+                    scope.environment_id,
+                    scope.controller,
+                )?;
                 let registry_request = Self::marker_request(&registry_record_name(name, record_type), &marker)?;
                 provider.set_record(zone, registry_request).await?;
                 Ok(marker)
@@ -838,7 +866,10 @@ impl ManagedDnsRecordService {
         }
     }
 
-    fn validate_record_request(zone: &str, request: &DnsRecordRequest) -> Result<String, DnsError> {
+    pub(crate) fn validate_record_request(
+        zone: &str,
+        request: &DnsRecordRequest,
+    ) -> Result<String, DnsError> {
         let record_type = request.content.record_type();
         Self::validate_record_type(record_type)?;
         if let Some(ttl) = request.ttl {
@@ -882,7 +913,7 @@ impl ManagedDnsRecordService {
         }
     }
 
-    fn validate_provider_capabilities(
+    pub(crate) fn validate_provider_capabilities(
         capabilities: &crate::providers::DnsProviderCapabilities,
         provider_name: &str,
         record_type: DnsRecordType,
@@ -922,10 +953,10 @@ impl ManagedDnsRecordService {
                     "Record name '{name}' uses the reserved Temps ownership namespace"
                 )));
             }
-            Self::validate_relative_labels(&normalized, true)?;
+            Self::validate_relative_labels(&normalized, true, false)?;
         }
         let registry_name = registry_record_name(&normalized, DnsRecordType::AAAA);
-        Self::validate_relative_labels(&registry_name, false)?;
+        Self::validate_relative_labels(&registry_name, false, true)?;
         let fqdn_len = if normalized == "@" {
             zone.len()
         } else {
@@ -946,10 +977,14 @@ impl ManagedDnsRecordService {
                 "Invalid CNAME target '{name}'"
             )));
         }
-        Self::validate_relative_labels(&normalized, false)
+        Self::validate_relative_labels(&normalized, false, false)
     }
 
-    fn validate_relative_labels(name: &str, allow_wildcard: bool) -> Result<(), DnsError> {
+    fn validate_relative_labels(
+        name: &str,
+        allow_wildcard: bool,
+        allow_underscore: bool,
+    ) -> Result<(), DnsError> {
         for (index, label) in name.split('.').enumerate() {
             let wildcard = allow_wildcard && index == 0 && label == "*";
             if label.is_empty()
@@ -960,7 +995,7 @@ impl ManagedDnsRecordService {
                         || !label.chars().all(|character| {
                             character.is_ascii_alphanumeric()
                                 || character == '-'
-                                || character == '_'
+                                || (allow_underscore && character == '_')
                         })))
             {
                 return Err(DnsError::Validation(format!(
@@ -1163,6 +1198,7 @@ mod tests {
             &record_fingerprint(&content, false).unwrap(),
             Some(1),
             Some(2),
+            None,
         )
         .unwrap()
     }
@@ -1183,6 +1219,7 @@ mod tests {
             OwnershipScope {
                 project_id: Some(1),
                 environment_id: Some(2),
+                controller: None,
             },
         )
         .await
@@ -1624,6 +1661,7 @@ mod tests {
             OwnershipScope {
                 project_id: Some(9),
                 environment_id: None,
+                controller: None,
             },
         )
         .await

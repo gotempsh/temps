@@ -316,6 +316,7 @@ pub(super) async fn set_managed_record(
             OwnershipScope {
                 project_id: request.project_id,
                 environment_id: request.environment_id,
+                controller: None,
             },
         )
         .await?;
@@ -415,6 +416,7 @@ pub(super) async fn import_managed_record(
             OwnershipScope {
                 project_id: request.project_id,
                 environment_id: request.environment_id,
+                controller: None,
             },
         )
         .await?;

@@ -8,11 +8,13 @@
 
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder,
+    QueryOrder, TransactionTrait,
 };
 use std::sync::Arc;
 use temps_core::EncryptionService;
-use temps_entities::{dns_managed_domains, dns_providers};
+use temps_entities::{
+    dns_managed_domains, dns_managed_record_states, dns_providers, dns_reconciliation_runs,
+};
 use tracing::{debug, error, info};
 
 use crate::errors::DnsError;
@@ -71,6 +73,16 @@ pub struct UpdateManagedDomainRequest {
 }
 
 impl DnsProviderService {
+    pub fn parse_requested_hostname_mode(value: &str) -> Result<PublicHostnameStrategy, DnsError> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "standard" => Ok(PublicHostnameStrategy::Standard),
+            "flat" => Ok(PublicHostnameStrategy::Flat),
+            _ => Err(DnsError::Validation(format!(
+                "Invalid generated hostname mode '{value}'; expected 'standard' or 'flat'"
+            ))),
+        }
+    }
+
     pub fn new(db: Arc<DatabaseConnection>, encryption_service: Arc<EncryptionService>) -> Self {
         Self {
             db,
@@ -556,13 +568,12 @@ impl DnsProviderService {
             )));
         }
 
-        // Normalize the requested mode; unknown values fall back to standard.
-        let mode = temps_core::PublicHostnameStrategy::from_db_str(
+        let mode = Self::parse_requested_hostname_mode(
             request
                 .generated_hostname_mode
                 .as_deref()
                 .unwrap_or("standard"),
-        )
+        )?
         .as_db_str()
         .to_string();
 
@@ -637,7 +648,7 @@ impl DnsProviderService {
         let instance = self.create_provider_instance(&provider)?;
 
         // Distinguish "token lacks zone access" (PermissionDenied) from "zone
-        // absent" so the UI can flag a mis-scoped token.
+        // absent" so the UI can flag an incorrectly scoped token.
         let access = instance.check_zone_access(&normalized_domain).await;
         let can_manage = access.is_ok();
         let (zone_access_ok, zone_access_error) = match &access {
@@ -712,7 +723,7 @@ impl DnsProviderService {
 
         let mut active: dns_managed_domains::ActiveModel = managed.into();
         if let Some(mode) = request.generated_hostname_mode {
-            active.generated_hostname_mode = Set(PublicHostnameStrategy::from_db_str(&mode)
+            active.generated_hostname_mode = Set(Self::parse_requested_hostname_mode(&mode)?
                 .as_db_str()
                 .to_string());
         }
@@ -753,7 +764,7 @@ impl DnsProviderService {
         target: PublicHostnameStrategy,
         want_sync: bool,
     ) -> Result<HostnameModeResult, DnsError> {
-        self.hostname_mode_operation(provider_id, domain, target, want_sync, true)
+        self.hostname_mode_operation(provider_id, domain, target, want_sync, true, None)
             .await
     }
 
@@ -767,9 +778,17 @@ impl DnsProviderService {
         domain: &str,
         target: PublicHostnameStrategy,
         sync_dns: bool,
+        actor_user_id: i32,
     ) -> Result<HostnameModeResult, DnsError> {
-        self.hostname_mode_operation(provider_id, domain, target, sync_dns, false)
-            .await
+        self.hostname_mode_operation(
+            provider_id,
+            domain,
+            target,
+            sync_dns,
+            false,
+            Some(actor_user_id),
+        )
+        .await
     }
 
     /// Shared preview/apply implementation. With `dry_run` it computes the
@@ -782,6 +801,7 @@ impl DnsProviderService {
         target: PublicHostnameStrategy,
         sync_dns: bool,
         dry_run: bool,
+        actor_user_id: Option<i32>,
     ) -> Result<HostnameModeResult, DnsError> {
         // Confirm the domain belongs to this provider.
         let managed = dns_managed_domains::Entity::find()
@@ -800,10 +820,17 @@ impl DnsProviderService {
             || base.ends_with(&format!(".{}", domain.to_ascii_lowercase()));
 
         let hostname_changes = if applies {
-            hostname_sync::compute_hostname_changes(self.db.as_ref(), &preview_domain, target).await
+            hostname_sync::compute_hostname_changes(self.db.as_ref(), &preview_domain, target)
+                .await?
         } else {
             Vec::new()
         };
+
+        if sync_dns && !applies {
+            return Err(DnsError::Validation(format!(
+                "Managed zone '{domain}' does not govern the configured preview domain '{preview_domain}'"
+            )));
+        }
 
         let mut result = HostnameModeResult {
             hostname_changes,
@@ -835,20 +862,93 @@ impl DnsProviderService {
             }
 
             if let Some(edge_target) = edge_target.as_deref() {
+                let instance_id =
+                    crate::services::ManagedDnsRecordService::load_instance_id(self.db.as_ref())
+                        .await?;
+                let signing_key = self
+                    .encryption_service
+                    .derive_subkey("temps:dns-ownership:v1");
                 let desired = hostname_sync::enumerate_generated_hosts(
                     self.db.as_ref(),
                     &preview_domain,
                     target,
                 )
-                .await;
-                result.dns_changes = hostname_sync::reconcile_zone_records(
-                    instance.as_ref(),
-                    domain,
-                    &desired,
-                    edge_target,
-                    dry_run,
-                )
                 .await?;
+                let options = |dry_run| hostname_sync::ReconcileOptions {
+                    proxied: managed.proxied_by_default,
+                    instance_id: &instance_id,
+                    signing_key: &signing_key,
+                    dry_run,
+                };
+                if dry_run {
+                    result.dns_changes = hostname_sync::reconcile_zone_records(
+                        instance.as_ref(),
+                        domain,
+                        &desired,
+                        edge_target,
+                        options(true),
+                    )
+                    .await?;
+                } else {
+                    let plan = hostname_sync::reconcile_zone_records(
+                        instance.as_ref(),
+                        domain,
+                        &desired,
+                        edge_target,
+                        options(true),
+                    )
+                    .await?;
+                    let run = dns_reconciliation_runs::ActiveModel {
+                        provider_id: Set(provider_id),
+                        zone: Set(domain.to_ascii_lowercase()),
+                        actor_user_id: Set(actor_user_id.ok_or_else(|| {
+                            DnsError::Validation(
+                                "DNS reconciliation requires an authenticated actor".to_string(),
+                            )
+                        })?),
+                        controller: Set("generated-hostname".to_string()),
+                        status: Set("pending".to_string()),
+                        planned_changes: Set(
+                            serde_json::to_value(&plan).map_err(DnsError::Serialization)?
+                        ),
+                        error: Set(None),
+                        ..Default::default()
+                    }
+                    .insert(self.db.as_ref())
+                    .await?;
+
+                    let applied = hostname_sync::reconcile_zone_records(
+                        instance.as_ref(),
+                        domain,
+                        &desired,
+                        edge_target,
+                        options(false),
+                    )
+                    .await;
+                    result.dns_changes = match applied {
+                        Ok(changes) => changes,
+                        Err(error) => {
+                            self.finish_reconciliation_run(run, "failed", Some(error.to_string()))
+                                .await?;
+                            return Err(error);
+                        }
+                    };
+                    if let Err(error) = self
+                        .replace_generated_record_states(
+                            provider_id,
+                            domain,
+                            &desired,
+                            edge_target,
+                            managed.proxied_by_default,
+                        )
+                        .await
+                    {
+                        self.finish_reconciliation_run(run, "failed", Some(error.to_string()))
+                            .await?;
+                        return Err(error);
+                    }
+                    self.finish_reconciliation_run(run, "applied", None).await?;
+                }
             }
         }
 
@@ -862,6 +962,56 @@ impl DnsProviderService {
         }
 
         Ok(result)
+    }
+
+    async fn finish_reconciliation_run(
+        &self,
+        run: dns_reconciliation_runs::Model,
+        status: &str,
+        error: Option<String>,
+    ) -> Result<(), DnsError> {
+        let mut active: dns_reconciliation_runs::ActiveModel = run.into();
+        active.status = Set(status.to_string());
+        active.error = Set(error);
+        active.update(self.db.as_ref()).await?;
+        Ok(())
+    }
+
+    async fn replace_generated_record_states(
+        &self,
+        provider_id: i32,
+        zone: &str,
+        desired: &[hostname_sync::GeneratedHost],
+        edge_target: &str,
+        proxied: bool,
+    ) -> Result<(), DnsError> {
+        let txn = self.db.begin().await?;
+        dns_managed_record_states::Entity::delete_many()
+            .filter(dns_managed_record_states::Column::ProviderId.eq(provider_id))
+            .filter(dns_managed_record_states::Column::Zone.eq(zone))
+            .filter(dns_managed_record_states::Column::Controller.eq("generated-hostname"))
+            .exec(&txn)
+            .await?;
+
+        let suffix = format!(".{}", zone.to_ascii_lowercase());
+        let (_, _, record_type) = hostname_sync::desired_content(edge_target);
+        for host in desired {
+            let name = hostname_sync::relative_name(&host.fqdn, &suffix)?;
+            dns_managed_record_states::ActiveModel {
+                provider_id: Set(provider_id),
+                zone: Set(zone.to_ascii_lowercase()),
+                name: Set(name),
+                fqdn: Set(host.fqdn.to_ascii_lowercase()),
+                record_type: Set(record_type.clone()),
+                controller: Set("generated-hostname".to_string()),
+                proxied: Set(proxied),
+                ..Default::default()
+            }
+            .insert(&txn)
+            .await?;
+        }
+        txn.commit().await?;
+        Ok(())
     }
 
     /// Resolve the public hostname strategy for a preview/base domain by

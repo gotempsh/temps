@@ -30,6 +30,38 @@ impl MigrationTrait for Migration {
                 created_at timestamptz NOT NULL DEFAULT now()
             );
 
+            CREATE TABLE IF NOT EXISTS dns_managed_record_states (
+                id serial PRIMARY KEY,
+                provider_id integer NOT NULL REFERENCES dns_providers(id) ON DELETE CASCADE,
+                zone text NOT NULL,
+                name text NOT NULL,
+                fqdn text NOT NULL,
+                record_type text NOT NULL,
+                controller text NOT NULL,
+                proxied boolean NOT NULL,
+                updated_at timestamptz NOT NULL DEFAULT now(),
+                CONSTRAINT uq_dns_managed_record_state
+                    UNIQUE (provider_id, zone, name, record_type, controller)
+            );
+            CREATE INDEX IF NOT EXISTS idx_dns_managed_record_states_tls
+                ON dns_managed_record_states (fqdn)
+                WHERE proxied = true;
+
+            CREATE TABLE IF NOT EXISTS dns_reconciliation_runs (
+                id serial PRIMARY KEY,
+                provider_id integer NOT NULL REFERENCES dns_providers(id) ON DELETE CASCADE,
+                zone text NOT NULL,
+                actor_user_id integer NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+                controller text NOT NULL,
+                status text NOT NULL,
+                planned_changes jsonb NOT NULL,
+                error text,
+                created_at timestamptz NOT NULL DEFAULT now(),
+                updated_at timestamptz NOT NULL DEFAULT now()
+            );
+            CREATE INDEX IF NOT EXISTS idx_dns_reconciliation_runs_zone_created
+                ON dns_reconciliation_runs (zone, created_at DESC);
+
             ALTER TABLE dns_managed_domains
                 ADD COLUMN IF NOT EXISTS proxied_by_default boolean NOT NULL DEFAULT false;
             "#,
@@ -47,6 +79,8 @@ impl MigrationTrait for Migration {
             ALTER TABLE dns_managed_domains
                 DROP COLUMN IF EXISTS proxied_by_default;
 
+            DROP TABLE IF EXISTS dns_reconciliation_runs;
+            DROP TABLE IF EXISTS dns_managed_record_states;
             DROP TABLE IF EXISTS dns_instance_identity;
             "#,
         )

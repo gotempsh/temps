@@ -1,13 +1,13 @@
 ---
 title: "ADR-031: Managed DNS Records and Cloudflare Proxied Mode"
-status: Proposed
+status: Accepted
 date: 2026-07-12
 author: David Viejo
 ---
 
 # ADR-031: Managed DNS Records and Cloudflare Proxied Mode
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-07-12
 **Author:** David Viejo
 **Security review required:** Yes — this feature writes to users' public DNS zones and stores provider API tokens. A bug can take a production domain offline or hijack traffic. Requires security-auditor sign-off before implementation.

@@ -22,9 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_auth::{permission_check, Permission, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
-use temps_core::{
-    AuditContext, AuditOperation, ForceRouteReloadJob, Job, PublicHostnameStrategy, RequestMetadata,
-};
+use temps_core::{AuditContext, AuditOperation, ForceRouteReloadJob, Job, RequestMetadata};
 use utoipa::{OpenApi, ToSchema};
 
 use crate::errors::DnsError;
@@ -1021,7 +1019,7 @@ async fn preview_hostname_mode(
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, Permission::SettingsRead);
 
-    let target = PublicHostnameStrategy::from_db_str(&query.mode);
+    let target = DnsProviderService::parse_requested_hostname_mode(&query.mode)?;
     let result = state
         .provider_service
         .preview_hostname_mode(provider_id, &domain, target, query.sync)
@@ -1054,14 +1052,21 @@ async fn apply_hostname_mode(
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, Permission::SettingsWrite);
 
-    let target = PublicHostnameStrategy::from_db_str(&request.mode);
+    let target = DnsProviderService::parse_requested_hostname_mode(&request.mode)?;
     let result = state
         .provider_service
-        .apply_hostname_mode(provider_id, &domain, target, request.sync_dns)
+        .apply_hostname_mode(
+            provider_id,
+            &domain,
+            target,
+            request.sync_dns,
+            auth.user_id(),
+        )
         .await?;
 
     // Trigger a full route reload so derived (Standard/Flat) hostnames take
-    // effect. Failure to enqueue is logged but does not fail the request.
+    // effect. Never report a fully successful apply when the route plane was
+    // not notified; the durable reconciliation run preserves what DNS changed.
     if let Err(e) = state
         .queue
         .send(Job::ForceRouteReload(ForceRouteReloadJob {
@@ -1074,6 +1079,11 @@ async fn apply_hostname_mode(
             "Failed to enqueue route reload after hostname mode change: {}",
             e
         );
+        return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Route Reload Failed")
+            .with_detail(format!(
+                "DNS and hostname settings were applied, but the route reload could not be queued: {e}"
+            )));
     }
 
     log_managed_domain_audit(

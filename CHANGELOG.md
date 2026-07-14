@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Managed DNS and proxied origins:** Add signed, ownership-guarded A/AAAA/CNAME automation, per-domain Cloudflare proxy defaults, flat generated-hostname sync, conflict/import states, and self-signed origin TLS that avoids per-hostname ACME issuance.
 - **Daily returning-visitor metric**: The analytics overview now reports visitors active in the selected period who were previously seen in the same project and environment, making daily audience retention visible across TimescaleDB and ClickHouse backends.
 
 ### Fixed
