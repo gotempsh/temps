@@ -39,6 +39,9 @@ pub enum UrlValidationError {
     #[error("Unspecified addresses are not allowed")]
     UnspecifiedIp,
 
+    #[error("Non-global special-purpose addresses are not allowed")]
+    NonGlobalIp,
+
     #[error("DNS resolution failed: {0}")]
     DnsResolutionFailed(String),
 
@@ -268,6 +271,21 @@ pub fn validate_ipv4(ip: &Ipv4Addr) -> Result<(), UrlValidationError> {
         return Err(UrlValidationError::UnspecifiedIp);
     }
 
+    // Default-deny the remaining IANA special-purpose ranges. RFC1918 and
+    // loopback have distinct variants above because selected callers may
+    // explicitly acknowledge those; these ranges must never become an SSRF
+    // escape hatch.
+    let [a, b, c, _] = ip.octets();
+    if a == 0
+        || (a == 100 && (64..=127).contains(&b))
+        || (a == 192 && b == 0 && c == 0)
+        || (a == 192 && b == 88 && c == 99)
+        || (a == 198 && (b == 18 || b == 19))
+        || a >= 240
+    {
+        return Err(UrlValidationError::NonGlobalIp);
+    }
+
     Ok(())
 }
 
@@ -281,6 +299,10 @@ pub fn validate_ipv4(ip: &Ipv4Addr) -> Result<(), UrlValidationError> {
 /// - Unspecified (::)
 /// - IPv6 cloud metadata (fd00:ec2::254 for AWS)
 pub fn validate_ipv6(ip: &Ipv6Addr) -> Result<(), UrlValidationError> {
+    if let Some(mapped) = ip.to_ipv4_mapped() {
+        return validate_ipv4(&mapped);
+    }
+
     // Check for cloud metadata (AWS IPv6)
     if is_cloud_metadata_ipv6(ip) {
         return Err(UrlValidationError::CloudMetadata);
@@ -309,6 +331,14 @@ pub fn validate_ipv6(ip: &Ipv6Addr) -> Result<(), UrlValidationError> {
     // Check for unspecified (::)
     if ip.is_unspecified() {
         return Err(UrlValidationError::UnspecifiedIp);
+    }
+
+    let segments = ip.segments();
+    if (segments[0] == 0x0100 && segments[1] == 0 && segments[2] == 0 && segments[3] == 0)
+        || (segments[0] & 0xffc0) == 0xfec0
+        || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+    {
+        return Err(UrlValidationError::NonGlobalIp);
     }
 
     Ok(())
@@ -619,6 +649,18 @@ mod tests {
 
         // Invalid unspecified
         assert!(validate_ipv4(&Ipv4Addr::new(0, 0, 0, 0)).is_err());
+
+        for ip in [
+            Ipv4Addr::new(100, 64, 0, 1),
+            Ipv4Addr::new(192, 0, 0, 1),
+            Ipv4Addr::new(198, 18, 0, 1),
+            Ipv4Addr::new(240, 0, 0, 1),
+        ] {
+            assert!(matches!(
+                validate_ipv4(&ip),
+                Err(UrlValidationError::NonGlobalIp)
+            ));
+        }
     }
 
     #[test]
@@ -638,6 +680,11 @@ mod tests {
         // Invalid unique local (fc00::/7)
         assert!(validate_ipv6(&"fc00::1".parse::<Ipv6Addr>().unwrap()).is_err());
         assert!(validate_ipv6(&"fd00::1".parse::<Ipv6Addr>().unwrap()).is_err());
+        assert!(matches!(
+            validate_ipv6(&"2001:db8::1".parse::<Ipv6Addr>().unwrap()),
+            Err(UrlValidationError::NonGlobalIp)
+        ));
+        assert!(validate_ipv6(&"::ffff:169.254.169.254".parse::<Ipv6Addr>().unwrap()).is_err());
     }
 
     #[test]

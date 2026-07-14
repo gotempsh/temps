@@ -3511,7 +3511,15 @@ export type CreateProviderRequest = {
 };
 
 export type CreateRouteRequest = {
+    /**
+     * Explicitly acknowledge that this public route targets a private or loopback address.
+     */
+    allow_private_upstream?: boolean;
     domain: string;
+    /**
+     * Explicitly allow this route to override a Temps-managed domain.
+     */
+    force_override?: boolean;
     host: string;
     port: number;
     /**
@@ -4076,7 +4084,17 @@ export type DeploymentConfig = {
      */
     idleTimeoutSeconds?: number;
     /**
-     * Memory limit in megabytes (e.g., 512 = 512MB)
+     * Memory limit in megabytes. Three-state semantics:
+     * - `None`     → inherit the parent layer (env inherits project, project
+     * inherits the seeded default); used by the settings UI's "Use default".
+     * - `Some(0)`  → explicit **uncapped**: stop inheriting and run with no
+     * memory limit. This is the deliberate escape hatch for dedicated
+     * workloads, distinct from `None`.
+     * - `Some(n)`  → hard cap of `n` MB.
+     *
+     * `merge`/resolution keep `Some(0)` as a present value (it wins precedence
+     * over a parent cap), and the deployer collapses it to "no limit" before
+     * talking to Docker.
      */
     memoryLimit?: number | null;
     /**
@@ -12670,6 +12688,7 @@ export type RouteResponse = {
     created_at: number;
     domain: string;
     enabled: boolean;
+    force_override: boolean;
     host: string;
     id: number;
     port: number;
@@ -16237,6 +16256,10 @@ export type UpdateProviderRequest = {
 };
 
 export type UpdateRouteRequest = {
+    /**
+     * Explicitly acknowledge that this public route targets a private or loopback address.
+     */
+    allow_private_upstream?: boolean;
     enabled: boolean;
     host: string;
     port: number;

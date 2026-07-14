@@ -206,6 +206,7 @@ fn validate_seed_url(url: &str, kind: &str) -> Result<(), SandboxError> {
             | UrlValidationError::BroadcastIp
             | UrlValidationError::DocumentationIp
             | UrlValidationError::UnspecifiedIp
+            | UrlValidationError::NonGlobalIp
             | UrlValidationError::DomainResolvesToBlockedIp => {
                 "host points to a private, loopback, or metadata address".to_string()
             }
@@ -2461,6 +2462,18 @@ mod tests {
             git_connection_id: None,
         };
         assert!(body.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_non_global_special_purpose_seed_urls() {
+        for host in ["100.64.0.1", "198.18.0.1", "240.0.0.1", "[2001:db8::1]"] {
+            let error = validate_seed_url(&format!("https://{host}/archive.tar"), "tarball")
+                .expect_err("special-purpose seed target must be rejected");
+            assert!(matches!(
+                error,
+                crate::error::SandboxError::Validation { .. }
+            ));
+        }
     }
 
     #[test]

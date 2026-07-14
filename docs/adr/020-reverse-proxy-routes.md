@@ -41,25 +41,44 @@ second-class, DB-surgery paths with no UX, no validation, and no discoverability
 
 ## Decision
 
-Add a **`temps route`** command group that manages `custom_routes` directly
-through `LbService`, mirroring the direct-DB style of `temps domain import`
-(read `TEMPS_DATABASE_URL` from the environment; scrub it from argv):
+Add a **`temps route`** command group that manages `custom_routes` through the
+authenticated load-balancer API (`TEMPS_API_URL` + `TEMPS_API_TOKEN`). Going
+through the API preserves RBAC, validation, typed HTTP errors, and audit logs;
+the CLI never receives database credentials:
 
 | Command | Action |
 |---|---|
-| `temps route add -d <host> -u <host:port> [-t http\|tls]` | Create a route via `LbService::create_route` |
+| `temps route add -d <host> -u <host:port> [-t http\|tls]` | Create a validated and audited route |
 | `temps route list` (alias `ls`) `[--json]` | List all routes |
-| `temps route show -d <host>` `[--json]` | Show one route (exact + wildcard match) |
-| `temps route rm -d <host> [-y]` | Delete a route (confirms existence first) |
+| `temps route show -d <host>` `[--json]` | Show one exact route |
+| `temps route rm -d <host> [-y]` | Delete one exact route |
 
 `--type http` is the default and terminates TLS at the proxy, so the hostname
 still needs a certificate — the `add` command prints the exact `temps domain
 add` / `temps domain import` follow-up. `--type tls` performs SNI passthrough
 and needs no Temps-held cert (the upstream presents its own).
 
-This is deliberately the **smallest coherent slice**: it exposes the existing
-backend with validation (`host:port` parsing, port range, IPv6 bracket
-handling) and a discoverable CLI, and changes no proxy data-plane behavior.
+Route domains are canonicalized and protected by a normalized unique index.
+Wildcard overlaps are rejected, and managed-domain collisions require the
+explicit `--force-override` acknowledgement. Private or loopback upstreams
+require `--allow-private-upstream`; link-local, metadata, unspecified,
+broadcast, and multicast targets remain blocked even with that flag. IPv6
+upstreams are stored bracketed so socket address rendering remains valid.
+Hostname upstreams must resolve when the route is written and are persisted as
+a validated literal address. The data plane therefore never re-resolves an
+operator-supplied hostname after the SSRF check.
+
+The override decision is durable: `force_override` is stored with the route.
+On every route-table reload, all managed names are generated first—including
+environment aliases, Compose service names, internal names, and deployment
+fallbacks. They take precedence over an overlapping custom route unless that
+custom route carries the explicit flag. This also protects managed domains
+created after the custom route.
+
+The hardening migration disables legacy hostname and special-use-address
+upstreams that could not have passed the new validation. The route loader
+independently repeats literal-address validation so direct database writes
+cannot reintroduce an unsafe route.
 
 ### Naming
 
@@ -85,23 +104,25 @@ be a breaking change to that command's argument surface.
 
 ## Risks & open questions
 
-- **SSRF / authorization.** A route forwards `:443` traffic to an arbitrary
-  internal `host:port`. The command is admin-only (DB access), but the console
-  follow-up must add guardrails before exposing this to less-privileged roles.
+- **Internal exposure.** A route can deliberately publish a private upstream.
+  It requires `LoadBalancerWrite` plus `--allow-private-upstream`, prints a
+  warning, and records the acknowledgement in a fail-closed audit intent before
+  the mutation. Special-purpose destinations such as cloud metadata addresses
+  cannot be enabled. DNS failures are rejected instead of bypassing validation.
+  Carrier-grade NAT, benchmarking, documentation, reserved, and other
+  non-global special-purpose ranges are also hard-blocked; only RFC1918/ULA and
+  loopback can be admitted with the explicit acknowledgement.
 - **Overlap.** `project_custom_domains` / `environment_domains` /
   `deployment_domains` cover Temps-*managed* deployments. `custom_routes` is the
   unmanaged-upstream escape hatch; the docs must make the distinction explicit
   so operators pick the right one.
-- **CLI/server schema drift.** The `temps domain add`/`list` *API* commands
-  have drifted from the running server ("error decoding response body"). The new
-  `temps route` command sidesteps this by talking to the database directly (as
-  `temps domain import` does), but the underlying API drift should still be
-  fixed separately.
+- **CLI/server schema drift.** Route request DTOs reject unknown fields and the
+  CLI reports the server's Problem Details body when versions disagree.
 
 ## Consequences
 
 - Routing an unmanaged upstream becomes a supported, validated, scriptable
   operation instead of manual SQL.
-- No data-plane change: the proxy already loads `custom_routes`; this only adds
-  a writer/reader CLI in front of the existing `LbService`.
+- Managed domains win over non-forced custom routes at every data-plane reload;
+  explicit overrides remain effective because their intent is persisted.
 - The cert step remains explicit (`temps domain`) until follow-up #1 lands.

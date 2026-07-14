@@ -283,7 +283,7 @@ pub fn install_crypto_provider() {
 /// continues normally. The flag is still accepted; it may remain visible in
 /// the process table, which is no worse than before this change.
 fn scrub_sensitive_argv() {
-    const SENSITIVE_FLAGS: &[&str] = &["--database-url"];
+    const SENSITIVE_FLAGS: &[&str] = &["--database-url", "--api-token"];
 
     // macOS: use the stable _NSGetArgc/_NSGetArgv APIs from libSystem.
     #[cfg(target_os = "macos")]
@@ -406,4 +406,36 @@ pub fn run(extra_plugins: Vec<Box<dyn temps_core::plugin::TempsPlugin>>) -> anyh
     scrub_sensitive_argv();
     install_tracing(&cli.log_level, &cli.log_format);
     dispatch(cli, extra_plugins)
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod argv_scrub_tests {
+    use super::scrub_argv_raw;
+
+    #[test]
+    fn scrubs_api_tokens_in_separate_and_equals_forms() {
+        let mut args = [
+            b"temps\0".to_vec(),
+            b"--api-token\0".to_vec(),
+            b"secret-one\0".to_vec(),
+            b"--api-token=secret-two\0".to_vec(),
+            b"--domain=api.example.com\0".to_vec(),
+        ];
+        let mut pointers = args
+            .iter_mut()
+            .map(|arg| arg.as_mut_ptr().cast::<libc::c_char>())
+            .collect::<Vec<_>>();
+
+        unsafe {
+            scrub_argv_raw(
+                pointers.len(),
+                pointers.as_mut_ptr(),
+                &["--database-url", "--api-token"],
+            );
+        }
+
+        assert_eq!(&args[2], b"xxxxxxxxxx\0");
+        assert_eq!(&args[3], b"--api-token=xxxxxxxxxx\0");
+        assert_eq!(&args[4], b"--domain=api.example.com\0");
+    }
 }

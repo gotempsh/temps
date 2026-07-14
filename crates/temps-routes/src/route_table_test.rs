@@ -38,7 +38,7 @@ mod route_table_tests {
         // Create a custom route
         let custom_route = custom_routes::ActiveModel {
             domain: Set("api.example.com".to_string()),
-            host: Set("localhost".to_string()),
+            host: Set("127.0.0.1".to_string()),
             port: Set(8080),
             enabled: Set(true),
             ..Default::default()
@@ -55,7 +55,7 @@ mod route_table_tests {
         assert!(route_info.is_some());
 
         let route_info = route_info.unwrap();
-        assert_eq!(route_info.get_backend_addr(), "localhost:8080");
+        assert_eq!(route_info.get_backend_addr(), "127.0.0.1:8080");
         assert!(route_info.project.is_none()); // Custom routes don't have projects
         assert!(route_info.environment.is_none());
         assert!(route_info.deployment.is_none());
@@ -217,7 +217,7 @@ mod route_table_tests {
         // Add a custom route
         let custom_route = custom_routes::ActiveModel {
             domain: Set("new-route.com".to_string()),
-            host: Set("localhost".to_string()),
+            host: Set("127.0.0.1".to_string()),
             port: Set(8888),
             enabled: Set(true),
             ..Default::default()
@@ -245,7 +245,7 @@ mod route_table_tests {
         for i in 0..5 {
             let custom_route = custom_routes::ActiveModel {
                 domain: Set(format!("route-{}.com", i)),
-                host: Set("localhost".to_string()),
+                host: Set("127.0.0.1".to_string()),
                 port: Set(8000 + i),
                 enabled: Set(true),
                 ..Default::default()
@@ -265,7 +265,7 @@ mod route_table_tests {
             let route_info = route_info.unwrap();
             assert_eq!(
                 route_info.get_backend_addr(),
-                format!("localhost:{}", 8000 + i)
+                format!("127.0.0.1:{}", 8000 + i)
             );
         }
 
@@ -282,7 +282,7 @@ mod route_table_tests {
         // Create disabled custom route
         let custom_route = custom_routes::ActiveModel {
             domain: Set("disabled-route.com".to_string()),
-            host: Set("localhost".to_string()),
+            host: Set("127.0.0.1".to_string()),
             port: Set(8080),
             enabled: Set(false), // Disabled
             ..Default::default()

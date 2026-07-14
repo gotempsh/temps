@@ -47,6 +47,10 @@ pub struct Model {
     /// - 'tls': Match on TLS SNI hostname (Layer 4/5)
     #[sea_orm(default_value = "http")]
     pub route_type: RouteType,
+    /// Whether this operator route intentionally takes precedence over a
+    /// Temps-managed domain with the same/overlapping hostname.
+    #[sea_orm(default_value = false)]
+    pub force_override: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

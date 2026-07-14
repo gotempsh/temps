@@ -23,6 +23,7 @@ use parking_lot::RwLock;
 use sea_orm::{DatabaseConnection, EntityTrait};
 use sqlx::postgres::{PgListener, PgPool};
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use temps_core::public_hostname_resolver::match_strategy;
@@ -30,6 +31,132 @@ use temps_core::{AppSettings, DeploymentMode, PublicHostnameStrategy};
 use temps_entities::custom_routes::RouteType;
 use temps_entities::{deployments, environments, nodes, projects};
 use tracing::{debug, error, info, warn};
+
+fn route_domains_overlap(left: &str, right: &str) -> bool {
+    let left = left.trim().trim_end_matches('.').to_ascii_lowercase();
+    let right = right.trim().trim_end_matches('.').to_ascii_lowercase();
+    let left_base = left.strip_prefix("*.").unwrap_or(&left);
+    let right_base = right.strip_prefix("*.").unwrap_or(&right);
+
+    left == right
+        || (left.starts_with("*.")
+            && (right == left_base || right.ends_with(&format!(".{left_base}"))))
+        || (right.starts_with("*.")
+            && (left == right_base || left.ends_with(&format!(".{right_base}"))))
+}
+
+async fn load_logical_managed_domains(
+    db: &DatabaseConnection,
+    preview_domain: &str,
+) -> Result<Vec<String>, sea_orm::DbErr> {
+    use sea_orm::{ColumnTrait, QueryFilter};
+    use temps_entities::{deployment_domains, environment_domains, project_custom_domains};
+
+    let mut domains = environment_domains::Entity::find()
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|row| row.domain)
+        .collect::<Vec<_>>();
+    domains.extend(
+        project_custom_domains::Entity::find()
+            .all(db)
+            .await?
+            .into_iter()
+            .map(|row| row.domain),
+    );
+    domains.extend(
+        deployment_domains::Entity::find()
+            .all(db)
+            .await?
+            .into_iter()
+            .map(|row| row.domain),
+    );
+
+    let projects = projects::Entity::find()
+        .filter(projects::Column::DeletedAt.is_null())
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|project| (project.id, project))
+        .collect::<HashMap<_, _>>();
+    let deployments = deployments::Entity::find()
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|deployment| (deployment.id, deployment))
+        .collect::<HashMap<_, _>>();
+    let environments = environments::Entity::find()
+        .filter(environments::Column::DeletedAt.is_null())
+        .filter(environments::Column::CurrentDeploymentId.is_not_null())
+        .all(db)
+        .await?;
+
+    for environment in environments {
+        let subdomain = environment.subdomain.trim();
+        if !subdomain.is_empty() {
+            domains.push(subdomain.to_string());
+            domains.push(format!("{subdomain}.{preview_domain}"));
+        }
+        let Some(project) = projects.get(&environment.project_id) else {
+            continue;
+        };
+        if !environment.slug.trim().is_empty() && !project.slug.trim().is_empty() {
+            domains.push(format!(
+                "{}.{}.temps.local",
+                environment.slug.trim(),
+                project.slug.trim()
+            ));
+        }
+        if let Some(deployment) = environment
+            .current_deployment_id
+            .and_then(|id| deployments.get(&id))
+        {
+            domains.push(format!("{}.{}", deployment.slug, preview_domain));
+        }
+        if let Some(temps_entities::preset::PresetConfig::DockerCompose(config)) =
+            project.preset_config.as_ref()
+        {
+            for public_port in &config.public_ports {
+                let label = format!("{}-{subdomain}", public_port.service);
+                let label = label.chars().take(63).collect::<String>();
+                let label = label.trim_end_matches('-');
+                if !label.is_empty() {
+                    domains.push(format!("{label}.{preview_domain}"));
+                }
+            }
+        }
+    }
+
+    Ok(domains)
+}
+
+fn validated_persisted_upstream(host: &str) -> Option<String> {
+    use temps_core::url_validation::{validate_ipv4, validate_ipv6, UrlValidationError};
+
+    let unbracketed = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    let ip = unbracketed.parse::<IpAddr>().ok()?;
+    let validation = match ip {
+        IpAddr::V4(ip) => validate_ipv4(&ip),
+        IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
+            Some(mapped) => validate_ipv4(&mapped),
+            None => validate_ipv6(&ip),
+        },
+    };
+    if !matches!(
+        validation,
+        Ok(()) | Err(UrlValidationError::PrivateIp) | Err(UrlValidationError::LoopbackIp)
+    ) {
+        return None;
+    }
+    Some(match ip {
+        IpAddr::V4(ip) => ip.to_string(),
+        IpAddr::V6(ip) => format!("[{ip}]"),
+    })
+}
 
 /// Look up the private address for a container's node, caching results.
 /// Returns None for local containers (node_id is None).
@@ -580,6 +707,9 @@ impl CachedPeerTable {
         let env_domains = environment_domains::Entity::find()
             .all(self.db.as_ref())
             .await?;
+        let custom_domains = project_custom_domains::Entity::find()
+            .all(self.db.as_ref())
+            .await?;
 
         debug!(
             "Section 1: Loading {} environment domains",
@@ -734,76 +864,8 @@ impl CachedPeerTable {
         let mut http_wildcards_matcher = WildcardMatcher::new();
         let mut tls_wildcards_matcher = WildcardMatcher::new();
 
-        for custom_route in custom_routes_data {
-            let backend_addr = format!("{}:{}", custom_route.host, custom_route.port);
-            let route_info = RouteInfo {
-                backend: BackendType::Upstream {
-                    backends: vec![BackendEntry {
-                        address: backend_addr.clone(),
-                        container_id: None,
-                        container_name: None,
-                    }],
-                    round_robin_counter: Arc::new(AtomicUsize::new(0)),
-                },
-                redirect_to: None,
-                status_code: None,
-                project: None, // Custom routes don't have project context
-                environment: None,
-                deployment: None,
-                // Operator-configured custom route mapping, not an on-demand zone
-                // host — never trigger on-demand issuance (ADR-018 §2).
-                cert_eligible: false,
-            };
-
-            let is_wildcard = custom_route.domain.starts_with("*.");
-            let route_type_str = match custom_route.route_type {
-                RouteType::Http => "http",
-                RouteType::Tls => "tls",
-            };
-
-            match custom_route.route_type {
-                RouteType::Http => {
-                    if is_wildcard {
-                        http_wildcards_matcher.insert(&custom_route.domain, route_info.clone());
-                        debug!(
-                            "Loaded HTTP wildcard custom route: {} -> {} (type={})",
-                            custom_route.domain, backend_addr, route_type_str
-                        );
-                    } else {
-                        http_routes_map.insert(custom_route.domain.clone(), route_info.clone());
-                        debug!(
-                            "Loaded HTTP custom route: {} -> {} (type={})",
-                            custom_route.domain, backend_addr, route_type_str
-                        );
-                    }
-                }
-                RouteType::Tls => {
-                    if is_wildcard {
-                        tls_wildcards_matcher.insert(&custom_route.domain, route_info.clone());
-                        debug!(
-                            "Loaded TLS wildcard custom route: {} -> {} (type={})",
-                            custom_route.domain, backend_addr, route_type_str
-                        );
-                    } else {
-                        tls_routes_map.insert(custom_route.domain.clone(), route_info.clone());
-                        debug!(
-                            "Loaded TLS custom route: {} -> {} (type={})",
-                            custom_route.domain, backend_addr, route_type_str
-                        );
-                    }
-                }
-            }
-
-            // Also add to legacy routes map for backward compatibility
-            routes.insert(custom_route.domain.clone(), route_info);
-        }
-
         // 3. Load project_custom_domains (custom domains with redirects or environment mapping)
         // Note: We load ALL custom domains regardless of status to allow immediate routing
-        let custom_domains = project_custom_domains::Entity::find()
-            .all(self.db.as_ref())
-            .await?;
-
         debug!(
             "Section 3: Loading {} project custom domains",
             custom_domains.len()
@@ -1510,6 +1572,80 @@ impl CachedPeerTable {
             }
         }
 
+        // Admit custom routes only after every managed route has been
+        // generated. This complete set includes persisted domains plus
+        // environment aliases, Compose service names, internal temps.local
+        // names, and deployment fallbacks. A later-created managed route thus
+        // wins on every reload unless the operator persisted force_override.
+        // Keep logical ownership separate from active backends. Sleeping
+        // environments intentionally have no RouteInfo, but their persisted
+        // and generated names must remain reserved so the wake path cannot be
+        // displaced by a pre-existing custom route.
+        let mut managed_domains =
+            load_logical_managed_domains(self.db.as_ref(), &preview_domain).await?;
+        managed_domains.extend(routes.keys().cloned());
+        for custom_route in custom_routes_data {
+            if !custom_route.force_override
+                && managed_domains
+                    .iter()
+                    .any(|managed| route_domains_overlap(&custom_route.domain, managed))
+            {
+                warn!(
+                    domain = %custom_route.domain,
+                    "Skipping non-forced custom route because a managed domain takes precedence"
+                );
+                continue;
+            }
+            let Some(host) = validated_persisted_upstream(&custom_route.host) else {
+                warn!(
+                    domain = %custom_route.domain,
+                    host = %custom_route.host,
+                    "Skipping unsafe persisted custom route; update it through the route API"
+                );
+                continue;
+            };
+            let backend_addr = format!("{}:{}", host, custom_route.port);
+            let route_info = RouteInfo {
+                backend: BackendType::Upstream {
+                    backends: vec![BackendEntry {
+                        address: backend_addr.clone(),
+                        container_id: None,
+                        container_name: None,
+                    }],
+                    round_robin_counter: Arc::new(AtomicUsize::new(0)),
+                },
+                redirect_to: None,
+                status_code: None,
+                project: None,
+                environment: None,
+                deployment: None,
+                cert_eligible: false,
+            };
+            let is_wildcard = custom_route.domain.starts_with("*.");
+            match custom_route.route_type {
+                RouteType::Http if is_wildcard => {
+                    http_wildcards_matcher.insert(&custom_route.domain, route_info.clone());
+                }
+                RouteType::Http => {
+                    http_routes_map.insert(custom_route.domain.clone(), route_info.clone());
+                }
+                RouteType::Tls if is_wildcard => {
+                    tls_wildcards_matcher.insert(&custom_route.domain, route_info.clone());
+                }
+                RouteType::Tls => {
+                    tls_routes_map.insert(custom_route.domain.clone(), route_info.clone());
+                }
+            }
+            debug!(
+                domain = %custom_route.domain,
+                upstream = %backend_addr,
+                route_type = %custom_route.route_type,
+                force_override = custom_route.force_override,
+                "Loaded validated custom route"
+            );
+            routes.insert(custom_route.domain, route_info);
+        }
+
         debug!("Loaded all active deployments. Final cache: {} projects, {} environments, {} deployments",
             projects_cache.len(), environments_cache.len(), deployments_cache.len());
 
@@ -1848,6 +1984,40 @@ mod tests {
             }
         }
         Arc::new(NoOpQueue)
+    }
+
+    #[test]
+    fn managed_domain_precedence_detects_exact_and_wildcard_overlap() {
+        assert!(route_domains_overlap("*.example.com", "api.example.com"));
+        assert!(route_domains_overlap("API.EXAMPLE.COM.", "*.example.com"));
+        assert!(route_domains_overlap("*.example.com", "example.com"));
+        assert!(!route_domains_overlap("api.example.com", "www.example.com"));
+        assert!(!route_domains_overlap(
+            "deep.api.example.com",
+            "*.other.example.com"
+        ));
+    }
+
+    #[test]
+    fn persisted_upstreams_reject_hostnames_and_special_use_addresses() {
+        assert_eq!(
+            validated_persisted_upstream("127.0.0.1"),
+            Some("127.0.0.1".to_string())
+        );
+        assert_eq!(
+            validated_persisted_upstream("[2001:4860:4860::8888]"),
+            Some("[2001:4860:4860::8888]".to_string())
+        );
+        for host in [
+            "localhost",
+            "169.254.169.254",
+            "100.64.0.1",
+            "198.18.0.1",
+            "2001:db8::1",
+            "::ffff:169.254.169.254",
+        ] {
+            assert_eq!(validated_persisted_upstream(host), None, "host={host}");
+        }
     }
 
     #[test]
