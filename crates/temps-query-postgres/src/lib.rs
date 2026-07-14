@@ -71,6 +71,17 @@ pub struct PostgresSource {
 }
 
 impl PostgresSource {
+    fn starts_with_sql_keyword(input: &str, keyword: &str) -> bool {
+        let Some(rest) = input.trim_start().strip_prefix(keyword) else {
+            return false;
+        };
+
+        match rest.chars().next() {
+            None => true,
+            Some(c) => !(c.is_ascii_alphanumeric() || c == '_' || c == '$' || !c.is_ascii()),
+        }
+    }
+
     /// Create a new PostgreSQL data source
     pub async fn connect(
         host: &str,
@@ -303,23 +314,23 @@ impl PostgresSource {
             ));
         }
 
-        // Prevent subqueries via parenthesized SELECT
-        // This blocks: (SELECT ...), EXISTS (SELECT ...), IN (SELECT ...)
+        // Prevent subqueries through every parenthesized PostgreSQL query form.
         if without_strings.contains('(') {
-            // Allow simple IN lists like: id IN (1, 2, 3) but block any subqueries
-            // by checking if SELECT appears after any opening paren
-            let paren_content_has_select = without_strings.match_indices('(').any(|(idx, _)| {
-                let after_paren = &without_strings[idx..];
-                // Check if there's a SELECT between this ( and its matching )
-                after_paren
-                    .find(')')
-                    .map(|close_idx| {
-                        let inner = &after_paren[1..close_idx];
-                        inner.contains("select")
-                    })
-                    .unwrap_or(false)
-            });
-            if paren_content_has_select {
+            // PostgreSQL query expressions can start with SELECT, TABLE,
+            // VALUES, or WITH. `IN (TABLE private_ids)` is a valid subquery and
+            // must not be mistaken for a simple IN-list. Check every opening
+            // parenthesis because query expressions can be nested in grouping
+            // parentheses. Keyword boundaries avoid rejecting quoted columns
+            // such as `"table"` or identifiers such as `selected_id`.
+            const QUERY_EXPRESSION_STARTERS: [&str; 4] = ["select", "table", "values", "with"];
+            let paren_starts_query_expression =
+                without_strings.match_indices('(').any(|(idx, _)| {
+                    let after_paren = &without_strings[idx + 1..];
+                    QUERY_EXPRESSION_STARTERS
+                        .iter()
+                        .any(|keyword| Self::starts_with_sql_keyword(after_paren, keyword))
+                });
+            if paren_starts_query_expression {
                 return Err(DataError::InvalidQuery(
                     "Subqueries are not allowed in the data browser".to_string(),
                 ));
@@ -1517,6 +1528,20 @@ mod tests {
     }
 
     #[test]
+    fn test_sql_injection_alternate_query_expression_subqueries() {
+        assert_sql_rejected("7 IN (TABLE private_ids)");
+        assert_sql_rejected("7 in (\nTaBlE\tprivate_ids)");
+        assert_sql_rejected("7 IN ((TABLE private_ids))");
+        assert_sql_rejected("7 IN (VALUES (7))");
+        assert_sql_rejected("7 IN (WITH ids AS (TABLE private_ids) TABLE ids)");
+
+        // Token boundaries must not reject ordinary identifiers that merely
+        // contain a query-expression keyword.
+        assert_sql_allowed("selected_id IN (1, 2)");
+        assert_sql_allowed("\"table\" IN (1, 2)");
+    }
+
+    #[test]
     fn test_sql_injection_drop_table() {
         assert_sql_rejected("1=1; DROP TABLE users");
         assert_sql_rejected("drop table users");
@@ -1708,6 +1733,8 @@ mod tests {
                    INSERT INTO public.public_users VALUES (1);
                    CREATE TABLE public.private_secrets (secret text NOT NULL);
                    INSERT INTO public.private_secrets VALUES ('synthetic-secret');
+                   CREATE TABLE public.private_ids (id integer NOT NULL);
+                   INSERT INTO public.private_ids VALUES (7);
                    CREATE FUNCTION public."in"() RETURNS boolean LANGUAGE sql STABLE AS
                    $$ SELECT EXISTS (
                        SELECT 1 FROM public.private_secrets
@@ -1723,6 +1750,8 @@ mod tests {
             "U&\"query_to_xml\" UESCAPE '!'('select secret from private_secrets', true, false, '')::text LIKE '%synthetic-secret%'",
             "pg_catalog.U&\"query_to_xml\" UESCAPE '!'('select secret from private_secrets', true, false, '')::text LIKE '%synthetic-secret%'",
             "public.in()",
+            "7 IN (TABLE private_ids)",
+            "7 in (\nTaBlE\tprivate_ids)",
         ];
 
         for attack in attacks {
