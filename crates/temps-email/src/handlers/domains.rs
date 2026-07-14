@@ -45,7 +45,9 @@ impl From<EmailError> for Problem {
                 .with_title("Domain Not Verified")
                 .with_detail(error.to_string()),
 
-            EmailError::Validation(_) | EmailError::InvalidProviderType(_) => {
+            EmailError::Validation(_)
+            | EmailError::InvalidProviderType(_)
+            | EmailError::InvalidTrackingRetentionDays { .. } => {
                 problemdetails::new(StatusCode::BAD_REQUEST)
                     .with_title("Validation Error")
                     .with_detail(error.to_string())
@@ -60,7 +62,10 @@ impl From<EmailError> for Problem {
             | EmailError::Scaleway(_)
             | EmailError::Smtp(_)
             | EmailError::Serialization(_)
-            | EmailError::TrackingRewrite { .. } => {
+            | EmailError::TrackingRewrite { .. }
+            | EmailError::TrackingRetentionRedaction { .. }
+            | EmailError::TrackingRetentionIndexUnavailable
+            | EmailError::TrackingRetentionSchedulerState => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
                     .with_detail(error.to_string())

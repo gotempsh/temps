@@ -13,6 +13,7 @@ temps-core = { path = "../temps-core" }
 temps-entities = { path = "../temps-entities" }
 temps-migrations = { path = "../temps-migrations" }
 sea-orm = { workspace = true, features = ["runtime-tokio-native-tls", "sqlx-postgres"] }
+sqlx.workspace = true
 sea-orm-migration = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }

@@ -51,6 +51,29 @@ pub enum EmailError {
 
     #[error("Tracking rewrite failed for email {email_id}: {reason}")]
     TrackingRewrite { email_id: String, reason: String },
+
+    #[error(
+        "Failed to redact email tracking data before {cutoff} in batches of {batch_size}: {source}"
+    )]
+    TrackingRetentionRedaction {
+        cutoff: chrono::DateTime<chrono::Utc>,
+        batch_size: i64,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+
+    #[error("Tracking event retention must be at least 1 day; received {days}")]
+    InvalidTrackingRetentionDays { days: u32 },
+
+    #[error(
+        "Email tracking retention index is not ready; deferring connection-metadata redaction"
+    )]
+    TrackingRetentionIndexUnavailable,
+
+    #[error(
+        "Failed to manage the email tracking retention scheduler: task state lock is poisoned"
+    )]
+    TrackingRetentionSchedulerState,
 }
 
 impl From<serde_json::Error> for EmailError {

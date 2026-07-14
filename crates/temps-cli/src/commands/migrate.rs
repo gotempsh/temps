@@ -173,6 +173,21 @@ impl MigrateCommand {
                 );
             }
 
+            tokio::select! {
+                result = temps_database::run_post_migration_indexes(&self.database_url) => {
+                    result.map_err(|error| anyhow::anyhow!(
+                        "Post-migration index build failed; refusing to report migration success: {error}"
+                    ))?;
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    anyhow::bail!(
+                        "Migration interrupted during the post-migration index build. \
+                         The dedicated PostgreSQL session was closed; re-run `temps migrate` \
+                         to repair any interrupted concurrent index and continue."
+                    );
+                }
+            }
+
             // Continuous-aggregate backfill is idempotent and safe to run here
             // (the operator is already waiting on this command).
             if let Err(e) = temps_database::run_post_migration_backfill(&db).await {

@@ -36,6 +36,23 @@ const MIGRATION_TIMEOUT: Duration = Duration::from_secs(600);
 /// (holds its own lock, runs to completion).
 const MIGRATION_LOCK_TIMEOUT_MS: u64 = 15_000;
 
+const EMAIL_TRACKING_RETENTION_INDEX_SQL: &str = r#"
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_email_events_tracking_retention
+ON email_events (created_at, id)
+WHERE ip_address IS NOT NULL
+   OR user_agent IS NOT NULL
+"#;
+
+const EMAIL_TRACKING_RETENTION_INDEX_STATE_SQL: &str = r#"
+SELECT index.indisvalid, index.indisready
+FROM pg_class AS class
+JOIN pg_index AS index ON index.indexrelid = class.oid
+WHERE class.oid = to_regclass('idx_email_events_tracking_retention')
+"#;
+
+const DROP_EMAIL_TRACKING_RETENTION_INDEX_SQL: &str =
+    "DROP INDEX CONCURRENTLY IF EXISTS idx_email_events_tracking_retention";
+
 /// Parse database URL and extract host and port
 fn parse_database_url(database_url: &str) -> Result<(String, u16), String> {
     // Handle postgres:// or postgresql:// URLs
@@ -547,6 +564,115 @@ pub async fn get_pending_migration_names(db: &DbConnection) -> ServiceResult<Vec
     Ok(pending.iter().map(|m| m.name().to_string()).collect())
 }
 
+/// Build large, non-blocking indexes that cannot be created inside Sea-ORM's
+/// migration transactions. This is idempotent and safe to run after every
+/// migration pass or server startup.
+pub async fn run_post_migration_indexes(database_url: &str) -> ServiceResult<()> {
+    use sqlx::{Connection, Executor, Row};
+
+    // A single explicitly pinned session supports pools configured with one
+    // connection and lets the session-level advisory lock cover every state
+    // check and concurrent DDL statement (which cannot run in a transaction).
+    let mut connection = sqlx::PgConnection::connect(database_url)
+        .await
+        .map_err(|error| {
+            ServiceError::Database(format!(
+                "Failed to open dedicated email tracking index connection: {error}"
+            ))
+        })?;
+    sqlx::query(
+        "SELECT pg_advisory_lock(hashtextextended(\
+            'temps_email_retention_index:' || current_schema(), 0))",
+    )
+    .execute(&mut connection)
+    .await
+    .map_err(|error| {
+        ServiceError::Database(format!(
+            "Failed to acquire email tracking index advisory lock: {error}"
+        ))
+    })?;
+
+    let operation = async {
+        let existing_state = sqlx::query(EMAIL_TRACKING_RETENTION_INDEX_STATE_SQL)
+            .fetch_optional(&mut connection)
+            .await
+            .map_err(|error| {
+                ServiceError::Database(format!(
+                    "Failed to inspect email tracking retention index state: {error}"
+                ))
+            })?;
+        let existing_is_ready = existing_state
+            .as_ref()
+            .map(|row| {
+                row.try_get::<bool, _>("indisvalid").unwrap_or(false)
+                    && row.try_get::<bool, _>("indisready").unwrap_or(false)
+            })
+            .unwrap_or(false);
+
+        if existing_state.is_some() && !existing_is_ready {
+            connection
+                .execute(DROP_EMAIL_TRACKING_RETENTION_INDEX_SQL)
+                .await
+                .map_err(|error| {
+                    ServiceError::Database(format!(
+                        "Failed to drop invalid email tracking retention index concurrently: {error}"
+                    ))
+                })?;
+        }
+        if !existing_is_ready {
+            connection
+                .execute(EMAIL_TRACKING_RETENTION_INDEX_SQL)
+                .await
+                .map_err(|error| {
+                    ServiceError::Database(format!(
+                        "Failed to build email tracking retention index concurrently: {error}"
+                    ))
+                })?;
+        }
+
+        let rebuilt_state = sqlx::query(EMAIL_TRACKING_RETENTION_INDEX_STATE_SQL)
+            .fetch_optional(&mut connection)
+            .await
+            .map_err(|error| {
+                ServiceError::Database(format!(
+                    "Failed to verify email tracking retention index: {error}"
+                ))
+            })?;
+        let rebuilt_is_ready = rebuilt_state
+            .as_ref()
+            .map(|row| {
+                row.try_get::<bool, _>("indisvalid").unwrap_or(false)
+                    && row.try_get::<bool, _>("indisready").unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if !rebuilt_is_ready {
+            return Err(ServiceError::Database(
+                "Email tracking retention index build completed without a valid, ready index"
+                    .to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+    .await;
+
+    let unlock = sqlx::query(
+        "SELECT pg_advisory_unlock(hashtextextended(\
+            'temps_email_retention_index:' || current_schema(), 0))",
+    )
+    .execute(&mut connection)
+    .await
+    .map_err(|error| {
+        ServiceError::Database(format!(
+            "Failed to release email tracking index advisory lock: {error}"
+        ))
+    });
+
+    operation?;
+    unlock?;
+    Ok(())
+}
+
 /// Run post-migration backfill for continuous aggregates.
 ///
 /// `CALL refresh_continuous_aggregate()` cannot run inside a transaction block,
@@ -676,6 +802,16 @@ pub async fn run_post_migration_backfill(db: &DatabaseConnection) -> ServiceResu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn email_tracking_retention_index_matches_redaction_query() {
+        assert!(EMAIL_TRACKING_RETENTION_INDEX_SQL.contains("CONCURRENTLY"));
+        assert!(EMAIL_TRACKING_RETENTION_INDEX_SQL.contains("(created_at, id)"));
+        for personal_column in ["ip_address", "user_agent"] {
+            assert!(EMAIL_TRACKING_RETENTION_INDEX_SQL.contains(personal_column));
+        }
+        assert!(DROP_EMAIL_TRACKING_RETENTION_INDEX_SQL.contains("CONCURRENTLY"));
+    }
 
     #[test]
     fn test_parse_database_url_basic() {

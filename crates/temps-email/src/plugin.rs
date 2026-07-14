@@ -21,12 +21,13 @@ use temps_dns::services::DnsProviderService;
 
 /// How often the tracking-data retention sweep runs.
 const RETENTION_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const RETENTION_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// How long an open/click/bounce/complaint event (with its IP address and
 /// user-agent string) is kept before being purged. No per-tenant knob exists
 /// yet for this — matches the same hardcoded-default approach
 /// `temps-log-aggregator`'s `RetentionConfig` uses.
-const TRACKING_EVENT_RETENTION_DAYS: i64 = 90;
+const TRACKING_EVENT_RETENTION_DAYS: u32 = 90;
 
 /// Email Plugin for managing email providers, domains, and sending emails
 pub struct EmailPlugin;
@@ -124,30 +125,16 @@ impl TempsPlugin for EmailPlugin {
             // ── Tracking-data retention sweep ───────────────────────────
             // Every open/click/bounce/complaint event pins an IP address and
             // user-agent to a send indefinitely without this — see
-            // `TrackingService::purge_events_older_than`.
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(RETENTION_INTERVAL);
-                loop {
-                    interval.tick().await;
-                    match tracking_service
-                        .purge_events_older_than(TRACKING_EVENT_RETENTION_DAYS)
-                        .await
-                    {
-                        Ok(deleted) => {
-                            tracing::info!(
-                                deleted = deleted,
-                                retention_days = TRACKING_EVENT_RETENTION_DAYS,
-                                "Tracking event retention sweep completed"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::error!(error = %e, "Tracking event retention sweep failed");
-                        }
-                    }
-                }
-            });
+            // `TrackingService::redact_connection_metadata_older_than`.
+            tracking_service
+                .start_connection_metadata_retention(
+                    TRACKING_EVENT_RETENTION_DAYS,
+                    RETENTION_INTERVAL,
+                    RETENTION_RETRY_INTERVAL,
+                )
+                .map_err(|error| PluginError::InitializationFailed(error.to_string()))?;
             tracing::info!(
-                "Tracking event retention scheduler started (interval: {:?}, retention: {}d)",
+                "Tracking event data redaction scheduler started (interval: {:?}, retention: {}d)",
                 RETENTION_INTERVAL,
                 TRACKING_EVENT_RETENTION_DAYS
             );

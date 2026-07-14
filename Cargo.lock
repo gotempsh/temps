@@ -11371,6 +11371,7 @@ dependencies = [
  "once_cell",
  "sea-orm",
  "sea-orm-migration",
+ "sqlx 0.8.6",
  "temps-core",
  "temps-entities",
  "temps-migrations",

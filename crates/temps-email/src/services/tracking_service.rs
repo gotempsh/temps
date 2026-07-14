@@ -19,6 +19,7 @@ pub struct TrackingService {
     /// Override base URL for testing (avoids needing a full ConfigService setup)
     #[cfg(test)]
     base_url_override: Option<String>,
+    retention_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// Result of transforming HTML for tracking
@@ -71,6 +72,7 @@ impl TrackingService {
             config_service,
             #[cfg(test)]
             base_url_override: None,
+            retention_task: std::sync::Mutex::new(None),
         }
     }
 
@@ -85,7 +87,57 @@ impl TrackingService {
             db,
             config_service,
             base_url_override: Some(base_url),
+            retention_task: std::sync::Mutex::new(None),
         }
+    }
+
+    pub(crate) fn start_connection_metadata_retention(
+        self: &Arc<Self>,
+        retention_days: u32,
+        success_interval: std::time::Duration,
+        retry_interval: std::time::Duration,
+    ) -> Result<(), EmailError> {
+        let mut task = self
+            .retention_task
+            .lock()
+            .map_err(|_| EmailError::TrackingRetentionSchedulerState)?;
+        if task.as_ref().is_some_and(|handle| !handle.is_finished()) {
+            return Ok(());
+        }
+
+        let service = Arc::downgrade(self);
+        *task = Some(tokio::spawn(async move {
+            loop {
+                let Some(service) = service.upgrade() else {
+                    break;
+                };
+                let next_delay = match service
+                    .redact_connection_metadata_older_than(retention_days)
+                    .await
+                {
+                    Ok(redacted) => {
+                        tracing::info!(
+                            redacted,
+                            retention_days,
+                            "Tracking event connection-metadata redaction sweep completed"
+                        );
+                        success_interval
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            error = %error,
+                            retry_seconds = retry_interval.as_secs(),
+                            "Tracking event connection-metadata redaction sweep failed"
+                        );
+                        retry_interval
+                    }
+                };
+                drop(service);
+                tokio::time::sleep(next_delay).await;
+            }
+        }));
+
+        Ok(())
     }
 
     /// Get the base URL for tracking endpoints from the config service
@@ -454,39 +506,99 @@ impl TrackingService {
         Ok(links)
     }
 
-    /// Delete tracking events older than `retention_days`. Each event row
-    /// pins an IP address and user-agent string to an individual open/click
-    /// indefinitely — this is the GDPR-relevant cleanup for that data,
+    /// Redact IP addresses and user-agent strings older than `retention_days`
+    /// while keeping event facts needed for per-email and deliverability
+    /// statistics. This is data minimization for connection metadata; it does
+    /// not anonymize the event or remove its association with an email. It is
     /// called on a schedule by `EmailPlugin::initialize_plugin_services`.
     ///
-    /// Deletes in bounded batches rather than one `DELETE ... WHERE
-    /// created_at < cutoff` — this table previously had no retention policy
+    /// Redacts in bounded batches rather than one unbounded `UPDATE` — this
+    /// table previously had no retention policy
     /// at all, so the first sweep on an existing database could otherwise
     /// try to delete a very large backlog in a single transaction, holding
     /// locks and consuming memory disproportionate to the reference 3
-    /// vCPU/4 GB deployment. Returns the total number of rows deleted.
-    pub async fn purge_events_older_than(&self, retention_days: i64) -> Result<u64, EmailError> {
+    /// vCPU/4 GB deployment. Returns the total number of rows redacted.
+    pub async fn redact_connection_metadata_older_than(
+        &self,
+        retention_days: u32,
+    ) -> Result<u64, EmailError> {
+        if retention_days == 0 {
+            return Err(EmailError::InvalidTrackingRetentionDays { days: 0 });
+        }
+
+        let duration = chrono::Duration::try_days(i64::from(retention_days)).ok_or(
+            EmailError::InvalidTrackingRetentionDays {
+                days: retention_days,
+            },
+        )?;
+        let cutoff = Utc::now().checked_sub_signed(duration).ok_or(
+            EmailError::InvalidTrackingRetentionDays {
+                days: retention_days,
+            },
+        )?;
+        self.redact_connection_metadata_before(cutoff).await
+    }
+
+    pub(crate) async fn redact_connection_metadata_before(
+        &self,
+        cutoff: chrono::DateTime<Utc>,
+    ) -> Result<u64, EmailError> {
         use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 
         const BATCH_SIZE: i64 = 5_000;
-        let cutoff = Utc::now() - chrono::Duration::days(retention_days);
-        let mut total_deleted: u64 = 0;
+        let mut total_redacted: u64 = 0;
+
+        let index_ready = self
+            .db
+            .query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT COALESCE(bool_and(index.indisvalid AND index.indisready), FALSE) AS ready \
+                 FROM pg_class AS class \
+                 JOIN pg_index AS index ON index.indexrelid = class.oid \
+                 WHERE class.oid = to_regclass('idx_email_events_tracking_retention')"
+                    .to_string(),
+            ))
+            .await
+            .map_err(|source| EmailError::TrackingRetentionRedaction {
+                cutoff,
+                batch_size: BATCH_SIZE,
+                source,
+            })?
+            .and_then(|row| row.try_get::<bool>("", "ready").ok())
+            .unwrap_or(false);
+        if !index_ready {
+            return Err(EmailError::TrackingRetentionIndexUnavailable);
+        }
 
         loop {
             let result = self
                 .db
                 .execute(Statement::from_sql_and_values(
                     DatabaseBackend::Postgres,
-                    "DELETE FROM email_events WHERE id IN \
-                     (SELECT id FROM email_events WHERE created_at < $1 LIMIT $2)",
+                    "WITH candidates AS (\
+                         SELECT id FROM email_events \
+                         WHERE created_at < $1 \
+                           AND (ip_address IS NOT NULL OR user_agent IS NOT NULL) \
+                         ORDER BY created_at, id \
+                         FOR UPDATE SKIP LOCKED \
+                         LIMIT $2\
+                     ) \
+                     UPDATE email_events AS event \
+                     SET ip_address = NULL, user_agent = NULL \
+                     FROM candidates WHERE event.id = candidates.id",
                     [cutoff.into(), BATCH_SIZE.into()],
                 ))
-                .await?;
+                .await
+                .map_err(|source| EmailError::TrackingRetentionRedaction {
+                    cutoff,
+                    batch_size: BATCH_SIZE,
+                    source,
+                })?;
 
-            let deleted = result.rows_affected();
-            total_deleted += deleted;
+            let redacted = result.rows_affected();
+            total_redacted += redacted;
 
-            if deleted < BATCH_SIZE as u64 {
+            if redacted < BATCH_SIZE as u64 {
                 break;
             }
             // Brief pause between batches so a large backlog doesn't
@@ -494,7 +606,17 @@ impl TrackingService {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
 
-        Ok(total_deleted)
+        Ok(total_redacted)
+    }
+}
+
+impl Drop for TrackingService {
+    fn drop(&mut self) {
+        if let Ok(task) = self.retention_task.get_mut() {
+            if let Some(handle) = task.take() {
+                handle.abort();
+            }
+        }
     }
 }
 

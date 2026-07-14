@@ -293,7 +293,16 @@ impl ServeCommand {
         // catches up regardless, so it must not gate the proxy bind.
         {
             let backfill_db = db.clone();
+            let post_migration_database_url = self.database_url.clone();
             rt.spawn(async move {
+                if let Err(e) =
+                    temps_database::run_post_migration_indexes(&post_migration_database_url).await
+                {
+                    tracing::warn!(
+                        "Post-migration index build failed (will retry on restart): {}",
+                        e
+                    );
+                }
                 if let Err(e) =
                     temps_database::run_post_migration_backfill(backfill_db.as_ref()).await
                 {
