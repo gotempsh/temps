@@ -128,22 +128,59 @@ pub struct SnsVerifier {
     http_client: reqwest::Client,
 }
 
-impl Default for SnsVerifier {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl SnsVerifier {
-    pub fn new() -> Self {
-        Self {
+    pub fn new() -> Result<Self, EmailTrackingError> {
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| {
+                EmailTrackingError::Configuration(format!(
+                    "Failed to build SNS HTTP client: {error}"
+                ))
+            })?;
+        Ok(Self {
             cert_cache: Arc::new(CertCache::new(100)),
-            http_client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .expect("Failed to create HTTP client"),
+            http_client,
+        })
+    }
+
+    fn sns_hostname_for_topic(topic_arn: &str) -> Result<String, EmailTrackingError> {
+        let parts: Vec<&str> = topic_arn.split(':').collect();
+        if parts.len() != 6
+            || parts[0] != "arn"
+            || parts[2] != "sns"
+            || parts[3].is_empty()
+            || parts[4].len() != 12
+            || !parts[4].bytes().all(|byte| byte.is_ascii_digit())
+            || parts[5].is_empty()
+        {
+            return Err(EmailTrackingError::SnsValidation(format!(
+                "Invalid SNS TopicArn: {topic_arn}"
+            )));
         }
+        let suffix = match parts[1] {
+            "aws" | "aws-us-gov" => "amazonaws.com",
+            "aws-cn" => "amazonaws.com.cn",
+            partition => {
+                return Err(EmailTrackingError::SnsValidation(format!(
+                    "Unsupported SNS ARN partition: {partition}"
+                )))
+            }
+        };
+        Ok(format!("sns.{}.{}", parts[3], suffix))
+    }
+
+    pub fn validate_topic<'a>(
+        &self,
+        message: &'a SnsMessage,
+    ) -> Result<&'a str, EmailTrackingError> {
+        let topic = message
+            .topic_arn
+            .as_deref()
+            .ok_or_else(|| EmailTrackingError::SnsValidation("Missing TopicArn".to_string()))?;
+        Self::sns_hostname_for_topic(topic)?;
+        Ok(topic)
     }
 
     /// Validate that a SigningCertURL is a legitimate AWS SNS URL.
@@ -163,7 +200,9 @@ impl SnsVerifier {
             EmailTrackingError::SnsValidation("SigningCertURL missing host".to_string())
         })?;
 
-        if !host.ends_with(".amazonaws.com") || !host.starts_with("sns.") {
+        if (!host.ends_with(".amazonaws.com") && !host.ends_with(".amazonaws.com.cn"))
+            || !host.starts_with("sns.")
+        {
             return Err(EmailTrackingError::SnsValidation(format!(
                 "SigningCertURL host must be sns.{{region}}.amazonaws.com, got: {}",
                 host
@@ -176,9 +215,27 @@ impl SnsVerifier {
             ));
         }
 
-        if !url.path().starts_with("/SimpleNotificationService-") {
+        if !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
             return Err(EmailTrackingError::SnsValidation(
-                "SigningCertURL path must start with /SimpleNotificationService-".to_string(),
+                "SigningCertURL must not contain credentials, query, or fragment".to_string(),
+            ));
+        }
+
+        let filename = url.path().strip_prefix('/').ok_or_else(|| {
+            EmailTrackingError::SnsValidation("Invalid SigningCertURL path".to_string())
+        })?;
+        let digest = filename
+            .strip_prefix("SimpleNotificationService-")
+            .and_then(|value| value.strip_suffix(".pem"));
+        if digest.is_none_or(|value| {
+            value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        }) {
+            return Err(EmailTrackingError::SnsValidation(
+                "SigningCertURL must name an AWS SimpleNotificationService certificate".to_string(),
             ));
         }
 
@@ -193,7 +250,7 @@ impl SnsVerifier {
 
         Self::validate_signing_cert_url(url)?;
 
-        let resp = self.http_client.get(url).send().await.map_err(|e| {
+        let mut resp = self.http_client.get(url).send().await.map_err(|e| {
             EmailTrackingError::SnsValidation(format!("Failed to fetch cert: {}", e))
         })?;
 
@@ -204,15 +261,32 @@ impl SnsVerifier {
             )));
         }
 
-        let cert_pem = resp.bytes().await.map_err(|e| {
-            EmailTrackingError::SnsValidation(format!("Failed to read cert body: {}", e))
-        })?;
+        const MAX_CERT_BYTES: usize = 64 * 1024;
+        if resp
+            .content_length()
+            .is_some_and(|length| length > MAX_CERT_BYTES as u64)
+        {
+            return Err(EmailTrackingError::SnsValidation(
+                "SNS signing certificate exceeded 64 KiB".to_string(),
+            ));
+        }
+        let mut cert_pem = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(|e| {
+            EmailTrackingError::SnsValidation(format!("Failed to read cert body: {e}"))
+        })? {
+            if cert_pem.len() + chunk.len() > MAX_CERT_BYTES {
+                return Err(EmailTrackingError::SnsValidation(
+                    "SNS signing certificate exceeded 64 KiB".to_string(),
+                ));
+            }
+            cert_pem.extend_from_slice(&chunk);
+        }
 
         self.cert_cache
-            .insert(url.to_string(), cert_pem.to_vec())
+            .insert(url.to_string(), cert_pem.clone())
             .await;
 
-        Ok(cert_pem.to_vec())
+        Ok(cert_pem)
     }
 
     /// Build the string-to-sign for an SNS message based on message type.
@@ -336,9 +410,20 @@ impl SnsVerifier {
     /// what actually proves the notification came from AWS, not just that
     /// the cert URL looked legitimate.
     pub async fn verify_signature(&self, message: &SnsMessage) -> Result<(), EmailTrackingError> {
+        let topic_arn = self.validate_topic(message)?;
         let cert_url = message.signing_cert_url.as_deref().ok_or_else(|| {
             EmailTrackingError::SnsValidation("Missing SigningCertURL".to_string())
         })?;
+
+        let cert_host = url::Url::parse(cert_url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_owned));
+        let expected_host = Self::sns_hostname_for_topic(topic_arn)?;
+        if cert_host.as_deref() != Some(expected_host.as_str()) {
+            return Err(EmailTrackingError::SnsValidation(format!(
+                "SigningCertURL host does not match TopicArn region: expected {expected_host}"
+            )));
+        }
 
         let cert_pem = self.fetch_cert(cert_url).await?;
         let public_key = Self::extract_public_key(&cert_pem)?;
@@ -376,15 +461,38 @@ impl SnsVerifier {
             .as_deref()
             .ok_or_else(|| EmailTrackingError::SnsValidation("Missing SubscribeURL".to_string()))?;
 
-        // Validate SubscribeURL is on SNS domain
+        let topic_arn = self.validate_topic(message)?;
+        let token = message.token.as_deref().ok_or_else(|| {
+            EmailTrackingError::SnsValidation("Missing subscription Token".to_string())
+        })?;
+
+        // Bind the confirmation request to the exact authorized topic, region
+        // and signed token. No redirects are followed by the shared client.
         let url = url::Url::parse(subscribe_url)
             .map_err(|_| EmailTrackingError::SnsValidation("Invalid SubscribeURL".to_string()))?;
-        let host = url.host_str().unwrap_or("");
-        if !host.ends_with(".amazonaws.com") || !host.starts_with("sns.") {
+        let expected_host = Self::sns_hostname_for_topic(topic_arn)?;
+        if url.scheme() != "https"
+            || url.host_str() != Some(expected_host.as_str())
+            || url.port().is_some()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.fragment().is_some()
+            || url.path() != "/"
+        {
             return Err(EmailTrackingError::SnsValidation(format!(
-                "SubscribeURL must be on sns.{{region}}.amazonaws.com, got: {}",
-                host
+                "SubscribeURL must use the authorized SNS endpoint {expected_host}"
             )));
+        }
+        let pairs: HashMap<String, String> = url.query_pairs().into_owned().collect();
+        if pairs.len() != 3
+            || pairs.get("Action").map(String::as_str) != Some("ConfirmSubscription")
+            || pairs.get("TopicArn").map(String::as_str) != Some(topic_arn)
+            || pairs.get("Token").map(String::as_str) != Some(token)
+        {
+            return Err(EmailTrackingError::SnsValidation(
+                "SubscribeURL action, topic, or token does not match the signed envelope"
+                    .to_string(),
+            ));
         }
 
         // Retry with exponential backoff: 3 attempts, 1s/2s/4s
@@ -489,10 +597,11 @@ mod tests {
     //   openssl dgst -sha1/-sha256 -sign key.pem message.txt | base64
     // Exercises the actual crypto path (extract_public_key + verify_pkcs1v15)
     // against known-good vectors, not just error-path plumbing.
+    // spellchecker:disable
     const TEST_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
 MIIDLTCCAhWgAwIBAgIUXj+rcBQ6uYyv/nRRRUamAvHUbBUwDQYJKoZIhvcNAQEL\n\
-BQAwJjEkMCIGA1UEAwwbc25zLnVzLWVhc3QtMS5hbWF6b25hd3MuY29tMB4XDTI2\n\
-MDcxMTA4NTU1MloXDTM2MDcwODA4NTU1MlowJjEkMCIGA1UEAwwbc25zLnVzLWVh\n\
+BQAwJjEkMCIGA1\x55\x45Awwbc25zLnVzLWVhc3QtMS5hbWF6b25hd3MuY29tMB4XDTI2\n\
+MDcxMTA4NTU1MloXDTM2MDcwODA4NTU1MlowJjEkMCIGA1\x55\x45Awwbc25zLnVzLWVh\n\
 c3QtMS5hbWF6b25hd3MuY29tMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKC\n\
 AQEAsu8cvSBCdR/7h2dRj92q/9lcPOvJcwxN9ltYepB8Yo2Am+OA7BAkZKpSDJBQ\n\
 snjTMdRcl0YyXIUZC3S2+pJQwJOfYHGx+Aj6uO20E03GtmFtjhT7phx2Z0SfvVjd\n\
@@ -509,6 +618,7 @@ k4YZJ3XZqxeS5/0tAqqj+XzacraM6mm92nZxQNrF9UkPFwQWxxxBYfKQyU+8bWdO\n\
 NzhDwvguWhmGlUoSFrzbyr3JbHTQCA+zhE5VxqYlcXCPap0dtfw1JxE0gUGJ/WdS\n\
 EQ==\n\
 -----END CERTIFICATE-----\n";
+    // spellchecker:enable
 
     const TEST_MESSAGE: &str = "hello sns test";
 
@@ -518,6 +628,101 @@ EQ==\n\
 
     fn decode_b64(s: &str) -> Vec<u8> {
         base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s).unwrap()
+    }
+
+    const ALLOWED_TOPIC: &str = "arn:aws:sns:us-east-1:123456789012:temps-ses";
+
+    fn sns_message(topic_arn: Option<&str>) -> SnsMessage {
+        SnsMessage {
+            message_type: "Notification".to_string(),
+            message_id: "sns-message-1".to_string(),
+            topic_arn: topic_arn.map(str::to_string),
+            message: "{}".to_string(),
+            timestamp: "2026-07-14T10:00:00Z".to_string(),
+            signature: String::new(),
+            signature_version: "2".to_string(),
+            signing_cert_url: Some(
+                "https://sns.us-east-1.amazonaws.com/SimpleNotificationService-abc123.pem"
+                    .to_string(),
+            ),
+            subscribe_url: None,
+            subject: None,
+            token: None,
+        }
+    }
+
+    #[test]
+    fn verifier_rejects_malformed_or_unsupported_topic_arns() {
+        let verifier = SnsVerifier::new().unwrap();
+        for topic in [
+            "not-an-arn",
+            "arn:aws:sqs:us-east-1:123456789012:temps-ses",
+            "arn:aws:sns::123456789012:temps-ses",
+            "arn:aws:sns:us-east-1:123:temps-ses",
+            "arn:aws:sns:us-east-1:123456789012:",
+            "arn:unknown:sns:us-east-1:123456789012:temps-ses",
+        ] {
+            assert!(verifier.validate_topic(&sns_message(Some(topic))).is_err());
+        }
+    }
+
+    #[test]
+    fn topic_validation_requires_a_well_formed_arn() {
+        let verifier = SnsVerifier::new().unwrap();
+
+        assert_eq!(
+            verifier
+                .validate_topic(&sns_message(Some(ALLOWED_TOPIC)))
+                .unwrap(),
+            ALLOWED_TOPIC
+        );
+        assert!(verifier.validate_topic(&sns_message(None)).is_err());
+    }
+
+    #[test]
+    fn signature_verification_rejects_cert_host_from_another_region_before_fetch() {
+        let verifier = SnsVerifier::new().unwrap();
+        let mut message = sns_message(Some(ALLOWED_TOPIC));
+        message.signing_cert_url = Some(
+            "https://sns.eu-west-1.amazonaws.com/SimpleNotificationService-abc123.pem".to_string(),
+        );
+
+        let result = tokio_test::block_on(verifier.verify_signature(&message));
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn subscription_confirmation_rejects_url_not_bound_to_signed_envelope() {
+        let verifier = SnsVerifier::new().unwrap();
+        let token = "signed-token";
+        let encoded_topic = urlencoding::encode(ALLOWED_TOPIC);
+
+        for subscribe_url in [
+            format!(
+                "http://sns.us-east-1.amazonaws.com/?Action=ConfirmSubscription&TopicArn={encoded_topic}&Token={token}"
+            ),
+            format!(
+                "https://sns.us-east-1.amazonaws.com:8443/?Action=ConfirmSubscription&TopicArn={encoded_topic}&Token={token}"
+            ),
+            format!(
+                "https://sns.eu-west-1.amazonaws.com/?Action=ConfirmSubscription&TopicArn={encoded_topic}&Token={token}"
+            ),
+            format!(
+                "https://sns.us-east-1.amazonaws.com/?Action=ConfirmSubscription&TopicArn={encoded_topic}&Token=wrong-token"
+            ),
+            format!(
+                "https://sns.us-east-1.amazonaws.com/?Action=DeleteTopic&TopicArn={encoded_topic}&Token={token}"
+            ),
+        ] {
+            let mut message = sns_message(Some(ALLOWED_TOPIC));
+            message.message_type = "SubscriptionConfirmation".to_string();
+            message.token = Some(token.to_string());
+            message.subscribe_url = Some(subscribe_url.clone());
+            assert!(
+                verifier.confirm_subscription(&message).await.is_err(),
+                "unbound SubscribeURL must be rejected: {subscribe_url}"
+            );
+        }
     }
 
     #[test]
@@ -581,6 +786,10 @@ EQ==\n\
             "https://sns.us-east-1.amazonaws.com/SimpleNotificationService-abc123.pem"
         )
         .is_ok());
+        assert!(SnsVerifier::validate_signing_cert_url(
+            "https://sns.cn-north-1.amazonaws.com.cn/SimpleNotificationService-abc123.pem"
+        )
+        .is_ok());
     }
 
     #[test]
@@ -621,6 +830,22 @@ EQ==\n\
             "https://s3.us-east-1.amazonaws.com/SimpleNotificationService-abc123.pem"
         )
         .is_err());
+    }
+
+    #[test]
+    fn test_validate_signing_cert_url_rejects_url_smuggling_components() {
+        for url in [
+            "https://user@sns.us-east-1.amazonaws.com/SimpleNotificationService-abc123.pem",
+            "https://sns.us-east-1.amazonaws.com/SimpleNotificationService-abc123.pem?next=https://evil.example",
+            "https://sns.us-east-1.amazonaws.com/SimpleNotificationService-abc123.pem#fragment",
+            "https://sns.us-east-1.amazonaws.com/nested/SimpleNotificationService-abc123.pem",
+            "https://sns.us-east-1.amazonaws.com/SimpleNotificationService-abc123.pem.exe",
+        ] {
+            assert!(
+                SnsVerifier::validate_signing_cert_url(url).is_err(),
+                "invalid signing certificate URL must be rejected: {url}"
+            );
+        }
     }
 
     #[test]

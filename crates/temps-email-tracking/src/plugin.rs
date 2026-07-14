@@ -8,10 +8,9 @@ use sea_orm::DatabaseConnection;
 use temps_core::plugin::{PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext};
 use temps_core::EncryptionService;
 use tracing::debug;
-use utoipa::OpenApi;
 
 use crate::event_service::EmailEventService;
-use crate::handlers::{self, EmailTrackingApiDoc, TrackingState};
+use crate::handlers::{self, TrackingState};
 use crate::html_rewriter::HtmlTrackingRewriter;
 use crate::sns::SnsVerifier;
 use temps_email::SuppressionService;
@@ -71,8 +70,13 @@ impl temps_core::plugin::TempsPlugin for EmailTrackingPlugin {
             let event_service = Arc::new(EmailEventService::new(db.clone()));
             context.register_service(event_service.clone());
 
-            // Create SNS verifier
-            let sns_verifier = Arc::new(SnsVerifier::new());
+            let sns_verifier = Arc::new(SnsVerifier::new().map_err(|error| {
+                PluginError::PluginRegistrationFailed {
+                    plugin_name: "email-tracking".to_string(),
+                    error: error.to_string(),
+                }
+            })?);
+            let provider_service = context.require_service::<temps_email::ProviderService>();
 
             // SuppressionService is a thin, stateless DB wrapper (see
             // temps-email), so constructing our own instance here — rather
@@ -87,19 +91,12 @@ impl temps_core::plugin::TempsPlugin for EmailTrackingPlugin {
                 sns_verifier,
                 hmac_key,
                 suppression_service,
+                provider_service,
             });
             context.register_service(tracking_state);
 
             Ok(())
         })
-    }
-
-    fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
-        let tracking_state = context.get_service::<TrackingState>()?;
-
-        let routes = handlers::api_routes().with_state(tracking_state);
-
-        Some(PluginRoutes::new(routes))
     }
 
     fn configure_public_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
@@ -108,9 +105,5 @@ impl temps_core::plugin::TempsPlugin for EmailTrackingPlugin {
         let routes = handlers::public_routes().with_state(tracking_state);
 
         Some(PluginRoutes::new(routes))
-    }
-
-    fn openapi_schema(&self) -> Option<utoipa::openapi::OpenApi> {
-        Some(<EmailTrackingApiDoc as OpenApi>::openapi())
     }
 }

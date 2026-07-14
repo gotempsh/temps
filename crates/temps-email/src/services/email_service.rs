@@ -200,10 +200,14 @@ impl EmailService {
         all_recipients.extend(request.cc.iter().flatten().cloned());
         all_recipients.extend(request.bcc.iter().flatten().cloned());
 
-        let suppressed = self
-            .suppression_service
-            .suppressed_among(&all_recipients)
-            .await?;
+        let suppressed = match domain.as_ref() {
+            Some(domain) => {
+                self.suppression_service
+                    .suppressed_among(domain.id, &all_recipients)
+                    .await?
+            }
+            None => Vec::new(),
+        };
 
         if !suppressed.is_empty() {
             info!(

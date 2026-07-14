@@ -2978,6 +2978,8 @@ export type CreateEmailProviderRequest = {
      * Cloud region. For SMTP this is informational only — the host/port carry the real routing.
      */
     region: string;
+    /** Exact SNS topic allowed to deliver SES events for this provider. */
+    sns_topic_arn?: string | null;
     scaleway_credentials?: null | ScalewayCredentialsRequest;
     ses_credentials?: null | SesCredentialsRequest;
     smtp_credentials?: null | SmtpCredentialsRequest;
@@ -5226,6 +5228,7 @@ export type EmailProviderResponse = {
     name: string;
     provider_type: EmailProviderTypeRoute;
     region: string;
+    sns_topic_arn?: string | null;
     updated_at: string;
 };
 
@@ -15694,6 +15697,8 @@ export type UpdateEmailProviderRequest = {
     is_active?: boolean | null;
     name?: string | null;
     region?: string | null;
+    /** Rotate the exact SNS topic allowed for this SES provider. */
+    sns_topic_arn?: string | null;
     scaleway_credentials?: null | ScalewayCredentialsRequest;
     ses_credentials?: null | SesCredentialsRequest;
     smtp_credentials?: null | SmtpCredentialsRequest;

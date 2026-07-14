@@ -75,6 +75,214 @@ async fn test_migration_up() -> anyhow::Result<()> {
     }
 }
 
+#[tokio::test]
+async fn test_secure_sns_migration_upgrades_applied_global_suppression_schema() -> anyhow::Result<()>
+{
+    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+        return Ok(());
+    }
+
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!("Skipping secure SNS migration test: Docker unavailable: {error}");
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db_url = format!("postgresql://postgres:postgres@localhost:{port}/postgres");
+    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    let db = connect_with_retries(&db_url).await?;
+
+    let target = "m20260714_000001_secure_sns_email_events";
+    let pre_target_count = Migrator::migrations()
+        .iter()
+        .position(|migration| migration.name() == target)
+        .expect("secure SNS migration must be registered");
+    Migrator::up(&db, Some(pre_target_count as u32)).await?;
+
+    db.execute_unprepared(
+        r#"
+        INSERT INTO email_providers (name, provider_type, region, credentials)
+            VALUES ('legacy-migration-test', 'ses', 'us-east-1', 'test');
+        INSERT INTO email_domains (provider_id, domain)
+            SELECT id, domain
+            FROM email_providers
+            CROSS JOIN (VALUES
+                ('legacy-one.example'), ('legacy-two.example')
+            ) AS domains(domain)
+            WHERE name = 'legacy-migration-test';
+        "#,
+    )
+    .await?;
+
+    // Reproduce the exact schema #296 installed before this PR changed it.
+    db.execute_unprepared(
+        r#"
+        DROP INDEX IF EXISTS idx_suppressed_recipients_domain_email;
+        ALTER TABLE suppressed_recipients ALTER COLUMN domain_id DROP NOT NULL;
+        ALTER TABLE suppressed_recipients
+            DROP CONSTRAINT IF EXISTS suppressed_recipients_domain_id_fkey;
+        ALTER TABLE suppressed_recipients
+            ADD CONSTRAINT suppressed_recipients_domain_id_fkey
+            FOREIGN KEY (domain_id) REFERENCES email_domains(id) ON DELETE SET NULL;
+        CREATE UNIQUE INDEX idx_suppressed_recipients_email
+            ON suppressed_recipients (email);
+        INSERT INTO suppressed_recipients (email, reason, domain_id)
+            VALUES ('legacy-unscoped@example.com', 'bounced', NULL);
+        "#,
+    )
+    .await?;
+
+    Migrator::up(&db, None).await?;
+
+    let nullable = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT is_nullable FROM information_schema.columns \
+             WHERE table_schema = current_schema() \
+               AND table_name = 'suppressed_recipients' \
+               AND column_name = 'domain_id'"
+                .to_string(),
+        ))
+        .await?
+        .expect("domain_id schema row");
+    let is_nullable: String = nullable.try_get("", "is_nullable")?;
+    assert_eq!(is_nullable, "NO");
+
+    let legacy_count = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*)::int AS count FROM suppressed_recipients \
+             WHERE domain_id IS NULL"
+                .to_string(),
+        ))
+        .await?
+        .expect("legacy suppression count");
+    let count: i32 = legacy_count.try_get("", "count")?;
+    assert_eq!(count, 0, "unscoped suppressions must gain domain ownership");
+
+    let expanded_count = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*)::int AS count FROM suppressed_recipients \
+             WHERE email = 'legacy-unscoped@example.com'"
+                .to_string(),
+        ))
+        .await?
+        .expect("expanded legacy suppression count");
+    let count: i32 = expanded_count.try_get("", "count")?;
+    assert_eq!(
+        count, 2,
+        "legacy global suppression must cover every existing domain"
+    );
+
+    let index = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT indexdef FROM pg_indexes \
+             WHERE schemaname = current_schema() \
+               AND indexname = 'idx_suppressed_recipients_domain_email'"
+                .to_string(),
+        ))
+        .await?
+        .expect("domain-scoped unique index");
+    let indexdef: String = index.try_get("", "indexdef")?;
+    assert!(indexdef.contains("UNIQUE"));
+    assert!(indexdef.contains("domain_id, email"));
+
+    // The legacy global unique index must be gone: the same recipient can be
+    // suppressed independently for two sending domains.
+    db.execute_unprepared(
+        r#"
+        INSERT INTO email_providers (name, provider_type, region, credentials)
+            VALUES ('migration-test', 'ses', 'us-east-1', 'test');
+        INSERT INTO email_domains (provider_id, domain)
+            SELECT id, domain
+            FROM email_providers
+            CROSS JOIN (VALUES ('one.example'), ('two.example')) AS domains(domain)
+            WHERE name = 'migration-test';
+        INSERT INTO suppressed_recipients (email, reason, domain_id)
+            SELECT 'shared@example.com', 'bounced', id
+            FROM email_domains
+            WHERE domain IN ('one.example', 'two.example');
+
+        WITH inserted_email AS (
+            INSERT INTO emails (
+                domain_id, from_address, to_addresses, subject,
+                provider_message_id
+            )
+            SELECT id, 'sender@one.example', '["shared@example.com"]'::jsonb,
+                   'migration rollback test', 'ses-message-id'
+            FROM email_domains
+            WHERE domain = 'one.example'
+            RETURNING id
+        )
+        INSERT INTO email_events (
+            email_id, event_type, provider_message_id, recipient,
+            idempotency_key
+        )
+        SELECT id, 'bounced', 'ses-message-id', recipient, idempotency_key
+        FROM inserted_email
+        CROSS JOIN (VALUES
+            ('first@example.com', repeat('a', 64)),
+            ('second@example.com', repeat('b', 64))
+        ) AS events(recipient, idempotency_key);
+        "#,
+    )
+    .await?;
+
+    let scoped_count = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*)::int AS count FROM suppressed_recipients \
+             WHERE email = 'shared@example.com'"
+                .to_string(),
+        ))
+        .await?
+        .expect("domain-scoped suppression count");
+    let count: i32 = scoped_count.try_get("", "count")?;
+    assert_eq!(count, 2);
+
+    Migrator::down(&db, Some(1)).await?;
+
+    let rollback_counts = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT \
+                (SELECT count(*)::int FROM suppressed_recipients \
+                 WHERE email = 'shared@example.com') AS suppressions, \
+                (SELECT count(*)::int FROM email_events \
+                 WHERE provider_message_id = 'ses-message-id') AS correlated_events, \
+                (SELECT count(*)::int FROM email_events \
+                 WHERE provider_message_id IS NULL) AS uncorrelated_events"
+                .to_string(),
+        ))
+        .await?
+        .expect("rollback compatibility counts");
+    let suppressions: i32 = rollback_counts.try_get("", "suppressions")?;
+    let correlated_events: i32 = rollback_counts.try_get("", "correlated_events")?;
+    let uncorrelated_events: i32 = rollback_counts.try_get("", "uncorrelated_events")?;
+    assert_eq!(
+        suppressions, 1,
+        "legacy global suppression must be restored"
+    );
+    assert_eq!(correlated_events, 1, "legacy correlation must stay unique");
+    assert_eq!(
+        uncorrelated_events, 1,
+        "duplicate event rows must be retained"
+    );
+
+    Ok(())
+}
+
 /// Test that migrations can be rolled back successfully
 #[tokio::test]
 async fn test_migration_down() -> anyhow::Result<()> {

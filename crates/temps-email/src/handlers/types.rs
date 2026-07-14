@@ -4,7 +4,7 @@ use crate::providers::{EmailProviderType, SmtpEncryption};
 use crate::services::{
     DomainService, EmailService, ProviderService, TrackingService, ValidationService,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use temps_core::AuditLogger;
@@ -143,6 +143,9 @@ pub struct CreateEmailProviderRequest {
     /// Cloud region. For SMTP this is informational only — the host/port carry the real routing.
     #[schema(example = "us-east-1")]
     pub region: String,
+    /// Exact SNS topic allowed to deliver SES events for this provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sns_topic_arn: Option<String>,
     /// AWS SES credentials (required if provider_type is ses)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ses_credentials: Option<SesCredentialsRequest>,
@@ -170,6 +173,14 @@ pub struct UpdateEmailProviderRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "us-east-1")]
     pub region: Option<String>,
+    /// Rotate or clear the exact SNS topic allowed for this SES provider.
+    /// Omit to preserve it, send `null` to clear it, or send a string to set it.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_optional",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub sns_topic_arn: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_active: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -180,6 +191,14 @@ pub struct UpdateEmailProviderRequest {
     pub smtp_credentials: Option<SmtpCredentialsRequest>,
 }
 
+fn deserialize_present_optional<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct EmailProviderResponse {
     pub id: i32,
@@ -188,6 +207,7 @@ pub struct EmailProviderResponse {
     pub provider_type: EmailProviderTypeRoute,
     #[schema(example = "us-east-1")]
     pub region: String,
+    pub sns_topic_arn: Option<String>,
     pub is_active: bool,
     /// Masked credentials for display
     pub credentials: serde_json::Value,
@@ -458,4 +478,27 @@ pub struct ListEmailsQuery {
     pub page: Option<u64>,
     #[schema(example = 20)]
     pub page_size: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UpdateEmailProviderRequest;
+
+    #[test]
+    fn update_provider_sns_topic_is_tri_state() {
+        let omitted: UpdateEmailProviderRequest =
+            serde_json::from_value(serde_json::json!({})).expect("omitted topic request");
+        assert_eq!(omitted.sns_topic_arn, None);
+
+        let cleared: UpdateEmailProviderRequest =
+            serde_json::from_value(serde_json::json!({ "sns_topic_arn": null }))
+                .expect("cleared topic request");
+        assert_eq!(cleared.sns_topic_arn, Some(None));
+
+        let topic = "arn:aws:sns:us-east-1:123456789012:temps-events";
+        let rotated: UpdateEmailProviderRequest =
+            serde_json::from_value(serde_json::json!({ "sns_topic_arn": topic }))
+                .expect("rotated topic request");
+        assert_eq!(rotated.sns_topic_arn, Some(Some(topic.to_string())));
+    }
 }

@@ -28,10 +28,14 @@ impl MigrationTrait for Migration {
             .get_connection()
             .execute_unprepared(
                 r#"
-                UPDATE email_events SET event_type = 'opened' WHERE event_type = 'open';
-                UPDATE email_events SET event_type = 'clicked' WHERE event_type = 'click';
-                UPDATE email_events SET event_type = 'bounced' WHERE event_type = 'bounce';
-                UPDATE email_events SET event_type = 'complained' WHERE event_type = 'complaint';
+                UPDATE email_events
+                SET event_type = CASE event_type
+                    WHEN 'open' THEN 'opened'
+                    WHEN 'click' THEN 'clicked'
+                    WHEN 'bounce' THEN 'bounced'
+                    WHEN 'complaint' THEN 'complained'
+                END
+                WHERE event_type IN ('open', 'click', 'bounce', 'complaint');
                 "#,
             )
             .await?;
@@ -47,10 +51,14 @@ impl MigrationTrait for Migration {
             .get_connection()
             .execute_unprepared(
                 r#"
-                UPDATE email_events SET event_type = 'open' WHERE event_type = 'opened';
-                UPDATE email_events SET event_type = 'click' WHERE event_type = 'clicked';
-                UPDATE email_events SET event_type = 'bounce' WHERE event_type = 'bounced';
-                UPDATE email_events SET event_type = 'complaint' WHERE event_type = 'complained';
+                UPDATE email_events
+                SET event_type = CASE event_type
+                    WHEN 'opened' THEN 'open'
+                    WHEN 'clicked' THEN 'click'
+                    WHEN 'bounced' THEN 'bounce'
+                    WHEN 'complained' THEN 'complaint'
+                END
+                WHERE event_type IN ('opened', 'clicked', 'bounced', 'complained');
                 "#,
             )
             .await?;

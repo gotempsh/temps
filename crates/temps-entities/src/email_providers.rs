@@ -16,6 +16,8 @@ pub struct Model {
     pub region: String,
     /// Encrypted JSON with provider credentials
     pub credentials: String,
+    /// Exact AWS SNS topic authorized to deliver this SES provider's events.
+    pub sns_topic_arn: Option<String>,
     pub is_active: bool,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,

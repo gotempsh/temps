@@ -15,9 +15,9 @@ pub struct Model {
     pub email: String,
     /// "bounced" | "complained" | "manual"
     pub reason: String,
-    /// Which domain's send triggered this, if known. Diagnostic only —
-    /// suppression is enforced globally, not scoped to one sending domain.
-    pub domain_id: Option<i32>,
+    /// Sending-domain boundary for this suppression. The same address may be
+    /// independently suppressed (or restored) for different tenants.
+    pub domain_id: i32,
     pub detail: Option<String>,
     pub created_at: DBDateTime,
 }

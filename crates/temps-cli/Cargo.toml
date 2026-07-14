@@ -48,6 +48,7 @@ temps-dns = { path = "../temps-dns" }
 temps-network = { path = "../temps-network" }
 temps-domains = { path = "../temps-domains" }
 temps-email = { path = "../temps-email" }
+temps-email-tracking = { path = "../temps-email-tracking" }
 temps-entities = { path = "../temps-entities" }
 temps-environments = { path = "../temps-environments" }
 temps-error-tracking = { path = "../temps-error-tracking" }

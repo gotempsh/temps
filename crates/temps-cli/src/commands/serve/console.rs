@@ -1513,6 +1513,11 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let email_plugin = Box::new(EmailPlugin::new());
     plugin_manager.register_plugin(email_plugin);
 
+    // Must follow EmailPlugin: tracking uses the email schema/services for
+    // recipient correlation and domain-scoped bounce suppression.
+    let email_tracking_plugin = Box::new(temps_email_tracking::EmailTrackingPlugin::new());
+    plugin_manager.register_plugin(email_tracking_plugin);
+
     // 7.5. WebhooksPlugin - provides webhook delivery and management (depends on database and encryption)
     debug!("Registering WebhooksPlugin");
     let webhooks_plugin = Box::new(WebhooksPlugin::new());

@@ -3,7 +3,8 @@
 //! nothing stopped a permanently-bad or complained address from being
 //! emailed again on the next send, which is exactly the pattern that gets a
 //! sending domain's reputation downgraded by receiving mail providers.
-//! Enforced globally (not per sending domain) in `EmailService::send`.
+//! Enforced per sending domain in `EmailService::send`. A recipient bouncing
+//! for one tenant/domain must never block another tenant from contacting it.
 
 use sea_orm_migration::prelude::*;
 
@@ -26,13 +27,13 @@ impl MigrationTrait for Migration {
                     id SERIAL PRIMARY KEY,
                     email TEXT NOT NULL,
                     reason TEXT NOT NULL,
-                    domain_id INTEGER REFERENCES email_domains(id) ON DELETE SET NULL,
+                    domain_id INTEGER NOT NULL REFERENCES email_domains(id) ON DELETE CASCADE,
                     detail TEXT,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
                 );
 
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_suppressed_recipients_email
-                    ON suppressed_recipients (email);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_suppressed_recipients_domain_email
+                    ON suppressed_recipients (domain_id, email);
                 "#,
             )
             .await?;

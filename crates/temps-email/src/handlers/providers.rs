@@ -125,10 +125,11 @@ pub async fn create_email_provider(
         region: request.region.clone(),
         credentials,
     };
+    let sns_topic_arn = request.sns_topic_arn.clone();
 
     let provider = state
         .provider_service
-        .create(create_request)
+        .create_with_sns_topic(create_request, sns_topic_arn)
         .await
         .map_err(|e| {
             error!("Failed to create email provider: {}", e);
@@ -175,6 +176,7 @@ pub async fn create_email_provider(
             .map(EmailProviderTypeRoute::from)
             .unwrap_or(EmailProviderTypeRoute::Ses),
         region: provider.region,
+        sns_topic_arn: provider.sns_topic_arn,
         is_active: provider.is_active,
         credentials: masked_credentials,
         created_at: provider.created_at.to_rfc3339(),
@@ -225,6 +227,7 @@ pub async fn list_email_providers(
                     .map(EmailProviderTypeRoute::from)
                     .unwrap_or(EmailProviderTypeRoute::Ses),
                 region: p.region,
+                sns_topic_arn: p.sns_topic_arn,
                 is_active: p.is_active,
                 credentials: masked_credentials,
                 created_at: p.created_at.to_rfc3339(),
@@ -277,6 +280,7 @@ pub async fn get_email_provider(
             .map(EmailProviderTypeRoute::from)
             .unwrap_or(EmailProviderTypeRoute::Ses),
         region: provider.region,
+        sns_topic_arn: provider.sns_topic_arn,
         is_active: provider.is_active,
         credentials: masked_credentials,
         created_at: provider.created_at.to_rfc3339(),
@@ -403,6 +407,7 @@ pub async fn update_email_provider(
         }
     };
 
+    let sns_topic_arn = request.sns_topic_arn;
     let update_request = UpdateProviderRequest {
         name: request.name,
         region: request.region,
@@ -412,7 +417,7 @@ pub async fn update_email_provider(
 
     let outcome = state
         .provider_service
-        .update(id, update_request)
+        .update_with_sns_topic(id, update_request, sns_topic_arn)
         .await
         .map_err(|e: crate::errors::EmailError| -> Problem {
             error!("Failed to update email provider {}: {}", id, e);
@@ -452,6 +457,7 @@ pub async fn update_email_provider(
             .map(EmailProviderTypeRoute::from)
             .unwrap_or(EmailProviderTypeRoute::Ses),
         region: provider.region,
+        sns_topic_arn: provider.sns_topic_arn,
         is_active: provider.is_active,
         credentials: masked_credentials,
         created_at: provider.created_at.to_rfc3339(),

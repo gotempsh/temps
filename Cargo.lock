@@ -11244,6 +11244,7 @@ dependencies = [
  "temps-domains",
  "temps-edge",
  "temps-email",
+ "temps-email-tracking",
  "temps-entities",
  "temps-environments",
  "temps-error-tracking",
