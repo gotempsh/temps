@@ -17,9 +17,7 @@ use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
 use crate::handlers::{self, dns_sync::DnsSyncAppState, DnsApiDoc, DnsAppState};
-use crate::services::{
-    DnsProviderService, DnsRecordService, DnsRegistry, ManagedDnsRecordService,
-};
+use crate::services::{DnsProviderService, DnsRecordService, DnsRegistry, ManagedDnsRecordService};
 
 /// DNS Plugin for managing DNS providers and automatic DNS record configuration
 pub struct DnsPlugin;

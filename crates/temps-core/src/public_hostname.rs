@@ -61,7 +61,12 @@ impl PublicHostnameStrategy {
     /// Per-service public host. This is the only layout that differs between
     /// strategies: Standard yields `{service}-{environment}.base`, Flat yields
     /// `{environment}-{service}.base`.
-    pub fn service_hostname(self, preview_domain: &str, environment: &str, service: &str) -> String {
+    pub fn service_hostname(
+        self,
+        preview_domain: &str,
+        environment: &str,
+        service: &str,
+    ) -> String {
         let base = normalize_base_domain(preview_domain);
         let raw = match self {
             PublicHostnameStrategy::Standard => format!("{service}-{environment}.{base}"),

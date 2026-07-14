@@ -136,7 +136,8 @@ pub async fn compute_hostname_changes(
     if target == PublicHostnameStrategy::Standard {
         return Vec::new();
     }
-    let before = enumerate_generated_hosts(db, preview_domain, PublicHostnameStrategy::Standard).await;
+    let before =
+        enumerate_generated_hosts(db, preview_domain, PublicHostnameStrategy::Standard).await;
     let after = enumerate_generated_hosts(db, preview_domain, target).await;
 
     before
@@ -297,7 +298,10 @@ mod tests {
     #[test]
     fn desired_content_picks_record_type() {
         assert!(matches!(desired_content("192.0.2.1").0, DnsRecordType::A));
-        assert!(matches!(desired_content("2001:db8::1").0, DnsRecordType::AAAA));
+        assert!(matches!(
+            desired_content("2001:db8::1").0,
+            DnsRecordType::AAAA
+        ));
         assert!(matches!(
             desired_content("edge.temps.sh").0,
             DnsRecordType::CNAME
@@ -306,15 +310,24 @@ mod tests {
 
     #[test]
     fn relative_name_strips_suffix() {
-        assert_eq!(relative_name("api-staging.example.com", ".example.com"), "api-staging");
+        assert_eq!(
+            relative_name("api-staging.example.com", ".example.com"),
+            "api-staging"
+        );
         assert_eq!(relative_name("example.com", ".example.com"), "@");
     }
 
     #[test]
     fn generated_candidate_excludes_apex_and_deep_names() {
-        assert!(is_generated_candidate("api-staging.example.com", ".example.com"));
+        assert!(is_generated_candidate(
+            "api-staging.example.com",
+            ".example.com"
+        ));
         assert!(!is_generated_candidate("example.com", ".example.com"));
         // Deep (nested) names are not single-label generated candidates.
-        assert!(!is_generated_candidate("api.staging.example.com", ".example.com"));
+        assert!(!is_generated_candidate(
+            "api.staging.example.com",
+            ".example.com"
+        ));
     }
 }
