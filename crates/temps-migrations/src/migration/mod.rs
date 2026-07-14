@@ -149,6 +149,7 @@ mod m20260711_000001_normalize_email_event_types;
 mod m20260711_000002_add_ip_geolocations_hosting_provider;
 mod m20260711_000002_create_suppressed_recipients;
 mod m20260711_000003_add_visitor_non_crawler_partial_index;
+mod m20260713_000001_add_mfa_pending_to_sessions;
 
 pub struct Migrator;
 
@@ -303,6 +304,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260711_000002_add_ip_geolocations_hosting_provider::Migration),
             Box::new(m20260711_000002_create_suppressed_recipients::Migration),
             Box::new(m20260711_000003_add_visitor_non_crawler_partial_index::Migration),
+            Box::new(m20260713_000001_add_mfa_pending_to_sessions::Migration),
         ]
     }
 }

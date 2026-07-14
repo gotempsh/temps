@@ -1413,7 +1413,14 @@ impl GithubAppService {
             let code_bytes = result.into_bytes();
             let expected_signature = format!("sha256={}", hex::encode(code_bytes));
 
-            if original_signature == expected_signature {
+            // Constant-time comparison to avoid a timing side-channel that could
+            // leak the expected signature byte-by-byte (security review finding #14).
+            use subtle::ConstantTimeEq;
+            if original_signature
+                .as_bytes()
+                .ct_eq(expected_signature.as_bytes())
+                .into()
+            {
                 debug!("Valid signature for GitHub App: {}", github_app.name);
                 return Ok(());
             }

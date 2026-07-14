@@ -218,7 +218,6 @@ export function CodeBlock({
           if ((char === '"' || char === "'") && !inString) {
             if (current) {
               tokens.push(renderPythonToken(current, keywords, builtins))
-              current = ''
             }
             inString = true
             stringChar = char
@@ -416,7 +415,6 @@ export function CodeBlock({
           if ((char === '"' || char === "'" || char === '`') && !inString) {
             if (current) {
               tokens.push(renderToken(current, keywords, types))
-              current = ''
             }
             inString = true
             stringChar = char
@@ -567,7 +565,6 @@ export function CodeBlock({
           if ((char === '"' || char === "'" || char === '`') && !inString) {
             if (current) {
               tokens.push(renderGoToken(current, keywords, types))
-              current = ''
             }
             inString = true
             stringChar = char

@@ -76,6 +76,43 @@ pub(crate) fn postgres_healthcheck_cmd(username: &str, database: &str) -> String
     )
 }
 
+fn walg_target_user_data(backup: &temps_entities::backups::Model) -> Result<Option<String>> {
+    let metadata: serde_json::Value = serde_json::from_str(&backup.metadata)
+        .with_context(|| format!("Backup {} has invalid metadata JSON", backup.backup_id))?;
+    let Some(version) = metadata.get("walg_identity_version") else {
+        return Ok(None);
+    };
+    if version.as_u64() != Some(1) {
+        return Err(anyhow::anyhow!(
+            "Backup {} uses unsupported WAL-G identity version {}",
+            backup.backup_id,
+            version
+        ));
+    }
+    let value = metadata.get("walg_target_user_data").ok_or_else(|| {
+        anyhow::anyhow!(
+            "Backup {} is missing its WAL-G target user data",
+            backup.backup_id
+        )
+    })?;
+    if value
+        .get("temps_backup_id")
+        .and_then(serde_json::Value::as_str)
+        != Some(backup.backup_id.as_str())
+    {
+        return Err(anyhow::anyhow!(
+            "Backup {} has WAL-G target user data for a different backup",
+            backup.backup_id
+        ));
+    }
+    Ok(Some(serde_json::to_string(value).with_context(|| {
+        format!(
+            "Failed to serialize WAL-G target user data for backup {}",
+            backup.backup_id
+        )
+    })?))
+}
+
 /// Validate a PostgreSQL role/username before it is interpolated into a
 /// shell command or SQL. Allows only `[A-Za-z0-9_]` (the realistic role-name
 /// charset), non-empty, and at most 63 bytes.
@@ -1613,6 +1650,7 @@ impl PostgresService {
         walg_s3_prefix: &str,
         service_config: ServiceConfig,
         recovery_target: Option<&super::RecoveryTarget>,
+        target_user_data: Option<&str>,
     ) -> Result<()> {
         use bollard::exec::CreateExecOptions;
 
@@ -1647,6 +1685,9 @@ impl PostgresService {
         if s3_credentials.force_path_style {
             walg_env.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
         }
+        if let Some(target_user_data) = target_user_data {
+            walg_env.push(format!("WALG_FETCH_TARGET_USER_DATA={target_user_data}"));
+        }
 
         use bollard::exec::StartExecOptions;
         let walg_env_refs: Vec<&str> = walg_env.iter().map(|s| s.as_str()).collect();
@@ -1661,8 +1702,13 @@ impl PostgresService {
         // paths on that volume — not the original container's writable layer.
         info!("Fetching WAL-G backup to temporary directory on shared volume");
         let restore_temp = "/var/lib/postgresql/restore_temp";
+        let fetch_target = if target_user_data.is_some() {
+            "--target-user-data \"$WALG_FETCH_TARGET_USER_DATA\""
+        } else {
+            "LATEST"
+        };
         let fetch_cmd_str = format!(
-            "mkdir -p {restore_temp} && rm -rf {restore_temp}/* && wal-g backup-fetch {restore_temp} LATEST > /tmp/walg_restore.log 2>&1"
+            "mkdir -p {restore_temp} && rm -rf {restore_temp}/* && wal-g backup-fetch {restore_temp} {fetch_target} > /tmp/walg_restore.log 2>&1"
         );
         let fetch_cmd = vec!["sh", "-c", &fetch_cmd_str];
 
@@ -3300,12 +3346,34 @@ impl ExternalService for PostgresService {
         // Detect if this is a WAL-G backup (s3:// prefix) or a legacy backup (.sql.gz / .pgdump.gz)
         if backup_location.starts_with("s3://") {
             // WAL-G backup: use wal-g backup-fetch
-            self.restore_from_walg(s3_credentials, backup_location, service_config, None)
+            self.restore_from_walg(s3_credentials, backup_location, service_config, None, None)
                 .await
         } else {
             // Legacy backup: fall back to old psql/pg_restore approach
             self.restore_from_legacy(s3_client, backup_location, s3_source, service_config)
                 .await
+        }
+    }
+
+    async fn restore_in_place(&self, ctx: super::RestoreContext<'_>) -> Result<()> {
+        if ctx.backup_location.starts_with("s3://") {
+            let target_user_data = walg_target_user_data(ctx.backup)?;
+            self.restore_from_walg(
+                ctx.s3_credentials,
+                ctx.backup_location,
+                ctx.source_config,
+                None,
+                target_user_data.as_deref(),
+            )
+            .await
+        } else {
+            self.restore_from_legacy(
+                ctx.s3_client,
+                ctx.backup_location,
+                ctx.s3_source,
+                ctx.source_config,
+            )
+            .await
         }
     }
 
@@ -3683,12 +3751,14 @@ impl ExternalService for PostgresService {
 
         // Dispatch to the same WAL-G / legacy paths used for in-place restore.
         if ctx.backup_location.starts_with("s3://") {
+            let target_user_data = walg_target_user_data(ctx.backup)?;
             new_service
                 .restore_from_walg(
                     ctx.s3_credentials,
                     ctx.backup_location,
                     new_service_config,
                     None,
+                    target_user_data.as_deref(),
                 )
                 .await?;
         } else {
@@ -3784,12 +3854,14 @@ impl ExternalService for PostgresService {
                 })?,
             };
 
+            let target_user_data = walg_target_user_data(ctx.backup)?;
             new_service
                 .restore_from_walg(
                     ctx.s3_credentials,
                     ctx.backup_location,
                     new_service_config,
                     Some(&target),
+                    target_user_data.as_deref(),
                 )
                 .await?;
 
@@ -3820,11 +3892,13 @@ impl ExternalService for PostgresService {
             }))
         } else {
             // In-place PITR — replay the WAL onto the existing container.
+            let target_user_data = walg_target_user_data(ctx.backup)?;
             self.restore_from_walg(
                 ctx.s3_credentials,
                 ctx.backup_location,
                 ctx.source_config.clone(),
                 Some(&target),
+                target_user_data.as_deref(),
             )
             .await?;
             Ok(None)
@@ -3837,6 +3911,62 @@ mod tests {
     use super::*;
 
     use crate::externalsvc::DEPLOYMENT_MODE_MUTEX as ENV_MUTEX;
+
+    fn backup_with_metadata(metadata: serde_json::Value) -> temps_entities::backups::Model {
+        temps_entities::backups::Model {
+            id: 1,
+            name: "backup".into(),
+            backup_id: "selected-backup".into(),
+            schedule_id: None,
+            schedule_run_id: None,
+            backup_type: "external_service".into(),
+            state: "completed".into(),
+            started_at: chrono::Utc::now(),
+            finished_at: Some(chrono::Utc::now()),
+            size_bytes: None,
+            file_count: None,
+            s3_source_id: 1,
+            s3_location: "s3://bucket/repository".into(),
+            error_message: None,
+            metadata: metadata.to_string(),
+            checksum: None,
+            compression_type: "lz4".into(),
+            created_by: 1,
+            expires_at: None,
+            tags: "[]".into(),
+        }
+    }
+
+    #[test]
+    fn walg_restore_selector_uses_persisted_backup_identity() {
+        let backup = backup_with_metadata(serde_json::json!({
+            "walg_identity_version": 1,
+            "walg_target_user_data": {"temps_backup_id": "selected-backup"}
+        }));
+        assert_eq!(
+            walg_target_user_data(&backup).expect("valid metadata should parse"),
+            Some(r#"{"temps_backup_id":"selected-backup"}"#.to_string())
+        );
+    }
+
+    #[test]
+    fn walg_restore_selector_rejects_incomplete_identity_metadata() {
+        let backup = backup_with_metadata(serde_json::json!({"walg_identity_version": 1}));
+        let error = walg_target_user_data(&backup).expect_err("missing selector must fail closed");
+        assert!(error
+            .to_string()
+            .contains("missing its WAL-G target user data"));
+    }
+
+    #[test]
+    fn walg_restore_selector_rejects_mismatched_backup_identity() {
+        let backup = backup_with_metadata(serde_json::json!({
+            "walg_identity_version": 1,
+            "walg_target_user_data": {"temps_backup_id": "different-backup"}
+        }));
+        let error = walg_target_user_data(&backup).expect_err("mismatched selector must fail");
+        assert!(error.to_string().contains("for a different backup"));
+    }
 
     #[test]
     fn healthcheck_cmd_pins_database_when_it_differs_from_username() {

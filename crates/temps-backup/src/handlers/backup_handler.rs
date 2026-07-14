@@ -1,15 +1,16 @@
 use crate::engines::dispatch::{resolve_engine_key, ResolveEngineError};
 use crate::handlers::audit::{
-    AuditContext, BackupRunAudit, BackupScheduleStatusChangedAudit, BackupScheduleUpdatedAudit,
-    ExternalServiceBackupRunAudit, S3SourceCreatedAudit, S3SourceDeletedAudit,
-    S3SourceUpdatedAudit, ScheduleRunNowAudit, ScheduleServiceDetachedAudit,
-    ScheduleServicesAttachedAudit,
+    AuditContext, BackupDeletedAudit, BackupRetentionCleanupAudit, BackupRunAudit,
+    BackupScheduleStatusChangedAudit, BackupScheduleUpdatedAudit, ExternalServiceBackupRunAudit,
+    S3SourceCreatedAudit, S3SourceDeletedAudit, S3SourceUpdatedAudit, ScheduleRunNowAudit,
+    ScheduleServiceDetachedAudit, ScheduleServicesAttachedAudit,
 };
 use crate::handlers::types::BackupAppState;
 use crate::services::BackupTriggerParams;
 use crate::services::{
-    BackupError, ChildBackupEntry, EnqueuedJob, ScheduleRunEntry, ScheduleRunJobEntry,
-    ScheduleRunListResponse, ScheduleRunResponse, ScheduleRunSummary, ScheduleRunSummaryList,
+    BackupError, ChildBackupEntry, EnqueuedJob, RetentionCleanupReport, ScheduleRunEntry,
+    ScheduleRunJobEntry, ScheduleRunListResponse, ScheduleRunResponse, ScheduleRunSummary,
+    ScheduleRunSummaryList,
 };
 use axum::{
     extract::{Extension, Path, State},
@@ -76,15 +77,33 @@ impl From<BackupError> for Problem {
                     ))
             }
 
+            BackupError::BackupNotTerminal { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Backup Is Still Running")
+                .with_detail(error.to_string()),
+
+            BackupError::BackupHasRestoreHistory { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Backup Is Referenced By Restore History")
+                    .with_detail(error.to_string())
+            }
+
+            BackupError::CleanupPreviewStale { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Cleanup Preview Is Stale")
+                .with_detail(error.to_string()),
+
+            BackupError::Unsupported(_) => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Backup Cannot Be Safely Deleted")
+                .with_detail(error.to_string()),
+
             BackupError::Database(_)
             | BackupError::S3(_)
             | BackupError::Configuration(_)
             | BackupError::ExternalService(_)
             | BackupError::Internal { .. }
             | BackupError::NotificationError(_)
-            | BackupError::Unsupported(_)
             | BackupError::Io(_)
-            | BackupError::Serialization(_) => {
+            | BackupError::Serialization(_)
+            | BackupError::PartialDeletion { .. } => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
                     .with_detail(error.to_string())
@@ -118,6 +137,8 @@ impl From<BackupError> for Problem {
         list_source_backups,
         list_external_service_backups,
         get_backup,
+        delete_backup,
+        cleanup_expired_backups,
         list_backup_children,
         disable_backup_schedule,
         enable_backup_schedule,
@@ -157,6 +178,7 @@ impl From<BackupError> for Problem {
             ScheduleRunResponse,
             EnqueuedJob,
             CancelBackupResponse,
+            RetentionCleanupReport,
             ChildBackupEntryResponse,
             ChildBackupListResponse,
             AttachScheduleServicesRequest,
@@ -1249,7 +1271,8 @@ pub fn configure_routes() -> Router<Arc<BackupAppState>> {
             "/backups/external-services/{id}/backups",
             get(list_external_service_backups),
         )
-        .route("/backups/{id}", get(get_backup))
+        .route("/backups/cleanup", post(cleanup_expired_backups))
+        .route("/backups/{id}", get(get_backup).delete(delete_backup))
         .route("/backups/{id}/children", get(list_backup_children))
         .route(
             "/backups/schedules/{id}/disable",
@@ -2085,6 +2108,253 @@ async fn run_backup_for_source(
     );
 
     Ok((StatusCode::ACCEPTED, Json(BackupResponse::from(backup))).into_response())
+}
+
+/// Permanently delete one terminal backup from object storage and the database.
+#[utoipa::path(
+    tag = "Backups",
+    delete,
+    path = "/backups/{id}",
+    params(("id" = String, Path, description = "Backup UUID")),
+    responses(
+        (status = 204, description = "Backup deleted"),
+        (status = 400, description = "Backup artifact cannot be safely attributed", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 404, description = "Backup not found", body = ProblemDetails),
+        (status = 409, description = "Backup is running, referenced, or lacks safe artifact identity", body = ProblemDetails),
+        (status = 500, description = "Object storage or database error", body = ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn delete_backup(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<BackupAppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, BackupsDelete);
+
+    let existing = app_state
+        .backup_service
+        .get_backup(&id)
+        .await
+        .map_err(Problem::from)?
+        .ok_or_else(|| {
+            Problem::from(BackupError::NotFound {
+                resource: "Backup".to_string(),
+                detail: format!("backup id {}", id),
+            })
+        })?;
+    let audit_context = AuditContext {
+        user_id: auth.user_id(),
+        ip_address: Some(metadata.ip_address.clone()),
+        user_agent: metadata.user_agent.clone(),
+    };
+    let attempted = BackupDeletedAudit {
+        context: audit_context.clone(),
+        backup_id: existing.backup_id.clone(),
+        s3_source_id: existing.s3_source_id,
+        s3_location: existing.s3_location.clone(),
+        outcome: "attempted".to_string(),
+        failure_reason: None,
+        deleted_objects: 0,
+    };
+    if let Err(e) = app_state.audit_service.create_audit_log(&attempted).await {
+        error!(error = %e, "Failed to create backup deletion attempt audit log");
+        return Err(Problem::from(BackupError::Internal {
+            message: format!(
+                "Refusing to delete backup {} because the audit attempt could not be recorded: {}",
+                id, e
+            ),
+        }));
+    }
+
+    let (deleted, deleted_objects) = match app_state.backup_service.delete_backup(&id).await {
+        Ok(result) => result,
+        Err(error) => {
+            let (outcome, deleted_objects) = match &error {
+                BackupError::PartialDeletion {
+                    deleted_objects, ..
+                } => ("partial", *deleted_objects),
+                _ => ("failed", 0),
+            };
+            let failed = BackupDeletedAudit {
+                context: audit_context,
+                backup_id: existing.backup_id,
+                s3_source_id: existing.s3_source_id,
+                s3_location: existing.s3_location,
+                outcome: outcome.to_string(),
+                failure_reason: Some(error.to_string()),
+                deleted_objects,
+            };
+            if let Err(audit_error) = app_state.audit_service.create_audit_log(&failed).await {
+                error!(error = %audit_error, "Failed to create backup deletion failure audit log");
+            }
+            return Err(Problem::from(error));
+        }
+    };
+
+    let audit = BackupDeletedAudit {
+        context: audit_context,
+        backup_id: deleted.backup_id,
+        s3_source_id: deleted.s3_source_id,
+        s3_location: deleted.s3_location,
+        outcome: "completed".to_string(),
+        failure_reason: None,
+        deleted_objects,
+    };
+    if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
+        error!(error = %e, "Failed to create backup deletion audit log");
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
+struct CleanupExpiredBackupsParams {
+    /// Return the backups selected by retention without deleting anything.
+    #[serde(default)]
+    dry_run: bool,
+    /// Limit cleanup to one backup schedule.
+    schedule_id: Option<i32>,
+}
+
+#[derive(Debug, Default, Deserialize, ToSchema)]
+struct CleanupExpiredBackupsRequest {
+    /// Exact candidates returned by the dry run. Execution fails if the
+    /// retention selection has changed since preview.
+    expected_backup_ids: Option<Vec<String>>,
+}
+
+/// Preview or run retention using each selected schedule's configured retention days.
+#[utoipa::path(
+    tag = "Backups",
+    post,
+    path = "/backups/cleanup",
+    params(CleanupExpiredBackupsParams),
+    request_body = CleanupExpiredBackupsRequest,
+    responses(
+        (status = 200, description = "Retention cleanup completed", body = RetentionCleanupReport),
+        (status = 400, description = "Missing or invalid preview candidate list", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 404, description = "Schedule or backup not found", body = ProblemDetails),
+        (status = 409, description = "Cleanup preview is stale", body = ProblemDetails),
+        (status = 500, description = "Cleanup could not be started", body = ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn cleanup_expired_backups(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<BackupAppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    axum::extract::Query(params): axum::extract::Query<CleanupExpiredBackupsParams>,
+    request: Option<Json<CleanupExpiredBackupsRequest>>,
+) -> Result<impl IntoResponse, Problem> {
+    if params.dry_run {
+        permission_guard!(auth, BackupsRead);
+        let report = app_state
+            .backup_service
+            .preview_retention(params.schedule_id)
+            .await?;
+        return Ok(Json(report));
+    }
+
+    permission_guard!(auth, BackupsDelete);
+
+    let expected_backup_ids = request
+        .as_ref()
+        .and_then(|body| body.expected_backup_ids.as_deref())
+        .ok_or_else(|| {
+            Problem::from(BackupError::Validation(
+                "Destructive cleanup requires expected_backup_ids from a dry-run preview"
+                    .to_string(),
+            ))
+        })?;
+
+    let audit_context = AuditContext {
+        user_id: auth.user_id(),
+        ip_address: Some(metadata.ip_address.clone()),
+        user_agent: metadata.user_agent.clone(),
+    };
+    let attempted = BackupRetentionCleanupAudit {
+        context: audit_context.clone(),
+        requested_backup_ids: expected_backup_ids.to_vec(),
+        requested_backup_ids_truncated: false,
+        expired: 0,
+        deleted: 0,
+        failed: 0,
+        deleted_backup_ids: Vec::new(),
+        deleted_backup_ids_truncated: false,
+        partially_deleted_backup_ids: Vec::new(),
+        partially_deleted_backup_ids_truncated: false,
+        outcome: "attempted".to_string(),
+        failure_reason: None,
+    };
+    if let Err(e) = app_state.audit_service.create_audit_log(&attempted).await {
+        error!(error = %e, "Failed to create retention cleanup attempt audit log");
+        return Err(Problem::from(BackupError::Internal {
+            message: format!(
+                "Refusing to run backup cleanup because the audit attempt could not be recorded: {}",
+                e
+            ),
+        }));
+    }
+
+    let report = match app_state
+        .backup_service
+        .enforce_retention(params.schedule_id, Some(expected_backup_ids))
+        .await
+    {
+        Ok(report) => report,
+        Err(error) => {
+            let failed = BackupRetentionCleanupAudit {
+                context: audit_context,
+                requested_backup_ids: expected_backup_ids.to_vec(),
+                requested_backup_ids_truncated: false,
+                expired: 0,
+                deleted: 0,
+                failed: 1,
+                deleted_backup_ids: Vec::new(),
+                deleted_backup_ids_truncated: false,
+                partially_deleted_backup_ids: Vec::new(),
+                partially_deleted_backup_ids_truncated: false,
+                outcome: "failed".to_string(),
+                failure_reason: Some(error.to_string()),
+            };
+            if let Err(audit_error) = app_state.audit_service.create_audit_log(&failed).await {
+                error!(error = %audit_error, "Failed to create retention cleanup failure audit log");
+            }
+            return Err(Problem::from(error));
+        }
+    };
+
+    let audit = BackupRetentionCleanupAudit {
+        context: audit_context,
+        requested_backup_ids: expected_backup_ids.to_vec(),
+        requested_backup_ids_truncated: false,
+        expired: report.expired,
+        deleted: report.deleted,
+        failed: report.failed,
+        deleted_backup_ids: report.deleted_backup_ids.clone(),
+        deleted_backup_ids_truncated: report.deleted_backup_ids_truncated,
+        partially_deleted_backup_ids: report.partially_deleted_backup_ids.clone(),
+        partially_deleted_backup_ids_truncated: report.partially_deleted_backup_ids_truncated,
+        outcome: if report.failed == 0 {
+            "completed".to_string()
+        } else if report.deleted > 0 || !report.partially_deleted_backup_ids.is_empty() {
+            "partial".to_string()
+        } else {
+            "failed".to_string()
+        },
+        failure_reason: None,
+    };
+    if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
+        error!(error = %e, "Failed to create retention cleanup audit log");
+    }
+
+    Ok(Json(report))
 }
 
 /// Get a backup by ID

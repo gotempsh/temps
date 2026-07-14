@@ -34,7 +34,6 @@ use async_trait::async_trait;
 use sea_orm::{DatabaseConnection, EntityTrait};
 use serde_json::{json, Value};
 use tracing::{info, warn};
-use uuid::Uuid;
 
 use super::mariadb_exec::{exec_stream_stdout_to_file, parse_binlog_position};
 use super::v2_common;
@@ -109,7 +108,7 @@ impl BackupEngine for MariadbPhysicalEngine {
         .await?;
         v2_common::assert_bucket_reachable(&s3_client, &s3_source.bucket_name).await?;
 
-        let backup_uuid = Uuid::new_v4().to_string();
+        let backup_uuid = v2_common::load_backup_uuid(deps.db.as_ref(), backup_id).await?;
         let s3_key = v2_common::build_external_service_s3_key(
             &s3_source.bucket_path,
             "mariadb",

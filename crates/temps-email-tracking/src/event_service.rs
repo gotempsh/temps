@@ -49,7 +49,9 @@ fn is_provider_message_id_violation(error: &sea_orm::DbErr) -> bool {
     if matches!(error, sea_orm::DbErr::RecordNotInserted) {
         return true;
     }
-    error.to_string().contains("idx_email_events_provider_msg_id")
+    error
+        .to_string()
+        .contains("idx_email_events_provider_msg_id")
 }
 
 impl EmailEventService {

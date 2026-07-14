@@ -259,7 +259,10 @@ mod tests {
     #[tokio::test]
     async fn suppressed_among_empty_input_short_circuits() {
         let (_db, service) = setup().await;
-        assert_eq!(service.suppressed_among(&[]).await.unwrap(), Vec::<String>::new());
+        assert_eq!(
+            service.suppressed_among(&[]).await.unwrap(),
+            Vec::<String>::new()
+        );
     }
 
     #[tokio::test]

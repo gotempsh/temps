@@ -303,7 +303,11 @@ async fn ses_webhook_handler(State(state): State<Arc<TrackingState>>, body: Stri
                         };
                         let detail = format!(
                             "SES {} for message {}",
-                            if is_complaint { "complaint" } else { "permanent bounce" },
+                            if is_complaint {
+                                "complaint"
+                            } else {
+                                "permanent bounce"
+                            },
                             provider_message_id
                         );
                         if let Err(e) = suppression_service

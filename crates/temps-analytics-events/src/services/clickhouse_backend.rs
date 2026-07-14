@@ -890,6 +890,59 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
         &self,
         q: UniqueCountsSpec,
     ) -> Result<UniqueCountsResponse, EventsError> {
+        let env_filter_flag: i32 = q.scope.environment_id.map(|_| 1).unwrap_or(0);
+        let env_filter_value: i32 = q.scope.environment_id.unwrap_or(0);
+        let dep_filter_flag: i32 = q.scope.deployment_id.map(|_| 1).unwrap_or(0);
+        let dep_filter_value: i32 = q.scope.deployment_id.unwrap_or(0);
+        let start_ms = to_unix_milli(q.range.start);
+        let end_ms = to_unix_milli(q.range.end);
+
+        if q.metric == "returning_visitors" {
+            let sql = r#"
+                SELECT uniq(visitor_id) AS value
+                FROM events FINAL
+                WHERE project_id = ?
+                  AND timestamp >= fromUnixTimestamp64Milli(?)
+                  AND timestamp <= fromUnixTimestamp64Milli(?)
+                  AND visitor_id IS NOT NULL
+                  AND (? = 0 OR environment_id = ?)
+                  AND (? = 0 OR deployment_id = ?)
+                  AND visitor_id IN (
+                      SELECT visitor_id
+                      FROM events FINAL
+                      WHERE project_id = ?
+                        AND timestamp < fromUnixTimestamp64Milli(?)
+                        AND visitor_id IS NOT NULL
+                        AND (? = 0 OR environment_id = ?)
+                        AND (? = 0 OR deployment_id = ?)
+                  )
+            "#;
+
+            let row = self
+                .client
+                .query(sql)
+                .bind(q.scope.project_id)
+                .bind(start_ms)
+                .bind(end_ms)
+                .bind(env_filter_flag)
+                .bind(env_filter_value)
+                .bind(dep_filter_flag)
+                .bind(dep_filter_value)
+                .bind(q.scope.project_id)
+                .bind(start_ms)
+                .bind(env_filter_flag)
+                .bind(env_filter_value)
+                .bind(dep_filter_flag)
+                .bind(dep_filter_value)
+                .fetch_one::<ScalarU64>()
+                .await
+                .map_err(|e| ch_err("query_returning_visitors", e))?;
+
+            return Ok(UniqueCountsResponse {
+                count: row.value as i64,
+            });
+        }
+
         // The Timescale impl validates the metric here; do the same so behavior
         // is identical.
         let count_expr = match q.metric.as_str() {
@@ -898,17 +951,10 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
             "page_views" | "paths" => "countIf(event_type = 'page_view')",
             other => {
                 return Err(EventsError::Validation(format!(
-                    "Invalid metric '{other}'. Valid options: sessions, visitors, page_views"
+                    "Invalid metric '{other}'. Valid options: sessions, visitors, returning_visitors, page_views"
                 )))
             }
         };
-
-        let env_filter_flag: i32 = q.scope.environment_id.map(|_| 1).unwrap_or(0);
-        let env_filter_value: i32 = q.scope.environment_id.unwrap_or(0);
-        let dep_filter_flag: i32 = q.scope.deployment_id.map(|_| 1).unwrap_or(0);
-        let dep_filter_value: i32 = q.scope.deployment_id.unwrap_or(0);
-        let start_ms = to_unix_milli(q.range.start);
-        let end_ms = to_unix_milli(q.range.end);
 
         let sql = format!(
             r#"
@@ -1496,11 +1542,21 @@ mod tests {
         let now = Utc::now();
         let t = |mins_ago: i64| (now - Duration::minutes(mins_ago)).timestamp_millis();
 
-        // Project 7, session A, visitor 100: 2 page_views + 1 signup.
+        // Project 7, visitor 100: 1 visit before the reporting range, then
+        // session A with 2 page_views + 1 signup inside it.
         // Project 7, session B, visitor 101: 1 page_view, 1 click.
         // Project 8, session C, visitor 102: 1 page_view (different project — must
         // not leak into project 7 queries).
         let rows = [
+            make_row(
+                7,
+                7,
+                "sess-prior",
+                Some(100),
+                "page_view",
+                "page_view",
+                t(180),
+            ),
             make_row(1, 7, "sess-a", Some(100), "page_view", "page_view", t(60)),
             make_row(2, 7, "sess-a", Some(100), "page_view", "page_view", t(50)),
             make_row(3, 7, "sess-a", Some(100), "signup", "signup", t(45)),
@@ -1630,6 +1686,18 @@ mod tests {
             .expect("query_unique_counts visitors");
         // 2 distinct visitor_ids on project 7 (100, 101).
         assert_eq!(visitors.count, 2);
+
+        // ---- query_unique_counts: returning visitors ----
+        let returning_visitors = backend
+            .query_unique_counts(UniqueCountsSpec {
+                range: full_range(),
+                scope: project_scope(7).with_deployment(None),
+                metric: "returning_visitors".to_string(),
+            })
+            .await
+            .expect("query_unique_counts returning_visitors");
+        // Visitor 100 has an event before the range; visitor 101 is new.
+        assert_eq!(returning_visitors.count, 1);
 
         // ---- query_unique_counts: page_views ----
         let pvs = backend

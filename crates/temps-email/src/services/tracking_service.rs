@@ -342,8 +342,8 @@ impl TrackingService {
             email_events::Entity::find().filter(email_events::Column::EmailId.eq(email_id));
 
         if let Some(et) = event_type {
-            query = query
-                .filter(email_events::Column::EventType.eq(normalize_event_type_filter(et)));
+            query =
+                query.filter(email_events::Column::EventType.eq(normalize_event_type_filter(et)));
         }
 
         let events = query
@@ -433,8 +433,8 @@ impl TrackingService {
         let mut query = email_events::Entity::find();
 
         if let Some(et) = event_type {
-            query = query
-                .filter(email_events::Column::EventType.eq(normalize_event_type_filter(et)));
+            query =
+                query.filter(email_events::Column::EventType.eq(normalize_event_type_filter(et)));
         }
 
         let paginator = query

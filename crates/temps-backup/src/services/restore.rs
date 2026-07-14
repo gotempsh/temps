@@ -10,7 +10,7 @@ use chrono::Utc;
 use sea_orm::ActiveValue::{NotSet, Set};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder,
-    QuerySelect,
+    QuerySelect, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -27,6 +27,9 @@ pub enum RestoreError {
 
     #[error("Backup {backup_id} not found")]
     BackupNotFound { backup_id: i32 },
+
+    #[error("Backup {backup_id} is being deleted and cannot be restored")]
+    BackupDeleting { backup_id: i32 },
 
     #[error("External service {service_id} not found")]
     ServiceNotFound { service_id: i32 },
@@ -54,6 +57,57 @@ pub enum RestoreError {
 
     #[error("Internal error: {reason}")]
     Internal { reason: String },
+}
+
+fn selected_walg_target_user_data(
+    backup: &temps_entities::backups::Model,
+) -> Result<Option<String>, RestoreError> {
+    let metadata: serde_json::Value =
+        serde_json::from_str(&backup.metadata).map_err(|error| RestoreError::Validation {
+            message: format!(
+                "Backup {} has invalid metadata JSON: {}",
+                backup.backup_id, error
+            ),
+        })?;
+    let Some(version) = metadata.get("walg_identity_version") else {
+        return Ok(None);
+    };
+    if version.as_u64() != Some(1) {
+        return Err(RestoreError::Validation {
+            message: format!(
+                "Backup {} uses unsupported WAL-G identity version {}",
+                backup.backup_id, version
+            ),
+        });
+    }
+    let value = metadata
+        .get("walg_target_user_data")
+        .ok_or_else(|| RestoreError::Validation {
+            message: format!(
+                "Backup {} is missing its WAL-G target user data",
+                backup.backup_id
+            ),
+        })?;
+    if value
+        .get("temps_backup_id")
+        .and_then(serde_json::Value::as_str)
+        != Some(backup.backup_id.as_str())
+    {
+        return Err(RestoreError::Validation {
+            message: format!(
+                "Backup {} has WAL-G target user data for a different backup",
+                backup.backup_id
+            ),
+        });
+    }
+    serde_json::to_string(value)
+        .map(Some)
+        .map_err(|error| RestoreError::Validation {
+            message: format!(
+                "Backup {} has invalid WAL-G target user data: {}",
+                backup.backup_id, error
+            ),
+        })
 }
 
 /// How the caller identifies which backup to restore.
@@ -294,6 +348,14 @@ impl RestoreService {
 
         let mut warnings: Vec<String> = Vec::new();
         let mut errors: Vec<String> = Vec::new();
+        if let Some(backup) = &backup_row {
+            if backup.state == "deleting" {
+                errors.push(format!(
+                    "Backup {} is being deleted and cannot be restored.",
+                    backup.id
+                ));
+            }
+        }
 
         // Engine compat.
         let engine_from_backup = backup_engine_hint.clone();
@@ -784,9 +846,11 @@ impl RestoreService {
             "s3_source_id": s3_source_id,
         });
 
-        // Insert run row.
+        // Insert the run while holding the source row lock. Deletion uses the
+        // same lock before checking restore history, so exactly one operation
+        // wins and remote data can never be removed underneath a new restore.
         let log_id = uuid::Uuid::new_v4().to_string();
-        let run = temps_entities::restore_runs::ActiveModel {
+        let run_active = temps_entities::restore_runs::ActiveModel {
             id: NotSet,
             source_backup_id: Set(resolved_backup_id.unwrap_or(0)),
             // `source_service_id` historically meant "service we're
@@ -810,9 +874,23 @@ impl RestoreService {
             created_by: Set(user_id),
             created_at: NotSet,
             updated_at: NotSet,
-        }
-        .insert(self.db.as_ref())
-        .await?;
+        };
+        let run = if let Some(backup_id) = resolved_backup_id {
+            let transaction = self.db.begin().await?;
+            let backup = temps_entities::backups::Entity::find_by_id(backup_id)
+                .lock_exclusive()
+                .one(&transaction)
+                .await?
+                .ok_or(RestoreError::BackupNotFound { backup_id })?;
+            if backup.state == "deleting" {
+                return Err(RestoreError::BackupDeleting { backup_id });
+            }
+            let run = run_active.insert(&transaction).await?;
+            transaction.commit().await?;
+            run
+        } else {
+            run_active.insert(self.db.as_ref()).await?
+        };
 
         // Spawn the worker — it owns Arc clones and updates the row as it goes.
         let run_id = run.id;
@@ -1274,28 +1352,23 @@ async fn run_restore_inner(
             // access to service_members or the agent protocol so it
             // can't handle clusters — same carve-out as backup.
             if target_service.topology == "cluster" && target_service.service_type == "postgres" {
+                let target_user_data = selected_walg_target_user_data(&backup_model)?;
                 mgr.restore_postgres_cluster(
                     &target_service,
                     &backup_model.s3_location,
                     &s3_credentials,
+                    target_user_data.as_deref(),
                 )
                 .await
                 .map_err(|e| RestoreError::ExternalService {
                     reason: format!("cluster in-place restore failed: {}", e),
                 })?;
             } else {
-                instance
-                    .restore_from_s3(
-                        &s3_client,
-                        &s3_credentials,
-                        &backup_model.s3_location,
-                        &s3_source_plain,
-                        source_config.clone(),
-                    )
-                    .await
-                    .map_err(|e| RestoreError::ExternalService {
+                instance.restore_in_place(ctx).await.map_err(|e| {
+                    RestoreError::ExternalService {
                         reason: format!("in-place restore failed: {}", e),
-                    })?;
+                    }
+                })?;
             }
             None
         }

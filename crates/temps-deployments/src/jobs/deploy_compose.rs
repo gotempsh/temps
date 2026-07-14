@@ -624,6 +624,7 @@ mod tests {
         let compose =
             canonicalize_confined_repo_path(&project, Path::new("compose.yml"), "compose_path")
                 .unwrap();
-        assert!(compose.starts_with(repo.path()));
+        let canonical_repo = repo.path().canonicalize().unwrap();
+        assert!(compose.starts_with(canonical_repo));
     }
 }

@@ -456,7 +456,9 @@ pub struct DiskSpaceAlertSettings {
     /// Interval in seconds between disk space checks
     #[schema(minimum = 60, example = 300)]
     pub check_interval_seconds: u64,
-    /// Path to monitor (defaults to data directory)
+    /// Restrict monitoring to the disk backing this path. When unset (the
+    /// default), every mounted writable volume is monitored — including
+    /// dedicated volumes such as `/var/lib/docker`.
     pub monitor_path: Option<String>,
 }
 
@@ -826,7 +828,7 @@ impl Default for DiskSpaceAlertSettings {
             enabled: true,               // Enabled by default
             threshold_percent: 80,       // Alert at 80% usage
             check_interval_seconds: 300, // Check every 5 minutes
-            monitor_path: None,          // Use data directory by default
+            monitor_path: None,          // Monitor all mounted disks by default
         }
     }
 }

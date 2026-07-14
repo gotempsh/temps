@@ -524,7 +524,8 @@ fn filter_suppressed_recipients(
 
     let suppressed_set: std::collections::HashSet<&str> =
         suppressed.iter().map(String::as_str).collect();
-    let keep = |addr: &String| !suppressed_set.contains(SuppressionService::normalize(addr).as_str());
+    let keep =
+        |addr: &String| !suppressed_set.contains(SuppressionService::normalize(addr).as_str());
 
     (
         to.into_iter().filter(&keep).collect(),
@@ -806,7 +807,10 @@ mod tests {
         // from the DB — the filter must normalize candidates the same way,
         // not compare raw strings.
         let (to, _, _) = filter_suppressed_recipients(
-            vec!["  Bad@Example.COM  ".to_string(), "good@example.com".to_string()],
+            vec![
+                "  Bad@Example.COM  ".to_string(),
+                "good@example.com".to_string(),
+            ],
             None,
             None,
             &["bad@example.com".to_string()],
