@@ -12,6 +12,16 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  compose-security:
+    name: Compose Security
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Validate secure Compose defaults
+        run: scripts/test-compose-security.sh
+
   check:
     name: Cargo Check
     runs-on: ubuntu-latest

@@ -34,7 +34,6 @@ bun.lockb
 
 # Docs and examples
 docs/
-examples/
 README.md
 CHANGELOG.md
 LICENSE

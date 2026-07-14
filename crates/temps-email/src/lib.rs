@@ -21,6 +21,6 @@ pub use errors::EmailError;
 pub use plugin::EmailPlugin;
 pub use providers::{EmailProvider, EmailProviderType};
 pub use services::{
-    DomainService, EmailService, ProviderService, TrackingService, ValidateEmailRequest,
-    ValidateEmailResponse, ValidationService,
+    is_valid_email_syntax, DomainService, EmailService, ProviderService, TrackingService,
+    ValidateEmailRequest, ValidateEmailResponse, ValidationService,
 };
