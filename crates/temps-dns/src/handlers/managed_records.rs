@@ -58,8 +58,7 @@ pub struct SetManagedRecordRequest {
     pub ttl: Option<u32>,
     /// Proxy through the provider's CDN (Cloudflare orange-cloud). Also
     /// enabled by the managed domain's `proxied_by_default`.
-    #[serde(default)]
-    pub proxied: bool,
+    pub proxied: Option<bool>,
     /// Project this record belongs to (stamped into the ownership marker)
     pub project_id: Option<i32>,
     /// Environment this record belongs to (stamped into the ownership marker)
@@ -86,7 +85,8 @@ pub struct ImportManagedRecordRequest {
 /// Ownership state of one record, for the conflict/import UI
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct RecordOwnershipResponse {
-    /// One of: not_found | unmanaged | owned | owned_by_other
+    /// One of: not_found | unmanaged | owned | owned_by_other | orphaned |
+    /// blocked_by_other | registry_conflict
     #[schema(example = "unmanaged")]
     pub status: String,
     /// The record at the provider, when one exists
@@ -135,6 +135,30 @@ impl From<RecordOwnership> for RecordOwnershipResponse {
                 owner_instance: Some(marker.instance),
                 project_id: marker.project_id,
                 environment_id: marker.environment_id,
+            },
+            RecordOwnership::Orphaned(marker) => Self {
+                status: "orphaned".to_string(),
+                record: None,
+                writable: true,
+                owner_instance: None,
+                project_id: marker.project_id,
+                environment_id: marker.environment_id,
+            },
+            RecordOwnership::BlockedByOther(marker) => Self {
+                status: "blocked_by_other".to_string(),
+                record: None,
+                writable: false,
+                owner_instance: Some(marker.instance),
+                project_id: marker.project_id,
+                environment_id: marker.environment_id,
+            },
+            RecordOwnership::RegistryConflict => Self {
+                status: "registry_conflict".to_string(),
+                record: None,
+                writable: false,
+                owner_instance: None,
+                project_id: None,
+                environment_id: None,
             },
         }
     }
@@ -286,8 +310,9 @@ pub(super) async fn set_managed_record(
                 name: request.name.clone(),
                 content: request.content.clone(),
                 ttl: request.ttl,
-                proxied: request.proxied,
+                proxied: false,
             },
+            request.proxied,
             OwnershipScope {
                 project_id: request.project_id,
                 environment_id: request.environment_id,

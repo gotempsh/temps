@@ -23,10 +23,14 @@
 //! it carries a `v` field so the format can evolve. Unknown fields are
 //! tolerated on parse so a `v: 2` writer doesn't brick a `v: 1` reader.
 
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::errors::DnsError;
-use crate::providers::{DnsProviderCapabilities, DnsRecordType};
+use crate::providers::{DnsProviderCapabilities, DnsRecordContent, DnsRecordType};
+
+type HmacSha256 = Hmac<Sha256>;
 
 /// Current marker format version.
 pub const OWNERSHIP_MARKER_VERSION: u32 = 1;
@@ -58,8 +62,18 @@ pub struct OwnershipMarker {
 
     /// Record type this marker covers (e.g. "A"). Belt-and-braces on top of
     /// the type-scoped registry name; a mismatch means "not ours".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub record_type: Option<String>,
+    pub record_type: String,
+
+    /// Canonical location covered by this marker. Including the location in
+    /// the signed payload prevents a valid public marker from being copied to
+    /// another record name.
+    pub zone: String,
+    pub name: String,
+
+    /// SHA-256 fingerprint of the record content and proxied flag. A stale
+    /// marker therefore cannot authorize a replacement record at the same
+    /// name and type.
+    pub record_fingerprint: String,
 
     /// Project the record was created for, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -71,23 +85,37 @@ pub struct OwnershipMarker {
 
     /// Marker format version.
     pub v: u32,
+
+    /// HMAC-SHA256 over every authority-bearing field above.
+    pub signature: String,
 }
 
 impl OwnershipMarker {
-    pub fn new(
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_signed(
+        signing_key: &[u8; 32],
         instance: &str,
+        zone: &str,
+        name: &str,
         record_type: DnsRecordType,
+        record_fingerprint: &str,
         project_id: Option<i32>,
         environment_id: Option<i32>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, DnsError> {
+        let mut marker = Self {
             managed_by: OWNERSHIP_MANAGED_BY.to_string(),
             instance: instance.to_string(),
-            record_type: Some(record_type.to_string()),
+            record_type: record_type.to_string(),
+            zone: normalize_dns_name(zone),
+            name: normalize_dns_name(name),
+            record_fingerprint: record_fingerprint.to_string(),
             project_id,
             environment_id,
             v: OWNERSHIP_MARKER_VERSION,
-        }
+            signature: String::new(),
+        };
+        marker.signature = marker.compute_signature(signing_key)?;
+        Ok(marker)
     }
 
     /// Serialize to the TXT record content.
@@ -106,7 +134,7 @@ impl OwnershipMarker {
     /// temps' logs and error messages, where the field is interpolated.
     pub fn parse(content: &str) -> Option<Self> {
         let marker: Self = serde_json::from_str(content.trim()).ok()?;
-        if marker.managed_by != OWNERSHIP_MANAGED_BY {
+        if marker.managed_by != OWNERSHIP_MANAGED_BY || marker.v != OWNERSHIP_MARKER_VERSION {
             return None;
         }
         if marker.instance.is_empty()
@@ -118,20 +146,106 @@ impl OwnershipMarker {
         {
             return None;
         }
+        if marker.record_type.is_empty()
+            || marker.zone.is_empty()
+            || marker.name.is_empty()
+            || marker.record_fingerprint.len() != 64
+            || marker.signature.len() != 64
+            || !marker
+                .record_fingerprint
+                .chars()
+                .all(|c| c.is_ascii_hexdigit())
+            || !marker.signature.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            return None;
+        }
         Some(marker)
     }
 
-    /// Whether this marker was written by the given temps instance AND covers
-    /// the given record type. A marker without a `record_type` (never written
-    /// by temps) does not cover anything.
-    pub fn covers(&self, instance: &str, record_type: DnsRecordType) -> bool {
-        self.instance == instance && self.record_type.as_deref() == Some(&record_type.to_string())
+    /// Verify both the authenticated payload and the exact DNS location.
+    pub fn covers(
+        &self,
+        signing_key: &[u8; 32],
+        instance: &str,
+        zone: &str,
+        name: &str,
+        record_type: DnsRecordType,
+    ) -> bool {
+        if self.instance != instance
+            || self.zone != normalize_dns_name(zone)
+            || self.name != normalize_dns_name(name)
+            || self.record_type != record_type.to_string()
+        {
+            return false;
+        }
+        let Ok(signature) = hex::decode(&self.signature) else {
+            return false;
+        };
+        let Ok(payload) = self.signing_payload() else {
+            return false;
+        };
+        let Ok(mut mac) = HmacSha256::new_from_slice(signing_key) else {
+            return false;
+        };
+        mac.update(&payload);
+        mac.verify_slice(&signature).is_ok()
     }
 
     /// Whether this marker was written by the given temps instance.
     pub fn is_owned_by(&self, instance: &str) -> bool {
         self.instance == instance
     }
+
+    pub fn matches_fingerprint(&self, fingerprint: &str) -> bool {
+        self.record_fingerprint == fingerprint
+    }
+
+    fn compute_signature(&self, signing_key: &[u8; 32]) -> Result<String, DnsError> {
+        let mut mac = HmacSha256::new_from_slice(signing_key).map_err(|error| {
+            DnsError::Validation(format!(
+                "Failed to initialize DNS ownership signer: {error}"
+            ))
+        })?;
+        mac.update(&self.signing_payload()?);
+        Ok(hex::encode(mac.finalize().into_bytes()))
+    }
+
+    fn signing_payload(&self) -> Result<Vec<u8>, DnsError> {
+        #[derive(Serialize)]
+        struct Payload<'a> {
+            managed_by: &'a str,
+            instance: &'a str,
+            record_type: &'a str,
+            zone: &'a str,
+            name: &'a str,
+            record_fingerprint: &'a str,
+            project_id: Option<i32>,
+            environment_id: Option<i32>,
+            v: u32,
+        }
+
+        serde_json::to_vec(&Payload {
+            managed_by: &self.managed_by,
+            instance: &self.instance,
+            record_type: &self.record_type,
+            zone: &self.zone,
+            name: &self.name,
+            record_fingerprint: &self.record_fingerprint,
+            project_id: self.project_id,
+            environment_id: self.environment_id,
+            v: self.v,
+        })
+        .map_err(DnsError::Serialization)
+    }
+}
+
+pub fn record_fingerprint(content: &DnsRecordContent, proxied: bool) -> Result<String, DnsError> {
+    let encoded = serde_json::to_vec(&(content, proxied)).map_err(DnsError::Serialization)?;
+    Ok(hex::encode(Sha256::digest(encoded)))
+}
+
+fn normalize_dns_name(value: &str) -> String {
+    value.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
 /// Injective escaping of a record name for use inside a registry name.
@@ -216,8 +330,21 @@ pub fn check_proxy_allowed(
 mod tests {
     use super::*;
 
+    const KEY: [u8; 32] = [7; 32];
+    const FINGERPRINT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
     fn marker(record_type: DnsRecordType) -> OwnershipMarker {
-        OwnershipMarker::new("inst-abc123", record_type, Some(7), Some(42))
+        OwnershipMarker::new_signed(
+            &KEY,
+            "inst-abc123",
+            "example.com",
+            "app",
+            record_type,
+            FINGERPRINT,
+            Some(7),
+            Some(42),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -227,12 +354,22 @@ mod tests {
         let parsed = OwnershipMarker::parse(&content).unwrap();
         assert_eq!(parsed, marker);
         assert_eq!(parsed.v, OWNERSHIP_MARKER_VERSION);
-        assert_eq!(parsed.record_type.as_deref(), Some("A"));
+        assert_eq!(parsed.record_type, "A");
     }
 
     #[test]
     fn marker_without_scope_omits_ids_in_json() {
-        let marker = OwnershipMarker::new("inst-abc123", DnsRecordType::A, None, None);
+        let marker = OwnershipMarker::new_signed(
+            &KEY,
+            "inst-abc123",
+            "example.com",
+            "app",
+            DnsRecordType::A,
+            FINGERPRINT,
+            None,
+            None,
+        )
+        .unwrap();
         let content = marker.to_txt_content().unwrap();
         assert!(!content.contains("project_id"));
         assert!(!content.contains("environment_id"));
@@ -276,24 +413,38 @@ mod tests {
     }
 
     #[test]
-    fn parse_tolerates_unknown_fields_from_future_versions() {
-        let content = r#"{"managed_by":"temps","instance":"x","v":2,"new_field":"y"}"#;
-        let marker = OwnershipMarker::parse(content).unwrap();
-        assert_eq!(marker.v, 2);
+    fn parse_rejects_unsupported_future_versions() {
+        let mut future = marker(DnsRecordType::A);
+        future.v = 2;
+        assert!(OwnershipMarker::parse(&future.to_txt_content().unwrap()).is_none());
     }
 
     #[test]
     fn covers_requires_instance_and_record_type() {
         let m = marker(DnsRecordType::A);
-        assert!(m.covers("inst-abc123", DnsRecordType::A));
-        assert!(!m.covers("inst-abc123", DnsRecordType::AAAA));
-        assert!(!m.covers("other", DnsRecordType::A));
-
-        // A marker with no record_type (not something temps writes) covers nothing.
-        let untyped =
-            OwnershipMarker::parse(r#"{"managed_by":"temps","instance":"inst-abc123","v":1}"#)
-                .unwrap();
-        assert!(!untyped.covers("inst-abc123", DnsRecordType::A));
+        assert!(m.covers(&KEY, "inst-abc123", "example.com", "app", DnsRecordType::A));
+        assert!(!m.covers(
+            &KEY,
+            "inst-abc123",
+            "example.com",
+            "app",
+            DnsRecordType::AAAA
+        ));
+        assert!(!m.covers(&KEY, "other", "example.com", "app", DnsRecordType::A));
+        assert!(!m.covers(
+            &[8; 32],
+            "inst-abc123",
+            "example.com",
+            "app",
+            DnsRecordType::A
+        ));
+        assert!(!m.covers(
+            &KEY,
+            "inst-abc123",
+            "example.com",
+            "other",
+            DnsRecordType::A
+        ));
     }
 
     #[test]

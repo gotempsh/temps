@@ -16,12 +16,15 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
     routing::{delete, get, post},
-    Json, Router,
+    Extension, Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_auth::{permission_check, Permission, RequireAuth};
+use temps_core::audit::{AuditContext, AuditOperation};
 use temps_core::problemdetails::{self, Problem};
+use temps_core::RequestMetadata;
+use tracing::error;
 use utoipa::{OpenApi, ToSchema};
 
 use crate::errors::DnsError;
@@ -32,7 +35,7 @@ use crate::providers::{
 };
 use crate::services::{
     AddManagedDomainRequest, CreateProviderRequest, DnsProviderService, DnsRecordService,
-    UpdateProviderRequest,
+    UpdateManagedDomainRequest, UpdateProviderRequest,
 };
 
 /// Application state for DNS handlers
@@ -219,6 +222,45 @@ pub struct AddManagedDomainApiRequest {
     pub domain: String,
     #[serde(default = "default_true")]
     pub auto_manage: bool,
+    #[serde(default)]
+    pub proxied_by_default: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct UpdateManagedDomainApiRequest {
+    pub auto_manage: Option<bool>,
+    pub proxied_by_default: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ManagedDomainUpdatedAudit {
+    context: AuditContext,
+    provider_id: i32,
+    domain: String,
+    auto_manage: bool,
+    proxied_by_default: bool,
+}
+
+impl AuditOperation for ManagedDomainUpdatedAudit {
+    fn operation_type(&self) -> String {
+        "DNS_MANAGED_DOMAIN_UPDATED".to_string()
+    }
+
+    fn user_id(&self) -> i32 {
+        self.context.user_id
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self).map_err(anyhow::Error::from)
+    }
 }
 
 fn default_true() -> bool {
@@ -233,11 +275,30 @@ pub struct ManagedDomainResponse {
     pub domain: String,
     pub zone_id: Option<String>,
     pub auto_manage: bool,
+    pub proxied_by_default: bool,
     pub verified: bool,
     pub verified_at: Option<String>,
     pub verification_error: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+impl From<temps_entities::dns_managed_domains::Model> for ManagedDomainResponse {
+    fn from(managed: temps_entities::dns_managed_domains::Model) -> Self {
+        Self {
+            id: managed.id,
+            provider_id: managed.provider_id,
+            domain: managed.domain,
+            zone_id: managed.zone_id,
+            auto_manage: managed.auto_manage,
+            proxied_by_default: managed.proxied_by_default,
+            verified: managed.verified,
+            verified_at: managed.verified_at.map(|time| time.to_rfc3339()),
+            verification_error: managed.verification_error,
+            created_at: managed.created_at.to_rfc3339(),
+            updated_at: managed.updated_at.to_rfc3339(),
+        }
+    }
 }
 
 /// Connection test result
@@ -675,22 +736,12 @@ async fn add_managed_domain(
             AddManagedDomainRequest {
                 domain: request.domain,
                 auto_manage: request.auto_manage,
+                proxied_by_default: request.proxied_by_default,
             },
         )
         .await?;
 
-    let response = ManagedDomainResponse {
-        id: managed.id,
-        provider_id: managed.provider_id,
-        domain: managed.domain,
-        zone_id: managed.zone_id,
-        auto_manage: managed.auto_manage,
-        verified: managed.verified,
-        verified_at: managed.verified_at.map(|t| t.to_rfc3339()),
-        verification_error: managed.verification_error,
-        created_at: managed.created_at.to_rfc3339(),
-        updated_at: managed.updated_at.to_rfc3339(),
-    };
+    let response = ManagedDomainResponse::from(managed);
 
     Ok((StatusCode::CREATED, Json(response)))
 }
@@ -719,18 +770,7 @@ async fn list_managed_domains(
 
     let responses: Vec<ManagedDomainResponse> = domains
         .into_iter()
-        .map(|d| ManagedDomainResponse {
-            id: d.id,
-            provider_id: d.provider_id,
-            domain: d.domain,
-            zone_id: d.zone_id,
-            auto_manage: d.auto_manage,
-            verified: d.verified,
-            verified_at: d.verified_at.map(|t| t.to_rfc3339()),
-            verification_error: d.verification_error,
-            created_at: d.created_at.to_rfc3339(),
-            updated_at: d.updated_at.to_rfc3339(),
-        })
+        .map(ManagedDomainResponse::from)
         .collect();
 
     Ok(Json(responses))
@@ -762,6 +802,65 @@ async fn remove_managed_domain(
         .await?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Update managed-domain automation and proxy defaults.
+#[utoipa::path(
+    tag = "DNS Providers",
+    patch,
+    path = "/dns-providers/{provider_id}/domains/{domain}",
+    request_body = UpdateManagedDomainApiRequest,
+    responses(
+        (status = 200, description = "Managed domain updated", body = ManagedDomainResponse),
+        (status = 400, description = "Invalid request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Domain not found"),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn update_managed_domain(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<DnsAppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path((provider_id, domain)): Path<(i32, String)>,
+    Json(request): Json<UpdateManagedDomainApiRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_check!(auth, Permission::SettingsWrite);
+
+    let managed = state
+        .provider_service
+        .update_managed_domain(
+            provider_id,
+            &domain,
+            UpdateManagedDomainRequest {
+                auto_manage: request.auto_manage,
+                proxied_by_default: request.proxied_by_default,
+            },
+        )
+        .await?;
+
+    let audit = ManagedDomainUpdatedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address),
+            user_agent: metadata.user_agent,
+        },
+        provider_id,
+        domain: managed.domain.clone(),
+        auto_manage: managed.auto_manage,
+        proxied_by_default: managed.proxied_by_default,
+    };
+    if let Err(error) = state.audit_service.create_audit_log(&audit).await {
+        error!(
+            provider_id,
+            domain = %managed.domain,
+            error = %error,
+            "failed to create managed-domain update audit log"
+        );
+    }
+
+    Ok(Json(ManagedDomainResponse::from(managed)))
 }
 
 /// Verify a managed domain
@@ -799,18 +898,7 @@ async fn verify_managed_domain(
         .find(|d| d.domain == domain)
         .ok_or_else(|| DnsError::DomainNotFound(domain))?;
 
-    let response = ManagedDomainResponse {
-        id: managed.id,
-        provider_id: managed.provider_id,
-        domain: managed.domain,
-        zone_id: managed.zone_id,
-        auto_manage: managed.auto_manage,
-        verified: managed.verified,
-        verified_at: managed.verified_at.map(|t| t.to_rfc3339()),
-        verification_error: managed.verification_error,
-        created_at: managed.created_at.to_rfc3339(),
-        updated_at: managed.updated_at.to_rfc3339(),
-    };
+    let response = ManagedDomainResponse::from(managed);
 
     Ok(Json(response))
 }
@@ -842,7 +930,7 @@ pub fn configure_routes() -> Router<Arc<DnsAppState>> {
         )
         .route(
             "/dns-providers/{provider_id}/domains/{domain}",
-            delete(remove_managed_domain),
+            delete(remove_managed_domain).patch(update_managed_domain),
         )
         .route(
             "/dns-providers/{provider_id}/domains/{domain}/verify",
@@ -897,6 +985,7 @@ pub fn configure_internal_routes() -> Router<Arc<dns_sync::DnsSyncAppState>> {
         list_provider_zones,
         add_managed_domain,
         list_managed_domains,
+        update_managed_domain,
         remove_managed_domain,
         verify_managed_domain,
         managed_records::get_record_ownership,
@@ -913,6 +1002,7 @@ pub fn configure_internal_routes() -> Router<Arc<dns_sync::DnsSyncAppState>> {
             DnsProviderCredentials,
             DnsProviderResponse,
             AddManagedDomainApiRequest,
+            UpdateManagedDomainApiRequest,
             ManagedDomainResponse,
             ConnectionTestResult,
             ZoneListResponse,

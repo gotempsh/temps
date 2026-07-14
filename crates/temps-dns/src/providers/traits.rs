@@ -353,6 +353,24 @@ pub trait DnsProvider: Send + Sync {
         record_type: DnsRecordType,
     ) -> Result<Option<DnsRecord>, DnsError>;
 
+    /// Get every value in a name/type RRset.
+    ///
+    /// Ownership-sensitive callers must use this instead of `get_record` so
+    /// foreign values cannot be hidden behind the first provider result.
+    async fn get_records(
+        &self,
+        domain: &str,
+        name: &str,
+        record_type: DnsRecordType,
+    ) -> Result<Vec<DnsRecord>, DnsError> {
+        Ok(self
+            .list_records(domain)
+            .await?
+            .into_iter()
+            .filter(|record| record.name == name && record.content.record_type() == record_type)
+            .collect())
+    }
+
     /// Create a new DNS record
     async fn create_record(
         &self,
@@ -370,6 +388,19 @@ pub trait DnsProvider: Send + Sync {
 
     /// Delete a DNS record
     async fn delete_record(&self, domain: &str, record_id: &str) -> Result<(), DnsError>;
+
+    /// Delete the exact provider record returned by `get_records`.
+    async fn delete_exact_record(&self, domain: &str, record: &DnsRecord) -> Result<(), DnsError> {
+        let record_id = record.id.as_deref().ok_or_else(|| {
+            DnsError::Validation(format!(
+                "Provider returned no record ID for {} {} in zone {}",
+                record.content.record_type(),
+                record.name,
+                domain
+            ))
+        })?;
+        self.delete_record(domain, record_id).await
+    }
 
     /// Set or update a record by name and type (upsert operation)
     ///

@@ -28,6 +28,7 @@ pub use dns_registry::{
 };
 pub use managed_records::{ManagedDnsRecordService, OwnershipScope, RecordOwnership};
 pub use provider_service::{
-    AddManagedDomainRequest, CreateProviderRequest, DnsProviderService, UpdateProviderRequest,
+    AddManagedDomainRequest, CreateProviderRequest, DnsProviderService, UpdateManagedDomainRequest,
+    UpdateProviderRequest,
 };
 pub use record_service::{DnsOperationResult, DnsRecordService, ManualDnsInstructions};

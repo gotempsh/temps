@@ -64,6 +64,7 @@ impl TempsPlugin for DnsPlugin {
             let managed_record_service = Arc::new(ManagedDnsRecordService::new(
                 db.clone(),
                 provider_service.clone(),
+                encryption_service.clone(),
             ));
             context.register_service(managed_record_service.clone());
 

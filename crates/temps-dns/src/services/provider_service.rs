@@ -52,6 +52,14 @@ pub struct UpdateProviderRequest {
 pub struct AddManagedDomainRequest {
     pub domain: String,
     pub auto_manage: bool,
+    pub proxied_by_default: bool,
+}
+
+/// Mutable managed-domain behavior.
+#[derive(Debug, Clone)]
+pub struct UpdateManagedDomainRequest {
+    pub auto_manage: Option<bool>,
+    pub proxied_by_default: Option<bool>,
 }
 
 impl DnsProviderService {
@@ -501,11 +509,25 @@ impl DnsProviderService {
         request: AddManagedDomainRequest,
     ) -> Result<dns_managed_domains::Model, DnsError> {
         // Verify provider exists
-        let _provider = self.get(provider_id).await?;
+        let provider = self.get(provider_id).await?;
+        let normalized_domain = Self::normalize_domain(&request.domain);
+        if normalized_domain.is_empty() {
+            return Err(DnsError::Validation(
+                "Managed domain cannot be empty".to_string(),
+            ));
+        }
+        if request.proxied_by_default {
+            let instance = self.create_provider_instance(&provider)?;
+            if !instance.capabilities().proxy {
+                return Err(DnsError::ProxyNotSupportedByProvider {
+                    provider: provider.name,
+                });
+            }
+        }
 
         // Check if domain is already managed
         let existing = dns_managed_domains::Entity::find()
-            .filter(dns_managed_domains::Column::Domain.eq(&request.domain))
+            .filter(dns_managed_domains::Column::Domain.eq(&normalized_domain))
             .one(self.db.as_ref())
             .await?;
 
@@ -518,8 +540,9 @@ impl DnsProviderService {
 
         let managed_domain = dns_managed_domains::ActiveModel {
             provider_id: Set(provider_id),
-            domain: Set(request.domain.clone()),
+            domain: Set(normalized_domain.clone()),
             auto_manage: Set(request.auto_manage),
+            proxied_by_default: Set(request.proxied_by_default),
             verified: Set(false),
             ..Default::default()
         };
@@ -528,10 +551,48 @@ impl DnsProviderService {
 
         info!(
             "Added managed domain {} to provider {}",
-            request.domain, provider_id
+            normalized_domain, provider_id
         );
 
         Ok(result)
+    }
+
+    /// Update runtime behavior for an existing managed domain.
+    pub async fn update_managed_domain(
+        &self,
+        provider_id: i32,
+        domain: &str,
+        request: UpdateManagedDomainRequest,
+    ) -> Result<dns_managed_domains::Model, DnsError> {
+        let normalized_domain = Self::normalize_domain(domain);
+        let managed = dns_managed_domains::Entity::find()
+            .filter(dns_managed_domains::Column::ProviderId.eq(provider_id))
+            .filter(dns_managed_domains::Column::Domain.eq(&normalized_domain))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| DnsError::DomainNotFound(normalized_domain.clone()))?;
+
+        if request.proxied_by_default == Some(true) {
+            let provider = self.get(provider_id).await?;
+            let instance = self.create_provider_instance(&provider)?;
+            if !instance.capabilities().proxy {
+                return Err(DnsError::ProxyNotSupportedByProvider {
+                    provider: provider.name,
+                });
+            }
+        }
+
+        let mut active: dns_managed_domains::ActiveModel = managed.into();
+        if let Some(auto_manage) = request.auto_manage {
+            active.auto_manage = Set(auto_manage);
+        }
+        if let Some(proxied_by_default) = request.proxied_by_default {
+            active.proxied_by_default = Set(proxied_by_default);
+        }
+        active
+            .update(self.db.as_ref())
+            .await
+            .map_err(DnsError::from)
     }
 
     /// Remove a managed domain
@@ -540,14 +601,15 @@ impl DnsProviderService {
         provider_id: i32,
         domain: &str,
     ) -> Result<(), DnsError> {
+        let normalized_domain = Self::normalize_domain(domain);
         let deleted = dns_managed_domains::Entity::delete_many()
             .filter(dns_managed_domains::Column::ProviderId.eq(provider_id))
-            .filter(dns_managed_domains::Column::Domain.eq(domain))
+            .filter(dns_managed_domains::Column::Domain.eq(&normalized_domain))
             .exec(self.db.as_ref())
             .await?;
 
         if deleted.rows_affected == 0 {
-            return Err(DnsError::DomainNotFound(domain.to_string()));
+            return Err(DnsError::DomainNotFound(normalized_domain));
         }
 
         info!(
@@ -578,19 +640,20 @@ impl DnsProviderService {
         provider_id: i32,
         domain: &str,
     ) -> Result<bool, DnsError> {
+        let normalized_domain = Self::normalize_domain(domain);
         let provider = self.get(provider_id).await?;
         let instance = self.create_provider_instance(&provider)?;
 
         // Check if provider can manage this domain
-        let can_manage = instance.can_manage_domain(domain).await;
+        let can_manage = instance.can_manage_domain(&normalized_domain).await;
 
         // Update verification status
         let managed_domain = dns_managed_domains::Entity::find()
             .filter(dns_managed_domains::Column::ProviderId.eq(provider_id))
-            .filter(dns_managed_domains::Column::Domain.eq(domain))
+            .filter(dns_managed_domains::Column::Domain.eq(&normalized_domain))
             .one(self.db.as_ref())
             .await?
-            .ok_or_else(|| DnsError::DomainNotFound(domain.to_string()))?;
+            .ok_or_else(|| DnsError::DomainNotFound(normalized_domain.clone()))?;
 
         let mut active_model: dns_managed_domains::ActiveModel = managed_domain.into();
         active_model.verified = Set(can_manage);
@@ -600,7 +663,7 @@ impl DnsProviderService {
             active_model.verification_error = Set(None);
 
             // Try to get and cache the zone ID
-            if let Ok(Some(zone)) = instance.get_zone(domain).await {
+            if let Ok(Some(zone)) = instance.get_zone(&normalized_domain).await {
                 active_model.zone_id = Set(Some(zone.id));
             }
         } else {
@@ -623,15 +686,23 @@ impl DnsProviderService {
         &self,
         domain: &str,
     ) -> Result<Option<(dns_providers::Model, dns_managed_domains::Model)>, DnsError> {
-        // Extract base domain
-        let base_domain = Self::extract_base_domain(domain);
-
-        let managed_domain = dns_managed_domains::Entity::find()
-            .filter(dns_managed_domains::Column::Domain.eq(&base_domain))
+        let normalized_domain = Self::normalize_domain(domain);
+        let managed_domains = dns_managed_domains::Entity::find()
             .filter(dns_managed_domains::Column::Verified.eq(true))
             .filter(dns_managed_domains::Column::AutoManage.eq(true))
-            .one(self.db.as_ref())
+            .all(self.db.as_ref())
             .await?;
+
+        // A public suffix list is unnecessary here: the database already contains
+        // the provider zones the operator verified. Choose the most-specific zone
+        // whose label boundary covers the requested hostname.
+        let managed_domain = managed_domains
+            .into_iter()
+            .filter(|managed| {
+                let zone = Self::normalize_domain(&managed.domain);
+                normalized_domain == zone || normalized_domain.ends_with(&format!(".{zone}"))
+            })
+            .max_by_key(|managed| Self::normalize_domain(&managed.domain).len());
 
         if let Some(managed) = managed_domain {
             let provider = self.get(managed.provider_id).await?;
@@ -643,14 +714,8 @@ impl DnsProviderService {
         Ok(None)
     }
 
-    /// Extract base domain from a full domain name
-    fn extract_base_domain(domain: &str) -> String {
-        let parts: Vec<&str> = domain.split('.').collect();
-        if parts.len() >= 2 {
-            parts[parts.len() - 2..].join(".")
-        } else {
-            domain.to_string()
-        }
+    fn normalize_domain(domain: &str) -> String {
+        domain.trim().trim_end_matches('.').to_ascii_lowercase()
     }
 }
 
@@ -659,18 +724,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_extract_base_domain() {
+    fn normalize_domain_is_case_and_trailing_dot_insensitive() {
         assert_eq!(
-            DnsProviderService::extract_base_domain("example.com"),
-            "example.com"
-        );
-        assert_eq!(
-            DnsProviderService::extract_base_domain("sub.example.com"),
-            "example.com"
-        );
-        assert_eq!(
-            DnsProviderService::extract_base_domain("deep.sub.example.com"),
-            "example.com"
+            DnsProviderService::normalize_domain(" Example.CO.UK. "),
+            "example.co.uk"
         );
     }
 }
