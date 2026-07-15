@@ -55,14 +55,25 @@ impl TempsPlugin for DnsPlugin {
             ));
             context.register_service(provider_service.clone());
 
+            // Expose the provider service as the public hostname resolver so
+            // other crates (routes, deployments) can resolve per-domain
+            // Standard/Flat modes without depending on temps-dns.
+            let hostname_resolver =
+                provider_service.clone() as Arc<dyn temps_core::PublicHostnameResolver>;
+            context.register_service(hostname_resolver);
+
             // Create DnsRecordService
             let record_service = Arc::new(DnsRecordService::new(provider_service.clone()));
             context.register_service(record_service.clone());
 
             // Create DnsAppState for handlers
+            let queue = context.require_service::<dyn temps_core::JobQueue>();
+            let audit = context.require_service::<dyn temps_core::AuditLogger>();
             let app_state = Arc::new(DnsAppState {
                 provider_service,
                 record_service,
+                queue,
+                audit,
             });
             context.register_service(app_state);
 

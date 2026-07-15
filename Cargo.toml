@@ -262,7 +262,7 @@ prometheus = "0.14"
 aws-sdk-s3 = { version = "1.112.0", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
 aws-config = { version = "1.6", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso"] }
 # Caching (Redis)
-redis = { version = "0.28.2", features = ["tokio-comp", "connection-manager"] }
+redis = { version = "1.3.0", features = ["tokio-comp", "connection-manager"] }
 
 # Email (SMTP)
 lettre = { version = "0.11.11", features = ["tokio1", "tokio1-rustls-tls", "smtp-transport", "tokio1-native-tls"] }
@@ -311,9 +311,9 @@ libc = "0.2"
 # decay returns freed pages to the OS. "profiling"/"stats" are inert unless
 # _RJEM_MALLOC_CONF is set at process start (see temps-cli/src/main.rs).
 tikv-jemallocator = { version = "0.7", features = ["profiling", "stats"] }
-tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 rand = "0.8"
-sysinfo = "0.29.0"
+sysinfo = "0.33.1"
 tempfile = "3.12.0"
 once_cell = "1.20"
 notify = "8.2"

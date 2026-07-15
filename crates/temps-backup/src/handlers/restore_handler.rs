@@ -39,6 +39,9 @@ impl From<RestoreError> for Problem {
             | RestoreError::RestoreRunNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Resource Not Found")
                 .with_detail(error.to_string()),
+            RestoreError::BackupDeleting { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Backup deletion in progress")
+                .with_detail(error.to_string()),
             RestoreError::BackupHasNoService { .. }
             | RestoreError::Validation { .. }
             | RestoreError::UnsupportedMode { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
@@ -473,6 +476,14 @@ mod tests {
                 service_type: "redis".into(),
             }),
             StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn deleting_backup_maps_to_conflict() {
+        assert_eq!(
+            status_for(RestoreError::BackupDeleting { backup_id: 1 }),
+            StatusCode::CONFLICT
         );
     }
 

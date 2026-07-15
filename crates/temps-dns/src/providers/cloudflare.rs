@@ -17,6 +17,22 @@ use super::traits::{
     DnsRecordRequest, DnsRecordType, DnsZone,
 };
 use crate::errors::DnsError;
+use cloudflare::framework::response::ApiFailure;
+
+/// Map a Cloudflare API failure to a [`DnsError`], surfacing 401/403 as
+/// [`DnsError::PermissionDenied`] so callers can distinguish "token lacks zone
+/// access" from a generic API error or a missing zone.
+fn map_cf_error(context: &str, error: ApiFailure) -> DnsError {
+    if let ApiFailure::Error(status, _) = &error {
+        let code = status.as_u16();
+        if code == 401 || code == 403 {
+            return DnsError::PermissionDenied(format!(
+                "{context}: Cloudflare token lacks required permissions (HTTP {code}): {error:?}"
+            ));
+        }
+    }
+    DnsError::ApiError(format!("{context}: {error:?}"))
+}
 
 /// Cloudflare DNS provider
 pub struct CloudflareProvider {
@@ -263,6 +279,7 @@ impl DnsProvider for CloudflareProvider {
             proxy: true,
             auto_ssl: true,
             wildcard: true,
+            flat_hostnames: true,
         }
     }
 
@@ -288,7 +305,7 @@ impl DnsProvider for CloudflareProvider {
             .client
             .request(&endpoint)
             .await
-            .map_err(|e| DnsError::ApiError(format!("Failed to list zones: {:?}", e)))?;
+            .map_err(|e| map_cf_error("Failed to list zones", e))?;
 
         Ok(response
             .result
@@ -317,7 +334,7 @@ impl DnsProvider for CloudflareProvider {
             .client
             .request(&endpoint)
             .await
-            .map_err(|e| DnsError::ApiError(format!("Failed to get zone: {:?}", e)))?;
+            .map_err(|e| map_cf_error("Failed to get zone", e))?;
 
         Ok(response.result.into_iter().next().map(|zone| DnsZone {
             id: zone.id,
@@ -971,6 +988,7 @@ mod tests {
         assert!(caps.proxy); // Cloudflare supports proxying
         assert!(caps.auto_ssl);
         assert!(caps.wildcard);
+        assert!(caps.flat_hostnames); // Cloudflare benefits from flat hostnames (Universal SSL)
     }
 
     // ==================== Round-trip conversion tests ====================

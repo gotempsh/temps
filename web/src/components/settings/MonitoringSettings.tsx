@@ -156,7 +156,7 @@ export function MonitoringSettings({
                 <Input
                   id="monitor-path"
                   type="text"
-                  placeholder="Leave empty to monitor data directory"
+                  placeholder="Leave empty to monitor all disks"
                   value={diskSpaceAlert?.monitor_path || ''}
                   onChange={(e) =>
                     setValue(
@@ -167,8 +167,8 @@ export function MonitoringSettings({
                   }
                 />
                 <p className="text-sm text-muted-foreground">
-                  Specify a custom path to monitor, or leave empty to monitor
-                  the data directory
+                  Restrict monitoring to the disk backing a specific path, or
+                  leave empty to monitor all mounted disks (recommended)
                 </p>
               </div>
             </>

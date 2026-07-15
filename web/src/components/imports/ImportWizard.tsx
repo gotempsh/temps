@@ -1028,7 +1028,7 @@ export function ImportWizard({ onCancel, className }: ImportWizardProps) {
                           ).map(([envKey, envValue]) => {
                             // Extract the actual key and value from the object structure
                             let key = envKey
-                            let value = ''
+                            let value: string
 
                             if (
                               typeof envValue === 'object' &&

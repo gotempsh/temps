@@ -410,11 +410,11 @@ async fn handle_remote_terminal_proxy(
     let b2a = tokio::spawn(async move {
         while let Some(Ok(msg)) = browser_rx.next().await {
             let out = match msg {
-                Message::Binary(b) => TMessage::Binary(b.to_vec()),
-                Message::Text(t) => TMessage::Text(t.to_string()),
+                Message::Binary(b) => TMessage::Binary(b),
+                Message::Text(t) => TMessage::Text(t.to_string().into()),
                 Message::Close(_) => TMessage::Close(None),
-                Message::Ping(p) => TMessage::Ping(p.to_vec()),
-                Message::Pong(p) => TMessage::Pong(p.to_vec()),
+                Message::Ping(p) => TMessage::Ping(p),
+                Message::Pong(p) => TMessage::Pong(p),
             };
             if agent_tx.send(out).await.is_err() {
                 break;

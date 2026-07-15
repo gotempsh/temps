@@ -122,6 +122,7 @@ mod m20260618_000001_create_on_demand_cert_attempts;
 mod m20260618_000002_add_domains_on_demand_backoff;
 mod m20260619_000001_add_settings_change_trigger;
 mod m20260621_000001_create_telemetry_milestones;
+mod m20260622_000001_managed_domain_hostnames;
 mod m20260623_000001_add_external_services_default_backup_provisioned;
 mod m20260626_000001_create_metric_dashboards;
 mod m20260626_000002_create_metric_alert_rules;
@@ -147,6 +148,7 @@ mod m20260708_000001_add_node_id_to_monitoring_alert_rules;
 mod m20260711_000001_add_proxy_logs_stats_cagg;
 mod m20260711_000002_add_ip_geolocations_hosting_provider;
 mod m20260711_000003_add_visitor_non_crawler_partial_index;
+mod m20260713_000001_add_mfa_pending_to_sessions;
 
 pub struct Migrator;
 
@@ -272,6 +274,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260618_000002_add_domains_on_demand_backoff::Migration),
             Box::new(m20260619_000001_add_settings_change_trigger::Migration),
             Box::new(m20260621_000001_create_telemetry_milestones::Migration),
+            Box::new(m20260622_000001_managed_domain_hostnames::Migration),
             Box::new(m20260623_000001_add_external_services_default_backup_provisioned::Migration),
             Box::new(m20260626_000001_create_metric_dashboards::Migration),
             Box::new(m20260626_000002_create_metric_alert_rules::Migration),
@@ -299,6 +302,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260711_000001_add_proxy_logs_stats_cagg::Migration),
             Box::new(m20260711_000002_add_ip_geolocations_hosting_provider::Migration),
             Box::new(m20260711_000003_add_visitor_non_crawler_partial_index::Migration),
+            Box::new(m20260713_000001_add_mfa_pending_to_sessions::Migration),
         ]
     }
 }

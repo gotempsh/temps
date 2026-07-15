@@ -1460,17 +1460,8 @@ impl GitProviderService for GitHubProvider {
         signature: &str,
         secret: &str,
     ) -> Result<bool, GitProviderError> {
-        use hmac::{Hmac, KeyInit, Mac};
-        use sha2::Sha256;
-
-        // GitHub uses HMAC-SHA256 for webhook signatures
-        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
-            .map_err(|e| GitProviderError::Other(format!("Invalid secret key: {}", e)))?;
-
-        mac.update(payload);
-
-        let expected = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
-        Ok(signature == expected)
+        github_webhook_signature_matches(payload, signature, secret)
+            .map_err(GitProviderError::Other)
     }
 
     async fn get_user(&self, access_token: &str) -> Result<User, GitProviderError> {
@@ -2719,5 +2710,57 @@ mod list_directory_tests {
         assert_eq!(entries[0].name, "Cargo.toml");
         assert!(!entries[0].is_dir);
         assert_eq!(entries[0].size, Some(1024));
+    }
+}
+
+/// Verify a GitHub `X-Hub-Signature-256` HMAC-SHA256 webhook signature.
+///
+/// The comparison is **constant-time** (`subtle::ConstantTimeEq`) to avoid a
+/// timing side-channel that could leak the expected signature byte-by-byte
+/// (security review finding #14). Factored out as a free function so the
+/// verification logic can be unit-tested with a known vector.
+fn github_webhook_signature_matches(
+    payload: &[u8],
+    signature: &str,
+    secret: &str,
+) -> Result<bool, String> {
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::Sha256;
+    use subtle::ConstantTimeEq;
+
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+        .map_err(|e| format!("Invalid secret key: {}", e))?;
+    mac.update(payload);
+    let expected = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+    Ok(signature.as_bytes().ct_eq(expected.as_bytes()).into())
+}
+
+#[cfg(test)]
+mod signature_tests {
+    use super::github_webhook_signature_matches;
+
+    // Known HMAC-SHA256 vector (GitHub's documented example):
+    // secret "It's a Secret to Everybody", payload "Hello, World!".
+    const SECRET: &str = "It's a Secret to Everybody";
+    const PAYLOAD: &[u8] = b"Hello, World!";
+    const VALID: &str = "sha256=757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17";
+
+    #[test]
+    fn valid_signature_matches() {
+        assert!(github_webhook_signature_matches(PAYLOAD, VALID, SECRET).unwrap());
+    }
+
+    #[test]
+    fn tampered_signature_is_rejected() {
+        let mut bad = VALID.to_string();
+        bad.pop();
+        bad.push('0');
+        assert!(!github_webhook_signature_matches(PAYLOAD, &bad, SECRET).unwrap());
+    }
+
+    #[test]
+    fn wrong_length_signature_is_rejected() {
+        // ct_eq handles unequal lengths without panicking and returns false.
+        assert!(!github_webhook_signature_matches(PAYLOAD, "sha256=deadbeef", SECRET).unwrap());
     }
 }

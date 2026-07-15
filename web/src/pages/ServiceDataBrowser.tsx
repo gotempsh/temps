@@ -1805,7 +1805,7 @@ export function ServiceDataBrowser() {
               explorerSupport={explorerSupport}
               onSort={(field: string) => {
                 let nextField = dataSortField
-                let nextOrder: 'asc' | 'desc' = dataSortOrder
+                let nextOrder: 'asc' | 'desc'
                 if (dataSortField === field) {
                   nextOrder = dataSortOrder === 'asc' ? 'desc' : 'asc'
                   setDataSortOrder(nextOrder)

@@ -695,7 +695,11 @@ async fn retry_delivery(
     permission_guard!(auth, WebhooksWrite);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
-    match state.webhook_service.retry_delivery(delivery_id).await {
+    match state
+        .webhook_service
+        .retry_delivery(project_id, webhook_id, delivery_id)
+        .await
+    {
         Ok(result) => {
             info!(
                 "Retried delivery {}, success: {}",
@@ -722,13 +726,28 @@ async fn retry_delivery(
                 "attempt_number": result.attempt_number,
             })))
         }
+        Err(e @ crate::service::WebhookError::DeliveryNotInScope { .. }) => {
+            Err(retry_delivery_problem(e))
+        }
         Err(e) => {
             error!("Failed to retry delivery: {}", e);
-            Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .title("Failed to retry delivery")
-                .detail(e.to_string())
-                .build())
+            Err(retry_delivery_problem(e))
         }
+    }
+}
+
+fn retry_delivery_problem(error: crate::service::WebhookError) -> Problem {
+    match error {
+        crate::service::WebhookError::DeliveryNotInScope { .. } => {
+            ErrorBuilder::new(StatusCode::NOT_FOUND)
+                .title("Delivery not found")
+                .detail("Delivery does not exist in the requested project and webhook")
+                .build()
+        }
+        other => ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .title("Failed to retry delivery")
+            .detail(other.to_string())
+            .build(),
     }
 }
 
@@ -820,4 +839,50 @@ pub fn configure_routes() -> Router<Arc<WebhookState>> {
             "/projects/{project_id}/webhooks/{webhook_id}/deliveries/{delivery_id}/retry",
             post(retry_delivery),
         )
+}
+
+#[cfg(test)]
+mod retry_delivery_tests {
+    use super::retry_delivery_problem;
+    use crate::service::WebhookError;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn every_out_of_scope_retry_has_an_identical_non_enumerating_404() {
+        let errors = [
+            WebhookError::DeliveryNotInScope {
+                project_id: 1,
+                webhook_id: 10,
+                delivery_id: 20,
+            },
+            WebhookError::DeliveryNotInScope {
+                project_id: 1,
+                webhook_id: 99,
+                delivery_id: 20,
+            },
+            WebhookError::DeliveryNotInScope {
+                project_id: 1,
+                webhook_id: 10,
+                delivery_id: 999,
+            },
+        ];
+
+        let problems = errors.map(retry_delivery_problem);
+        let mut expected_body = problems[0].body.clone();
+        expected_body.remove("timestamp");
+        for problem in &problems {
+            assert_eq!(problem.status_code, StatusCode::NOT_FOUND);
+            let mut body = problem.body.clone();
+            body.remove("timestamp");
+            assert_eq!(body, expected_body);
+            let title_and_detail = format!(
+                "{} {}",
+                body.get("title").unwrap(),
+                body.get("detail").unwrap()
+            );
+            assert!(!title_and_detail.contains("20"));
+            assert!(!title_and_detail.contains("99"));
+            assert!(!title_and_detail.contains("999"));
+        }
+    }
 }

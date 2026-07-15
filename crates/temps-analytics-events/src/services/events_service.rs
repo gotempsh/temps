@@ -972,6 +972,56 @@ WHERE project_id = $1
         deployment_id: Option<i32>,
         metric: String,
     ) -> Result<UniqueCountsResponse, EventsError> {
+        if metric == "returning_visitors" {
+            let query = r#"
+                WITH current_visitors AS (
+                    SELECT DISTINCT visitor_id
+                    FROM events
+                    WHERE project_id = $1
+                      AND timestamp >= $2::timestamp
+                      AND timestamp <= $3::timestamp
+                      AND visitor_id IS NOT NULL
+                      AND ($4::int IS NULL OR environment_id = $4)
+                      AND ($5::int IS NULL OR deployment_id = $5)
+                )
+                SELECT COUNT(*)::bigint AS count
+                FROM current_visitors cv
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM events previous
+                    WHERE previous.project_id = $1
+                      AND previous.visitor_id = cv.visitor_id
+                      AND previous.timestamp < $2::timestamp
+                      AND ($4::int IS NULL OR previous.environment_id = $4)
+                      AND ($5::int IS NULL OR previous.deployment_id = $5)
+                )
+            "#;
+
+            #[derive(FromQueryResult)]
+            struct ReturningVisitorsResult {
+                count: i64,
+            }
+
+            let params = vec![
+                project_id.into(),
+                start_date.into(),
+                end_date.into(),
+                environment_id.into(),
+                deployment_id.into(),
+            ];
+
+            let result = ReturningVisitorsResult::find_by_statement(
+                Statement::from_sql_and_values(DatabaseBackend::Postgres, query, params),
+            )
+            .one(self.db.as_ref())
+            .await?
+            .unwrap_or(ReturningVisitorsResult { count: 0 });
+
+            return Ok(UniqueCountsResponse {
+                count: result.count,
+            });
+        }
+
         // Determine what to count based on metric
         let count_expr = match metric.as_str() {
             "sessions" => {
@@ -983,7 +1033,7 @@ WHERE project_id = $1
             "page_views" | "paths" => "COUNT(*) FILTER (WHERE event_type = 'page_view')::bigint",
             _ => {
                 return Err(EventsError::Validation(format!(
-                    "Invalid metric '{}'. Valid options: sessions, visitors, page_views",
+                    "Invalid metric '{}'. Valid options: sessions, visitors, returning_visitors, page_views",
                     metric
                 )))
             }
@@ -2063,6 +2113,22 @@ mod tests {
     async fn create_test_events(_db: &DatabaseConnection) {
         // This test would require the events table schema
         // For now, this is a template for future tests
+    }
+
+    #[tokio::test]
+    async fn test_unique_counts_rejects_unknown_metric() {
+        let db = setup_test_db().await.unwrap();
+        let service = AnalyticsEventsService::new(Arc::new(db));
+        let start = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2024, 1, 2, 0, 0, 0).unwrap();
+
+        let result = service
+            .get_unique_counts(start, end, 1, None, None, "unknown".to_string())
+            .await;
+
+        assert!(
+            matches!(result, Err(EventsError::Validation(message)) if message.contains("returning_visitors"))
+        );
     }
 
     #[tokio::test]
@@ -3683,7 +3749,19 @@ mod tests {
         let project_a = make_project(&db, "trend-baseline").await;
         let env_a = make_environment(&db, project_a.id, "trend-baseline-env").await;
         let dep_a = make_deployment(&db, project_a.id, env_a.id, "trend-baseline-dep").await;
-        for i in 0..4 {
+        let returning_visitor =
+            make_visitor(&db, project_a.id, env_a.id, "a-returning", prev_ts).await;
+        make_page_view(
+            &db,
+            project_a.id,
+            env_a.id,
+            dep_a.id,
+            returning_visitor.id,
+            "a-returning-prev-session",
+            prev_ts,
+        )
+        .await;
+        for i in 1..4 {
             let v =
                 make_visitor(&db, project_a.id, env_a.id, &format!("a-prev-{i}"), prev_ts).await;
             make_page_view(
@@ -3697,7 +3775,17 @@ mod tests {
             )
             .await;
         }
-        for i in 0..6 {
+        make_page_view(
+            &db,
+            project_a.id,
+            env_a.id,
+            dep_a.id,
+            returning_visitor.id,
+            "a-returning-current-session",
+            curr_ts,
+        )
+        .await;
+        for i in 1..6 {
             let v =
                 make_visitor(&db, project_a.id, env_a.id, &format!("a-curr-{i}"), curr_ts).await;
             make_page_view(
@@ -3771,6 +3859,22 @@ mod tests {
             a.trend_percentage,
             Some(50.0),
             "trend must be the real (6-4)/4*100 ratio, not derived from a stale/empty aggregate"
+        );
+
+        let returning = service
+            .get_unique_counts(
+                start,
+                end,
+                project_a.id,
+                Some(env_a.id),
+                Some(dep_a.id),
+                "returning_visitors".to_string(),
+            )
+            .await
+            .expect("get returning visitors");
+        assert_eq!(
+            returning.count, 1,
+            "only the visitor with an event before the reporting range is returning"
         );
 
         let b = response

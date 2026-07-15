@@ -21,6 +21,8 @@ use crate::providers::{
     GcpProvider, ManualDnsProvider, NamecheapProvider, PebbleDnsProvider, ProviderCredentials,
     Route53Provider,
 };
+use crate::services::hostname_sync::{self, HostnameModeResult};
+use temps_core::{AppSettings, PublicHostnameStrategy};
 
 /// Service for managing DNS providers
 #[derive(Clone)]
@@ -52,6 +54,18 @@ pub struct UpdateProviderRequest {
 pub struct AddManagedDomainRequest {
     pub domain: String,
     pub auto_manage: bool,
+    /// Optional generated hostname mode (`"standard"`/`"flat"`); defaults to standard.
+    pub generated_hostname_mode: Option<String>,
+    /// Opt in to reconciling generated hostnames into this domain's DNS zone.
+    pub sync_generated_records: bool,
+}
+
+/// Request to update a managed domain's settings.
+#[derive(Debug, Clone, Default)]
+pub struct UpdateManagedDomainRequest {
+    pub generated_hostname_mode: Option<String>,
+    pub sync_generated_records: Option<bool>,
+    pub auto_manage: Option<bool>,
 }
 
 impl DnsProviderService {
@@ -332,6 +346,16 @@ impl DnsProviderService {
     }
 
     /// Create a DNS provider instance from a database model
+    /// Whether the provider advertises the flat-hostname capability (i.e. its
+    /// wildcard TLS only covers one label, like Cloudflare Universal SSL). Used
+    /// by the UI to surface and recommend the Flat hostname mode. Returns false
+    /// if the provider instance can't be constructed.
+    pub fn flat_hostnames_supported(&self, provider: &dns_providers::Model) -> bool {
+        self.create_provider_instance(provider)
+            .map(|instance| instance.capabilities().flat_hostnames)
+            .unwrap_or(false)
+    }
+
     pub fn create_provider_instance(
         &self,
         provider: &dns_providers::Model,
@@ -516,11 +540,23 @@ impl DnsProviderService {
             )));
         }
 
+        // Normalize the requested mode; unknown values fall back to standard.
+        let mode = temps_core::PublicHostnameStrategy::from_db_str(
+            request
+                .generated_hostname_mode
+                .as_deref()
+                .unwrap_or("standard"),
+        )
+        .as_db_str()
+        .to_string();
+
         let managed_domain = dns_managed_domains::ActiveModel {
             provider_id: Set(provider_id),
             domain: Set(request.domain.clone()),
             auto_manage: Set(request.auto_manage),
             verified: Set(false),
+            generated_hostname_mode: Set(mode),
+            sync_generated_records: Set(request.sync_generated_records),
             ..Default::default()
         };
 
@@ -581,8 +617,15 @@ impl DnsProviderService {
         let provider = self.get(provider_id).await?;
         let instance = self.create_provider_instance(&provider)?;
 
-        // Check if provider can manage this domain
-        let can_manage = instance.can_manage_domain(domain).await;
+        // Distinguish "token lacks zone access" (PermissionDenied) from "zone
+        // absent" so the UI can flag a mis-scoped token.
+        let access = instance.check_zone_access(domain).await;
+        let can_manage = access.is_ok();
+        let (zone_access_ok, zone_access_error) = match &access {
+            Ok(()) => (Some(true), None),
+            Err(DnsError::PermissionDenied(msg)) => (Some(false), Some(msg.clone())),
+            Err(e) => (Some(false), Some(e.to_string())),
+        };
 
         // Update verification status
         let managed_domain = dns_managed_domains::Entity::find()
@@ -595,6 +638,8 @@ impl DnsProviderService {
         let mut active_model: dns_managed_domains::ActiveModel = managed_domain.into();
         active_model.verified = Set(can_manage);
         active_model.verified_at = Set(Some(chrono::Utc::now()));
+        active_model.zone_access_ok = Set(zone_access_ok);
+        active_model.zone_access_error = Set(zone_access_error);
 
         if can_manage {
             active_model.verification_error = Set(None);
@@ -616,6 +661,205 @@ impl DnsProviderService {
         );
 
         Ok(can_manage)
+    }
+
+    /// Update a managed domain's settings (hostname mode, sync opt-in,
+    /// auto-manage). Persists the values only; switching the mode does NOT
+    /// recompute existing hostnames — callers use [`apply_hostname_mode`] for
+    /// that.
+    pub async fn update_managed_domain(
+        &self,
+        provider_id: i32,
+        domain: &str,
+        request: UpdateManagedDomainRequest,
+    ) -> Result<dns_managed_domains::Model, DnsError> {
+        let managed = dns_managed_domains::Entity::find()
+            .filter(dns_managed_domains::Column::ProviderId.eq(provider_id))
+            .filter(dns_managed_domains::Column::Domain.eq(domain))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| DnsError::DomainNotFound(domain.to_string()))?;
+
+        let mut active: dns_managed_domains::ActiveModel = managed.into();
+        if let Some(mode) = request.generated_hostname_mode {
+            active.generated_hostname_mode = Set(PublicHostnameStrategy::from_db_str(&mode)
+                .as_db_str()
+                .to_string());
+        }
+        if let Some(sync) = request.sync_generated_records {
+            active.sync_generated_records = Set(sync);
+        }
+        if let Some(auto) = request.auto_manage {
+            active.auto_manage = Set(auto);
+        }
+
+        Ok(active.update(self.db.as_ref()).await?)
+    }
+
+    /// Read the instance-wide preview domain and edge target from the settings
+    /// singleton.
+    async fn hosting_settings(&self) -> (String, Option<String>) {
+        let settings = temps_entities::settings::Entity::find()
+            .one(self.db.as_ref())
+            .await
+            .ok()
+            .flatten()
+            .map(|s| AppSettings::from_json(s.data))
+            .unwrap_or_default();
+        (settings.preview_domain, settings.edge_target)
+    }
+
+    /// Preview a hostname-mode change for a managed domain without writing
+    /// anything: the generated hostnames that would change, plus (when
+    /// `want_sync`) the DNS records the sync would reconcile, plus the token's
+    /// zone-access state.
+    pub async fn preview_hostname_mode(
+        &self,
+        provider_id: i32,
+        domain: &str,
+        target: PublicHostnameStrategy,
+        want_sync: bool,
+    ) -> Result<HostnameModeResult, DnsError> {
+        self.hostname_mode_operation(provider_id, domain, target, want_sync, true)
+            .await
+    }
+
+    /// Apply a hostname-mode change: persist the mode and (when `sync_dns`)
+    /// reconcile the provider's DNS zone. Returns the changes that were applied.
+    /// The caller is responsible for triggering a route reload so derived
+    /// hostnames take effect.
+    pub async fn apply_hostname_mode(
+        &self,
+        provider_id: i32,
+        domain: &str,
+        target: PublicHostnameStrategy,
+        sync_dns: bool,
+    ) -> Result<HostnameModeResult, DnsError> {
+        self.hostname_mode_operation(provider_id, domain, target, sync_dns, false)
+            .await
+    }
+
+    /// Shared preview/apply implementation. With `dry_run` it computes the
+    /// changes without writing; otherwise it persists the mode and executes the
+    /// DNS reconciliation.
+    async fn hostname_mode_operation(
+        &self,
+        provider_id: i32,
+        domain: &str,
+        target: PublicHostnameStrategy,
+        sync_dns: bool,
+        dry_run: bool,
+    ) -> Result<HostnameModeResult, DnsError> {
+        // Confirm the domain belongs to this provider.
+        let managed = dns_managed_domains::Entity::find()
+            .filter(dns_managed_domains::Column::ProviderId.eq(provider_id))
+            .filter(dns_managed_domains::Column::Domain.eq(domain))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| DnsError::DomainNotFound(domain.to_string()))?;
+
+        let (preview_domain, edge_target) = self.hosting_settings().await;
+
+        // Only domains matching the instance's preview base domain govern
+        // generated hostnames; others have no generated hosts to change.
+        let base = temps_core::public_base_domain(&preview_domain);
+        let applies = base == domain.to_ascii_lowercase()
+            || base.ends_with(&format!(".{}", domain.to_ascii_lowercase()));
+
+        let hostname_changes = if applies {
+            hostname_sync::compute_hostname_changes(self.db.as_ref(), &preview_domain, target).await
+        } else {
+            Vec::new()
+        };
+
+        let mut result = HostnameModeResult {
+            hostname_changes,
+            dns_changes: Vec::new(),
+            zone_access_ok: None,
+        };
+
+        if sync_dns {
+            let provider = self.get(provider_id).await?;
+            let instance = self.create_provider_instance(&provider)?;
+
+            // Verify token zone access before attempting any record changes.
+            match instance.check_zone_access(domain).await {
+                Ok(()) => result.zone_access_ok = Some(true),
+                Err(DnsError::PermissionDenied(msg)) => {
+                    result.zone_access_ok = Some(false);
+                    if !dry_run {
+                        return Err(DnsError::PermissionDenied(msg));
+                    }
+                    return Ok(result);
+                }
+                Err(e) => {
+                    result.zone_access_ok = Some(false);
+                    if !dry_run {
+                        return Err(e);
+                    }
+                    return Ok(result);
+                }
+            }
+
+            if let Some(edge_target) = edge_target.as_deref() {
+                let desired = hostname_sync::enumerate_generated_hosts(
+                    self.db.as_ref(),
+                    &preview_domain,
+                    target,
+                )
+                .await;
+                result.dns_changes = hostname_sync::reconcile_zone_records(
+                    instance.as_ref(),
+                    domain,
+                    &desired,
+                    edge_target,
+                    dry_run,
+                )
+                .await?;
+            }
+        }
+
+        if !dry_run {
+            let mut active: dns_managed_domains::ActiveModel = managed.into();
+            active.generated_hostname_mode = Set(target.as_db_str().to_string());
+            if sync_dns {
+                active.sync_generated_records = Set(true);
+            }
+            active.update(self.db.as_ref()).await?;
+        }
+
+        Ok(result)
+    }
+
+    /// Resolve the public hostname strategy for a preview/base domain by
+    /// matching it against managed domains. Defaults to `Standard` when no
+    /// managed domain matches.
+    pub async fn resolve_hostname_strategy(
+        &self,
+        preview_domain: &str,
+    ) -> temps_core::PublicHostnameStrategy {
+        let map = self.hostname_strategy_map().await;
+        temps_core::public_hostname_resolver::match_strategy(&map, preview_domain)
+    }
+
+    /// Load every managed domain's hostname strategy keyed by its (lowercased)
+    /// base domain. Errors are swallowed into an empty map so hostname
+    /// generation degrades to `Standard` rather than failing.
+    pub async fn hostname_strategy_map(
+        &self,
+    ) -> std::collections::HashMap<String, temps_core::PublicHostnameStrategy> {
+        dns_managed_domains::Entity::find()
+            .all(self.db.as_ref())
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|d| {
+                (
+                    d.domain.to_ascii_lowercase(),
+                    temps_core::PublicHostnameStrategy::from_db_str(&d.generated_hostname_mode),
+                )
+            })
+            .collect()
     }
 
     /// Find the provider that manages a specific domain
@@ -651,6 +895,19 @@ impl DnsProviderService {
         } else {
             domain.to_string()
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl temps_core::PublicHostnameResolver for DnsProviderService {
+    async fn strategy_for(&self, preview_domain: &str) -> temps_core::PublicHostnameStrategy {
+        self.resolve_hostname_strategy(preview_domain).await
+    }
+
+    async fn strategy_map(
+        &self,
+    ) -> std::collections::HashMap<String, temps_core::PublicHostnameStrategy> {
+        self.hostname_strategy_map().await
     }
 }
 
