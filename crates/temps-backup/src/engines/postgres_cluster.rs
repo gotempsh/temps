@@ -52,6 +52,7 @@ impl BackupEngine for PostgresClusterEngine {
 
         let service_id = v2_common::require_i32_param(&ctx.params, "service_id")?;
         let s3_source_id = v2_common::require_i32_param(&ctx.params, "s3_source_id")?;
+        let backup_uuid = v2_common::load_backup_uuid(deps.db.as_ref(), backup_id).await?;
 
         // ── Locate the cluster primary ───────────────────────────────────────
         let primary_member = temps_entities::service_members::Entity::find()
@@ -143,6 +144,18 @@ impl BackupEngine for PostgresClusterEngine {
                 reason: format!("decrypt secret key: {}", e),
             })?;
 
+        let container_endpoint = temps_providers::externalsvc::S3Credentials {
+            access_key_id: access_key.clone(),
+            secret_key: secret_key.clone(),
+            region: s3_source.region.clone(),
+            endpoint: s3_source.endpoint.clone(),
+            bucket_name: s3_source.bucket_name.clone(),
+            bucket_path: s3_source.bucket_path.clone(),
+            force_path_style: s3_source.force_path_style.unwrap_or(true),
+        }
+        .resolve_endpoint_for_container(&deps.docker, &primary_container)
+        .await;
+
         let mut walg_env: Vec<String> = vec![
             format!("WALG_S3_PREFIX={}", walg_prefix),
             format!("AWS_ACCESS_KEY_ID={}", access_key),
@@ -158,9 +171,10 @@ impl BackupEngine for PostgresClusterEngine {
             "WALG_UPLOAD_QUEUE=2".to_string(),
             "WALG_TAR_SIZE_THRESHOLD=134217728".to_string(),
         ];
-        if let Some(ep) = &s3_source.endpoint {
+        walg_env.extend(v2_common::walg_identity_env(&backup_uuid));
+        if let Some(ep) = container_endpoint {
             let url = if ep.starts_with("http") {
-                ep.clone()
+                ep
             } else {
                 format!("http://{}", ep)
             };
@@ -233,6 +247,7 @@ impl BackupEngine for PostgresClusterEngine {
             })),
         )
         .await?;
+        v2_common::record_walg_identity(deps.db.as_ref(), backup_id, &backup_uuid).await?;
 
         info!(
             backup_id,

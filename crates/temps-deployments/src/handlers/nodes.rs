@@ -27,6 +27,7 @@ use crate::services::node_service::{
     HeartbeatRequest, NodeError, NodeService, RegisterNodeRequest,
 };
 use temps_core::problemdetails::{self, Problem};
+use temps_core::{AppSettings, PublicHostnameStrategy};
 use temps_deployer::ContainerDeployer;
 
 /// App state for node registration handlers
@@ -1424,18 +1425,13 @@ async fn edge_routes(
     {
         use temps_entities::settings;
 
-        let preview_domain = settings::Entity::find()
+        let app_settings = settings::Entity::find()
             .one(app_state.db.as_ref())
             .await
             .ok()
             .flatten()
-            .and_then(|s| {
-                s.data
-                    .get("preview_domain")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-            })
-            .unwrap_or_else(|| "localho.st".to_string());
+            .map(|s| AppSettings::from_json(s.data))
+            .unwrap_or_default();
 
         let all_envs = environments::Entity::find()
             .filter(environments::Column::Subdomain.is_not_null())
@@ -1454,7 +1450,8 @@ async fn edge_routes(
             })?;
 
         for env in &all_envs {
-            let full_domain = format!("{}.{}", env.subdomain, preview_domain);
+            let full_domain = PublicHostnameStrategy::Standard
+                .environment_hostname(&app_settings.preview_domain, &env.subdomain);
             // Skip if already added from environment_domains
             if routes.iter().any(|r| r.domain == full_domain) {
                 continue;

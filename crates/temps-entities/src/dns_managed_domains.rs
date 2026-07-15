@@ -38,6 +38,24 @@ pub struct Model {
     /// Error message from last verification attempt
     pub verification_error: Option<String>,
 
+    /// Generated public hostname layout for hosts under this domain.
+    /// `"standard"` (default) or `"flat"` (single label below the base domain,
+    /// required by providers like Cloudflare whose Universal SSL wildcard cert
+    /// only covers one label). Parsed via `PublicHostnameStrategy::from_db_str`.
+    pub generated_hostname_mode: String,
+
+    /// Whether to reconcile generated hostnames into this domain's DNS zone on
+    /// the provider (opt-in per domain). Requires `edge_target` to be set.
+    pub sync_generated_records: bool,
+
+    /// Result of the last token zone-access check: `Some(true)` if the provider
+    /// token can manage this zone, `Some(false)` if access was denied, `None`
+    /// if never checked.
+    pub zone_access_ok: Option<bool>,
+
+    /// Detail for a failed zone-access check (e.g. token lacks zone scope).
+    pub zone_access_error: Option<String>,
+
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }

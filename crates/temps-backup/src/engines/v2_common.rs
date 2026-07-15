@@ -20,6 +20,7 @@ use aws_smithy_http_client::tls::{
     rustls_provider::CryptoMode, Provider as TlsProvider, TlsContext, TrustStore,
 };
 use chrono::Utc;
+use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, IntoActiveModel, Set};
 use serde_json::{json, Value};
 use tracing::warn;
 
@@ -336,6 +337,93 @@ pub async fn load_s3_source(
         .ok_or_else(|| BackupError::PermanentFailure {
             reason: format!("s3_source {} not found", s3_source_id),
         })
+}
+
+/// Return the stable public UUID assigned to the parent backup row.
+///
+/// Engines must use this value as their snapshot directory. Generating a new
+/// UUID inside an engine makes retries write multiple snapshots and prevents
+/// the deletion path from proving that an S3 prefix belongs to the row being
+/// deleted.
+pub async fn load_backup_uuid(
+    db: &DatabaseConnection,
+    backup_id: i32,
+) -> Result<String, BackupError> {
+    temps_entities::backups::Entity::find_by_id(backup_id)
+        .one(db)
+        .await
+        .map_err(|error| BackupError::Failed {
+            reason: format!("db error loading backup {}: {}", backup_id, error),
+        })?
+        .map(|backup| backup.backup_id)
+        .ok_or_else(|| BackupError::PermanentFailure {
+            reason: format!("backup {} not found", backup_id),
+        })
+}
+
+/// Persist the exact WAL-G sentinel selector used for this backup.
+/// Legacy rows without this marker are deliberately not individually
+/// deletable because their shared repository cannot be mapped to one row.
+pub async fn record_walg_identity(
+    db: &DatabaseConnection,
+    backup_id: i32,
+    backup_uuid: &str,
+) -> Result<(), BackupError> {
+    let backup = temps_entities::backups::Entity::find_by_id(backup_id)
+        .one(db)
+        .await
+        .map_err(|error| BackupError::Failed {
+            reason: format!("db error loading WAL-G backup {}: {}", backup_id, error),
+        })?
+        .ok_or_else(|| BackupError::PermanentFailure {
+            reason: format!("backup {} not found", backup_id),
+        })?;
+    let mut metadata =
+        serde_json::from_str::<serde_json::Value>(&backup.metadata).map_err(|error| {
+            BackupError::PermanentFailure {
+                reason: format!(
+                    "backup {} metadata is invalid JSON; WAL-G identity was not persisted: {}",
+                    backup_id, error
+                ),
+            }
+        })?;
+    let object = metadata
+        .as_object_mut()
+        .ok_or_else(|| BackupError::PermanentFailure {
+            reason: format!("backup {} metadata is not a JSON object", backup_id),
+        })?;
+    object.insert("walg_identity_version".to_string(), serde_json::json!(1));
+    object.insert(
+        "walg_target_user_data".to_string(),
+        serde_json::json!({ "temps_backup_id": backup_uuid }),
+    );
+    object.insert("walg_full_backup".to_string(), serde_json::json!(true));
+
+    let mut active = backup.into_active_model();
+    active.metadata = Set(metadata.to_string());
+    active
+        .update(db)
+        .await
+        .map_err(|error| BackupError::Failed {
+            reason: format!(
+                "failed to persist WAL-G identity for backup {}: {}",
+                backup_id, error
+            ),
+        })?;
+    Ok(())
+}
+
+/// Environment that makes one WAL-G snapshot independently deletable.
+/// Explicitly disabling deltas overrides any inherited container setting;
+/// otherwise deleting one target may also delete newer dependent snapshots.
+pub fn walg_identity_env(backup_uuid: &str) -> [String; 2] {
+    [
+        "WALG_DELTA_MAX_STEPS=0".to_string(),
+        format!(
+            "WALG_SENTINEL_USER_DATA={}",
+            json!({ "temps_backup_id": backup_uuid })
+        ),
+    ]
 }
 
 /// Build an S3 client from an already-loaded S3 source row. Decrypts the
@@ -782,5 +870,24 @@ pub async fn best_effort_remove(path: &std::path::Path) {
         if e.kind() != std::io::ErrorKind::NotFound {
             warn!(path = %path.display(), error = %e, "best_effort_remove: unlink failed (non-fatal)");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::walg_identity_env;
+
+    #[test]
+    fn walg_identity_env_forces_full_backup_and_exact_user_data() {
+        let backup_id = "4dc29e1a-1234-4abc-8def-123456789abc";
+        let env = walg_identity_env(backup_id);
+        assert_eq!(env[0], "WALG_DELTA_MAX_STEPS=0");
+        assert_eq!(
+            env[1],
+            format!(
+                "WALG_SENTINEL_USER_DATA={{\"temps_backup_id\":\"{}\"}}",
+                backup_id
+            )
+        );
     }
 }

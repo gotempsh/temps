@@ -101,6 +101,8 @@ impl AuthService {
             user_id: Set(user_id),
             session_token: Set(session_token.clone()),
             expires_at: Set(expires_at),
+            // Fully authenticated session, not an MFA challenge.
+            mfa_pending: Set(false),
             ..Default::default()
         };
 
@@ -122,6 +124,9 @@ impl AuthService {
         let count = temps_entities::sessions::Entity::find()
             .filter(temps_entities::sessions::Column::UserId.eq(user_id))
             .filter(temps_entities::sessions::Column::ExpiresAt.gt(Utc::now()))
+            // Pending MFA challenge rows are not real sessions -- excluding
+            // them keeps the concurrent-login audit signal honest.
+            .filter(temps_entities::sessions::Column::MfaPending.eq(false))
             .count(self.db.as_ref())
             .await?;
         Ok(count)
@@ -134,6 +139,9 @@ impl AuthService {
         let session = temps_entities::sessions::Entity::find()
             .filter(temps_entities::sessions::Column::SessionToken.eq(session_token))
             .filter(temps_entities::sessions::Column::ExpiresAt.gt(Utc::now()))
+            // A first-factor-only MFA challenge row must never authenticate a
+            // real request. Only `verify_mfa_challenge` may consume those.
+            .filter(temps_entities::sessions::Column::MfaPending.eq(false))
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| AuthError::NotFound("Session not found or expired".to_string()))?;
@@ -225,6 +233,9 @@ impl AuthService {
             user_id: Set(user_id),
             session_token: Set(session_token.clone()),
             expires_at: Set(expires_at),
+            // Mark this as a pending MFA challenge so it can never be replayed
+            // as a real session cookie -- `verify_session` rejects such rows.
+            mfa_pending: Set(true),
             ..Default::default()
         };
 
@@ -239,10 +250,13 @@ impl AuthService {
         session_token: &str,
         code: &str,
     ) -> Result<temps_entities::users::Model, AuthError> {
-        // Get the user from the temporary session
+        // Get the user from the temporary session. Require mfa_pending so a
+        // real (fully authenticated) session token can never be spent as an
+        // MFA challenge -- the discriminator cuts both ways.
         let session = temps_entities::sessions::Entity::find()
             .filter(temps_entities::sessions::Column::SessionToken.eq(session_token))
             .filter(temps_entities::sessions::Column::ExpiresAt.gt(Utc::now()))
+            .filter(temps_entities::sessions::Column::MfaPending.eq(true))
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| AuthError::GenericError("Invalid or expired session".to_string()))?;
@@ -1280,6 +1294,91 @@ mod tests {
         // Session should be valid
         let verified_user = auth_service.verify_session(&session_token).await.unwrap();
         assert_eq!(verified_user.id, user.id);
+    }
+
+    /// Regression: an MFA challenge token (first factor only) must never
+    /// authenticate a real request. Before the `mfa_pending` discriminator,
+    /// `create_mfa_session` inserted an ordinary `sessions` row and
+    /// `verify_session` accepted it, so replaying the `mfa_session` cookie as
+    /// the `session` cookie yielded a fully authenticated context without the
+    /// second factor.
+    #[tokio::test]
+    async fn test_mfa_pending_session_cannot_authenticate_via_verify_session() {
+        let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+            return;
+        };
+        let user = create_test_user(&db.db, "mfabypass@example.com", "password").await;
+
+        // Token handed to the client as the `mfa_session` cookie.
+        let mfa_token = auth_service.create_mfa_session(user.id).await.unwrap();
+
+        // The attack: replay it on the normal session path.
+        let result = auth_service.verify_session(&mfa_token).await;
+        assert!(
+            result.is_err(),
+            "MFA challenge token must NOT authenticate a real request"
+        );
+        assert!(
+            matches!(result.unwrap_err(), AuthError::NotFound(_)),
+            "MFA challenge token should be indistinguishable from a missing session"
+        );
+
+        // Sanity: a genuine session on the same user still authenticates.
+        let real_token = auth_service.create_session(user.id).await.unwrap();
+        assert_eq!(
+            auth_service.verify_session(&real_token).await.unwrap().id,
+            user.id
+        );
+    }
+
+    /// Regression (symmetric): a real, fully authenticated session token must
+    /// not be consumable as an MFA challenge. `verify_mfa_challenge` filters on
+    /// `mfa_pending = true`, so a real token is rejected before the TOTP code
+    /// is ever checked.
+    #[tokio::test]
+    async fn test_real_session_cannot_be_used_as_mfa_challenge() {
+        let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+            return;
+        };
+        let user = create_test_user(&db.db, "notachallenge@example.com", "password").await;
+
+        let real_token = auth_service.create_session(user.id).await.unwrap();
+
+        let result = auth_service
+            .verify_mfa_challenge(&real_token, "000000")
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(AuthError::GenericError(ref message))
+                    if message == "Invalid or expired session"
+            ),
+            "A real session token must be rejected before TOTP verification, got: {result:?}"
+        );
+    }
+
+    /// A pending MFA challenge row is not a real, active session, so it must
+    /// not inflate the concurrent-session count used for login auditing.
+    #[tokio::test]
+    async fn test_mfa_pending_session_not_counted_as_active() {
+        let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+            return;
+        };
+        let user = create_test_user(&db.db, "activecount@example.com", "password").await;
+
+        auth_service.create_mfa_session(user.id).await.unwrap();
+        assert_eq!(
+            auth_service.count_active_sessions(user.id).await.unwrap(),
+            0,
+            "A pending MFA challenge must not count as an active session"
+        );
+
+        auth_service.create_session(user.id).await.unwrap();
+        assert_eq!(
+            auth_service.count_active_sessions(user.id).await.unwrap(),
+            1,
+            "Only the real session should be counted"
+        );
     }
 
     #[tokio::test]

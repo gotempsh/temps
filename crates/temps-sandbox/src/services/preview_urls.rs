@@ -82,7 +82,7 @@ pub async fn load(platform_config: &Arc<ConfigService>) -> PreviewUrlParts {
             let domain = if s.preview_domain.is_empty() {
                 "localho.st".to_string()
             } else {
-                s.preview_domain.trim_start_matches("*.").to_string()
+                temps_core::public_base_domain(&s.preview_domain)
             };
 
             let port = port.filter(|p| {

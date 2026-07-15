@@ -21,7 +21,6 @@ use aws_sdk_s3::Client as S3Client;
 use sea_orm::{DatabaseConnection, EntityTrait};
 use serde_json::{json, Value};
 use tracing::{info, warn};
-use uuid::Uuid;
 
 use super::oneshot::{run_one_shot, OneShotError, OneShotSpec};
 use super::v2_common;
@@ -141,7 +140,7 @@ impl BackupEngine for S3MirrorEngine {
                 ("http", dest_endpoint.as_str())
             };
 
-        let backup_uuid = Uuid::new_v4().to_string();
+        let backup_uuid = v2_common::load_backup_uuid(deps.db.as_ref(), backup_id).await?;
         let dest_prefix = build_dest_prefix(&s3_dest.bucket_path, &service.name, &backup_uuid);
 
         let source_path = if source_bucket.is_empty() {

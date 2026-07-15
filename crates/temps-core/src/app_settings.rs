@@ -17,6 +17,11 @@ pub struct AppSettings {
     /// `external_url`, which is the public-facing address.
     pub internal_url: Option<String>,
     pub preview_domain: String,
+    /// Public edge target that generated DNS records point at when a managed
+    /// domain opts into automatic record sync. An IPv4/IPv6 address produces an
+    /// `A`/`AAAA` record; anything else is treated as a `CNAME` target. `None`
+    /// disables DNS record sync regardless of per-domain opt-in.
+    pub edge_target: Option<String>,
 
     // Screenshot settings
     pub screenshots: ScreenshotSettings,
@@ -456,7 +461,9 @@ pub struct DiskSpaceAlertSettings {
     /// Interval in seconds between disk space checks
     #[schema(minimum = 60, example = 300)]
     pub check_interval_seconds: u64,
-    /// Path to monitor (defaults to data directory)
+    /// Restrict monitoring to the disk backing this path. When unset (the
+    /// default), every mounted writable volume is monitored — including
+    /// dedicated volumes such as `/var/lib/docker`.
     pub monitor_path: Option<String>,
 }
 
@@ -714,6 +721,7 @@ impl Default for AppSettings {
             external_url: None,
             internal_url: None,
             preview_domain: DEFAULT_LOCAL_DOMAIN.to_string(),
+            edge_target: None,
             screenshots: ScreenshotSettings::default(),
             letsencrypt: LetsEncryptSettings::default(),
             dns_provider: DnsProviderSettings::default(),
@@ -826,7 +834,7 @@ impl Default for DiskSpaceAlertSettings {
             enabled: true,               // Enabled by default
             threshold_percent: 80,       // Alert at 80% usage
             check_interval_seconds: 300, // Check every 5 minutes
-            monitor_path: None,          // Use data directory by default
+            monitor_path: None,          // Monitor all mounted disks by default
         }
     }
 }

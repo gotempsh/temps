@@ -63,6 +63,33 @@ pub struct BackupRunAudit {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct BackupDeletedAudit {
+    pub context: AuditContext,
+    pub backup_id: String,
+    pub s3_source_id: i32,
+    pub s3_location: String,
+    pub outcome: String,
+    pub failure_reason: Option<String>,
+    pub deleted_objects: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BackupRetentionCleanupAudit {
+    pub context: AuditContext,
+    pub requested_backup_ids: Vec<String>,
+    pub requested_backup_ids_truncated: bool,
+    pub expired: u64,
+    pub deleted: u64,
+    pub failed: u64,
+    pub deleted_backup_ids: Vec<String>,
+    pub deleted_backup_ids_truncated: bool,
+    pub partially_deleted_backup_ids: Vec<String>,
+    pub partially_deleted_backup_ids_truncated: bool,
+    pub outcome: String,
+    pub failure_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ExternalServiceBackupRunAudit {
     pub context: AuditContext,
     pub service_id: i32,
@@ -204,6 +231,52 @@ impl AuditOperation for BackupScheduleStatusChangedAudit {
 impl AuditOperation for BackupRunAudit {
     fn operation_type(&self) -> String {
         "BACKUP_RUN".to_string()
+    }
+
+    fn user_id(&self) -> i32 {
+        self.context.user_id
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+impl AuditOperation for BackupDeletedAudit {
+    fn operation_type(&self) -> String {
+        "BACKUP_DELETED".to_string()
+    }
+
+    fn user_id(&self) -> i32 {
+        self.context.user_id
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+impl AuditOperation for BackupRetentionCleanupAudit {
+    fn operation_type(&self) -> String {
+        "BACKUP_RETENTION_CLEANUP".to_string()
     }
 
     fn user_id(&self) -> i32 {

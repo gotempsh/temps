@@ -24,7 +24,7 @@ use temps_auth::RequireAuth;
 use temps_auth::{
     permission_guard, project_access_guard, project_permission_guard, project_scope_guard,
 };
-use temps_core::{AuditContext, RequestMetadata};
+use temps_core::{AppSettings, AuditContext, PublicHostnameStrategy, RequestMetadata};
 use tracing::{debug, error, info, warn};
 use utoipa::OpenApi;
 
@@ -54,6 +54,37 @@ use temps_core::problemdetails::Problem;
 // defence-in-depth measure for the ADR-028 Phase B rollout. Adding the guard
 // to every handler in this file would be redundant noise: the token is already
 // rejected by the earlier `permission_guard!` call.
+fn public_url_for_hostname(settings: &AppSettings, hostname: &str) -> String {
+    let (protocol, port) = if let Some(ref external_url) = settings.external_url {
+        if let Ok(parsed) = url::Url::parse(external_url) {
+            (parsed.scheme().to_string(), parsed.port())
+        } else if external_url.starts_with("http://") {
+            ("http".to_string(), None)
+        } else {
+            ("https".to_string(), None)
+        }
+    } else {
+        ("https".to_string(), None)
+    };
+
+    let port =
+        port.filter(|p| !((protocol == "https" && *p == 443) || (protocol == "http" && *p == 80)));
+
+    match port {
+        Some(port) => format!("{}://{}:{}", protocol, hostname, port),
+        None => format!("{}://{}", protocol, hostname),
+    }
+}
+
+fn public_service_url(
+    settings: &AppSettings,
+    strategy: PublicHostnameStrategy,
+    environment: &str,
+    service: &str,
+) -> String {
+    let hostname = strategy.service_hostname(&settings.preview_domain, environment, service);
+    public_url_for_hostname(settings, &hostname)
+}
 
 #[derive(OpenApi)]
 #[openapi(
@@ -877,28 +908,10 @@ pub async fn list_containers(
         .await
         .ok()
         .flatten();
-    let preview_domain = settings_row
+    let app_settings = settings_row
         .as_ref()
-        .and_then(|s| {
-            s.data
-                .get("preview_domain")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        })
-        .unwrap_or_else(|| "localho.st".to_string());
-    // Derive the URL scheme from external_url so HTTP-only installs
-    // (sslip.io quick/local modes) don't emit dead https:// links.
-    let url_scheme = settings_row
-        .as_ref()
-        .and_then(|s| s.data.get("external_url").and_then(|v| v.as_str()))
-        .map(|u| {
-            if u.starts_with("http://") {
-                "http"
-            } else {
-                "https"
-            }
-        })
-        .unwrap_or("https");
+        .map(|s| AppSettings::from_json(s.data.clone()))
+        .unwrap_or_default();
 
     let env_subdomain = temps_entities::environments::Entity::find_by_id(environment_id)
         .one(state.db.as_ref())
@@ -906,6 +919,13 @@ pub async fn list_containers(
         .ok()
         .flatten()
         .map(|e| e.subdomain);
+
+    // Resolve the hostname strategy for this instance's preview domain once,
+    // before the synchronous response-building closure below.
+    let hostname_strategy = state
+        .hostname_resolver
+        .strategy_for(&app_settings.preview_domain)
+        .await;
 
     // Read public_ports from project's preset_config
     let public_ports: Vec<temps_entities::preset::ComposePublicPort> =
@@ -935,15 +955,9 @@ pub async fn list_containers(
                 if !is_public {
                     return None;
                 }
-                env_subdomain.as_ref().map(|sub| {
-                    let label = format!("{}-{}", svc, sub);
-                    let label = if label.len() > 63 {
-                        label[..63].trim_end_matches('-').to_string()
-                    } else {
-                        label
-                    };
-                    format!("{}://{}.{}", url_scheme, label, preview_domain)
-                })
+                env_subdomain
+                    .as_ref()
+                    .map(|sub| public_service_url(&app_settings, hostname_strategy, sub, svc))
             });
             ContainerInfoResponse::from_info(info, node_name, service_name, service_url)
         })
@@ -1685,26 +1699,10 @@ pub async fn get_container_detail(
                 .await
                 .ok()
                 .flatten();
-            let preview_domain = settings_row2
+            let app_settings = settings_row2
                 .as_ref()
-                .and_then(|s| {
-                    s.data
-                        .get("preview_domain")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                })
-                .unwrap_or_else(|| "localho.st".to_string());
-            let url_scheme2 = settings_row2
-                .as_ref()
-                .and_then(|s| s.data.get("external_url").and_then(|v| v.as_str()))
-                .map(|u| {
-                    if u.starts_with("http://") {
-                        "http"
-                    } else {
-                        "https"
-                    }
-                })
-                .unwrap_or("https");
+                .map(|s| AppSettings::from_json(s.data.clone()))
+                .unwrap_or_default();
 
             let env_subdomain = temps_entities::environments::Entity::find_by_id(environment_id)
                 .one(state.db.as_ref())
@@ -1713,15 +1711,13 @@ pub async fn get_container_detail(
                 .flatten()
                 .map(|e| e.subdomain);
 
-            env_subdomain.map(|sub| {
-                let label = format!("{}-{}", svc_name, sub);
-                let label = if label.len() > 63 {
-                    label[..63].trim_end_matches('-').to_string()
-                } else {
-                    label
-                };
-                format!("{}://{}.{}", url_scheme2, label, preview_domain)
-            })
+            let hostname_strategy = state
+                .hostname_resolver
+                .strategy_for(&app_settings.preview_domain)
+                .await;
+
+            env_subdomain
+                .map(|sub| public_service_url(&app_settings, hostname_strategy, &sub, svc_name))
         } else {
             None
         }
@@ -3361,6 +3357,8 @@ mod tests {
             ),
             deployment_gate: None,
             project_access_checker: None,
+            hostname_resolver: Arc::new(temps_core::StandardHostnameResolver)
+                as Arc<dyn temps_core::PublicHostnameResolver>,
         })
     }
 

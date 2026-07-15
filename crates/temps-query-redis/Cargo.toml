@@ -7,7 +7,7 @@ edition = "2021"
 temps-query = { path = "../temps-query" }
 
 # Redis client
-redis = { version = "0.28", features = ["tokio-comp", "connection-manager"] }
+redis = { version = "1.3", features = ["tokio-comp", "connection-manager"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

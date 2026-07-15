@@ -480,6 +480,15 @@ impl TempsPlugin for DeploymentsPlugin {
                 .expect("Failed to connect to Docker for container exec"),
         );
 
+        // Resolves the per-managed-domain public hostname strategy. Falls back to
+        // the Standard resolver when no DNS provider plugin registered one.
+        let hostname_resolver = context
+            .get_service::<dyn temps_core::PublicHostnameResolver>()
+            .unwrap_or_else(|| {
+                Arc::new(temps_core::StandardHostnameResolver)
+                    as Arc<dyn temps_core::PublicHostnameResolver>
+            });
+
         let app_state = Arc::new(handlers::types::AppState {
             deployment_service,
             log_service,
@@ -500,6 +509,7 @@ impl TempsPlugin for DeploymentsPlugin {
             docker: docker_for_exec,
             deployment_gate,
             project_access_checker,
+            hostname_resolver,
         });
 
         let deployments_routes = handlers::deployments::configure_routes();

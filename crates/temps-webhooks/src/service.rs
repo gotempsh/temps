@@ -24,6 +24,15 @@ pub enum WebhookError {
     #[error("Webhook not found: {0}")]
     NotFound(i32),
 
+    #[error(
+        "Webhook delivery {delivery_id} not found for webhook {webhook_id} in project {project_id}"
+    )]
+    DeliveryNotInScope {
+        project_id: i32,
+        webhook_id: i32,
+        delivery_id: i32,
+    },
+
     #[error("HTTP request failed: {0}")]
     HttpError(#[from] reqwest::Error),
 
@@ -469,20 +478,49 @@ impl WebhookService {
         Ok(delivery)
     }
 
-    /// Retry a failed delivery
+    async fn load_retry_scope(
+        &self,
+        project_id: i32,
+        webhook_id: i32,
+        delivery_id: i32,
+    ) -> Result<
+        (
+            temps_entities::webhook_deliveries::Model,
+            temps_entities::webhooks::Model,
+        ),
+        WebhookError,
+    > {
+        let not_in_scope = || WebhookError::DeliveryNotInScope {
+            project_id,
+            webhook_id,
+            delivery_id,
+        };
+
+        let webhook = temps_entities::webhooks::Entity::find_by_id(webhook_id)
+            .filter(temps_entities::webhooks::Column::ProjectId.eq(project_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(not_in_scope)?;
+
+        let delivery = temps_entities::webhook_deliveries::Entity::find_by_id(delivery_id)
+            .filter(temps_entities::webhook_deliveries::Column::WebhookId.eq(webhook_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(not_in_scope)?;
+
+        Ok((delivery, webhook))
+    }
+
+    /// Retry a failed delivery after verifying its full project/webhook scope.
     pub async fn retry_delivery(
         &self,
+        project_id: i32,
+        webhook_id: i32,
         delivery_id: i32,
     ) -> Result<WebhookDeliveryResult, WebhookError> {
-        let delivery = temps_entities::webhook_deliveries::Entity::find_by_id(delivery_id)
-            .one(self.db.as_ref())
-            .await?
-            .ok_or(WebhookError::NotFound(delivery_id))?;
-
-        let webhook = temps_entities::webhooks::Entity::find_by_id(delivery.webhook_id)
-            .one(self.db.as_ref())
-            .await?
-            .ok_or(WebhookError::NotFound(delivery.webhook_id))?;
+        let (delivery, webhook) = self
+            .load_retry_scope(project_id, webhook_id, delivery_id)
+            .await?;
 
         // Parse the original event from the stored payload
         let event: WebhookEvent = serde_json::from_str(&delivery.payload)?;
@@ -552,6 +590,49 @@ impl WebhookService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use sea_orm::{DatabaseBackend, DbErr, MockDatabase};
+
+    fn service_with_db(db: Arc<DatabaseConnection>) -> WebhookService {
+        let encryption_service = Arc::new(
+            temps_core::EncryptionService::new(
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .unwrap(),
+        );
+        WebhookService::new(db, encryption_service)
+    }
+
+    fn webhook(id: i32, project_id: i32) -> temps_entities::webhooks::Model {
+        temps_entities::webhooks::Model {
+            id,
+            project_id,
+            url: "https://example.com/webhook".to_string(),
+            secret: None,
+            events: "[]".to_string(),
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[allow(deprecated)]
+    fn delivery(id: i32, webhook_id: i32) -> temps_entities::webhook_deliveries::Model {
+        temps_entities::webhook_deliveries::Model {
+            id,
+            webhook_id,
+            event_type: "deployment.succeeded".to_string(),
+            event_id: "event-1".to_string(),
+            payload: "{}".to_string(),
+            success: false,
+            status_code: None,
+            response_body: None,
+            error_message: None,
+            attempt_number: 1,
+            created_at: Utc::now(),
+            delivered_at: None,
+        }
+    }
 
     #[test]
     fn test_signature_generation() {
@@ -576,6 +657,125 @@ mod tests {
 
         assert!(signature.starts_with("sha256="));
         assert_eq!(signature.len(), 71); // "sha256=" (7) + 64 hex chars
+    }
+
+    #[tokio::test]
+    async fn retry_scope_loads_delivery_only_from_requested_project_and_webhook() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![webhook(10, 1)]])
+                .append_query_results(vec![vec![delivery(20, 10)]])
+                .into_connection(),
+        );
+        let service = service_with_db(db.clone());
+
+        let (found_delivery, found_webhook) = service.load_retry_scope(1, 10, 20).await.unwrap();
+
+        assert_eq!(found_webhook.id, 10);
+        assert_eq!(found_webhook.project_id, 1);
+        assert_eq!(found_delivery.id, 20);
+        assert_eq!(found_delivery.webhook_id, 10);
+
+        drop(service);
+        let log = Arc::try_unwrap(db).unwrap().into_transaction_log();
+        assert_eq!(log.len(), 2);
+        assert!(log[0].statements()[0]
+            .sql
+            .contains(r#""webhooks"."project_id" = $2"#));
+        assert!(log[1].statements()[0]
+            .sql
+            .contains(r#""webhook_deliveries"."webhook_id" = $2"#));
+    }
+
+    #[tokio::test]
+    async fn retry_scope_rejects_cross_project_webhook() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![Vec::<temps_entities::webhooks::Model>::new()])
+                .into_connection(),
+        );
+        let service = service_with_db(db.clone());
+
+        let error = service.retry_delivery(1, 10, 20).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            WebhookError::DeliveryNotInScope {
+                project_id: 1,
+                webhook_id: 10,
+                delivery_id: 20
+            }
+        ));
+
+        drop(service);
+        let log = Arc::try_unwrap(db).unwrap().into_transaction_log();
+        assert_eq!(
+            log.len(),
+            1,
+            "retry must stop before loading or sending a delivery"
+        );
+        let statement = &log[0].statements()[0];
+        assert!(statement.sql.contains(r#""webhooks"."id" = $1"#));
+        assert!(statement.sql.contains(r#""webhooks"."project_id" = $2"#));
+        assert_eq!(
+            format!("{:?}", statement.values),
+            "Some(Values([Int(Some(10)), Int(Some(1)), BigUnsigned(Some(1))]))"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_scope_rejects_delivery_from_another_webhook() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![webhook(10, 1)]])
+                .append_query_results(vec![Vec::<temps_entities::webhook_deliveries::Model>::new()])
+                .into_connection(),
+        );
+        let service = service_with_db(db.clone());
+
+        let error = service.retry_delivery(1, 10, 20).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            WebhookError::DeliveryNotInScope {
+                project_id: 1,
+                webhook_id: 10,
+                delivery_id: 20
+            }
+        ));
+
+        drop(service);
+        let log = Arc::try_unwrap(db).unwrap().into_transaction_log();
+        assert_eq!(
+            log.len(),
+            2,
+            "retry must stop before parsing or sending the payload"
+        );
+        let statement = &log[1].statements()[0];
+        assert!(statement.sql.contains(r#""webhook_deliveries"."id" = $1"#));
+        assert!(statement
+            .sql
+            .contains(r#""webhook_deliveries"."webhook_id" = $2"#));
+        assert_eq!(
+            format!("{:?}", statement.values),
+            "Some(Values([Int(Some(20)), Int(Some(10)), BigUnsigned(Some(1))]))"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_scope_preserves_database_errors() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors(vec![DbErr::Custom("webhook lookup failed".to_string())])
+                .into_connection(),
+        );
+        let service = service_with_db(db);
+
+        let error = service.load_retry_scope(1, 10, 20).await.unwrap_err();
+
+        assert!(
+            matches!(error, WebhookError::Database(DbErr::Custom(message)) if message == "webhook lookup failed")
+        );
     }
 
     // Note: Testing format_webhook_error requires constructing reqwest::Error instances,

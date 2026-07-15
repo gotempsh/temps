@@ -16,8 +16,8 @@ use temps_core::error_builder::ErrorBuilder;
 use temps_core::{
     problemdetails::Problem, AiConfigSettings, AppSettings, AuditContext, AuditLogger,
     AuditOperation, BuildLimitsSettings, ClusterDnsSettings, ContainerLogSettings,
-    DiskSpaceAlertSettings, LetsEncryptSettings, MetricsStoreKind, RateLimitSettings,
-    RequestMetadata, ScreenshotSettings, SecurityHeadersSettings,
+    DiskSpaceAlertSettings, LetsEncryptSettings, MetricsStoreKind, PublicHostnameStrategy,
+    RateLimitSettings, RequestMetadata, ScreenshotSettings, SecurityHeadersSettings,
 };
 use tracing::{error, info};
 use utoipa::{OpenApi, ToSchema};
@@ -82,6 +82,8 @@ pub struct AppSettingsResponse {
     pub external_url: Option<String>,
     pub internal_url: Option<String>,
     pub preview_domain: String,
+    /// Public edge target that synced DNS records point at (IP → A/AAAA, else CNAME).
+    pub edge_target: Option<String>,
 
     // Screenshot settings
     pub screenshots: ScreenshotSettings,
@@ -265,6 +267,7 @@ impl From<AppSettings> for AppSettingsResponse {
             external_url: settings.external_url,
             internal_url: settings.internal_url,
             preview_domain: settings.preview_domain,
+            edge_target: settings.edge_target,
             screenshots: settings.screenshots,
             letsencrypt: settings.letsencrypt,
             dns_provider: DnsProviderSettingsMasked {
@@ -393,6 +396,7 @@ impl AppSettingsResponse {
         crate::disk_status::DiskSpaceCheckResult,
         ContainerLogSettings,
         ClusterDnsSettings,
+        PublicHostnameStrategy,
         DnsProviderSettingsMasked,
         DockerRegistrySettingsMasked,
         AgentSandboxSettingsMasked,
@@ -792,6 +796,17 @@ fn sanitize_optional_url(
     Ok(Some(trimmed))
 }
 
+/// Normalize the edge target: trim whitespace and treat an empty string as
+/// `None` so an operator clearing the field disables DNS record sync.
+fn normalize_edge_target(settings: &mut AppSettings) {
+    if let Some(value) = settings.edge_target.take() {
+        let trimmed = value.trim().to_string();
+        if !trimmed.is_empty() {
+            settings.edge_target = Some(trimmed);
+        }
+    }
+}
+
 /// Update application settings
 #[utoipa::path(
     tag = "Settings",
@@ -973,6 +988,52 @@ async fn update_settings(
 
     settings.external_url = sanitize_optional_url("External", settings.external_url)?;
     settings.internal_url = sanitize_optional_url("Internal", settings.internal_url)?;
+    // Validate and sanitize external_url
+    if let Some(ref mut ext_url) = settings.external_url {
+        *ext_url = ext_url.trim().to_string();
+        *ext_url = ext_url.trim_end_matches('/').to_string();
+        if !ext_url.starts_with("http://") && !ext_url.starts_with("https://") {
+            return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .detail("External URL must start with http:// or https://")
+                .build());
+        }
+        if ext_url.contains('#') || ext_url.contains('?') {
+            return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .detail("External URL must not contain '#' or '?' characters")
+                .build());
+        }
+        if url::Url::parse(ext_url).is_err() {
+            return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .detail("External URL is not a valid URL")
+                .build());
+        }
+    }
+
+    // Validate and sanitize internal_url (same rules as external_url)
+    if let Some(ref mut int_url) = settings.internal_url {
+        *int_url = int_url.trim().trim_end_matches('/').to_string();
+        if int_url.is_empty() {
+            settings.internal_url = None;
+        } else {
+            if !int_url.starts_with("http://") && !int_url.starts_with("https://") {
+                return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                    .detail("Internal URL must start with http:// or https://")
+                    .build());
+            }
+            if int_url.contains('#') || int_url.contains('?') {
+                return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                    .detail("Internal URL must not contain '#' or '?' characters")
+                    .build());
+            }
+            if url::Url::parse(int_url).is_err() {
+                return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                    .detail("Internal URL is not a valid URL")
+                    .build());
+            }
+        }
+    }
+
+    normalize_edge_target(&mut settings);
 
     match app_state.config_service.update_settings(settings).await {
         Ok(_) => {
