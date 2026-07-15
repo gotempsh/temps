@@ -226,7 +226,9 @@ impl PostgresSource {
 
         let mut chars = after_dollar.char_indices();
         let (_, first) = chars.next()?;
-        if !(first == '_' || first.is_alphabetic()) {
+        // PostgreSQL accepts any high-bit character in an unquoted identifier,
+        // including characters Rust does not classify as alphabetic.
+        if !(first == '_' || first.is_ascii_alphabetic() || !first.is_ascii()) {
             return None;
         }
 
@@ -234,7 +236,7 @@ impl PostgresSource {
             if character == '$' {
                 return Some(1 + index + character.len_utf8());
             }
-            if !(character == '_' || character.is_alphanumeric()) {
+            if !(character == '_' || character.is_ascii_alphanumeric() || !character.is_ascii()) {
                 return None;
             }
         }
@@ -1786,6 +1788,8 @@ mod tests {
         assert_sql_allowed("name = $person$O'Brien$person$");
         assert_sql_allowed("name = $Tag$O'Brien$Tag$");
         assert_sql_rejected("name = $Tag$O'Brien$tag$");
+        assert_sql_allowed("name = $💣$O'Brien$💣$");
+        assert_sql_rejected("name = $💣$unterminated");
         assert_sql_allowed("identifier$tag$ = 1");
         assert_sql_rejected("name = $person$unterminated");
     }
@@ -1923,6 +1927,7 @@ mod tests {
             "7 in (\nTaBlE\tprivate_ids)",
             r"E'x\'' IS NOT NULL AND query_to_xml('select secret from private_secrets', true, false, '')::text LIKE '%synthetic-secret%'",
             "$tag$'$tag$ IS NOT NULL AND query_to_xml('select secret from private_secrets', true, false, '')::text LIKE '%synthetic-secret%' AND $tail$'$tail$ IS NOT NULL",
+            "$💣$'$💣$ IS NOT NULL AND query_to_xml('select secret from private_secrets', true, false, '')::text LIKE '%synthetic-secret%' AND $tail$'$tail$ IS NOT NULL",
             "\"'\" IS NOT NULL AND query_to_xml('select secret from private_secrets', true, false, '')::text LIKE '%synthetic-secret%' AND \"'\" IS NOT NULL",
         ];
 
