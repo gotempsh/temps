@@ -94,16 +94,10 @@ Monitors for deploy failures, runtime crashes, certificate expiry, and backup he
 </td>
 </tr>
 <tr>
-<td width="50%">
+<td width="100%" colspan="2">
 
 **Transactional Email**
 Add sender domains with DKIM records through the UI. Send transactional emails via `@temps-sdk/node-sdk`. No external email service needed.
-
-</td>
-<td width="50%">
-
-**AI-Ready (MCP Server)**
-Ship with a Model Context Protocol server (`@temps-sdk/mcp`) so AI agents can deploy, monitor, and manage your infrastructure through natural language.
 
 </td>
 </tr>
@@ -194,7 +188,6 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 | [`@temps-sdk/kv`](https://www.npmjs.com/package/@temps-sdk/kv) | Serverless key-value store |
 | [`@temps-sdk/blob`](https://www.npmjs.com/package/@temps-sdk/blob) | File storage (S3-compatible) |
 | [`@temps-sdk/cli`](https://www.npmjs.com/package/@temps-sdk/cli) | Command-line interface |
-| [`@temps-sdk/mcp`](https://www.npmjs.com/package/@temps-sdk/mcp) | Model Context Protocol server for AI agents |
 
 <details>
 <summary><strong>Quick examples</strong></summary>
