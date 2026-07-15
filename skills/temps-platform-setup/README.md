@@ -80,7 +80,6 @@ Use this skill when you need to:
 
 - [deploy-to-temps](../deploy-to-temps/) - Deploy applications to Temps
 - [add-custom-domain](../add-custom-domain/) - Custom domain configuration
-- [temps-mcp-setup](../temps-mcp-setup/) - Model Context Protocol server setup
 
 ## Full Documentation
 
