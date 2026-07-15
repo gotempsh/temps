@@ -115,6 +115,17 @@ for credential_doc in .env.example docs/installation/page.mdx docs/upgrade/page.
   fi
 done
 
+if ! git check-ignore --quiet --no-index secrets/admin_password; then
+  echo "repo-local admin secrets are not excluded by Git" >&2
+  exit 1
+fi
+for ignore_file in .gitignore .dockerignore; do
+  if ! grep -Fxq '/secrets/' "$ignore_file"; then
+    echo "$ignore_file does not exclude repo-local admin secrets" >&2
+    exit 1
+  fi
+done
+
 old_postgres="temps_password_change_me"
 POSTGRES_PASSWORD="$old_postgres" REDIS_PASSWORD="$safe_redis" \
   "${compose[@]}" up --detach postgres-credential-sync >/dev/null

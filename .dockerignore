@@ -43,6 +43,7 @@ LICENSE
 .env
 .env.local
 .env.*.local
+/secrets/
 docker-compose.dev.yml
 .pre-commit-config.yaml
 
