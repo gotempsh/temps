@@ -1106,6 +1106,13 @@ pub struct ConsoleApiParams {
     /// connection handling. Any future object shared this same way requires an
     /// explicit security review before being added here.
     pub retention_resolver_slot: Arc<temps_core::RetentionResolverSlot>,
+    /// Shared "a newer release exists" slot. Owned by the caller
+    /// (`commands/serve/mod.rs`), which spawns the background update
+    /// notifier that writes into it; registered into the service registry
+    /// below so the settings API can serve it to the web console's upgrade
+    /// banner (`GET /settings/update-status`). Advisory read-only metadata —
+    /// it never influences routing, auth, or connection handling.
+    pub update_status: Arc<temps_core::UpdateStatusSlot>,
 }
 
 /// Build a ClickHouse-backed metrics store from the server config, or `None`
@@ -1515,6 +1522,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         admin_gate_service: provided_admin_gate_service,
         admin_gate_handle: provided_admin_gate_handle,
         retention_resolver_slot,
+        update_status,
     } = params;
 
     // Readiness flag for the `/readyz` probe. Starts `false` (not ready) and is
@@ -1600,6 +1608,10 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     // slot instance instead of creating its own — see the field doc on
     // `ConsoleApiParams::retention_resolver_slot`.
     service_context.register_service(retention_resolver_slot.clone());
+    // Update-notifier slot: the background loop in serve/mod.rs writes into
+    // it; ConfigPlugin's `GET /settings/update-status` reads it so the web
+    // console can render the upgrade banner.
+    service_context.register_service(update_status.clone());
 
     // Register the shared route table (created in serve/mod.rs)
     // This is used by analytics-events and other plugins that need to resolve hosts

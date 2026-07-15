@@ -1893,6 +1893,14 @@ export type ChildBackupListResponse = {
     children: Array<ChildBackupEntryResponse>;
 };
 
+export type CleanupExpiredBackupsRequest = {
+    /**
+     * Exact candidates returned by the dry run. Execution fails if the
+     * retention selection has changed since preview.
+     */
+    expected_backup_ids?: Array<string> | null;
+};
+
 export type CliDeviceApproveRequest = {
     user_code: string;
 };
@@ -4076,7 +4084,17 @@ export type DeploymentConfig = {
      */
     idleTimeoutSeconds?: number;
     /**
-     * Memory limit in megabytes (e.g., 512 = 512MB)
+     * Memory limit in megabytes. Three-state semantics:
+     * - `None`     → inherit the parent layer (env inherits project, project
+     * inherits the seeded default); used by the settings UI's "Use default".
+     * - `Some(0)`  → explicit **uncapped**: stop inheriting and run with no
+     * memory limit. This is the deliberate escape hatch for dedicated
+     * workloads, distinct from `None`.
+     * - `Some(n)`  → hard cap of `n` MB.
+     *
+     * `merge`/resolution keep `Some(0)` as a present value (it wins precedence
+     * over a parent cap), and the deployer collapses it to "no limit" before
+     * talking to Docker.
      */
     memoryLimit?: number | null;
     /**
@@ -4625,7 +4643,9 @@ export type DiskSpaceAlertSettings = {
      */
     enabled?: boolean;
     /**
-     * Path to monitor (defaults to data directory)
+     * Restrict monitoring to the disk backing this path. When unset (the
+     * default), every mounted writable volume is monitored — including
+     * dedicated volumes such as `/var/lib/docker`.
      */
     monitor_path?: string | null;
     /**
@@ -12607,6 +12627,43 @@ export type RestoreRunView = {
     target_service_name?: string | null;
 };
 
+export type RetentionCleanupFailure = {
+    backup_id: string;
+    deleted_objects: number;
+    partial: boolean;
+    reason: string;
+};
+
+export type RetentionCleanupReport = {
+    /**
+     * Capped sample of backups selected by the retention policy.
+     */
+    candidate_backup_ids: Array<string>;
+    candidate_backup_ids_truncated: boolean;
+    deleted: number;
+    /**
+     * Capped sample of deleted backup UUIDs for audit attribution.
+     */
+    deleted_backup_ids: Array<string>;
+    deleted_backup_ids_truncated: boolean;
+    /**
+     * True when this report is a non-destructive preview.
+     */
+    dry_run: boolean;
+    expired: number;
+    failed: number;
+    /**
+     * Capped diagnostic sample; `failed` remains the authoritative total.
+     */
+    failures: Array<RetentionCleanupFailure>;
+    partially_deleted_backup_ids: Array<string>;
+    partially_deleted_backup_ids_truncated: boolean;
+    /**
+     * Schedule scope, or `None` when every schedule was considered.
+     */
+    schedule_id?: number | null;
+};
+
 /**
  * Request body for retrying a failed cluster initialization.
  */
@@ -16327,6 +16384,44 @@ export type UpdateSpeedMetricsPayload = {
      * Interaction to Next Paint (milliseconds)
      */
     inp?: number | null;
+};
+
+/**
+ * Result of the background release-update check, driving the web console's
+ * upgrade banner. All optional fields are set together iff
+ * `update_available` is true.
+ */
+export type UpdateStatusResponse = {
+    /**
+     * Channel the install tracks: `stable` or `beta`.
+     */
+    channel?: string | null;
+    /**
+     * When the check that found the update ran (ISO 8601, UTC).
+     */
+    checked_at?: string | null;
+    /**
+     * Version tag of the running binary, e.g. `v0.1.0-beta.45`.
+     */
+    current_version?: string | null;
+    /**
+     * Docs page with upgrade instructions. Always present so the UI links
+     * the same page regardless of update state.
+     */
+    docs_url: string;
+    /**
+     * Newest published tag on this install's channel.
+     */
+    latest_version?: string | null;
+    /**
+     * Release-notes page (GitHub release) for the newer version.
+     */
+    release_url?: string | null;
+    /**
+     * True when a newer release than the running binary has been published
+     * on this install's channel.
+     */
+    update_available: boolean;
 };
 
 export type UpdateTokenRequest = {
@@ -20941,6 +21036,60 @@ export type ListBackupAlertsResponses = {
 
 export type ListBackupAlertsResponse = ListBackupAlertsResponses[keyof ListBackupAlertsResponses];
 
+export type CleanupExpiredBackupsData = {
+    body: CleanupExpiredBackupsRequest;
+    path?: never;
+    query?: {
+        /**
+         * Return the backups selected by retention without deleting anything.
+         */
+        dry_run?: boolean;
+        /**
+         * Limit cleanup to one backup schedule.
+         */
+        schedule_id?: number | null;
+    };
+    url: '/backups/cleanup';
+};
+
+export type CleanupExpiredBackupsErrors = {
+    /**
+     * Missing or invalid preview candidate list
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Schedule or backup not found
+     */
+    404: ProblemDetails;
+    /**
+     * Cleanup preview is stale
+     */
+    409: ProblemDetails;
+    /**
+     * Cleanup could not be started
+     */
+    500: ProblemDetails;
+};
+
+export type CleanupExpiredBackupsError = CleanupExpiredBackupsErrors[keyof CleanupExpiredBackupsErrors];
+
+export type CleanupExpiredBackupsResponses = {
+    /**
+     * Retention cleanup completed
+     */
+    200: RetentionCleanupReport;
+};
+
+export type CleanupExpiredBackupsResponse = CleanupExpiredBackupsResponses[keyof CleanupExpiredBackupsResponses];
+
 export type RunExternalServiceBackupData = {
     body: RunExternalServiceBackupRequest;
     path: {
@@ -21934,6 +22083,56 @@ export type DetachScheduleServiceResponses = {
 };
 
 export type DetachScheduleServiceResponse = DetachScheduleServiceResponses[keyof DetachScheduleServiceResponses];
+
+export type DeleteBackupData = {
+    body?: never;
+    path: {
+        /**
+         * Backup UUID
+         */
+        id: string;
+    };
+    query?: never;
+    url: '/backups/{id}';
+};
+
+export type DeleteBackupErrors = {
+    /**
+     * Backup artifact cannot be safely attributed
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Backup not found
+     */
+    404: ProblemDetails;
+    /**
+     * Backup is running, referenced, or lacks safe artifact identity
+     */
+    409: ProblemDetails;
+    /**
+     * Object storage or database error
+     */
+    500: ProblemDetails;
+};
+
+export type DeleteBackupError = DeleteBackupErrors[keyof DeleteBackupErrors];
+
+export type DeleteBackupResponses = {
+    /**
+     * Backup deleted
+     */
+    204: void;
+};
+
+export type DeleteBackupResponse = DeleteBackupResponses[keyof DeleteBackupResponses];
 
 export type GetBackupData = {
     body?: never;
@@ -43885,6 +44084,33 @@ export type DownloadGlobalSkillArchiveResponses = {
 
 export type DownloadGlobalSkillArchiveResponse = DownloadGlobalSkillArchiveResponses[keyof DownloadGlobalSkillArchiveResponses];
 
+export type GetUpdateStatusData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/settings/update-status';
+};
+
+export type GetUpdateStatusErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+};
+
+export type GetUpdateStatusResponses = {
+    /**
+     * Release update status for this install
+     */
+    200: UpdateStatusResponse;
+};
+
+export type GetUpdateStatusResponse = GetUpdateStatusResponses[keyof GetUpdateStatusResponses];
+
 export type ListProjectTemplatesData = {
     body?: never;
     path?: never;
@@ -44367,6 +44593,14 @@ export type AssignRoleErrors = {
      */
     400: unknown;
     /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Admin role required or self-modification forbidden
+     */
+    403: unknown;
+    /**
      * User or role not found
      */
     404: unknown;
@@ -44404,6 +44638,10 @@ export type RemoveRoleErrors = {
      * Invalid role type
      */
     400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
     /**
      * Forbidden - Cannot modify own roles or non-admin attempt
      */

@@ -28,6 +28,11 @@ pub struct SettingsState {
     pub route_table_refresher: Option<Arc<dyn temps_core::route_table::RouteTableRefresher>>,
     /// Node enrollment token minting/listing/revocation (ADR-020 WS-1.1).
     pub enrollment_token_service: Arc<crate::enrollment_tokens::EnrollmentTokenService>,
+    /// Result slot of the background release-update notifier (`temps serve`
+    /// writes it). `None` in host processes that don't run the notifier
+    /// (e.g. the standalone proxy's plugin context) — the update-status
+    /// endpoint then reports "no update known".
+    pub update_status: Option<Arc<temps_core::UpdateStatusSlot>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -378,6 +383,7 @@ impl AppSettingsResponse {
 #[openapi(
     paths(
         get_settings,
+        get_update_status,
         get_disk_status,
         update_settings,
         generate_join_token,
@@ -413,6 +419,7 @@ impl AppSettingsResponse {
         EnrollmentTokenInfo,
         EnrollmentTokenListResponse,
         RouteRefreshResponse,
+        UpdateStatusResponse,
     )),
     info(
         title = "Settings API",
@@ -427,6 +434,7 @@ pub fn configure_routes() -> Router<Arc<SettingsState>> {
     Router::new()
         .route("/settings", get(get_settings))
         .route("/settings", put(update_settings))
+        .route("/settings/update-status", get(get_update_status))
         .route("/settings/disk-status", get(get_disk_status))
         .route("/settings/join-token/generate", post(generate_join_token))
         .route("/settings/join-token", delete(revoke_join_token))
@@ -658,6 +666,78 @@ async fn revoke_enrollment_token(
     Ok(Json(SettingsUpdateResponse {
         message: format!("Enrollment token {} revoked", id),
     }))
+}
+
+/// Result of the background release-update check, driving the web console's
+/// upgrade banner. All optional fields are set together iff
+/// `update_available` is true.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct UpdateStatusResponse {
+    /// True when a newer release than the running binary has been published
+    /// on this install's channel.
+    pub update_available: bool,
+    /// Version tag of the running binary, e.g. `v0.1.0-beta.45`.
+    pub current_version: Option<String>,
+    /// Newest published tag on this install's channel.
+    pub latest_version: Option<String>,
+    /// Channel the install tracks: `stable` or `beta`.
+    pub channel: Option<String>,
+    /// Release-notes page (GitHub release) for the newer version.
+    pub release_url: Option<String>,
+    /// When the check that found the update ran (ISO 8601, UTC).
+    pub checked_at: Option<String>,
+    /// Docs page with upgrade instructions. Always present so the UI links
+    /// the same page regardless of update state.
+    pub docs_url: String,
+}
+
+/// Report whether a newer temps release is available for this install.
+#[utoipa::path(
+    tag = "Settings",
+    get,
+    path = "/settings/update-status",
+    responses(
+        (status = 200, description = "Release update status for this install", body = UpdateStatusResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_update_status(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<SettingsState>>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsRead);
+
+    let update = app_state.update_status.as_ref().and_then(|slot| slot.get());
+    let response = match update {
+        Some(update) => UpdateStatusResponse {
+            update_available: true,
+            current_version: Some(update.current_version),
+            latest_version: Some(update.latest_version),
+            channel: Some(update.channel),
+            release_url: Some(update.release_url),
+            checked_at: Some(
+                update
+                    .checked_at
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            ),
+            docs_url: temps_core::UPGRADE_DOCS_URL.to_string(),
+        },
+        // Covers both "up to date" and "no check has succeeded yet" — the
+        // banner is advisory, so the UI treats them identically.
+        None => UpdateStatusResponse {
+            update_available: false,
+            current_version: None,
+            latest_version: None,
+            channel: None,
+            release_url: None,
+            checked_at: None,
+            docs_url: temps_core::UPGRADE_DOCS_URL.to_string(),
+        },
+    };
+
+    Ok(Json(response))
 }
 
 /// Get application settings

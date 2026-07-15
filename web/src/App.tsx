@@ -24,6 +24,7 @@ import { client } from './api/client/client.gen'
 import { Header } from './components/dashboard/Header'
 import AppSidebar from './components/dashboard/Sidebar'
 import { DiskSpaceAlert } from './components/alerts/DiskSpaceAlert'
+import { UpdateAvailableBanner } from './components/alerts/UpdateAvailableBanner'
 import { ProtectedLayout } from './components/layout/ProtectedLayout'
 import { SettingsLayout } from './components/settings/SettingsLayout'
 import { SidebarInset, SidebarProvider } from './components/ui/sidebar'
@@ -403,6 +404,9 @@ const FullAppRoutes = () => {
               content column (to the right of the fixed sidebar, so it's never
               clipped by it), full content width, on every page. */}
           <DiskSpaceAlert />
+          {/* App-wide "newer release published" banner — informational, per-
+              version dismissible, links the upgrade docs. */}
+          <UpdateAvailableBanner />
           {/* Wrap header with independent error boundary */}
           <ErrorBoundary
             fallback={(error, _errorInfo, resetError) => (
