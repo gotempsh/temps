@@ -215,34 +215,167 @@ pub async fn connect_with_self_signed_tls(
 }
 
 impl PostgresSource {
-    /// Strip SQL string literals to avoid false positives when scanning for dangerous patterns.
-    /// Replaces content inside single-quoted strings with empty strings.
-    fn strip_sql_string_literals(sql: &str) -> String {
-        let mut result = String::with_capacity(sql.len());
-        let mut in_string = false;
-        let mut chars = sql.chars().peekable();
+    /// Return the byte length of a PostgreSQL dollar-quote delimiter at the
+    /// start of `sql`. Tags follow unquoted identifier rules, except that `$`
+    /// is not permitted inside the tag.
+    fn dollar_quote_delimiter_len(sql: &str) -> Option<usize> {
+        let after_dollar = sql.strip_prefix('$')?;
+        if after_dollar.starts_with('$') {
+            return Some(2);
+        }
 
-        while let Some(c) = chars.next() {
-            if in_string {
-                if c == '\'' {
-                    // Check for escaped quote ('')
-                    if chars.peek() == Some(&'\'') {
-                        chars.next(); // skip the escaped quote
-                    } else {
-                        in_string = false;
-                        result.push('\'');
-                    }
-                }
-                // Skip characters inside string literals
-            } else if c == '\'' {
-                in_string = true;
-                result.push('\'');
-            } else {
-                result.push(c);
+        let mut chars = after_dollar.char_indices();
+        let (_, first) = chars.next()?;
+        if !(first == '_' || first.is_alphabetic()) {
+            return None;
+        }
+
+        for (index, character) in chars {
+            if character == '$' {
+                return Some(1 + index + character.len_utf8());
+            }
+            if !(character == '_' || character.is_alphanumeric()) {
+                return None;
             }
         }
 
-        result
+        None
+    }
+
+    /// Strip SQL string literals to avoid false positives when scanning for dangerous patterns.
+    /// Replaces content inside single-quoted strings with empty strings while
+    /// honoring PostgreSQL `E'...'` escapes and dollar-quoted strings.
+    /// Ambiguous backslash-escaped quotes in ordinary strings are rejected so
+    /// validation is independent of the server's `standard_conforming_strings`
+    /// setting.
+    fn strip_sql_string_literals(sql: &str) -> Result<String> {
+        let mut result = String::with_capacity(sql.len());
+        let mut position = 0;
+
+        while position < sql.len() {
+            let remaining = &sql[position..];
+
+            let at_token_boundary = sql[..position].chars().next_back().is_none_or(|previous| {
+                !(previous.is_ascii_alphanumeric()
+                    || previous == '_'
+                    || previous == '$'
+                    || !previous.is_ascii())
+            });
+            if let Some(delimiter_len) = at_token_boundary
+                .then(|| Self::dollar_quote_delimiter_len(remaining))
+                .flatten()
+            {
+                let delimiter = &remaining[..delimiter_len];
+                let content = &remaining[delimiter_len..];
+                let closing_offset = content.find(delimiter).ok_or_else(|| {
+                    DataError::InvalidQuery(
+                        "Unterminated dollar-quoted string in WHERE clause".to_string(),
+                    )
+                })?;
+                result.push_str("''");
+                position += delimiter_len + closing_offset + delimiter_len;
+                continue;
+            }
+
+            let Some(character) = remaining.chars().next() else {
+                break;
+            };
+            if character == '"' {
+                position += character.len_utf8();
+                let mut terminated = false;
+                while position < sql.len() {
+                    let identifier_remaining = &sql[position..];
+                    let Some(identifier_char) = identifier_remaining.chars().next() else {
+                        break;
+                    };
+                    position += identifier_char.len_utf8();
+                    if identifier_char == '"' {
+                        if sql[position..].starts_with('"') {
+                            position += '"'.len_utf8();
+                        } else {
+                            terminated = true;
+                            break;
+                        }
+                    }
+                }
+
+                if !terminated {
+                    return Err(DataError::InvalidQuery(
+                        "Unterminated quoted identifier in WHERE clause".to_string(),
+                    ));
+                }
+                // Keep a quoted-identifier placeholder so `"function"(...)`
+                // is still recognized as a forbidden function call.
+                result.push_str("\"\"");
+                continue;
+            }
+            if character != '\'' {
+                result.push(character);
+                position += character.len_utf8();
+                continue;
+            }
+
+            let prefix = &sql[..position];
+            let escape_string = (prefix.ends_with('e') || prefix.ends_with('E'))
+                && prefix[..prefix.len() - 1]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|previous| {
+                        !(previous.is_ascii_alphanumeric()
+                            || previous == '_'
+                            || previous == '$'
+                            || !previous.is_ascii())
+                    });
+            result.push('\'');
+            position += character.len_utf8();
+            let mut terminated = false;
+
+            while position < sql.len() {
+                let string_remaining = &sql[position..];
+                let Some(string_char) = string_remaining.chars().next() else {
+                    break;
+                };
+                position += string_char.len_utf8();
+
+                if string_char == '\\' {
+                    if escape_string {
+                        let Some(escaped) = sql[position..].chars().next() else {
+                            return Err(DataError::InvalidQuery(
+                                "Unterminated escape sequence in WHERE clause string literal"
+                                    .to_string(),
+                            ));
+                        };
+                        position += escaped.len_utf8();
+                        continue;
+                    }
+
+                    if sql[position..].starts_with('\'') {
+                        return Err(DataError::InvalidQuery(
+                            "Backslash-escaped quotes require an explicit PostgreSQL E string"
+                                .to_string(),
+                        ));
+                    }
+                }
+
+                if string_char == '\'' {
+                    if sql[position..].starts_with('\'') {
+                        position += '\''.len_utf8();
+                    } else {
+                        result.push('\'');
+                        terminated = true;
+                        break;
+                    }
+                }
+            }
+
+            if !terminated {
+                return Err(DataError::InvalidQuery(
+                    "Unterminated string literal in WHERE clause".to_string(),
+                ));
+            }
+        }
+
+        Ok(result)
     }
 
     /// Validate that a sort_by field name is a safe SQL identifier.
@@ -294,16 +427,18 @@ impl PostgresSource {
     /// patterns while structural checks block injection vectors like subqueries,
     /// UNION, and function calls that could bypass simple pattern matching.
     fn validate_sql(sql: &str) -> Result<()> {
-        let sql_lower = sql.trim().to_lowercase();
+        let sql_trimmed = sql.trim();
 
-        if sql_lower.is_empty() {
+        if sql_trimmed.is_empty() {
             return Err(DataError::InvalidQuery(
                 "WHERE clause cannot be empty".to_string(),
             ));
         }
 
         // Strip string literals to avoid false positives on content inside quotes
-        let without_strings = Self::strip_sql_string_literals(&sql_lower);
+        // Lex case-sensitive dollar tags and quoted identifiers before
+        // lowercasing the remaining SQL for keyword comparisons.
+        let without_strings = Self::strip_sql_string_literals(sql_trimmed)?.to_lowercase();
 
         // STRUCTURAL CHECKS: Block injection vectors that denylist alone cannot catch
 
@@ -1633,6 +1768,40 @@ mod tests {
     }
 
     #[test]
+    fn test_escape_string_cannot_hide_function_call() {
+        assert_sql_rejected(
+            r"E'x\'' IS NOT NULL AND query_to_xml('select secret from private_secrets', true, false, '')::text LIKE '%synthetic-secret%'",
+        );
+        assert_sql_allowed(r"name = E'O\'Brien'");
+        assert_sql_rejected(r"name = 'O\'Brien'");
+        assert_sql_rejected("name = 'unterminated");
+    }
+
+    #[test]
+    fn test_dollar_quoted_string_cannot_hide_function_call() {
+        assert_sql_rejected(
+            "$tag$'$tag$ IS NOT NULL AND query_to_xml('select secret from private_secrets', true, false, '')::text LIKE '%synthetic-secret%' AND $tail$'$tail$ IS NOT NULL",
+        );
+        assert_sql_allowed("name = $$O'Brien$$");
+        assert_sql_allowed("name = $person$O'Brien$person$");
+        assert_sql_allowed("name = $Tag$O'Brien$Tag$");
+        assert_sql_rejected("name = $Tag$O'Brien$tag$");
+        assert_sql_allowed("identifier$tag$ = 1");
+        assert_sql_rejected("name = $person$unterminated");
+    }
+
+    #[test]
+    fn test_quoted_identifier_cannot_hide_function_call() {
+        assert_sql_rejected(
+            "\"'\" IS NOT NULL AND query_to_xml('select secret from private_secrets', true, false, '')::text LIKE '%synthetic-secret%' AND \"'\" IS NOT NULL",
+        );
+        assert_sql_allowed("\"O'Brien\" = 1");
+        assert_sql_allowed("U&\"O\\0027Brien\" = 1");
+        assert_sql_allowed("\"contains \"\"quote\"\"\" = 1");
+        assert_sql_rejected("\"unterminated = 1");
+    }
+
+    #[test]
     fn test_sql_injection_quoted_function_identifier_exfiltration() {
         // PostgreSQL allows function identifiers to be quoted and optionally
         // schema-qualified. The closing quote must still be recognized as a
@@ -1729,8 +1898,8 @@ mod tests {
 
         source
             .execute_raw(
-                r#"CREATE TABLE public.public_users (id integer PRIMARY KEY);
-                   INSERT INTO public.public_users VALUES (1);
+                r#"CREATE TABLE public.public_users (id integer PRIMARY KEY, "'" integer NOT NULL);
+                   INSERT INTO public.public_users VALUES (1, 1);
                    CREATE TABLE public.private_secrets (secret text NOT NULL);
                    INSERT INTO public.private_secrets VALUES ('synthetic-secret');
                    CREATE TABLE public.private_ids (id integer NOT NULL);
@@ -1752,6 +1921,9 @@ mod tests {
             "public.in()",
             "7 IN (TABLE private_ids)",
             "7 in (\nTaBlE\tprivate_ids)",
+            r"E'x\'' IS NOT NULL AND query_to_xml('select secret from private_secrets', true, false, '')::text LIKE '%synthetic-secret%'",
+            "$tag$'$tag$ IS NOT NULL AND query_to_xml('select secret from private_secrets', true, false, '')::text LIKE '%synthetic-secret%' AND $tail$'$tail$ IS NOT NULL",
+            "\"'\" IS NOT NULL AND query_to_xml('select secret from private_secrets', true, false, '')::text LIKE '%synthetic-secret%' AND \"'\" IS NOT NULL",
         ];
 
         for attack in attacks {
