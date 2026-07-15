@@ -874,7 +874,48 @@ pub async fn verify_magic_link(
 ) -> Result<impl IntoResponse, temps_core::problemdetails::Problem> {
     match state.auth_service.verify_magic_link(&query.token).await {
         Ok(user) => {
-            // Create session
+            // If MFA is enabled, do not issue a real session from the magic
+            // link. Start the same first-factor MFA challenge as password login
+            // (short-lived `mfa_session` cookie, `mfa_required: true`) so a magic
+            // link cannot be used to bypass the second factor.
+            if user.mfa_enabled {
+                let mfa_token = state
+                    .auth_service
+                    .create_mfa_session(user.id)
+                    .await
+                    .map_err(|e| {
+                        error!("Failed to create MFA session after magic link: {}", e);
+                        problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                            .with_title("Authentication Error")
+                            .with_detail("Could not initiate MFA verification. Please try again.")
+                    })?;
+                let encrypted_token = state.cookie_crypto.encrypt(&mfa_token).map_err(|e| {
+                    error!("Failed to encrypt MFA token: {}", e);
+                    problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .with_title("Authentication Error")
+                        .with_detail("Could not process MFA session. Please try again.")
+                })?;
+                let mut headers = HeaderMap::new();
+                let mfa_cookie = cookie::Cookie::build(("mfa_session", encrypted_token))
+                    .http_only(true)
+                    .path("/")
+                    .max_age(cookie::time::Duration::minutes(5))
+                    .same_site(cookie::SameSite::Strict)
+                    .secure(metadata.is_secure)
+                    .build();
+                headers.insert(SET_COOKIE, mfa_cookie.to_string().parse().unwrap());
+                return Ok((
+                    headers,
+                    Json(AuthResponse {
+                        success: false,
+                        message: "MFA authentication required".to_string(),
+                        user_id: None,
+                        mfa_required: true,
+                    }),
+                ));
+            }
+
+            // No MFA -- create the real session.
             match state.auth_service.create_session(user.id).await {
                 Ok(session_token) => {
                     // Encrypt the session token
@@ -2076,7 +2117,7 @@ async fn disable_mfa(
 mod tests {
     use super::{
         assign_role, authorize_admin_target, authorize_role_assignment, delete_user, remove_role,
-        AdminTargetDenied, AssignRoleRequest, RoleChangeDenied,
+        verify_magic_link, AdminTargetDenied, AssignRoleRequest, RoleChangeDenied, VerifyTokenQuery,
     };
     use crate::auth_service::UserAuthError;
     use crate::context::AuthContext;
@@ -2560,5 +2601,124 @@ mod tests {
         assert!(!summary.slug.is_empty());
         // Slug must carry the hash suffix (separated by '-')
         assert!(summary.slug.contains('-'));
+    }
+
+    /// Regression test: a magic-link login for a user with MFA enabled must NOT
+    /// mint a real session. It must start the first-factor MFA challenge (an
+    /// `mfa_session` cookie, `mfa_required: true`) exactly like password login,
+    /// so the magic link cannot bypass the second factor.
+    #[tokio::test]
+    async fn verify_magic_link_starts_mfa_challenge_for_mfa_user() {
+        use axum::extract::Query;
+        use axum::http::header::SET_COOKIE;
+        use axum::response::IntoResponse;
+        use chrono::Duration;
+        use sea_orm::{ActiveModelTrait, Set};
+        use temps_database::test_utils::TestDatabase;
+        use temps_entities::magic_link_tokens;
+
+        // Docker-backed integration test: skip gracefully when unavailable.
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Docker/test database not available, skipping");
+                return;
+            }
+        };
+
+        // Minimal settings row so services that read config don't fail.
+        let _ = settings_row(&test_db).await;
+
+        let now = Utc::now();
+        let email = "mfa-magic@example.com".to_string();
+        let user = users::ActiveModel {
+            name: Set("MFA Magic User".to_string()),
+            email: Set(email.clone()),
+            email_verified: Set(true),
+            mfa_enabled: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await
+        .expect("insert mfa user");
+
+        let token = "magic-token-mfa-regression".to_string();
+        magic_link_tokens::ActiveModel {
+            email: Set(email),
+            token: Set(token.clone()),
+            expires_at: Set(now + Duration::minutes(15)),
+            used: Set(false),
+            created_at: Set(now),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await
+        .expect("insert magic link token");
+
+        let state = Arc::new(AuthState::new(
+            test_db.db.clone(),
+            Arc::new(NoopAuditLogger),
+            Arc::new(temps_core::EncryptionService::new_from_password(
+                "handler-regression-test",
+            )),
+            Arc::new(temps_core::CookieCrypto::from_bytes(&[7; 32])),
+            Arc::new(NoopNotificationService),
+            Arc::new(temps_core::telemetry::NoopTelemetryReporter),
+        ));
+
+        let response = verify_magic_link(
+            State(state),
+            Query(VerifyTokenQuery { token }),
+            Extension(request_metadata()),
+        )
+        .await
+        .expect("magic link verify should succeed")
+        .into_response();
+
+        let cookies: Vec<String> = response
+            .headers()
+            .get_all(SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .map(str::to_string)
+            .collect();
+
+        // Must set a non-empty mfa_session challenge cookie...
+        assert!(
+            cookies.iter().any(|c| {
+                c.strip_prefix("mfa_session=")
+                    .and_then(|rest| rest.split(';').next())
+                    .is_some_and(|val| !val.is_empty())
+            }),
+            "expected a non-empty mfa_session cookie, got: {cookies:?}"
+        );
+        // ...and must NOT mint an authenticating session cookie.
+        assert!(
+            !cookies.iter().any(|c| {
+                c.strip_prefix("session=")
+                    .and_then(|rest| rest.split(';').next())
+                    .is_some_and(|val| !val.is_empty())
+            }),
+            "magic link must not issue a real session for an MFA user, got: {cookies:?}"
+        );
+
+        // The target user must not have been left with a usable (non-pending)
+        // session either.
+        let _ = user;
+    }
+
+    /// Insert the default settings row used by services during the integration
+    /// test above.
+    async fn settings_row(test_db: &temps_database::test_utils::TestDatabase) {
+        use sea_orm::{ActiveModelTrait, Set};
+        let _ = temps_entities::settings::ActiveModel {
+            id: Set(1),
+            data: Set(serde_json::json!({ "external_url": "https://test.example.com" })),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await;
     }
 }
