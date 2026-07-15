@@ -1487,6 +1487,56 @@ impl OtelStorage for TimescaleDbStorage {
         self.count_traces_from_table(query).await
     }
     async fn get_trace(&self, project_id: i32, trace_id: &str) -> StorageResult<Vec<SpanRecord>> {
+        // Two-phase lookup. Phase 1: fetch the trace's time window from
+        // otel_trace_summaries (PK lookup, O(1)). Phase 2: scan otel_spans
+        // bounded to that window so hypertable chunk exclusion prunes the
+        // scan to 1-2 chunks. Without the bound, this query touches every
+        // chunk in the retention window — and on compressed chunks (which
+        // have no B-tree indexes, and no trace_id segmentby since
+        // m20260714_000001) that means decompressing the project's entire
+        // history for one trace.
+        //
+        // The window is padded generously: spans of a trace can start before
+        // the summary's recorded start (late/out-of-order batches update it,
+        // but a reader can race the update) and child spans can outlive the
+        // root. A day of slack is negligible for chunk exclusion (chunks are
+        // 1 day) and safe for any realistic trace duration.
+        let window = self
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT start_time, duration_ms FROM otel_trace_summaries
+                 WHERE project_id = $1 AND trace_id = $2",
+                vec![project_id.into(), trace_id.to_string().into()],
+            ))
+            .await?
+            .and_then(|row| {
+                let start: chrono::DateTime<chrono::Utc> = row.try_get("", "start_time").ok()?;
+                let duration_ms: f64 = row.try_get("", "duration_ms").unwrap_or(0.0);
+                let end = start + chrono::Duration::milliseconds(duration_ms.ceil() as i64);
+                Some((
+                    start - chrono::Duration::days(1),
+                    end + chrono::Duration::days(1),
+                ))
+            });
+
+        // No summary row means the trace is invisible in every list view (the
+        // list reads from otel_trace_summaries), so it can only be requested
+        // via a direct link. That happens for (a) an ingest race — the summary
+        // upsert in store_spans runs just after the span insert, (b) a
+        // transient, fail-soft summary upsert failure, or (c) legacy spans
+        // predating the summaries table. (a) and (b) are recent by nature, so
+        // fall back to a scan bounded to the last 7 days — the window in which
+        // chunks are still uncompressed and carry the trace_id B-tree index.
+        // Never scan unbounded: on compressed chunks a trace_id lookup has no
+        // index and no segmentby to seek on, so an unbounded fallback would
+        // decompress the project's entire history for any unknown trace_id
+        // (stale links, cross-project probes, or abuse).
+        let (from, to) = window.unwrap_or_else(|| {
+            let now = chrono::Utc::now();
+            (now - chrono::Duration::days(7), now)
+        });
+
         let sql = r#"
             SELECT project_id, deployment_id, service_name, service_version,
                    deployment_environment, trace_id, span_id, parent_span_id,
@@ -1494,15 +1544,22 @@ impl OtelStorage for TimescaleDbStorage {
                    status_code, status_message, attributes, events
             FROM otel_spans
             WHERE project_id = $1 AND trace_id = $2
+              AND start_time >= $3 AND start_time <= $4
             ORDER BY start_time ASC
         "#;
+        let values: Vec<sea_orm::Value> = vec![
+            project_id.into(),
+            trace_id.to_string().into(),
+            from.into(),
+            to.into(),
+        ];
 
         let results = self
             .db
             .query_all(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 sql,
-                vec![project_id.into(), trace_id.to_string().into()],
+                values,
             ))
             .await?;
 
@@ -3961,5 +4018,83 @@ mod tests {
         // project_id(1) + k1(1) + v1(1) + k2(1) + v2(1) = 5 values
         assert_eq!(values.len(), 5);
         assert_eq!(next, 6);
+    }
+
+    /// When otel_trace_summaries has a row for the trace, the span scan must
+    /// be bounded by the trace's time window so hypertable chunk exclusion
+    /// applies (compressed chunks have no trace_id B-tree index).
+    #[tokio::test]
+    async fn get_trace_bounds_span_scan_when_summary_exists() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        use std::collections::BTreeMap;
+
+        let start = chrono::Utc.with_ymd_and_hms(2026, 7, 10, 10, 0, 0).unwrap();
+        let summary_row: BTreeMap<&str, sea_orm::Value> = BTreeMap::from([
+            ("start_time", start.into()),
+            ("duration_ms", 1500.0_f64.into()),
+        ]);
+
+        let conn = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![summary_row]])
+                .append_query_results([Vec::<BTreeMap<&str, sea_orm::Value>>::new()])
+                .into_connection(),
+        );
+        let storage = TimescaleDbStorage::new(conn.clone(), None);
+
+        let spans = storage.get_trace(7, "abc123").await.unwrap();
+        assert!(spans.is_empty());
+
+        drop(storage);
+        let log = Arc::try_unwrap(conn)
+            .unwrap_or_else(|_| panic!("connection still shared"))
+            .into_transaction_log();
+        assert_eq!(log.len(), 2, "summary lookup + bounded span query");
+        let span_query = format!("{:?}", log[1]);
+        assert!(
+            span_query.contains("start_time >= $3"),
+            "span query must be time-bounded, got: {span_query}"
+        );
+        assert!(span_query.contains("start_time <= $4"));
+        // Window derived from the summary: start - 1 day .. start + duration + 1 day.
+        assert!(
+            span_query.contains("2026-07-09"),
+            "lower bound must come from the summary window, got: {span_query}"
+        );
+        assert!(span_query.contains("2026-07-11"));
+    }
+
+    /// Without a summary row (ingest race, fail-soft summary upsert failure,
+    /// or legacy spans predating summaries), get_trace must still bound the
+    /// scan — to the recent hot window — and never scan the full retention
+    /// range: on compressed chunks a trace_id lookup has no index to seek on,
+    /// so an unbounded fallback would decompress the project's entire history
+    /// for any unknown trace_id.
+    #[tokio::test]
+    async fn get_trace_falls_back_to_recent_window_without_summary() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        use std::collections::BTreeMap;
+
+        let conn = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<BTreeMap<&str, sea_orm::Value>>::new()])
+                .append_query_results([Vec::<BTreeMap<&str, sea_orm::Value>>::new()])
+                .into_connection(),
+        );
+        let storage = TimescaleDbStorage::new(conn.clone(), None);
+
+        let spans = storage.get_trace(7, "abc123").await.unwrap();
+        assert!(spans.is_empty());
+
+        drop(storage);
+        let log = Arc::try_unwrap(conn)
+            .unwrap_or_else(|_| panic!("connection still shared"))
+            .into_transaction_log();
+        assert_eq!(log.len(), 2, "summary lookup + fallback span query");
+        let span_query = format!("{:?}", log[1]);
+        assert!(
+            span_query.contains("start_time >= $3") && span_query.contains("start_time <= $4"),
+            "fallback query must be bounded to the recent window, got: {span_query}"
+        );
     }
 }

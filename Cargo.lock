@@ -11221,6 +11221,7 @@ dependencies = [
  "sha2 0.11.0",
  "sysinfo",
  "tar",
+ "tempfile",
  "temps-agent",
  "temps-agents",
  "temps-ai-api-tools",
@@ -12262,6 +12263,7 @@ dependencies = [
  "temps-entities",
  "testcontainers",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

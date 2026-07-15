@@ -1,6 +1,28 @@
-version: '3.9'
-
 services:
+  credential-check:
+    image: alpine:3.22
+    restart: "no"
+    network_mode: none
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set (put it in a .env file next to docker-compose.yml)}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set (put it in a .env file next to docker-compose.yml)}
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        case "$$POSTGRES_PASSWORD" in
+          *[!A-Za-z0-9_-]*)
+            echo "POSTGRES_PASSWORD must contain only URL-safe characters: A-Z, a-z, 0-9, underscore, or hyphen" >&2
+            exit 1
+            ;;
+        esac
+        case "$$REDIS_PASSWORD" in
+          *[!A-Za-z0-9_-]*)
+            echo "REDIS_PASSWORD must contain only URL-safe characters: A-Z, a-z, 0-9, underscore, or hyphen" >&2
+            exit 1
+            ;;
+        esac
+
   # PostgreSQL Database (with TimescaleDB + WAL-G for backups)
   postgres:
     image: gotempsh/timescaledb-walg:pg18
@@ -9,15 +31,25 @@ services:
     environment:
       POSTGRES_DB: temps
       POSTGRES_USER: temps
-      POSTGRES_PASSWORD: temps_password_change_me
+      # No default: the deployment must supply POSTGRES_PASSWORD (e.g. in a .env
+      # file). Compose fails fast if it is unset, so no known credential ships.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set (put it in a .env file next to docker-compose.yml)}
       # TimescaleDB specific settings
       TIMESCALEDB_TELEMETRY: off
-      # Connection settings
-      POSTGRES_HOST_AUTH_METHOD: md5
+      # Use SCRAM (not md5) for password hashing and host authentication.
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+    depends_on:
+      credential-check:
+        condition: service_completed_successfully
     ports:
-      - "5432:5432"
+      # Bind to loopback only — the database is reachable by other services over
+      # the internal temps-network and must not be published to the host's
+      # public interfaces.
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - postgres_socket:/var/run/postgresql
     # NOTE: archive_command is NOT set here on purpose.
     # Command-line parameters take highest priority in PostgreSQL and cannot be
     # overridden by ALTER SYSTEM. After the first backup, Temps uses ALTER SYSTEM
@@ -30,44 +62,99 @@ services:
     networks:
       - temps-network
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U temps"]
+      # Authenticated TCP query: unlike pg_isready, this catches a password
+      # mismatch after upgrading an existing data volume.
+      test: ["CMD-SHELL", "PGPASSWORD=\"$$POSTGRES_PASSWORD\" psql -h 127.0.0.1 -U temps -d temps -tAc 'SELECT 1' | grep -qx 1"]
       interval: 30s
       timeout: 10s
       retries: 5
       start_period: 30s
 
+  # The official Postgres image only applies POSTGRES_PASSWORD while creating
+  # a new data directory. This one-shot service also rotates existing volumes
+  # before Temps starts, preventing an upgrade from retaining the old shipped
+  # password or losing database connectivity.
+  postgres-credential-sync:
+    image: gotempsh/timescaledb-walg:pg18
+    restart: "no"
+    network_mode: none
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set (put it in a .env file next to docker-compose.yml)}
+    depends_on:
+      credential-check:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_started
+    volumes:
+      - postgres_socket:/var/run/postgresql
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        attempts=0
+        until psql -h /var/run/postgresql -U temps -d postgres -tAc 'SELECT 1' >/dev/null 2>&1; do
+          attempts=$$((attempts + 1))
+          if [ "$$attempts" -ge 120 ]; then
+            echo "PostgreSQL did not accept local connections within 120 seconds" >&2
+            exit 1
+          fi
+          sleep 1
+        done
+        umask 077
+        trap 'rm -f /tmp/rotate-password.sql' EXIT
+        printf "\\set password '%s'\nSET password_encryption = 'scram-sha-256';\nALTER ROLE temps WITH PASSWORD :'password';\n" "$$POSTGRES_PASSWORD" > /tmp/rotate-password.sql
+        psql -v ON_ERROR_STOP=1 -h /var/run/postgresql -U temps -d postgres -f /tmp/rotate-password.sql
+
   # Redis Cache
   redis:
     image: redis:8-alpine
     container_name: temps-redis
-    command: redis-server --appendonly yes
+    user: redis
+    # Require a password. No default: compose fails fast if REDIS_PASSWORD is unset.
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set (put it in a .env file next to docker-compose.yml)}
+    depends_on:
+      credential-check:
+        condition: service_completed_successfully
+    # Keep the secret out of the long-lived redis-server argv. The validator
+    # above rejects whitespace/newlines and other Redis-config metacharacters.
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        umask 077
+        printf 'appendonly yes\nrequirepass %s\n' "$$REDIS_PASSWORD" > /tmp/redis.conf
+        unset REDIS_PASSWORD
+        exec redis-server /tmp/redis.conf
     ports:
-      - "6379:6379"
+      # Loopback only — Redis is reachable over the internal temps-network.
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
     networks:
       - temps-network
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$REDIS_PASSWORD\" redis-cli ping | grep -q PONG"]
       interval: 10s
       timeout: 5s
       retries: 5
 
   # Temps Application
-  # Note: Before running, ensure GeoLite2-City.mmdb is downloaded and placed in ./data/
-  #       See Dockerfile for instructions
+  # The image bundles the tracked GeoLite2 City database outside /app/data so
+  # it remains available when an existing persistent volume is mounted.
   temps:
     build:
       context: .
       dockerfile: Dockerfile
-      args:
-        # Uncomment and set your MaxMind license key to embed GeoLite2 database
-        # MAXMIND_LICENSE_KEY: "your_license_key_here"
     container_name: temps-app
     restart: unless-stopped
+    # Docker socket access is root-equivalent. Temps needs it to manage
+    # deployments, but the process remains the image's non-root user.
+    group_add:
+      - ${DOCKER_GID:?DOCKER_GID must be the group ID that owns /var/run/docker.sock}
     environment:
-      # Database configuration
-      TEMPS_DATABASE_URL: postgresql://temps:temps_password_change_me@postgres:5432/temps
+      # Database configuration (password sourced from the same env var as postgres)
+      TEMPS_DATABASE_URL: postgresql://temps:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/temps
 
       # Server configuration
       TEMPS_ADDRESS: 0.0.0.0:3000
@@ -79,18 +166,28 @@ services:
       # Data directory
       TEMPS_DATA_DIR: /app/data
 
+      # Required for unattended first startup. Temps creates the admin account
+      # using a password mounted from the Compose secret below.
+      TEMPS_ADMIN_EMAIL: ${TEMPS_ADMIN_EMAIL:?TEMPS_ADMIN_EMAIL must be set to the initial administrator email}
+      TEMPS_ADMIN_PASSWORD_FILE: /run/secrets/temps_admin_password
+
       # Logging
       TEMPS_LOG_LEVEL: info
 
-      # Redis configuration (if needed by services)
-      REDIS_URL: redis://redis:6379
+      # Redis configuration (authenticated; password from REDIS_PASSWORD)
+      REDIS_URL: redis://:${REDIS_PASSWORD:?REDIS_PASSWORD must be set}@redis:6379
     ports:
-      - "3000:3000"      # HTTP API
-      - "3443:3443"      # HTTPS API (if configured)
-      - "9000:9000"      # Console API
+      - "3000:3000"              # HTTP API (public)
+      - "3443:3443"              # HTTPS API (public, if configured)
+      # Console admin API — loopback only, never published to public interfaces.
+      - "127.0.0.1:9000:9000"    # Console API
     volumes:
       # Persistent data directory
       - temps_data:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    secrets:
+      - source: temps_admin_password
+        target: temps_admin_password
 
       # Optional: Mount local GeoLite2 database
       # Uncomment and update path to your local database file
@@ -101,12 +198,14 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      postgres-credential-sync:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
     networks:
       - temps-network
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/health"]
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:9000/readyz"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -114,6 +213,8 @@ services:
 
 volumes:
   postgres_data:
+    driver: local
+  postgres_socket:
     driver: local
   redis_data:
     driver: local
@@ -123,3 +224,7 @@ volumes:
 networks:
   temps-network:
     driver: bridge
+
+secrets:
+  temps_admin_password:
+    file: ${TEMPS_ADMIN_PASSWORD_FILE:?TEMPS_ADMIN_PASSWORD_FILE must point to a permission-restricted initial admin password file}

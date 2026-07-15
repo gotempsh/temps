@@ -19,6 +19,6 @@ pub use provider_service::{
 };
 pub use tracking_service::{ExtractedLink, TrackingEvent, TrackingService, TransformResult};
 pub use validation::{
-    MiscResult, MxResult, ProxyConfig, ReachabilityStatus, SmtpResult, SyntaxResult,
-    ValidateEmailRequest, ValidateEmailResponse, ValidationConfig, ValidationService,
+    is_valid_email_syntax, MiscResult, MxResult, ProxyConfig, ReachabilityStatus, SmtpResult,
+    SyntaxResult, ValidateEmailRequest, ValidateEmailResponse, ValidationConfig, ValidationService,
 };

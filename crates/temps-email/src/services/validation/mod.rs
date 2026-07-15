@@ -10,6 +10,12 @@ mod mx;
 mod smtp;
 mod syntax;
 
+/// Validate an email address using the same strict syntax parser as the email
+/// validation service, without performing DNS or SMTP checks.
+pub fn is_valid_email_syntax(email: &str) -> bool {
+    syntax::parse_email(email).is_some()
+}
+
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};

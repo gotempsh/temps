@@ -34,7 +34,6 @@ bun.lockb
 
 # Docs and examples
 docs/
-examples/
 README.md
 CHANGELOG.md
 LICENSE
@@ -44,6 +43,7 @@ LICENSE
 .env
 .env.local
 .env.*.local
+/secrets/
 docker-compose.dev.yml
 .pre-commit-config.yaml
 

@@ -1,20 +1,12 @@
 # Multi-stage build for Temps with embedded MaxMind GeoLite2 database
 #
-# REQUIRES: Prebuilt Rust binary (target/release/temps)
-# This Dockerfile builds WASM and Web UI inside Docker, then packages
-# them with a prebuilt Rust binary.
+# Builds the Rust binary, WASM, and Web UI inside Linux/Alpine so the runtime
+# artifact always matches the target architecture and musl libc.
 #
-# Usage:
-#    cp target/release/temps .
-#    docker build -t temps:latest --build-arg PREBUILT_BINARY=temps .
-
-# Build argument for prebuilt binary (REQUIRED)
-ARG PREBUILT_BINARY=""
+# Usage: docker build -t temps:latest .
 
 # Stage 1: Builder
-FROM rust:1.90-alpine AS builder
-
-ARG PREBUILT_BINARY
+FROM rust:1.94-alpine AS builder
 
 # Install required build dependencies
 RUN apk add --no-cache \
@@ -26,6 +18,7 @@ RUN apk add --no-cache \
     pkgconfig \
     openssl-dev \
     postgresql-dev \
+    protobuf-dev \
     git \
     curl \
     tar \
@@ -38,8 +31,11 @@ RUN apk add --no-cache nodejs npm
 RUN curl -fsSL https://bun.sh/install | bash && \
     ln -s $HOME/.bun/bin/bun /usr/local/bin/bun
 
-# Install wasm-pack globally
-RUN npm install -g wasm-pack
+# Install the Rust-native WASM tooling. The npm wrapper tries to download a
+# prebuilt wasm-bindgen binary that does not exist for every Alpine architecture
+# (notably arm64), so pin and compile the matching CLI instead.
+RUN cargo install wasm-pack --version 0.13.1 --locked && \
+    cargo install wasm-bindgen-cli --version 0.2.121 --locked
 
 # Install wasm32 target for Rust (needed for WASM compilation)
 RUN rustup target add wasm32-unknown-unknown
@@ -64,20 +60,21 @@ RUN cd /build/web && \
     bun run build && \
     echo "Web UI build completed at /build/crates/temps-cli/dist"
 
-# Copy prebuilt binary from build context
-RUN if [ -f "/build/$PREBUILT_BINARY" ]; then \
-      cp "/build/$PREBUILT_BINARY" /app/temps && \
-      chmod +x /app/temps && \
-      chown root:root /app/temps; \
-    else \
-      echo "ERROR: Prebuilt binary not found at /build/$PREBUILT_BINARY"; \
-      exit 1; \
-    fi
+# The musl target links system zlib statically.
+RUN apk add --no-cache zlib-static
+
+# Build natively in the Alpine builder. Copying a host-built binary here is
+# unsafe: macOS produces Mach-O and ordinary Linux builds target glibc, while
+# the runtime stage is musl-based Alpine.
+RUN --mount=type=cache,target=/build/target \
+    cargo build --release --bin temps --package temps-cli && \
+    cp /build/target/release/temps /app/temps && \
+    chmod +x /app/temps && \
+    chown root:root /app/temps
 
 # Verify binary exists
 RUN test -f /app/temps || { \
       echo "ERROR: Binary not found at /app/temps"; \
-      echo "If using PREBUILT_BINARY, ensure the file exists in build context"; \
       exit 1; \
     }
 
@@ -100,37 +97,20 @@ WORKDIR /app
 # Copy binary from builder
 COPY --from=builder /app/temps /app/temps
 
+# The city database is tracked in the repository and required by the proxy.
+# Keep it outside /app/data so an existing persistent volume cannot mask it
+# during an upgrade.
+COPY --from=builder /build/crates/temps-cli/GeoLite2-City.mmdb /usr/share/temps/GeoLite2-City.mmdb
+
 # Create data directory structure
 RUN mkdir -p /app/data/logs && \
     chown -R appuser:appgroup /app
 
-# Copy GeoLite2 database from local repository if available
-# The database should be placed in the repository root or crates/temps-cli directory
-RUN if [ -f GeoLite2-City.mmdb ]; then \
-      cp GeoLite2-City.mmdb /app/data/GeoLite2-City.mmdb && \
-      chown appuser:appgroup /app/data/GeoLite2-City.mmdb; \
-    elif [ -f crates/temps-cli/GeoLite2-City.mmdb ]; then \
-      cp crates/temps-cli/GeoLite2-City.mmdb /app/data/GeoLite2-City.mmdb && \
-      chown appuser:appgroup /app/data/GeoLite2-City.mmdb; \
-    else \
-      echo "Note: GeoLite2 database not found in repository. Geolocation features will be disabled."; \
-    fi
-
-# Copy GeoLite2 ASN database if available (optional -- powers hosting/VPS-provider
-# detection for datacenter traffic spoofing a real browser user-agent; when absent,
-# that detection silently disables and city/country geolocation still works)
-RUN if [ -f GeoLite2-ASN.mmdb ]; then \
-      cp GeoLite2-ASN.mmdb /app/data/GeoLite2-ASN.mmdb && \
-      chown appuser:appgroup /app/data/GeoLite2-ASN.mmdb; \
-    elif [ -f crates/temps-cli/GeoLite2-ASN.mmdb ]; then \
-      cp crates/temps-cli/GeoLite2-ASN.mmdb /app/data/GeoLite2-ASN.mmdb && \
-      chown appuser:appgroup /app/data/GeoLite2-ASN.mmdb; \
-    else \
-      echo "Note: GeoLite2 ASN database not found in repository. Hosting-provider detection will be disabled."; \
-    fi
-
 # Set permissions
-RUN chmod -R 755 /app/data
+RUN chown -R appuser:appgroup /app/data && \
+    chmod -R 755 /app/data && \
+    chmod 644 /usr/share/temps/GeoLite2-City.mmdb && \
+    ln -s /usr/share/temps/GeoLite2-City.mmdb /app/GeoLite2-City.mmdb
 
 # Switch to non-root user
 USER appuser:appgroup
@@ -141,51 +121,29 @@ EXPOSE 3000
 # Expose TLS port (if configured)
 EXPOSE 3443
 
+# Expose the console/API listener
+EXPOSE 9000
+
 # Health check
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD wget --no-verbose --tries=1 --spider http://localhost:3000/health || exit 1
+    CMD wget --no-verbose --tries=1 --spider http://127.0.0.1:9000/readyz || exit 1
 
 # Run the application (Pingora handles signals internally)
 CMD ["/app/temps", "serve"]
 
 # Build instructions:
 # ==================
-# REQUIRED BUILD STEPS (before Docker):
-# The Rust binary MUST be built outside Docker with all dependencies:
+# Docker builds the WASM package, web UI, and Rust binary inside its Alpine
+# builder. No host toolchain or prebuilt binary is required.
 #
-# 1. Build WebAssembly (temps-captcha-wasm):
-#    cd crates/temps-captcha-wasm
-#    bun install
-#    npm run build
-#    Output: pkg/
+# 1. Build the image:
+#    docker build -t temps:latest .
 #
-# 2. Build Web UI (must happen before Rust binary):
-#    cd web
-#    bun install
-#    RSBUILD_OUTPUT_PATH=../crates/temps-cli/dist bun run build
-#    Output: crates/temps-cli/dist/
-#
-# 3. Build Rust Binary (includes embedded web UI):
-#    cargo build --release --bin temps
-#    Output: target/release/temps
-#
-# DOCKER BUILD (requires prebuilt binary):
-#
-# 1. Copy the prebuilt binary to build context:
-#    cp target/release/temps .
-#
-# 2. Build Docker image:
-#    docker build -t temps:latest --build-arg PREBUILT_BINARY=temps .
-#
-# 3. Optional: Add GeoLite2 database:
-#    First, download from: https://www.maxmind.com/en/account/login
-#    Then build Docker image (WASM and Web UI built inside Docker):
-#    docker build -t temps:latest --build-arg PREBUILT_BINARY=temps .
-#
-# 4. Run the container:
+# 2. Run the container:
 #    docker run -d \
 #      --name temps \
 #      -p 3000:3000 \
+#      -p 127.0.0.1:9000:9000 \
 #      -e TEMPS_DATABASE_URL="postgresql://user:password@postgres:5432/temps" \
 #      -v temps_data:/app/data \
 #      temps:latest
@@ -202,7 +160,7 @@ CMD ["/app/temps", "serve"]
 # Volumes:
 # ========
 # - /app/data: Persistent data directory
-#   - Stores: logs, encryption keys, GeoLite2 database, etc.
+#   - Stores: logs, encryption keys, and optional runtime databases
 #
 # Notes:
 # ======
@@ -211,27 +169,13 @@ CMD ["/app/temps", "serve"]
 #   Location: Built inside Docker at crates/temps-captcha-wasm/pkg/
 # - Web UI Build: Rsbuild frontend application built with bun
 #   Location: Built inside Docker at crates/temps-cli/dist/
-# - Rust Binary: Main server binary (MUST be prebuilt outside Docker)
-#   Includes: Embedded web UI via include_dir! macro in temps-cli
-#
-# WHY PREBUILT BINARY:
-# - The Rust binary is built outside Docker to leverage local caches and development setup
-# - WASM and Web UI are still built inside Docker (dependencies: nodejs, npm, bun, wasm-pack)
-# - Docker builds WASM and Web UI from source, then includes the prebuilt binary
-# - The prebuilt binary must:
-#   - Be for the same Linux architecture as the Docker image (musl x86_64 for Alpine)
-#   - Have been built with full web UI and WASM included (from step 1-3 above)
+# - Rust Binary: built natively in Alpine and embeds the generated web UI
 #
 # GEOLITE2 DATABASE:
-# - GeoLite2 database should be placed in the repository root or crates/temps-cli/
-#   before building the Docker image for it to be embedded in the image.
-# - If GeoLite2 database is not embedded at build time, you can mount it at runtime:
-#   docker run -v /path/to/GeoLite2-City.mmdb:/app/data/GeoLite2-City.mmdb temps:latest
-# - GeoLite2 database is optional but required for geolocation features
-#   Download from: https://www.maxmind.com/en/geolite2/geolite2-free-data-sources
-# - Geolocation features will be disabled if database is missing (non-fatal)
-#   The application will continue to run normally with a warning in logs
-# - GeoLite2-ASN.mmdb (same download page) is also optional and follows the same
-#   placement/mount rules. It powers hosting/VPS-provider detection used to keep
-#   scraper/bot traffic out of the live-visitors view. Without it, that detection
-#   is disabled (non-fatal) but city/country geolocation is unaffected.
+# - The tracked crates/temps-cli/GeoLite2-City.mmdb is copied to the immutable
+#   /usr/share/temps directory. It remains available when /app/data is an existing
+#   persistent volume.
+# - GeoLite2-ASN.mmdb is optional and may be mounted under /app/data. It powers
+#   hosting/VPS-provider detection used to keep scraper/bot traffic out of the
+#   live-visitors view. Without it, that detection is disabled (non-fatal), while
+#   city/country geolocation continues to use the bundled city database.
