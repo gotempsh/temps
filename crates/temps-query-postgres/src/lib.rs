@@ -1936,7 +1936,7 @@ mod tests {
             // executes when it is not intercepted by the data-explorer validator.
             let direct_row = source
                 .client
-                .query_one(&format!("SELECT {attack}"), &[])
+                .query_one(&format!("SELECT {attack} FROM public_users"), &[])
                 .await
                 .expect("quoted query_to_xml call must be valid PostgreSQL");
             assert!(direct_row.get::<_, bool>(0));
