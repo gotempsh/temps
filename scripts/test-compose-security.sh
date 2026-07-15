@@ -108,6 +108,13 @@ if grep -En 'temps_password_change_me|redis-server .*--requirepass|redis-cli -a'
   exit 1
 fi
 
+for credential_doc in .env.example docs/installation/page.mdx docs/upgrade/page.mdx; do
+  if ! grep -Fq 'install -m 600 .env.example .env' "$credential_doc"; then
+    echo "$credential_doc does not require creating .env with mode 0600" >&2
+    exit 1
+  fi
+done
+
 old_postgres="temps_password_change_me"
 POSTGRES_PASSWORD="$old_postgres" REDIS_PASSWORD="$safe_redis" \
   "${compose[@]}" up --detach postgres-credential-sync >/dev/null

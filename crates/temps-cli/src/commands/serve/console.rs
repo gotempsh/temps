@@ -303,7 +303,7 @@ async fn create_initial_admin_user(
     conn: &sea_orm::DatabaseConnection,
     email: &str,
     configured_password: Option<&str>,
-) -> anyhow::Result<()> {
+) -> Result<(), InitialAdminBootstrapError> {
     use sea_orm::{ActiveModelTrait, ColumnTrait, QueryFilter, TransactionTrait};
 
     // Check if user with this email already exists (normalize to lowercase)
@@ -311,7 +311,11 @@ async fn create_initial_admin_user(
     let existing_user = users::Entity::find()
         .filter(users::Column::Email.eq(&email_lower))
         .one(conn)
-        .await?;
+        .await
+        .map_err(|source| InitialAdminBootstrapError::LookupUser {
+            email: email_lower.clone(),
+            source,
+        })?;
 
     if let Some(existing_user) = existing_user {
         ensure_existing_initial_admin_is_active(existing_user.deleted_at.is_some(), &email_lower)?;
@@ -370,7 +374,10 @@ async fn create_initial_admin_user(
     let salt = SaltString::generate(&mut OsRng);
     let password_hash = argon2
         .hash_password(password.as_bytes(), &salt)
-        .map_err(|e| anyhow::anyhow!("Password hashing failed: {}", e))?
+        .map_err(|error| InitialAdminBootstrapError::HashPassword {
+            email: email_lower.clone(),
+            reason: error.to_string(),
+        })?
         .to_string();
 
     // Resolve the role before creating anything so a missing role cannot leave
@@ -378,13 +385,25 @@ async fn create_initial_admin_user(
     let admin_role = temps_entities::roles::Entity::find()
         .filter(temps_entities::roles::Column::Name.eq("admin"))
         .one(conn)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("Admin role not found"))?;
+        .await
+        .map_err(|source| InitialAdminBootstrapError::LookupAdminRole {
+            email: email_lower.clone(),
+            source,
+        })?
+        .ok_or_else(|| InitialAdminBootstrapError::AdminRoleNotFound {
+            email: email_lower.clone(),
+        })?;
 
     // Create the user and role assignment atomically. A partial bootstrap would
     // leave a non-deleted user that suppresses future bootstrap attempts but
     // cannot administer the instance.
-    let transaction = conn.begin().await?;
+    let transaction =
+        conn.begin()
+            .await
+            .map_err(|source| InitialAdminBootstrapError::BeginTransaction {
+                email: email_lower.clone(),
+                source,
+            })?;
 
     // Create the user with normalized email
     let new_user = users::ActiveModel {
@@ -405,7 +424,12 @@ async fn create_initial_admin_user(
         ..Default::default()
     };
 
-    let user = new_user.insert(&transaction).await?;
+    let user = new_user.insert(&transaction).await.map_err(|source| {
+        InitialAdminBootstrapError::CreateUser {
+            email: email_lower.clone(),
+            source,
+        }
+    })?;
 
     // Assign admin role to the user
     let user_role = temps_entities::user_roles::ActiveModel {
@@ -416,8 +440,21 @@ async fn create_initial_admin_user(
         ..Default::default()
     };
 
-    user_role.insert(&transaction).await?;
-    transaction.commit().await?;
+    user_role.insert(&transaction).await.map_err(|source| {
+        InitialAdminBootstrapError::AssignAdminRole {
+            email: email_lower.clone(),
+            user_id: user.id,
+            role_id: admin_role.id,
+            source,
+        }
+    })?;
+    transaction
+        .commit()
+        .await
+        .map_err(|source| InitialAdminBootstrapError::CommitTransaction {
+            email: email_lower.clone(),
+            source,
+        })?;
 
     println!();
     println!(
@@ -469,10 +506,22 @@ async fn create_initial_admin_user(
                 "{} ",
                 "Have you saved the password? (y/n):".bright_white().bold()
             );
-            io::stdout().flush()?;
+            io::stdout().flush().map_err(|source| {
+                InitialAdminBootstrapError::InteractivePrompt {
+                    email: email_lower.clone(),
+                    operation: "flush password confirmation prompt",
+                    source,
+                }
+            })?;
 
             let mut response = String::new();
-            io::stdin().read_line(&mut response)?;
+            io::stdin().read_line(&mut response).map_err(|source| {
+                InitialAdminBootstrapError::InteractivePrompt {
+                    email: email_lower.clone(),
+                    operation: "read password confirmation",
+                    source,
+                }
+            })?;
             let response = response.trim().to_lowercase();
 
             if response == "y" || response == "yes" {
@@ -509,6 +558,63 @@ async fn create_initial_admin_user(
 }
 
 #[derive(Debug, thiserror::Error)]
+enum InitialAdminBootstrapError {
+    #[error("failed to look up initial admin '{email}': {source}")]
+    LookupUser {
+        email: String,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+    #[error("failed to hash password for initial admin '{email}': {reason}")]
+    HashPassword { email: String, reason: String },
+    #[error("failed to look up admin role while bootstrapping '{email}': {source}")]
+    LookupAdminRole {
+        email: String,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+    #[error("admin role not found while bootstrapping initial admin '{email}'")]
+    AdminRoleNotFound { email: String },
+    #[error("failed to begin initial-admin transaction for '{email}': {source}")]
+    BeginTransaction {
+        email: String,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+    #[error("failed to create initial admin user '{email}': {source}")]
+    CreateUser {
+        email: String,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+    #[error(
+        "failed to assign admin role {role_id} to initial admin '{email}' (user {user_id}): {source}"
+    )]
+    AssignAdminRole {
+        email: String,
+        user_id: i32,
+        role_id: i32,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+    #[error("failed to commit initial-admin transaction for '{email}': {source}")]
+    CommitTransaction {
+        email: String,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+    #[error("failed to {operation} for initial admin '{email}': {source}")]
+    InteractivePrompt {
+        email: String,
+        operation: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(transparent)]
+    Configuration(#[from] InitialAdminConfigError),
+}
+
+#[derive(Debug, thiserror::Error)]
 enum InitialAdminConfigError {
     #[error("TEMPS_ADMIN_EMAIL must be a valid email address")]
     InvalidEmail,
@@ -526,6 +632,31 @@ enum InitialAdminConfigError {
         "initial admin '{email}' is soft-deleted; restore it or choose a different TEMPS_ADMIN_EMAIL"
     )]
     DeletedUser { email: String },
+    #[error("environment variable {name} is not valid Unicode: {source}")]
+    InvalidEnvironment {
+        name: &'static str,
+        #[source]
+        source: std::env::VarError,
+    },
+}
+
+fn optional_environment_variable(
+    name: &'static str,
+) -> Result<Option<String>, InitialAdminConfigError> {
+    optional_environment_variable_result(name, std::env::var(name))
+}
+
+fn optional_environment_variable_result(
+    name: &'static str,
+    result: Result<String, std::env::VarError>,
+) -> Result<Option<String>, InitialAdminConfigError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(source @ std::env::VarError::NotUnicode(_)) => {
+            Err(InitialAdminConfigError::InvalidEnvironment { name, source })
+        }
+    }
 }
 
 fn normalize_configured_admin_email(value: &str) -> Result<String, InitialAdminConfigError> {
@@ -1857,8 +1988,9 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("Failed to initialize roles: {}", e))?;
             debug!("Initialized user roles");
 
-            let configured_email = std::env::var("TEMPS_ADMIN_EMAIL").ok();
-            let configured_password_file = std::env::var("TEMPS_ADMIN_PASSWORD_FILE").ok();
+            let configured_email = optional_environment_variable("TEMPS_ADMIN_EMAIL")?;
+            let configured_password_file =
+                optional_environment_variable("TEMPS_ADMIN_PASSWORD_FILE")?;
             if let Some((admin_email, admin_password)) = configured_initial_admin(
                 configured_email.as_deref(),
                 configured_password_file.as_deref(),
@@ -2761,6 +2893,32 @@ mod initial_admin_tests {
     }
 
     #[test]
+    fn optional_environment_variable_distinguishes_absent_and_non_unicode_values() {
+        assert_eq!(
+            optional_environment_variable_result(
+                "TEMPS_ADMIN_EMAIL",
+                Err(std::env::VarError::NotPresent),
+            )
+            .unwrap(),
+            None
+        );
+
+        let result = optional_environment_variable_result(
+            "TEMPS_ADMIN_EMAIL",
+            Err(std::env::VarError::NotUnicode(std::ffi::OsString::from(
+                "invalid-value",
+            ))),
+        );
+        assert!(matches!(
+            result,
+            Err(InitialAdminConfigError::InvalidEnvironment {
+                name: "TEMPS_ADMIN_EMAIL",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn configured_admin_email_is_trimmed_and_normalized() {
         assert_eq!(
             normalize_configured_admin_email("  Admin@Example.COM ").unwrap(),
@@ -2833,6 +2991,41 @@ mod initial_admin_tests {
     }
 
     #[tokio::test]
+    async fn missing_admin_role_returns_contextual_bootstrap_error() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<users::Model>::new()])
+            .append_query_results([Vec::<temps_entities::roles::Model>::new()])
+            .into_connection();
+
+        let result =
+            create_initial_admin_user(&db, "admin@example.com", Some("tT3!0123456789abcdef")).await;
+
+        assert!(matches!(
+            result,
+            Err(InitialAdminBootstrapError::AdminRoleNotFound { email })
+                if email == "admin@example.com"
+        ));
+    }
+
+    #[tokio::test]
+    async fn initial_admin_lookup_preserves_database_error_context() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([DbErr::Custom("user lookup failed".to_string())])
+            .into_connection();
+
+        let result =
+            create_initial_admin_user(&db, "admin@example.com", Some("tT3!0123456789abcdef")).await;
+
+        assert!(matches!(
+            result,
+            Err(InitialAdminBootstrapError::LookupUser {
+                email,
+                source: DbErr::Custom(message),
+            }) if email == "admin@example.com" && message == "user lookup failed"
+        ));
+    }
+
+    #[tokio::test]
     async fn role_assignment_failure_rolls_back_initial_user_transaction() {
         let now = chrono::Utc::now();
         let role = temps_entities::roles::Model {
@@ -2869,7 +3062,15 @@ mod initial_admin_tests {
 
         let result =
             create_initial_admin_user(&db, "admin@example.com", Some("tT3!0123456789abcdef")).await;
-        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(InitialAdminBootstrapError::AssignAdminRole {
+                email,
+                user_id: 1,
+                role_id: 1,
+                source: DbErr::Custom(message),
+            }) if email == "admin@example.com" && message == "role assignment failed"
+        ));
 
         let log = db.into_transaction_log();
         assert_eq!(log.len(), 3, "lookups plus one rolled-back transaction");

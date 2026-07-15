@@ -142,8 +142,11 @@ Database migrations are **idempotent** — re-running a version that's already m
 
 ### Upgrading an Existing Docker Compose Stack
 
-Back up the `postgres_data` volume, copy `.env.example` to `.env`, and set new,
-independent hexadecimal values for `POSTGRES_PASSWORD` and `REDIS_PASSWORD`.
+Back up the `postgres_data` volume, create a private `.env` with
+`install -m 600 .env.example .env`, and set new, independent hexadecimal values
+for `POSTGRES_PASSWORD` and `REDIS_PASSWORD`. Keep the file owned by the account
+that operates Temps and mode `0600`; it grants access to the loopback-published
+data services.
 Set `TEMPS_ADMIN_EMAIL` to the administrator email; it is used only when the
 database has no existing user.
 Set `TEMPS_ADMIN_PASSWORD_FILE` to a permission-restricted password file. For a
