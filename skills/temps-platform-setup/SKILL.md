@@ -47,22 +47,27 @@ Complete guide for installing and managing the Temps self-hosted deployment plat
 
 ### Method 1: Install Script (Recommended)
 
-Download the installer, **review it**, then run it. Piping a remote
-script straight into a shell (`curl ... | bash`) executes whatever the
-server returns without giving you a chance to inspect it — download to a
-file and read it first.
+Download the installer, **verify and review it**, then run it. Piping a
+remote script straight from curl into a shell executes whatever the server
+returns without giving you a chance to inspect it — download to a file,
+check its integrity, and read it first.
 
 ```bash
 # 1. Download the installer to a file
 curl -fsSL https://temps.sh/deploy.sh -o deploy.sh
 
-# 2. Review it before running (check the URLs it fetches and what it writes)
+# 2. Verify its integrity against the published checksum
+#    (on macOS use: shasum -a 256 -c deploy.sh.sha256)
+curl -fsSL https://temps.sh/deploy.sh.sha256 -o deploy.sh.sha256
+sha256sum -c deploy.sh.sha256   # must print: deploy.sh: OK
+
+# 3. Review it before running (check the URLs it fetches and what it writes)
 less deploy.sh
 
-# 3. Run it once you're satisfied
+# 4. Run it once you're satisfied
 bash deploy.sh
 
-# 4. Reload shell configuration
+# 5. Reload shell configuration
 source ~/.zshrc  # or ~/.bashrc for bash users
 ```
 
@@ -84,20 +89,29 @@ throwaway Temps instance to try it out, run `deploy.sh` in **non-interactive
 mode**. It skips every prompt, suppresses banners/spinners, and writes a
 machine-readable JSON result.
 
+The same download-verify-run flow applies in headless mode — never pipe the
+installer straight into a shell, even in automation:
+
 ```bash
 # Local-only instance on this machine (127.0.0.1.sslip.io, HTTP, no domain).
-# --non-interactive is auto-enabled when there is no controlling terminal,
-# so an agent can also just run the bare curl|bash and get the same behavior.
-curl -fsSL https://temps.sh/deploy.sh | bash -s -- --mode local --non-interactive
+# --non-interactive is auto-enabled when there is no controlling terminal.
+curl -fsSL https://temps.sh/deploy.sh -o deploy.sh
+curl -fsSL https://temps.sh/deploy.sh.sha256 -o deploy.sh.sha256
+sha256sum -c deploy.sh.sha256   # abort unless it prints: deploy.sh: OK
+bash deploy.sh --mode local --non-interactive
 
-# Read the structured result (console URL, admin creds, API key):
-cat ~/.temps/setup-result.json
+# The structured result (console URL, admin credentials, API key) is written to:
+#   ~/.temps/setup-result.json   (mode 0600)
+# Treat this file as a secret store: extract only the specific field you need
+# (see below) — never cat the whole file or echo its contents into logs,
+# chat output, or generated files.
 ```
 
-The final stdout line is also machine-readable:
+The final stdout line is also machine-readable (secret fields shown redacted
+here — the real output contains live credentials, so never paste it anywhere):
 
 ```
-::temps:result:: {"status":"ok","mode":"local","console_url":"http://console.127.0.0.1.sslip.io:8080","admin_email":"admin@127.0.0.1.sslip.io","admin_password":"...","api_key":"tmps_...","domain":"127.0.0.1.sslip.io","channel":"stable"}
+::temps:result:: {"status":"ok","mode":"local","console_url":"http://console.127.0.0.1.sslip.io:8080","admin_email":"admin@127.0.0.1.sslip.io","admin_password":"<redacted>","api_key":"<redacted>","domain":"127.0.0.1.sslip.io","channel":"stable"}
 ```
 
 **Result fields:** `status` (`ok` | `degraded`), `mode`, `channel`,
@@ -111,14 +125,19 @@ The final stdout line is also machine-readable:
 - `--output-json <path>` — write the result somewhere other than `~/.temps/setup-result.json`
 - `--channel beta` — install a prerelease binary
 
-After setup, the agent can immediately deploy using the returned `api_key`:
+After setup, the agent can immediately deploy using the returned `api_key`.
+Extract only that field — the `admin_password` is for the human operator's
+console login and should never be read, displayed, or reused by automation:
 
 ```bash
-API_KEY=$(jq -r .api_key ~/.temps/setup-result.json)
 API_URL="$(jq -r .console_url ~/.temps/setup-result.json)/api"
 bunx @temps-sdk/cli configure set apiUrl "$API_URL"
-bunx @temps-sdk/cli login --api-key "$API_KEY"
+TEMPS_TOKEN="$(jq -r .api_key ~/.temps/setup-result.json)" bunx @temps-sdk/cli whoami
 ```
+
+Exporting `TEMPS_TOKEN` (or passing it per-command as above) keeps the key out
+of shell history and process listings; `login --api-key` would expose it in
+both.
 
 > Advanced/manual-DNS mode is **TTY-only** — it needs interactive DNS-record
 > entry. Agents must use `--mode local` or `--mode quick`.
@@ -128,13 +147,17 @@ bunx @temps-sdk/cli login --api-key "$API_KEY"
 For production deployments with PostgreSQL and Redis:
 
 ```bash
-# Clone the repository
-git clone https://github.com/gotempsh/temps.git
+# Clone the repository, pinned to a release tag (check
+# https://github.com/gotempsh/temps/releases for the latest, e.g. v0.0.8)
+git clone --depth 1 --branch v0.0.8 https://github.com/gotempsh/temps.git
 cd temps
 
 # Start with Docker Compose
 docker-compose up -d
 ```
+
+> Pinning to a tag ensures you build exactly the reviewed, released code
+> rather than whatever is currently on the default branch.
 
 **Docker Compose includes:**
 - Temps application server
@@ -151,7 +174,8 @@ docker-compose up -d
 
 ```bash
 # Prerequisites: Rust 1.70+, PostgreSQL, Bun
-git clone https://github.com/gotempsh/temps.git
+# Pin to a release tag unless you're developing against main
+git clone --depth 1 --branch v0.0.8 https://github.com/gotempsh/temps.git
 cd temps
 
 # Build Rust backend
@@ -182,20 +206,25 @@ Temps requires **PostgreSQL 14+ with TimescaleDB extension**.
 # Create persistent volume
 docker volume create temps-postgres
 
+# Generate a strong database password (don't use a fixed/example value)
+# and store it in your password manager before closing this shell —
+# it is only in $PGPASSWORD, nowhere on disk.
+export PGPASSWORD="$(openssl rand -base64 24)"
+
 # Start PostgreSQL + TimescaleDB
 docker run -d \
   --name temps-postgres \
   -v temps-postgres:/home/postgres/pgdata/data \
   -e POSTGRES_USER=postgres \
-  -e POSTGRES_PASSWORD=temps \
+  -e POSTGRES_PASSWORD="$PGPASSWORD" \
   -e POSTGRES_DB=temps \
   -p 16432:5432 \
   timescale/timescaledb-ha:pg18
 ```
 
-**Connection string:**
+**Connection string** (substitute the password you generated):
 ```
-postgresql://postgres:temps@localhost:16432/temps
+postgresql://postgres:<DB_PASSWORD>@localhost:16432/temps
 ```
 
 ### 2. Run Temps Setup
@@ -262,7 +291,7 @@ appears in shell history or `ps` output:
 
 ```bash
 temps serve \
-  --database-url "postgresql://postgres:temps@localhost:16432/temps" \
+  --database-url "postgresql://postgres:<DB_PASSWORD>@localhost:16432/temps" \
   --address 0.0.0.0:80 \
   --tls-address 0.0.0.0:443 \
   --console-address 0.0.0.0:8081
@@ -349,13 +378,15 @@ This opens your browser to authorize the CLI. No token is typed in.
 
 **Non-interactive login (CI/CD or agents — with an API key):**
 
-Passing `--api-key` on the command line records it in shell history and
-process listings. In CI, set the token as a secret environment variable
-instead (see below); use the flag only for one-off local logins.
+Prefer the `TEMPS_TOKEN` environment variable (next section) — the CLI reads
+it directly and no login command is needed. If you must use `login --api-key`,
+reference an exported variable rather than typing the key, so the literal
+value never lands in shell history:
 
 ```bash
-# URL is positional; -k/--api-key supplies the key (there is no -u flag)
-temps login https://temps.yourdomain.com --api-key "<YOUR_API_KEY>"
+# URL is positional; -k/--api-key supplies the key (there is no -u flag).
+# TEMPS_API_KEY should come from your CI secret store or secret manager.
+temps login https://temps.yourdomain.com --api-key "$TEMPS_API_KEY"
 ```
 
 Create an API key first with `temps apikeys create` (see the
@@ -448,9 +479,12 @@ To deploy from Git, connect a provider with `temps providers git connect`:
 **GitHub (personal access token):**
 
 ```bash
+# Export the token from your secret manager first — an exported variable
+# keeps the literal value out of shell history:
+#   export GITHUB_TOKEN="$(op read op://vault/github/token)"   # or your equivalent
 temps providers git connect \
   --name "My GitHub" \
-  --token "<YOUR_GITHUB_TOKEN>"
+  --token "$GITHUB_TOKEN"
 ```
 
 **Get GitHub token:**
@@ -463,7 +497,7 @@ temps providers git connect \
 ```bash
 temps providers git connect \
   --name "My GitLab" \
-  --token "<YOUR_GITLAB_TOKEN>" \
+  --token "$GITLAB_TOKEN" \
   --base-url "https://gitlab.example.com"
 ```
 
@@ -541,7 +575,9 @@ temps users list
 
 ### API Keys & Tokens
 
-**Create a token** (`--expires-in` is a number of days, or `never`):
+**Create a token** (`--expires-in` is a number of days, or `never` — always
+prefer a bounded expiry; reserve `never` for cases where rotation is handled
+some other way):
 
 ```bash
 temps tokens create \
@@ -659,12 +695,16 @@ Temps supports automatic DNS record management. Create a provider with
 `temps dns-providers create -t <type>` (type: `cloudflare`, `route53`,
 `digitalocean`, `namecheap`, `gcp`, `azure`, `manual`):
 
+Export provider credentials from your secret manager first (see
+[Credential Handling](#credential-handling)) and reference the variables —
+never type token values into the command line:
+
 **Cloudflare:**
 
 ```bash
 temps dns-providers create \
   --name "Cloudflare" --type cloudflare \
-  --api-token "<YOUR_CLOUDFLARE_TOKEN>"
+  --api-token "$CLOUDFLARE_API_TOKEN"
 ```
 
 **AWS Route53:**
@@ -672,8 +712,8 @@ temps dns-providers create \
 ```bash
 temps dns-providers create \
   --name "Route53" --type route53 \
-  --access-key-id "<YOUR_AWS_ACCESS_KEY_ID>" \
-  --secret-access-key "<YOUR_AWS_SECRET_ACCESS_KEY>" \
+  --access-key-id "$AWS_ACCESS_KEY_ID" \
+  --secret-access-key "$AWS_SECRET_ACCESS_KEY" \
   --region "us-east-1"
 ```
 
@@ -682,7 +722,7 @@ temps dns-providers create \
 ```bash
 temps dns-providers create \
   --name "DigitalOcean" --type digitalocean \
-  --api-token "<YOUR_DIGITALOCEAN_TOKEN>"
+  --api-token "$DIGITALOCEAN_API_TOKEN"
 ```
 
 **List providers:** `temps dns-providers list`
@@ -777,7 +817,7 @@ See the **Cloud ACME Certificates (acme.sh)** section in the [Temps CLI referenc
 docker ps | grep postgres
 
 # Test connection
-psql "postgresql://postgres:temps@localhost:16432/temps" -c "SELECT version();"
+psql "postgresql://postgres:<DB_PASSWORD>@localhost:16432/temps" -c "SELECT version();"
 
 # Check database URL format
 temps serve --database-url "postgresql://user:password@host:port/database"
@@ -792,8 +832,8 @@ temps serve --database-url "postgresql://user:password@host:port/database"
 # Find process using port 3000
 lsof -i :3000
 
-# Kill process
-kill -9 <PID>
+# Stop the process gracefully (escalate to SIGKILL only if it hangs)
+kill <PID>
 
 # Or use different port
 temps serve --address 0.0.0.0:3001
@@ -1003,11 +1043,23 @@ temps deployments status <deployment-id>
 ### Installing Remote Scripts
 
 The install script (`deploy.sh`) and third-party tooling (e.g. `acme.sh`)
-are fetched over the network. **Download to a file and review it before
-running** rather than piping straight into a shell — `curl ... | bash`
-executes whatever the server returns, with no opportunity to inspect it
-and no protection if the host or your connection is compromised. See
-[Method 1](#method-1-install-script-recommended) for the safe flow.
+are fetched over the network. **Never pipe a remote script from curl
+straight into a shell** — that executes whatever the server returns, with
+no opportunity to inspect it and no protection if the host or your
+connection is compromised. Instead, always:
+
+1. **Download to a file** (`curl -o deploy.sh`).
+2. **Verify the checksum** against the published `deploy.sh.sha256`
+   (`sha256sum -c deploy.sh.sha256`; `shasum -a 256 -c` on macOS) — abort
+   on mismatch.
+3. **Review the script** before running it (check the URLs it fetches and
+   what it writes).
+4. Run it only after 2 and 3 pass.
+
+This applies to interactive *and* headless/agent installs alike — see
+[Method 1](#method-1-install-script-recommended) and
+[Method 1b](#method-1b-headless--ai-agent-install). When building from
+source, pin `git clone` to a release tag rather than the default branch.
 
 ### Credential Handling
 
@@ -1065,6 +1117,7 @@ After installing Temps:
 1. **Deploy your first app**: See [deploy-to-temps skill](../deploy-to-temps/SKILL.md)
 2. **Add analytics**: See [add-react-analytics skill](../add-react-analytics/SKILL.md)
 3. **Set up custom domain**: See [add-custom-domain skill](../add-custom-domain/SKILL.md)
+4. **Configure MCP**: See [temps-mcp-setup skill](../temps-mcp-setup/SKILL.md)
 
 **Documentation:**
 - CLI Reference: [temps-cli skill](../temps-cli/SKILL.md) — full command reference (440+ commands)
