@@ -2221,7 +2221,15 @@ impl BackupService {
             .region(aws_sdk_s3::config::Region::new(s3_source.region.clone()))
             .force_path_style(s3_source.force_path_style.unwrap_or(true)) // Default to true for Minio
             .credentials_provider(creds)
-            .http_client(crate::engines::v2_common::bundled_roots_http_client());
+            .http_client(crate::engines::v2_common::bundled_roots_http_client())
+            // aws-sdk-s3 defaults to computing a flexible checksum and sending it via
+            // aws-chunked trailers on every PutObject/UploadPart. Most third-party
+            // S3-compatible providers (Cloudflare R2, OVH, MinIO, Backblaze) don't
+            // implement that trailer format and reject or corrupt the upload, so only
+            // compute checksums when a caller explicitly asks for one.
+            .request_checksum_calculation(
+                aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
+            );
 
         // Only set endpoint URL if endpoint is specified (for Minio/custom S3)
         if let Some(endpoint) = &s3_source.endpoint {
@@ -2256,7 +2264,11 @@ impl BackupService {
             .region(aws_sdk_s3::config::Region::new(request.region.clone()))
             .force_path_style(request.force_path_style.unwrap_or(true))
             .credentials_provider(creds)
-            .http_client(crate::engines::v2_common::bundled_roots_http_client());
+            .http_client(crate::engines::v2_common::bundled_roots_http_client())
+            // See create_s3_client() above for why this is forced to WhenRequired.
+            .request_checksum_calculation(
+                aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
+            );
 
         // Only set endpoint URL if endpoint is specified (for MinIO)
         if let Some(endpoint) = &request.endpoint {
@@ -3891,7 +3903,13 @@ impl BackupService {
                     &backup.backup_id,
                 )?);
             }
-            if prefixes.is_empty() {
+            if prefixes.is_empty() && backup.state != "failed" {
+                // A `failed` backup never finished uploading, so there is
+                // nothing on remote storage to attribute — safe to fall
+                // through and delete only the bookkeeping rows below.
+                // Any other state reaching here with no artifact indicates
+                // a lost reference to real remote data, which must not be
+                // silently discarded.
                 return Err(BackupError::Validation(format!(
                     "Backup {} has no attributable remote artifact",
                     backup.backup_id
@@ -7563,16 +7581,35 @@ ORDER BY esb.id ASC
 
         // Mark the parent `backups` row as completed. Without this the row
         // stays in state='running' forever, which breaks listing/filtering
-        // and makes the restore UI skip the backup.
-        let mut backup_update: temps_entities::backups::ActiveModel = backup.clone().into();
-        backup_update.state = sea_orm::Set("completed".to_string());
-        backup_update.s3_location = sea_orm::Set(backup_outcome.location.clone());
-        backup_update.finished_at = sea_orm::Set(Some(Utc::now()));
-        backup_update.size_bytes = sea_orm::Set(final_size_bytes);
-        if let Err(e) = backup_update.update(self.db.as_ref()).await {
+        // and makes the restore UI skip the backup. Retry transient DB
+        // failures a few times before giving up — the backup data itself
+        // already succeeded, so we don't fail the caller on a lasting
+        // failure either, but we also don't want a single blip to strand
+        // the row in 'running' until the next server restart reconciles it.
+        let retry = temps_core::retry::RetryConfig::new(3)
+            .with_base_delay(std::time::Duration::from_millis(200))
+            .with_max_delay(std::time::Duration::from_secs(2));
+        let update_result = retry
+            .retry(|| {
+                let mut backup_update: temps_entities::backups::ActiveModel = backup.clone().into();
+                backup_update.state = sea_orm::Set("completed".to_string());
+                backup_update.s3_location = sea_orm::Set(backup_outcome.location.clone());
+                backup_update.finished_at = sea_orm::Set(Some(Utc::now()));
+                backup_update.size_bytes = sea_orm::Set(final_size_bytes);
+                let db = self.db.as_ref();
+                async move { backup_update.update(db).await }
+            })
+            .await;
+        if let Err(e) = update_result {
             // Don't fail the caller — the backup itself succeeded. Log and
-            // continue; the row will be reconciled next time.
-            error!("Failed to mark backup {} as completed: {}", backup.id, e);
+            // continue; the boot-time reconciler will mark the still-'running'
+            // row as failed, and the completed child `external_service_backups`
+            // row (already correctly updated above) keeps the real S3 location
+            // attributable for later cleanup/restore.
+            error!(
+                "Failed to mark backup {} as completed after retries: {}",
+                backup.id, e
+            );
         }
 
         // Get the external service backup record
@@ -8294,6 +8331,99 @@ mod tests {
                 restore_count: 1
             } if backup_id == "backup-uuid"
         ));
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires system TLS certificates (fails on some macOS configurations)
+    async fn delete_backup_model_removes_failed_backup_with_no_remote_artifact() {
+        // Regression test: a backup whose upload never completed (state
+        // "failed") has no s3_location on the parent row or any child
+        // external_service_backups row. Retention cleanup must still be
+        // able to delete this bookkeeping row instead of hard-failing with
+        // "no attributable remote artifact" forever.
+        let failed_backup = temps_entities::backups::Model {
+            id: 55,
+            name: "failed-backup".to_string(),
+            backup_id: "failed-backup-uuid".to_string(),
+            schedule_id: Some(9),
+            backup_type: "full".to_string(),
+            state: "failed".to_string(),
+            started_at: Utc::now(),
+            finished_at: Some(Utc::now()),
+            size_bytes: None,
+            file_count: None,
+            s3_source_id: 1,
+            s3_location: "".to_string(),
+            error_message: Some("upload failed".to_string()),
+            metadata: "{}".to_string(),
+            checksum: None,
+            compression_type: "gzip".to_string(),
+            created_by: 1,
+            expires_at: None,
+            tags: "[]".to_string(),
+            schedule_run_id: None,
+        };
+
+        let mut count_row = std::collections::BTreeMap::new();
+        count_row.insert("num_items".to_string(), sea_orm::Value::BigInt(Some(0)));
+
+        let encryption_service =
+            Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
+        let encrypted_access_key = encryption_service.encrypt_string("test-key").unwrap();
+        let encrypted_secret_key = encryption_service.encrypt_string("test-secret").unwrap();
+        let s3_source = s3_sources::Model {
+            id: 1,
+            name: "test-source".to_string(),
+            bucket_name: "test-bucket".to_string(),
+            bucket_path: "/backups".to_string(),
+            access_key_id: encrypted_access_key,
+            secret_key: encrypted_secret_key,
+            region: "us-east-1".to_string(),
+            endpoint: Some("http://localhost:9000".to_string()),
+            force_path_style: Some(true),
+            is_default: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let deleting_backup = temps_entities::backups::Model {
+            state: "deleting".to_string(),
+            ..failed_backup.clone()
+        };
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                // Phase one: lock + fetch the backup row.
+                .append_query_results(vec![vec![failed_backup.clone()]])
+                // restore_runs count
+                .append_query_results(vec![vec![count_row]])
+                // s3_sources lookup
+                .append_query_results(vec![vec![s3_source.clone()]])
+                // external_service_backups children (none — the upload never got that far)
+                .append_query_results(vec![
+                    Vec::<temps_entities::external_service_backups::Model>::new(),
+                ])
+                // state -> "deleting" (UPDATE ... RETURNING)
+                .append_query_results(vec![vec![deleting_backup.clone()]])
+                // Phase two: re-lock the tombstone before deleting.
+                .append_query_results(vec![vec![deleting_backup]])
+                // Final DB row deletion.
+                .append_exec_results(vec![MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let service = build_service_for_mock(db).expect("mock service should construct");
+
+        let (_, deleted_objects) = service
+            .delete_backup_model(failed_backup)
+            .await
+            .expect("a failed backup with no remote artifact must still be deletable");
+        assert_eq!(
+            deleted_objects, 0,
+            "nothing was ever uploaded, so nothing should be deleted remotely"
+        );
     }
 
     #[test]

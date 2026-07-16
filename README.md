@@ -94,16 +94,10 @@ Monitors for deploy failures, runtime crashes, certificate expiry, and backup he
 </td>
 </tr>
 <tr>
-<td width="50%">
+<td width="100%" colspan="2">
 
 **Transactional Email**
 Add sender domains with DKIM records through the UI. Send transactional emails via `@temps-sdk/node-sdk`. No external email service needed.
-
-</td>
-<td width="50%">
-
-**AI-Ready (MCP Server)**
-Ship with a Model Context Protocol server (`@temps-sdk/mcp`) so AI agents can deploy, monitor, and manage your infrastructure through natural language.
 
 </td>
 </tr>
@@ -155,24 +149,29 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 
 ## Temps vs. Alternatives
 
-| Feature | Temps | Coolify | Dokploy | CapRover | Dokku | Railway | Vercel |
+| Feature | Temps | Coolify | Dokploy | Kamal | Railway | Render | Vercel |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| Self-hosted | Yes | Yes | Yes | Yes | Yes | No | No |
-| Single binary install | Yes | No | No | No | No | -- | -- |
-| Git push deploy | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Multi-node / clustering | No | Yes | Yes | Yes | No | Yes | Yes |
-| Web analytics | Yes | No | No | No | No | Yes | Yes |
+| Self-hosted & open source | Yes | Yes | Yes | Yes | No | No | No |
+| Single binary install | Yes | No | No | CLI tool | -- | -- | -- |
+| Git push deploy | Yes | Yes | Yes | No | Yes | Yes | Yes |
+| Preview deployments | Yes | Yes | Yes | No | Yes | Yes | Yes |
+| Auto TLS (HTTP-01 + DNS-01) | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Docker Compose support | No | Yes | Yes | No | -- | -- | -- |
+| One-click template library | No | 280+ | Yes | No | Yes | Yes | Yes |
+| Web analytics | Yes | No | No | No | No | No | Paid add-on |
 | Session replay | Yes | No | No | No | No | No | No |
 | Error tracking (Sentry-compatible) | Yes | No | No | No | No | No | No |
 | Uptime monitoring | Yes | No | No | No | No | No | No |
 | Transactional email + DKIM | Yes | No | No | No | No | No | No |
-| Managed Postgres/Redis/S3 | Yes | Yes | Yes | Partial | Plugin | Yes | Add-on |
-| Pingora proxy (Cloudflare-grade) | Yes | No | No | No | No | No | No |
-| Auto TLS (HTTP-01 + DNS-01) | Yes | Yes | Yes | Yes | Plugin | Yes | Yes |
-| Request-level logging | Yes | No | No | No | No | Partial | Partial |
-| Preview deployments | Yes | Yes | Yes | No | No | Yes | Yes |
-| Built with Rust | Yes | No | No | No | No | No | No |
-| Free & open source | Yes | Yes | Yes | Yes | Yes | No | No |
+| Managed Postgres / Redis | Yes | Yes | Yes | No | Yes | Yes | Partner add-ons |
+| S3-compatible storage | Yes | No | No | No | No | No | Blob (paid) |
+| Multi-node / clustering | Yes | Yes | Swarm | Yes | Managed | Managed | Managed |
+| Edge functions / global edge network | No | No | No | No | No | No | Yes |
+| Per-seat fees | No | No | No | No | $20/user (Pro) | Per-user | $20/seat (Pro) |
+
+**Where the alternatives win.** Coolify and Dokploy have first-class Docker Compose support and one-click template libraries (280+ apps on Coolify) that Temps doesn't have yet, and both have far larger communities — Coolify alone has 56k+ GitHub stars, while Temps is the newest project on this list. Kamal is the simpler choice if all you want is zero-downtime Docker deploys driven from a CLI. Vercel and the other managed platforms give you a global edge network, edge functions, and DDoS absorption that a single VPS can't match — and they run the infrastructure for you, which is real value if you never want to think about a server.
+
+Detailed, regularly updated comparisons: [temps.sh/compare](https://temps.sh/compare)
 
 ---
 
@@ -194,7 +193,6 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 | [`@temps-sdk/kv`](https://www.npmjs.com/package/@temps-sdk/kv) | Serverless key-value store |
 | [`@temps-sdk/blob`](https://www.npmjs.com/package/@temps-sdk/blob) | File storage (S3-compatible) |
 | [`@temps-sdk/cli`](https://www.npmjs.com/package/@temps-sdk/cli) | Command-line interface |
-| [`@temps-sdk/mcp`](https://www.npmjs.com/package/@temps-sdk/mcp) | Model Context Protocol server for AI agents |
 
 <details>
 <summary><strong>Quick examples</strong></summary>

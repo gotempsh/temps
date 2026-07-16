@@ -565,12 +565,13 @@ export function DeploymentStages({
   // AI debugging chat (ADR-023), opened from a failed stage into the persistent
   // app-level dock. The chat is scoped to the whole deployment.
   const { open: openAiAssistant } = useAiAssistant()
-  // Read-only AI chat is safe, so we don't hide the "Debug with AI" affordance
-  // when it's off — we enable it inline (one click) and then open the chat,
-  // rather than sending the user to Settings. Local state so the button reflects
-  // enablement without refetching the project prop.
+  // Read-only AI chat is on by default; only an explicit opt-out
+  // (ai_debug_chat_enabled === false) disables it. For opted-out projects we
+  // re-enable inline (one click) and then open the chat, rather than sending
+  // the user to Settings. Local state so the button reflects enablement
+  // without refetching the project prop.
   const [chatEnabled, setChatEnabled] = useState(
-    project.ai_debug_chat_enabled === true ||
+    project.ai_debug_chat_enabled !== false ||
       project.ai_write_actions_enabled === true
   )
   const [enablingChat, setEnablingChat] = useState(false)

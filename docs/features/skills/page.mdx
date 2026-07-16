@@ -13,6 +13,7 @@ export const sections = [
   { title: "Install All Skills", id: "install-all" },
   { title: "Install a Specific Skill", id: "install-specific" },
   { title: "Available Skills", id: "available-skills" },
+  { title: "estimate-temps-savings", id: "estimate-temps-savings" },
   { title: "deploy-to-temps", id: "deploy-to-temps" },
   { title: "temps-cli", id: "temps-cli" },
   { title: "temps-platform-setup", id: "temps-platform-setup" },
@@ -31,7 +32,7 @@ Give your AI coding agent deep knowledge about Temps. Skills are structured guid
 
 ## Overview {{ anchor: true, id: 'overview' }}
 
-Temps ships with **8 skills** that work with AI coding tools like Claude Code, Cursor, Windsurf, Cline, and any agent that supports the skills protocol. Each skill is a curated set of instructions, code examples, and reference material that the AI loads when it recognizes a relevant task.
+Temps ships with **9 skills** that work with AI coding tools like Claude Code, Cursor, Windsurf, Cline, and any agent that supports the skills protocol. Each skill is a curated set of instructions, code examples, and reference material that the AI loads when it recognizes a relevant task.
 
 For example, if you tell your AI agent "deploy my app to Temps", and the `deploy-to-temps` skill is installed, the agent already knows the exact CLI commands, framework detection logic, Dockerfile patterns, and troubleshooting steps -- without you having to explain anything.
 
@@ -71,6 +72,7 @@ Select skills to install (space to toggle)
   ◻ add-react-analytics
   ◻ add-session-recording
   ◻ deploy-to-temps
+  ◻ estimate-temps-savings
   ◻ temps-cli
   ◻ temps-mcp-setup
   ◻ temps-platform-setup
@@ -99,6 +101,7 @@ Replace `deploy-to-temps` with any skill name from the list below.
 
 | Skill                                             | Description                                                   | Triggers on                           |
 | ------------------------------------------------- | ------------------------------------------------------------- | ------------------------------------- |
+| [`estimate-temps-savings`](#estimate-temps-savings) | Audit your SaaS stack and calculate what Temps would save you | "how much would I save", "audit my stack" |
 | [`deploy-to-temps`](#deploy-to-temps)             | Deploy applications with auto-detection and CI/CD             | "deploy to temps", "temps deployment" |
 | [`temps-cli`](#temps-cli)                         | Complete reference for all 54+ CLI commands                   | "temps cli", "temps command"          |
 | [`temps-platform-setup`](#temps-platform-setup)   | Install and configure Temps on a server                       | "install temps", "setup temps"        |
@@ -107,6 +110,38 @@ Replace `deploy-to-temps` with any skill name from the list below.
 | [`add-session-recording`](#add-session-recording) | Add privacy-aware session recording with rrweb                | "session recording", "session replay" |
 | [`add-node-sdk`](#add-node-sdk)                   | Integrate KV storage, blob storage, and server-side analytics | "temps node sdk", "temps kv"          |
 | [`add-custom-domain`](#add-custom-domain)         | Configure domains with automatic SSL/TLS                      | "custom domain", "ssl certificate"    |
+
+---
+
+## estimate-temps-savings {{ anchor: true, id: 'estimate-temps-savings' }}
+
+Audit a project's infrastructure and SaaS stack, then get a cost report showing current spend versus running Temps -- detected straight from your codebase, no forms to fill in.
+
+```bash
+npx skills add gotempsh/temps --skill estimate-temps-savings
+```
+
+<Properties>
+  <Property name="Stack Detection">
+    Finds hosting (Vercel, Netlify, Railway, Heroku), analytics (PostHog,
+    Plausible, Mixpanel), error tracking (Sentry, Bugsnag), session replay
+    (LogRocket, FullStory, Hotjar), uptime monitors, managed databases, and
+    email providers from dependencies, config files, and env var key names --
+    without ever reading secret values.
+  </Property>
+  <Property name="Honest Pricing">
+    Bundled list-price reference for 40+ tools. Reports low-to-typical ranges,
+    counts free tiers as $0, and tells you when Temps will not save you money.
+  </Property>
+  <Property name="Savings Report">
+    Current spend vs. self-hosted Temps (~€8/mo Hetzner) or Temps Cloud, yearly
+    savings, and what Temps does not replace (edge CDN, deep APM).
+  </Property>
+  <Property name="Migration Plan">
+    Suggested migration order starting with zero-risk parallel swaps, with
+    pointers to the matching Temps skills for each step.
+  </Property>
+</Properties>
 
 ---
 

@@ -974,6 +974,54 @@ pub struct EventVisitorsResponse {
     pub visitors: Vec<EventVisitorInfo>,
 }
 
+/// A single raw occurrence of an event, including its custom JSON properties
+#[derive(Debug, Serialize, Deserialize, ToSchema, Clone)]
+pub struct EventEntryInfo {
+    /// Event row ID
+    pub id: i64,
+    /// When the event occurred
+    #[schema(value_type = String, format = "date-time")]
+    pub timestamp: UtcDateTime,
+    /// Visitor numeric ID (if known)
+    pub visitor_id: Option<i32>,
+    /// Visitor UUID (if known)
+    pub visitor_uuid: Option<String>,
+    /// Session ID the event belongs to (if any)
+    pub session_id: Option<String>,
+    /// Page path where the event was triggered
+    pub page_path: String,
+    /// Full URL where the event was triggered
+    pub href: String,
+    /// Browser name
+    pub browser: Option<String>,
+    /// Device type (Desktop, Mobile, Tablet)
+    pub device_type: Option<String>,
+    /// Country of the visitor at the time of the event
+    pub country: Option<String>,
+    /// ISO country code (2-letter)
+    pub country_code: Option<String>,
+    /// City of the visitor at the time of the event
+    pub city: Option<String>,
+    /// Custom event properties as JSON (null when the event carried no data)
+    #[schema(value_type = Option<Object>)]
+    pub props: Option<serde_json::Value>,
+}
+
+/// Paginated response for raw event entries
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct EventEntriesResponse {
+    /// The event name
+    pub event_name: String,
+    /// Total number of occurrences of this event in the date range
+    pub total_count: i64,
+    /// Current page number
+    pub page: u64,
+    /// Items per page
+    pub per_page: u64,
+    /// Individual event occurrences, most recent first
+    pub entries: Vec<EventEntryInfo>,
+}
+
 /// Complete page flow analytics response
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct PageFlowResponse {

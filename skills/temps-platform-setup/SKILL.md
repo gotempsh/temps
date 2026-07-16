@@ -1065,7 +1065,6 @@ After installing Temps:
 1. **Deploy your first app**: See [deploy-to-temps skill](../deploy-to-temps/SKILL.md)
 2. **Add analytics**: See [add-react-analytics skill](../add-react-analytics/SKILL.md)
 3. **Set up custom domain**: See [add-custom-domain skill](../add-custom-domain/SKILL.md)
-4. **Configure MCP**: See [temps-mcp-setup skill](../temps-mcp-setup/SKILL.md)
 
 **Documentation:**
 - CLI Reference: [temps-cli skill](../temps-cli/SKILL.md) — full command reference (440+ commands)

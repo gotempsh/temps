@@ -18,6 +18,11 @@ import {
   ReferrersChart,
   UTMCampaignsChart,
 } from '@/components/analytics/overview'
+import {
+  InsightsToggleButton,
+  OverviewInsights,
+  useInsightsOpen,
+} from '@/components/analytics/insights'
 import { AiAgentsDetail } from '@/components/analytics/AiAgentsDetail'
 import { VisitorGlobePage } from '@/components/analytics/VisitorGlobe'
 import { LiveGlobePage } from '@/components/analytics/LiveGlobe'
@@ -446,6 +451,8 @@ export interface AnalyticsFiltersProps {
   onEnvironmentChange: (environment: number | undefined) => void
   onRefresh: () => void
   isRefreshing: boolean
+  /** Extra page-level actions rendered before the refresh button. */
+  actions?: React.ReactNode
 }
 
 export function AnalyticsFilters({
@@ -458,6 +465,7 @@ export function AnalyticsFilters({
   onEnvironmentChange,
   onRefresh,
   isRefreshing,
+  actions,
 }: AnalyticsFiltersProps) {
   const { data: environments } = useQuery({
     ...getEnvironmentsOptions({
@@ -489,6 +497,7 @@ export function AnalyticsFilters({
 
       <div className="flex items-center sm:justify-end gap-2">
         <div className="flex items-center gap-2">
+          {actions}
           <Button
             variant="outline"
             size="sm"
@@ -901,9 +910,7 @@ function EventDetailTab({ project }: EventDetailTabProps) {
             params.set('to', dateFilter.dateRange.to.toISOString())
           }
           const qs = params.toString()
-          navigate(
-            `/projects/${project.slug}/analytics${qs ? `?${qs}` : ''}`
-          )
+          navigate(`/projects/${project.slug}/analytics${qs ? `?${qs}` : ''}`)
         }}
       />
     </div>
@@ -1185,7 +1192,9 @@ function AiAgentsTab({ project, view = 'overview' }: AiAgentsTabProps) {
         onBack={goBack}
         view={view}
         onViewAll={view === 'overview' ? onViewAll : undefined}
-        onViewAllProviders={view === 'overview' ? onViewAllProviders : undefined}
+        onViewAllProviders={
+          view === 'overview' ? onViewAllProviders : undefined
+        }
         defaultGroupBy={
           searchParams.get('group') === 'provider' ? 'provider' : 'agent'
         }
@@ -1209,21 +1218,23 @@ function SegmentVisitorsTab({ project }: SegmentVisitorsTabProps) {
   const navigate = useNavigate()
   const [searchParams, setSearchParams] = useSearchParams()
 
-  const [dateFilter, setDateFilter] = React.useState<AnalyticsDateFilter>(() => {
-    const filter = searchParams.get('filter') as QuickFilter | null
-    const from = searchParams.get('from')
-    const to = searchParams.get('to')
-    if (filter === 'custom' && from && to) {
-      return {
-        quickFilter: 'custom',
-        dateRange: { from: new Date(from), to: new Date(to) },
+  const [dateFilter, setDateFilter] = React.useState<AnalyticsDateFilter>(
+    () => {
+      const filter = searchParams.get('filter') as QuickFilter | null
+      const from = searchParams.get('from')
+      const to = searchParams.get('to')
+      if (filter === 'custom' && from && to) {
+        return {
+          quickFilter: 'custom',
+          dateRange: { from: new Date(from), to: new Date(to) },
+        }
       }
+      if (filter && QUICK_FILTERS.some((f) => f.value === filter)) {
+        return { quickFilter: filter, dateRange: undefined }
+      }
+      return { quickFilter: '24hours', dateRange: undefined }
     }
-    if (filter && QUICK_FILTERS.some((f) => f.value === filter)) {
-      return { quickFilter: filter, dateRange: undefined }
-    }
-    return { quickFilter: '24hours', dateRange: undefined }
-  })
+  )
   const [selectedEnvironment, setSelectedEnvironment] = React.useState<
     number | undefined
   >(undefined)
@@ -1258,11 +1269,7 @@ function SegmentVisitorsTab({ project }: SegmentVisitorsTabProps) {
     queryClient.invalidateQueries({
       predicate: (query) => {
         const key = query.queryKey[0] as string
-        return !!(
-          key &&
-          typeof key === 'string' &&
-          key.includes('getVisitors')
-        )
+        return !!(key && typeof key === 'string' && key.includes('getVisitors'))
       },
     })
     setTimeout(() => setIsRefreshing(false), 1000)
@@ -1576,6 +1583,7 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
   >(undefined)
   const [isRefreshing, setIsRefreshing] = React.useState(false)
   const [showSetupOverride] = React.useState(false)
+  const [insightsOpen, setInsightsOpen] = useInsightsOpen()
   const queryClient = useQueryClient()
   const { startDate, endDate } = getDateRangeFromFilter(dateFilter)
 
@@ -1691,6 +1699,12 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
             onEnvironmentChange={setSelectedEnvironment}
             onRefresh={handleRefresh}
             isRefreshing={isRefreshing}
+            actions={
+              <InsightsToggleButton
+                open={insightsOpen}
+                onToggle={setInsightsOpen}
+              />
+            }
           />
 
           {/* Analytics Metrics */}
@@ -1700,6 +1714,14 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
             endDate={endDate}
             environment={selectedEnvironment}
           />
+          {insightsOpen && (
+            <OverviewInsights
+              project={project}
+              startDate={startDate}
+              endDate={endDate}
+              environment={selectedEnvironment}
+            />
+          )}
           <div className="relative">
             {dateFilter.quickFilter === 'custom' && dateFilter.dateRange && (
               <div className="flex justify-end mb-2">
