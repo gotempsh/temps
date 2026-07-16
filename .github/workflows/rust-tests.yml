@@ -19,7 +19,39 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # The toolchain stage (apk deps, bun, wasm-pack/wasm-bindgen-cli compiled
+      # from source) only changes when the Dockerfile does, so cache it as
+      # image layers. Kept as a separate build so cache-to never exports the
+      # huge source-dependent layers of the full image on every commit.
+      - name: Warm Docker toolchain layer cache
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: toolchain
+          cache-from: type=gha,scope=compose-security-toolchain
+          cache-to: type=gha,scope=compose-security-toolchain,mode=max
+
+      # Pre-build the image the compose file's `temps` service will run, using
+      # the cached toolchain layers and the `fast` cargo profile (release
+      # semantics, parallel codegen, no LTO). Production images keep the
+      # default `release` profile.
+      - name: Build temps image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: temps-compose-security:ci
+          build-args: |
+            TEMPS_BUILD_PROFILE=fast
+          cache-from: type=gha,scope=compose-security-toolchain
+
       - name: Validate secure Compose defaults
+        env:
+          COMPOSE_SECURITY_OVERRIDE: .github/compose-security.prebuilt.yml
+          COMPOSE_SECURITY_PREBUILT: "1"
         run: scripts/test-compose-security.sh
 
   check:

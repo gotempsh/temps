@@ -7,6 +7,13 @@ compose=("${config_compose[@]}")
 if [[ -n "${COMPOSE_SECURITY_OVERRIDE:-}" ]]; then
   compose+=(--file "$COMPOSE_SECURITY_OVERRIDE")
 fi
+# CI pre-builds the temps image with layer caching and points the compose
+# `temps` service at it via COMPOSE_SECURITY_OVERRIDE. In that case skip the
+# uncached in-compose rebuild; locally we still build from source.
+build_flag=(--build)
+if [[ -n "${COMPOSE_SECURITY_PREBUILT:-}" ]]; then
+  build_flag=()
+fi
 safe_postgres="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 safe_redis="abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 export TEMPS_ADMIN_EMAIL="Admin@Example.TEST"
@@ -195,7 +202,7 @@ fi
 # first application start. This models an upgrade where an existing volume
 # masks /app/data and verifies immutable runtime assets remain available.
 POSTGRES_PASSWORD="$safe_postgres" REDIS_PASSWORD="$safe_redis" \
-  "${compose[@]}" run --rm --no-deps --build --entrypoint /bin/sh temps \
+  "${compose[@]}" run --rm --no-deps ${build_flag[@]+"${build_flag[@]}"} --entrypoint /bin/sh temps \
   -ec 'touch /app/data/.preexisting-volume' >/dev/null
 POSTGRES_PASSWORD="$safe_postgres" REDIS_PASSWORD="$safe_redis" \
   "${compose[@]}" up --detach temps >/dev/null
