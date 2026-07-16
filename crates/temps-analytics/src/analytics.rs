@@ -4555,6 +4555,148 @@ WHERE project_id = $1
             visitors,
         })
     }
+
+    async fn get_event_entries(
+        &self,
+        project_id: i32,
+        event_name: &str,
+        start_date: UtcDateTime,
+        end_date: UtcDateTime,
+        environment_id: Option<i32>,
+        page: u64,
+        per_page: u64,
+    ) -> Result<crate::types::responses::EventEntriesResponse, AnalyticsError> {
+        let per_page = per_page.min(100);
+        let offset = (page.saturating_sub(1)) * per_page;
+
+        let env_filter = environment_id
+            .map(|id| format!("AND e.environment_id = {}", id))
+            .unwrap_or_default();
+
+        // Total number of occurrences in the range
+        let count_sql = format!(
+            r#"
+            SELECT COUNT(*) as total_count
+            FROM events e
+            WHERE e.project_id = $1
+              AND COALESCE(e.event_name, e.event_type) = $2
+              AND e.timestamp >= $3
+              AND e.timestamp < $4
+              {}
+            "#,
+            env_filter
+        );
+
+        #[derive(FromQueryResult)]
+        struct CountResult {
+            total_count: i64,
+        }
+
+        let total_count = CountResult::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            &count_sql,
+            vec![
+                project_id.into(),
+                event_name.into(),
+                start_date.into(),
+                end_date.into(),
+            ],
+        ))
+        .one(self.db.as_ref())
+        .await?
+        .map(|c| c.total_count)
+        .unwrap_or(0);
+
+        // Paginated raw occurrences, most recent first, with props JSON
+        let entries_sql = format!(
+            r#"
+            SELECT
+                e.id,
+                e.timestamp,
+                e.visitor_id,
+                v.visitor_id as visitor_uuid,
+                e.session_id,
+                e.page_path,
+                e.href,
+                e.browser,
+                e.device_type,
+                ig.country,
+                ig.country_code,
+                ig.city,
+                e.props
+            FROM events e
+            LEFT JOIN visitor v ON v.id = e.visitor_id
+            LEFT JOIN ip_geolocations ig ON e.ip_geolocation_id = ig.id
+            WHERE e.project_id = $1
+              AND COALESCE(e.event_name, e.event_type) = $2
+              AND e.timestamp >= $3
+              AND e.timestamp < $4
+              {env_filter}
+            ORDER BY e.timestamp DESC, e.id DESC
+            LIMIT $5 OFFSET $6
+            "#,
+            env_filter = env_filter
+        );
+
+        #[derive(FromQueryResult)]
+        struct EntryResult {
+            id: i64,
+            timestamp: UtcDateTime,
+            visitor_id: Option<i32>,
+            visitor_uuid: Option<String>,
+            session_id: Option<String>,
+            page_path: String,
+            href: String,
+            browser: Option<String>,
+            device_type: Option<String>,
+            country: Option<String>,
+            country_code: Option<String>,
+            city: Option<String>,
+            props: Option<serde_json::Value>,
+        }
+
+        let entry_results = EntryResult::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            &entries_sql,
+            vec![
+                project_id.into(),
+                event_name.into(),
+                start_date.into(),
+                end_date.into(),
+                (per_page as i64).into(),
+                (offset as i64).into(),
+            ],
+        ))
+        .all(self.db.as_ref())
+        .await?;
+
+        let entries: Vec<crate::types::responses::EventEntryInfo> = entry_results
+            .into_iter()
+            .map(|e| crate::types::responses::EventEntryInfo {
+                id: e.id,
+                timestamp: e.timestamp,
+                visitor_id: e.visitor_id,
+                visitor_uuid: e.visitor_uuid,
+                session_id: e.session_id,
+                page_path: e.page_path,
+                href: e.href,
+                browser: e.browser,
+                device_type: e.device_type,
+                country: e.country,
+                country_code: e.country_code,
+                city: e.city,
+                props: e.props,
+            })
+            .collect();
+
+        Ok(crate::types::responses::EventEntriesResponse {
+            event_name: event_name.to_string(),
+            total_count,
+            page,
+            per_page,
+            entries,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -4635,6 +4777,84 @@ mod tests {
             pages.is_empty(),
             "Should have empty pages for invalid project"
         );
+
+        cleanup_test_analytics!(db);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_event_entries_returns_props() -> anyhow::Result<()> {
+        let (service, db, _container) =
+            create_test_analytics_service!("test_get_event_entries_returns_props");
+
+        use chrono::{TimeZone, Utc};
+        use sea_orm::{ActiveModelTrait, Set};
+        use temps_entities::events;
+
+        // Seed two custom "signup" events: the earlier one carries custom JSON
+        // props, the later one has none.
+        let props = serde_json::json!({"plan": "pro", "amount": 49.99});
+        let seeded: Vec<(u32, Option<serde_json::Value>)> =
+            vec![(0, Some(props.clone())), (1, None)];
+        for (minute, event_props) in seeded {
+            events::ActiveModel {
+                project_id: Set(1),
+                environment_id: Set(Some(1)),
+                deployment_id: Set(Some(1)),
+                session_id: Set(Some("session_1".to_string())),
+                visitor_id: Set(Some(1)),
+                hostname: Set("example.com".to_string()),
+                pathname: Set("/pricing".to_string()),
+                page_path: Set("/pricing".to_string()),
+                href: Set("https://example.com/pricing".to_string()),
+                timestamp: Set(Utc.with_ymd_and_hms(2024, 1, 1, 12, minute, 0).unwrap()),
+                event_type: Set("signup".to_string()),
+                event_name: Set(Some("signup".to_string())),
+                props: Set(event_props),
+                is_crawler: Set(false),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await?;
+        }
+
+        let start_date = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let end_date = Utc.with_ymd_and_hms(2024, 1, 2, 0, 0, 0).unwrap();
+
+        let result = service
+            .get_event_entries(1, "signup", start_date, end_date, None, 1, 20)
+            .await?;
+
+        assert_eq!(result.event_name, "signup");
+        assert_eq!(result.total_count, 2, "Should count both signup events");
+        assert_eq!(result.entries.len(), 2);
+        // Most recent first
+        assert!(result.entries[0].timestamp >= result.entries[1].timestamp);
+        // The later event has no props; the earlier one round-trips the JSON
+        assert!(result.entries[0].props.is_none());
+        assert_eq!(result.entries[1].props, Some(props));
+        assert_eq!(
+            result.entries[1].visitor_uuid.as_deref(),
+            Some("test_visitor_1")
+        );
+        assert_eq!(result.entries[1].page_path, "/pricing");
+
+        // Page-view events must not leak into the signup listing
+        assert!(result.entries.iter().all(|e| e.page_path == "/pricing"));
+
+        // A page beyond the data is empty but keeps the total
+        let page2 = service
+            .get_event_entries(1, "signup", start_date, end_date, None, 2, 20)
+            .await?;
+        assert_eq!(page2.total_count, 2);
+        assert!(page2.entries.is_empty());
+
+        // Environment filter: a non-existent environment returns nothing
+        let filtered = service
+            .get_event_entries(1, "signup", start_date, end_date, Some(9999), 1, 20)
+            .await?;
+        assert_eq!(filtered.total_count, 0);
+        assert!(filtered.entries.is_empty());
 
         cleanup_test_analytics!(db);
         Ok(())

@@ -1,10 +1,12 @@
 import {
   getEventDetailOptions,
+  getEventEntriesOptions,
   getEventVisitorsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
-import { ProjectResponse } from '@/api/client/types.gen'
+import { EventEntryInfo, ProjectResponse } from '@/api/client/types.gen'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { CopyButton } from '@/components/ui/copy-button'
 import {
   Card,
   CardContent,
@@ -32,13 +34,16 @@ import {
   AppWindow,
   ArrowLeft,
   BarChart3,
+  Braces,
+  ChevronDown,
+  ChevronRight,
   Globe,
   Hash,
   Link2,
   Loader2,
   Users,
 } from 'lucide-react'
-import { useState } from 'react'
+import { Fragment, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { TimeAgo } from '../utils/TimeAgo'
 
@@ -223,6 +228,15 @@ export function EventDetail({
         </div>
       )}
 
+      {/* Individual event occurrences with custom data */}
+      <EventEntriesCard
+        project={project}
+        eventName={eventName}
+        startDate={startDate}
+        endDate={endDate}
+        environment={environment}
+      />
+
       {/* Visitors Table */}
       <Card>
         <CardHeader>
@@ -249,8 +263,7 @@ export function EventDetail({
         <CardContent className="p-0">
           {visitorsLoading && !visitorsData ? (
             <VisitorsTableSkeleton />
-          ) : !visitorsData?.visitors ||
-            visitorsData.visitors.length === 0 ? (
+          ) : !visitorsData?.visitors || visitorsData.visitors.length === 0 ? (
             <div className="p-8 text-center">
               <p className="text-sm text-muted-foreground">
                 No visitors found for this event in the selected date range
@@ -317,7 +330,8 @@ export function EventDetail({
                             {visitor.first_triggered !==
                               visitor.last_triggered && (
                               <span className="text-xs text-muted-foreground">
-                                first {format(
+                                first{' '}
+                                {format(
                                   new Date(visitor.first_triggered),
                                   'MMM d, HH:mm'
                                 )}
@@ -360,9 +374,7 @@ export function EventDetail({
                       variant="outline"
                       size="sm"
                       disabled={currentPage <= 1}
-                      onClick={() =>
-                        setCurrentPage((p) => Math.max(1, p - 1))
-                      }
+                      onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
                     >
                       Previous
                     </Button>
@@ -390,6 +402,276 @@ export function EventDetail({
 // ============================================================================
 // Helper Components
 // ============================================================================
+
+interface EventEntriesCardProps {
+  project: ProjectResponse
+  eventName: string
+  startDate: Date | undefined
+  endDate: Date | undefined
+  environment: number | undefined
+}
+
+function EventEntriesCard({
+  project,
+  eventName,
+  startDate,
+  endDate,
+  environment,
+}: EventEntriesCardProps) {
+  const navigate = useNavigate()
+  const [currentPage, setCurrentPage] = useState(1)
+  const [expandedId, setExpandedId] = useState<number | null>(null)
+  const perPage = 20
+
+  const { data: entriesData, isLoading: entriesLoading } = useQuery({
+    ...getEventEntriesOptions({
+      query: {
+        event_name: eventName,
+        project_id: project.id,
+        start_date: startDate ? startDate.toISOString() : '',
+        end_date: endDate ? endDate.toISOString() : '',
+        environment_id: environment,
+        page: currentPage,
+        per_page: perPage,
+      },
+    }),
+    enabled: !!startDate && !!endDate,
+  })
+
+  const totalPages = entriesData
+    ? Math.ceil(entriesData.total_count / perPage)
+    : 0
+
+  const toggleExpanded = (entry: EventEntryInfo) => {
+    if (!entry.props) return
+    setExpandedId((current) => (current === entry.id ? null : entry.id))
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex items-center justify-between">
+          <div>
+            <CardTitle className="text-base">Events</CardTitle>
+            <CardDescription>
+              Individual occurrences of this event
+              {entriesData && (
+                <span className="ml-1">
+                  ({entriesData.total_count.toLocaleString()} total)
+                </span>
+              )}
+            </CardDescription>
+          </div>
+          {entriesLoading && entriesData && (
+            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+              <Loader2 className="h-4 w-4 animate-spin" />
+              Loading...
+            </div>
+          )}
+        </div>
+      </CardHeader>
+      <CardContent className="p-0">
+        {entriesLoading && !entriesData ? (
+          <EntriesTableSkeleton />
+        ) : !entriesData?.entries || entriesData.entries.length === 0 ? (
+          <div className="p-8 text-center">
+            <p className="text-sm text-muted-foreground">
+              No events found in the selected date range
+            </p>
+          </div>
+        ) : (
+          <>
+            <div className="overflow-x-auto">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead className="w-8" />
+                    <TableHead>Time</TableHead>
+                    <TableHead>Visitor</TableHead>
+                    <TableHead className="hidden md:table-cell">Page</TableHead>
+                    <TableHead className="hidden sm:table-cell">Data</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {entriesData.entries.map((entry) => (
+                    <Fragment key={entry.id}>
+                      <TableRow
+                        className={
+                          entry.props
+                            ? 'cursor-pointer hover:bg-muted/50'
+                            : undefined
+                        }
+                        onClick={() => toggleExpanded(entry)}
+                      >
+                        <TableCell className="pr-0">
+                          {entry.props ? (
+                            expandedId === entry.id ? (
+                              <ChevronDown className="h-4 w-4 text-muted-foreground" />
+                            ) : (
+                              <ChevronRight className="h-4 w-4 text-muted-foreground" />
+                            )
+                          ) : null}
+                        </TableCell>
+                        <TableCell>
+                          <div className="flex flex-col leading-tight">
+                            <span className="text-sm">
+                              <TimeAgo date={entry.timestamp} />
+                            </span>
+                            <span className="text-xs text-muted-foreground">
+                              {format(
+                                new Date(entry.timestamp),
+                                'MMM d, HH:mm:ss'
+                              )}
+                            </span>
+                          </div>
+                        </TableCell>
+                        <TableCell>
+                          {entry.visitor_id ? (
+                            <button
+                              type="button"
+                              className="flex items-center gap-1.5 hover:underline"
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                navigate(
+                                  `/projects/${project.slug}/analytics/visitors/${entry.visitor_id}`
+                                )
+                              }}
+                            >
+                              <Users className="h-3 w-3 text-muted-foreground shrink-0" />
+                              <span className="text-sm font-mono">
+                                {entry.visitor_uuid?.slice(0, 8) ||
+                                  entry.visitor_id}
+                              </span>
+                            </button>
+                          ) : (
+                            <span className="text-sm text-muted-foreground">
+                              -
+                            </span>
+                          )}
+                        </TableCell>
+                        <TableCell className="hidden md:table-cell">
+                          <span className="text-sm text-muted-foreground truncate max-w-[200px] block">
+                            {entry.page_path}
+                          </span>
+                        </TableCell>
+                        <TableCell className="hidden sm:table-cell">
+                          {entry.props ? (
+                            <span className="text-xs font-mono text-muted-foreground truncate max-w-[280px] block">
+                              {formatPropsPreview(entry.props)}
+                            </span>
+                          ) : (
+                            <span className="text-xs text-muted-foreground">
+                              -
+                            </span>
+                          )}
+                        </TableCell>
+                      </TableRow>
+                      {expandedId === entry.id && entry.props && (
+                        <TableRow className="hover:bg-transparent">
+                          <TableCell colSpan={5} className="bg-muted/30 p-0">
+                            <div className="relative m-3 rounded-md border bg-background">
+                              <div className="flex items-center justify-between border-b px-3 py-1.5">
+                                <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                                  <Braces className="h-3 w-3" />
+                                  Custom data
+                                </div>
+                                <CopyButton
+                                  value={JSON.stringify(entry.props, null, 2)}
+                                  className="h-6 w-6 rounded-md text-muted-foreground"
+                                />
+                              </div>
+                              <pre className="overflow-x-auto p-3 text-xs font-mono leading-relaxed">
+                                {JSON.stringify(entry.props, null, 2)}
+                              </pre>
+                            </div>
+                          </TableCell>
+                        </TableRow>
+                      )}
+                    </Fragment>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+
+            {/* Pagination */}
+            {totalPages > 1 && (
+              <div className="flex items-center justify-between px-4 py-3 border-t">
+                <p className="text-sm text-muted-foreground">
+                  Page {currentPage} of {totalPages}
+                </p>
+                <div className="flex items-center gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={currentPage <= 1}
+                    onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+                  >
+                    Previous
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={currentPage >= totalPages}
+                    onClick={() =>
+                      setCurrentPage((p) => Math.min(totalPages, p + 1))
+                    }
+                  >
+                    Next
+                  </Button>
+                </div>
+              </div>
+            )}
+          </>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+function formatPropsPreview(props: Record<string, unknown>): string {
+  const compact = JSON.stringify(props)
+  return compact.length > 80 ? `${compact.slice(0, 80)}…` : compact
+}
+
+function EntriesTableSkeleton() {
+  return (
+    <Table>
+      <TableHeader>
+        <TableRow>
+          <TableHead className="w-8" />
+          <TableHead>Time</TableHead>
+          <TableHead>Visitor</TableHead>
+          <TableHead className="hidden md:table-cell">Page</TableHead>
+          <TableHead className="hidden sm:table-cell">Data</TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody>
+        {['s1', 's2', 's3', 's4', 's5'].map((key) => (
+          <TableRow key={`entry-skeleton-${key}`}>
+            <TableCell className="pr-0">
+              <Skeleton className="h-4 w-4" />
+            </TableCell>
+            <TableCell>
+              <div className="flex flex-col gap-1">
+                <Skeleton className="h-4 w-20" />
+                <Skeleton className="h-3 w-24" />
+              </div>
+            </TableCell>
+            <TableCell>
+              <Skeleton className="h-4 w-16" />
+            </TableCell>
+            <TableCell className="hidden md:table-cell">
+              <Skeleton className="h-4 w-28" />
+            </TableCell>
+            <TableCell className="hidden sm:table-cell">
+              <Skeleton className="h-4 w-40" />
+            </TableCell>
+          </TableRow>
+        ))}
+      </TableBody>
+    </Table>
+  )
+}
 
 interface StatCardProps {
   label: string

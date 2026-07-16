@@ -6102,6 +6102,114 @@ export type EventTimelineQuery = {
     start_date: string;
 };
 
+/**
+ * Query parameters for the raw event entries list
+ */
+export type EventEntriesQuery = {
+    end_date: string;
+    environment_id?: number | null;
+    /**
+     * The specific event name to list occurrences for
+     */
+    event_name: string;
+    /**
+     * Page number (1-based, default: 1)
+     */
+    page?: number | null;
+    /**
+     * Items per page (default: 20, max: 100)
+     */
+    per_page?: number | null;
+    project_id: number;
+    start_date: string;
+};
+
+/**
+ * Paginated response for raw event entries
+ */
+export type EventEntriesResponse = {
+    /**
+     * Individual event occurrences, most recent first
+     */
+    entries: Array<EventEntryInfo>;
+    /**
+     * The event name
+     */
+    event_name: string;
+    /**
+     * Current page number
+     */
+    page: number;
+    /**
+     * Items per page
+     */
+    per_page: number;
+    /**
+     * Total number of occurrences of this event in the date range
+     */
+    total_count: number;
+};
+
+/**
+ * A single raw occurrence of an event, including its custom JSON properties
+ */
+export type EventEntryInfo = {
+    /**
+     * Browser name
+     */
+    browser?: string | null;
+    /**
+     * City of the visitor at the time of the event
+     */
+    city?: string | null;
+    /**
+     * Country of the visitor at the time of the event
+     */
+    country?: string | null;
+    /**
+     * ISO country code (2-letter)
+     */
+    country_code?: string | null;
+    /**
+     * Device type (Desktop, Mobile, Tablet)
+     */
+    device_type?: string | null;
+    /**
+     * Full URL where the event was triggered
+     */
+    href: string;
+    /**
+     * Event row ID
+     */
+    id: number;
+    /**
+     * Page path where the event was triggered
+     */
+    page_path: string;
+    /**
+     * Custom event properties as JSON (null when the event carried no data)
+     */
+    props?: {
+        [key: string]: unknown;
+    } | null;
+    /**
+     * Session ID the event belongs to (if any)
+     */
+    session_id?: string | null;
+    /**
+     * When the event occurred
+     */
+    timestamp: string;
+    /**
+     * Visitor numeric ID (if known)
+     */
+    visitor_id?: number | null;
+    /**
+     * Visitor UUID (if known)
+     */
+    visitor_uuid?: string | null;
+};
+
 export type EventType = {
     count: number;
     name: string;
@@ -18864,6 +18972,62 @@ export type GetEventVisitorsResponses = {
 };
 
 export type GetEventVisitorsResponse = GetEventVisitorsResponses[keyof GetEventVisitorsResponses];
+
+export type GetEventEntriesData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Event name to list occurrences for
+         */
+        event_name: string;
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID (optional)
+         */
+        environment_id?: number;
+        /**
+         * Start date (ISO 8601)
+         */
+        start_date: string;
+        /**
+         * End date (ISO 8601)
+         */
+        end_date: string;
+        /**
+         * Page number (1-based, default: 1)
+         */
+        page?: number;
+        /**
+         * Items per page (default: 20, max: 100)
+         */
+        per_page?: number;
+    };
+    url: '/analytics/event-entries';
+};
+
+export type GetEventEntriesErrors = {
+    /**
+     * Invalid parameters
+     */
+    400: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetEventEntriesResponses = {
+    /**
+     * Successfully retrieved event entries
+     */
+    200: EventEntriesResponse;
+};
+
+export type GetEventEntriesResponse = GetEventEntriesResponses[keyof GetEventEntriesResponses];
 
 export type GetAnalyticsEventsCountData = {
     body?: never;

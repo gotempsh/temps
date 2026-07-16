@@ -31,6 +31,7 @@ pub struct AppState {
         get_analytics_events_count,
         get_event_detail,
         get_event_visitors,
+        get_event_entries,
         get_visitors,
         get_visitor_facets,
         get_visitor_details,
@@ -163,6 +164,9 @@ pub struct AppState {
         EventVisitorsQuery,
         EventVisitorsResponse,
         EventVisitorInfo,
+        EventEntriesQuery,
+        EventEntriesResponse,
+        EventEntryInfo,
     )),
     info(
         title = "Analytics API",
@@ -179,6 +183,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route("/analytics/events", get(get_analytics_events_count))
         .route("/analytics/event-detail", get(get_event_detail))
         .route("/analytics/event-visitors", get(get_event_visitors))
+        .route("/analytics/event-entries", get(get_event_entries))
         .route("/analytics/visitors", get(get_visitors))
         .route("/analytics/visitor-facets", get(get_visitor_facets))
         .route("/analytics/visitors/{visitor_id}", get(get_visitor_details))
@@ -1662,6 +1667,64 @@ pub async fn get_event_visitors(
     match app_state
         .analytics_service
         .get_event_visitors(
+            query.project_id,
+            &query.event_name,
+            start_date,
+            end_date,
+            query.environment_id,
+            page,
+            per_page,
+        )
+        .await
+    {
+        Ok(result) => Ok(Json(result)),
+        Err(e) => {
+            error!("Analytics error: {:?}", e);
+            Err(handle_analytics_error(e))
+        }
+    }
+}
+
+/// Get paginated list of raw occurrences of a specific event, including custom JSON properties
+#[utoipa::path(
+    tag = "Analytics",
+    get,
+    path = "/analytics/event-entries",
+    params(
+        ("event_name" = String, Query, description = "Event name to list occurrences for"),
+        ("project_id" = i32, Query, description = "Project ID"),
+        ("environment_id" = Option<i32>, Query, description = "Environment ID (optional)"),
+        ("start_date" = String, Query, description = "Start date (ISO 8601)"),
+        ("end_date" = String, Query, description = "End date (ISO 8601)"),
+        ("page" = Option<u64>, Query, description = "Page number (1-based, default: 1)"),
+        ("per_page" = Option<u64>, Query, description = "Items per page (default: 20, max: 100)")
+    ),
+    responses(
+        (status = 200, description = "Successfully retrieved event entries", body = EventEntriesResponse),
+        (status = 400, description = "Invalid parameters"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+pub async fn get_event_entries(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Query(query): Query<requests::EventEntriesQuery>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, AnalyticsRead);
+    project_scope_guard!(auth, query.project_id);
+    project_access_guard!(auth, query.project_id, app_state.project_access_checker);
+
+    let start_date: UtcDateTime = query.start_date.into();
+    let end_date: UtcDateTime = query.end_date.into();
+    let page = query.page.unwrap_or(1);
+    let per_page = query.per_page.unwrap_or(20).min(100);
+
+    match app_state
+        .analytics_service
+        .get_event_entries(
             query.project_id,
             &query.event_name,
             start_date,
