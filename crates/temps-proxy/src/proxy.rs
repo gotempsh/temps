@@ -18,15 +18,16 @@
 //! branch was removed as part of `perf/remove-db-from-request-path` (WS1–WS6).
 
 use crate::handler::preview_wall::{
-    build_logout_cookie_sandbox, generate_preview_form_html_labeled, sanitize_next,
-    PREVIEW_LOGIN_PATH, PREVIEW_LOGOUT_PATH,
+    build_logout_cookie_sandbox, build_logout_cookie_sandbox_unpartitioned,
+    generate_preview_form_html_labeled, sanitize_next, PREVIEW_LOGIN_PATH, PREVIEW_LOGOUT_PATH,
 };
 use crate::on_demand::OnDemandManager;
 use crate::preview_auth::{
-    build_set_cookie_sandbox, check_preview_auth, encode_preview_cookie_subject,
-    parse_preview_host, preview_peer_group_key, verify_argon2, PreviewAuthLimiter,
-    PreviewAuthOutcome, PreviewHost, PreviewSandboxLookup, SandboxLookupCache,
-    PREVIEW_GATEWAY_PEER,
+    build_set_cookie_sandbox, check_preview_auth, combine_cookie_header_values,
+    encode_preview_cookie_subject, extract_cookie_values, parse_preview_host,
+    preview_cookie_needs_refresh, preview_peer_group_key, verify_argon2,
+    verify_preview_session_grant, PreviewAuthLimiter, PreviewAuthOutcome, PreviewHost,
+    PreviewSandboxLookup, SandboxLookupCache, PREVIEW_GATEWAY_PEER,
 };
 use crate::service::cert_host_cache::CertHostCache;
 use crate::service::challenge_service::ChallengeService;
@@ -2553,31 +2554,6 @@ impl ProxyHttp for LoadBalancer {
                     .clone()
                     .filter(|_| ctx.path == PREVIEW_LOGIN_PATH && ctx.method == "POST")
                 {
-                    if self.preview_auth_limiter.is_blocked(client_ip, &hex) {
-                        warn!(
-                            sandbox = %hex,
-                            client_ip = %client_ip,
-                            "preview-auth: sandbox login POST rate limited"
-                        );
-                        let mut response =
-                            ResponseHeader::build(StatusCode::TOO_MANY_REQUESTS, None)?;
-                        response.insert_header("Retry-After", "60")?;
-                        response.insert_header("Cache-Control", "no-store")?;
-                        response.insert_header("X-Request-ID", &ctx.request_id)?;
-                        response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
-                        session
-                            .write_response_header(Box::new(response), false)
-                            .await?;
-                        session
-                            .write_response_body(
-                                Some(Bytes::from_static(b"Too many failed attempts\n")),
-                                true,
-                            )
-                            .await?;
-                        ctx.routing_status = "preview_rate_limited".to_string();
-                        return Ok(true);
-                    }
-
                     let stored_hash = match self.sandbox_lookup_cache.lookup(&hex).await {
                         PreviewSandboxLookup::Protected { password_hash } => password_hash,
                         PreviewSandboxLookup::Open => {
@@ -2628,6 +2604,11 @@ impl ProxyHttp for LoadBalancer {
                         .find(|(k, _)| k == "password")
                         .map(|(_, v)| v.as_str())
                         .unwrap_or("");
+                    let session_grant = params
+                        .iter()
+                        .find(|(k, _)| k == "session_grant")
+                        .map(|(_, v)| v.as_str())
+                        .unwrap_or("");
                     let next_raw = params
                         .iter()
                         .find(|(k, _)| k == "next")
@@ -2635,43 +2616,152 @@ impl ProxyHttp for LoadBalancer {
                         .unwrap_or("/");
                     let next = sanitize_next(next_raw);
 
-                    if verify_argon2(password, &stored_hash) {
+                    let subject = format!("sbx_{}", hex);
+                    let now = std::time::SystemTime::now();
+                    let valid_session_grant =
+                        verify_preview_session_grant(&self.crypto, session_grant, &subject, now);
+
+                    // A valid platform-session grant is not a password guess
+                    // and must remain usable even if this IP previously hit
+                    // the manual-login limiter.
+                    if !valid_session_grant && self.preview_auth_limiter.is_blocked(client_ip, &hex)
+                    {
+                        warn!(
+                            sandbox = %hex,
+                            client_ip = %client_ip,
+                            "preview-auth: sandbox login POST rate limited"
+                        );
+                        let mut response =
+                            ResponseHeader::build(StatusCode::TOO_MANY_REQUESTS, None)?;
+                        response.insert_header("Retry-After", "60")?;
+                        response.insert_header("Cache-Control", "no-store")?;
+                        response.insert_header("X-Request-ID", &ctx.request_id)?;
+                        response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+                        session
+                            .write_response_header(Box::new(response), false)
+                            .await?;
+                        session
+                            .write_response_body(
+                                Some(Bytes::from_static(b"Too many failed attempts\n")),
+                                true,
+                            )
+                            .await?;
+                        ctx.routing_status = "preview_rate_limited".to_string();
+                        return Ok(true);
+                    }
+
+                    // Password reconciliation can update the sandbox row
+                    // immediately while this worker still has the previous
+                    // hash in its short-lived lookup cache. The owner bridge
+                    // already has the new password, so retry against a fresh
+                    // row before showing a manual password wall.
+                    let verified_hash = if valid_session_grant
+                        || verify_argon2(password, &stored_hash)
+                    {
+                        Some(stored_hash)
+                    } else {
+                        match self.sandbox_lookup_cache.lookup_fresh(&hex).await {
+                            PreviewSandboxLookup::Protected { password_hash }
+                                if verify_argon2(password, &password_hash) =>
+                            {
+                                debug!(
+                                    sandbox = %hex,
+                                    "preview-auth: login succeeded after refreshing stale password hash"
+                                );
+                                Some(password_hash)
+                            }
+                            _ => None,
+                        }
+                    };
+
+                    if let Some(stored_hash) = verified_hash {
                         self.preview_auth_limiter.record_success(client_ip, &hex);
-                        let subject = format!("sbx_{}", hex);
-                        let Some(cookie_value) = encode_preview_cookie_subject(
+                        let cookie_name = format!("temps_preview_sbx_{}", hex);
+                        let cookie_values = session
+                            .req_header()
+                            .headers
+                            .get_all("cookie")
+                            .iter()
+                            .filter_map(|value| value.to_str().ok())
+                            .collect::<Vec<_>>();
+                        let cookie_header = combine_cookie_header_values(cookie_values);
+                        let cookie_needs_refresh = preview_cookie_needs_refresh(
                             &self.crypto,
+                            cookie_header.as_deref(),
+                            &cookie_name,
                             &subject,
                             &stored_hash,
-                            std::time::SystemTime::now(),
-                        ) else {
-                            error!("preview-auth: failed to encode sandbox preview cookie");
-                            let mut response =
-                                ResponseHeader::build(StatusCode::INTERNAL_SERVER_ERROR, None)?;
-                            response.insert_header("Cache-Control", "no-store")?;
-                            response.insert_header("X-Request-ID", &ctx.request_id)?;
-                            session
-                                .write_response_header(Box::new(response), false)
-                                .await?;
-                            session
-                                .write_response_body(
-                                    Some(Bytes::from_static(b"Cookie mint failed\n")),
-                                    true,
-                                )
-                                .await?;
-                            ctx.routing_status = "preview_cookie_error".to_string();
-                            return Ok(true);
-                        };
-                        let set_cookie = build_set_cookie_sandbox(
-                            &hex,
-                            &cookie_value,
-                            &settings.preview_domain,
-                            self.is_tls_connection(session),
+                            now,
                         );
+                        // Duplicate names indicate an obsolete cookie scope.
+                        // Mint the partitioned replacement before expiring the
+                        // old scopes so cleanup can never delete the only
+                        // healthy cookie.
+                        let has_duplicate_candidates =
+                            cookie_header.as_deref().is_some_and(|header| {
+                                extract_cookie_values(header, &cookie_name).len() > 1
+                            });
+                        let should_refresh_cookie =
+                            cookie_needs_refresh || has_duplicate_candidates;
 
-                        info!(sandbox = %hex, "preview-auth: sandbox login succeeded");
+                        let set_cookie = if !should_refresh_cookie {
+                            None
+                        } else {
+                            let Some(cookie_value) = encode_preview_cookie_subject(
+                                &self.crypto,
+                                &subject,
+                                &stored_hash,
+                                now,
+                            ) else {
+                                error!("preview-auth: failed to encode sandbox preview cookie");
+                                let mut response =
+                                    ResponseHeader::build(StatusCode::INTERNAL_SERVER_ERROR, None)?;
+                                response.insert_header("Cache-Control", "no-store")?;
+                                response.insert_header("X-Request-ID", &ctx.request_id)?;
+                                session
+                                    .write_response_header(Box::new(response), false)
+                                    .await?;
+                                session
+                                    .write_response_body(
+                                        Some(Bytes::from_static(b"Cookie mint failed\n")),
+                                        true,
+                                    )
+                                    .await?;
+                                ctx.routing_status = "preview_cookie_error".to_string();
+                                return Ok(true);
+                            };
+                            Some(build_set_cookie_sandbox(
+                                &hex,
+                                &cookie_value,
+                                &settings.preview_domain,
+                                self.is_tls_connection(session),
+                            ))
+                        };
+
+                        info!(
+                            sandbox = %hex,
+                            auth_kind = if valid_session_grant { "platform_session" } else { "password" },
+                            cookie_refreshed = should_refresh_cookie,
+                            "preview-auth: sandbox login succeeded"
+                        );
                         let mut response = ResponseHeader::build(303, None)?;
                         response.insert_header("Location", &next)?;
-                        response.insert_header("Set-Cookie", &set_cookie)?;
+                        if let Some(set_cookie) = &set_cookie {
+                            response.append_header("Set-Cookie", set_cookie)?;
+                        }
+                        // Expire both scopes used by older gateway versions.
+                        // Chrome can keep an unpartitioned host-only cookie and
+                        // a parent-domain cookie alongside the fresh CHIPS
+                        // cookie, sometimes emitting them in separate Cookie
+                        // header fields.
+                        if should_refresh_cookie && self.is_tls_connection(session) {
+                            let unpartitioned_cookie =
+                                build_logout_cookie_sandbox_unpartitioned(&hex);
+                            response.append_header("Set-Cookie", &unpartitioned_cookie)?;
+                            let legacy_cookie =
+                                build_logout_cookie_sandbox(&hex, &settings.preview_domain, false);
+                            response.append_header("Set-Cookie", &legacy_cookie)?;
+                        }
                         response.insert_header("Cache-Control", "no-store")?;
                         response.insert_header("X-Request-ID", &ctx.request_id)?;
                         session
@@ -2760,12 +2850,17 @@ impl ProxyHttp for LoadBalancer {
                 }
 
                 // ── Regular preview request: check cookie ─────────────────
-                let cookie_header = session
+                // HTTP/2 and some browser cookie stores may emit duplicate
+                // cookie names in separate Cookie header fields. Join every
+                // field so check_preview_auth can validate every candidate.
+                let cookie_values = session
                     .req_header()
                     .headers
-                    .get("cookie")
-                    .and_then(|h| h.to_str().ok())
-                    .map(|s| s.to_string());
+                    .get_all("cookie")
+                    .iter()
+                    .filter_map(|value| value.to_str().ok())
+                    .collect::<Vec<_>>();
+                let cookie_header = combine_cookie_header_values(cookie_values);
 
                 let outcome = check_preview_auth(
                     &self.sandbox_lookup_cache,

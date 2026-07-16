@@ -61,15 +61,30 @@ pub fn generate_preview_form_html_labeled(
 /// Build an expired Set-Cookie header for a standalone sandbox logout.
 /// Matches the scope of the live cookie so the browser actually drops it.
 /// `secure` must match the scheme used when the live cookie was set.
+/// Expire the obsolete HTTPS host-only, unpartitioned variant.
+pub fn build_logout_cookie_sandbox_unpartitioned(public_id_suffix: &str) -> String {
+    format!(
+        "{}{}=; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=0",
+        crate::preview_auth::PREVIEW_SANDBOX_COOKIE_PREFIX,
+        public_id_suffix,
+    )
+}
+
 pub fn build_logout_cookie_sandbox(
     public_id_suffix: &str,
     preview_domain: &str,
     secure: bool,
 ) -> String {
+    if secure {
+        return format!(
+            "{}{}=; Path=/; HttpOnly; Secure; SameSite=None; Partitioned; Max-Age=0",
+            crate::preview_auth::PREVIEW_SANDBOX_COOKIE_PREFIX,
+            public_id_suffix,
+        );
+    }
     let domain = preview_domain.trim_start_matches("*.");
-    let secure_attr = if secure { "; Secure" } else { "" };
     format!(
-        "{}{}=; Domain=.{domain}; Path=/; HttpOnly{secure_attr}; SameSite=Lax; Max-Age=0",
+        "{}{}=; Domain=.{domain}; Path=/; HttpOnly; SameSite=Lax; Max-Age=0",
         crate::preview_auth::PREVIEW_SANDBOX_COOKIE_PREFIX,
         public_id_suffix,
     )
@@ -146,12 +161,25 @@ mod tests {
     }
 
     #[test]
-    fn logout_cookie_has_max_age_zero_and_domain() {
+    fn secure_logout_cookie_matches_partitioned_host_only_scope() {
         let c = build_logout_cookie_sandbox("abc", "*.localho.st", true);
         assert!(c.starts_with("temps_preview_sbx_abc="));
-        assert!(c.contains("Domain=.localho.st"));
+        assert!(!c.contains("Domain="));
         assert!(c.contains("Max-Age=0"));
         assert!(c.contains("; Secure"));
+        assert!(c.contains("SameSite=None"));
+        assert!(c.contains("Partitioned"));
+    }
+
+    #[test]
+    fn unpartitioned_logout_cookie_targets_obsolete_https_scope() {
+        let c = build_logout_cookie_sandbox_unpartitioned("abc");
+        assert!(c.starts_with("temps_preview_sbx_abc="));
+        assert!(c.contains("; Secure"));
+        assert!(c.contains("SameSite=None"));
+        assert!(!c.contains("Partitioned"));
+        assert!(!c.contains("Domain="));
+        assert!(c.contains("Max-Age=0"));
     }
 
     #[test]
