@@ -176,11 +176,35 @@ bunx @temps-sdk/cli login --api-key "$(printf '%s' "$RESULT" | jq -r .api_key)"
 bunx @temps-sdk/cli projects list   # smoke test
 ```
 
-**Custom domain instead of sslip.io:** advanced mode is TTY-only, so force a
-TTY when you want the DNS wizard: `ssh -t "$SERVER" 'bash /tmp/deploy.sh
---mode advanced'`. Alternatively start with `quick` and attach a real domain
-later with `bunx @temps-sdk/cli domains add --domain yourdomain.com` followed
-by `domains verify`.
+**Which modes work over SSH:**
+
+| Mode | Over SSH | What you get |
+|------|----------|--------------|
+| `quick` | Plain `ssh` (headless) | Console at `http://console.<SERVER_IP>.sslip.io` over HTTP — zero DNS setup |
+| `advanced` | `ssh -t` (interactive wizard) | Your own domain + wildcard Let's Encrypt certificate |
+| `local` | Not useful remotely | Binds `127.0.0.1.sslip.io` — only reachable from the server itself |
+
+**Advanced mode over SSH (custom domain + wildcard TLS):**
+
+The advanced wizard is interactive, so force a TTY with `-t`. Running it
+inside `tmux` on the server protects the wizard if your SSH connection
+drops mid-run:
+
+```bash
+ssh -t "$SERVER" 'tmux new -A -s temps-setup "bash /tmp/deploy.sh --mode advanced"'
+```
+
+The wizard prompts for your domain and a Let's Encrypt notification email,
+then walks a **manual DNS-01 challenge**: it prints
+`_acme-challenge.<domain>` TXT values for you to add at your DNS provider,
+and validates once they propagate (it retries up to 5 times, so propagation
+delays are fine — keep the session open while you edit DNS). It also
+reminds you to add the A records (`<domain>` and `*.<domain>` → the
+server's public IP) that route traffic to the instance.
+
+Alternatively, start with `quick` to get running immediately and attach a
+real domain later with `bunx @temps-sdk/cli domains add --domain
+yourdomain.com` followed by `domains verify`.
 
 **Security notes:**
 
