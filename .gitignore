@@ -62,3 +62,11 @@ GeoLite2-*.mmdb
 # what "good" looks like) and must NOT be open-sourced. See telemetry-api/ for
 # the public, auditable side.
 /telemetry-dashboard/
+
+# CI compose-security prebuilt-binary pipeline
+ci-prebuilt/
+ci-build-cache/
+
+# CI compose-security prebuilt-binary pipeline
+ci-prebuilt/
+ci-build-cache/

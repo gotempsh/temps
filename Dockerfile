@@ -5,6 +5,12 @@
 #
 # Usage: docker build -t temps:latest .
 
+# Selects which stage the runtime copies the binary from: `artifacts-source`
+# (default, compiled by the builder stage below) or `artifacts-prebuilt`
+# (CI-injected binary from ci-prebuilt/). Declared before the first FROM so
+# it can be referenced in a FROM line.
+ARG TEMPS_ARTIFACTS=artifacts-source
+
 # Stage 1: Toolchain — everything that depends only on the Dockerfile, not on
 # the source tree. Kept as its own stage so CI can cache it as image layers
 # (compiling wasm-pack/wasm-bindgen-cli from source dominates a cold build).
@@ -88,7 +94,24 @@ RUN test -f /app/temps || { \
       exit 1; \
     }
 
-# Stage 2: Runtime
+# Artifact indirection: the runtime stage copies the binary and GeoLite2
+# database from the `artifacts` stage. By default that resolves to the
+# from-source builder above. CI passes TEMPS_ARTIFACTS=artifacts-prebuilt to
+# inject a binary compiled outside Docker in the same musl toolchain image
+# (with a persistent cargo cache), skipping the cold in-Docker workspace
+# build. BuildKit only builds the stages the target actually references, so
+# ci-prebuilt/ does not need to exist for default from-source builds.
+FROM scratch AS artifacts-source
+COPY --from=builder /app/temps /temps
+COPY --from=builder /build/crates/temps-cli/GeoLite2-City.mmdb /GeoLite2-City.mmdb
+
+FROM scratch AS artifacts-prebuilt
+COPY ci-prebuilt/temps /temps
+COPY crates/temps-cli/GeoLite2-City.mmdb /GeoLite2-City.mmdb
+
+FROM ${TEMPS_ARTIFACTS} AS artifacts
+
+# Stage 3: Runtime
 FROM alpine:3.20
 
 # Install runtime dependencies
@@ -104,13 +127,13 @@ RUN addgroup -g 1001 -S appgroup && \
 # Create app directory
 WORKDIR /app
 
-# Copy binary from builder
-COPY --from=builder /app/temps /app/temps
+# Copy binary from the selected artifacts stage
+COPY --from=artifacts /temps /app/temps
 
 # The city database is tracked in the repository and required by the proxy.
 # Keep it outside /app/data so an existing persistent volume cannot mask it
 # during an upgrade.
-COPY --from=builder /build/crates/temps-cli/GeoLite2-City.mmdb /usr/share/temps/GeoLite2-City.mmdb
+COPY --from=artifacts /GeoLite2-City.mmdb /usr/share/temps/GeoLite2-City.mmdb
 
 # Create data directory structure
 RUN mkdir -p /app/data/logs && \

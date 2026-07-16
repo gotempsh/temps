@@ -81,3 +81,11 @@ docker-compose.*.yml
 .eslintrc*
 .stylelintrc*
 thoughts/
+
+# CI compose-security prebuilt-binary pipeline
+ci-build-cache/
+**/node_modules/
+
+# CI compose-security prebuilt-binary pipeline
+ci-build-cache/
+**/node_modules/
