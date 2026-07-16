@@ -1,5 +1,7 @@
 use chrono::Utc;
-use sea_orm::{ActiveModelTrait, DatabaseBackend, EntityTrait, Set};
+use sea_orm::{
+    ActiveModelTrait, ConnectionTrait, DatabaseBackend, EntityTrait, Set, TransactionTrait,
+};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,6 +40,45 @@ pub enum ConfigServiceError {
 
     #[error("Serialization error: {0}")]
     Serialization(String),
+
+    #[error(
+        "Failed to set TimescaleDB compression policy for {table} to {after_hours} hours: {source}"
+    )]
+    CompressionPolicyUpdate {
+        table: &'static str,
+        after_hours: u32,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+}
+
+fn compression_policy_sql(table: &'static str, after_hours: u32) -> String {
+    format!(
+        "SELECT remove_compression_policy('{table}', if_exists => TRUE); \
+         SELECT add_compression_policy(\
+             '{table}', \
+             compress_after => make_interval(hours => {after_hours}), \
+             if_not_exists => TRUE\
+         )"
+    )
+}
+
+async fn replace_compression_policy<C>(
+    db: &C,
+    table: &'static str,
+    after_hours: u32,
+) -> Result<(), ConfigServiceError>
+where
+    C: ConnectionTrait,
+{
+    db.execute_unprepared(&compression_policy_sql(table, after_hours))
+        .await
+        .map_err(|source| ConfigServiceError::CompressionPolicyUpdate {
+            table,
+            after_hours,
+            source,
+        })?;
+    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -612,22 +653,38 @@ impl ConfigService {
     /// Update the application settings
     pub async fn update_settings(&self, settings: AppSettings) -> Result<(), ConfigServiceError> {
         let now = Utc::now();
-        // Refresh the TLS opt-in cache as soon as the operator toggles it
-        // in the settings UI; otherwise the change wouldn't take effect
-        // until the next get_settings() call.
-        temps_core::tls::set_insecure_tls(settings.insecure_tls);
+
+        // Persist the settings and replace changed TimescaleDB policies in one
+        // transaction. A policy error therefore cannot leave the API reporting
+        // a delay that the database did not actually apply (or vice versa).
+        let txn = self.db.begin().await?;
 
         // Check if record exists
-        let existing = settings::Entity::find_by_id(1)
-            .one(self.db.as_ref())
-            .await?;
+        let existing = settings::Entity::find_by_id(1).one(&txn).await?;
+
+        let previous_compression = existing
+            .as_ref()
+            .map(|model| AppSettings::from_json(model.data.clone()).observability_compression)
+            .unwrap_or_default();
+
+        if self.db.get_database_backend() == DatabaseBackend::Postgres {
+            let compression = &settings.observability_compression;
+            if compression.proxy_logs_after_hours != previous_compression.proxy_logs_after_hours {
+                replace_compression_policy(&txn, "proxy_logs", compression.proxy_logs_after_hours)
+                    .await?;
+            }
+            if compression.otel_spans_after_hours != previous_compression.otel_spans_after_hours {
+                replace_compression_policy(&txn, "otel_spans", compression.otel_spans_after_hours)
+                    .await?;
+            }
+        }
 
         if let Some(existing_model) = existing {
             // Update existing settings
             let mut active_model: settings::ActiveModel = existing_model.into();
             active_model.data = Set(settings.to_json());
             active_model.updated_at = Set(now);
-            active_model.update(self.db.as_ref()).await?;
+            active_model.update(&txn).await?;
         } else {
             // Create new settings
             let new_settings = settings::ActiveModel {
@@ -636,8 +693,15 @@ impl ConfigService {
                 created_at: Set(now),
                 updated_at: Set(now),
             };
-            new_settings.insert(self.db.as_ref()).await?;
+            new_settings.insert(&txn).await?;
         }
+
+        txn.commit().await?;
+
+        // Publish runtime settings only after the transaction commits. A
+        // failed policy replacement must not partially apply an unrelated TLS
+        // toggle in memory while the persisted settings remain unchanged.
+        temps_core::tls::set_insecure_tls(settings.insecure_tls);
 
         // Write-through: refresh the cache with the just-written value so an
         // admin's change takes effect immediately in this process, rather than
@@ -972,6 +1036,14 @@ mod tests {
         }
     }
 
+    #[test]
+    fn compression_policy_sql_uses_an_integer_interval_and_idempotent_replace() {
+        let sql = compression_policy_sql("proxy_logs", 24);
+        assert!(sql.contains("remove_compression_policy('proxy_logs', if_exists => TRUE)"));
+        assert!(sql.contains("make_interval(hours => 24)"));
+        assert!(sql.contains("if_not_exists => TRUE"));
+    }
+
     // The proxy reads settings on the per-request hot path, so get_settings()
     // must serve from the in-memory cache and NOT hit the DB every call.
     #[tokio::test]
@@ -1043,6 +1115,66 @@ mod tests {
             "new.example.com",
             "update_settings must write through to the cache"
         );
+    }
+
+    #[tokio::test]
+    async fn update_settings_applies_changed_observability_compression_policies() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![
+                vec![settings_row("logs.example.com")],
+                vec![settings_row("logs.example.com")],
+                vec![settings_row("logs.example.com")],
+            ])
+            // proxy policy, span policy, settings row update
+            .append_exec_results(vec![
+                sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                },
+                sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                },
+                sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                },
+            ])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+        let mut updated = AppSettings::default();
+        updated.observability_compression.proxy_logs_after_hours = 12;
+        updated.observability_compression.otel_spans_after_hours = 48;
+
+        svc.update_settings(updated.clone())
+            .await
+            .expect("changed compression policies should be applied transactionally");
+
+        let cached = svc.get_settings().await.expect("updated settings cache");
+        assert_eq!(
+            cached.observability_compression,
+            updated.observability_compression
+        );
+    }
+
+    #[tokio::test]
+    async fn compression_policy_errors_include_table_and_requested_delay() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_errors(vec![sea_orm::DbErr::Custom("Timescale job error".into())])
+            .into_connection();
+
+        let error = replace_compression_policy(&db, "otel_spans", 12)
+            .await
+            .expect_err("policy error should be returned");
+
+        assert!(matches!(
+            error,
+            ConfigServiceError::CompressionPolicyUpdate {
+                table: "otel_spans",
+                after_hours: 12,
+                ..
+            }
+        ));
     }
 
     // A settings_change NOTIFY must force the next get_settings() to re-read

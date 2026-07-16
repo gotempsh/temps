@@ -85,6 +85,10 @@ pub struct AppSettings {
     /// scrape interval, and tiered retention windows.
     pub monitoring: MonitoringSettings,
 
+    /// TimescaleDB compression delays for immutable observability data.
+    /// Changes are applied at runtime by the Settings API.
+    pub observability_compression: ObservabilityCompressionSettings,
+
     /// Set to `true` by `temps setup` (all modes) once initial configuration
     /// has been applied. The web onboarding wizard reads this from the server
     /// and skips itself when true, preventing the "Configure Base Domain" wall
@@ -700,6 +704,31 @@ pub struct MonitoringSettings {
     pub clickhouse_url: Option<String>,
 }
 
+/// TimescaleDB compression policy configuration for append-only observability
+/// tables. Values are expressed in hours so operators can choose sub-day
+/// windows while keeping the API representation unambiguous.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct ObservabilityCompressionSettings {
+    /// Compress proxy-log chunks after this many hours. Defaults to 24 hours.
+    #[schema(minimum = 1, maximum = 720, example = 24)]
+    pub proxy_logs_after_hours: u32,
+
+    /// Compress OpenTelemetry span chunks after this many hours. Defaults to
+    /// 24 hours.
+    #[schema(minimum = 1, maximum = 2160, example = 24)]
+    pub otel_spans_after_hours: u32,
+}
+
+impl Default for ObservabilityCompressionSettings {
+    fn default() -> Self {
+        Self {
+            proxy_logs_after_hours: 24,
+            otel_spans_after_hours: 24,
+        }
+    }
+}
+
 impl Default for MonitoringSettings {
     fn default() -> Self {
         Self {
@@ -739,6 +768,7 @@ impl Default for AppSettings {
             build_limits: BuildLimitsSettings::default(),
             cluster_dns: ClusterDnsSettings::default(),
             monitoring: MonitoringSettings::default(),
+            observability_compression: ObservabilityCompressionSettings::default(),
             setup_complete: false,
             require_mfa_for_admins: false,
             console_version: None,
@@ -1065,5 +1095,34 @@ mod tests {
         let json = s.to_json();
         let back = AppSettings::from_json(json);
         assert!(back.require_mfa_for_admins);
+    }
+
+    #[test]
+    fn observability_compression_defaults_to_24_hours() {
+        let compression = ObservabilityCompressionSettings::default();
+        assert_eq!(compression.proxy_logs_after_hours, 24);
+        assert_eq!(compression.otel_spans_after_hours, 24);
+    }
+
+    #[test]
+    fn legacy_settings_get_24_hour_observability_compression_defaults() {
+        let parsed = AppSettings::from_json(serde_json::json!({
+            "external_url": "https://paas.example.com",
+            "preview_domain": "localho.st"
+        }));
+
+        assert_eq!(parsed.observability_compression.proxy_logs_after_hours, 24);
+        assert_eq!(parsed.observability_compression.otel_spans_after_hours, 24);
+    }
+
+    #[test]
+    fn observability_compression_round_trips_through_json() {
+        let mut settings = AppSettings::default();
+        settings.observability_compression.proxy_logs_after_hours = 12;
+        settings.observability_compression.otel_spans_after_hours = 48;
+
+        let parsed = AppSettings::from_json(settings.to_json());
+        assert_eq!(parsed.observability_compression.proxy_logs_after_hours, 12);
+        assert_eq!(parsed.observability_compression.otel_spans_after_hours, 48);
     }
 }

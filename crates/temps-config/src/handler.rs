@@ -16,8 +16,9 @@ use temps_core::error_builder::ErrorBuilder;
 use temps_core::{
     problemdetails::Problem, AiConfigSettings, AppSettings, AuditContext, AuditLogger,
     AuditOperation, BuildLimitsSettings, ClusterDnsSettings, ContainerLogSettings,
-    DiskSpaceAlertSettings, LetsEncryptSettings, MetricsStoreKind, PublicHostnameStrategy,
-    RateLimitSettings, RequestMetadata, ScreenshotSettings, SecurityHeadersSettings,
+    DiskSpaceAlertSettings, LetsEncryptSettings, MetricsStoreKind,
+    ObservabilityCompressionSettings, PublicHostnameStrategy, RateLimitSettings, RequestMetadata,
+    ScreenshotSettings, SecurityHeadersSettings,
 };
 use tracing::{error, info};
 use utoipa::{OpenApi, ToSchema};
@@ -126,6 +127,9 @@ pub struct AppSettingsResponse {
 
     // Metrics monitoring settings (clickhouse_url masked)
     pub monitoring: MonitoringSettingsMasked,
+
+    /// TimescaleDB compression delays for immutable proxy logs and OTel spans.
+    pub observability_compression: ObservabilityCompressionSettings,
 
     /// The storage backend the runtime is **actually** using for metrics,
     /// after reconciling the `monitoring.store` toggle with the server's
@@ -352,6 +356,7 @@ impl From<AppSettings> for AppSettingsResponse {
             // the ClickHouse env-var state is known (via `with_effective_store`).
             effective_metrics_store: settings.monitoring.store.clone(),
             monitoring: MonitoringSettingsMasked::from(settings.monitoring),
+            observability_compression: settings.observability_compression,
             insecure_tls: settings.insecure_tls,
             setup_complete: settings.setup_complete,
             require_mfa_for_admins: settings.require_mfa_for_admins,
@@ -410,6 +415,7 @@ impl AppSettingsResponse {
         PreviewGatewaySettingsMasked,
         MultiNodeSettingsMasked,
         MonitoringSettingsMasked,
+        ObservabilityCompressionSettings,
         MetricsStoreKind,
         SettingsUpdateResponse,
         GenerateJoinTokenResponse,
@@ -876,6 +882,22 @@ fn sanitize_optional_url(
     Ok(Some(trimmed))
 }
 
+fn validate_observability_compression(
+    compression: &ObservabilityCompressionSettings,
+) -> Result<(), Problem> {
+    if !(1..=720).contains(&compression.proxy_logs_after_hours) {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .detail("observability_compression.proxy_logs_after_hours must be between 1 and 720")
+            .build());
+    }
+    if !(1..=2160).contains(&compression.otel_spans_after_hours) {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .detail("observability_compression.otel_spans_after_hours must be between 1 and 2160")
+            .build());
+    }
+    Ok(())
+}
+
 /// Normalize the edge target: trim whitespace and treat an empty string as
 /// `None` so an operator clearing the field disables DNS record sync.
 fn normalize_edge_target(settings: &mut AppSettings) {
@@ -1065,6 +1087,8 @@ async fn update_settings(
             }
         }
     }
+
+    validate_observability_compression(&settings.observability_compression)?;
 
     settings.external_url = sanitize_optional_url("External", settings.external_url)?;
     settings.internal_url = sanitize_optional_url("Internal", settings.internal_url)?;
@@ -1460,6 +1484,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn observability_compression_validation_accepts_supported_boundaries() {
+        assert!(
+            validate_observability_compression(&ObservabilityCompressionSettings {
+                proxy_logs_after_hours: 1,
+                otel_spans_after_hours: 1,
+            })
+            .is_ok()
+        );
+        assert!(
+            validate_observability_compression(&ObservabilityCompressionSettings {
+                proxy_logs_after_hours: 720,
+                otel_spans_after_hours: 2160,
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn observability_compression_validation_rejects_zero_and_over_retention() {
+        assert!(
+            validate_observability_compression(&ObservabilityCompressionSettings {
+                proxy_logs_after_hours: 0,
+                otel_spans_after_hours: 24,
+            })
+            .is_err()
+        );
+        assert!(
+            validate_observability_compression(&ObservabilityCompressionSettings {
+                proxy_logs_after_hours: 24,
+                otel_spans_after_hours: 2161,
+            })
+            .is_err()
+        );
+    }
+
     // Regression: the GET /api/settings response must surface agent_sandbox,
     // ai_config, preview_gateway, multi_node, and insecure_tls so the UI can
     // render (and round-trip) resource/runtime/network settings. An earlier
@@ -1569,6 +1629,24 @@ mod tests {
         assert!(!json.contains("ch-pass"));
         assert!(!json.contains("clickhouse:8123"));
         assert!(json.contains("\"clickhouse_url_set\":true"));
+    }
+
+    #[test]
+    fn response_surfaces_observability_compression_settings() {
+        let mut settings = AppSettings::default();
+        settings.observability_compression.proxy_logs_after_hours = 12;
+        settings.observability_compression.otel_spans_after_hours = 48;
+
+        let response = AppSettingsResponse::from(settings);
+
+        assert_eq!(
+            response.observability_compression.proxy_logs_after_hours,
+            12
+        );
+        assert_eq!(
+            response.observability_compression.otel_spans_after_hours,
+            48
+        );
     }
 
     // The effective metrics store reconciles the `store` toggle with the

@@ -123,6 +123,13 @@ export interface MonitoringSettings {
   clickhouse_url?: string | null
 }
 
+export interface ObservabilityCompressionSettings {
+  /** Compress immutable proxy-log chunks after this many hours. */
+  proxy_logs_after_hours: number
+  /** Compress immutable OpenTelemetry span chunks after this many hours. */
+  otel_spans_after_hours: number
+}
+
 /** Per-managed-domain hostname layout (configured under DNS providers, not here). */
 export type PublicHostnameStrategy = 'standard' | 'flat'
 
@@ -142,6 +149,7 @@ export interface PlatformSettings extends AppSettingsResponse {
   insecure_tls: boolean
   attack_mode?: boolean
   build_limits: BuildLimitsSettings
+  observability_compression: ObservabilityCompressionSettings
   /** Set to true by `temps setup` once initial configuration has been applied.
    * The web onboarding wizard checks this and skips itself when true. */
   setup_complete: boolean
@@ -185,7 +193,6 @@ export async function updatePlatformSettings(
 
   validateSettings(updated)
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const body: any = {
     dns_provider: updated.dns_provider,
     external_url: updated.external_url,
@@ -202,6 +209,7 @@ export async function updatePlatformSettings(
     attack_mode: updated.attack_mode,
     build_limits: updated.build_limits,
     monitoring: updated.monitoring,
+    observability_compression: updated.observability_compression,
   }
   const result = await updateSettings({ body })
   if (result.error) {

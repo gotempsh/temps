@@ -79,8 +79,8 @@ pub use app_settings::{
     AgentSandboxSettings, AiConfigSettings, AppSettings, BuildLimitsSettings, ClusterDnsSettings,
     ContainerLogSettings, DiskSpaceAlertSettings, DnsProviderSettings, DockerRegistrySettings,
     LetsEncryptSettings, MetricsStoreKind, MonitoringSettings, MultiNodeSettings,
-    PreviewGatewaySettings, ProviderConfig, RateLimitSettings, ScreenshotSettings,
-    SecurityHeadersSettings,
+    ObservabilityCompressionSettings, PreviewGatewaySettings, ProviderConfig, RateLimitSettings,
+    ScreenshotSettings, SecurityHeadersSettings,
 };
 pub use async_trait;
 pub use chrono;

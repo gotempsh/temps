@@ -150,6 +150,7 @@ mod m20260711_000002_add_ip_geolocations_hosting_provider;
 mod m20260711_000003_add_visitor_non_crawler_partial_index;
 mod m20260713_000001_add_mfa_pending_to_sessions;
 mod m20260714_000001_fix_otel_spans_compression_segmentby;
+mod m20260716_000001_observability_compression_24h;
 
 pub struct Migrator;
 
@@ -305,6 +306,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260711_000003_add_visitor_non_crawler_partial_index::Migration),
             Box::new(m20260713_000001_add_mfa_pending_to_sessions::Migration),
             Box::new(m20260714_000001_fix_otel_spans_compression_segmentby::Migration),
+            Box::new(m20260716_000001_observability_compression_24h::Migration),
         ]
     }
 }
