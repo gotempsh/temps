@@ -2,7 +2,9 @@
 set -euo pipefail
 
 project="temps-compose-security-${GITHUB_RUN_ID:-local}-$$"
-config_compose=(docker compose --project-name "$project" --file docker-compose.yml)
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+config_compose=(docker compose --project-name "$project" --file docker-compose.yml
+  --file "$script_dir/compose-security.harness.yml")
 compose=("${config_compose[@]}")
 if [[ -n "${COMPOSE_SECURITY_OVERRIDE:-}" ]]; then
   compose+=(--file "$COMPOSE_SECURITY_OVERRIDE")
@@ -233,6 +235,10 @@ docker exec --env PGPASSWORD="$safe_postgres" temps-postgres \
   psql -h 127.0.0.1 -U temps -d temps -tAc \
   "SELECT count(*) FROM users u JOIN user_roles ur ON ur.user_id = u.id JOIN roles r ON r.id = ur.role_id WHERE u.email = 'admin@example.test' AND u.deleted_at IS NULL AND r.name = 'admin'" \
   | grep -qx 1
+if ! docker logs temps-app 2>&1 | grep -Fq 'Anonymous product telemetry is DISABLED'; then
+  echo "product telemetry is not disabled inside the compose security harness" >&2
+  exit 1
+fi
 if [[ "$(docker logs temps-app 2>&1 | grep -c 'Initial admin created from TEMPS_ADMIN_EMAIL and password secret file')" != "1" ]]; then
   echo "expected exactly one unattended initial-admin creation notice" >&2
   exit 1

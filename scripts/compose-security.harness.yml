@@ -1,0 +1,8 @@
+# Always applied by scripts/test-compose-security.sh (local and CI). The
+# security harness must never report product telemetry: without this, every
+# test run boots temps with telemetry enabled by default, mints a fresh
+# anonymous_id, and registers as a brand-new self-hosted instance.
+services:
+  temps:
+    environment:
+      TEMPS_TELEMETRY: "0"
