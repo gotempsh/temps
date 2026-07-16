@@ -2264,6 +2264,27 @@ fn response_body_filter_inner(
     Ok(None)
 }
 
+/// Resolve the client IP for a session from the TCP peer, honoring
+/// `CF-Connecting-IP` only when the peer is a verified Cloudflare egress
+/// address (see `cloudflare_ips`). Returns `None` for non-inet peers (unix
+/// sockets) so callers keep their own fallback.
+///
+/// Using `as_inet()` (not string-splitting on `:`) keeps IPv6 peers intact —
+/// `[2001:db8::1]:443` must resolve to `2001:db8::1`, not a mangled prefix.
+fn resolve_session_client_ip(session: &PingoraSession) -> Option<String> {
+    let peer = session.client_addr()?.as_inet()?.ip();
+    let cf_connecting_ip = session
+        .req_header()
+        .headers
+        .get("cf-connecting-ip")
+        .and_then(|v| v.to_str().ok());
+    Some(
+        crate::cloudflare_ips::CLOUDFLARE_TRUST
+            .resolve_client_ip(peer, cf_connecting_ip)
+            .to_string(),
+    )
+}
+
 #[async_trait]
 impl ProxyHttp for LoadBalancer {
     type CTX = ProxyContext;
@@ -2325,13 +2346,7 @@ impl ProxyHttp for LoadBalancer {
         ctx: &mut Self::CTX,
     ) -> Result<()> {
         // Extract client IP address FIRST (needed for TLS fingerprinting)
-        let client_ip = session
-            .client_addr()
-            .map(|addr| {
-                let addr_str = addr.to_string();
-                addr_str.split(':').next().unwrap_or("unknown").to_string()
-            })
-            .unwrap_or_else(|| "unknown".to_string());
+        let client_ip = resolve_session_client_ip(session).unwrap_or_else(|| "unknown".to_string());
         ctx.ip_address = Some(client_ip.clone());
 
         // Extract user-agent FIRST (needed for TLS fingerprinting)
@@ -2514,10 +2529,8 @@ impl ProxyHttp for LoadBalancer {
             .unwrap_or_default();
 
         // Extract client IP address early (needed for attack mode checks)
-        if let Some(addr) = session.client_addr() {
-            let addr_str = addr.to_string();
-            let client_ip = addr_str.split(':').next().unwrap_or_default();
-            ctx.ip_address = Some(client_ip.to_string());
+        if let Some(client_ip) = resolve_session_client_ip(session) {
+            ctx.ip_address = Some(client_ip);
         }
 
         // SECURITY: Strip any inbound X-Temps-Demo-Mode header. Demo mode
