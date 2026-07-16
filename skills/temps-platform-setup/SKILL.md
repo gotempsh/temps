@@ -80,37 +80,48 @@ temps --version
 ### Method 1b: Headless / AI-agent install
 
 When an AI agent (or any non-interactive/CI context) wants to spin up a
-throwaway Temps instance to try it out, run `deploy.sh` in **non-interactive
-mode**. It skips every prompt, suppresses banners/spinners, and writes a
-machine-readable JSON result.
+throwaway Temps instance to try it out, run `deploy.sh` with `--yes`: every
+confirmation takes its default answer, value prompts are answered by flags,
+and the run ends with a machine-readable JSON result. Without a terminal
+and without `--yes`, the script fails fast at the first prompt with
+guidance (it never hangs waiting for input that can't arrive).
 
 ```bash
 # Local-only instance on this machine (127.0.0.1.sslip.io, HTTP, no domain).
 # Download first (same rule as Method 1 — never pipe a remote script into a
-# shell), then run. --non-interactive is auto-enabled when there is no
-# controlling terminal.
+# shell), then run.
 curl -fsSL https://temps.sh/deploy.sh -o deploy.sh
-bash deploy.sh --mode local --non-interactive
+bash deploy.sh --mode local --yes
+
+# On a server with a public IP, use quick mode instead. It requires --email
+# (the Let's Encrypt contact address — ACME has no fallback):
+bash deploy.sh --mode quick --email you@example.com --yes
 
 # Read the structured result (console URL, admin creds, API key):
 cat ~/.temps/setup-result.json
 ```
 
-The final stdout line is also machine-readable:
+The final stdout line carries the same JSON, so it can be harvested from
+command output without knowing the file path:
 
 ```
-::temps:result:: {"status":"ok","mode":"local","console_url":"http://console.127.0.0.1.sslip.io:8080","admin_email":"admin@127.0.0.1.sslip.io","admin_password":"...","api_key":"tmps_...","domain":"127.0.0.1.sslip.io","channel":"stable"}
+::temps:result:: {"status":"ok","mode":"local","channel":"beta","console_url":"http://console.127.0.0.1.sslip.io:8080","apps_url_pattern":"http://<project>.127.0.0.1.sslip.io:8080","domain":"127.0.0.1.sslip.io","admin_email":"admin@127.0.0.1.sslip.io","admin_password":"...","api_key":"tmps_..."}
 ```
 
-**Result fields:** `status` (`ok` | `degraded`), `mode`, `channel`,
-`console_url`, `apps_url_pattern` (with a `<project>` placeholder),
-`domain`, `admin_email`, `admin_password`, `api_key`.
+**Result fields:** `status`, `mode`, `channel`, `console_url`,
+`apps_url_pattern` (with a `<project>` placeholder), `domain`,
+`admin_email`, `admin_password`, `api_key` (minted for headless installs;
+`null` otherwise). The file is written with mode 0600 — treat it as a
+secrets file.
 
 **Flags for agents:**
 - `--mode local` — this machine, loopback sslip.io, HTTP (default headless mode)
 - `--mode quick` — server with a public IP, public sslip.io domain
-- `--non-interactive` / `--yes` / `-y` — force headless (auto-enabled with no TTY)
-- `--output-json <path>` — write the result somewhere other than `~/.temps/setup-result.json`
+- `--yes` / `-y` / `--non-interactive` — accept every confirmation's default
+  answer (required for headless — it is NOT auto-enabled)
+- `--email <address>` — Let's Encrypt contact + admin login email; required
+  with `--yes` in quick mode
+- `--domain <domain>` — pre-answer the domain prompt (advanced mode)
 - `--channel beta` — install a prerelease binary
 
 After setup, the agent can immediately deploy using the returned `api_key`:
@@ -130,8 +141,9 @@ bunx @temps-sdk/cli login --api-key "$API_KEY"
 When the target is a remote machine you can already reach over SSH — a
 Hetzner Cloud VPS, a DigitalOcean Droplet, any Ubuntu/Debian box — run the
 same installer through SSH from your workstation. `ssh host 'bash ...'`
-provides no TTY, so `--non-interactive` is auto-enabled and the run behaves
-exactly like Method 1b, writing the same machine-readable result.
+provides no TTY, so run it headless exactly like Method 1b — `--email` plus
+`--yes` — and it writes the same machine-readable result. (Any prompt that
+would need a terminal fails fast with guidance instead of hanging.)
 
 **Prerequisites:**
 
@@ -157,9 +169,9 @@ ssh -o BatchMode=yes "$SERVER" 'echo ok'
 curl -fsSL https://temps.sh/deploy.sh -o deploy.sh
 less deploy.sh
 
-# 3. Copy the reviewed script to the server and run it
+# 3. Copy the reviewed script to the server and run it headless
 scp deploy.sh "$SERVER":/tmp/deploy.sh
-ssh "$SERVER" 'bash /tmp/deploy.sh --mode quick --non-interactive'
+ssh "$SERVER" 'bash /tmp/deploy.sh --mode quick --email you@example.com --yes'
 
 # 4. Read the structured result (console URL, admin creds, API key) in place —
 #    avoid copying the secrets file to your machine
@@ -182,27 +194,34 @@ bunx @temps-sdk/cli projects list   # smoke test
 
 | Mode | Over SSH | What you get |
 |------|----------|--------------|
-| `quick` | Plain `ssh` (headless) | Console at `http://console.<SERVER_IP>.sslip.io` over HTTP — zero DNS setup |
-| `advanced` | `ssh -t` (interactive wizard) | Your own domain + wildcard Let's Encrypt certificate |
+| `quick` | Plain `ssh`, headless: `--email <addr> --yes` | Console at `http://console.<SERVER_IP>.sslip.io` — zero DNS setup |
+| `advanced` | `ssh -t` (interactive wizard); `--domain`/`--email` pre-answer its prompts | Your own domain + wildcard Let's Encrypt certificate |
 | `local` | Not useful remotely | Binds `127.0.0.1.sslip.io` — only reachable from the server itself |
 
 **Advanced mode over SSH (custom domain + wildcard TLS):**
 
-The advanced wizard is interactive, so force a TTY with `-t`. Running it
-inside `tmux` on the server protects the wizard if your SSH connection
-drops mid-run:
+The advanced wizard is interactive, so force a TTY with `-t`. Pass
+`--domain` and `--email` to pre-answer its value prompts — the wizard then
+only stops where a human is genuinely needed. Running it inside `tmux` on
+the server protects the wizard if your SSH connection drops mid-run:
 
 ```bash
-ssh -t "$SERVER" 'tmux new -A -s temps-setup "bash /tmp/deploy.sh --mode advanced"'
+ssh -t "$SERVER" 'tmux new -A -s temps-setup \
+  "bash /tmp/deploy.sh --mode advanced --domain yourdomain.com --email you@example.com"'
 ```
 
-The wizard prompts for your domain and a Let's Encrypt notification email,
-then walks a **manual DNS-01 challenge**: it prints
-`_acme-challenge.<domain>` TXT values for you to add at your DNS provider,
-and validates once they propagate (it retries up to 5 times, so propagation
-delays are fine — keep the session open while you edit DNS). It also
-reminds you to add the A records (`<domain>` and `*.<domain>` → the
-server's public IP) that route traffic to the instance.
+With both flags supplied, what remains interactive is the **manual DNS-01
+challenge** (by design — it proves you control the domain): the wizard
+prints `_acme-challenge.<domain>` TXT values for you to add at your DNS
+provider, waits for you to press Enter, and validates once they propagate
+(it retries up to 5 times, so propagation delays are fine — keep the
+session open while you edit DNS). It also reminds you to add the A records
+(`<domain>` and `*.<domain>` → the server's public IP) that route traffic
+to the instance. The admin email/password prompts default to `--email` and
+a generated password, so Enter accepts them.
+
+Do not combine `advanced` with `--yes` — the DNS-01 pause cannot be
+auto-answered, and the script will say so and exit.
 
 Alternatively, start with `quick` to get running immediately and attach a
 real domain later with `bunx @temps-sdk/cli domains add --domain
