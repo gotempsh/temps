@@ -105,7 +105,7 @@ The final stdout line carries the same JSON, so it can be harvested from
 command output without knowing the file path:
 
 ```
-::temps:result:: {"status":"ok","mode":"local","channel":"beta","console_url":"http://console.127.0.0.1.sslip.io:8080","apps_url_pattern":"http://<project>.127.0.0.1.sslip.io:8080","domain":"127.0.0.1.sslip.io","admin_email":"admin@127.0.0.1.sslip.io","admin_password":"...","api_key":"tmps_..."}
+::temps:result:: {"status":"ok","mode":"local","channel":"beta","console_url":"http://console.127.0.0.1.sslip.io:8080","apps_url_pattern":"http://<project>.127.0.0.1.sslip.io:8080","domain":"127.0.0.1.sslip.io","admin_email":"admin@127.0.0.1.sslip.io","admin_password":"...","api_key":"tk_..."}
 ```
 
 **Result fields:** `status`, `mode`, `channel`, `console_url`,
@@ -178,8 +178,12 @@ ssh "$SERVER" 'bash /tmp/deploy.sh --mode quick --email you@example.com --yes'
 ssh "$SERVER" 'cat ~/.temps/setup-result.json'
 ```
 
-`--mode quick` publishes the console at `http://console.<SERVER_IP>.sslip.io`
-using the server's public IP — no DNS records required to get started.
+`--mode quick` publishes the console at `https://console.<SERVER_IP>.sslip.io`
+using the server's public IP — no DNS records required to get started. The
+console and apps get real Let's Encrypt certificates automatically via
+on-demand TLS (the installer falls back to HTTP if the certificate manager
+can't activate, e.g. when port 80/443 isn't reachable — the result JSON
+carries whichever scheme is live).
 
 **Point your local CLI at the new instance:**
 
@@ -194,7 +198,7 @@ bunx @temps-sdk/cli projects list   # smoke test
 
 | Mode | Over SSH | What you get |
 |------|----------|--------------|
-| `quick` | Plain `ssh`, headless: `--email <addr> --yes` | Console at `http://console.<SERVER_IP>.sslip.io` — zero DNS setup |
+| `quick` | Plain `ssh`, headless: `--email <addr> --yes` | Console at `https://console.<SERVER_IP>.sslip.io` (on-demand TLS) — zero DNS setup |
 | `advanced` | `ssh -t` (interactive wizard); `--domain`/`--email` pre-answer its prompts | Your own domain + wildcard Let's Encrypt certificate |
 | `local` | Not useful remotely | Binds `127.0.0.1.sslip.io` — only reachable from the server itself |
 
