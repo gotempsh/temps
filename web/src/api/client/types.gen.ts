@@ -2521,6 +2521,35 @@ export type ContainerLogsQuery = {
 };
 
 /**
+ * One bucketed data point of a container resource metric time series.
+ */
+export type ContainerMetricHistoryPoint = {
+    /**
+     * Bucket timestamp (ISO 8601 with `Z` suffix).
+     */
+    time: string;
+    /**
+     * Averaged metric value for the bucket.
+     */
+    value: number;
+};
+
+/**
+ * Query parameters for the container metrics history endpoint.
+ */
+export type ContainerMetricsHistoryQuery = {
+    /**
+     * Dotted metric name, e.g. `container.cpu_percent` or
+     * `container.memory_used_bytes`.
+     */
+    metric: string;
+    /**
+     * Time window: `1h`, `6h`, `24h`, or `7d` (defaults to `1h`).
+     */
+    range?: string;
+};
+
+/**
  * Container resource metrics (CPU, memory usage)
  */
 export type ContainerMetricsResponse = {
@@ -37778,6 +37807,64 @@ export type GetContainerMetricsResponses = {
 };
 
 export type GetContainerMetricsResponse = GetContainerMetricsResponses[keyof GetContainerMetricsResponses];
+
+export type ContainerMetricsGetHistoryData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Container ID
+         */
+        container_id: string;
+    };
+    query: {
+        /**
+         * Dotted metric name, e.g. `container.cpu_percent` or
+         * `container.memory_used_bytes`.
+         */
+        metric: string;
+        /**
+         * Time window: `1h`, `6h`, `24h`, or `7d` (defaults to `1h`).
+         */
+        range?: string;
+    };
+    url: '/projects/{project_id}/environments/{environment_id}/containers/{container_id}/metrics/history';
+};
+
+export type ContainerMetricsGetHistoryErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Container not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * Metrics store not available
+     */
+    503: unknown;
+};
+
+export type ContainerMetricsGetHistoryResponses = {
+    /**
+     * Metric time series data points
+     */
+    200: Array<ContainerMetricHistoryPoint>;
+};
+
+export type ContainerMetricsGetHistoryResponse = ContainerMetricsGetHistoryResponses[keyof ContainerMetricsGetHistoryResponses];
 
 export type StreamContainerMetricsData = {
     body?: never;

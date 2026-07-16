@@ -11466,6 +11466,7 @@ dependencies = [
  "temps-git",
  "temps-log-aggregator",
  "temps-logs",
+ "temps-metrics",
  "temps-network",
  "temps-presets",
  "temps-providers",

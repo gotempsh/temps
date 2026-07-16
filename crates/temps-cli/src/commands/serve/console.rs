@@ -2325,14 +2325,25 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         use temps_providers::health_monitor::{
             ExternalServiceHealthConfig, ExternalServiceHealthMonitor,
         };
-        let health_monitor = Arc::new(ExternalServiceHealthMonitor::new(
+        let mut health_monitor = ExternalServiceHealthMonitor::new(
             db.clone(),
             external_service_manager,
             notification_service,
             ExternalServiceHealthConfig::default(),
             docker.clone(),
             service_context.require_service::<temps_core::EncryptionService>(),
-        ));
+        );
+
+        // Attach the shared metrics store (registered by the MetricsScraper
+        // block above) so the monitor records container CPU/memory history
+        // for services with metrics enabled.
+        if let Some(metrics_store) =
+            service_context.get_service::<dyn temps_metrics::MetricsStore>()
+        {
+            health_monitor = health_monitor.with_metrics_store(metrics_store);
+        }
+
+        let health_monitor = Arc::new(health_monitor);
 
         // Register so the providers plugin can pick it up and expose a
         // manual-trigger endpoint that reuses the monitor's check logic.
