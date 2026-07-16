@@ -431,7 +431,7 @@ impl MetricsStore for ClickhouseMetricsStore {
             // read path expects.
             format!(
                 "SELECT \
-                   toUnixTimestamp(bucket) * 1000 AS bucket_ms, \
+                   toInt64(toUnixTimestamp(bucket)) * 1000 AS bucket_ms, \
                    greatest(bucket_max - lagInFrame(bucket_max, 1, bucket_max) \
                             OVER (ORDER BY bucket ASC), 0) AS avg_value \
                  FROM ( \
@@ -458,7 +458,7 @@ impl MetricsStore for ClickhouseMetricsStore {
             // yields a second-resolution `DateTime`; * 1000 gives the i64 ms.
             format!(
                 "SELECT \
-                   toUnixTimestamp(toStartOfInterval(time, INTERVAL {step} SECOND)) * 1000 AS bucket_ms, \
+                   toInt64(toUnixTimestamp(toStartOfInterval(time, INTERVAL {step} SECOND))) * 1000 AS bucket_ms, \
                    avg(value) AS avg_value \
                  FROM service_metrics FINAL \
                  WHERE source_kind = ? AND source_id = ? AND name = '{nm}' \
@@ -531,10 +531,20 @@ impl MetricsStore for ClickhouseMetricsStore {
             name_filter = format!(" AND name IN ({list})");
         }
 
+        // PERF: time-bounded so partition pruning and primary-key range
+        // pruning apply — `FINAL` over an unbounded WHERE dedup-merges up to
+        // the full TTL (90 days) of rows for the source on every request.
+        // Anchoring on the source's own max(time) (cheap: single column,
+        // primary-key prefix filter) keeps values visible when the scraper is
+        // paused/stale. With no rows, max(time) is epoch and the query is
+        // empty either way.
         let sql = format!(
             "SELECT name, value \
              FROM service_metrics FINAL \
              WHERE source_kind = ? AND source_id = ?{name_filter} \
+               AND time > (SELECT max(time) FROM service_metrics \
+                            WHERE source_kind = ? AND source_id = ?) \
+                          - INTERVAL 15 MINUTE \
              ORDER BY name, length(JSONExtractKeys(labels)) ASC, time DESC \
              LIMIT 1 BY name",
             name_filter = name_filter,
@@ -543,6 +553,8 @@ impl MetricsStore for ClickhouseMetricsStore {
         let rows = self
             .client
             .query(&sql)
+            .bind(filter.source_kind.as_str())
+            .bind(filter.source_id)
             .bind(filter.source_kind.as_str())
             .bind(filter.source_id)
             .fetch_all::<ChLatestRow>()
@@ -602,10 +614,15 @@ impl MetricsStore for ClickhouseMetricsStore {
 
         // label_key is bound (?) into JSONExtractString / JSONHas — never
         // interpolated.
+        // PERF: time-bounded for the same reason as `query_latest` — see the
+        // comment there for the max(time) anchor rationale.
         let sql = format!(
             "SELECT name, JSONExtractString(labels, ?) AS label_value, value \
              FROM service_metrics FINAL \
              WHERE source_kind = ? AND source_id = ? \
+               AND time > (SELECT max(time) FROM service_metrics \
+                            WHERE source_kind = ? AND source_id = ?) \
+                          - INTERVAL 15 MINUTE \
                AND name IN ({list}) \
                AND JSONHas(labels, ?) \
              ORDER BY name, label_value, time DESC \
@@ -617,6 +634,8 @@ impl MetricsStore for ClickhouseMetricsStore {
             .client
             .query(&sql)
             .bind(&filter.label_key)
+            .bind(filter.source_kind.as_str())
+            .bind(filter.source_id)
             .bind(filter.source_kind.as_str())
             .bind(filter.source_id)
             .bind(&filter.label_key)
@@ -708,11 +727,17 @@ impl ClickhouseMetricsStore {
         }
 
         // Validated metric name interpolated; source_kind/source_id bound.
+        // Time-bounded so partition/primary-key pruning applies (see
+        // query_latest); without it the ORDER BY time DESC sort reads the
+        // metric's full history before the LIMIT.
         let sql = format!(
             "SELECT min(k) AS min_keys FROM ( \
                SELECT length(JSONExtractKeys(labels)) AS k \
                FROM service_metrics \
                WHERE source_kind = ? AND source_id = ? AND name = '{nm}' \
+                 AND time > (SELECT max(time) FROM service_metrics \
+                              WHERE source_kind = ? AND source_id = ?) \
+                            - INTERVAL 15 MINUTE \
                ORDER BY time DESC LIMIT 64 \
              )",
             nm = name,
@@ -721,6 +746,8 @@ impl ClickhouseMetricsStore {
         match self
             .client
             .query(&sql)
+            .bind(source_kind)
+            .bind(source_id)
             .bind(source_kind)
             .bind(source_id)
             .fetch_one::<MinKeysRow>()
