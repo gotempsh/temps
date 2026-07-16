@@ -4,11 +4,21 @@
 //! ## Flow
 //!
 //! 1. Validate S3 source + bucket reachability.
-//! 2. Run `pg_dumpall | gzip` as a one-shot Docker container whose entrypoint
-//!    is the backup command itself. The container exits when the dump exits;
-//!    `auto_remove=true` reaps it.
+//! 2. Run `pg_dumpall --globals-only` + `pg_dump | gzip` as a one-shot Docker
+//!    container whose entrypoint is the backup command itself. The container
+//!    exits when the dump exits; `auto_remove=true` reaps it.
 //! 3. Upload the resulting `.sql.gz` to S3 (single-part or multipart).
 //! 4. Write a `metadata.json` companion object.
+//!
+//! ## What is backed up
+//!
+//! Schema for every table, but data only for critical tables: high-volume
+//! observability/analytics tables ([`EXCLUDED_DATA_TABLES`]) are dumped
+//! schema-only via `--exclude-table-data`. Most of them are TimescaleDB
+//! hypertables whose rows physically live in `_timescaledb_internal` chunk
+//! tables, so the exclusion patterns are resolved against
+//! `_timescaledb_catalog.hypertable` at backup time to also cover the
+//! `_hyper_N_*` (and `compress_hyper_N_*`) chunks.
 //!
 //! ## Retry semantics
 //!
@@ -30,6 +40,37 @@ use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, Bac
 
 const ENGINE_KEY: &str = "control_plane";
 const DUMP_FILE_SUFFIX: &str = "backup.sql.gz";
+
+/// High-volume observability/analytics tables backed up schema-only.
+///
+/// Their data regenerates from live traffic and would otherwise dominate the
+/// dump size; everything needed to bring a control plane back (projects,
+/// deployments, domains, certs, users, secrets, settings, audit logs, revenue
+/// data) keeps its data. Excluded tables only reference other excluded tables
+/// (or kept parents), so restore recreates all FK constraints cleanly.
+const EXCLUDED_DATA_TABLES: &[&str] = &[
+    // Proxy / OTel telemetry (hypertables)
+    "proxy_logs",
+    "otel_spans",
+    "otel_metrics",
+    "otel_log_events",
+    // Web analytics
+    "events",
+    "events_ch_outbox",
+    "visitor",
+    "request_sessions",
+    "performance_metrics",
+    // Session replay (raw rrweb payloads)
+    "session_replay_sessions",
+    "session_replay_events",
+    // Error tracking (groups reference visitor, so the set is excluded whole)
+    "error_events",
+    "error_groups",
+    "error_alert_fires",
+    // Uptime / AI-gateway samples (hypertables)
+    "status_checks",
+    "ai_usage_logs",
+];
 
 // ── Dependencies ─────────────────────────────────────────────────────────────
 
@@ -118,17 +159,37 @@ impl BackupEngine for ControlPlaneEngine {
         let stderr_path_in_container = format!("/backup/{}", stderr_filename);
         let host_stderr_path = backup_dir.join(&stderr_filename);
 
+        let exclude_patterns = resolve_exclude_data_patterns(deps.db.as_ref()).await;
+        info!(
+            backup_id,
+            tables = EXCLUDED_DATA_TABLES.len(),
+            patterns = exclude_patterns.len(),
+            "ControlPlaneEngine: dumping schema-only for high-volume tables",
+        );
+        let exclude_flags = exclude_patterns
+            .iter()
+            .map(|p| format!("--exclude-table-data={}", v2_common::shell_escape(p)))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        // Globals (roles) via pg_dumpall, then a single-database pg_dump with
+        // the heavy tables dumped schema-only. Both restore through the same
+        // `psql --dbname=<cp-db> --file=dump.sql` path as the old pg_dumpall
+        // format.
         let pg_dump_cmd = format!(
-            "pg_dumpall --clean --if-exists --no-password \
-             --host={} --port={} --username={} --database={} \
-             2>{} > {} && gzip {}",
-            v2_common::shell_escape(&host),
-            v2_common::shell_escape(&port.to_string()),
-            v2_common::shell_escape(&username),
-            v2_common::shell_escape(&database),
-            stderr_path_in_container,
-            v2_common::shell_escape(&uncompressed_in_container),
-            v2_common::shell_escape(&uncompressed_in_container),
+            "pg_dumpall --globals-only --clean --if-exists --no-password \
+             --host={host} --port={port} --username={user} --database={db} \
+             2>{stderr} > {out} \
+             && pg_dump --clean --if-exists --no-password \
+             --host={host} --port={port} --username={user} {excludes} --dbname={db} \
+             2>>{stderr} >> {out} && gzip {out}",
+            host = v2_common::shell_escape(&host),
+            port = v2_common::shell_escape(&port.to_string()),
+            user = v2_common::shell_escape(&username),
+            db = v2_common::shell_escape(&database),
+            excludes = exclude_flags,
+            stderr = stderr_path_in_container,
+            out = v2_common::shell_escape(&uncompressed_in_container),
         );
 
         let docker =
@@ -158,7 +219,7 @@ impl BackupEngine for ControlPlaneEngine {
                 v2_common::best_effort_remove(&host_dump_path).await;
                 v2_common::best_effort_remove(&host_stderr_path).await;
                 return Err(BackupError::Failed {
-                    reason: format!("pg_dumpall one-shot failed: {}", e),
+                    reason: format!("control-plane dump one-shot failed: {}", e),
                 });
             }
         };
@@ -169,7 +230,7 @@ impl BackupEngine for ControlPlaneEngine {
             v2_common::best_effort_remove(&host_dump_path).await;
             return Err(BackupError::Failed {
                 reason: format!(
-                    "pg_dumpall exited with code {}. file-stderr: {}{}",
+                    "control-plane dump exited with code {}. file-stderr: {}{}",
                     result.exit_code,
                     String::from_utf8_lossy(&file_stderr),
                     if result.stderr_tail.trim().is_empty() {
@@ -188,7 +249,7 @@ impl BackupEngine for ControlPlaneEngine {
                 .await
                 .map_err(|e| BackupError::Failed {
                     reason: format!(
-                        "dump file not found at {} after pg_dumpall exited 0: {}",
+                        "dump file not found at {} after dump exited 0: {}",
                         host_dump_path.display(),
                         e
                     ),
@@ -196,7 +257,7 @@ impl BackupEngine for ControlPlaneEngine {
         if dump_meta.len() == 0 {
             v2_common::best_effort_remove(&host_dump_path).await;
             return Err(BackupError::Failed {
-                reason: "pg_dumpall produced an empty file".into(),
+                reason: "control-plane dump produced an empty file".into(),
             });
         }
         let file_size = dump_meta.len() as i64;
@@ -206,7 +267,7 @@ impl BackupEngine for ControlPlaneEngine {
             backup_id,
             path = %host_dump_path_str,
             size_bytes = file_size,
-            "ControlPlaneEngine: pg_dumpall completed",
+            "ControlPlaneEngine: dump completed",
         );
 
         // ── Upload dump ──────────────────────────────────────────────────────
@@ -247,7 +308,9 @@ impl BackupEngine for ControlPlaneEngine {
             file_size,
             s3_source_id,
             "gzip",
-            None,
+            Some(serde_json::json!({
+                "excluded_table_data": EXCLUDED_DATA_TABLES,
+            })),
         )
         .await?;
         info!(
@@ -266,6 +329,70 @@ impl BackupEngine for ControlPlaneEngine {
 }
 
 // ── Local helpers ────────────────────────────────────────────────────────────
+
+/// Build the `--exclude-table-data` patterns for [`EXCLUDED_DATA_TABLES`].
+///
+/// Always excludes the root `public.<table>`. For tables that are TimescaleDB
+/// hypertables, additionally excludes their chunk tables
+/// (`_timescaledb_internal._hyper_<id>_*`) and, when compression is enabled,
+/// the compressed chunks (`_timescaledb_internal.compress_hyper_<cid>_*`) —
+/// hypertable rows live in chunks, so root-table exclusion alone would keep
+/// all the data. Continuous-aggregate materializations are intentionally NOT
+/// excluded: they are small and let dashboards keep aggregate history.
+///
+/// If the catalog lookup fails the backup proceeds with root-table exclusion
+/// only (worst case: a larger dump, never data loss), and the failure is
+/// logged.
+async fn resolve_exclude_data_patterns(db: &DatabaseConnection) -> Vec<String> {
+    use sea_orm::{DatabaseBackend, FromQueryResult, Statement};
+
+    let mut patterns: Vec<String> = EXCLUDED_DATA_TABLES
+        .iter()
+        .map(|t| format!("public.{}", t))
+        .collect();
+
+    #[derive(FromQueryResult)]
+    struct HypertableRow {
+        id: i32,
+        compressed_hypertable_id: Option<i32>,
+    }
+
+    // EXCLUDED_DATA_TABLES are compile-time identifiers, safe to inline.
+    let in_list = EXCLUDED_DATA_TABLES
+        .iter()
+        .map(|t| format!("'{}'", t))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT id, compressed_hypertable_id \
+         FROM _timescaledb_catalog.hypertable \
+         WHERE schema_name = 'public' AND table_name IN ({})",
+        in_list
+    );
+
+    match HypertableRow::find_by_statement(Statement::from_string(DatabaseBackend::Postgres, sql))
+        .all(db)
+        .await
+    {
+        Ok(rows) => {
+            for row in rows {
+                patterns.push(format!("_timescaledb_internal._hyper_{}_*", row.id));
+                if let Some(cid) = row.compressed_hypertable_id {
+                    patterns.push(format!("_timescaledb_internal.compress_hyper_{}_*", cid));
+                }
+            }
+        }
+        Err(e) => {
+            warn!(
+                "ControlPlaneEngine: could not resolve TimescaleDB chunks for data \
+                 exclusion, hypertable data will be included in the dump: {}",
+                e
+            );
+        }
+    }
+
+    patterns
+}
 
 /// Detect the PostgreSQL major version via `current_setting('server_version')`.
 /// Falls back to `"pg18"` if detection fails — pg_dumpall is

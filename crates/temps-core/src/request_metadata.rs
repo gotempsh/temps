@@ -90,6 +90,16 @@ pub fn normalize_session_cookie(plaintext: String) -> Option<String> {
 pub fn build_from_request(req: &Request, crypto: &CookieCrypto) -> RequestMetadata {
     let headers = req.headers();
 
+    // Resolve the client IP trust-awarely: `X-Forwarded-For` is only honored
+    // from a loopback peer (our Pingora proxy), so a client connecting directly
+    // cannot spoof it. The peer socket is injected by axum's connect-info make
+    // service on every listener. Falls back to "unknown" when absent.
+    let peer = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|connect_info| connect_info.0);
+    let ip_address = crate::resolve_client_ip(headers, peer);
+
     let visitor_id_cookie = extract_encrypted_cookie(headers, VISITOR_ID_COOKIE_NAME, crypto);
     // Decrypt the session cookie then normalise from the v2 payload format
     // (`v2|<uuid>|<unix_secs>`) to a bare UUID. The proxy's own
@@ -119,12 +129,7 @@ pub fn build_from_request(req: &Request, crypto: &CookieCrypto) -> RequestMetada
     let host = host_without_port(&raw_host).to_string();
 
     RequestMetadata {
-        ip_address: headers
-            .get("x-forwarded-for")
-            .and_then(|h| h.to_str().ok())
-            .and_then(|s| s.split(',').next())
-            .unwrap_or("unknown")
-            .to_string(),
+        ip_address,
         user_agent: headers
             .get("user-agent")
             .and_then(|h| h.to_str().ok())
@@ -330,6 +335,46 @@ mod tests {
         assert!(body_str.contains("host=example.com"));
         assert!(body_str.contains("scheme=https"));
         assert!(body_str.contains("ua=regression-test/1.0"));
+    }
+
+    /// `build_from_request` must derive `ip_address` trust-awarely from the
+    /// connect-info peer, not from the raw leftmost `X-Forwarded-For` (which a
+    /// direct client can spoof).
+    #[test]
+    fn build_from_request_resolves_trustworthy_client_ip() {
+        use axum::extract::ConnectInfo;
+
+        fn ip_of(peer: &str, xff: &str) -> String {
+            let crypto = test_crypto();
+            let mut req = HttpRequest::builder()
+                .uri("/")
+                .header("x-forwarded-for", xff)
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut()
+                .insert(ConnectInfo(peer.parse::<std::net::SocketAddr>().unwrap()));
+            build_from_request(&req, &crypto).ip_address
+        }
+
+        // Loopback proxy peer → the rightmost (proxy-appended) XFF entry wins;
+        // the attacker-supplied leftmost value is ignored.
+        assert_eq!(
+            ip_of("127.0.0.1:9000", "6.6.6.6, 203.0.113.9"),
+            "203.0.113.9"
+        );
+
+        // Direct, untrusted peer → the socket IP wins and XFF is ignored, so a
+        // spoofed header cannot forge the audited IP.
+        assert_eq!(ip_of("203.0.113.5:42424", "1.1.1.1"), "203.0.113.5");
+
+        // No connect-info peer at all → "unknown" (never a spoofable header).
+        let crypto = test_crypto();
+        let req = HttpRequest::builder()
+            .uri("/")
+            .header("x-forwarded-for", "9.9.9.9")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(build_from_request(&req, &crypto).ip_address, "unknown");
     }
 
     #[tokio::test]

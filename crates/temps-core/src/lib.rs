@@ -2,6 +2,7 @@
 
 pub mod admin_gate;
 pub mod audit;
+pub mod client_ip;
 pub mod config;
 pub mod deployment;
 pub mod env_vars_provider;
@@ -46,6 +47,7 @@ pub mod workflow_executor;
 pub mod workflow_memory;
 // Re-export commonly used types
 pub use audit::*;
+pub use client_ip::resolve_client_ip;
 pub use config::*;
 pub use constants::*;
 pub use deployment::*;
