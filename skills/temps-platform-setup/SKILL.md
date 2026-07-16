@@ -86,9 +86,11 @@ machine-readable JSON result.
 
 ```bash
 # Local-only instance on this machine (127.0.0.1.sslip.io, HTTP, no domain).
-# --non-interactive is auto-enabled when there is no controlling terminal,
-# so an agent can also just run the bare curl|bash and get the same behavior.
-curl -fsSL https://temps.sh/deploy.sh | bash -s -- --mode local --non-interactive
+# Download first (same rule as Method 1 — never pipe a remote script into a
+# shell), then run. --non-interactive is auto-enabled when there is no
+# controlling terminal.
+curl -fsSL https://temps.sh/deploy.sh -o deploy.sh
+bash deploy.sh --mode local --non-interactive
 
 # Read the structured result (console URL, admin creds, API key):
 cat ~/.temps/setup-result.json
@@ -409,7 +411,7 @@ temps configure reset
 
 **Configuration files:**
 - **Config**: `~/.temps/config.json` (API URL, output format)
-- **Credentials**: `~/.temps/.secrets` (API tokens, mode 0600)
+- **Credentials**: stored securely under `~/.temps/` with restricted permissions (mode 0600), managed by `login`/`logout`
 
 **Environment variables** (override config):
 
@@ -969,7 +971,7 @@ temps deployments status <deployment-id>
 | File | Purpose | Location |
 |------|---------|----------|
 | `config.json` | CLI configuration | `~/.temps/config.json` |
-| `.secrets` | API tokens | `~/.temps/.secrets` |
+| credentials store | API tokens (managed by `login`/`logout`) | under `~/.temps/` (mode 0600) |
 | `encryption_key` | Encryption key | `~/.temps/encryption_key` |
 | `GeoLite2-City.mmdb` | Geolocation database | `~/.temps/GeoLite2-City.mmdb` |
 
@@ -1026,9 +1028,9 @@ and no protection if the host or your connection is compromised. See
      ask for the value (it won't be echoed or stored in history).
   3. **CI secret stores** — inject tokens at runtime from your platform's
      secret manager; never hard-code them in pipeline files.
-- The CLI stores credentials in `~/.temps/.secrets` with restricted
-  permissions (mode 0600), managed by `login`/`logout`. Don't copy that
-  file or commit it to version control.
+- The CLI stores credentials under `~/.temps/` with restricted
+  permissions (mode 0600), managed by `login`/`logout`. Don't copy the
+  credentials file or commit it to version control.
 - All environment variables set via `temps environments vars set` /
   `temps environments vars import` are encrypted at rest and masked in the
   UI — but the local `.env` files you import from are not. Keep them out of
