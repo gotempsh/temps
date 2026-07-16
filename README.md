@@ -165,7 +165,7 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 | Transactional email + DKIM | Yes | No | No | No | No | No | No |
 | Managed Postgres / Redis | Yes | Yes | Yes | No | Yes | Yes | Partner add-ons |
 | S3-compatible storage | Yes | No | No | No | No | No | Blob (paid) |
-| Multi-node / clustering | WireGuard mesh | Yes | Swarm | Yes | Managed | Managed | Managed |
+| Multi-node / clustering | Yes | Yes | Swarm | Yes | Managed | Managed | Managed |
 | Edge functions / global edge network | No | No | No | No | No | No | Yes |
 | Per-seat fees | No | No | No | No | $20/user (Pro) | Per-user | $20/seat (Pro) |
 
