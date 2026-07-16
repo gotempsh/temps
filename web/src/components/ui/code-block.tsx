@@ -286,8 +286,16 @@ export function CodeBlock({
 
     if (lang === 'json') {
       return lines.map((line, lineIdx) => {
-        // Process JSON with simple token replacement
+        // HTML-escape first: the highlighter below injects <span> markup and
+        // renders via dangerouslySetInnerHTML, and JSON string values/keys can
+        // be attacker-controlled (e.g. custom event props). Escaping &, <, >
+        // neutralises tag injection; the token regexes below match on ", :,
+        // digits and keywords, which escaping leaves intact, and user content
+        // only ever lands in text position (never inside an attribute).
         let processedLine = line
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
 
         // Keys (property names with quotes followed by colon)
         processedLine = processedLine.replace(
@@ -675,7 +683,12 @@ export function CodeBlock({
           const trimmed = value.trim()
           if (trimmed === '') return value
           // Block scalar markers
-          if (trimmed === '|' || trimmed === '>' || trimmed === '|-' || trimmed === '>-') {
+          if (
+            trimmed === '|' ||
+            trimmed === '>' ||
+            trimmed === '|-' ||
+            trimmed === '>-'
+          ) {
             return (
               <span className="text-orange-600 dark:text-orange-400">
                 {value}
@@ -688,13 +701,17 @@ export function CodeBlock({
             (trimmed.startsWith("'") && trimmed.endsWith("'"))
           ) {
             return (
-              <span className="text-green-600 dark:text-green-400">{value}</span>
+              <span className="text-green-600 dark:text-green-400">
+                {value}
+              </span>
             )
           }
           // Booleans / null
           if (['true', 'false', 'null', '~', 'yes', 'no'].includes(trimmed)) {
             return (
-              <span className="text-orange-600 dark:text-orange-400">{value}</span>
+              <span className="text-orange-600 dark:text-orange-400">
+                {value}
+              </span>
             )
           }
           // Numbers
@@ -704,7 +721,9 @@ export function CodeBlock({
             )
           }
           // Plain string value
-          return <span className="text-green-600 dark:text-green-400">{value}</span>
+          return (
+            <span className="text-green-600 dark:text-green-400">{value}</span>
+          )
         }
 
         return (
@@ -749,7 +768,11 @@ export function CodeBlock({
     ))
   }
 
-  const renderGoToken = (token: string, keywords: string[], types: string[]) => {
+  const renderGoToken = (
+    token: string,
+    keywords: string[],
+    types: string[]
+  ) => {
     if (keywords.includes(token)) {
       return (
         <span className="text-purple-600 dark:text-purple-400 font-semibold">
@@ -853,9 +876,7 @@ export function CodeBlock({
           <pre
             className={cn(
               'text-sm font-mono leading-6 m-0',
-              wrapLines
-                ? 'whitespace-pre-wrap break-all'
-                : 'whitespace-pre'
+              wrapLines ? 'whitespace-pre-wrap break-all' : 'whitespace-pre'
             )}
           >
             <code
