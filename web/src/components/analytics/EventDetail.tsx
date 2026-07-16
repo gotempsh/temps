@@ -6,7 +6,7 @@ import {
 import { EventEntryInfo, ProjectResponse } from '@/api/client/types.gen'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { CopyButton } from '@/components/ui/copy-button'
+import { CodeBlock } from '@/components/ui/code-block'
 import {
   Card,
   CardContent,
@@ -34,7 +34,6 @@ import {
   AppWindow,
   ArrowLeft,
   BarChart3,
-  Braces,
   ChevronDown,
   ChevronRight,
   Globe,
@@ -569,21 +568,12 @@ function EventEntriesCard({
                       {expandedId === entry.id && entry.props && (
                         <TableRow className="hover:bg-transparent">
                           <TableCell colSpan={5} className="bg-muted/30 p-0">
-                            <div className="relative m-3 rounded-md border bg-background">
-                              <div className="flex items-center justify-between border-b px-3 py-1.5">
-                                <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                                  <Braces className="h-3 w-3" />
-                                  Custom data
-                                </div>
-                                <CopyButton
-                                  value={JSON.stringify(entry.props, null, 2)}
-                                  className="h-6 w-6 rounded-md text-muted-foreground"
-                                />
-                              </div>
-                              <pre className="overflow-x-auto p-3 text-xs font-mono leading-relaxed">
-                                {JSON.stringify(entry.props, null, 2)}
-                              </pre>
-                            </div>
+                            <CodeBlock
+                              code={JSON.stringify(entry.props, null, 2)}
+                              language="json"
+                              title="Custom data"
+                              className="m-3"
+                            />
                           </TableCell>
                         </TableRow>
                       )}
