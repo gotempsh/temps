@@ -123,6 +123,77 @@ bunx @temps-sdk/cli login --api-key "$API_KEY"
 > Advanced/manual-DNS mode is **TTY-only** — it needs interactive DNS-record
 > entry. Agents must use `--mode local` or `--mode quick`.
 
+### Method 1c: Remote server over SSH (e.g. a fresh Hetzner VPS)
+
+When the target is a remote machine you can already reach over SSH — a
+Hetzner Cloud VPS, a DigitalOcean Droplet, any Ubuntu/Debian box — run the
+same installer through SSH from your workstation. `ssh host 'bash ...'`
+provides no TTY, so `--non-interactive` is auto-enabled and the run behaves
+exactly like Method 1b, writing the same machine-readable result.
+
+**Prerequisites:**
+
+- SSH access as `root` or a sudo-capable user, with key-based auth (e.g. the
+  SSH key you attached when provisioning the Hetzner server)
+- Ubuntu/Debian recommended; 3 vCPU / 4 GB RAM is the reference footprint
+  (Hetzner cpx22)
+- Inbound ports **80** and **443** open in the cloud firewall (Hetzner Cloud
+  → Firewalls), plus 22 for SSH
+- No separate managed database needed — the installer sets up Docker and a
+  TimescaleDB container on the server itself
+
+**Steps:**
+
+```bash
+SERVER=root@<SERVER_IP>
+
+# 1. Verify connectivity (key auth only, fail instead of prompting)
+ssh -o BatchMode=yes "$SERVER" 'echo ok'
+
+# 2. Download the installer locally and review it (same rule as Method 1 —
+#    never pipe a remote script into a shell)
+curl -fsSL https://temps.sh/deploy.sh -o deploy.sh
+less deploy.sh
+
+# 3. Copy the reviewed script to the server and run it
+scp deploy.sh "$SERVER":/tmp/deploy.sh
+ssh "$SERVER" 'bash /tmp/deploy.sh --mode quick --non-interactive'
+
+# 4. Read the structured result (console URL, admin creds, API key) in place —
+#    avoid copying the secrets file to your machine
+ssh "$SERVER" 'cat ~/.temps/setup-result.json'
+```
+
+`--mode quick` publishes the console at `http://console.<SERVER_IP>.sslip.io`
+using the server's public IP — no DNS records required to get started.
+
+**Point your local CLI at the new instance:**
+
+```bash
+RESULT=$(ssh "$SERVER" 'cat ~/.temps/setup-result.json')
+bunx @temps-sdk/cli configure set apiUrl "$(printf '%s' "$RESULT" | jq -r .console_url)/api"
+bunx @temps-sdk/cli login --api-key "$(printf '%s' "$RESULT" | jq -r .api_key)"
+bunx @temps-sdk/cli projects list   # smoke test
+```
+
+**Custom domain instead of sslip.io:** advanced mode is TTY-only, so force a
+TTY when you want the DNS wizard: `ssh -t "$SERVER" 'bash /tmp/deploy.sh
+--mode advanced'`. Alternatively start with `quick` and attach a real domain
+later with `bunx @temps-sdk/cli domains add --domain yourdomain.com` followed
+by `domains verify`.
+
+**Security notes:**
+
+- `setup-result.json` contains the admin password and an API key — treat it
+  as a secrets file. Read it over SSH as shown rather than downloading it,
+  and never paste its contents into logs, chat, or committed files.
+- Keep SSH host-key checking on (no `StrictHostKeyChecking=no`). Connect
+  once interactively to accept the fingerprint, or pre-seed `known_hosts`
+  from your provider's console.
+- Later upgrades run the same way: `ssh "$SERVER" '~/.temps/bin/temps
+  upgrade'` (the explicit path matters — non-interactive SSH shells may not
+  source the rc file that puts `~/.temps/bin` on `PATH`).
+
 ### Method 2: Docker Compose (Production)
 
 For production deployments with PostgreSQL and Redis:
