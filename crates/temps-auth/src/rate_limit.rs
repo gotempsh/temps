@@ -3,7 +3,7 @@
 //! Provides a simple sliding-window rate limiter to prevent brute force attacks
 //! on login, password reset, magic link, and MFA verification endpoints.
 
-use crate::client_ip::resolve_client_ip;
+use crate::resolve_client_ip;
 use axum::{
     extract::ConnectInfo,
     http::{Request, StatusCode},
