@@ -2117,7 +2117,8 @@ async fn disable_mfa(
 mod tests {
     use super::{
         assign_role, authorize_admin_target, authorize_role_assignment, delete_user, remove_role,
-        verify_magic_link, AdminTargetDenied, AssignRoleRequest, RoleChangeDenied, VerifyTokenQuery,
+        verify_magic_link, AdminTargetDenied, AssignRoleRequest, RoleChangeDenied,
+        VerifyTokenQuery,
     };
     use crate::auth_service::UserAuthError;
     use crate::context::AuthContext;
