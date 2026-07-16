@@ -305,7 +305,8 @@ impl ServeCommand {
             });
         }
 
-        // Update notifier: shortly after startup, then daily, check GitHub
+        // Update notifier: shortly after startup, then at the configured
+        // interval (two hours by default), check GitHub
         // for a newer release on this install's channel (stable vs beta is
         // inferred from the running version tag). Hits land in this shared
         // slot, which the console registers as a service so the settings API
@@ -316,8 +317,10 @@ impl ServeCommand {
         // blocking proxy) and `--role=console` (the console block_on below
         // runs on this same runtime).
         let update_status = Arc::new(temps_core::UpdateStatusSlot::new());
+        let update_check_interval = crate::commands::upgrade::configured_update_check_interval();
         rt.spawn(crate::commands::upgrade::update_notifier_loop(
             update_status.clone(),
+            update_check_interval,
         ));
 
         // Connect to Docker once and share the handle between:

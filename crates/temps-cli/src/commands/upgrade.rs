@@ -591,10 +591,74 @@ const UPDATE_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// work (DB migrations, plugin init, proxy bind) for I/O or log attention.
 const UPDATE_CHECK_STARTUP_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Re-check interval after the startup check. Daily: frequent enough that an
-/// operator who leaves the server running still hears about releases, rare
-/// enough to be invisible in GitHub API quota (60 unauthenticated req/h).
-const UPDATE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+/// Default re-check interval. Two hours stays comfortably below GitHub's
+/// unauthenticated API limit while surfacing releases promptly.
+const DEFAULT_UPDATE_CHECK_INTERVAL_HOURS: u64 = 2;
+const DEFAULT_UPDATE_CHECK_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(DEFAULT_UPDATE_CHECK_INTERVAL_HOURS * 60 * 60);
+const UPDATE_CHECK_INTERVAL_ENV: &str = "TEMPS_UPDATE_CHECK_INTERVAL_HOURS";
+const MIN_UPDATE_CHECK_INTERVAL_HOURS: u64 = 1;
+const MAX_UPDATE_CHECK_INTERVAL_HOURS: u64 = 168;
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+enum UpdateCheckIntervalError {
+    #[error("value '{value}' is not a whole number of hours")]
+    InvalidNumber { value: String },
+    #[error("{hours} hours is outside the supported range 1..=168")]
+    OutOfRange { hours: u64 },
+    #[error("value is not valid UTF-8")]
+    NotUnicode,
+}
+
+fn parse_update_check_interval_hours(value: &str) -> Result<u64, UpdateCheckIntervalError> {
+    let hours =
+        value
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| UpdateCheckIntervalError::InvalidNumber {
+                value: value.to_string(),
+            })?;
+    if !(MIN_UPDATE_CHECK_INTERVAL_HOURS..=MAX_UPDATE_CHECK_INTERVAL_HOURS).contains(&hours) {
+        return Err(UpdateCheckIntervalError::OutOfRange { hours });
+    }
+    Ok(hours)
+}
+
+pub fn configured_update_check_interval() -> std::time::Duration {
+    let configured_hours = match std::env::var(UPDATE_CHECK_INTERVAL_ENV) {
+        Ok(value) => match parse_update_check_interval_hours(&value) {
+            Ok(hours) => hours,
+            Err(error) => {
+                tracing::warn!(
+                    variable = UPDATE_CHECK_INTERVAL_ENV,
+                    value = %value,
+                    error = %error,
+                    default_hours = DEFAULT_UPDATE_CHECK_INTERVAL_HOURS,
+                    "Invalid update-check interval; using the default"
+                );
+                return DEFAULT_UPDATE_CHECK_INTERVAL;
+            }
+        },
+        Err(std::env::VarError::NotPresent) => DEFAULT_UPDATE_CHECK_INTERVAL_HOURS,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            let error = UpdateCheckIntervalError::NotUnicode;
+            tracing::warn!(
+                variable = UPDATE_CHECK_INTERVAL_ENV,
+                error = %error,
+                default_hours = DEFAULT_UPDATE_CHECK_INTERVAL_HOURS,
+                "Invalid update-check interval; using the default"
+            );
+            return DEFAULT_UPDATE_CHECK_INTERVAL;
+        }
+    };
+    let interval = std::time::Duration::from_secs(configured_hours * 60 * 60);
+    tracing::info!(
+        interval_hours = configured_hours,
+        variable = UPDATE_CHECK_INTERVAL_ENV,
+        "Release update-check cadence configured"
+    );
+    interval
+}
 
 /// A newer release the background notifier found for this install's channel.
 pub struct UpdateNotice {
@@ -719,12 +783,15 @@ pub async fn check_for_newer_release() -> Option<UpdateNotice> {
 }
 
 /// Background task for `temps serve`: check for a newer release shortly
-/// after startup, then re-check daily. Each hit is published into the
+/// after startup, then re-check at the configured interval. Each hit is published into the
 /// shared `UpdateStatusSlot`, which `GET /settings/update-status` serves so
 /// the web console can render an upgrade banner; a single WARN line covers
 /// headless/log-only operators. Never returns; the caller detaches it on a
 /// long-lived runtime.
-pub async fn update_notifier_loop(slot: Arc<temps_core::UpdateStatusSlot>) {
+pub async fn update_notifier_loop(
+    slot: Arc<temps_core::UpdateStatusSlot>,
+    interval: std::time::Duration,
+) {
     tokio::time::sleep(UPDATE_CHECK_STARTUP_DELAY).await;
     loop {
         if let Some(notice) = check_for_newer_release().await {
@@ -747,7 +814,7 @@ pub async fn update_notifier_loop(slot: Arc<temps_core::UpdateStatusSlot>) {
                 checked_at: chrono::Utc::now(),
             });
         }
-        tokio::time::sleep(UPDATE_CHECK_INTERVAL).await;
+        tokio::time::sleep(interval).await;
     }
 }
 
@@ -1546,6 +1613,37 @@ mod tests {
         assert!(!is_newer_version("v2.0.0", "local-dev"));
         assert!(!is_newer_version("v1.2", "v1.1.0"));
         assert!(!is_newer_version("v1.2.3.4", "v1.1.0"));
+    }
+
+    #[test]
+    fn test_update_check_interval_defaults_to_two_hours() {
+        assert_eq!(
+            DEFAULT_UPDATE_CHECK_INTERVAL,
+            std::time::Duration::from_secs(2 * 60 * 60)
+        );
+    }
+
+    #[test]
+    fn test_update_check_interval_parser_accepts_bounded_whole_hours() {
+        assert_eq!(parse_update_check_interval_hours("1"), Ok(1));
+        assert_eq!(parse_update_check_interval_hours(" 2 "), Ok(2));
+        assert_eq!(parse_update_check_interval_hours("168"), Ok(168));
+    }
+
+    #[test]
+    fn test_update_check_interval_parser_rejects_invalid_values() {
+        assert!(matches!(
+            parse_update_check_interval_hours("0"),
+            Err(UpdateCheckIntervalError::OutOfRange { hours: 0 })
+        ));
+        assert!(matches!(
+            parse_update_check_interval_hours("169"),
+            Err(UpdateCheckIntervalError::OutOfRange { hours: 169 })
+        ));
+        assert!(matches!(
+            parse_update_check_interval_hours("1.5"),
+            Err(UpdateCheckIntervalError::InvalidNumber { .. })
+        ));
     }
 
     // ── Channel logic ─────────────────────────────────────────────────────
