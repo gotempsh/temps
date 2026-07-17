@@ -112,7 +112,7 @@ fn wrap_stream_with_usage_tracking(
         Box<dyn tokio_stream::Stream<Item = Result<Bytes, AiGatewayError>> + Send>,
     >,
     usage_service: Arc<UsageService>,
-    user_id: i32,
+    user_id: Option<i32>,
     provider: String,
     model: String,
     start: Instant,
@@ -165,7 +165,7 @@ fn wrap_stream_with_usage_tracking(
                 tokio::spawn(async move {
                     if let Err(e) = usage_service
                         .log_usage_with_context(
-                            Some(user_id),
+                            user_id,
                             &provider,
                             &model,
                             input,
@@ -404,7 +404,9 @@ async fn chat_completions(
     let start = Instant::now();
     let model = request.model.clone();
     let is_streaming = request.stream;
-    let user_id = auth.user_id();
+    // None for deployment tokens (machine callers) so usage rows store NULL
+    // instead of falsely attributing all deployed-app traffic to user id 0.
+    let user_id = auth.user_id_opt();
 
     if is_streaming {
         match app_state
@@ -418,7 +420,7 @@ async fn chat_completions(
 
                 info!(
                     model = model,
-                    user_id = user_id,
+                    user_id = ?user_id,
                     streaming = true,
                     credential_type = credential_type_str(cred_type),
                     "AI gateway streaming request started"
@@ -495,7 +497,7 @@ async fn chat_completions(
                     tokio::spawn(async move {
                         if let Err(e) = usage_service
                             .log_usage_with_context(
-                                Some(user_id),
+                                user_id,
                                 &provider_clone,
                                 &model_clone,
                                 input,
@@ -516,7 +518,7 @@ async fn chat_completions(
 
                 info!(
                     model = model,
-                    user_id = user_id,
+                    user_id = ?user_id,
                     latency_ms = latency.as_millis() as u64,
                     credential_type = credential_type_str(cred_type),
                     "AI gateway request completed"
@@ -627,10 +629,86 @@ async fn embeddings(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AiGatewayExecute);
 
+    if request.model.is_empty() {
+        return Ok(error_to_response(AiGatewayError::Validation {
+            message: "model field is required".to_string(),
+        })
+        .into_response());
+    }
+
+    match &request.input {
+        EmbeddingInput::Single(s) if s.is_empty() => {
+            return Ok(error_to_response(AiGatewayError::Validation {
+                message: "input cannot be empty".to_string(),
+            })
+            .into_response());
+        }
+        EmbeddingInput::Multiple(items) if items.is_empty() => {
+            return Ok(error_to_response(AiGatewayError::Validation {
+                message: "input array cannot be empty".to_string(),
+            })
+            .into_response());
+        }
+        EmbeddingInput::Multiple(items) if items.len() > 2048 => {
+            return Ok(error_to_response(AiGatewayError::Validation {
+                message: format!("input array has {} items, maximum is 2048", items.len()),
+            })
+            .into_response());
+        }
+        _ => {}
+    }
+
     let byok = extract_byok(&headers);
+    let ai_context = extract_ai_context(&headers);
+    let start = Instant::now();
+    let user_id = auth.user_id_opt();
 
     match app_state.gateway_service.embeddings(&request, &byok).await {
         Ok((response, cred_type)) => {
+            let latency = start.elapsed();
+            let provider_id =
+                crate::providers::route_model_to_provider(&request.model).unwrap_or("unknown");
+
+            // Log usage asynchronously (don't block the response). Embeddings
+            // only consume prompt tokens; there is no completion output.
+            {
+                let usage_service = app_state.usage_service.clone();
+                let model = request.model.clone();
+                let provider = provider_id.to_string();
+                let input_tokens = response.usage.prompt_tokens;
+                let latency_ms = latency.as_millis() as i32;
+                let is_byok = cred_type == CredentialType::Byok;
+                let ctx = ai_context.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = usage_service
+                        .log_usage_with_context(
+                            user_id,
+                            &provider,
+                            &model,
+                            input_tokens,
+                            0,
+                            latency_ms,
+                            0,
+                            200,
+                            false,
+                            is_byok,
+                            &ctx,
+                        )
+                        .await
+                    {
+                        error!(error = %e, "Failed to log AI embedding usage");
+                    }
+                });
+            }
+
+            info!(
+                model = request.model,
+                user_id = ?user_id,
+                latency_ms = latency.as_millis() as u64,
+                credential_type = credential_type_str(cred_type),
+                "AI gateway embedding request completed"
+            );
+
             let resp = axum::response::Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "application/json")
