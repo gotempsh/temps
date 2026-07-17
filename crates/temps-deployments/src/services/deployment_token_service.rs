@@ -1566,6 +1566,7 @@ mod tests {
             "analytics:read",
             "events:write",
             "errors:read",
+            "ai_gateway:execute",
             "*",
         ];
 
