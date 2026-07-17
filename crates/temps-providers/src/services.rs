@@ -8985,6 +8985,68 @@ echo "[restore] Pre-seed complete"
         })
     }
 
+    /// Sample stats for every container in this service against a
+    /// caller-held baseline map (`container_name` → previous raw sample).
+    ///
+    /// Designed for periodic pollers (e.g. the health monitor's 30s loop):
+    /// the poll interval itself provides the CPU delta window, so unlike
+    /// `get_service_stats` no artificial 1s sleep per container is needed.
+    /// The first tick for a container has no baseline, so `cpu_percent` is
+    /// `None` (memory is still reported) and the baseline is seeded for the
+    /// next tick.
+    ///
+    /// The baseline map is rewritten on every call: entries for containers
+    /// that no longer back the service are dropped, and entries whose
+    /// sample failed this tick (container stopped / remote node) are
+    /// carried over unchanged — cumulative counters stay valid across a
+    /// longer window, and a restart in between reads back as a counter
+    /// reset which `cpu_percent_from_delta` already rejects.
+    pub async fn sample_service_stats(
+        &self,
+        service: &external_services::Model,
+        baselines: &mut HashMap<String, bollard::models::ContainerStatsResponse>,
+    ) -> Result<ServiceStatsReport, ExternalServiceError> {
+        let containers = self.resolve_member_containers(service).await?;
+
+        let mut members = Vec::with_capacity(containers.len());
+        let mut next_baselines = HashMap::with_capacity(containers.len());
+
+        for (role, name) in containers {
+            match sample_container_stats_once(&self.docker, &name).await {
+                Some(current) => {
+                    let previous = baselines.get(&name);
+                    members.push(compute_stats_sample(role, name.clone(), &current, previous));
+                    next_baselines.insert(name, current);
+                }
+                None => {
+                    // Container missing/stopped or on a remote node — keep
+                    // the old baseline (if any) so a later success still has
+                    // a valid delta window.
+                    if let Some(prev) = baselines.remove(&name) {
+                        next_baselines.insert(name.clone(), prev);
+                    }
+                    members.push(ContainerStatsSample {
+                        role,
+                        container_name: name,
+                        cpu_percent: None,
+                        memory_usage_bytes: None,
+                        memory_limit_bytes: None,
+                        memory_percent: None,
+                        online_cpus: None,
+                    });
+                }
+            }
+        }
+
+        *baselines = next_baselines;
+
+        Ok(ServiceStatsReport {
+            service_id: service.id,
+            topology: service.topology.clone(),
+            members,
+        })
+    }
+
     /// Apply a resource-limits block to every container that backs this
     /// service via Docker's live `update_container` API. Works on running
     /// AND stopped containers (Docker accepts updates for both states —
@@ -9438,6 +9500,24 @@ async fn sample_container_stats_twice(
     bollard::models::ContainerStatsResponse,
     bollard::models::ContainerStatsResponse,
 )> {
+    let first = sample_container_stats_once(docker, name).await?;
+
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    let second = sample_container_stats_once(docker, name).await?;
+
+    Some((first, second))
+}
+
+/// Take a single `one_shot` stats sample from a container. Returns `None`
+/// on any error or if Docker returns no frames (container missing /
+/// stopped). Note Docker zeroes `precpu_stats` on one_shot responses, so a
+/// lone sample cannot yield a CPU percent — callers must diff two samples
+/// (`sample_container_stats_twice`, or a poller holding its own baseline).
+async fn sample_container_stats_once(
+    docker: &bollard::Docker,
+    name: &str,
+) -> Option<bollard::models::ContainerStatsResponse> {
     use futures::StreamExt;
 
     let opts = bollard::query_parameters::StatsOptionsBuilder::default()
@@ -9445,16 +9525,8 @@ async fn sample_container_stats_twice(
         .one_shot(true)
         .build();
 
-    let mut first_stream = docker.stats(name, Some(opts.clone()));
-    let first = first_stream.next().await?.ok()?;
-    drop(first_stream);
-
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-    let mut second_stream = docker.stats(name, Some(opts));
-    let second = second_stream.next().await?.ok()?;
-
-    Some((first, second))
+    let mut stream = docker.stats(name, Some(opts));
+    stream.next().await?.ok()
 }
 
 /// Compute the docker-CLI-equivalent CPU percent from two consecutive

@@ -200,9 +200,35 @@ pub fn install_tracing_extra(log_level: &str, log_format: &str, extra: &str) {
             .boxed(),
     };
 
-    let subscriber = tracing_subscriber::registry().with(filter).with(fmt_layer);
+    let subscriber = tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt_layer)
+        .with(ErrorMetricsLayer);
     tracing::subscriber::set_global_default(subscriber)
         .expect("Failed to set global default subscriber");
+}
+
+/// Tracing layer that counts ERROR-level events for the anonymous
+/// `error_summary` telemetry event (see `temps_core::error_metrics`).
+///
+/// Records ONLY the event's target — the module path, a compile-time
+/// identifier of our own code. The message and all fields are ignored, so no
+/// user data (IDs, paths, resource names embedded in error messages) can
+/// reach telemetry. Counting is in-memory and bounded; nothing leaves the
+/// process unless the serve command's telemetry flusher is running and the
+/// operator hasn't opted out.
+struct ErrorMetricsLayer;
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ErrorMetricsLayer {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if *event.metadata().level() == tracing::Level::ERROR {
+            temps_core::error_metrics::record_log_error(event.metadata().target());
+        }
+    }
 }
 
 // Re-exported so embedding binaries build their UI bundle with the exact
@@ -403,4 +429,42 @@ pub fn run(extra_plugins: Vec<Box<dyn temps_core::plugin::TempsPlugin>>) -> anyh
     scrub_sensitive_argv();
     install_tracing(&cli.log_level, &cli.log_format);
     dispatch(cli, extra_plugins)
+}
+
+#[cfg(test)]
+mod error_metrics_layer_tests {
+    use super::*;
+    use temps_core::error_metrics::{self, CATEGORY_LOG_ERROR};
+
+    /// The layer must count ERROR events by target and ignore every other
+    /// level. Targets are unique to this test so parallel tests can't
+    /// interfere via the global counter store.
+    #[test]
+    fn counts_only_error_level_events_by_target() {
+        let subscriber = tracing_subscriber::registry().with(ErrorMetricsLayer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::error!(
+                target: "layer_test_error_target",
+                "message with user data {} that must never be recorded",
+                "/home/alice/secret"
+            );
+            tracing::error!(target: "layer_test_error_target", "second error");
+            tracing::warn!(target: "layer_test_warn_target", "not counted");
+            tracing::info!(target: "layer_test_info_target", "not counted");
+        });
+
+        let counters = error_metrics::global();
+        assert_eq!(
+            counters.count_for(CATEGORY_LOG_ERROR, "layer_test_error_target"),
+            2
+        );
+        assert_eq!(
+            counters.count_for(CATEGORY_LOG_ERROR, "layer_test_warn_target"),
+            0
+        );
+        assert_eq!(
+            counters.count_for(CATEGORY_LOG_ERROR, "layer_test_info_target"),
+            0
+        );
+    }
 }

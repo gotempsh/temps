@@ -1090,12 +1090,24 @@ export type AppSettingsResponse = {
      * effective backend and warns when it diverges from the configured store.
      */
     effective_metrics_store: MetricsStoreKind;
+    /**
+     * Storage backend actually used for proxy logs, OTel spans, and OTel
+     * metrics. OTel logs remain TimescaleDB-backed.
+     */
+    effective_observability_store: MetricsStoreKind;
     external_url?: string | null;
     insecure_tls: boolean;
     internal_url?: string | null;
     letsencrypt: LetsEncryptSettings;
     monitoring: MonitoringSettingsMasked;
+    /**
+     * Number of enabled, running services included in the metrics scrape
+     * cycle. Null when the count could not be loaded.
+     */
+    monitored_services_count: number | null;
     multi_node: MultiNodeSettingsMasked;
+    observability_compression: ObservabilityCompressionSettings;
+    observability_retention: ObservabilityRetentionSettings;
     preview_domain: string;
     preview_gateway: PreviewGatewaySettingsMasked;
     rate_limiting: RateLimitSettings;
@@ -2518,6 +2530,35 @@ export type ContainerLogsQuery = {
      * Include timestamps in log output (default: false)
      */
     timestamps?: boolean;
+};
+
+/**
+ * One bucketed data point of a container resource metric time series.
+ */
+export type ContainerMetricHistoryPoint = {
+    /**
+     * Bucket timestamp (ISO 8601 with `Z` suffix).
+     */
+    time: string;
+    /**
+     * Averaged metric value for the bucket.
+     */
+    value: number;
+};
+
+/**
+ * Query parameters for the container metrics history endpoint.
+ */
+export type ContainerMetricsHistoryQuery = {
+    /**
+     * Dotted metric name, e.g. `container.cpu_percent` or
+     * `container.memory_used_bytes`.
+     */
+    metric: string;
+    /**
+     * Time window: `1h`, `6h`, `24h`, or `7d` (defaults to `1h`).
+     */
+    range?: string;
 };
 
 /**
@@ -9432,6 +9473,24 @@ export type MonitoringSettingsMasked = {
     retention_raw_days: number;
     scrape_interval_secs: number;
     store: MetricsStoreKind;
+};
+
+export type ObservabilityCompressionSettings = {
+    /** Compress OpenTelemetry span chunks after this many hours. */
+    otel_spans_after_hours: number;
+    /** Compress proxy-log chunks after this many hours. */
+    proxy_logs_after_hours: number;
+};
+
+export type ObservabilityRetentionSettings = {
+    /** OpenTelemetry log-event retention in days. */
+    otel_logs_days: number;
+    /** OpenTelemetry metric-point retention in days. */
+    otel_metrics_days: number;
+    /** OpenTelemetry span/trace retention in days. */
+    otel_spans_days: number;
+    /** Raw proxy request-log retention in days. */
+    proxy_logs_days: number;
 };
 
 export type MrrBucketResponse = {
@@ -37718,6 +37777,64 @@ export type GetContainerMetricsResponses = {
 };
 
 export type GetContainerMetricsResponse = GetContainerMetricsResponses[keyof GetContainerMetricsResponses];
+
+export type ContainerMetricsGetHistoryData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Container ID
+         */
+        container_id: string;
+    };
+    query: {
+        /**
+         * Dotted metric name, e.g. `container.cpu_percent` or
+         * `container.memory_used_bytes`.
+         */
+        metric: string;
+        /**
+         * Time window: `1h`, `6h`, `24h`, or `7d` (defaults to `1h`).
+         */
+        range?: string;
+    };
+    url: '/projects/{project_id}/environments/{environment_id}/containers/{container_id}/metrics/history';
+};
+
+export type ContainerMetricsGetHistoryErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Container not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * Metrics store not available
+     */
+    503: unknown;
+};
+
+export type ContainerMetricsGetHistoryResponses = {
+    /**
+     * Metric time series data points
+     */
+    200: Array<ContainerMetricHistoryPoint>;
+};
+
+export type ContainerMetricsGetHistoryResponse = ContainerMetricsGetHistoryResponses[keyof ContainerMetricsGetHistoryResponses];
 
 export type StreamContainerMetricsData = {
     body?: never;

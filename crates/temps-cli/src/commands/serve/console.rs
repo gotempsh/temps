@@ -246,6 +246,105 @@ fn spawn_heartbeat_task(
     });
 }
 
+/// Interval between anonymous `error_summary` flushes. Shorter than the daily
+/// heartbeat so shorter-lived instances still report, but coarse enough that
+/// even a melting-down instance costs at most 4 small POSTs per day.
+const ERROR_SUMMARY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
+/// Spawn a detached task that drains the process-global error counters (see
+/// `temps_core::error_metrics`) every [`ERROR_SUMMARY_INTERVAL`] and reports
+/// one aggregated `error_summary` event. Emits nothing when no errors were
+/// recorded, so healthy instances stay silent. Best-effort and opt-out aware
+/// like every other telemetry emission.
+fn spawn_error_summary_task(
+    reporter: std::sync::Arc<dyn temps_core::telemetry::TelemetryReporter>,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(ERROR_SUMMARY_INTERVAL);
+        // Skip the immediate first tick: nothing meaningful has accumulated
+        // at boot, and instance_started already covers "alive today".
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let Some(summary) = temps_core::error_metrics::global().drain() else {
+                continue;
+            };
+            reporter.report(build_error_summary_event(&summary));
+            tracing::debug!("emitted anonymous error_summary telemetry event");
+        }
+    });
+}
+
+/// Build the `error_summary` telemetry event from a drained counter snapshot.
+///
+/// Every value is a count or a compile-time identifier of our own code
+/// (tracing target, route template, crate-relative source location) — see the
+/// privacy contract in `temps_core::error_metrics`. `overflow` is included
+/// only when non-zero so truncation by the key cap is never silent.
+fn build_error_summary_event(
+    summary: &temps_core::error_metrics::ErrorSummary,
+) -> temps_core::telemetry::TelemetryEvent {
+    use temps_core::telemetry::{TelemetryEvent, TelemetryEventKind};
+
+    let mut event = TelemetryEvent::new(TelemetryEventKind::ErrorSummary)
+        .with(
+            "window_hours",
+            (ERROR_SUMMARY_INTERVAL.as_secs() / 3600) as i64,
+        )
+        .with("total", summary.total as i64)
+        .with_opt(
+            "overflow",
+            (summary.overflow > 0).then_some(summary.overflow as i64),
+        );
+    for (category, count) in &summary.category_totals {
+        event = event.with(format!("{category}_total"), *count as i64);
+    }
+    let top: Vec<serde_json::Value> = summary
+        .top
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "category": entry.category,
+                "key": entry.key,
+                "count": entry.count,
+            })
+        })
+        .collect();
+    event.with("top", serde_json::Value::Array(top))
+}
+
+/// Middleware counting console-API 5xx responses for the anonymous
+/// `error_summary` telemetry event.
+///
+/// Records only the method, the route TEMPLATE (axum's `MatchedPath`, e.g.
+/// `/api/projects/{id}` — never the concrete URL, query, or body), and the
+/// status code. Unmatched requests (e.g. the SPA fallback) are recorded under
+/// the fixed label `unmatched` so a 500 storm there is still visible without
+/// capturing raw paths. Runs only on the console listeners — proxied user-app
+/// traffic never passes through this router, so user requests are never
+/// counted. Cost outside the 5xx case is one extension lookup and two short
+/// string allocations per request (fine for the control plane; this
+/// middleware must never be mounted on the proxy data path).
+async fn track_server_errors(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let route = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|matched| matched.as_str().to_owned());
+    let method = req.method().as_str().to_owned();
+    let response = next.run(req).await;
+    if response.status().is_server_error() {
+        temps_core::error_metrics::record_http_5xx(
+            &method,
+            route.as_deref().unwrap_or("unmatched"),
+            response.status().as_u16(),
+        );
+    }
+    response
+}
+
 /// This user is referenced by webhook-created resources (e.g., GitHub App installations)
 /// that don't have an authenticated user context.
 async fn ensure_system_user(db: &sea_orm::DatabaseConnection) -> anyhow::Result<()> {
@@ -1525,6 +1624,20 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         update_status,
     } = params;
 
+    // Count panics for the anonymous `error_summary` telemetry event. Only
+    // the sanitized source location (crate-relative file:line) is recorded —
+    // never the panic message, which can embed user data. Chains to the
+    // previous hook so normal backtrace printing is unaffected. Task panics
+    // don't kill the process, so they are flushed by the summary task below;
+    // a fatal main-thread panic may be lost, which is acceptable for v1.
+    {
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |panic_info| {
+            temps_core::error_metrics::record_panic(panic_info.location());
+            previous_hook(panic_info);
+        }));
+    }
+
     // Readiness flag for the `/readyz` probe. Starts `false` (not ready) and is
     // flipped to `true` at the same point the legacy `ready_signal` fires —
     // after the full plugin system has initialized and immediately before the
@@ -1978,6 +2091,11 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
             // instance still checks in even when it isn't deploying. No-op when
             // telemetry is disabled (guarded above + report() no-ops anyway).
             spawn_heartbeat_task(reporter.clone(), db.clone());
+            // Periodic aggregated error_summary flush (ERROR logs / console
+            // 5xx / panics — counts only, never messages). Only spawned when
+            // telemetry is enabled; the counters themselves are just bounded
+            // in-process memory either way.
+            spawn_error_summary_task(reporter.clone());
         }
     }
     if let Some(user_service) = service_context.get_service::<temps_auth::UserService>() {
@@ -2325,14 +2443,25 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         use temps_providers::health_monitor::{
             ExternalServiceHealthConfig, ExternalServiceHealthMonitor,
         };
-        let health_monitor = Arc::new(ExternalServiceHealthMonitor::new(
+        let mut health_monitor = ExternalServiceHealthMonitor::new(
             db.clone(),
             external_service_manager,
             notification_service,
             ExternalServiceHealthConfig::default(),
             docker.clone(),
             service_context.require_service::<temps_core::EncryptionService>(),
-        ));
+        );
+
+        // Attach the shared metrics store (registered by the MetricsScraper
+        // block above) so the monitor records container CPU/memory history
+        // for services with metrics enabled.
+        if let Some(metrics_store) =
+            service_context.get_service::<dyn temps_metrics::MetricsStore>()
+        {
+            health_monitor = health_monitor.with_metrics_store(metrics_store);
+        }
+
+        let health_monitor = Arc::new(health_monitor);
 
         // Register so the providers plugin can pick it up and expose a
         // manual-trigger endpoint that reuses the monitor's check logic.
@@ -2690,7 +2819,8 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     // regardless of `console_admin_address`.
     let public_app = Router::new()
         .merge(health_router(ready_flag.clone()))
-        .nest("/api", public_router);
+        .nest("/api", public_router)
+        .layer(axum::middleware::from_fn(track_server_errors));
 
     // Platform-console listener: when an embedding binary overrode the root
     // bundle AND configured an address, serve the ORIGINAL console (same
@@ -2704,7 +2834,8 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
 
     let admin_app = Router::new()
         .nest("/api", admin_router)
-        .fallback(serve_static_file);
+        .fallback(serve_static_file)
+        .layer(axum::middleware::from_fn(track_server_errors));
 
     // Defense-in-depth: the Pingora proxy is now the primary enforcer (it
     // 404s gated requests before they ever reach this listener). The axum
@@ -2722,6 +2853,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         let platform_app = Router::new()
             .nest("/api", router)
             .fallback(serve_original_console)
+            .layer(axum::middleware::from_fn(track_server_errors))
             .layer(axum::middleware::from_fn_with_state(
                 admin_gate_handle.clone(),
                 super::admin_gate::admin_gate,
@@ -3171,5 +3303,173 @@ mod ai_tool_allowlist_tests {
             "DeploymentMetricsToggle is a write (PATCH) operation and must never be \
              resolvable via the read-only AI tool allowlist"
         );
+    }
+}
+
+#[cfg(test)]
+mod error_telemetry_tests {
+    use super::*;
+    use axum::response::IntoResponse;
+    use axum::routing::get;
+    use temps_core::error_metrics::{self, CATEGORY_HTTP_5XX};
+    use tower::ServiceExt;
+
+    async fn failing_handler() -> axum::response::Response {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "it broke, with details that must never reach telemetry",
+        )
+            .into_response()
+    }
+
+    async fn ok_handler() -> &'static str {
+        "ok"
+    }
+
+    fn get_request(uri: &str) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .expect("valid test request")
+    }
+
+    /// The middleware must count 5xx responses under the route TEMPLATE (the
+    /// compile-time string from our route table), never the concrete request
+    /// path, and must not count non-5xx responses at all. Route names are
+    /// unique to this test so parallel tests can't interfere via the global
+    /// counter store.
+    #[tokio::test]
+    async fn track_server_errors_counts_5xx_by_route_template_only() {
+        let app = Router::new()
+            .route("/error-telemetry-test/{id}", get(failing_handler))
+            .route("/error-telemetry-test-ok", get(ok_handler))
+            .layer(axum::middleware::from_fn(track_server_errors));
+
+        let response = app
+            .clone()
+            .oneshot(get_request("/error-telemetry-test/12345"))
+            .await
+            .expect("request succeeds");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        let response = app
+            .oneshot(get_request("/error-telemetry-test-ok"))
+            .await
+            .expect("request succeeds");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let counters = error_metrics::global();
+        assert_eq!(
+            counters.count_for(CATEGORY_HTTP_5XX, "GET /error-telemetry-test/{id} 500"),
+            1,
+            "5xx must be recorded under the route template"
+        );
+        assert_eq!(
+            counters.count_for(CATEGORY_HTTP_5XX, "GET /error-telemetry-test/12345 500"),
+            0,
+            "the concrete request path must never be recorded"
+        );
+        assert_eq!(
+            counters.count_for(CATEGORY_HTTP_5XX, "GET /error-telemetry-test-ok 200"),
+            0,
+            "non-5xx responses must not be recorded"
+        );
+    }
+
+    /// Requests that don't match any route (SPA fallback and friends) are
+    /// recorded under the fixed `unmatched` label — visible, but without
+    /// capturing the raw path.
+    #[tokio::test]
+    async fn track_server_errors_uses_unmatched_label_for_fallback() {
+        async fn failing_fallback() -> axum::response::Response {
+            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response()
+        }
+
+        let app = Router::new()
+            .fallback(failing_fallback)
+            .layer(axum::middleware::from_fn(track_server_errors));
+
+        let before = error_metrics::global().count_for(CATEGORY_HTTP_5XX, "GET unmatched 500");
+        let response = app
+            .oneshot(get_request("/error-telemetry-secret-user-path"))
+            .await
+            .expect("request succeeds");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        let counters = error_metrics::global();
+        assert_eq!(
+            counters.count_for(CATEGORY_HTTP_5XX, "GET unmatched 500"),
+            before + 1
+        );
+        assert_eq!(
+            counters.count_for(
+                CATEGORY_HTTP_5XX,
+                "GET /error-telemetry-secret-user-path 500"
+            ),
+            0,
+            "unmatched raw paths must never be recorded"
+        );
+    }
+
+    /// The error_summary event must carry only counts and identifier keys —
+    /// with per-category totals, a capped top list, and overflow present only
+    /// when keys were actually dropped.
+    #[test]
+    fn build_error_summary_event_shape() {
+        use temps_core::error_metrics::{ErrorCount, ErrorSummary};
+
+        let summary = ErrorSummary {
+            total: 7,
+            overflow: 0,
+            category_totals: vec![("http_5xx", 2), ("log_error", 5)],
+            top: vec![
+                ErrorCount {
+                    category: "log_error",
+                    key: "temps_backup::service".to_string(),
+                    count: 5,
+                },
+                ErrorCount {
+                    category: "http_5xx",
+                    key: "GET /api/projects/{id} 500".to_string(),
+                    count: 2,
+                },
+            ],
+        };
+
+        let event = build_error_summary_event(&summary);
+        assert_eq!(event.event_type, "error_summary");
+        assert_eq!(event.properties["total"], serde_json::json!(7));
+        assert_eq!(event.properties["log_error_total"], serde_json::json!(5));
+        assert_eq!(event.properties["http_5xx_total"], serde_json::json!(2));
+        assert!(
+            !event.properties.contains_key("overflow"),
+            "overflow must be omitted when zero"
+        );
+
+        let top = event.properties["top"].as_array().expect("top is an array");
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0]["key"], serde_json::json!("temps_backup::service"));
+        assert_eq!(top[0]["count"], serde_json::json!(5));
+    }
+
+    #[test]
+    fn build_error_summary_event_reports_overflow_when_capped() {
+        use temps_core::error_metrics::ErrorSummary;
+
+        let summary = ErrorSummary {
+            total: 10,
+            overflow: 3,
+            category_totals: vec![("log_error", 7)],
+            top: vec![],
+        };
+
+        let event = build_error_summary_event(&summary);
+        assert_eq!(event.properties["overflow"], serde_json::json!(3));
     }
 }

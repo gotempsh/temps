@@ -20,6 +20,7 @@ temps-error-tracking = { path = "../temps-error-tracking" }
 temps-file-store = { path = "../temps-file-store" }
 temps-git = { path = "../temps-git" }
 temps-logs = { path = "../temps-logs" }
+temps-metrics = { path = "../temps-metrics" }
 temps-queue = { path = "../temps-queue" }
 temps-providers = { path = "../temps-providers" }
 temps-presets = { path = "../temps-presets" }

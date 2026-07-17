@@ -8,6 +8,35 @@ use std::collections::HashMap;
 
 use crate::error::MetricsError;
 
+/// Returns `true` when a metric should be treated as a cumulative monotonic
+/// counter for query purposes — i.e. the raw values must be LAG-differenced
+/// to produce a meaningful rate-of-change chart.
+///
+/// OTLP cumulative Sum metrics (RustFS, etc.) are stored as raw Gauge values
+/// in `service_metrics` to avoid double-delta corruption. This flag tells the
+/// query layer to apply the LAG window function at read time.
+pub fn is_monotonic_counter(metric_name: &str) -> bool {
+    // OpenMetrics/Prometheus convention: _total suffix = cumulative counter.
+    // Also match common patterns from OTLP exporters.
+    metric_name.ends_with("_total")
+        || metric_name.ends_with(".total")
+        || metric_name.ends_with("_count")
+        || metric_name.ends_with(".count")
+}
+
+/// Convert a UI `range` string (`1h`, `6h`, `24h`, `7d`) to
+/// `(window_duration, bucket_step)` for a [`RangeQuery`]. Unknown ranges
+/// fall back to the 1-hour window.
+pub fn range_to_step(range: &str) -> (Duration, Duration) {
+    match range {
+        "1h" => (Duration::hours(1), Duration::minutes(1)),
+        "6h" => (Duration::hours(6), Duration::minutes(5)),
+        "24h" => (Duration::hours(24), Duration::minutes(15)),
+        "7d" => (Duration::days(7), Duration::hours(1)),
+        _ => (Duration::hours(1), Duration::minutes(1)),
+    }
+}
+
 /// The kind of metric value being stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetricKind {
@@ -196,4 +225,40 @@ pub trait MetricsStore: Send + Sync {
     /// Continuous-aggregate retention is managed by TimescaleDB refresh
     /// policies; this method only touches the raw `service_metrics` table.
     async fn prune(&self, older_than: DateTime<Utc>) -> Result<u64, MetricsError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_range_to_step_1h() {
+        let (window, step) = range_to_step("1h");
+        assert_eq!(window, Duration::hours(1));
+        assert_eq!(step, Duration::minutes(1));
+    }
+
+    #[test]
+    fn test_range_to_step_7d() {
+        let (window, step) = range_to_step("7d");
+        assert_eq!(window, Duration::days(7));
+        assert_eq!(step, Duration::hours(1));
+    }
+
+    #[test]
+    fn test_range_to_step_unknown_defaults_to_1h() {
+        let (window, step) = range_to_step("30d");
+        assert_eq!(window, Duration::hours(1));
+        assert_eq!(step, Duration::minutes(1));
+    }
+
+    #[test]
+    fn test_is_monotonic_counter_suffixes() {
+        assert!(is_monotonic_counter("pg.blks_read_total"));
+        assert!(is_monotonic_counter("mongo.op_insert.total"));
+        assert!(is_monotonic_counter("http.requests_count"));
+        assert!(!is_monotonic_counter("container.cpu_percent"));
+        assert!(!is_monotonic_counter("container.memory_used_bytes"));
+        assert!(!is_monotonic_counter("container.network_rx_bytes_delta"));
+    }
 }

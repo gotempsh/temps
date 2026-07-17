@@ -1333,12 +1333,13 @@ mod tests {
     #[test]
     fn test_permission_all() {
         let all = DeploymentTokenPermission::all();
-        assert_eq!(all.len(), 6);
+        assert_eq!(all.len(), 7);
         assert!(all.contains(&DeploymentTokenPermission::VisitorsEnrich));
         assert!(all.contains(&DeploymentTokenPermission::EmailsSend));
         assert!(all.contains(&DeploymentTokenPermission::AnalyticsRead));
         assert!(all.contains(&DeploymentTokenPermission::EventsWrite));
         assert!(all.contains(&DeploymentTokenPermission::ErrorsRead));
+        assert!(all.contains(&DeploymentTokenPermission::AiGatewayExecute));
         assert!(all.contains(&DeploymentTokenPermission::FullAccess));
     }
 
@@ -1566,6 +1567,7 @@ mod tests {
             "analytics:read",
             "events:write",
             "errors:read",
+            "ai_gateway:execute",
             "*",
         ];
 

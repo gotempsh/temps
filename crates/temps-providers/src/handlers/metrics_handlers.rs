@@ -37,7 +37,7 @@ use axum::{
     routing::{get, patch, put},
     Json, Router,
 };
-use chrono::{Duration, Utc};
+use chrono::Utc;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use serde::{Deserialize, Serialize};
 use temps_auth::{permission_guard, RequireAuth};
@@ -46,41 +46,16 @@ use temps_core::{
     problemdetails::Problem,
 };
 use temps_entities::{external_services, monitoring_alert_rules};
-use temps_metrics::{LatestByLabelQuery, LatestQuery, RangeQuery, SourceKind};
+use temps_metrics::{
+    is_monotonic_counter, range_to_step, LatestByLabelQuery, LatestQuery, RangeQuery, SourceKind,
+};
 use tracing::error;
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
 use super::types::AppState;
 
-// ---------------------------------------------------------------------------
-// Helper: convert a `range` string to `(window_duration, bucket_step)`.
-// ---------------------------------------------------------------------------
-
-/// Returns `true` when a metric should be treated as a cumulative monotonic
-/// counter for query purposes — i.e. the raw values must be LAG-differenced
-/// to produce a meaningful rate-of-change chart.
-///
-/// OTLP cumulative Sum metrics (RustFS, etc.) are stored as raw Gauge values
-/// in `service_metrics` to avoid double-delta corruption. This flag tells the
-/// query layer to apply the LAG window function at read time.
-fn is_monotonic_counter(metric_name: &str) -> bool {
-    // OpenMetrics/Prometheus convention: _total suffix = cumulative counter.
-    // Also match common patterns from OTLP exporters.
-    metric_name.ends_with("_total")
-        || metric_name.ends_with(".total")
-        || metric_name.ends_with("_count")
-        || metric_name.ends_with(".count")
-}
-
-fn range_to_step(range: &str) -> (Duration, Duration) {
-    match range {
-        "1h" => (Duration::hours(1), Duration::minutes(1)),
-        "6h" => (Duration::hours(6), Duration::minutes(5)),
-        "24h" => (Duration::hours(24), Duration::minutes(15)),
-        "7d" => (Duration::days(7), Duration::hours(1)),
-        _ => (Duration::hours(1), Duration::minutes(1)),
-    }
-}
+// `is_monotonic_counter` / `range_to_step` live in `temps_metrics` (shared
+// with the deployment container metrics handlers) — imported below.
 
 // ---------------------------------------------------------------------------
 // Helper: Prometheus-compatible histogram_quantile (linear interpolation).
@@ -1504,27 +1479,6 @@ pub struct MetricsApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_range_to_step_1h() {
-        let (window, step) = range_to_step("1h");
-        assert_eq!(window, Duration::hours(1));
-        assert_eq!(step, Duration::minutes(1));
-    }
-
-    #[test]
-    fn test_range_to_step_7d() {
-        let (window, step) = range_to_step("7d");
-        assert_eq!(window, Duration::days(7));
-        assert_eq!(step, Duration::hours(1));
-    }
-
-    #[test]
-    fn test_range_to_step_unknown_defaults_to_1h() {
-        let (window, step) = range_to_step("30d");
-        assert_eq!(window, Duration::hours(1));
-        assert_eq!(step, Duration::minutes(1));
-    }
 
     #[test]
     fn test_histogram_quantile_p50() {

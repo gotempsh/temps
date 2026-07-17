@@ -61,6 +61,7 @@ arc-swap = "1"
 moka = { version = "0.12", features = ["future"] }
 ipnetwork = "0.21"
 regex = { workspace = true }
+reqwest = { workspace = true }
 once_cell = { workspace = true }
 woothee = "0.13"
 rustls = "0.23"
