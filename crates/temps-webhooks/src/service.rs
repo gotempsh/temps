@@ -286,21 +286,21 @@ impl WebhookService {
     /// 169.254.169.254 / RFC1918 at send time). IP-literal hosts involve no DNS,
     /// so the shared client is reused.
     async fn delivery_client_for(&self, url: &str) -> Result<reqwest::Client, WebhookError> {
-        let parsed = url::Url::parse(url)
-            .map_err(|e| WebhookError::InvalidConfiguration(format!("Invalid webhook URL: {}", e)))?;
+        let parsed = url::Url::parse(url).map_err(|e| {
+            WebhookError::InvalidConfiguration(format!("Invalid webhook URL: {}", e))
+        })?;
 
         match parsed.host() {
             Some(url::Host::Domain(domain)) => {
                 let port = parsed.port_or_known_default().unwrap_or(443);
-                let addrs =
-                    temps_core::url_validation::resolve_and_validate_domain(domain, port)
-                        .await
-                        .map_err(|e| {
-                            WebhookError::InvalidConfiguration(format!(
-                                "Webhook URL failed SSRF re-validation at delivery: {}",
-                                e
-                            ))
-                        })?;
+                let addrs = temps_core::url_validation::resolve_and_validate_domain(domain, port)
+                    .await
+                    .map_err(|e| {
+                        WebhookError::InvalidConfiguration(format!(
+                            "Webhook URL failed SSRF re-validation at delivery: {}",
+                            e
+                        ))
+                    })?;
                 webhook_client_builder()
                     .resolve_to_addrs(domain, &addrs)
                     .build()
@@ -369,41 +369,39 @@ impl WebhookService {
         // Build a delivery client pinned to the validated IP (SSRF/rebinding
         // guard). A re-validation failure aborts the send and is recorded as a
         // failed delivery rather than silently connecting to an internal target.
-        let (success, status_code, error_message) = match self
-            .delivery_client_for(&webhook.url)
-            .await
-        {
-            Err(e) => (false, None, Some(e.to_string())),
-            Ok(http_client) => {
-                // Send HTTP request
-                let mut request_builder = http_client
-                    .post(&webhook.url)
-                    .header("Content-Type", "application/json")
-                    .header("X-Webhook-Event", event.event_type.as_str())
-                    .header("X-Webhook-Delivery", &delivery_record.id.to_string())
-                    .header("X-Webhook-Timestamp", &timestamp);
+        let (success, status_code, error_message) =
+            match self.delivery_client_for(&webhook.url).await {
+                Err(e) => (false, None, Some(e.to_string())),
+                Ok(http_client) => {
+                    // Send HTTP request
+                    let mut request_builder = http_client
+                        .post(&webhook.url)
+                        .header("Content-Type", "application/json")
+                        .header("X-Webhook-Event", event.event_type.as_str())
+                        .header("X-Webhook-Delivery", &delivery_record.id.to_string())
+                        .header("X-Webhook-Timestamp", &timestamp);
 
-                if let Some(sig) = &signature {
-                    request_builder = request_builder.header("X-Webhook-Signature", sig);
-                }
-
-                let response = request_builder.body(payload).send().await;
-
-                match response {
-                    Ok(resp) => {
-                        let status = resp.status();
-                        // SECURITY: Do NOT store response body to prevent data exfiltration via SSRF
-                        // Response bodies could contain sensitive data from internal services
-                        let is_success = status.is_success();
-                        (is_success, Some(status.as_u16()), None)
+                    if let Some(sig) = &signature {
+                        request_builder = request_builder.header("X-Webhook-Signature", sig);
                     }
-                    Err(e) => {
-                        let error_msg = Self::format_webhook_error(&e, &webhook.url);
-                        (false, None, Some(error_msg))
+
+                    let response = request_builder.body(payload).send().await;
+
+                    match response {
+                        Ok(resp) => {
+                            let status = resp.status();
+                            // SECURITY: Do NOT store response body to prevent data exfiltration via SSRF
+                            // Response bodies could contain sensitive data from internal services
+                            let is_success = status.is_success();
+                            (is_success, Some(status.as_u16()), None)
+                        }
+                        Err(e) => {
+                            let error_msg = Self::format_webhook_error(&e, &webhook.url);
+                            (false, None, Some(error_msg))
+                        }
                     }
                 }
-            }
-        };
+            };
 
         // Update delivery record with result
         let mut delivery_update: temps_entities::webhook_deliveries::ActiveModel =
