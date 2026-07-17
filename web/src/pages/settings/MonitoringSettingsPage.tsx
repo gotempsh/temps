@@ -298,7 +298,9 @@ export function MonitoringSettingsPage() {
                     </span>
                   </div>
                   <p className="text-xs text-muted-foreground">
-                    Default 24 hours. Maximum 30 days.
+                    Compresses closed proxy-log chunks once their newest row is
+                    this old. It does not delete logs. Default 24 hours; maximum
+                    30 days.
                   </p>
                   {errors.observability_compression?.proxy_logs_after_hours && (
                     <p className="text-xs text-destructive">
@@ -336,7 +338,9 @@ export function MonitoringSettingsPage() {
                     </span>
                   </div>
                   <p className="text-xs text-muted-foreground">
-                    Default 24 hours. Maximum 90 days.
+                    Compresses closed span chunks once their newest row is this
+                    old. It does not delete traces. Default 24 hours; maximum 90
+                    days.
                   </p>
                   {errors.observability_compression?.otel_spans_after_hours && (
                     <p className="text-xs text-destructive">
@@ -388,6 +392,11 @@ export function MonitoringSettingsPage() {
                 <SelectItem value="60">60 seconds</SelectItem>
               </SelectContent>
             </Select>
+            <p className="mt-2 text-xs leading-5 text-muted-foreground">
+              Controls how often Temps samples CPU, memory, database, container,
+              and node metrics. Shorter intervals show finer detail but create
+              more raw metric rows.
+            </p>
           </div>
         </CardContent>
       </Card>
@@ -412,6 +421,17 @@ export function MonitoringSettingsPage() {
           </div>
         </CardHeader>
         <CardContent className="space-y-8">
+          <Alert>
+            <AlertCircle className="h-4 w-4" />
+            <AlertTitle>Retention permanently deletes old data</AlertTitle>
+            <AlertDescription>
+              Each value is an independent policy for one table or resolution
+              tier. Shortening a window makes data beyond that age eligible for
+              deletion on the next background policy run. Compression is
+              different: it reduces storage without deleting rows.
+            </AlertDescription>
+          </Alert>
+
           <section className="space-y-4">
             <div>
               <h3 className="text-sm font-semibold">Resource metrics</h3>
@@ -430,9 +450,14 @@ export function MonitoringSettingsPage() {
                 </p>
               </div>
             ) : (
-              <div className="grid gap-6 sm:grid-cols-3">
-                <div className="space-y-2">
+              <div className="grid gap-4 lg:grid-cols-3">
+                <div className="space-y-3 rounded-lg border p-4">
                   <Label htmlFor="retention-raw">Raw data (days)</Label>
+                  <p className="min-h-10 text-xs leading-5 text-muted-foreground">
+                    Keeps every original sample at the selected scrape interval.
+                    Used for detailed recent charts and precise incident
+                    investigation.
+                  </p>
                   <Input
                     id="retention-raw"
                     type="number"
@@ -446,7 +471,8 @@ export function MonitoringSettingsPage() {
                     })}
                   />
                   <p className="text-xs text-muted-foreground">
-                    30-second resolution. Min 1, max 30. Default 7.
+                    After expiry, hourly and daily summaries remain. Range 1–30
+                    days; default 7.
                   </p>
                   {errors.monitoring?.retention_raw_days && (
                     <p className="text-xs text-destructive">
@@ -455,8 +481,12 @@ export function MonitoringSettingsPage() {
                   )}
                 </div>
 
-                <div className="space-y-2">
+                <div className="space-y-3 rounded-lg border p-4">
                   <Label htmlFor="retention-hourly">Hourly rollup (days)</Label>
+                  <p className="min-h-10 text-xs leading-5 text-muted-foreground">
+                    Keeps one aggregated value per metric and hour. It preserves
+                    medium-term trends after the individual raw samples expire.
+                  </p>
                   <Input
                     id="retention-hourly"
                     type="number"
@@ -470,7 +500,8 @@ export function MonitoringSettingsPage() {
                     })}
                   />
                   <p className="text-xs text-muted-foreground">
-                    1-hour resolution. Min 7, max 365. Default 90.
+                    After expiry, daily summaries remain. Range 7–365 days;
+                    default 90.
                   </p>
                   {errors.monitoring?.retention_hourly_days && (
                     <p className="text-xs text-destructive">
@@ -479,8 +510,12 @@ export function MonitoringSettingsPage() {
                   )}
                 </div>
 
-                <div className="space-y-2">
+                <div className="space-y-3 rounded-lg border p-4">
                   <Label htmlFor="retention-daily">Daily rollup (years)</Label>
+                  <p className="min-h-10 text-xs leading-5 text-muted-foreground">
+                    Keeps one aggregated value per metric and day for capacity
+                    planning, seasonality, and long-term historical trends.
+                  </p>
                   <Input
                     id="retention-daily"
                     type="number"
@@ -494,7 +529,8 @@ export function MonitoringSettingsPage() {
                     })}
                   />
                   <p className="text-xs text-muted-foreground">
-                    1-day resolution. Default 2 years.
+                    This is the longest-lived metrics tier. Range 1–10 years;
+                    default 2.
                   </p>
                   {errors.monitoring?.retention_daily_years && (
                     <p className="text-xs text-destructive">
@@ -524,35 +560,62 @@ export function MonitoringSettingsPage() {
             <div>
               <h3 className="text-sm font-semibold">Logs and traces</h3>
               <p className="text-xs text-muted-foreground">
-                Raw request and OpenTelemetry signals. TimescaleDB policy
-                changes are saved immediately; cleanup runs in the background.
+                Each signal has its own table and retention window, so
+                high-volume request logs can expire sooner than traces or
+                application telemetry. TimescaleDB cleanup runs in the
+                background.
               </p>
             </div>
 
             {effectiveObservabilityStore === 'click_house' && (
               <div className="grid gap-3 sm:grid-cols-2">
-                <div className="rounded-lg border bg-muted/30 px-4 py-3">
-                  <p className="text-sm font-medium">Proxy request logs</p>
-                  <p className="mt-1 text-xs text-muted-foreground">
-                    ClickHouse TTL · 30 days per row
+                <div className="rounded-lg border bg-muted/30 p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <p className="text-sm font-medium">Proxy request logs</p>
+                    <code className="rounded bg-background px-2 py-0.5 text-[11px] text-muted-foreground ring-1 ring-inset ring-border">
+                      proxy_logs
+                    </code>
+                  </div>
+                  <p className="mt-2 text-xs leading-5 text-muted-foreground">
+                    One row per proxied HTTP request, including route, status,
+                    duration, and request metadata. ClickHouse expires each row
+                    after 30 days using its native TTL.
                   </p>
                 </div>
-                <div className="rounded-lg border bg-muted/30 px-4 py-3">
-                  <p className="text-sm font-medium">OTel spans / traces</p>
-                  <p className="mt-1 text-xs text-muted-foreground">
-                    ClickHouse TTL · 90 days per row
+                <div className="rounded-lg border bg-muted/30 p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <p className="text-sm font-medium">OTel spans / traces</p>
+                    <code className="rounded bg-background px-2 py-0.5 text-[11px] text-muted-foreground ring-1 ring-inset ring-border">
+                      spans
+                    </code>
+                  </div>
+                  <p className="mt-2 text-xs leading-5 text-muted-foreground">
+                    Individual operations that compose a distributed trace,
+                    including timings, errors, attributes, and service links.
+                    ClickHouse expires each row after 90 days using its native
+                    TTL.
                   </p>
                 </div>
               </div>
             )}
 
-            <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-4">
+            <div className="grid gap-4 md:grid-cols-2">
               {effectiveObservabilityStore !== 'click_house' && (
                 <>
-                  <div className="space-y-2">
-                    <Label htmlFor="retention-proxy-logs">
-                      Proxy logs (days)
-                    </Label>
+                  <div className="space-y-3 rounded-lg border p-4">
+                    <div className="flex items-center justify-between gap-3">
+                      <Label htmlFor="retention-proxy-logs">
+                        Proxy request logs
+                      </Label>
+                      <code className="rounded bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
+                        proxy_logs
+                      </code>
+                    </div>
+                    <p className="min-h-10 text-xs leading-5 text-muted-foreground">
+                      Keeps one record per proxied HTTP request for traffic
+                      investigation, status-code analysis, latency debugging,
+                      and request forensics.
+                    </p>
                     <Input
                       id="retention-proxy-logs"
                       type="number"
@@ -565,7 +628,10 @@ export function MonitoringSettingsPage() {
                         max: { value: 3650, message: 'Max 3650 days' },
                       })}
                     />
-                    <p className="text-xs text-muted-foreground">Default 30.</p>
+                    <p className="text-xs text-muted-foreground">
+                      Rows older than this are deleted. Range 1–3650 days;
+                      default 30.
+                    </p>
                     {errors.observability_retention?.proxy_logs_days && (
                       <p className="text-xs text-destructive">
                         {errors.observability_retention.proxy_logs_days.message}
@@ -573,10 +639,20 @@ export function MonitoringSettingsPage() {
                     )}
                   </div>
 
-                  <div className="space-y-2">
-                    <Label htmlFor="retention-otel-spans">
-                      OTel traces (days)
-                    </Label>
+                  <div className="space-y-3 rounded-lg border p-4">
+                    <div className="flex items-center justify-between gap-3">
+                      <Label htmlFor="retention-otel-spans">
+                        OTel spans / traces
+                      </Label>
+                      <code className="rounded bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
+                        otel_spans
+                      </code>
+                    </div>
+                    <p className="min-h-10 text-xs leading-5 text-muted-foreground">
+                      Keeps the spans used to reconstruct trace waterfalls,
+                      follow requests across services, and inspect timings,
+                      errors, events, and attributes.
+                    </p>
                     <Input
                       id="retention-otel-spans"
                       type="number"
@@ -589,7 +665,10 @@ export function MonitoringSettingsPage() {
                         max: { value: 3650, message: 'Max 3650 days' },
                       })}
                     />
-                    <p className="text-xs text-muted-foreground">Default 90.</p>
+                    <p className="text-xs text-muted-foreground">
+                      Expired spans disappear from trace search and detail
+                      views. Range 1–3650 days; default 90.
+                    </p>
                     {errors.observability_retention?.otel_spans_days && (
                       <p className="text-xs text-destructive">
                         {errors.observability_retention.otel_spans_days.message}
@@ -599,8 +678,18 @@ export function MonitoringSettingsPage() {
                 </>
               )}
 
-              <div className="space-y-2">
-                <Label htmlFor="retention-otel-logs">OTel logs (days)</Label>
+              <div className="space-y-3 rounded-lg border p-4">
+                <div className="flex items-center justify-between gap-3">
+                  <Label htmlFor="retention-otel-logs">OTel log records</Label>
+                  <code className="rounded bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
+                    otel_log_events
+                  </code>
+                </div>
+                <p className="min-h-10 text-xs leading-5 text-muted-foreground">
+                  Keeps structured logs received over OTLP, including severity,
+                  body, attributes, and trace correlation. This does not control
+                  Docker container log files.
+                </p>
                 <Input
                   id="retention-otel-logs"
                   type="number"
@@ -614,7 +703,7 @@ export function MonitoringSettingsPage() {
                   })}
                 />
                 <p className="text-xs text-muted-foreground">
-                  TimescaleDB · default 90.
+                  Stored in TimescaleDB. Range 1–3650 days; default 90.
                 </p>
                 {errors.observability_retention?.otel_logs_days && (
                   <p className="text-xs text-destructive">
@@ -623,10 +712,20 @@ export function MonitoringSettingsPage() {
                 )}
               </div>
 
-              <div className="space-y-2">
-                <Label htmlFor="retention-otel-metrics">
-                  OTel metrics (days)
-                </Label>
+              <div className="space-y-3 rounded-lg border p-4">
+                <div className="flex items-center justify-between gap-3">
+                  <Label htmlFor="retention-otel-metrics">
+                    OTel metric points
+                  </Label>
+                  <code className="rounded bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
+                    otel_metrics
+                  </code>
+                </div>
+                <p className="min-h-10 text-xs leading-5 text-muted-foreground">
+                  Keeps application metrics sent by OpenTelemetry SDKs and
+                  collectors. These are separate from the Temps-scraped resource
+                  metrics configured above.
+                </p>
                 <Input
                   id="retention-otel-metrics"
                   type="number"
@@ -640,7 +739,7 @@ export function MonitoringSettingsPage() {
                   })}
                 />
                 <p className="text-xs text-muted-foreground">
-                  TimescaleDB · default 90.
+                  Stored in TimescaleDB. Range 1–3650 days; default 90.
                 </p>
                 {errors.observability_retention?.otel_metrics_days && (
                   <p className="text-xs text-destructive">
