@@ -160,6 +160,8 @@ export interface PlatformSettings extends AppSettingsResponse {
   insecure_tls: boolean
   attack_mode?: boolean
   build_limits: BuildLimitsSettings
+  /** Enabled, running services included in the metrics scrape cycle. */
+  monitored_services_count: number
   observability_compression: ObservabilityCompressionSettings
   observability_retention: ObservabilityRetentionSettings
   /** Effective backend for proxy logs and OTel spans. */

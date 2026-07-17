@@ -1,5 +1,5 @@
 use crate::disk_status::DiskSpaceCheckResult;
-use crate::ConfigService;
+use crate::{ConfigService, EffectiveTelemetryPolicies};
 use axum::{
     extract::{Extension, State},
     http::StatusCode,
@@ -127,6 +127,10 @@ pub struct AppSettingsResponse {
 
     // Metrics monitoring settings (clickhouse_url masked)
     pub monitoring: MonitoringSettingsMasked,
+
+    /// Number of enabled, running services the MetricsScraper currently
+    /// includes. Used for the lightweight storage estimate in the UI.
+    pub monitored_services_count: u64,
 
     /// TimescaleDB compression delays for immutable proxy logs and OTel spans.
     pub observability_compression: ObservabilityCompressionSettings,
@@ -366,6 +370,7 @@ impl From<AppSettings> for AppSettingsResponse {
             effective_metrics_store: settings.monitoring.store.clone(),
             effective_observability_store: MetricsStoreKind::TimescaleDb,
             monitoring: MonitoringSettingsMasked::from(settings.monitoring),
+            monitored_services_count: 0,
             observability_compression: settings.observability_compression,
             observability_retention: settings.observability_retention,
             insecure_tls: settings.insecure_tls,
@@ -396,6 +401,50 @@ impl AppSettingsResponse {
         } else {
             MetricsStoreKind::TimescaleDb
         };
+        self
+    }
+
+    fn with_effective_timescale_state(
+        mut self,
+        policies: EffectiveTelemetryPolicies,
+        monitored_services_count: u64,
+    ) -> Self {
+        self.monitored_services_count = monitored_services_count;
+
+        if self.effective_metrics_store == MetricsStoreKind::TimescaleDb {
+            if let Some(days) = policies.metrics_raw_days {
+                self.monitoring.retention_raw_days = days;
+            }
+            if let Some(days) = policies.metrics_hourly_days {
+                self.monitoring.retention_hourly_days = days;
+            }
+            if let Some(years) = policies.metrics_daily_years {
+                self.monitoring.retention_daily_years = years;
+            }
+        }
+
+        if self.effective_observability_store == MetricsStoreKind::TimescaleDb {
+            if let Some(hours) = policies.proxy_logs_compression_hours {
+                self.observability_compression.proxy_logs_after_hours = hours;
+            }
+            if let Some(hours) = policies.otel_spans_compression_hours {
+                self.observability_compression.otel_spans_after_hours = hours;
+            }
+            if let Some(days) = policies.proxy_logs_retention_days {
+                self.observability_retention.proxy_logs_days = days;
+            }
+            if let Some(days) = policies.otel_spans_retention_days {
+                self.observability_retention.otel_spans_days = days;
+            }
+        }
+
+        if let Some(days) = policies.otel_logs_retention_days {
+            self.observability_retention.otel_logs_days = days;
+        }
+        if let Some(days) = policies.otel_metrics_retention_days {
+            self.observability_retention.otel_metrics_days = days;
+        }
+
         self
     }
 }
@@ -783,14 +832,35 @@ async fn get_settings(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsRead);
 
-    match app_state.config_service.get_settings().await {
+    let (settings_result, policies_result, monitored_services_result) = tokio::join!(
+        app_state.config_service.get_settings(),
+        app_state.config_service.get_effective_telemetry_policies(),
+        app_state.config_service.count_monitored_services(),
+    );
+
+    match settings_result {
         Ok(settings) => {
             // Convert to response type that masks sensitive fields, then
             // reconcile the effective metrics store with the server's
             // ClickHouse env-var configuration so the UI shows the backend the
             // runtime actually uses (not just the DB toggle).
+            let policies = policies_result.unwrap_or_else(|error| {
+                tracing::warn!(
+                    %error,
+                    "Failed to read effective TimescaleDB policies; using configured values"
+                );
+                EffectiveTelemetryPolicies::default()
+            });
+            let monitored_services_count = monitored_services_result.unwrap_or_else(|error| {
+                tracing::warn!(
+                    %error,
+                    "Failed to count monitored services; storage estimate will use zero services"
+                );
+                0
+            });
             let response = AppSettingsResponse::from(settings)
-                .with_effective_store(app_state.config_service.is_clickhouse_enabled());
+                .with_effective_store(app_state.config_service.is_clickhouse_enabled())
+                .with_effective_timescale_state(policies, monitored_services_count);
             Ok(Json(response))
         }
         Err(e) => {
@@ -1728,6 +1798,93 @@ mod tests {
         assert_eq!(response.observability_retention.otel_spans_days, 60);
         assert_eq!(response.observability_retention.otel_logs_days, 90);
         assert_eq!(response.observability_retention.otel_metrics_days, 90);
+    }
+
+    #[test]
+    fn response_uses_active_timescale_policies_and_service_count() {
+        let policies = EffectiveTelemetryPolicies {
+            metrics_raw_days: Some(14),
+            metrics_hourly_days: Some(120),
+            metrics_daily_years: Some(3),
+            proxy_logs_compression_hours: Some(12),
+            otel_spans_compression_hours: Some(18),
+            proxy_logs_retention_days: Some(21),
+            otel_spans_retention_days: Some(75),
+            otel_logs_retention_days: Some(45),
+            otel_metrics_retention_days: Some(60),
+        };
+
+        let response = AppSettingsResponse::from(AppSettings::default())
+            .with_effective_store(false)
+            .with_effective_timescale_state(policies, 7);
+
+        assert_eq!(response.monitored_services_count, 7);
+        assert_eq!(response.monitoring.retention_raw_days, 14);
+        assert_eq!(response.monitoring.retention_hourly_days, 120);
+        assert_eq!(response.monitoring.retention_daily_years, 3);
+        assert_eq!(
+            response.observability_compression.proxy_logs_after_hours,
+            12
+        );
+        assert_eq!(
+            response.observability_compression.otel_spans_after_hours,
+            18
+        );
+        assert_eq!(response.observability_retention.proxy_logs_days, 21);
+        assert_eq!(response.observability_retention.otel_spans_days, 75);
+        assert_eq!(response.observability_retention.otel_logs_days, 45);
+        assert_eq!(response.observability_retention.otel_metrics_days, 60);
+    }
+
+    #[test]
+    fn response_does_not_overlay_clickhouse_backed_values() {
+        let mut settings = AppSettings::default();
+        settings.monitoring.store = MetricsStoreKind::ClickHouse;
+        let configured_monitoring = settings.monitoring.clone();
+        let configured_compression = settings.observability_compression.clone();
+        let configured_proxy_retention = settings.observability_retention.proxy_logs_days;
+        let configured_span_retention = settings.observability_retention.otel_spans_days;
+
+        let response = AppSettingsResponse::from(settings)
+            .with_effective_store(true)
+            .with_effective_timescale_state(
+                EffectiveTelemetryPolicies {
+                    metrics_raw_days: Some(1),
+                    proxy_logs_compression_hours: Some(1),
+                    otel_spans_compression_hours: Some(1),
+                    proxy_logs_retention_days: Some(1),
+                    otel_spans_retention_days: Some(1),
+                    otel_logs_retention_days: Some(45),
+                    otel_metrics_retention_days: Some(60),
+                    ..Default::default()
+                },
+                3,
+            );
+
+        assert_eq!(
+            response.monitoring.retention_raw_days,
+            configured_monitoring.retention_raw_days
+        );
+        assert_eq!(
+            response.monitoring.retention_hourly_days,
+            configured_monitoring.retention_hourly_days
+        );
+        assert_eq!(
+            response.monitoring.retention_daily_years,
+            configured_monitoring.retention_daily_years
+        );
+        assert_eq!(response.observability_compression, configured_compression);
+        assert_eq!(
+            response.observability_retention.proxy_logs_days,
+            configured_proxy_retention
+        );
+        assert_eq!(
+            response.observability_retention.otel_spans_days,
+            configured_span_retention
+        );
+        assert_eq!(response.observability_retention.otel_logs_days, 45);
+        assert_eq!(response.observability_retention.otel_metrics_days, 60);
+        assert_eq!(response.monitored_services_count, 3);
     }
 
     // The effective metrics store reconciles the `store` toggle with the

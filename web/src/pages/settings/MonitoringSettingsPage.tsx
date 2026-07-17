@@ -96,10 +96,10 @@ const DurationInput = forwardRef<HTMLInputElement, DurationInputProps>(
 )
 DurationInput.displayName = 'DurationInput'
 
-function estimateStorageMbPerDay(scrapeIntervalSecs: number): number {
-  // Placeholder: pull the "monitored services" count from settings if available
-  // For the estimate we use a hard-coded representative value of 5 services.
-  const monitoredServices = 5
+function estimateStorageMbPerDay(
+  scrapeIntervalSecs: number,
+  monitoredServices: number
+): number {
   const scrapesPerDay = Math.floor(
     (24 * 3600) / Math.max(scrapeIntervalSecs, 15)
   )
@@ -194,8 +194,10 @@ export function MonitoringSettingsPage() {
   }
 
   const estimatedMbPerDay = estimateStorageMbPerDay(
-    monitoring?.scrape_interval_secs ?? DEFAULTS.scrape_interval_secs
+    monitoring?.scrape_interval_secs ?? DEFAULTS.scrape_interval_secs,
+    settings?.monitored_services_count ?? 0
   )
+  const monitoredServicesCount = settings?.monitored_services_count ?? 0
 
   return (
     <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
@@ -559,8 +561,9 @@ export function MonitoringSettingsPage() {
               <AlertTitle>Estimated metric storage</AlertTitle>
               <AlertDescription>
                 Approximately <strong>{estimatedMbPerDay} MB/day</strong> of raw
-                metric data based on 5 monitored services, {METRICS_PER_SERVICE}{' '}
-                metrics each, scraped every{' '}
+                metric data based on {monitoredServicesCount} monitored{' '}
+                {monitoredServicesCount === 1 ? 'service' : 'services'},{' '}
+                {METRICS_PER_SERVICE} metrics each, scraped every{' '}
                 {monitoring?.scrape_interval_secs ?? 30}s. Hourly/daily rollups
                 add roughly 5% overhead.
               </AlertDescription>
