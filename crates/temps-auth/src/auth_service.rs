@@ -65,7 +65,7 @@ pub enum AuthError {
     SamePassword,
     #[error("Password complexity check failed: {0}")]
     WeakPassword(String),
-    #[error("Account has no password set (likely a SSO/magic-link-only user)")]
+    #[error("Account has no password set (likely an SSO-only user)")]
     NoPasswordSet,
 }
 
@@ -490,88 +490,6 @@ impl AuthService {
         Ok(user)
     }
 
-    // Send magic link for passwordless login
-    pub async fn send_magic_link(&self, request: MagicLinkRequest) -> Result<(), UserAuthError> {
-        // Check if email service is configured
-
-        // Check if user exists
-        let user = temps_entities::users::Entity::find()
-            .filter(temps_entities::users::Column::Email.eq(request.email.to_lowercase()))
-            .one(self.db.as_ref())
-            .await?;
-
-        // Always return success to avoid email enumeration
-        if user.is_none() {
-            return Ok(());
-        }
-
-        // Generate magic link token
-        let token = self.generate_token();
-        let expires_at = Utc::now() + Duration::minutes(15);
-
-        // Save token to database
-        let magic_link_token = temps_entities::magic_link_tokens::ActiveModel {
-            email: Set(request.email.to_lowercase()),
-            token: Set(token.clone()),
-            expires_at: Set(expires_at),
-            used: Set(false),
-            created_at: Set(Utc::now()),
-            ..Default::default()
-        };
-
-        magic_link_token.insert(self.db.as_ref()).await?;
-        let settings = self.get_settings().await?;
-        // Send magic link email
-        let base_url = settings
-            .external_url
-            .unwrap_or_else(|| DEFAULT_EXTERNAL_URL.to_string());
-        let magic_link_url = format!("{}/auth/magic-link?token={}", base_url, token);
-
-        self.email_service
-            .send_magic_link_email(&request.email, &magic_link_url)
-            .await
-            .map_err(|e| UserAuthError::EmailServiceError(e.to_string()))?;
-
-        Ok(())
-    }
-
-    // Verify magic link token
-    pub async fn verify_magic_link(
-        &self,
-        token: &str,
-    ) -> Result<temps_entities::users::Model, UserAuthError> {
-        // Find the token
-        let magic_link = temps_entities::magic_link_tokens::Entity::find()
-            .filter(temps_entities::magic_link_tokens::Column::Token.eq(token))
-            .filter(temps_entities::magic_link_tokens::Column::Used.eq(false))
-            .filter(temps_entities::magic_link_tokens::Column::ExpiresAt.gt(Utc::now()))
-            .one(self.db.as_ref())
-            .await?
-            .ok_or(UserAuthError::InvalidToken)?;
-
-        // Mark token as used
-        let mut magic_link_update: temps_entities::magic_link_tokens::ActiveModel =
-            magic_link.clone().into();
-        magic_link_update.used = Set(true);
-        magic_link_update.update(self.db.as_ref()).await?;
-
-        // Find user by email
-        let user = temps_entities::users::Entity::find()
-            .filter(temps_entities::users::Column::Email.eq(&magic_link.email))
-            .one(self.db.as_ref())
-            .await?
-            .ok_or(UserAuthError::UserNotFound)?;
-
-        // Mark email as verified if not already
-        if !user.email_verified {
-            let mut user_update: temps_entities::users::ActiveModel = user.clone().into();
-            user_update.email_verified = Set(true);
-            user_update.update(self.db.as_ref()).await?;
-        }
-
-        Ok(user)
-    }
-
     // Request password reset
     pub async fn request_password_reset(&self, email: &str) -> Result<(), UserAuthError> {
         // Check if email service is configured
@@ -675,7 +593,7 @@ impl AuthService {
             .await?
             .ok_or_else(|| AuthError::NotFound(format!("User {} not found", user_id)))?;
 
-        // 1. Account must have a password set. SSO/magic-link-only users
+        // 1. Account must have a password set. SSO-only users
         // get a friendly error instead of a generic 401.
         let stored_hash = user
             .password_hash
@@ -815,9 +733,8 @@ impl AuthService {
     /// Whether an email provider is configured for transactional mail.
     ///
     /// Checks specifically for an enabled *email* notification provider —
-    /// not just any provider — because password reset, email verification
-    /// and magic links require real inbox delivery, not a Slack/webhook
-    /// channel.
+    /// not just any provider — because password reset and email
+    /// verification require real inbox delivery, not a Slack/webhook channel.
     pub async fn is_email_configured(&self) -> bool {
         self.email_service.is_email_provider_configured().await
     }
@@ -932,7 +849,7 @@ fn is_unique_violation(error: &sea_orm::DbErr) -> bool {
     // Match the specific constraint name rather than a generic "duplicate
     // key"/"23505" substring: this crate has other unique-constrained
     // columns reachable through `UserAuthError` (e.g.
-    // `magic_link_tokens.token`), and a generic substring match would
+    // `api_keys.key_hash`), and a generic substring match would
     // misreport an unrelated collision on one of those as
     // `EmailAlreadyRegistered`.
     error.to_string().contains("idx_users_email_unique")
@@ -962,11 +879,6 @@ pub struct LoginRequest {
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct MagicLinkRequest {
-    pub email: String,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ResetPasswordRequest {
     pub token: String,
     pub new_password: String,
@@ -979,12 +891,11 @@ mod tests {
     use chrono::{Duration, Utc};
     use temps_database::test_utils::TestDatabase;
     use temps_entities::types::RoleType;
-    use temps_entities::{magic_link_tokens, sessions, settings, users};
+    use temps_entities::{sessions, settings, users};
 
     struct MockEmailService {
         verification_emails_sent: std::sync::Mutex<Vec<(String, String, String)>>,
         password_reset_emails_sent: std::sync::Mutex<Vec<(String, String, String)>>,
-        magic_link_emails_sent: std::sync::Mutex<Vec<(String, String)>>,
     }
 
     impl MockEmailService {
@@ -992,7 +903,6 @@ mod tests {
             Self {
                 verification_emails_sent: std::sync::Mutex::new(Vec::new()),
                 password_reset_emails_sent: std::sync::Mutex::new(Vec::new()),
-                magic_link_emails_sent: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -1002,10 +912,6 @@ mod tests {
 
         fn get_password_reset_emails(&self) -> Vec<(String, String, String)> {
             self.password_reset_emails_sent.lock().unwrap().clone()
-        }
-
-        fn get_magic_link_emails(&self) -> Vec<(String, String)> {
-            self.magic_link_emails_sent.lock().unwrap().clone()
         }
     }
 
@@ -1041,15 +947,6 @@ mod tests {
                             "".to_string(),
                             url,
                         ));
-                    }
-                } else if message.subject.contains("Magic") {
-                    // Extract magic link URL from body
-                    if let Some(start) = message.body.find("Click here to login: ") {
-                        let url = &message.body[start + 21..];
-                        self.magic_link_emails_sent
-                            .lock()
-                            .unwrap()
-                            .push((to.clone(), url.to_string()));
                     }
                 }
             }
@@ -1609,130 +1506,6 @@ mod tests {
         assert_eq!(user.email, "user@example.com");
     }
 
-    // Magic Link Tests
-
-    #[tokio::test]
-    async fn test_send_magic_link_existing_user() {
-        let (db, auth_service, email_service) = setup_test_env().await;
-        create_test_user(&db.db, "user@example.com", "password").await;
-
-        let request = MagicLinkRequest {
-            email: "user@example.com".to_string(),
-        };
-
-        auth_service.send_magic_link(request).await.unwrap();
-
-        // Verify token was saved
-        let token = magic_link_tokens::Entity::find()
-            .filter(magic_link_tokens::Column::Email.eq("user@example.com"))
-            .one(db.db.as_ref())
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert!(!token.used);
-        assert!(token.expires_at > Utc::now());
-
-        // Verify email was sent
-        let emails = email_service.get_magic_link_emails();
-        assert_eq!(emails.len(), 1);
-        assert_eq!(emails[0].0, "user@example.com");
-    }
-
-    #[tokio::test]
-    async fn test_send_magic_link_nonexistent_user() {
-        let (_db, auth_service, email_service) = setup_test_env().await;
-
-        let request = MagicLinkRequest {
-            email: "nonexistent@example.com".to_string(),
-        };
-
-        // Should not error to prevent email enumeration
-        auth_service.send_magic_link(request).await.unwrap();
-
-        // No email should be sent
-        let emails = email_service.get_magic_link_emails();
-        assert_eq!(emails.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_verify_magic_link_valid() {
-        let (db, auth_service, _) = setup_test_env().await;
-        let user = create_test_user(&db.db, "user@example.com", "password").await;
-
-        // Create magic link token manually
-        let token = Uuid::new_v4().to_string();
-        let magic_link = magic_link_tokens::ActiveModel {
-            email: Set("user@example.com".to_string()),
-            token: Set(token.clone()),
-            expires_at: Set(Utc::now() + Duration::minutes(15)),
-            used: Set(false),
-            created_at: Set(Utc::now()),
-            ..Default::default()
-        };
-        magic_link.insert(db.db.as_ref()).await.unwrap();
-
-        let verified_user = auth_service.verify_magic_link(&token).await.unwrap();
-
-        assert_eq!(verified_user.id, user.id);
-
-        // Verify token was marked as used
-        let updated_token = magic_link_tokens::Entity::find()
-            .filter(magic_link_tokens::Column::Token.eq(&token))
-            .one(db.db.as_ref())
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert!(updated_token.used);
-    }
-
-    #[tokio::test]
-    async fn test_verify_magic_link_expired() {
-        let (db, auth_service, _) = setup_test_env().await;
-        create_test_user(&db.db, "user@example.com", "password").await;
-
-        // Create expired token
-        let token = Uuid::new_v4().to_string();
-        let magic_link = magic_link_tokens::ActiveModel {
-            email: Set("user@example.com".to_string()),
-            token: Set(token.clone()),
-            expires_at: Set(Utc::now() - Duration::minutes(1)), // Expired
-            used: Set(false),
-            created_at: Set(Utc::now()),
-            ..Default::default()
-        };
-        magic_link.insert(db.db.as_ref()).await.unwrap();
-
-        let result = auth_service.verify_magic_link(&token).await;
-
-        assert!(result.is_err());
-        matches!(result.unwrap_err(), UserAuthError::InvalidToken);
-    }
-
-    #[tokio::test]
-    async fn test_verify_magic_link_already_used() {
-        let (db, auth_service, _) = setup_test_env().await;
-        create_test_user(&db.db, "user@example.com", "password").await;
-
-        // Create used token
-        let token = Uuid::new_v4().to_string();
-        let magic_link = magic_link_tokens::ActiveModel {
-            email: Set("user@example.com".to_string()),
-            token: Set(token.clone()),
-            expires_at: Set(Utc::now() + Duration::minutes(15)),
-            used: Set(true), // Already used
-            created_at: Set(Utc::now()),
-            ..Default::default()
-        };
-        magic_link.insert(db.db.as_ref()).await.unwrap();
-
-        let result = auth_service.verify_magic_link(&token).await;
-
-        assert!(result.is_err());
-        matches!(result.unwrap_err(), UserAuthError::InvalidToken);
-    }
-
     // Password Reset Tests
 
     #[tokio::test]
@@ -2136,10 +1909,10 @@ mod tests {
     #[test]
     fn is_unique_violation_false_for_unrelated_unique_constraint() {
         // A collision on a *different* unique-constrained column (e.g.
-        // magic_link_tokens.token) must not be misreported as a duplicate
+        // api_keys.key_hash) must not be misreported as a duplicate
         // email -- only `idx_users_email_unique` should match.
         let err = sea_orm::DbErr::Custom(
-            "error returned from database: duplicate key value violates unique constraint \"magic_link_tokens_token_key\" (SQLSTATE 23505)".to_string(),
+            "error returned from database: duplicate key value violates unique constraint \"api_keys_key_hash_key\" (SQLSTATE 23505)".to_string(),
         );
         assert!(!is_unique_violation(&err));
     }

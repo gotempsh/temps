@@ -1,7 +1,7 @@
 //! IP-based rate limiting middleware for authentication endpoints.
 //!
 //! Provides a simple sliding-window rate limiter to prevent brute force attacks
-//! on login, password reset, magic link, and MFA verification endpoints.
+//! on login, password reset, and MFA verification endpoints.
 
 use crate::client_ip::resolve_client_ip;
 use axum::{

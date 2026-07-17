@@ -103,7 +103,6 @@ pub mod users;
 // OpenTelemetry entities
 
 pub mod events;
-pub mod magic_link_tokens;
 pub mod session_replay_events;
 pub mod session_replay_sessions;
 pub mod settings;
