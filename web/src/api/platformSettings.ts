@@ -130,6 +130,17 @@ export interface ObservabilityCompressionSettings {
   otel_spans_after_hours: number
 }
 
+export interface ObservabilityRetentionSettings {
+  /** Raw proxy request-log retention in days. */
+  proxy_logs_days: number
+  /** OpenTelemetry span/trace retention in days. */
+  otel_spans_days: number
+  /** OpenTelemetry log-event retention in days. */
+  otel_logs_days: number
+  /** OpenTelemetry metric-point retention in days. */
+  otel_metrics_days: number
+}
+
 /** Per-managed-domain hostname layout (configured under DNS providers, not here). */
 export type PublicHostnameStrategy = 'standard' | 'flat'
 
@@ -150,6 +161,7 @@ export interface PlatformSettings extends AppSettingsResponse {
   attack_mode?: boolean
   build_limits: BuildLimitsSettings
   observability_compression: ObservabilityCompressionSettings
+  observability_retention: ObservabilityRetentionSettings
   /** Effective backend for proxy logs and OTel spans. */
   effective_observability_store: MetricsStoreKind
   /** Set to true by `temps setup` once initial configuration has been applied.
@@ -212,6 +224,7 @@ export async function updatePlatformSettings(
     build_limits: updated.build_limits,
     monitoring: updated.monitoring,
     observability_compression: updated.observability_compression,
+    observability_retention: updated.observability_retention,
   }
   const result = await updateSettings({ body })
   if (result.error) {

@@ -89,6 +89,10 @@ pub struct AppSettings {
     /// Changes are applied at runtime by the Settings API.
     pub observability_compression: ObservabilityCompressionSettings,
 
+    /// Retention windows for raw proxy and OpenTelemetry telemetry.
+    /// TimescaleDB policies are updated at runtime by the Settings API.
+    pub observability_retention: ObservabilityRetentionSettings,
+
     /// Set to `true` by `temps setup` (all modes) once initial configuration
     /// has been applied. The web onboarding wizard reads this from the server
     /// and skips itself when true, preventing the "Configure Base Domain" wall
@@ -729,6 +733,40 @@ impl Default for ObservabilityCompressionSettings {
     }
 }
 
+/// Retention policy configuration for raw observability tables. Values are in
+/// days. The Settings API applies them to TimescaleDB; ClickHouse-backed proxy
+/// logs and spans retain their storage-level per-row TTL behavior.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct ObservabilityRetentionSettings {
+    /// Retain proxy request logs for this many days.
+    #[schema(minimum = 1, maximum = 3650, example = 30)]
+    pub proxy_logs_days: u32,
+
+    /// Retain OpenTelemetry spans (traces) for this many days.
+    #[schema(minimum = 1, maximum = 3650, example = 90)]
+    pub otel_spans_days: u32,
+
+    /// Retain OpenTelemetry log events for this many days.
+    #[schema(minimum = 1, maximum = 3650, example = 90)]
+    pub otel_logs_days: u32,
+
+    /// Retain OpenTelemetry metric points for this many days.
+    #[schema(minimum = 1, maximum = 3650, example = 90)]
+    pub otel_metrics_days: u32,
+}
+
+impl Default for ObservabilityRetentionSettings {
+    fn default() -> Self {
+        Self {
+            proxy_logs_days: 30,
+            otel_spans_days: 90,
+            otel_logs_days: 90,
+            otel_metrics_days: 90,
+        }
+    }
+}
+
 impl Default for MonitoringSettings {
     fn default() -> Self {
         Self {
@@ -769,6 +807,7 @@ impl Default for AppSettings {
             cluster_dns: ClusterDnsSettings::default(),
             monitoring: MonitoringSettings::default(),
             observability_compression: ObservabilityCompressionSettings::default(),
+            observability_retention: ObservabilityRetentionSettings::default(),
             setup_complete: false,
             require_mfa_for_admins: false,
             console_version: None,
@@ -1005,6 +1044,37 @@ mod tests {
         assert!(
             !parsed.cluster_dns.enabled,
             "cluster_dns must default to disabled when deserializing a legacy settings row"
+        );
+    }
+
+    #[test]
+    fn legacy_settings_json_uses_observability_retention_defaults() {
+        let parsed = AppSettings::from_json(serde_json::json!({
+            "external_url": "https://paas.example.com",
+            "preview_domain": "localho.st"
+        }));
+
+        assert_eq!(
+            parsed.observability_retention,
+            ObservabilityRetentionSettings::default()
+        );
+        assert_eq!(parsed.observability_retention.proxy_logs_days, 30);
+        assert_eq!(parsed.observability_retention.otel_spans_days, 90);
+    }
+
+    #[test]
+    fn observability_retention_round_trips_through_json() {
+        let mut settings = AppSettings::default();
+        settings.observability_retention.proxy_logs_days = 14;
+        settings.observability_retention.otel_spans_days = 60;
+        settings.observability_retention.otel_logs_days = 45;
+        settings.observability_retention.otel_metrics_days = 30;
+
+        let parsed = AppSettings::from_json(settings.to_json());
+
+        assert_eq!(
+            parsed.observability_retention,
+            settings.observability_retention
         );
     }
 

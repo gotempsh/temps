@@ -23,6 +23,7 @@ import type {
   MetricsStoreKind,
   MonitoringSettings,
   ObservabilityCompressionSettings,
+  ObservabilityRetentionSettings,
 } from '@/api/platformSettings'
 import {
   AlertCircle,
@@ -40,6 +41,7 @@ import { toast } from 'sonner'
 interface MonitoringFormData {
   monitoring: MonitoringSettings
   observability_compression: ObservabilityCompressionSettings
+  observability_retention: ObservabilityRetentionSettings
 }
 
 const DEFAULTS: MonitoringSettings = {
@@ -56,6 +58,13 @@ const DEFAULTS: MonitoringSettings = {
 const COMPRESSION_DEFAULTS: ObservabilityCompressionSettings = {
   proxy_logs_after_hours: 24,
   otel_spans_after_hours: 24,
+}
+
+const RETENTION_DEFAULTS: ObservabilityRetentionSettings = {
+  proxy_logs_days: 30,
+  otel_spans_days: 90,
+  otel_logs_days: 90,
+  otel_metrics_days: 90,
 }
 
 // Bytes per raw metric row (approximate: time 8 + source_kind 12 + source_id 4 +
@@ -92,6 +101,7 @@ export function MonitoringSettingsPage() {
     defaultValues: {
       monitoring: DEFAULTS,
       observability_compression: COMPRESSION_DEFAULTS,
+      observability_retention: RETENTION_DEFAULTS,
     },
   })
 
@@ -122,6 +132,8 @@ export function MonitoringSettingsPage() {
         monitoring: settings.monitoring,
         observability_compression:
           settings.observability_compression ?? COMPRESSION_DEFAULTS,
+        observability_retention:
+          settings.observability_retention ?? RETENTION_DEFAULTS,
       })
     }
   }, [settings, reset])
@@ -380,106 +392,264 @@ export function MonitoringSettingsPage() {
         </CardContent>
       </Card>
 
-      {/* Retention tiers */}
+      {/* Retention spans every observability signal, not only resource metrics. */}
       <Card>
         <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <HardDrive className="h-5 w-5" />
-            Retention
-          </CardTitle>
-          <CardDescription>
-            How long data is kept at each resolution tier. TimescaleDB
-            continuous aggregates enforce hourly and daily retention
-            automatically.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-6">
-          <div className="grid gap-6 sm:grid-cols-3">
-            <div className="space-y-2">
-              <Label htmlFor="retention-raw">Raw data (days)</Label>
-              <Input
-                id="retention-raw"
-                type="number"
-                min={1}
-                max={30}
-                {...register('monitoring.retention_raw_days', {
-                  valueAsNumber: true,
-                  required: true,
-                  min: { value: 1, message: 'Min 1 day' },
-                  max: { value: 30, message: 'Max 30 days' },
-                })}
-              />
-              <p className="text-xs text-muted-foreground">
-                30-second resolution. Min 1, max 30. Default 7.
-              </p>
-              {errors.monitoring?.retention_raw_days && (
-                <p className="text-xs text-destructive">
-                  {errors.monitoring.retention_raw_days.message}
-                </p>
-              )}
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div className="space-y-1.5">
+              <CardTitle className="flex items-center gap-2">
+                <HardDrive className="h-5 w-5" />
+                Data Retention
+              </CardTitle>
+              <CardDescription>
+                Control how long resource metrics, proxy request logs, traces,
+                OpenTelemetry logs, and OpenTelemetry metrics remain available.
+              </CardDescription>
             </div>
-
-            <div className="space-y-2">
-              <Label htmlFor="retention-hourly">Hourly rollup (days)</Label>
-              <Input
-                id="retention-hourly"
-                type="number"
-                min={7}
-                max={365}
-                {...register('monitoring.retention_hourly_days', {
-                  valueAsNumber: true,
-                  required: true,
-                  min: { value: 7, message: 'Min 7 days' },
-                  max: { value: 365, message: 'Max 365 days' },
-                })}
-              />
-              <p className="text-xs text-muted-foreground">
-                1-hour resolution. Min 7, max 365. Default 90.
-              </p>
-              {errors.monitoring?.retention_hourly_days && (
-                <p className="text-xs text-destructive">
-                  {errors.monitoring.retention_hourly_days.message}
-                </p>
-              )}
-            </div>
-
-            <div className="space-y-2">
-              <Label htmlFor="retention-daily">Daily rollup (years)</Label>
-              <Input
-                id="retention-daily"
-                type="number"
-                min={1}
-                max={10}
-                {...register('monitoring.retention_daily_years', {
-                  valueAsNumber: true,
-                  required: true,
-                  min: { value: 1, message: 'Min 1 year' },
-                  max: { value: 10, message: 'Max 10 years' },
-                })}
-              />
-              <p className="text-xs text-muted-foreground">
-                1-day resolution. Default 2 years.
-              </p>
-              {errors.monitoring?.retention_daily_years && (
-                <p className="text-xs text-destructive">
-                  {errors.monitoring.retention_daily_years.message}
-                </p>
-              )}
-            </div>
+            <span className="rounded-md bg-background px-2.5 py-1 text-xs font-medium text-foreground ring-1 ring-inset ring-border">
+              All telemetry
+            </span>
           </div>
+        </CardHeader>
+        <CardContent className="space-y-8">
+          <section className="space-y-4">
+            <div>
+              <h3 className="text-sm font-semibold">Resource metrics</h3>
+              <p className="text-xs text-muted-foreground">
+                Samples and rollups used by service and node dashboards.
+              </p>
+            </div>
+            {effectiveStore === 'click_house' ? (
+              <div className="rounded-lg border bg-muted/30 px-4 py-3">
+                <p className="text-sm font-medium">
+                  ClickHouse retention is managed by table TTL
+                </p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Resource metric rows are retained for 90 days, with rollups
+                  calculated at query time.
+                </p>
+              </div>
+            ) : (
+              <div className="grid gap-6 sm:grid-cols-3">
+                <div className="space-y-2">
+                  <Label htmlFor="retention-raw">Raw data (days)</Label>
+                  <Input
+                    id="retention-raw"
+                    type="number"
+                    min={1}
+                    max={30}
+                    {...register('monitoring.retention_raw_days', {
+                      valueAsNumber: true,
+                      required: true,
+                      min: { value: 1, message: 'Min 1 day' },
+                      max: { value: 30, message: 'Max 30 days' },
+                    })}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    30-second resolution. Min 1, max 30. Default 7.
+                  </p>
+                  {errors.monitoring?.retention_raw_days && (
+                    <p className="text-xs text-destructive">
+                      {errors.monitoring.retention_raw_days.message}
+                    </p>
+                  )}
+                </div>
 
-          {/* Estimated storage */}
-          <Alert>
-            <HardDrive className="h-4 w-4" />
-            <AlertTitle>Estimated storage</AlertTitle>
-            <AlertDescription>
-              Approximately <strong>{estimatedMbPerDay} MB/day</strong> of raw
-              metric data based on 5 monitored services, {METRICS_PER_SERVICE}{' '}
-              metrics each, scraped every{' '}
-              {monitoring?.scrape_interval_secs ?? 30}s. Hourly/daily rollups
-              add roughly 5% overhead.
-            </AlertDescription>
-          </Alert>
+                <div className="space-y-2">
+                  <Label htmlFor="retention-hourly">Hourly rollup (days)</Label>
+                  <Input
+                    id="retention-hourly"
+                    type="number"
+                    min={7}
+                    max={365}
+                    {...register('monitoring.retention_hourly_days', {
+                      valueAsNumber: true,
+                      required: true,
+                      min: { value: 7, message: 'Min 7 days' },
+                      max: { value: 365, message: 'Max 365 days' },
+                    })}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    1-hour resolution. Min 7, max 365. Default 90.
+                  </p>
+                  {errors.monitoring?.retention_hourly_days && (
+                    <p className="text-xs text-destructive">
+                      {errors.monitoring.retention_hourly_days.message}
+                    </p>
+                  )}
+                </div>
+
+                <div className="space-y-2">
+                  <Label htmlFor="retention-daily">Daily rollup (years)</Label>
+                  <Input
+                    id="retention-daily"
+                    type="number"
+                    min={1}
+                    max={10}
+                    {...register('monitoring.retention_daily_years', {
+                      valueAsNumber: true,
+                      required: true,
+                      min: { value: 1, message: 'Min 1 year' },
+                      max: { value: 10, message: 'Max 10 years' },
+                    })}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    1-day resolution. Default 2 years.
+                  </p>
+                  {errors.monitoring?.retention_daily_years && (
+                    <p className="text-xs text-destructive">
+                      {errors.monitoring.retention_daily_years.message}
+                    </p>
+                  )}
+                </div>
+              </div>
+            )}
+
+            <Alert>
+              <HardDrive className="h-4 w-4" />
+              <AlertTitle>Estimated metric storage</AlertTitle>
+              <AlertDescription>
+                Approximately <strong>{estimatedMbPerDay} MB/day</strong> of raw
+                metric data based on 5 monitored services, {METRICS_PER_SERVICE}{' '}
+                metrics each, scraped every{' '}
+                {monitoring?.scrape_interval_secs ?? 30}s. Hourly/daily rollups
+                add roughly 5% overhead.
+              </AlertDescription>
+            </Alert>
+          </section>
+
+          <div className="border-t" />
+
+          <section className="space-y-4">
+            <div>
+              <h3 className="text-sm font-semibold">Logs and traces</h3>
+              <p className="text-xs text-muted-foreground">
+                Raw request and OpenTelemetry signals. TimescaleDB policy
+                changes are saved immediately; cleanup runs in the background.
+              </p>
+            </div>
+
+            {effectiveObservabilityStore === 'click_house' && (
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="rounded-lg border bg-muted/30 px-4 py-3">
+                  <p className="text-sm font-medium">Proxy request logs</p>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    ClickHouse TTL · 30 days per row
+                  </p>
+                </div>
+                <div className="rounded-lg border bg-muted/30 px-4 py-3">
+                  <p className="text-sm font-medium">OTel spans / traces</p>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    ClickHouse TTL · 90 days per row
+                  </p>
+                </div>
+              </div>
+            )}
+
+            <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-4">
+              {effectiveObservabilityStore !== 'click_house' && (
+                <>
+                  <div className="space-y-2">
+                    <Label htmlFor="retention-proxy-logs">
+                      Proxy logs (days)
+                    </Label>
+                    <Input
+                      id="retention-proxy-logs"
+                      type="number"
+                      min={1}
+                      max={3650}
+                      {...register('observability_retention.proxy_logs_days', {
+                        valueAsNumber: true,
+                        required: true,
+                        min: { value: 1, message: 'Min 1 day' },
+                        max: { value: 3650, message: 'Max 3650 days' },
+                      })}
+                    />
+                    <p className="text-xs text-muted-foreground">Default 30.</p>
+                    {errors.observability_retention?.proxy_logs_days && (
+                      <p className="text-xs text-destructive">
+                        {errors.observability_retention.proxy_logs_days.message}
+                      </p>
+                    )}
+                  </div>
+
+                  <div className="space-y-2">
+                    <Label htmlFor="retention-otel-spans">
+                      OTel traces (days)
+                    </Label>
+                    <Input
+                      id="retention-otel-spans"
+                      type="number"
+                      min={1}
+                      max={3650}
+                      {...register('observability_retention.otel_spans_days', {
+                        valueAsNumber: true,
+                        required: true,
+                        min: { value: 1, message: 'Min 1 day' },
+                        max: { value: 3650, message: 'Max 3650 days' },
+                      })}
+                    />
+                    <p className="text-xs text-muted-foreground">Default 90.</p>
+                    {errors.observability_retention?.otel_spans_days && (
+                      <p className="text-xs text-destructive">
+                        {errors.observability_retention.otel_spans_days.message}
+                      </p>
+                    )}
+                  </div>
+                </>
+              )}
+
+              <div className="space-y-2">
+                <Label htmlFor="retention-otel-logs">OTel logs (days)</Label>
+                <Input
+                  id="retention-otel-logs"
+                  type="number"
+                  min={1}
+                  max={3650}
+                  {...register('observability_retention.otel_logs_days', {
+                    valueAsNumber: true,
+                    required: true,
+                    min: { value: 1, message: 'Min 1 day' },
+                    max: { value: 3650, message: 'Max 3650 days' },
+                  })}
+                />
+                <p className="text-xs text-muted-foreground">
+                  TimescaleDB · default 90.
+                </p>
+                {errors.observability_retention?.otel_logs_days && (
+                  <p className="text-xs text-destructive">
+                    {errors.observability_retention.otel_logs_days.message}
+                  </p>
+                )}
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="retention-otel-metrics">
+                  OTel metrics (days)
+                </Label>
+                <Input
+                  id="retention-otel-metrics"
+                  type="number"
+                  min={1}
+                  max={3650}
+                  {...register('observability_retention.otel_metrics_days', {
+                    valueAsNumber: true,
+                    required: true,
+                    min: { value: 1, message: 'Min 1 day' },
+                    max: { value: 3650, message: 'Max 3650 days' },
+                  })}
+                />
+                <p className="text-xs text-muted-foreground">
+                  TimescaleDB · default 90.
+                </p>
+                {errors.observability_retention?.otel_metrics_days && (
+                  <p className="text-xs text-destructive">
+                    {errors.observability_retention.otel_metrics_days.message}
+                  </p>
+                )}
+              </div>
+            </div>
+          </section>
         </CardContent>
       </Card>
 
