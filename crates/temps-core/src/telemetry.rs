@@ -89,6 +89,13 @@ pub enum TelemetryEventKind {
 
     // ---- Status page ----
     StatusPagePublished,
+
+    // ---- Instance health ----
+    /// Periodic aggregated summary of internal errors on the instance (ERROR
+    /// logs by target, console-API 5xx by route template, panics by source
+    /// location). Carries only counts keyed by compile-time identifiers of our
+    /// own code — never error messages. See [`crate::error_metrics`].
+    ErrorSummary,
 }
 
 impl TelemetryEventKind {
@@ -141,6 +148,8 @@ impl TelemetryEventKind {
             Self::EmailProviderConfigured => "email_provider_configured",
 
             Self::StatusPagePublished => "status_page_published",
+
+            Self::ErrorSummary => "error_summary",
         }
     }
 
@@ -184,6 +193,7 @@ impl TelemetryEventKind {
             Self::VulnerabilityScanTriggered,
             Self::EmailProviderConfigured,
             Self::StatusPagePublished,
+            Self::ErrorSummary,
         ]
     }
 }
@@ -306,8 +316,9 @@ mod tests {
     fn all_covers_every_variant() {
         // If a variant is added but not added to all(), as_str() on it will be
         // missing from the list and this length check is a cheap tripwire.
-        // 36 events (34 initial + instance_heartbeat + project_created_from_template).
-        assert_eq!(TelemetryEventKind::all().len(), 36);
+        // 37 events (34 initial + instance_heartbeat + project_created_from_template
+        // + error_summary).
+        assert_eq!(TelemetryEventKind::all().len(), 37);
     }
 
     #[test]

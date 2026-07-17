@@ -8,6 +8,7 @@ pub mod deployment;
 pub mod env_vars_provider;
 pub mod error;
 pub mod error_builder;
+pub mod error_metrics;
 pub mod external_plugin;
 pub mod jobs;
 pub mod node_pki;
