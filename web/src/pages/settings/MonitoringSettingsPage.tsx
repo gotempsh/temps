@@ -19,9 +19,14 @@ import {
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useSettings, useUpdateSettings } from '@/hooks/useSettings'
-import type { MonitoringSettings, MetricsStoreKind } from '@/api/platformSettings'
+import type {
+  MetricsStoreKind,
+  MonitoringSettings,
+  ObservabilityCompressionSettings,
+} from '@/api/platformSettings'
 import {
   AlertCircle,
+  Archive,
   BarChart2,
   Database,
   HardDrive,
@@ -34,6 +39,7 @@ import { toast } from 'sonner'
 
 interface MonitoringFormData {
   monitoring: MonitoringSettings
+  observability_compression: ObservabilityCompressionSettings
 }
 
 const DEFAULTS: MonitoringSettings = {
@@ -47,6 +53,11 @@ const DEFAULTS: MonitoringSettings = {
   clickhouse_url: null,
 }
 
+const COMPRESSION_DEFAULTS: ObservabilityCompressionSettings = {
+  proxy_logs_after_hours: 24,
+  otel_spans_after_hours: 24,
+}
+
 // Bytes per raw metric row (approximate: time 8 + source_kind 12 + source_id 4 +
 // name 20 + value 8 + labels 32 = ~84 bytes; round up to 100 for overhead)
 const BYTES_PER_ROW = 100
@@ -57,7 +68,9 @@ function estimateStorageMbPerDay(scrapeIntervalSecs: number): number {
   // Placeholder: pull the "monitored services" count from settings if available
   // For the estimate we use a hard-coded representative value of 5 services.
   const monitoredServices = 5
-  const scrapesPerDay = Math.floor((24 * 3600) / Math.max(scrapeIntervalSecs, 15))
+  const scrapesPerDay = Math.floor(
+    (24 * 3600) / Math.max(scrapeIntervalSecs, 15)
+  )
   const rowsPerDay = monitoredServices * METRICS_PER_SERVICE * scrapesPerDay
   const bytesPerDay = rowsPerDay * BYTES_PER_ROW
   return Math.round(bytesPerDay / (1024 * 1024))
@@ -75,19 +88,24 @@ export function MonitoringSettingsPage() {
     formState: { isDirty, isSubmitting, errors },
     reset,
     setValue,
-    watch,
   } = useForm<MonitoringFormData>({
-    defaultValues: { monitoring: DEFAULTS },
+    defaultValues: {
+      monitoring: DEFAULTS,
+      observability_compression: COMPRESSION_DEFAULTS,
+    },
   })
 
   const monitoring = useWatch({ control, name: 'monitoring' })
-  const storeKind: MetricsStoreKind = watch('monitoring.store')
+  const storeKind: MetricsStoreKind = monitoring?.store ?? DEFAULTS.store
   // The backend the runtime actually writes to, reconciled server-side with
   // the TEMPS_CLICKHOUSE_* env vars. Falls back to the configured store if the
   // server didn't report it (older binaries).
   const effectiveStore: MetricsStoreKind =
     settings?.effective_metrics_store ?? storeKind
-  const storeMismatch = storeKind === 'click_house' && effectiveStore !== 'click_house'
+  const storeMismatch =
+    storeKind === 'click_house' && effectiveStore !== 'click_house'
+  const effectiveObservabilityStore: MetricsStoreKind =
+    settings?.effective_observability_store ?? 'timescale_db'
 
   useEffect(() => {
     setBreadcrumbs([
@@ -100,7 +118,11 @@ export function MonitoringSettingsPage() {
 
   useEffect(() => {
     if (settings?.monitoring) {
-      reset({ monitoring: settings.monitoring })
+      reset({
+        monitoring: settings.monitoring,
+        observability_compression:
+          settings.observability_compression ?? COMPRESSION_DEFAULTS,
+      })
     }
   }, [settings, reset])
 
@@ -111,7 +133,9 @@ export function MonitoringSettingsPage() {
       toast.success('Monitoring settings saved')
     } catch (err: unknown) {
       const detail =
-        err instanceof Error ? err.message : 'Failed to save monitoring settings'
+        err instanceof Error
+          ? err.message
+          : 'Failed to save monitoring settings'
       toast.error(detail)
     }
   }
@@ -181,13 +205,144 @@ export function MonitoringSettingsPage() {
               <AlertTitle>Configured backend is not active</AlertTitle>
               <AlertDescription>
                 The metrics store is set to <strong>ClickHouse</strong>, but the
-                server's <code className="font-mono">TEMPS_CLICKHOUSE_*</code>{' '}
+                server&apos;s{' '}
+                <code className="font-mono">TEMPS_CLICKHOUSE_*</code>{' '}
                 environment variables are not fully configured, so metrics are
                 being written to <strong>TimescaleDB</strong>. Set the
                 ClickHouse env vars on the control plane and restart, or switch
                 the store back to TimescaleDB to clear this warning.
               </AlertDescription>
             </Alert>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* Immutable proxy logs and spans share one operational pattern: write
+          once, then compress closed Timescale chunks. ClickHouse compresses
+          parts automatically and therefore has no age-based policy. */}
+      <Card>
+        <CardHeader>
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div className="space-y-1.5">
+              <CardTitle className="flex items-center gap-2">
+                <Archive className="h-5 w-5" />
+                Telemetry Compression
+              </CardTitle>
+              <CardDescription>
+                Reduce storage used by immutable proxy request logs and
+                OpenTelemetry spans after their active ingest window closes.
+              </CardDescription>
+            </div>
+            <span className="rounded-md bg-background px-2.5 py-1 text-xs font-medium text-foreground ring-1 ring-inset ring-border">
+              {effectiveObservabilityStore === 'click_house'
+                ? 'ClickHouse · automatic'
+                : 'TimescaleDB · scheduled'}
+            </span>
+          </div>
+        </CardHeader>
+        <CardContent>
+          {effectiveObservabilityStore === 'click_house' ? (
+            <div className="rounded-lg border border-border bg-muted/30 px-4 py-4">
+              <div className="flex items-start gap-3">
+                <Database className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+                <div className="space-y-1">
+                  <p className="text-sm font-medium">
+                    Compression is managed automatically
+                  </p>
+                  <p className="text-sm text-muted-foreground">
+                    ClickHouse compresses data parts as they are written and
+                    merged using column-specific Delta, Gorilla, and ZSTD
+                    codecs. There is no age-based compression delay to tune.
+                  </p>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div className="space-y-5">
+              <div className="grid gap-5 sm:grid-cols-2">
+                <div className="space-y-2">
+                  <Label htmlFor="proxy-compression-delay">
+                    Proxy logs delay
+                  </Label>
+                  <div className="relative">
+                    <Input
+                      id="proxy-compression-delay"
+                      type="number"
+                      min={1}
+                      max={720}
+                      className="pr-16"
+                      {...register(
+                        'observability_compression.proxy_logs_after_hours',
+                        {
+                          valueAsNumber: true,
+                          required: 'Enter a compression delay',
+                          min: { value: 1, message: 'Min 1 hour' },
+                          max: { value: 720, message: 'Max 720 hours' },
+                        }
+                      )}
+                    />
+                    <span className="pointer-events-none absolute inset-y-0 right-3 flex items-center text-xs text-muted-foreground">
+                      hours
+                    </span>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    Default 24 hours. Maximum 30 days.
+                  </p>
+                  {errors.observability_compression?.proxy_logs_after_hours && (
+                    <p className="text-xs text-destructive">
+                      {
+                        errors.observability_compression.proxy_logs_after_hours
+                          .message
+                      }
+                    </p>
+                  )}
+                </div>
+
+                <div className="space-y-2">
+                  <Label htmlFor="span-compression-delay">
+                    OTel spans delay
+                  </Label>
+                  <div className="relative">
+                    <Input
+                      id="span-compression-delay"
+                      type="number"
+                      min={1}
+                      max={2160}
+                      className="pr-16"
+                      {...register(
+                        'observability_compression.otel_spans_after_hours',
+                        {
+                          valueAsNumber: true,
+                          required: 'Enter a compression delay',
+                          min: { value: 1, message: 'Min 1 hour' },
+                          max: { value: 2160, message: 'Max 2160 hours' },
+                        }
+                      )}
+                    />
+                    <span className="pointer-events-none absolute inset-y-0 right-3 flex items-center text-xs text-muted-foreground">
+                      hours
+                    </span>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    Default 24 hours. Maximum 90 days.
+                  </p>
+                  {errors.observability_compression?.otel_spans_after_hours && (
+                    <p className="text-xs text-destructive">
+                      {
+                        errors.observability_compression.otel_spans_after_hours
+                          .message
+                      }
+                    </p>
+                  )}
+                </div>
+              </div>
+
+              <p className="border-l-2 border-border pl-3 text-xs leading-5 text-muted-foreground">
+                Set the delay beyond your normal late-arrival window. Lower
+                values reclaim disk sooner; higher values keep more recent
+                chunks in row storage for operational queries.
+              </p>
+            </div>
           )}
         </CardContent>
       </Card>
@@ -233,8 +388,9 @@ export function MonitoringSettingsPage() {
             Retention
           </CardTitle>
           <CardDescription>
-            How long data is kept at each resolution tier. TimescaleDB continuous
-            aggregates enforce hourly and daily retention automatically.
+            How long data is kept at each resolution tier. TimescaleDB
+            continuous aggregates enforce hourly and daily retention
+            automatically.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-6">
@@ -317,12 +473,11 @@ export function MonitoringSettingsPage() {
             <HardDrive className="h-4 w-4" />
             <AlertTitle>Estimated storage</AlertTitle>
             <AlertDescription>
-              Approximately{' '}
-              <strong>{estimatedMbPerDay} MB/day</strong> of raw metric data
-              based on 5 monitored services, {METRICS_PER_SERVICE} metrics
-              each, scraped every{' '}
-              {monitoring?.scrape_interval_secs ?? 30}s. Hourly/daily
-              rollups add roughly 5% overhead.
+              Approximately <strong>{estimatedMbPerDay} MB/day</strong> of raw
+              metric data based on 5 monitored services, {METRICS_PER_SERVICE}{' '}
+              metrics each, scraped every{' '}
+              {monitoring?.scrape_interval_secs ?? 30}s. Hourly/daily rollups
+              add roughly 5% overhead.
             </AlertDescription>
           </Alert>
         </CardContent>

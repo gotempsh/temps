@@ -150,6 +150,8 @@ export interface PlatformSettings extends AppSettingsResponse {
   attack_mode?: boolean
   build_limits: BuildLimitsSettings
   observability_compression: ObservabilityCompressionSettings
+  /** Effective backend for proxy logs and OTel spans. */
+  effective_observability_store: MetricsStoreKind
   /** Set to true by `temps setup` once initial configuration has been applied.
    * The web onboarding wizard checks this and skips itself when true. */
   setup_complete: boolean

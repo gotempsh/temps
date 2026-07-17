@@ -140,6 +140,12 @@ pub struct AppSettingsResponse {
     /// effective backend and warns when it diverges from the configured store.
     pub effective_metrics_store: MetricsStoreKind,
 
+    /// Storage backend actually used for proxy logs and OTel spans. Unlike
+    /// metrics, these domains switch to ClickHouse whenever the server-level
+    /// ClickHouse connection is configured; they do not use the monitoring
+    /// store toggle.
+    pub effective_observability_store: MetricsStoreKind,
+
     // Outbound TLS verification toggle
     pub insecure_tls: bool,
 
@@ -355,6 +361,7 @@ impl From<AppSettings> for AppSettingsResponse {
             // the handler overrides it with the runtime-reconciled value once
             // the ClickHouse env-var state is known (via `with_effective_store`).
             effective_metrics_store: settings.monitoring.store.clone(),
+            effective_observability_store: MetricsStoreKind::TimescaleDb,
             monitoring: MonitoringSettingsMasked::from(settings.monitoring),
             observability_compression: settings.observability_compression,
             insecure_tls: settings.insecure_tls,
@@ -380,6 +387,11 @@ impl AppSettingsResponse {
             } else {
                 MetricsStoreKind::TimescaleDb
             };
+        self.effective_observability_store = if clickhouse_enabled {
+            MetricsStoreKind::ClickHouse
+        } else {
+            MetricsStoreKind::TimescaleDb
+        };
         self
     }
 }
@@ -1663,11 +1675,19 @@ mod tests {
             MetricsStoreKind::TimescaleDb,
             "ClickHouse selected but env vars unset must fall back to TimescaleDB"
         );
+        assert_eq!(
+            response.effective_observability_store,
+            MetricsStoreKind::TimescaleDb
+        );
 
         // store=click_house AND env vars configured → runtime uses ClickHouse.
         let response = AppSettingsResponse::from(settings).with_effective_store(true);
         assert_eq!(
             response.effective_metrics_store,
+            MetricsStoreKind::ClickHouse
+        );
+        assert_eq!(
+            response.effective_observability_store,
             MetricsStoreKind::ClickHouse
         );
 
@@ -1676,6 +1696,11 @@ mod tests {
         assert_eq!(
             response.effective_metrics_store,
             MetricsStoreKind::TimescaleDb
+        );
+        assert_eq!(
+            response.effective_observability_store,
+            MetricsStoreKind::ClickHouse,
+            "proxy logs and spans use ClickHouse whenever its server config is available"
         );
     }
 
