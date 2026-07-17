@@ -446,7 +446,8 @@ export function MonitoringSettingsPage() {
                 </p>
                 <p className="mt-1 text-xs text-muted-foreground">
                   Resource metric rows are retained for 90 days, with rollups
-                  calculated at query time.
+                  calculated at query time. Rows older than 90 days are
+                  permanently deleted.
                 </p>
               </div>
             ) : (
@@ -454,8 +455,8 @@ export function MonitoringSettingsPage() {
                 <div className="space-y-3 rounded-lg border p-4">
                   <Label htmlFor="retention-raw">Raw data (days)</Label>
                   <p className="min-h-10 text-xs leading-5 text-muted-foreground">
-                    Keeps every original sample at the selected scrape interval.
-                    Used for detailed recent charts and precise incident
+                    Stores every original sample at the selected scrape
+                    interval for detailed recent charts and precise incident
                     investigation.
                   </p>
                   <Input
@@ -471,8 +472,8 @@ export function MonitoringSettingsPage() {
                     })}
                   />
                   <p className="text-xs text-muted-foreground">
-                    After expiry, hourly and daily summaries remain. Range 1–30
-                    days; default 7.
+                    Raw samples older than this are permanently deleted. Hourly
+                    and daily summaries remain. Range 1–30 days; default 7.
                   </p>
                   {errors.monitoring?.retention_raw_days && (
                     <p className="text-xs text-destructive">
@@ -484,8 +485,8 @@ export function MonitoringSettingsPage() {
                 <div className="space-y-3 rounded-lg border p-4">
                   <Label htmlFor="retention-hourly">Hourly rollup (days)</Label>
                   <p className="min-h-10 text-xs leading-5 text-muted-foreground">
-                    Keeps one aggregated value per metric and hour. It preserves
-                    medium-term trends after the individual raw samples expire.
+                    Creates an hourly aggregate for each metric to preserve
+                    medium-term trends after individual raw samples are deleted.
                   </p>
                   <Input
                     id="retention-hourly"
@@ -500,8 +501,8 @@ export function MonitoringSettingsPage() {
                     })}
                   />
                   <p className="text-xs text-muted-foreground">
-                    After expiry, daily summaries remain. Range 7–365 days;
-                    default 90.
+                    Hourly aggregates older than this are permanently deleted.
+                    Daily summaries remain. Range 7–365 days; default 90.
                   </p>
                   {errors.monitoring?.retention_hourly_days && (
                     <p className="text-xs text-destructive">
@@ -513,7 +514,7 @@ export function MonitoringSettingsPage() {
                 <div className="space-y-3 rounded-lg border p-4">
                   <Label htmlFor="retention-daily">Daily rollup (years)</Label>
                   <p className="min-h-10 text-xs leading-5 text-muted-foreground">
-                    Keeps one aggregated value per metric and day for capacity
+                    Creates a daily aggregate for each metric for capacity
                     planning, seasonality, and long-term historical trends.
                   </p>
                   <Input
@@ -529,6 +530,7 @@ export function MonitoringSettingsPage() {
                     })}
                   />
                   <p className="text-xs text-muted-foreground">
+                    Daily aggregates older than this are permanently deleted.
                     This is the longest-lived metrics tier. Range 1–10 years;
                     default 2.
                   </p>
@@ -561,9 +563,9 @@ export function MonitoringSettingsPage() {
               <h3 className="text-sm font-semibold">Logs and traces</h3>
               <p className="text-xs text-muted-foreground">
                 Each signal has its own table and retention window, so
-                high-volume request logs can expire sooner than traces or
-                application telemetry. TimescaleDB cleanup runs in the
-                background.
+                high-volume request logs can be deleted sooner than traces or
+                application telemetry. TimescaleDB permanently deletes expired
+                rows in the background.
               </p>
             </div>
 
@@ -578,8 +580,8 @@ export function MonitoringSettingsPage() {
                   </div>
                   <p className="mt-2 text-xs leading-5 text-muted-foreground">
                     One row per proxied HTTP request, including route, status,
-                    duration, and request metadata. ClickHouse expires each row
-                    after 30 days using its native TTL.
+                    duration, and request metadata. ClickHouse permanently
+                    deletes rows older than 30 days using its native TTL.
                   </p>
                 </div>
                 <div className="rounded-lg border bg-muted/30 p-4">
@@ -592,8 +594,8 @@ export function MonitoringSettingsPage() {
                   <p className="mt-2 text-xs leading-5 text-muted-foreground">
                     Individual operations that compose a distributed trace,
                     including timings, errors, attributes, and service links.
-                    ClickHouse expires each row after 90 days using its native
-                    TTL.
+                    ClickHouse permanently deletes rows older than 90 days using
+                    its native TTL.
                   </p>
                 </div>
               </div>
@@ -612,9 +614,9 @@ export function MonitoringSettingsPage() {
                       </code>
                     </div>
                     <p className="min-h-10 text-xs leading-5 text-muted-foreground">
-                      Keeps one record per proxied HTTP request for traffic
-                      investigation, status-code analysis, latency debugging,
-                      and request forensics.
+                      Stores a separate log entry for every HTTP request handled
+                      by the proxy. Use these entries to investigate traffic,
+                      status codes, and slow requests.
                     </p>
                     <Input
                       id="retention-proxy-logs"
@@ -629,8 +631,8 @@ export function MonitoringSettingsPage() {
                       })}
                     />
                     <p className="text-xs text-muted-foreground">
-                      Rows older than this are deleted. Range 1–3650 days;
-                      default 30.
+                      Proxy log entries older than this are permanently deleted.
+                      Range 1–3650 days; default 30.
                     </p>
                     {errors.observability_retention?.proxy_logs_days && (
                       <p className="text-xs text-destructive">
@@ -649,9 +651,9 @@ export function MonitoringSettingsPage() {
                       </code>
                     </div>
                     <p className="min-h-10 text-xs leading-5 text-muted-foreground">
-                      Keeps the spans used to reconstruct trace waterfalls,
-                      follow requests across services, and inspect timings,
-                      errors, events, and attributes.
+                      Stores every received OTel span used to reconstruct trace
+                      waterfalls, follow requests across services, and inspect
+                      timings, errors, events, and attributes.
                     </p>
                     <Input
                       id="retention-otel-spans"
@@ -666,8 +668,9 @@ export function MonitoringSettingsPage() {
                       })}
                     />
                     <p className="text-xs text-muted-foreground">
-                      Expired spans disappear from trace search and detail
-                      views. Range 1–3650 days; default 90.
+                      Spans older than this are permanently deleted and disappear
+                      from trace search and detail views. Range 1–3650 days;
+                      default 90.
                     </p>
                     {errors.observability_retention?.otel_spans_days && (
                       <p className="text-xs text-destructive">
@@ -686,9 +689,9 @@ export function MonitoringSettingsPage() {
                   </code>
                 </div>
                 <p className="min-h-10 text-xs leading-5 text-muted-foreground">
-                  Keeps structured logs received over OTLP, including severity,
-                  body, attributes, and trace correlation. This does not control
-                  Docker container log files.
+                  Stores every structured log received over OTLP, including
+                  severity, body, attributes, and trace correlation. This does
+                  not control Docker container log files.
                 </p>
                 <Input
                   id="retention-otel-logs"
@@ -703,7 +706,8 @@ export function MonitoringSettingsPage() {
                   })}
                 />
                 <p className="text-xs text-muted-foreground">
-                  Stored in TimescaleDB. Range 1–3650 days; default 90.
+                  OTel log records older than this are permanently deleted. Range
+                  1–3650 days; default 90.
                 </p>
                 {errors.observability_retention?.otel_logs_days && (
                   <p className="text-xs text-destructive">
@@ -722,7 +726,7 @@ export function MonitoringSettingsPage() {
                   </code>
                 </div>
                 <p className="min-h-10 text-xs leading-5 text-muted-foreground">
-                  Keeps application metrics sent by OpenTelemetry SDKs and
+                  Stores application metric points sent by OpenTelemetry SDKs and
                   collectors. These are separate from the Temps-scraped resource
                   metrics configured above.
                 </p>
@@ -739,7 +743,8 @@ export function MonitoringSettingsPage() {
                   })}
                 />
                 <p className="text-xs text-muted-foreground">
-                  Stored in TimescaleDB. Range 1–3650 days; default 90.
+                  OTel metric points older than this are permanently deleted.
+                  Range 1–3650 days; default 90.
                 </p>
                 {errors.observability_retention?.otel_metrics_days && (
                   <p className="text-xs text-destructive">
