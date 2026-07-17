@@ -18,7 +18,7 @@ export const sections = [
 
 # Data Ownership & Privacy
 
-When you self-host Temps, every byte of your data — analytics events, error reports, session recordings, database backups, application logs — stays on your infrastructure. None of it is sent to Temps (the company), third-party analytics services, or any external server. The only thing the binary reports is [anonymous product telemetry](#anonymous-telemetry) — event names and counts under a random instance ID, fully disabled with `TEMPS_TELEMETRY=0`. {{ className: 'lead' }}
+When you self-host Temps, every byte of your data — analytics events, error reports, session recordings, database backups, application logs — stays on your infrastructure. None of it is sent to Temps (the company), third-party analytics services, or any external server. The only thing the binary reports is [anonymous product telemetry](#anonymous-telemetry) — event names, counts, and coarse internal labels (Temps module names, route templates) under a random instance ID. Set `TEMPS_TELEMETRY=0` and nothing is sent. {{ className: 'lead' }}
 
 ---
 
@@ -59,7 +59,7 @@ All data lives in one PostgreSQL database:
 - No data is sent to Google, Facebook, or any advertising network
 - No data is shared with analytics aggregators
 - The `temps upgrade` command checks GitHub for new releases (a public API call with no user data)
-- The binary sends anonymous product telemetry to `telemetry.temps.sh` — event names, counts, and coarse labels only, detailed in the next section. Set `TEMPS_TELEMETRY=0` to disable it entirely.
+- The binary sends anonymous product telemetry to `telemetry.temps.sh` — event names, counts, and coarse labels only, detailed in the next section. Set `TEMPS_TELEMETRY=0` and nothing is sent.
 
 ---
 
@@ -85,7 +85,7 @@ Every key is a compile-time identifier of Temps's own code. The error messages t
 
 ### Opting out
 
-Set `TEMPS_TELEMETRY=0` (also accepts `false`, `off`, `no`, `disabled`) in the server's environment and restart. This disables all telemetry, including error summaries. The instance ID file is still created so re-enabling later doesn't churn identity, but nothing is sent while opted out.
+Set `TEMPS_TELEMETRY=0` (also accepts `false`, `off`, `no`, `disabled`) in the server's environment and restart. Nothing is sent while opted out — no events, no error summaries. Two things still happen locally: the instance ID file is created (so re-enabling later doesn't churn identity), and error counts are tallied in a small fixed-size in-process buffer that is never read or transmitted while opted out.
 
 ---
 

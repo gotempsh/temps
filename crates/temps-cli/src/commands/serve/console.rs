@@ -322,7 +322,9 @@ fn build_error_summary_event(
 /// the fixed label `unmatched` so a 500 storm there is still visible without
 /// capturing raw paths. Runs only on the console listeners — proxied user-app
 /// traffic never passes through this router, so user requests are never
-/// counted. Cost outside the 5xx case is one extension lookup per request.
+/// counted. Cost outside the 5xx case is one extension lookup and two short
+/// string allocations per request (fine for the control plane; this
+/// middleware must never be mounted on the proxy data path).
 async fn track_server_errors(
     req: axum::extract::Request,
     next: axum::middleware::Next,

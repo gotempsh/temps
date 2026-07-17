@@ -26,8 +26,9 @@
 //! occurrences are still counted (in `overflow`) but not keyed, so a
 //! pathological instance can't grow memory or event size. Recording takes a
 //! short-lived `Mutex` — acceptable because errors are not a hot path (the
-//! 5xx recorder only runs on server-error responses, never per-request), and
-//! the proxy data path never calls into this module.
+//! 5xx middleware runs per console-API request but only acquires the lock on
+//! server-error responses), and the proxy data path never calls into this
+//! module.
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
@@ -214,8 +215,14 @@ pub fn record_panic(location: Option<&std::panic::Location<'_>>) {
 /// components otherwise.
 fn sanitize_source_path(file: &str, line: u32) -> String {
     let normalized = file.replace('\\', "/");
-    let trimmed = if let Some(idx) = normalized.find("crates/") {
-        &normalized[idx..]
+    // Anchor on a path COMPONENT named `crates` (leading slash or path start),
+    // not a bare substring — `my-crates/…` must not match. rfind so the
+    // workspace-level `crates/` wins if a parent directory is also named
+    // `crates` (e.g. a checkout under ~/crates/temps).
+    let trimmed = if normalized.starts_with("crates/") {
+        normalized.as_str()
+    } else if let Some(idx) = normalized.rfind("/crates/") {
+        &normalized[idx + 1..]
     } else {
         let mut components: Vec<&str> = normalized.rsplit('/').take(3).collect();
         components.reverse();
@@ -311,6 +318,22 @@ mod tests {
         assert_eq!(
             sanitize_source_path(r"C:\build\temps\crates\temps-core\src\lib.rs", 3),
             "crates/temps-core/src/lib.rs:3"
+        );
+        // A directory merely CONTAINING "crates" must not anchor the trim.
+        assert_eq!(
+            sanitize_source_path("/home/alice/my-crates/temps/src/lib.rs", 9),
+            "temps/src/lib.rs:9"
+        );
+        // Checkout under ~/crates: the rightmost `crates/` component wins, so
+        // the home directory is still stripped.
+        assert_eq!(
+            sanitize_source_path("/home/alice/crates/temps/crates/temps-core/src/lib.rs", 5),
+            "crates/temps-core/src/lib.rs:5"
+        );
+        // Relative build paths (CI) that already start at crates/ pass through.
+        assert_eq!(
+            sanitize_source_path("crates/temps-core/src/lib.rs", 1),
+            "crates/temps-core/src/lib.rs:1"
         );
     }
 
