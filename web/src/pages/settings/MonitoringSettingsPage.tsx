@@ -34,7 +34,7 @@ import {
   Loader2,
   Save,
 } from 'lucide-react'
-import { useEffect } from 'react'
+import { forwardRef, useEffect, type ComponentProps } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 
@@ -72,6 +72,29 @@ const RETENTION_DEFAULTS: ObservabilityRetentionSettings = {
 const BYTES_PER_ROW = 100
 // Approximate number of metrics tracked per monitored service
 const METRICS_PER_SERVICE = 15
+
+type DurationUnit = 'hours' | 'days' | 'years'
+
+interface DurationInputProps extends ComponentProps<'input'> {
+  unit: DurationUnit
+}
+
+const DurationInput = forwardRef<HTMLInputElement, DurationInputProps>(
+  ({ unit, ...props }, ref) => (
+    <div className="relative text-base md:text-sm">
+      <Input
+        ref={ref}
+        type="number"
+        className="pr-20 tabular-nums"
+        {...props}
+      />
+      <span className="pointer-events-none absolute inset-y-0 right-8 flex items-center text-muted-foreground">
+        {unit}
+      </span>
+    </div>
+  )
+)
+DurationInput.displayName = 'DurationInput'
 
 function estimateStorageMbPerDay(scrapeIntervalSecs: number): number {
   // Placeholder: pull the "monitored services" count from settings if available
@@ -276,27 +299,21 @@ export function MonitoringSettingsPage() {
                   <Label htmlFor="proxy-compression-delay">
                     Proxy logs delay
                   </Label>
-                  <div className="relative">
-                    <Input
-                      id="proxy-compression-delay"
-                      type="number"
-                      min={1}
-                      max={720}
-                      className="pr-16"
-                      {...register(
-                        'observability_compression.proxy_logs_after_hours',
-                        {
-                          valueAsNumber: true,
-                          required: 'Enter a compression delay',
-                          min: { value: 1, message: 'Min 1 hour' },
-                          max: { value: 720, message: 'Max 720 hours' },
-                        }
-                      )}
-                    />
-                    <span className="pointer-events-none absolute inset-y-0 right-3 flex items-center text-xs text-muted-foreground">
-                      hours
-                    </span>
-                  </div>
+                  <DurationInput
+                    id="proxy-compression-delay"
+                    unit="hours"
+                    min={1}
+                    max={720}
+                    {...register(
+                      'observability_compression.proxy_logs_after_hours',
+                      {
+                        valueAsNumber: true,
+                        required: 'Enter a compression delay',
+                        min: { value: 1, message: 'Min 1 hour' },
+                        max: { value: 720, message: 'Max 720 hours' },
+                      }
+                    )}
+                  />
                   <p className="text-xs text-muted-foreground">
                     Compresses closed proxy-log chunks once their newest row is
                     this old. It does not delete logs. Default 24 hours; maximum
@@ -316,27 +333,21 @@ export function MonitoringSettingsPage() {
                   <Label htmlFor="span-compression-delay">
                     OTel spans delay
                   </Label>
-                  <div className="relative">
-                    <Input
-                      id="span-compression-delay"
-                      type="number"
-                      min={1}
-                      max={2160}
-                      className="pr-16"
-                      {...register(
-                        'observability_compression.otel_spans_after_hours',
-                        {
-                          valueAsNumber: true,
-                          required: 'Enter a compression delay',
-                          min: { value: 1, message: 'Min 1 hour' },
-                          max: { value: 2160, message: 'Max 2160 hours' },
-                        }
-                      )}
-                    />
-                    <span className="pointer-events-none absolute inset-y-0 right-3 flex items-center text-xs text-muted-foreground">
-                      hours
-                    </span>
-                  </div>
+                  <DurationInput
+                    id="span-compression-delay"
+                    unit="hours"
+                    min={1}
+                    max={2160}
+                    {...register(
+                      'observability_compression.otel_spans_after_hours',
+                      {
+                        valueAsNumber: true,
+                        required: 'Enter a compression delay',
+                        min: { value: 1, message: 'Min 1 hour' },
+                        max: { value: 2160, message: 'Max 2160 hours' },
+                      }
+                    )}
+                  />
                   <p className="text-xs text-muted-foreground">
                     Compresses closed span chunks once their newest row is this
                     old. It does not delete traces. Default 24 hours; maximum 90
@@ -455,13 +466,13 @@ export function MonitoringSettingsPage() {
                 <div className="space-y-3 rounded-lg border p-4">
                   <Label htmlFor="retention-raw">Raw data (days)</Label>
                   <p className="min-h-10 text-xs leading-5 text-muted-foreground">
-                    Stores every original sample at the selected scrape
-                    interval for detailed recent charts and precise incident
+                    Stores every original sample at the selected scrape interval
+                    for detailed recent charts and precise incident
                     investigation.
                   </p>
-                  <Input
+                  <DurationInput
                     id="retention-raw"
-                    type="number"
+                    unit="days"
                     min={1}
                     max={30}
                     {...register('monitoring.retention_raw_days', {
@@ -488,9 +499,9 @@ export function MonitoringSettingsPage() {
                     Creates an hourly aggregate for each metric to preserve
                     medium-term trends after individual raw samples are deleted.
                   </p>
-                  <Input
+                  <DurationInput
                     id="retention-hourly"
-                    type="number"
+                    unit="days"
                     min={7}
                     max={365}
                     {...register('monitoring.retention_hourly_days', {
@@ -517,9 +528,9 @@ export function MonitoringSettingsPage() {
                     Creates a daily aggregate for each metric for capacity
                     planning, seasonality, and long-term historical trends.
                   </p>
-                  <Input
+                  <DurationInput
                     id="retention-daily"
-                    type="number"
+                    unit="years"
                     min={1}
                     max={10}
                     {...register('monitoring.retention_daily_years', {
@@ -618,9 +629,9 @@ export function MonitoringSettingsPage() {
                       by the proxy. Use these entries to investigate traffic,
                       status codes, and slow requests.
                     </p>
-                    <Input
+                    <DurationInput
                       id="retention-proxy-logs"
-                      type="number"
+                      unit="days"
                       min={1}
                       max={3650}
                       {...register('observability_retention.proxy_logs_days', {
@@ -655,9 +666,9 @@ export function MonitoringSettingsPage() {
                       waterfalls, follow requests across services, and inspect
                       timings, errors, events, and attributes.
                     </p>
-                    <Input
+                    <DurationInput
                       id="retention-otel-spans"
-                      type="number"
+                      unit="days"
                       min={1}
                       max={3650}
                       {...register('observability_retention.otel_spans_days', {
@@ -668,9 +679,9 @@ export function MonitoringSettingsPage() {
                       })}
                     />
                     <p className="text-xs text-muted-foreground">
-                      Spans older than this are permanently deleted and disappear
-                      from trace search and detail views. Range 1–3650 days;
-                      default 90.
+                      Spans older than this are permanently deleted and
+                      disappear from trace search and detail views. Range 1–3650
+                      days; default 90.
                     </p>
                     {errors.observability_retention?.otel_spans_days && (
                       <p className="text-xs text-destructive">
@@ -693,9 +704,9 @@ export function MonitoringSettingsPage() {
                   severity, body, attributes, and trace correlation. This does
                   not control Docker container log files.
                 </p>
-                <Input
+                <DurationInput
                   id="retention-otel-logs"
-                  type="number"
+                  unit="days"
                   min={1}
                   max={3650}
                   {...register('observability_retention.otel_logs_days', {
@@ -706,8 +717,8 @@ export function MonitoringSettingsPage() {
                   })}
                 />
                 <p className="text-xs text-muted-foreground">
-                  OTel log records older than this are permanently deleted. Range
-                  1–3650 days; default 90.
+                  OTel log records older than this are permanently deleted.
+                  Range 1–3650 days; default 90.
                 </p>
                 {errors.observability_retention?.otel_logs_days && (
                   <p className="text-xs text-destructive">
@@ -726,13 +737,13 @@ export function MonitoringSettingsPage() {
                   </code>
                 </div>
                 <p className="min-h-10 text-xs leading-5 text-muted-foreground">
-                  Stores application metric points sent by OpenTelemetry SDKs and
-                  collectors. These are separate from the Temps-scraped resource
-                  metrics configured above.
+                  Stores application metric points sent by OpenTelemetry SDKs
+                  and collectors. These are separate from the Temps-scraped
+                  resource metrics configured above.
                 </p>
-                <Input
+                <DurationInput
                   id="retention-otel-metrics"
-                  type="number"
+                  unit="days"
                   min={1}
                   max={3650}
                   {...register('observability_retention.otel_metrics_days', {
