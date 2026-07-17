@@ -1,5 +1,6 @@
 'use client'
 
+import { getEmailEvents, type TrackingEventResponse } from '@/api/client'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -17,24 +18,11 @@ import {
   ChevronLeft,
   ChevronRight,
   Globe,
-  Mail,
   Monitor,
 } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { EventBadge, EventIcon } from './shared'
-import { parseUserAgent } from './sharedUtils'
-
-interface EmailEvent {
-  id: number
-  email_id: string
-  event_type: string
-  provider_message_id: string | null
-  recipient: string | null
-  metadata: Record<string, unknown> | null
-  ip_address: string | null
-  user_agent: string | null
-  created_at: string
-}
+import { parseUserAgent, problemMessage } from './sharedUtils'
 
 // NOTE: the `/emails/{id}/tracking/events` endpoint (temps-email's
 // `get_email_events` handler / `EventsQuery`) only supports an `event_type`
@@ -46,13 +34,18 @@ interface EmailEvent {
 // number of tracking events for one email — and paginate over it
 // client-side, without keeping `page` in the query key so switching pages
 // doesn't trigger a redundant network refetch of the same data.
-async function fetchEmailEvents(emailId: string, eventType?: string): Promise<EmailEvent[]> {
-  const searchParams = new URLSearchParams()
-  if (eventType) searchParams.set('event_type', eventType)
-
-  const response = await fetch(`/api/emails/${emailId}/tracking/events?${searchParams}`)
-  if (!response.ok) throw new Error('Failed to fetch email events')
-  return response.json()
+async function fetchEmailEvents(
+  emailId: string,
+  eventType?: string
+): Promise<TrackingEventResponse[]> {
+  const response = await getEmailEvents({
+    path: { id: emailId },
+    query: eventType ? { event_type: eventType } : undefined,
+  })
+  if (response.error || !response.data) {
+    throw new Error(problemMessage(response.error, 'Failed to fetch email events'))
+  }
+  return response.data
 }
 
 export function EmailEventTimeline({ emailId }: { emailId: string }) {
@@ -108,7 +101,9 @@ export function EmailEventTimeline({ emailId }: { emailId: string }) {
           <CardTitle className="text-base">Activity</CardTitle>
         </CardHeader>
         <CardContent>
-          <p className="text-sm text-muted-foreground">Failed to load events.</p>
+          <p className="text-sm text-muted-foreground">
+            {error instanceof Error ? error.message : 'Failed to load events.'}
+          </p>
         </CardContent>
       </Card>
     )
@@ -139,8 +134,11 @@ export function EmailEventTimeline({ emailId }: { emailId: string }) {
             <SelectContent>
               <SelectItem value="all">All events</SelectItem>
               <SelectItem value="delivered">Delivered</SelectItem>
-              <SelectItem value="opened">Opened</SelectItem>
-              <SelectItem value="clicked">Clicked</SelectItem>
+              {/* Stored event_type values are "open"/"click" — see
+                  tracking_service.rs record_open/record_click. The endpoint
+                  filters by exact match, so these values must match storage. */}
+              <SelectItem value="open">Opened</SelectItem>
+              <SelectItem value="click">Clicked</SelectItem>
               <SelectItem value="bounced">Bounced</SelectItem>
               <SelectItem value="complained">Complained</SelectItem>
             </SelectContent>
@@ -179,17 +177,10 @@ export function EmailEventTimeline({ emailId }: { emailId: string }) {
                   </div>
 
                   <div className="flex items-center gap-3 text-xs text-muted-foreground flex-wrap">
-                    {(event.event_type === 'click' || event.event_type === 'clicked') && !!event.metadata?.url && (
+                    {event.link_url && (
                       <span className="flex items-center gap-1 truncate max-w-[300px]">
                         <Globe className="h-3 w-3 shrink-0" />
-                        <span className="truncate">{String(event.metadata!.url)}</span>
-                      </span>
-                    )}
-
-                    {event.recipient && (
-                      <span className="flex items-center gap-1">
-                        <Mail className="h-3 w-3 shrink-0" />
-                        {event.recipient}
+                        <span className="truncate">{event.link_url}</span>
                       </span>
                     )}
 
@@ -208,24 +199,6 @@ export function EmailEventTimeline({ emailId }: { emailId: string }) {
                     )}
                   </div>
 
-                  {/* Bounce/complaint metadata */}
-                  {(event.event_type === 'bounced' || event.event_type === 'complained') &&
-                    event.metadata != null && (
-                      <div className="text-xs bg-muted/50 rounded p-2 mt-1">
-                        {!!event.metadata.bounce_type && (
-                          <span>
-                            Type: <strong>{String(event.metadata.bounce_type)}</strong>
-                            {event.metadata.bounce_sub_type != null &&
-                              ` (${String(event.metadata.bounce_sub_type)})`}
-                          </span>
-                        )}
-                        {!!event.metadata.complaint_type && (
-                          <span>
-                            Type: <strong>{String(event.metadata.complaint_type)}</strong>
-                          </span>
-                        )}
-                      </div>
-                    )}
                 </div>
               </div>
             ))}

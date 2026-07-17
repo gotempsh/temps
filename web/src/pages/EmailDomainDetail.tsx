@@ -175,7 +175,11 @@ export function EmailDomainDetail() {
     enabled: !!id,
   })
 
-  const { data: emailStats, isLoading: isLoadingStats } = useQuery({
+  const {
+    data: emailStats,
+    isLoading: isLoadingStats,
+    error: statsError,
+  } = useQuery({
     queryKey: ['email-stats', id],
     queryFn: () => fetchEmailStats(id!),
     enabled: !!id,
@@ -480,9 +484,19 @@ export function EmailDomainDetail() {
           </Alert>
         )}
 
-        {/* Deliverability stats for this domain */}
+        {/* Delivery status stats for this domain */}
         {isLoadingStats ? (
           <StatsSkeleton />
+        ) : statsError ? (
+          <Alert variant="destructive">
+            <AlertCircle className="h-4 w-4" />
+            <AlertTitle>Failed to load email stats</AlertTitle>
+            <AlertDescription>
+              {statsError instanceof Error
+                ? statsError.message
+                : 'Could not fetch delivery stats for this domain.'}
+            </AlertDescription>
+          </Alert>
         ) : (
           emailStats && (
             <div className="grid gap-4 grid-cols-2 md:grid-cols-5">

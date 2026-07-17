@@ -262,8 +262,11 @@ export function EmailAnalytics() {
               <SelectContent>
                 <SelectItem value="all">All events</SelectItem>
                 <SelectItem value="delivered">Delivered</SelectItem>
-                <SelectItem value="opened">Opened</SelectItem>
-                <SelectItem value="clicked">Clicked</SelectItem>
+                {/* Stored event_type values are "open"/"click" — see
+                    tracking_service.rs record_open/record_click. The endpoint
+                    filters by exact match, so these values must match storage. */}
+                <SelectItem value="open">Opened</SelectItem>
+                <SelectItem value="click">Clicked</SelectItem>
                 <SelectItem value="bounced">Bounced</SelectItem>
                 <SelectItem value="complained">Complained</SelectItem>
               </SelectContent>
