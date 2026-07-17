@@ -1705,15 +1705,6 @@ export const loginMutation = (options?: Partial<Options<LoginData>>): UseMutatio
     return mutationOptions;
 };
 
-    return mutationOptions;
-};
-
-
-        return data;
-    },
-    queryKey: verifyMagicLinkQueryKey(options)
-});
-
 export const oidcCallbackQueryKey = (options?: Options<OidcCallbackData>) => createQueryKey('oidcCallback', options);
 
 export const oidcCallbackOptions = (options?: Options<OidcCallbackData>) => queryOptions<unknown, DefaultError, unknown, ReturnType<typeof oidcCallbackQueryKey>>({
