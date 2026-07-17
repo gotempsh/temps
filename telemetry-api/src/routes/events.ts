@@ -62,6 +62,11 @@ export const KNOWN_EVENT_TYPES = new Set([
 
   // Status page
   "status_page_published",
+
+  // Instance health — periodic aggregated error counts (ERROR logs by
+  // target, console-API 5xx by route template, panics by source location).
+  // Counts keyed by compile-time identifiers only; never error messages.
+  "error_summary",
 ]);
 
 interface IngestBody {
