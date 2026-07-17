@@ -700,7 +700,7 @@ pub struct MonitoringSettings {
     pub retention_hourly_days: u32,
 
     /// How many years of daily-aggregate data to keep (converted to days internally).
-    #[schema(minimum = 1, example = 2)]
+    #[schema(minimum = 1, maximum = 10, example = 2)]
     pub retention_daily_years: u32,
 
     /// ClickHouse DSN, required only when `store = "click_house"`.

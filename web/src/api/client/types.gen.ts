@@ -1090,12 +1090,24 @@ export type AppSettingsResponse = {
      * effective backend and warns when it diverges from the configured store.
      */
     effective_metrics_store: MetricsStoreKind;
+    /**
+     * Storage backend actually used for proxy logs, OTel spans, and OTel
+     * metrics. OTel logs remain TimescaleDB-backed.
+     */
+    effective_observability_store: MetricsStoreKind;
     external_url?: string | null;
     insecure_tls: boolean;
     internal_url?: string | null;
     letsencrypt: LetsEncryptSettings;
     monitoring: MonitoringSettingsMasked;
+    /**
+     * Number of enabled, running services included in the metrics scrape
+     * cycle. Null when the count could not be loaded.
+     */
+    monitored_services_count: number | null;
     multi_node: MultiNodeSettingsMasked;
+    observability_compression: ObservabilityCompressionSettings;
+    observability_retention: ObservabilityRetentionSettings;
     preview_domain: string;
     preview_gateway: PreviewGatewaySettingsMasked;
     rate_limiting: RateLimitSettings;
@@ -9462,6 +9474,24 @@ export type MonitoringSettingsMasked = {
     retention_raw_days: number;
     scrape_interval_secs: number;
     store: MetricsStoreKind;
+};
+
+export type ObservabilityCompressionSettings = {
+    /** Compress OpenTelemetry span chunks after this many hours. */
+    otel_spans_after_hours: number;
+    /** Compress proxy-log chunks after this many hours. */
+    proxy_logs_after_hours: number;
+};
+
+export type ObservabilityRetentionSettings = {
+    /** OpenTelemetry log-event retention in days. */
+    otel_logs_days: number;
+    /** OpenTelemetry metric-point retention in days. */
+    otel_metrics_days: number;
+    /** OpenTelemetry span/trace retention in days. */
+    otel_spans_days: number;
+    /** Raw proxy request-log retention in days. */
+    proxy_logs_days: number;
 };
 
 export type MrrBucketResponse = {

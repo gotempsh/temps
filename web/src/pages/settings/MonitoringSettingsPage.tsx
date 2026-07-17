@@ -193,11 +193,14 @@ export function MonitoringSettingsPage() {
     )
   }
 
-  const estimatedMbPerDay = estimateStorageMbPerDay(
-    monitoring?.scrape_interval_secs ?? DEFAULTS.scrape_interval_secs,
-    settings?.monitored_services_count ?? 0
-  )
-  const monitoredServicesCount = settings?.monitored_services_count ?? 0
+  const monitoredServicesCount = settings?.monitored_services_count
+  const estimatedMbPerDay =
+    monitoredServicesCount == null
+      ? null
+      : estimateStorageMbPerDay(
+          monitoring?.scrape_interval_secs ?? DEFAULTS.scrape_interval_secs,
+          monitoredServicesCount
+        )
 
   return (
     <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
@@ -558,14 +561,26 @@ export function MonitoringSettingsPage() {
 
             <Alert>
               <HardDrive className="h-4 w-4" />
-              <AlertTitle>Estimated metric storage</AlertTitle>
+              <AlertTitle>
+                {effectiveStore === 'click_house'
+                  ? 'Estimated metric ingest'
+                  : 'Estimated metric storage'}
+              </AlertTitle>
               <AlertDescription>
-                Approximately <strong>{estimatedMbPerDay} MB/day</strong> of raw
-                metric data based on {monitoredServicesCount} monitored{' '}
-                {monitoredServicesCount === 1 ? 'service' : 'services'},{' '}
-                {METRICS_PER_SERVICE} metrics each, scraped every{' '}
-                {monitoring?.scrape_interval_secs ?? 30}s. Hourly/daily rollups
-                add roughly 5% overhead.
+                {estimatedMbPerDay == null ? (
+                  'The estimate is unavailable because the monitored service count could not be loaded.'
+                ) : (
+                  <>
+                    Approximately <strong>{estimatedMbPerDay} MB/day</strong> of
+                    raw metric data based on {monitoredServicesCount} monitored{' '}
+                    {monitoredServicesCount === 1 ? 'service' : 'services'},{' '}
+                    {METRICS_PER_SERVICE} metrics each, scraped every{' '}
+                    {monitoring?.scrape_interval_secs ?? 30}s.{' '}
+                    {effectiveStore === 'click_house'
+                      ? 'This is ingest volume before ClickHouse compression; actual disk usage depends on codecs and data cardinality.'
+                      : 'Hourly/daily rollups add roughly 5% overhead.'}
+                  </>
+                )}
               </AlertDescription>
             </Alert>
           </section>
@@ -578,13 +593,13 @@ export function MonitoringSettingsPage() {
               <p className="text-xs text-muted-foreground">
                 Each signal has its own table and retention window, so
                 high-volume request logs can be deleted sooner than traces or
-                application telemetry. TimescaleDB permanently deletes expired
-                rows in the background.
+                application telemetry. The active storage backend permanently
+                deletes expired rows in the background.
               </p>
             </div>
 
             {effectiveObservabilityStore === 'click_house' && (
-              <div className="grid gap-3 sm:grid-cols-2">
+              <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
                 <div className="rounded-lg border bg-muted/30 p-4">
                   <div className="flex items-center justify-between gap-3">
                     <p className="text-sm font-medium">Proxy request logs</p>
@@ -596,6 +611,19 @@ export function MonitoringSettingsPage() {
                     One row per proxied HTTP request, including route, status,
                     duration, and request metadata. ClickHouse permanently
                     deletes rows older than 30 days using its native TTL.
+                  </p>
+                </div>
+                <div className="rounded-lg border bg-muted/30 p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <p className="text-sm font-medium">OTel metric points</p>
+                    <code className="rounded bg-background px-2 py-0.5 text-[11px] text-muted-foreground ring-1 ring-inset ring-border">
+                      metrics
+                    </code>
+                  </div>
+                  <p className="mt-2 text-xs leading-5 text-muted-foreground">
+                    Application metrics received over OTLP. ClickHouse
+                    permanently deletes rows older than 90 days using its native
+                    TTL.
                   </p>
                 </div>
                 <div className="rounded-lg border bg-muted/30 p-4">
@@ -730,42 +758,44 @@ export function MonitoringSettingsPage() {
                 )}
               </div>
 
-              <div className="space-y-3 rounded-lg border p-4">
-                <div className="flex items-center justify-between gap-3">
-                  <Label htmlFor="retention-otel-metrics">
-                    OTel metric points
-                  </Label>
-                  <code className="rounded bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
-                    otel_metrics
-                  </code>
-                </div>
-                <p className="min-h-10 text-xs leading-5 text-muted-foreground">
-                  Stores application metric points sent by OpenTelemetry SDKs
-                  and collectors. These are separate from the Temps-scraped
-                  resource metrics configured above.
-                </p>
-                <DurationInput
-                  id="retention-otel-metrics"
-                  unit="days"
-                  min={1}
-                  max={3650}
-                  {...register('observability_retention.otel_metrics_days', {
-                    valueAsNumber: true,
-                    required: true,
-                    min: { value: 1, message: 'Min 1 day' },
-                    max: { value: 3650, message: 'Max 3650 days' },
-                  })}
-                />
-                <p className="text-xs text-muted-foreground">
-                  OTel metric points older than this are permanently deleted.
-                  Range 1–3650 days; default 90.
-                </p>
-                {errors.observability_retention?.otel_metrics_days && (
-                  <p className="text-xs text-destructive">
-                    {errors.observability_retention.otel_metrics_days.message}
+              {effectiveObservabilityStore !== 'click_house' && (
+                <div className="space-y-3 rounded-lg border p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <Label htmlFor="retention-otel-metrics">
+                      OTel metric points
+                    </Label>
+                    <code className="rounded bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
+                      otel_metrics
+                    </code>
+                  </div>
+                  <p className="min-h-10 text-xs leading-5 text-muted-foreground">
+                    Stores application metric points sent by OpenTelemetry SDKs
+                    and collectors. These are separate from the Temps-scraped
+                    resource metrics configured above.
                   </p>
-                )}
-              </div>
+                  <DurationInput
+                    id="retention-otel-metrics"
+                    unit="days"
+                    min={1}
+                    max={3650}
+                    {...register('observability_retention.otel_metrics_days', {
+                      valueAsNumber: true,
+                      required: true,
+                      min: { value: 1, message: 'Min 1 day' },
+                      max: { value: 3650, message: 'Max 3650 days' },
+                    })}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    OTel metric points older than this are permanently deleted.
+                    Range 1–3650 days; default 90.
+                  </p>
+                  {errors.observability_retention?.otel_metrics_days && (
+                    <p className="text-xs text-destructive">
+                      {errors.observability_retention.otel_metrics_days.message}
+                    </p>
+                  )}
+                </div>
+              )}
             </div>
           </section>
         </CardContent>

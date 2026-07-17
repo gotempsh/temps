@@ -112,7 +112,13 @@ fn policies_from_rows(rows: Vec<TimescalePolicyRow>) -> EffectiveTelemetryPolici
                 policies.metrics_hourly_days = Some(value)
             }
             ("service_metrics_daily", "policy_retention") => {
-                policies.metrics_daily_years = rounded_u32(value.into(), 365)
+                // The API represents this tier in whole years. Do not claim an
+                // arbitrary manually configured day count (for example 500
+                // days) is an exact year value. Leaving it unset falls back to
+                // the configured value, and the next save reconciles the drift.
+                if value % 365 == 0 {
+                    policies.metrics_daily_years = Some(value / 365);
+                }
             }
             ("proxy_logs", "policy_compression") => {
                 policies.proxy_logs_compression_hours = Some(value)
@@ -640,6 +646,7 @@ SELECT
     )::BIGINT AS interval_seconds
 FROM timescaledb_information.jobs
 WHERE proc_name IN ('policy_compression', 'policy_retention')
+  AND hypertable_schema = current_schema()
   AND hypertable_name IN (
       'service_metrics',
       'service_metrics_hourly',
@@ -1292,7 +1299,8 @@ impl Drop for ConfigService {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use sea_orm::{DatabaseBackend, MockDatabase};
+    use sea_orm::{DatabaseBackend, MockDatabase, Value};
+    use std::collections::BTreeMap;
 
     fn test_config() -> Arc<ServerConfig> {
         Arc::new(
@@ -1317,6 +1325,31 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    fn timescale_policy_row(
+        hypertable_name: &str,
+        proc_name: &str,
+        interval_seconds: i64,
+    ) -> BTreeMap<String, Value> {
+        BTreeMap::from([
+            (
+                "hypertable_name".to_string(),
+                Value::String(Some(Box::new(hypertable_name.to_string()))),
+            ),
+            (
+                "proc_name".to_string(),
+                Value::String(Some(Box::new(proc_name.to_string()))),
+            ),
+            (
+                "interval_seconds".to_string(),
+                Value::BigInt(Some(interval_seconds)),
+            ),
+        ])
+    }
+
+    fn count_row(count: i64) -> BTreeMap<String, Value> {
+        BTreeMap::from([("num_items".to_string(), Value::BigInt(Some(count)))])
     }
 
     #[test]
@@ -1420,6 +1453,67 @@ mod tests {
             policies_from_rows(rows),
             EffectiveTelemetryPolicies::default()
         );
+    }
+
+    #[test]
+    fn timescale_policy_rows_do_not_round_partial_years() {
+        let policies = policies_from_rows(vec![TimescalePolicyRow {
+            hypertable_name: "service_metrics_daily".into(),
+            proc_name: "policy_retention".into(),
+            interval_seconds: 500 * SECONDS_PER_DAY,
+        }]);
+
+        assert_eq!(policies.metrics_daily_years, None);
+    }
+
+    #[tokio::test]
+    async fn effective_policy_query_reads_timescale_metadata_without_telemetry_scan() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[
+                    timescale_policy_row("proxy_logs", "policy_compression", 24 * SECONDS_PER_HOUR),
+                    timescale_policy_row("otel_metrics", "policy_retention", 90 * SECONDS_PER_DAY),
+                ]])
+                .into_connection(),
+        );
+        let svc = ConfigService::new(test_config(), db.clone());
+
+        let policies = svc
+            .get_effective_telemetry_policies()
+            .await
+            .expect("Timescale metadata query should map active jobs");
+
+        assert_eq!(policies.proxy_logs_compression_hours, Some(24));
+        assert_eq!(policies.otel_metrics_retention_days, Some(90));
+        drop(svc);
+        let statements = Arc::try_unwrap(db)
+            .expect("test should release database connection")
+            .into_transaction_log();
+        let sql = statements[0].statements()[0].to_string();
+        assert!(sql.contains("timescaledb_information.jobs"));
+        assert!(sql.contains("hypertable_schema = current_schema()"));
+        assert!(!sql.contains("FROM proxy_logs"));
+        assert!(!sql.contains("FROM otel_metrics"));
+    }
+
+    #[tokio::test]
+    async fn monitored_service_count_matches_scraper_predicates() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[count_row(4)]])
+                .into_connection(),
+        );
+        let svc = ConfigService::new(test_config(), db.clone());
+
+        assert_eq!(svc.count_monitored_services().await.unwrap(), 4);
+        drop(svc);
+        let statements = Arc::try_unwrap(db)
+            .expect("test should release database connection")
+            .into_transaction_log();
+        let sql = statements[0].statements()[0].to_string();
+        assert!(sql.contains("metrics_enabled"));
+        assert!(sql.contains("status"));
+        assert!(sql.contains("running"));
     }
 
     // The proxy reads settings on the per-request hot path, so get_settings()
@@ -1534,6 +1628,90 @@ mod tests {
             cached.observability_compression,
             updated.observability_compression
         );
+    }
+
+    #[tokio::test]
+    async fn update_settings_recreates_a_missing_live_policy_even_when_json_matches() {
+        let current = AppSettings::default();
+        let live_rows = vec![
+            timescale_policy_row(
+                "service_metrics",
+                "policy_retention",
+                i64::from(current.monitoring.retention_raw_days) * SECONDS_PER_DAY,
+            ),
+            timescale_policy_row(
+                "service_metrics_hourly",
+                "policy_retention",
+                i64::from(current.monitoring.retention_hourly_days) * SECONDS_PER_DAY,
+            ),
+            timescale_policy_row(
+                "service_metrics_daily",
+                "policy_retention",
+                i64::from(current.monitoring.retention_daily_years) * 365 * SECONDS_PER_DAY,
+            ),
+            // proxy_logs compression is intentionally missing.
+            timescale_policy_row(
+                "otel_spans",
+                "policy_compression",
+                i64::from(current.observability_compression.otel_spans_after_hours)
+                    * SECONDS_PER_HOUR,
+            ),
+            timescale_policy_row(
+                "proxy_logs",
+                "policy_retention",
+                i64::from(current.observability_retention.proxy_logs_days) * SECONDS_PER_DAY,
+            ),
+            timescale_policy_row(
+                "otel_spans",
+                "policy_retention",
+                i64::from(current.observability_retention.otel_spans_days) * SECONDS_PER_DAY,
+            ),
+            timescale_policy_row(
+                "otel_log_events",
+                "policy_retention",
+                i64::from(current.observability_retention.otel_logs_days) * SECONDS_PER_DAY,
+            ),
+            timescale_policy_row(
+                "otel_metrics",
+                "policy_retention",
+                i64::from(current.observability_retention.otel_metrics_days) * SECONDS_PER_DAY,
+            ),
+        ];
+        let row = settings_row("localhost");
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([live_rows])
+                .append_query_results([[row.clone()], [row]])
+                .append_exec_results([
+                    sea_orm::MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 1,
+                    },
+                    sea_orm::MockExecResult {
+                        last_insert_id: 1,
+                        rows_affected: 1,
+                    },
+                ])
+                .into_connection(),
+        );
+        let svc = ConfigService::new(test_config(), db.clone());
+
+        svc.update_settings(current)
+            .await
+            .expect("missing live policy should be recreated");
+
+        drop(svc);
+        let statements = Arc::try_unwrap(db)
+            .expect("test should release database connection")
+            .into_transaction_log();
+        let sql = statements
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(sql.contains("add_compression_policy"));
+        assert!(sql.contains("proxy_logs"));
     }
 
     #[tokio::test]

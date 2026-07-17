@@ -161,7 +161,7 @@ export interface PlatformSettings extends AppSettingsResponse {
   attack_mode?: boolean
   build_limits: BuildLimitsSettings
   /** Enabled, running services included in the metrics scrape cycle. */
-  monitored_services_count: number
+  monitored_services_count: number | null
   observability_compression: ObservabilityCompressionSettings
   observability_retention: ObservabilityRetentionSettings
   /** Effective backend for proxy logs and OTel spans. */
@@ -191,8 +191,8 @@ export async function getPlatformSettings(): Promise<PlatformSettings> {
     throw new Error('Settings endpoint returned no data')
   }
 
-  // Cast to include extended fields not yet present in generated OpenAPI types.
-  // The server contract guarantees these are populated.
+  // OpenAPI represents Rust `Option<T>` response fields as optional, while the
+  // settings handler serializes this complete response object on every read.
   return response.data as PlatformSettings
 }
 
