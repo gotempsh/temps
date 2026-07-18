@@ -39,7 +39,11 @@ async fn test_migration_up() -> anyhow::Result<()> {
         // that deliberately race jobs (concurrent-retention) still work,
         // because `CALL run_job(...)` executes in-session, not via the
         // launcher.
-        .with_cmd(vec!["postgres", "-c", "timescaledb.max_background_workers=0"])
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -112,7 +116,11 @@ async fn test_secure_sns_migration_upgrades_applied_global_suppression_schema() 
         // that deliberately race jobs (concurrent-retention) still work,
         // because `CALL run_job(...)` executes in-session, not via the
         // launcher.
-        .with_cmd(vec!["postgres", "-c", "timescaledb.max_background_workers=0"])
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
         .start()
         .await
     {
@@ -348,7 +356,11 @@ async fn test_migration_down() -> anyhow::Result<()> {
         // that deliberately race jobs (concurrent-retention) still work,
         // because `CALL run_job(...)` executes in-session, not via the
         // launcher.
-        .with_cmd(vec!["postgres", "-c", "timescaledb.max_background_workers=0"])
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -430,7 +442,11 @@ async fn test_migration_status() -> anyhow::Result<()> {
         // that deliberately race jobs (concurrent-retention) still work,
         // because `CALL run_job(...)` executes in-session, not via the
         // launcher.
-        .with_cmd(vec!["postgres", "-c", "timescaledb.max_background_workers=0"])
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -502,7 +518,11 @@ async fn test_pgvector_extension() -> anyhow::Result<()> {
         // that deliberately race jobs (concurrent-retention) still work,
         // because `CALL run_job(...)` executes in-session, not via the
         // launcher.
-        .with_cmd(vec!["postgres", "-c", "timescaledb.max_background_workers=0"])
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -620,7 +640,11 @@ async fn test_table_constraints() -> anyhow::Result<()> {
         // that deliberately race jobs (concurrent-retention) still work,
         // because `CALL run_job(...)` executes in-session, not via the
         // launcher.
-        .with_cmd(vec!["postgres", "-c", "timescaledb.max_background_workers=0"])
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -864,7 +888,11 @@ async fn test_compute_network_migration() -> anyhow::Result<()> {
         // that deliberately race jobs (concurrent-retention) still work,
         // because `CALL run_job(...)` executes in-session, not via the
         // launcher.
-        .with_cmd(vec!["postgres", "-c", "timescaledb.max_background_workers=0"])
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -1004,7 +1032,11 @@ async fn test_dns_service_endpoints_migration() -> anyhow::Result<()> {
         // that deliberately race jobs (concurrent-retention) still work,
         // because `CALL run_job(...)` executes in-session, not via the
         // launcher.
-        .with_cmd(vec!["postgres", "-c", "timescaledb.max_background_workers=0"])
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -1277,7 +1309,11 @@ async fn test_visitor_dedup_migration_repoints_session_replay_sessions() -> anyh
         // that deliberately race jobs (concurrent-retention) still work,
         // because `CALL run_job(...)` executes in-session, not via the
         // launcher.
-        .with_cmd(vec!["postgres", "-c", "timescaledb.max_background_workers=0"])
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -1569,7 +1605,11 @@ async fn test_observe_correlation_migration_handles_compressed_proxy_logs() -> a
         // that deliberately race jobs (concurrent-retention) still work,
         // because `CALL run_job(...)` executes in-session, not via the
         // launcher.
-        .with_cmd(vec!["postgres", "-c", "timescaledb.max_background_workers=0"])
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -1789,7 +1829,11 @@ async fn test_observe_correlation_migration_is_idempotent() -> anyhow::Result<()
         // that deliberately race jobs (concurrent-retention) still work,
         // because `CALL run_job(...)` executes in-session, not via the
         // launcher.
-        .with_cmd(vec!["postgres", "-c", "timescaledb.max_background_workers=0"])
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -1851,7 +1895,11 @@ async fn test_observe_correlation_migration_survives_concurrent_retention() -> a
         // that deliberately race jobs (concurrent-retention) still work,
         // because `CALL run_job(...)` executes in-session, not via the
         // launcher.
-        .with_cmd(vec!["postgres", "-c", "timescaledb.max_background_workers=0"])
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -2029,7 +2077,11 @@ async fn test_mfa_pending_migration_revokes_ambiguous_sessions_and_defaults_clos
         // that deliberately race jobs (concurrent-retention) still work,
         // because `CALL run_job(...)` executes in-session, not via the
         // launcher.
-        .with_cmd(vec!["postgres", "-c", "timescaledb.max_background_workers=0"])
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
         .start()
         .await
     {
