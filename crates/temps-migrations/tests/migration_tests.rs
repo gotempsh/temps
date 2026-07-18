@@ -32,6 +32,14 @@ async fn test_migration_up() -> anyhow::Result<()> {
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
         .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        // Same fix as TestDatabase (#196) and CI's shared container: the
+        // TimescaleDB background-worker launcher polls independently of the
+        // test and can compress/drop chunks mid-test ("chunk not found").
+        // Disabling background workers kills that scheduler race; tests
+        // that deliberately race jobs (concurrent-retention) still work,
+        // because `CALL run_job(...)` executes in-session, not via the
+        // launcher.
+        .with_cmd(vec!["postgres", "-c", "timescaledb.max_background_workers=0"])
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -97,6 +105,14 @@ async fn test_secure_sns_migration_upgrades_applied_global_suppression_schema() 
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
         .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        // Same fix as TestDatabase (#196) and CI's shared container: the
+        // TimescaleDB background-worker launcher polls independently of the
+        // test and can compress/drop chunks mid-test ("chunk not found").
+        // Disabling background workers kills that scheduler race; tests
+        // that deliberately race jobs (concurrent-retention) still work,
+        // because `CALL run_job(...)` executes in-session, not via the
+        // launcher.
+        .with_cmd(vec!["postgres", "-c", "timescaledb.max_background_workers=0"])
         .start()
         .await
     {
@@ -325,6 +341,14 @@ async fn test_migration_down() -> anyhow::Result<()> {
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
         .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        // Same fix as TestDatabase (#196) and CI's shared container: the
+        // TimescaleDB background-worker launcher polls independently of the
+        // test and can compress/drop chunks mid-test ("chunk not found").
+        // Disabling background workers kills that scheduler race; tests
+        // that deliberately race jobs (concurrent-retention) still work,
+        // because `CALL run_job(...)` executes in-session, not via the
+        // launcher.
+        .with_cmd(vec!["postgres", "-c", "timescaledb.max_background_workers=0"])
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -399,6 +423,14 @@ async fn test_migration_status() -> anyhow::Result<()> {
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
         .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        // Same fix as TestDatabase (#196) and CI's shared container: the
+        // TimescaleDB background-worker launcher polls independently of the
+        // test and can compress/drop chunks mid-test ("chunk not found").
+        // Disabling background workers kills that scheduler race; tests
+        // that deliberately race jobs (concurrent-retention) still work,
+        // because `CALL run_job(...)` executes in-session, not via the
+        // launcher.
+        .with_cmd(vec!["postgres", "-c", "timescaledb.max_background_workers=0"])
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -463,6 +495,14 @@ async fn test_pgvector_extension() -> anyhow::Result<()> {
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
         .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        // Same fix as TestDatabase (#196) and CI's shared container: the
+        // TimescaleDB background-worker launcher polls independently of the
+        // test and can compress/drop chunks mid-test ("chunk not found").
+        // Disabling background workers kills that scheduler race; tests
+        // that deliberately race jobs (concurrent-retention) still work,
+        // because `CALL run_job(...)` executes in-session, not via the
+        // launcher.
+        .with_cmd(vec!["postgres", "-c", "timescaledb.max_background_workers=0"])
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -573,6 +613,14 @@ async fn test_table_constraints() -> anyhow::Result<()> {
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
         .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        // Same fix as TestDatabase (#196) and CI's shared container: the
+        // TimescaleDB background-worker launcher polls independently of the
+        // test and can compress/drop chunks mid-test ("chunk not found").
+        // Disabling background workers kills that scheduler race; tests
+        // that deliberately race jobs (concurrent-retention) still work,
+        // because `CALL run_job(...)` executes in-session, not via the
+        // launcher.
+        .with_cmd(vec!["postgres", "-c", "timescaledb.max_background_workers=0"])
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -809,6 +857,14 @@ async fn test_compute_network_migration() -> anyhow::Result<()> {
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
         .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        // Same fix as TestDatabase (#196) and CI's shared container: the
+        // TimescaleDB background-worker launcher polls independently of the
+        // test and can compress/drop chunks mid-test ("chunk not found").
+        // Disabling background workers kills that scheduler race; tests
+        // that deliberately race jobs (concurrent-retention) still work,
+        // because `CALL run_job(...)` executes in-session, not via the
+        // launcher.
+        .with_cmd(vec!["postgres", "-c", "timescaledb.max_background_workers=0"])
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -941,6 +997,14 @@ async fn test_dns_service_endpoints_migration() -> anyhow::Result<()> {
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
         .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        // Same fix as TestDatabase (#196) and CI's shared container: the
+        // TimescaleDB background-worker launcher polls independently of the
+        // test and can compress/drop chunks mid-test ("chunk not found").
+        // Disabling background workers kills that scheduler race; tests
+        // that deliberately race jobs (concurrent-retention) still work,
+        // because `CALL run_job(...)` executes in-session, not via the
+        // launcher.
+        .with_cmd(vec!["postgres", "-c", "timescaledb.max_background_workers=0"])
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -1206,6 +1270,14 @@ async fn test_visitor_dedup_migration_repoints_session_replay_sessions() -> anyh
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
         .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        // Same fix as TestDatabase (#196) and CI's shared container: the
+        // TimescaleDB background-worker launcher polls independently of the
+        // test and can compress/drop chunks mid-test ("chunk not found").
+        // Disabling background workers kills that scheduler race; tests
+        // that deliberately race jobs (concurrent-retention) still work,
+        // because `CALL run_job(...)` executes in-session, not via the
+        // launcher.
+        .with_cmd(vec!["postgres", "-c", "timescaledb.max_background_workers=0"])
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -1490,6 +1562,14 @@ async fn test_observe_correlation_migration_handles_compressed_proxy_logs() -> a
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
         .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        // Same fix as TestDatabase (#196) and CI's shared container: the
+        // TimescaleDB background-worker launcher polls independently of the
+        // test and can compress/drop chunks mid-test ("chunk not found").
+        // Disabling background workers kills that scheduler race; tests
+        // that deliberately race jobs (concurrent-retention) still work,
+        // because `CALL run_job(...)` executes in-session, not via the
+        // launcher.
+        .with_cmd(vec!["postgres", "-c", "timescaledb.max_background_workers=0"])
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -1702,6 +1782,14 @@ async fn test_observe_correlation_migration_is_idempotent() -> anyhow::Result<()
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
         .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        // Same fix as TestDatabase (#196) and CI's shared container: the
+        // TimescaleDB background-worker launcher polls independently of the
+        // test and can compress/drop chunks mid-test ("chunk not found").
+        // Disabling background workers kills that scheduler race; tests
+        // that deliberately race jobs (concurrent-retention) still work,
+        // because `CALL run_job(...)` executes in-session, not via the
+        // launcher.
+        .with_cmd(vec!["postgres", "-c", "timescaledb.max_background_workers=0"])
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -1756,6 +1844,14 @@ async fn test_observe_correlation_migration_survives_concurrent_retention() -> a
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
         .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        // Same fix as TestDatabase (#196) and CI's shared container: the
+        // TimescaleDB background-worker launcher polls independently of the
+        // test and can compress/drop chunks mid-test ("chunk not found").
+        // Disabling background workers kills that scheduler race; tests
+        // that deliberately race jobs (concurrent-retention) still work,
+        // because `CALL run_job(...)` executes in-session, not via the
+        // launcher.
+        .with_cmd(vec!["postgres", "-c", "timescaledb.max_background_workers=0"])
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -1926,6 +2022,14 @@ async fn test_mfa_pending_migration_revokes_ambiguous_sessions_and_defaults_clos
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
         .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        // Same fix as TestDatabase (#196) and CI's shared container: the
+        // TimescaleDB background-worker launcher polls independently of the
+        // test and can compress/drop chunks mid-test ("chunk not found").
+        // Disabling background workers kills that scheduler race; tests
+        // that deliberately race jobs (concurrent-retention) still work,
+        // because `CALL run_job(...)` executes in-session, not via the
+        // launcher.
+        .with_cmd(vec!["postgres", "-c", "timescaledb.max_background_workers=0"])
         .start()
         .await
     {
