@@ -261,7 +261,21 @@ async fn test_secure_sns_migration_upgrades_applied_global_suppression_schema() 
     let count: i32 = scoped_count.try_get("", "count")?;
     assert_eq!(count, 2);
 
-    Migrator::down(&db, Some(1)).await?;
+    // Roll back exactly through the secure-sns migration, wherever it sits
+    // in the chain. A hardcoded step count breaks every time a newer
+    // migration lands after it (versions sort lexicographically ==
+    // chronologically under the mYYYYMMDD naming scheme).
+    let after = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*)::int AS n FROM seaql_migrations \
+             WHERE version > 'm20260714_000001_secure_sns_email_events'"
+                .to_string(),
+        ))
+        .await?
+        .expect("seaql_migrations count");
+    let steps_after: i32 = after.try_get("", "n")?;
+    Migrator::down(&db, Some(steps_after as u32 + 1)).await?;
 
     let rollback_counts = db
         .query_one(sea_orm::Statement::from_string(

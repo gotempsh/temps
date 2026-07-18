@@ -305,6 +305,24 @@ impl ServeCommand {
             });
         }
 
+        // Update notifier: shortly after startup, then at the configured
+        // interval (two hours by default), check GitHub
+        // for a newer release on this install's channel (stable vs beta is
+        // inferred from the running version tag). Hits land in this shared
+        // slot, which the console registers as a service so the settings API
+        // (`GET /settings/update-status`) can drive the web-console upgrade
+        // banner. Detached and best-effort — network failures are
+        // debug-logged and it never gates startup. Spawned before the role
+        // branch so it covers both `--role=all` (this runtime outlives the
+        // blocking proxy) and `--role=console` (the console block_on below
+        // runs on this same runtime).
+        let update_status = Arc::new(temps_core::UpdateStatusSlot::new());
+        let update_check_interval = crate::commands::upgrade::configured_update_check_interval();
+        rt.spawn(crate::commands::upgrade::update_notifier_loop(
+            update_status.clone(),
+            update_check_interval,
+        ));
+
         // Connect to Docker once and share the handle between:
         //   1. OnDemandManager (wake-on-request scale-to-zero)
         //   2. Preview gateway reconciler (workspace preview routing)
@@ -505,6 +523,7 @@ impl ServeCommand {
             admin_gate_service: Some(admin_gate_service),
             admin_gate_handle: Some(admin_gate_handle.clone()),
             retention_resolver_slot: retention_resolver_slot.clone(),
+            update_status,
         };
 
         if self.role == ServeRole::Console {

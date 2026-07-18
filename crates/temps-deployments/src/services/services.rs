@@ -28,6 +28,7 @@ use crate::services::types::{
     Deployment, DeploymentDomain, DeploymentEnvironment, DeploymentListResponse,
 };
 use crate::UpdateDeploymentSettingsRequest;
+use temps_core::PublicHostnameStrategy;
 use temps_core::WorkflowTask;
 
 /// Parameters for container log retrieval
@@ -2584,8 +2585,8 @@ impl DeploymentService {
     async fn compute_deployment_url(&self, deployment_slug: &str) -> anyhow::Result<String> {
         let settings = self.config_service.get_settings().await.unwrap_or_default();
 
-        let base_domain = settings.preview_domain;
-        let domain = format!("{}.{}", deployment_slug, base_domain);
+        let domain = PublicHostnameStrategy::Standard
+            .deployment_hostname(&settings.preview_domain, deployment_slug);
 
         // Determine protocol and port from external_url if set, otherwise default to http
         let (protocol, port) = if let Some(ref url) = settings.external_url {
@@ -2633,8 +2634,8 @@ impl DeploymentService {
     async fn compute_environment_url(&self, env_subdomain: &str) -> anyhow::Result<String> {
         let settings = self.config_service.get_settings().await.unwrap_or_default();
 
-        let base_domain = settings.preview_domain;
-        let domain = format!("{}.{}", env_subdomain, base_domain);
+        let domain = PublicHostnameStrategy::Standard
+            .environment_hostname(&settings.preview_domain, env_subdomain);
 
         // Determine protocol and port from external_url if set, otherwise default to http
         let (protocol, port) = if let Some(ref url) = settings.external_url {
@@ -2795,8 +2796,6 @@ impl DeploymentService {
             .await
             .map_err(|e| DeploymentError::Other(format!("Failed to get settings: {}", e)))?;
 
-        let base_domain = settings.preview_domain.trim_start_matches("*.").to_string();
-
         // Get pipeline id from deployment
         let deployment = deployments::Entity::find_by_id(deployment_id)
             .one(self.db.as_ref())
@@ -2805,9 +2804,12 @@ impl DeploymentService {
                 DeploymentError::NotFound(format!("Deployment {} not found", deployment_id))
             })?;
 
-        let domain = format!(
-            "{}-{}-{}.{}",
-            project.slug, environment.slug, deployment.id, base_domain
+        let deployment_label = deployment.id.to_string();
+        let domain = PublicHostnameStrategy::Standard.project_deployment_hostname(
+            &settings.preview_domain,
+            &project.slug,
+            &environment.slug,
+            &deployment_label,
         );
 
         // Remove any existing domains for this deployment

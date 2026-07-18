@@ -186,6 +186,10 @@ impl AuthContext {
                 // is documented, project-scoped machine access, so map it to the
                 // matching deployment-token permission.
                 Permission::EmailsSend => DeploymentTokenPermission::EmailsSend,
+                // Deployed apps also use TEMPS_API_TOKEN to call the AI gateway
+                // (POST /ai/v1/chat/completions, guarded by AiGatewayExecute).
+                // Same documented machine-access pattern as EmailsSend.
+                Permission::AiGatewayExecute => DeploymentTokenPermission::AiGatewayExecute,
                 // No implicit bridge from deployment-token permissions to
                 // general control-plane permissions.
                 _ => return false,
@@ -402,6 +406,35 @@ mod tests {
     fn deployment_token_without_emails_send_is_denied_emails_send() {
         let ctx = deployment_token_ctx(7, vec![DeploymentTokenPermission::AnalyticsRead]);
         assert!(!ctx.has_permission(&Permission::EmailsSend));
+    }
+
+    #[test]
+    fn deployment_token_full_access_grants_ai_gateway_execute() {
+        // Deployed apps use their injected deployment token to call the AI
+        // gateway; the default auto-minted token carries FullAccess, so it
+        // must satisfy AiGatewayExecute — same contract as EmailsSend.
+        let ctx = deployment_token_ctx(7, vec![DeploymentTokenPermission::FullAccess]);
+        assert!(ctx.has_permission(&Permission::AiGatewayExecute));
+    }
+
+    #[test]
+    fn deployment_token_ai_gateway_permission_grants_only_ai_gateway() {
+        let ctx = deployment_token_ctx(7, vec![DeploymentTokenPermission::AiGatewayExecute]);
+        assert!(ctx.has_permission(&Permission::AiGatewayExecute));
+        // ...but a narrow ai_gateway:execute token must not gain other access.
+        assert!(!ctx.has_permission(&Permission::EmailsSend));
+        assert!(!ctx.has_permission(&Permission::AnalyticsRead));
+    }
+
+    #[test]
+    fn deployment_token_without_ai_gateway_is_denied_ai_gateway_execute() {
+        let ctx = deployment_token_ctx(7, vec![DeploymentTokenPermission::AnalyticsRead]);
+        assert!(!ctx.has_permission(&Permission::AiGatewayExecute));
+        // AI gateway read/write management APIs stay control-plane only,
+        // even for FullAccess tokens.
+        let full = deployment_token_ctx(7, vec![DeploymentTokenPermission::FullAccess]);
+        assert!(!full.has_permission(&Permission::AiGatewayRead));
+        assert!(!full.has_permission(&Permission::AiGatewayWrite));
     }
 
     #[test]

@@ -2,11 +2,13 @@
 
 pub mod admin_gate;
 pub mod audit;
+pub mod client_ip;
 pub mod config;
 pub mod deployment;
 pub mod env_vars_provider;
 pub mod error;
 pub mod error_builder;
+pub mod error_metrics;
 pub mod external_plugin;
 pub mod jobs;
 pub mod node_pki;
@@ -16,13 +18,17 @@ pub mod openapi;
 pub mod plugin;
 pub mod problemdetails;
 pub mod project_access;
+pub mod public_hostname;
+pub mod public_hostname_resolver;
 pub mod retention;
 pub mod retry;
 pub mod secrets_manager;
 pub mod telemetry;
 pub mod tls;
 pub mod traces;
+pub mod update_status;
 pub use problemdetails::ProblemDetails;
+pub use update_status::{AvailableUpdate, UpdateStatusSlot, UPGRADE_DOCS_URL};
 mod app_settings;
 mod constants;
 mod cookie_crypto;
@@ -42,6 +48,7 @@ pub mod workflow_executor;
 pub mod workflow_memory;
 // Re-export commonly used types
 pub use audit::*;
+pub use client_ip::resolve_client_ip;
 pub use config::*;
 pub use constants::*;
 pub use deployment::*;
@@ -54,6 +61,10 @@ pub use error_builder::*;
 pub use jobs::*;
 pub use on_demand::*;
 pub use project_access::ProjectAccessChecker;
+pub use public_hostname::{base_domain as public_base_domain, PublicHostnameStrategy};
+pub use public_hostname_resolver::{
+    match_strategy, PublicHostnameResolver, StandardHostnameResolver,
+};
 pub use retention::{
     FixedRetentionResolver, RetentionResolver, RetentionResolverSlot, RetentionTable,
 };
@@ -71,8 +82,8 @@ pub use app_settings::{
     AgentSandboxSettings, AiConfigSettings, AppSettings, BuildLimitsSettings, ClusterDnsSettings,
     ContainerLogSettings, DiskSpaceAlertSettings, DnsProviderSettings, DockerRegistrySettings,
     LetsEncryptSettings, MetricsStoreKind, MonitoringSettings, MultiNodeSettings,
-    PreviewGatewaySettings, ProviderConfig, RateLimitSettings, ScreenshotSettings,
-    SecurityHeadersSettings,
+    ObservabilityCompressionSettings, ObservabilityRetentionSettings, PreviewGatewaySettings,
+    ProviderConfig, RateLimitSettings, ScreenshotSettings, SecurityHeadersSettings,
 };
 pub use async_trait;
 pub use chrono;

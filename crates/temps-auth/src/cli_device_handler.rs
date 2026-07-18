@@ -3,7 +3,7 @@
 //! This is the only interactive login path the CLI exposes — credentials are
 //! always entered in the web UI. The legacy password endpoint was removed:
 //! workspace/sandbox terminals have nothing reasonable to prompt into, and
-//! SSO / magic-link users have no password to type anyway. Headless callers
+//! SSO users have no password to type anyway. Headless callers
 //! authenticate with a pre-minted API key from the dashboard.
 //!
 //! Flow:

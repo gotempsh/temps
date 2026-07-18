@@ -246,6 +246,105 @@ fn spawn_heartbeat_task(
     });
 }
 
+/// Interval between anonymous `error_summary` flushes. Shorter than the daily
+/// heartbeat so shorter-lived instances still report, but coarse enough that
+/// even a melting-down instance costs at most 4 small POSTs per day.
+const ERROR_SUMMARY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
+/// Spawn a detached task that drains the process-global error counters (see
+/// `temps_core::error_metrics`) every [`ERROR_SUMMARY_INTERVAL`] and reports
+/// one aggregated `error_summary` event. Emits nothing when no errors were
+/// recorded, so healthy instances stay silent. Best-effort and opt-out aware
+/// like every other telemetry emission.
+fn spawn_error_summary_task(
+    reporter: std::sync::Arc<dyn temps_core::telemetry::TelemetryReporter>,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(ERROR_SUMMARY_INTERVAL);
+        // Skip the immediate first tick: nothing meaningful has accumulated
+        // at boot, and instance_started already covers "alive today".
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let Some(summary) = temps_core::error_metrics::global().drain() else {
+                continue;
+            };
+            reporter.report(build_error_summary_event(&summary));
+            tracing::debug!("emitted anonymous error_summary telemetry event");
+        }
+    });
+}
+
+/// Build the `error_summary` telemetry event from a drained counter snapshot.
+///
+/// Every value is a count or a compile-time identifier of our own code
+/// (tracing target, route template, crate-relative source location) — see the
+/// privacy contract in `temps_core::error_metrics`. `overflow` is included
+/// only when non-zero so truncation by the key cap is never silent.
+fn build_error_summary_event(
+    summary: &temps_core::error_metrics::ErrorSummary,
+) -> temps_core::telemetry::TelemetryEvent {
+    use temps_core::telemetry::{TelemetryEvent, TelemetryEventKind};
+
+    let mut event = TelemetryEvent::new(TelemetryEventKind::ErrorSummary)
+        .with(
+            "window_hours",
+            (ERROR_SUMMARY_INTERVAL.as_secs() / 3600) as i64,
+        )
+        .with("total", summary.total as i64)
+        .with_opt(
+            "overflow",
+            (summary.overflow > 0).then_some(summary.overflow as i64),
+        );
+    for (category, count) in &summary.category_totals {
+        event = event.with(format!("{category}_total"), *count as i64);
+    }
+    let top: Vec<serde_json::Value> = summary
+        .top
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "category": entry.category,
+                "key": entry.key,
+                "count": entry.count,
+            })
+        })
+        .collect();
+    event.with("top", serde_json::Value::Array(top))
+}
+
+/// Middleware counting console-API 5xx responses for the anonymous
+/// `error_summary` telemetry event.
+///
+/// Records only the method, the route TEMPLATE (axum's `MatchedPath`, e.g.
+/// `/api/projects/{id}` — never the concrete URL, query, or body), and the
+/// status code. Unmatched requests (e.g. the SPA fallback) are recorded under
+/// the fixed label `unmatched` so a 500 storm there is still visible without
+/// capturing raw paths. Runs only on the console listeners — proxied user-app
+/// traffic never passes through this router, so user requests are never
+/// counted. Cost outside the 5xx case is one extension lookup and two short
+/// string allocations per request (fine for the control plane; this
+/// middleware must never be mounted on the proxy data path).
+async fn track_server_errors(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let route = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|matched| matched.as_str().to_owned());
+    let method = req.method().as_str().to_owned();
+    let response = next.run(req).await;
+    if response.status().is_server_error() {
+        temps_core::error_metrics::record_http_5xx(
+            &method,
+            route.as_deref().unwrap_or("unmatched"),
+            response.status().as_u16(),
+        );
+    }
+    response
+}
+
 /// This user is referenced by webhook-created resources (e.g., GitHub App installations)
 /// that don't have an authenticated user context.
 async fn ensure_system_user(db: &sea_orm::DatabaseConnection) -> anyhow::Result<()> {
@@ -302,17 +401,23 @@ fn generate_secure_password() -> String {
 async fn create_initial_admin_user(
     conn: &sea_orm::DatabaseConnection,
     email: &str,
-) -> anyhow::Result<()> {
-    use sea_orm::{ActiveModelTrait, ColumnTrait, QueryFilter};
+    configured_password: Option<&str>,
+) -> Result<(), InitialAdminBootstrapError> {
+    use sea_orm::{ActiveModelTrait, ColumnTrait, QueryFilter, TransactionTrait};
 
     // Check if user with this email already exists (normalize to lowercase)
     let email_lower = email.to_lowercase();
     let existing_user = users::Entity::find()
         .filter(users::Column::Email.eq(&email_lower))
         .one(conn)
-        .await?;
+        .await
+        .map_err(|source| InitialAdminBootstrapError::LookupUser {
+            email: email_lower.clone(),
+            source,
+        })?;
 
-    if existing_user.is_some() {
+    if let Some(existing_user) = existing_user {
+        ensure_existing_initial_admin_is_active(existing_user.deleted_at.is_some(), &email_lower)?;
         info!("User with email {} already exists", email_lower);
         println!();
         println!(
@@ -359,16 +464,45 @@ async fn create_initial_admin_user(
         return Ok(());
     }
 
-    // Generate a secure random password
-    let password = generate_secure_password();
+    let password = configured_password
+        .map(str::to_owned)
+        .unwrap_or_else(generate_secure_password);
 
     // Hash the password using Argon2
     let argon2 = Argon2::default();
     let salt = SaltString::generate(&mut OsRng);
     let password_hash = argon2
         .hash_password(password.as_bytes(), &salt)
-        .map_err(|e| anyhow::anyhow!("Password hashing failed: {}", e))?
+        .map_err(|error| InitialAdminBootstrapError::HashPassword {
+            email: email_lower.clone(),
+            reason: error.to_string(),
+        })?
         .to_string();
+
+    // Resolve the role before creating anything so a missing role cannot leave
+    // partial bootstrap state.
+    let admin_role = temps_entities::roles::Entity::find()
+        .filter(temps_entities::roles::Column::Name.eq("admin"))
+        .one(conn)
+        .await
+        .map_err(|source| InitialAdminBootstrapError::LookupAdminRole {
+            email: email_lower.clone(),
+            source,
+        })?
+        .ok_or_else(|| InitialAdminBootstrapError::AdminRoleNotFound {
+            email: email_lower.clone(),
+        })?;
+
+    // Create the user and role assignment atomically. A partial bootstrap would
+    // leave a non-deleted user that suppresses future bootstrap attempts but
+    // cannot administer the instance.
+    let transaction =
+        conn.begin()
+            .await
+            .map_err(|source| InitialAdminBootstrapError::BeginTransaction {
+                email: email_lower.clone(),
+                source,
+            })?;
 
     // Create the user with normalized email
     let new_user = users::ActiveModel {
@@ -389,14 +523,12 @@ async fn create_initial_admin_user(
         ..Default::default()
     };
 
-    let user = new_user.insert(conn).await?;
-
-    // Get the admin role
-    let admin_role = temps_entities::roles::Entity::find()
-        .filter(temps_entities::roles::Column::Name.eq("admin"))
-        .one(conn)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("Admin role not found"))?;
+    let user = new_user.insert(&transaction).await.map_err(|source| {
+        InitialAdminBootstrapError::CreateUser {
+            email: email_lower.clone(),
+            source,
+        }
+    })?;
 
     // Assign admin role to the user
     let user_role = temps_entities::user_roles::ActiveModel {
@@ -407,7 +539,21 @@ async fn create_initial_admin_user(
         ..Default::default()
     };
 
-    user_role.insert(conn).await?;
+    user_role.insert(&transaction).await.map_err(|source| {
+        InitialAdminBootstrapError::AssignAdminRole {
+            email: email_lower.clone(),
+            user_id: user.id,
+            role_id: admin_role.id,
+            source,
+        }
+    })?;
+    transaction
+        .commit()
+        .await
+        .map_err(|source| InitialAdminBootstrapError::CommitTransaction {
+            email: email_lower.clone(),
+            source,
+        })?;
 
     println!();
     println!(
@@ -430,67 +576,239 @@ async fn create_initial_admin_user(
         "Email:".bright_white().bold(),
         email_lower.bright_cyan()
     );
-    println!(
-        "{} {}",
-        "Password:".bright_white().bold(),
-        password.bright_yellow().bold()
-    );
-    println!();
-    println!(
-        "{}",
-        "⚠️  IMPORTANT: Save this password now!"
-            .bright_yellow()
-            .bold()
-    );
-    println!(
-        "{}",
-        "This is the only time it will be displayed.".bright_white()
-    );
-    println!(
-        "{}",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".bright_green()
-    );
-    println!();
-
-    // Ask for confirmation before continuing
-    loop {
-        print!(
-            "{} ",
-            "Have you saved the password? (y/n):".bright_white().bold()
+    if configured_password.is_none() {
+        println!(
+            "{} {}",
+            "Password:".bright_white().bold(),
+            password.bright_yellow().bold()
         );
-        io::stdout().flush()?;
+        println!();
+        println!(
+            "{}",
+            "⚠️  IMPORTANT: Save this password now!"
+                .bright_yellow()
+                .bold()
+        );
+        println!(
+            "{}",
+            "This is the only time it will be displayed.".bright_white()
+        );
+        println!(
+            "{}",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".bright_green()
+        );
+        println!();
 
-        let mut response = String::new();
-        io::stdin().read_line(&mut response)?;
-        let response = response.trim().to_lowercase();
+        // Interactive starts pause so the operator can save the generated password.
+        loop {
+            print!(
+                "{} ",
+                "Have you saved the password? (y/n):".bright_white().bold()
+            );
+            io::stdout().flush().map_err(|source| {
+                InitialAdminBootstrapError::InteractivePrompt {
+                    email: email_lower.clone(),
+                    operation: "flush password confirmation prompt",
+                    source,
+                }
+            })?;
 
-        if response == "y" || response == "yes" {
-            println!();
-            println!("{}", "✅ Great! Starting the server...".bright_green());
-            println!();
-            break;
-        } else if response == "n" || response == "no" {
-            println!();
-            println!(
-                "{}",
-                "Please save the password before continuing.".bright_yellow()
-            );
-            println!(
-                "{} {}",
-                "Password:".bright_white().bold(),
-                password.bright_yellow().bold()
-            );
-            println!();
-        } else {
-            println!(
-                "{}",
-                "Please enter 'y' for yes or 'n' for no.".bright_white()
-            );
+            let mut response = String::new();
+            io::stdin().read_line(&mut response).map_err(|source| {
+                InitialAdminBootstrapError::InteractivePrompt {
+                    email: email_lower.clone(),
+                    operation: "read password confirmation",
+                    source,
+                }
+            })?;
+            let response = response.trim().to_lowercase();
+
+            if response == "y" || response == "yes" {
+                println!();
+                println!("{}", "✅ Great! Starting the server...".bright_green());
+                println!();
+                break;
+            } else if response == "n" || response == "no" {
+                println!();
+                println!(
+                    "{}",
+                    "Please save the password before continuing.".bright_yellow()
+                );
+                println!(
+                    "{} {}",
+                    "Password:".bright_white().bold(),
+                    password.bright_yellow().bold()
+                );
+                println!();
+            } else {
+                println!(
+                    "{}",
+                    "Please enter 'y' for yes or 'n' for no.".bright_white()
+                );
+            }
         }
+    } else {
+        info!("Initial admin created from TEMPS_ADMIN_EMAIL and password secret file");
     }
 
     debug!("Created initial admin user with email: {}", email);
 
+    Ok(())
+}
+
+#[derive(Debug, thiserror::Error)]
+enum InitialAdminBootstrapError {
+    #[error("failed to look up initial admin '{email}': {source}")]
+    LookupUser {
+        email: String,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+    #[error("failed to hash password for initial admin '{email}': {reason}")]
+    HashPassword { email: String, reason: String },
+    #[error("failed to look up admin role while bootstrapping '{email}': {source}")]
+    LookupAdminRole {
+        email: String,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+    #[error("admin role not found while bootstrapping initial admin '{email}'")]
+    AdminRoleNotFound { email: String },
+    #[error("failed to begin initial-admin transaction for '{email}': {source}")]
+    BeginTransaction {
+        email: String,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+    #[error("failed to create initial admin user '{email}': {source}")]
+    CreateUser {
+        email: String,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+    #[error(
+        "failed to assign admin role {role_id} to initial admin '{email}' (user {user_id}): {source}"
+    )]
+    AssignAdminRole {
+        email: String,
+        user_id: i32,
+        role_id: i32,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+    #[error("failed to commit initial-admin transaction for '{email}': {source}")]
+    CommitTransaction {
+        email: String,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+    #[error("failed to {operation} for initial admin '{email}': {source}")]
+    InteractivePrompt {
+        email: String,
+        operation: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(transparent)]
+    Configuration(#[from] InitialAdminConfigError),
+}
+
+#[derive(Debug, thiserror::Error)]
+enum InitialAdminConfigError {
+    #[error("TEMPS_ADMIN_EMAIL must be a valid email address")]
+    InvalidEmail,
+    #[error("TEMPS_ADMIN_EMAIL and TEMPS_ADMIN_PASSWORD_FILE must be configured together")]
+    IncompleteCredentials,
+    #[error("failed to read initial admin password file '{path}': {source}")]
+    ReadPasswordFile {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("initial admin password in '{path}' does not meet complexity requirements: {reason}")]
+    InvalidPassword { path: PathBuf, reason: String },
+    #[error(
+        "initial admin '{email}' is soft-deleted; restore it or choose a different TEMPS_ADMIN_EMAIL"
+    )]
+    DeletedUser { email: String },
+    #[error("environment variable {name} is not valid Unicode: {source}")]
+    InvalidEnvironment {
+        name: &'static str,
+        #[source]
+        source: std::env::VarError,
+    },
+}
+
+fn optional_environment_variable(
+    name: &'static str,
+) -> Result<Option<String>, InitialAdminConfigError> {
+    optional_environment_variable_result(name, std::env::var(name))
+}
+
+fn optional_environment_variable_result(
+    name: &'static str,
+    result: Result<String, std::env::VarError>,
+) -> Result<Option<String>, InitialAdminConfigError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(source @ std::env::VarError::NotUnicode(_)) => {
+            Err(InitialAdminConfigError::InvalidEnvironment { name, source })
+        }
+    }
+}
+
+fn normalize_configured_admin_email(value: &str) -> Result<String, InitialAdminConfigError> {
+    let email = value.trim().to_lowercase();
+    if !temps_email::is_valid_email_syntax(&email) {
+        return Err(InitialAdminConfigError::InvalidEmail);
+    }
+
+    Ok(email)
+}
+
+fn configured_initial_admin(
+    email: Option<&str>,
+    password_file: Option<&str>,
+) -> Result<Option<(String, String)>, InitialAdminConfigError> {
+    let (Some(email), Some(password_file)) = (email, password_file) else {
+        return if email.is_none() && password_file.is_none() {
+            Ok(None)
+        } else {
+            Err(InitialAdminConfigError::IncompleteCredentials)
+        };
+    };
+
+    let email = normalize_configured_admin_email(email)?;
+    let path = PathBuf::from(password_file);
+    let password_file_contents = std::fs::read_to_string(&path).map_err(|source| {
+        InitialAdminConfigError::ReadPasswordFile {
+            path: path.clone(),
+            source,
+        }
+    })?;
+    let password = password_file_contents
+        .trim_end_matches(['\r', '\n'])
+        .to_string();
+    temps_auth::validate_password_complexity(&password).map_err(|error| {
+        InitialAdminConfigError::InvalidPassword {
+            path,
+            reason: error.to_string(),
+        }
+    })?;
+
+    Ok(Some((email, password)))
+}
+
+fn ensure_existing_initial_admin_is_active(
+    is_deleted: bool,
+    email: &str,
+) -> Result<(), InitialAdminConfigError> {
+    if is_deleted {
+        return Err(InitialAdminConfigError::DeletedUser {
+            email: email.to_string(),
+        });
+    }
     Ok(())
 }
 
@@ -530,8 +848,7 @@ fn prompt_for_admin_email() -> anyhow::Result<Option<String>> {
     io::stdin().read_line(&mut email)?;
     let email = email.trim().to_lowercase();
 
-    // Basic email validation
-    if email.is_empty() || !email.contains('@') || !email.contains('.') {
+    if !temps_email::is_valid_email_syntax(&email) {
         println!();
         println!(
             "{}",
@@ -888,6 +1205,13 @@ pub struct ConsoleApiParams {
     /// connection handling. Any future object shared this same way requires an
     /// explicit security review before being added here.
     pub retention_resolver_slot: Arc<temps_core::RetentionResolverSlot>,
+    /// Shared "a newer release exists" slot. Owned by the caller
+    /// (`commands/serve/mod.rs`), which spawns the background update
+    /// notifier that writes into it; registered into the service registry
+    /// below so the settings API can serve it to the web console's upgrade
+    /// banner (`GET /settings/update-status`). Advisory read-only metadata —
+    /// it never influences routing, auth, or connection handling.
+    pub update_status: Arc<temps_core::UpdateStatusSlot>,
 }
 
 /// Build a ClickHouse-backed metrics store from the server config, or `None`
@@ -1297,7 +1621,22 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         admin_gate_service: provided_admin_gate_service,
         admin_gate_handle: provided_admin_gate_handle,
         retention_resolver_slot,
+        update_status,
     } = params;
+
+    // Count panics for the anonymous `error_summary` telemetry event. Only
+    // the sanitized source location (crate-relative file:line) is recorded —
+    // never the panic message, which can embed user data. Chains to the
+    // previous hook so normal backtrace printing is unaffected. Task panics
+    // don't kill the process, so they are flushed by the summary task below;
+    // a fatal main-thread panic may be lost, which is acceptable for v1.
+    {
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |panic_info| {
+            temps_core::error_metrics::record_panic(panic_info.location());
+            previous_hook(panic_info);
+        }));
+    }
 
     // Readiness flag for the `/readyz` probe. Starts `false` (not ready) and is
     // flipped to `true` at the same point the legacy `ready_signal` fires —
@@ -1382,6 +1721,10 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     // slot instance instead of creating its own — see the field doc on
     // `ConsoleApiParams::retention_resolver_slot`.
     service_context.register_service(retention_resolver_slot.clone());
+    // Update-notifier slot: the background loop in serve/mod.rs writes into
+    // it; ConfigPlugin's `GET /settings/update-status` reads it so the web
+    // console can render the upgrade banner.
+    service_context.register_service(update_status.clone());
 
     // Register the shared route table (created in serve/mod.rs)
     // This is used by analytics-events and other plugins that need to resolve hosts
@@ -1753,6 +2096,11 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
             // instance still checks in even when it isn't deploying. No-op when
             // telemetry is disabled (guarded above + report() no-ops anyway).
             spawn_heartbeat_task(reporter.clone(), db.clone());
+            // Periodic aggregated error_summary flush (ERROR logs / console
+            // 5xx / panics — counts only, never messages). Only spawned when
+            // telemetry is enabled; the counters themselves are just bounded
+            // in-process memory either way.
+            spawn_error_summary_task(reporter.clone());
         }
     }
     if let Some(user_service) = service_context.get_service::<temps_auth::UserService>() {
@@ -1775,8 +2123,17 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("Failed to initialize roles: {}", e))?;
             debug!("Initialized user roles");
 
-            if let Some(admin_email) = prompt_for_admin_email()? {
-                create_initial_admin_user(db.as_ref(), &admin_email).await?;
+            let configured_email = optional_environment_variable("TEMPS_ADMIN_EMAIL")?;
+            let configured_password_file =
+                optional_environment_variable("TEMPS_ADMIN_PASSWORD_FILE")?;
+            if let Some((admin_email, admin_password)) = configured_initial_admin(
+                configured_email.as_deref(),
+                configured_password_file.as_deref(),
+            )? {
+                info!("Creating initial admin from configured email and password secret file");
+                create_initial_admin_user(db.as_ref(), &admin_email, Some(&admin_password)).await?;
+            } else if let Some(admin_email) = prompt_for_admin_email()? {
+                create_initial_admin_user(db.as_ref(), &admin_email, None).await?;
             } else {
                 return Err(anyhow::anyhow!("Valid admin email is required to continue"));
             }
@@ -2091,14 +2448,25 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         use temps_providers::health_monitor::{
             ExternalServiceHealthConfig, ExternalServiceHealthMonitor,
         };
-        let health_monitor = Arc::new(ExternalServiceHealthMonitor::new(
+        let mut health_monitor = ExternalServiceHealthMonitor::new(
             db.clone(),
             external_service_manager,
             notification_service,
             ExternalServiceHealthConfig::default(),
             docker.clone(),
             service_context.require_service::<temps_core::EncryptionService>(),
-        ));
+        );
+
+        // Attach the shared metrics store (registered by the MetricsScraper
+        // block above) so the monitor records container CPU/memory history
+        // for services with metrics enabled.
+        if let Some(metrics_store) =
+            service_context.get_service::<dyn temps_metrics::MetricsStore>()
+        {
+            health_monitor = health_monitor.with_metrics_store(metrics_store);
+        }
+
+        let health_monitor = Arc::new(health_monitor);
 
         // Register so the providers plugin can pick it up and expose a
         // manual-trigger endpoint that reuses the monitor's check logic.
@@ -2456,7 +2824,8 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     // regardless of `console_admin_address`.
     let public_app = Router::new()
         .merge(health_router(ready_flag.clone()))
-        .nest("/api", public_router);
+        .nest("/api", public_router)
+        .layer(axum::middleware::from_fn(track_server_errors));
 
     // Platform-console listener: when an embedding binary overrode the root
     // bundle AND configured an address, serve the ORIGINAL console (same
@@ -2470,7 +2839,8 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
 
     let admin_app = Router::new()
         .nest("/api", admin_router)
-        .fallback(serve_static_file);
+        .fallback(serve_static_file)
+        .layer(axum::middleware::from_fn(track_server_errors));
 
     // Defense-in-depth: the Pingora proxy is now the primary enforcer (it
     // 404s gated requests before they ever reach this listener). The axum
@@ -2488,6 +2858,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         let platform_app = Router::new()
             .nest("/api", router)
             .fallback(serve_original_console)
+            .layer(axum::middleware::from_fn(track_server_errors))
             .layer(axum::middleware::from_fn_with_state(
                 admin_gate_handle.clone(),
                 super::admin_gate::admin_gate,
@@ -2661,6 +3032,210 @@ mod health_tests {
 }
 
 #[cfg(test)]
+mod initial_admin_tests {
+    use super::*;
+    use sea_orm::{DatabaseBackend, DbErr, MockDatabase};
+
+    #[test]
+    fn configured_initial_admin_is_optional_for_interactive_starts() {
+        assert_eq!(configured_initial_admin(None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn optional_environment_variable_distinguishes_absent_and_non_unicode_values() {
+        assert_eq!(
+            optional_environment_variable_result(
+                "TEMPS_ADMIN_EMAIL",
+                Err(std::env::VarError::NotPresent),
+            )
+            .unwrap(),
+            None
+        );
+
+        let result = optional_environment_variable_result(
+            "TEMPS_ADMIN_EMAIL",
+            Err(std::env::VarError::NotUnicode(std::ffi::OsString::from(
+                "invalid-value",
+            ))),
+        );
+        assert!(matches!(
+            result,
+            Err(InitialAdminConfigError::InvalidEnvironment {
+                name: "TEMPS_ADMIN_EMAIL",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn configured_admin_email_is_trimmed_and_normalized() {
+        assert_eq!(
+            normalize_configured_admin_email("  Admin@Example.COM ").unwrap(),
+            "admin@example.com"
+        );
+    }
+
+    #[test]
+    fn configured_admin_email_rejects_invalid_values() {
+        let overlong_local = format!("{}@example.com", "a".repeat(65));
+        let overlong_domain_label = format!("admin@{}.com", "a".repeat(64));
+        for value in [
+            "",
+            "admin",
+            "admin@example",
+            "example.com",
+            "a@@example.com",
+            "user name@example.com",
+            "admin@\n.example.com",
+            ".admin@example.com",
+            "admin..user@example.com",
+            "admin@-example.com",
+            "admin@example-.com",
+            &overlong_local,
+            &overlong_domain_label,
+        ] {
+            assert!(
+                matches!(
+                    normalize_configured_admin_email(value),
+                    Err(InitialAdminConfigError::InvalidEmail)
+                ),
+                "{value:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn configured_initial_admin_reads_and_validates_password_secret() {
+        let secret = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(secret.path(), "tT3!0123456789abcdef\n").unwrap();
+
+        let configured =
+            configured_initial_admin(Some("Admin@Example.COM"), secret.path().to_str())
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(configured.0, "admin@example.com");
+        assert_eq!(configured.1, "tT3!0123456789abcdef");
+    }
+
+    #[test]
+    fn configured_initial_admin_requires_both_values() {
+        assert!(matches!(
+            configured_initial_admin(Some("admin@example.com"), None),
+            Err(InitialAdminConfigError::IncompleteCredentials)
+        ));
+        assert!(matches!(
+            configured_initial_admin(None, Some("/run/secrets/admin")),
+            Err(InitialAdminConfigError::IncompleteCredentials)
+        ));
+    }
+
+    #[test]
+    fn deleted_initial_admin_fails_closed() {
+        assert!(matches!(
+            ensure_existing_initial_admin_is_active(true, "admin@example.com"),
+            Err(InitialAdminConfigError::DeletedUser { .. })
+        ));
+        assert!(ensure_existing_initial_admin_is_active(false, "admin@example.com").is_ok());
+    }
+
+    #[tokio::test]
+    async fn missing_admin_role_returns_contextual_bootstrap_error() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<users::Model>::new()])
+            .append_query_results([Vec::<temps_entities::roles::Model>::new()])
+            .into_connection();
+
+        let result =
+            create_initial_admin_user(&db, "admin@example.com", Some("tT3!0123456789abcdef")).await;
+
+        assert!(matches!(
+            result,
+            Err(InitialAdminBootstrapError::AdminRoleNotFound { email })
+                if email == "admin@example.com"
+        ));
+    }
+
+    #[tokio::test]
+    async fn initial_admin_lookup_preserves_database_error_context() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([DbErr::Custom("user lookup failed".to_string())])
+            .into_connection();
+
+        let result =
+            create_initial_admin_user(&db, "admin@example.com", Some("tT3!0123456789abcdef")).await;
+
+        assert!(matches!(
+            result,
+            Err(InitialAdminBootstrapError::LookupUser {
+                email,
+                source: DbErr::Custom(message),
+            }) if email == "admin@example.com" && message == "user lookup failed"
+        ));
+    }
+
+    #[tokio::test]
+    async fn role_assignment_failure_rolls_back_initial_user_transaction() {
+        let now = chrono::Utc::now();
+        let role = temps_entities::roles::Model {
+            id: 1,
+            name: "admin".to_string(),
+            created_at: now,
+            updated_at: now,
+        };
+        let user = users::Model {
+            id: 1,
+            name: "Admin".to_string(),
+            email: "admin@example.com".to_string(),
+            password_hash: Some("unused-by-mock".to_string()),
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<users::Model>::new()])
+            .append_query_results([vec![role]])
+            .append_query_results([vec![user]])
+            .append_query_errors([DbErr::Custom("role assignment failed".to_string())])
+            .into_connection();
+
+        let result =
+            create_initial_admin_user(&db, "admin@example.com", Some("tT3!0123456789abcdef")).await;
+        assert!(matches!(
+            result,
+            Err(InitialAdminBootstrapError::AssignAdminRole {
+                email,
+                user_id: 1,
+                role_id: 1,
+                source: DbErr::Custom(message),
+            }) if email == "admin@example.com" && message == "role assignment failed"
+        ));
+
+        let log = db.into_transaction_log();
+        assert_eq!(log.len(), 3, "lookups plus one rolled-back transaction");
+        let bootstrap = log[2].statements();
+        assert_eq!(bootstrap.len(), 4);
+        assert_eq!(bootstrap[0].sql, "BEGIN");
+        assert!(bootstrap[1].sql.starts_with("INSERT INTO \"users\""));
+        assert!(bootstrap[2].sql.starts_with("INSERT INTO \"user_roles\""));
+        assert_eq!(
+            bootstrap[3].sql, "ROLLBACK",
+            "a failed role assignment must roll back the initial user insert"
+        );
+    }
+}
+
+#[cfg(test)]
 mod ai_tool_allowlist_tests {
     use super::*;
     use temps_ai_api_tools::ReadOnlyApiIndex;
@@ -2733,5 +3308,173 @@ mod ai_tool_allowlist_tests {
             "DeploymentMetricsToggle is a write (PATCH) operation and must never be \
              resolvable via the read-only AI tool allowlist"
         );
+    }
+}
+
+#[cfg(test)]
+mod error_telemetry_tests {
+    use super::*;
+    use axum::response::IntoResponse;
+    use axum::routing::get;
+    use temps_core::error_metrics::{self, CATEGORY_HTTP_5XX};
+    use tower::ServiceExt;
+
+    async fn failing_handler() -> axum::response::Response {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "it broke, with details that must never reach telemetry",
+        )
+            .into_response()
+    }
+
+    async fn ok_handler() -> &'static str {
+        "ok"
+    }
+
+    fn get_request(uri: &str) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .expect("valid test request")
+    }
+
+    /// The middleware must count 5xx responses under the route TEMPLATE (the
+    /// compile-time string from our route table), never the concrete request
+    /// path, and must not count non-5xx responses at all. Route names are
+    /// unique to this test so parallel tests can't interfere via the global
+    /// counter store.
+    #[tokio::test]
+    async fn track_server_errors_counts_5xx_by_route_template_only() {
+        let app = Router::new()
+            .route("/error-telemetry-test/{id}", get(failing_handler))
+            .route("/error-telemetry-test-ok", get(ok_handler))
+            .layer(axum::middleware::from_fn(track_server_errors));
+
+        let response = app
+            .clone()
+            .oneshot(get_request("/error-telemetry-test/12345"))
+            .await
+            .expect("request succeeds");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        let response = app
+            .oneshot(get_request("/error-telemetry-test-ok"))
+            .await
+            .expect("request succeeds");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let counters = error_metrics::global();
+        assert_eq!(
+            counters.count_for(CATEGORY_HTTP_5XX, "GET /error-telemetry-test/{id} 500"),
+            1,
+            "5xx must be recorded under the route template"
+        );
+        assert_eq!(
+            counters.count_for(CATEGORY_HTTP_5XX, "GET /error-telemetry-test/12345 500"),
+            0,
+            "the concrete request path must never be recorded"
+        );
+        assert_eq!(
+            counters.count_for(CATEGORY_HTTP_5XX, "GET /error-telemetry-test-ok 200"),
+            0,
+            "non-5xx responses must not be recorded"
+        );
+    }
+
+    /// Requests that don't match any route (SPA fallback and friends) are
+    /// recorded under the fixed `unmatched` label — visible, but without
+    /// capturing the raw path.
+    #[tokio::test]
+    async fn track_server_errors_uses_unmatched_label_for_fallback() {
+        async fn failing_fallback() -> axum::response::Response {
+            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response()
+        }
+
+        let app = Router::new()
+            .fallback(failing_fallback)
+            .layer(axum::middleware::from_fn(track_server_errors));
+
+        let before = error_metrics::global().count_for(CATEGORY_HTTP_5XX, "GET unmatched 500");
+        let response = app
+            .oneshot(get_request("/error-telemetry-secret-user-path"))
+            .await
+            .expect("request succeeds");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        let counters = error_metrics::global();
+        assert_eq!(
+            counters.count_for(CATEGORY_HTTP_5XX, "GET unmatched 500"),
+            before + 1
+        );
+        assert_eq!(
+            counters.count_for(
+                CATEGORY_HTTP_5XX,
+                "GET /error-telemetry-secret-user-path 500"
+            ),
+            0,
+            "unmatched raw paths must never be recorded"
+        );
+    }
+
+    /// The error_summary event must carry only counts and identifier keys —
+    /// with per-category totals, a capped top list, and overflow present only
+    /// when keys were actually dropped.
+    #[test]
+    fn build_error_summary_event_shape() {
+        use temps_core::error_metrics::{ErrorCount, ErrorSummary};
+
+        let summary = ErrorSummary {
+            total: 7,
+            overflow: 0,
+            category_totals: vec![("http_5xx", 2), ("log_error", 5)],
+            top: vec![
+                ErrorCount {
+                    category: "log_error",
+                    key: "temps_backup::service".to_string(),
+                    count: 5,
+                },
+                ErrorCount {
+                    category: "http_5xx",
+                    key: "GET /api/projects/{id} 500".to_string(),
+                    count: 2,
+                },
+            ],
+        };
+
+        let event = build_error_summary_event(&summary);
+        assert_eq!(event.event_type, "error_summary");
+        assert_eq!(event.properties["total"], serde_json::json!(7));
+        assert_eq!(event.properties["log_error_total"], serde_json::json!(5));
+        assert_eq!(event.properties["http_5xx_total"], serde_json::json!(2));
+        assert!(
+            !event.properties.contains_key("overflow"),
+            "overflow must be omitted when zero"
+        );
+
+        let top = event.properties["top"].as_array().expect("top is an array");
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0]["key"], serde_json::json!("temps_backup::service"));
+        assert_eq!(top[0]["count"], serde_json::json!(5));
+    }
+
+    #[test]
+    fn build_error_summary_event_reports_overflow_when_capped() {
+        use temps_core::error_metrics::ErrorSummary;
+
+        let summary = ErrorSummary {
+            total: 10,
+            overflow: 3,
+            category_totals: vec![("log_error", 7)],
+            top: vec![],
+        };
+
+        let event = build_error_summary_event(&summary);
+        assert_eq!(event.properties["overflow"], serde_json::json!(3));
     }
 }

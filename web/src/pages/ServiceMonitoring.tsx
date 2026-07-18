@@ -331,6 +331,18 @@ const ENGINE_GROUPS: Record<EngineKind, MetricGroup[]> = {
   ],
 }
 
+// Container resource metrics — CPU/memory of the docker container(s) backing
+// the service, sampled every ~30s by the health monitor. Engine-agnostic, so
+// this group is shown for every engine (prepended in MonitoringDashboard).
+const RESOURCES_GROUP: MetricGroup = {
+  title: 'Resources',
+  metrics: [
+    'container.cpu_percent',
+    'container.memory_used_bytes',
+    'container.memory_percent',
+  ],
+}
+
 // Per-database Postgres metric groups, shown in the dedicated "Databases"
 // section with a database selector. Each metric is emitted once per `datname`
 // plus an instance-wide aggregate (selector value "All databases"). Order /
@@ -374,6 +386,7 @@ const ALL_METRICS: Record<EngineKind, string[]> = Object.fromEntries(
   Object.entries(ENGINE_GROUPS).map(([engine, groups]) => [
     engine,
     [
+      ...RESOURCES_GROUP.metrics,
       ...groups.flatMap((g) => g.metrics),
       ...(engine === 'postgres' ? PG_PER_DATABASE_METRICS : []),
     ],
@@ -468,6 +481,11 @@ function formatMetricValue(name: string, value: number): string {
 }
 
 const METRIC_LABELS: Record<string, string> = {
+  // Container resources (all engines) — sampled from docker stats. CPU uses
+  // the docker CLI convention: 100% == one core fully used.
+  'container.cpu_percent': 'CPU',
+  'container.memory_used_bytes': 'Memory',
+  'container.memory_percent': 'Memory %',
   // Postgres connections — "Total" is the headline (client backends only;
   // engine background processes are excluded by the collector).
   'pg.connections': 'Connections',
@@ -1191,7 +1209,9 @@ function MonitoringDashboard({
   latestMetrics,
 }: MonitoringDashboardProps) {
   const refetchInterval = useRefreshInterval()
-  const groups = ENGINE_GROUPS[engine]
+  // Container CPU/memory first — resource saturation is the first thing an
+  // operator checks — then the engine-specific groups.
+  const groups = [RESOURCES_GROUP, ...ENGINE_GROUPS[engine]]
   const heroMetrics = HERO_METRICS[engine]
 
   const [selectedMetric, setSelectedMetric] = useState(

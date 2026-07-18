@@ -16,6 +16,13 @@ use crate::store::{
 /// At ~300 bytes/row, 500 rows ≈ 150 KB — well inside safe limits.
 const BATCH_SIZE: usize = 500;
 
+/// Lookback window for "latest value" queries, anchored to the source's
+/// `service_metrics_status.last_received_at`. Wide enough to cover many scrape
+/// cycles (scrapes run every 10-30 s) plus clock skew between the scraper and
+/// the database, while keeping the scan to the most recent hypertable chunk
+/// instead of the source's full retention history.
+const LATEST_WINDOW: &str = "15 minutes";
+
 /// TimescaleDB-backed implementation of [`MetricsStore`].
 ///
 /// Writes are chunked into batches of at most [`BATCH_SIZE`] rows using
@@ -51,16 +58,22 @@ impl TimescaleMetricsStore {
         }
         // Look only at the most-recent ~64 rows: a single scrape writes all of a
         // metric's series at once, so the recent window contains every series.
+        // Time-bounded so TimescaleDB chunk exclusion applies (see query_latest).
         let sql = format!(
             "SELECT min(k)::bigint AS min_keys FROM ( \
                  SELECT (SELECT count(*) FROM jsonb_object_keys(labels)) AS k \
                  FROM service_metrics \
                  WHERE source_kind = '{sk}' AND source_id = {sid} AND name = '{nm}' \
+                   AND time > COALESCE( \
+                         (SELECT last_received_at FROM service_metrics_status \
+                           WHERE source_kind = '{sk}' AND source_id = {sid}), \
+                         now()) - interval '{window}' \
                  ORDER BY time DESC LIMIT 64 \
              ) recent",
             sk = escape_sql_string(source_kind),
             sid = source_id,
             nm = escape_sql_string(name),
+            window = LATEST_WINDOW,
         );
         match self
             .db
@@ -590,15 +603,29 @@ impl MetricsStore for TimescaleMetricsStore {
         // labels. So order by label-key count ascending, then by recency.
         // (An empty `{}` is just the zero-key case and still wins.) Metrics with
         // a single series are unaffected.
+        //
+        // PERF: the query MUST be time-bounded. The label-key-count ordering
+        // prevents the planner from satisfying `DISTINCT ON` with a backwards
+        // index scan, so without a bound this degenerates into a full scan of
+        // every chunk the source ever wrote (millions of rows at a 10-30s
+        // scrape interval) with the jsonb subquery evaluated per row. Bounding
+        // relative to `service_metrics_status.last_received_at` (O(1) row,
+        // upserted on every write_batch) keeps chunk exclusion active while
+        // still returning values for sources whose scraper is paused/stale.
         let sql = format!(
             "SELECT DISTINCT ON (name) name, value \
              FROM service_metrics \
              WHERE source_kind = '{source_kind}' \
                AND source_id = {source_id} \
+               AND time > COALESCE( \
+                     (SELECT last_received_at FROM service_metrics_status \
+                       WHERE source_kind = '{source_kind}' AND source_id = {source_id}), \
+                     now()) - interval '{window}' \
                {name_filter} \
              ORDER BY name, \
                       (SELECT count(*) FROM jsonb_object_keys(labels)) ASC, \
                       time DESC",
+            window = LATEST_WINDOW,
             source_kind = escape_sql_string(filter.source_kind.as_str()),
             source_id = filter.source_id,
             name_filter = name_filter,
@@ -674,15 +701,25 @@ impl MetricsStore for TimescaleMetricsStore {
         // carry the label key are considered (`labels ? key`), which excludes
         // the unlabelled instance-wide aggregate. The `DISTINCT ON` key is
         // (name, label_value) so each metric gets one value per label value.
+        //
+        // PERF: time-bounded for the same reason as `query_latest` — the
+        // `labels ? key` predicate and the label-value DISTINCT key defeat a
+        // backwards index scan, so an unbounded query scans the source's full
+        // retention history. See the comment there for the COALESCE fallback.
         let sql = format!(
             "SELECT DISTINCT ON (name, labels->>'{label_key}') \
                     name, labels->>'{label_key}' AS label_value, value \
              FROM service_metrics \
              WHERE source_kind = '{source_kind}' \
                AND source_id = {source_id} \
+               AND time > COALESCE( \
+                     (SELECT last_received_at FROM service_metrics_status \
+                       WHERE source_kind = '{source_kind}' AND source_id = {source_id}), \
+                     now()) - interval '{window}' \
                AND name = ANY(ARRAY[{names}]) \
                AND labels ? '{label_key}' \
              ORDER BY name, labels->>'{label_key}', time DESC",
+            window = LATEST_WINDOW,
             label_key = label_key,
             source_kind = escape_sql_string(filter.source_kind.as_str()),
             source_id = filter.source_id,

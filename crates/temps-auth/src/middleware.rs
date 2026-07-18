@@ -1,5 +1,5 @@
-use crate::client_ip::resolve_client_ip;
 use crate::permissions::Role;
+use crate::resolve_client_ip;
 use crate::{
     auth_service::AuthService, context::AuthContext, user_service::UserService, AuthState,
 };

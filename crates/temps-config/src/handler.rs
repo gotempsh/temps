@@ -1,5 +1,5 @@
 use crate::disk_status::DiskSpaceCheckResult;
-use crate::ConfigService;
+use crate::{ConfigService, EffectiveTelemetryPolicies};
 use axum::{
     extract::{Extension, State},
     http::StatusCode,
@@ -16,8 +16,9 @@ use temps_core::error_builder::ErrorBuilder;
 use temps_core::{
     problemdetails::Problem, AiConfigSettings, AppSettings, AuditContext, AuditLogger,
     AuditOperation, BuildLimitsSettings, ClusterDnsSettings, ContainerLogSettings,
-    DiskSpaceAlertSettings, LetsEncryptSettings, MetricsStoreKind, RateLimitSettings,
-    RequestMetadata, ScreenshotSettings, SecurityHeadersSettings,
+    DiskSpaceAlertSettings, LetsEncryptSettings, MetricsStoreKind, MonitoringSettings,
+    ObservabilityCompressionSettings, ObservabilityRetentionSettings, PublicHostnameStrategy,
+    RateLimitSettings, RequestMetadata, ScreenshotSettings, SecurityHeadersSettings,
 };
 use tracing::{error, info};
 use utoipa::{OpenApi, ToSchema};
@@ -28,6 +29,11 @@ pub struct SettingsState {
     pub route_table_refresher: Option<Arc<dyn temps_core::route_table::RouteTableRefresher>>,
     /// Node enrollment token minting/listing/revocation (ADR-020 WS-1.1).
     pub enrollment_token_service: Arc<crate::enrollment_tokens::EnrollmentTokenService>,
+    /// Result slot of the background release-update notifier (`temps serve`
+    /// writes it). `None` in host processes that don't run the notifier
+    /// (e.g. the standalone proxy's plugin context) — the update-status
+    /// endpoint then reports "no update known".
+    pub update_status: Option<Arc<temps_core::UpdateStatusSlot>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -82,6 +88,8 @@ pub struct AppSettingsResponse {
     pub external_url: Option<String>,
     pub internal_url: Option<String>,
     pub preview_domain: String,
+    /// Public edge target that synced DNS records point at (IP → A/AAAA, else CNAME).
+    pub edge_target: Option<String>,
 
     // Screenshot settings
     pub screenshots: ScreenshotSettings,
@@ -120,6 +128,16 @@ pub struct AppSettingsResponse {
     // Metrics monitoring settings (clickhouse_url masked)
     pub monitoring: MonitoringSettingsMasked,
 
+    /// Number of enabled, running services the MetricsScraper currently
+    /// includes. Used for the lightweight storage estimate in the UI.
+    pub monitored_services_count: Option<u64>,
+
+    /// TimescaleDB compression delays for immutable proxy logs and OTel spans.
+    pub observability_compression: ObservabilityCompressionSettings,
+
+    /// Retention windows for raw proxy logs and OpenTelemetry data.
+    pub observability_retention: ObservabilityRetentionSettings,
+
     /// The storage backend the runtime is **actually** using for metrics,
     /// after reconciling the `monitoring.store` toggle with the server's
     /// `TEMPS_CLICKHOUSE_*` configuration. When `monitoring.store` is
@@ -128,6 +146,12 @@ pub struct AppSettingsResponse {
     /// though `monitoring.store` says `click_house`. The UI shows this as the
     /// effective backend and warns when it diverges from the configured store.
     pub effective_metrics_store: MetricsStoreKind,
+
+    /// Storage backend actually used for proxy logs, OTel spans, and OTel
+    /// metrics. OTel logs remain TimescaleDB-backed. Unlike resource metrics,
+    /// these domains switch to ClickHouse whenever the server-level ClickHouse
+    /// connection is configured; they do not use the monitoring store toggle.
+    pub effective_observability_store: MetricsStoreKind,
 
     // Outbound TLS verification toggle
     pub insecure_tls: bool,
@@ -265,6 +289,7 @@ impl From<AppSettings> for AppSettingsResponse {
             external_url: settings.external_url,
             internal_url: settings.internal_url,
             preview_domain: settings.preview_domain,
+            edge_target: settings.edge_target,
             screenshots: settings.screenshots,
             letsencrypt: settings.letsencrypt,
             dns_provider: DnsProviderSettingsMasked {
@@ -343,7 +368,11 @@ impl From<AppSettings> for AppSettingsResponse {
             // the handler overrides it with the runtime-reconciled value once
             // the ClickHouse env-var state is known (via `with_effective_store`).
             effective_metrics_store: settings.monitoring.store.clone(),
+            effective_observability_store: MetricsStoreKind::TimescaleDb,
             monitoring: MonitoringSettingsMasked::from(settings.monitoring),
+            monitored_services_count: None,
+            observability_compression: settings.observability_compression,
+            observability_retention: settings.observability_retention,
             insecure_tls: settings.insecure_tls,
             setup_complete: settings.setup_complete,
             require_mfa_for_admins: settings.require_mfa_for_admins,
@@ -367,6 +396,57 @@ impl AppSettingsResponse {
             } else {
                 MetricsStoreKind::TimescaleDb
             };
+        self.effective_observability_store = if clickhouse_enabled {
+            MetricsStoreKind::ClickHouse
+        } else {
+            MetricsStoreKind::TimescaleDb
+        };
+        self
+    }
+
+    fn with_effective_timescale_state(
+        mut self,
+        policies: EffectiveTelemetryPolicies,
+        monitored_services_count: Option<u64>,
+    ) -> Self {
+        self.monitored_services_count = monitored_services_count;
+
+        if self.effective_metrics_store == MetricsStoreKind::TimescaleDb {
+            if let Some(days) = policies.metrics_raw_days {
+                self.monitoring.retention_raw_days = days;
+            }
+            if let Some(days) = policies.metrics_hourly_days {
+                self.monitoring.retention_hourly_days = days;
+            }
+            if let Some(years) = policies.metrics_daily_years {
+                self.monitoring.retention_daily_years = years;
+            }
+        }
+
+        if self.effective_observability_store == MetricsStoreKind::TimescaleDb {
+            if let Some(hours) = policies.proxy_logs_compression_hours {
+                self.observability_compression.proxy_logs_after_hours = hours;
+            }
+            if let Some(hours) = policies.otel_spans_compression_hours {
+                self.observability_compression.otel_spans_after_hours = hours;
+            }
+            if let Some(days) = policies.proxy_logs_retention_days {
+                self.observability_retention.proxy_logs_days = days;
+            }
+            if let Some(days) = policies.otel_spans_retention_days {
+                self.observability_retention.otel_spans_days = days;
+            }
+        }
+
+        if let Some(days) = policies.otel_logs_retention_days {
+            self.observability_retention.otel_logs_days = days;
+        }
+        if self.effective_observability_store == MetricsStoreKind::TimescaleDb {
+            if let Some(days) = policies.otel_metrics_retention_days {
+                self.observability_retention.otel_metrics_days = days;
+            }
+        }
+
         self
     }
 }
@@ -375,6 +455,7 @@ impl AppSettingsResponse {
 #[openapi(
     paths(
         get_settings,
+        get_update_status,
         get_disk_status,
         update_settings,
         generate_join_token,
@@ -393,6 +474,7 @@ impl AppSettingsResponse {
         crate::disk_status::DiskSpaceCheckResult,
         ContainerLogSettings,
         ClusterDnsSettings,
+        PublicHostnameStrategy,
         DnsProviderSettingsMasked,
         DockerRegistrySettingsMasked,
         AgentSandboxSettingsMasked,
@@ -400,6 +482,8 @@ impl AppSettingsResponse {
         PreviewGatewaySettingsMasked,
         MultiNodeSettingsMasked,
         MonitoringSettingsMasked,
+        ObservabilityCompressionSettings,
+        ObservabilityRetentionSettings,
         MetricsStoreKind,
         SettingsUpdateResponse,
         GenerateJoinTokenResponse,
@@ -409,6 +493,7 @@ impl AppSettingsResponse {
         EnrollmentTokenInfo,
         EnrollmentTokenListResponse,
         RouteRefreshResponse,
+        UpdateStatusResponse,
     )),
     info(
         title = "Settings API",
@@ -423,6 +508,7 @@ pub fn configure_routes() -> Router<Arc<SettingsState>> {
     Router::new()
         .route("/settings", get(get_settings))
         .route("/settings", put(update_settings))
+        .route("/settings/update-status", get(get_update_status))
         .route("/settings/disk-status", get(get_disk_status))
         .route("/settings/join-token/generate", post(generate_join_token))
         .route("/settings/join-token", delete(revoke_join_token))
@@ -656,6 +742,78 @@ async fn revoke_enrollment_token(
     }))
 }
 
+/// Result of the background release-update check, driving the web console's
+/// upgrade banner. All optional fields are set together iff
+/// `update_available` is true.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct UpdateStatusResponse {
+    /// True when a newer release than the running binary has been published
+    /// on this install's channel.
+    pub update_available: bool,
+    /// Version tag of the running binary, e.g. `v0.1.0-beta.45`.
+    pub current_version: Option<String>,
+    /// Newest published tag on this install's channel.
+    pub latest_version: Option<String>,
+    /// Channel the install tracks: `stable` or `beta`.
+    pub channel: Option<String>,
+    /// Release-notes page (GitHub release) for the newer version.
+    pub release_url: Option<String>,
+    /// When the check that found the update ran (ISO 8601, UTC).
+    pub checked_at: Option<String>,
+    /// Docs page with upgrade instructions. Always present so the UI links
+    /// the same page regardless of update state.
+    pub docs_url: String,
+}
+
+/// Report whether a newer temps release is available for this install.
+#[utoipa::path(
+    tag = "Settings",
+    get,
+    path = "/settings/update-status",
+    responses(
+        (status = 200, description = "Release update status for this install", body = UpdateStatusResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_update_status(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<SettingsState>>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsRead);
+
+    let update = app_state.update_status.as_ref().and_then(|slot| slot.get());
+    let response = match update {
+        Some(update) => UpdateStatusResponse {
+            update_available: true,
+            current_version: Some(update.current_version),
+            latest_version: Some(update.latest_version),
+            channel: Some(update.channel),
+            release_url: Some(update.release_url),
+            checked_at: Some(
+                update
+                    .checked_at
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            ),
+            docs_url: temps_core::UPGRADE_DOCS_URL.to_string(),
+        },
+        // Covers both "up to date" and "no check has succeeded yet" — the
+        // banner is advisory, so the UI treats them identically.
+        None => UpdateStatusResponse {
+            update_available: false,
+            current_version: None,
+            latest_version: None,
+            channel: None,
+            release_url: None,
+            checked_at: None,
+            docs_url: temps_core::UPGRADE_DOCS_URL.to_string(),
+        },
+    };
+
+    Ok(Json(response))
+}
+
 /// Get application settings
 #[utoipa::path(
     tag = "Settings",
@@ -676,14 +834,36 @@ async fn get_settings(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsRead);
 
-    match app_state.config_service.get_settings().await {
+    let (settings_result, policies_result, monitored_services_result) = tokio::join!(
+        app_state.config_service.get_settings(),
+        app_state.config_service.get_effective_telemetry_policies(),
+        app_state.config_service.count_monitored_services(),
+    );
+
+    match settings_result {
         Ok(settings) => {
             // Convert to response type that masks sensitive fields, then
             // reconcile the effective metrics store with the server's
             // ClickHouse env-var configuration so the UI shows the backend the
             // runtime actually uses (not just the DB toggle).
+            let policies = policies_result.unwrap_or_else(|error| {
+                tracing::warn!(
+                    %error,
+                    "Failed to read effective TimescaleDB policies; using configured values"
+                );
+                EffectiveTelemetryPolicies::default()
+            });
+            let monitored_services_count = monitored_services_result
+                .inspect_err(|error| {
+                    tracing::warn!(
+                        %error,
+                        "Failed to count monitored services; storage estimate is unavailable"
+                    );
+                })
+                .ok();
             let response = AppSettingsResponse::from(settings)
-                .with_effective_store(app_state.config_service.is_clickhouse_enabled());
+                .with_effective_store(app_state.config_service.is_clickhouse_enabled())
+                .with_effective_timescale_state(policies, monitored_services_count);
             Ok(Json(response))
         }
         Err(e) => {
@@ -790,6 +970,93 @@ fn sanitize_optional_url(
     }
 
     Ok(Some(trimmed))
+}
+
+fn validate_observability_compression(
+    compression: &ObservabilityCompressionSettings,
+) -> Result<(), Problem> {
+    if !(1..=720).contains(&compression.proxy_logs_after_hours) {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .detail("observability_compression.proxy_logs_after_hours must be between 1 and 720")
+            .build());
+    }
+    if !(1..=2160).contains(&compression.otel_spans_after_hours) {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .detail("observability_compression.otel_spans_after_hours must be between 1 and 2160")
+            .build());
+    }
+    Ok(())
+}
+
+fn validate_monitoring_settings(monitoring: &MonitoringSettings) -> Result<(), Problem> {
+    if monitoring.scrape_interval_secs < 15 {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .detail("monitoring.scrape_interval_secs must be >= 15")
+            .build());
+    }
+    if !(1..=30).contains(&monitoring.retention_raw_days) {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .detail("monitoring.retention_raw_days must be between 1 and 30")
+            .build());
+    }
+    if !(7..=365).contains(&monitoring.retention_hourly_days) {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .detail("monitoring.retention_hourly_days must be between 7 and 365")
+            .build());
+    }
+    if !(1..=10).contains(&monitoring.retention_daily_years) {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .detail("monitoring.retention_daily_years must be between 1 and 10")
+            .build());
+    }
+    if monitoring.store == MetricsStoreKind::ClickHouse {
+        match &monitoring.clickhouse_url {
+            None => {
+                return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                    .detail("monitoring.clickhouse_url is required when store is ClickHouse")
+                    .build());
+            }
+            Some(url) if url::Url::parse(url).is_err() => {
+                return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                    .detail("monitoring.clickhouse_url is not a valid URL")
+                    .build());
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_observability_retention(
+    retention: &ObservabilityRetentionSettings,
+) -> Result<(), Problem> {
+    let values = [
+        ("proxy_logs_days", retention.proxy_logs_days),
+        ("otel_spans_days", retention.otel_spans_days),
+        ("otel_logs_days", retention.otel_logs_days),
+        ("otel_metrics_days", retention.otel_metrics_days),
+    ];
+    for (field, days) in values {
+        if !(1..=3650).contains(&days) {
+            return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .detail(format!(
+                    "observability_retention.{field} must be between 1 and 3650"
+                ))
+                .build());
+        }
+    }
+    Ok(())
+}
+
+/// Normalize the edge target: trim whitespace and treat an empty string as
+/// `None` so an operator clearing the field disables DNS record sync.
+fn normalize_edge_target(settings: &mut AppSettings) {
+    if let Some(value) = settings.edge_target.take() {
+        let trimmed = value.trim().to_string();
+        if !trimmed.is_empty() {
+            settings.edge_target = Some(trimmed);
+        }
+    }
 }
 
 /// Update application settings
@@ -936,43 +1203,59 @@ async fn update_settings(
         }
     }
 
-    // Validate monitoring settings fields.
-    {
-        let m = &settings.monitoring;
-        if m.scrape_interval_secs < 15 {
+    validate_monitoring_settings(&settings.monitoring)?;
+
+    validate_observability_compression(&settings.observability_compression)?;
+    validate_observability_retention(&settings.observability_retention)?;
+
+    settings.external_url = sanitize_optional_url("External", settings.external_url)?;
+    settings.internal_url = sanitize_optional_url("Internal", settings.internal_url)?;
+    // Validate and sanitize external_url
+    if let Some(ref mut ext_url) = settings.external_url {
+        *ext_url = ext_url.trim().to_string();
+        *ext_url = ext_url.trim_end_matches('/').to_string();
+        if !ext_url.starts_with("http://") && !ext_url.starts_with("https://") {
             return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
-                .detail("monitoring.scrape_interval_secs must be >= 15")
+                .detail("External URL must start with http:// or https://")
                 .build());
         }
-        if m.retention_raw_days < 1 || m.retention_raw_days > 30 {
+        if ext_url.contains('#') || ext_url.contains('?') {
             return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
-                .detail("monitoring.retention_raw_days must be between 1 and 30")
+                .detail("External URL must not contain '#' or '?' characters")
                 .build());
         }
-        if m.retention_hourly_days < 7 || m.retention_hourly_days > 365 {
+        if url::Url::parse(ext_url).is_err() {
             return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
-                .detail("monitoring.retention_hourly_days must be between 7 and 365")
+                .detail("External URL is not a valid URL")
                 .build());
         }
-        if m.store == MetricsStoreKind::ClickHouse {
-            match &m.clickhouse_url {
-                None => {
-                    return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
-                        .detail("monitoring.clickhouse_url is required when store is ClickHouse")
-                        .build());
-                }
-                Some(url) if url::Url::parse(url).is_err() => {
-                    return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
-                        .detail("monitoring.clickhouse_url is not a valid URL")
-                        .build());
-                }
-                _ => {}
+    }
+
+    // Validate and sanitize internal_url (same rules as external_url)
+    if let Some(ref mut int_url) = settings.internal_url {
+        *int_url = int_url.trim().trim_end_matches('/').to_string();
+        if int_url.is_empty() {
+            settings.internal_url = None;
+        } else {
+            if !int_url.starts_with("http://") && !int_url.starts_with("https://") {
+                return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                    .detail("Internal URL must start with http:// or https://")
+                    .build());
+            }
+            if int_url.contains('#') || int_url.contains('?') {
+                return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                    .detail("Internal URL must not contain '#' or '?' characters")
+                    .build());
+            }
+            if url::Url::parse(int_url).is_err() {
+                return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                    .detail("Internal URL is not a valid URL")
+                    .build());
             }
         }
     }
 
-    settings.external_url = sanitize_optional_url("External", settings.external_url)?;
-    settings.internal_url = sanitize_optional_url("Internal", settings.internal_url)?;
+    normalize_edge_target(&mut settings);
 
     match app_state.config_service.update_settings(settings).await {
         Ok(_) => {
@@ -1319,6 +1602,97 @@ mod tests {
         );
     }
 
+    #[test]
+    fn observability_compression_validation_accepts_supported_boundaries() {
+        assert!(
+            validate_observability_compression(&ObservabilityCompressionSettings {
+                proxy_logs_after_hours: 1,
+                otel_spans_after_hours: 1,
+            })
+            .is_ok()
+        );
+        assert!(
+            validate_observability_compression(&ObservabilityCompressionSettings {
+                proxy_logs_after_hours: 720,
+                otel_spans_after_hours: 2160,
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn observability_compression_validation_rejects_zero_and_over_retention() {
+        assert!(
+            validate_observability_compression(&ObservabilityCompressionSettings {
+                proxy_logs_after_hours: 0,
+                otel_spans_after_hours: 24,
+            })
+            .is_err()
+        );
+        assert!(
+            validate_observability_compression(&ObservabilityCompressionSettings {
+                proxy_logs_after_hours: 24,
+                otel_spans_after_hours: 2161,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn observability_retention_validation_accepts_supported_boundaries() {
+        assert!(
+            validate_observability_retention(&ObservabilityRetentionSettings {
+                proxy_logs_days: 1,
+                otel_spans_days: 3650,
+                otel_logs_days: 90,
+                otel_metrics_days: 90,
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn observability_retention_validation_rejects_invalid_table_window() {
+        let error = validate_observability_retention(&ObservabilityRetentionSettings {
+            proxy_logs_days: 30,
+            otel_spans_days: 90,
+            otel_logs_days: 0,
+            otel_metrics_days: 90,
+        })
+        .expect_err("zero-day retention must be rejected");
+        assert_eq!(
+            error.body.get("detail").and_then(|value| value.as_str()),
+            Some("observability_retention.otel_logs_days must be between 1 and 3650")
+        );
+    }
+
+    #[test]
+    fn monitoring_validation_accepts_daily_retention_boundaries() {
+        for years in [1, 10] {
+            let monitoring = MonitoringSettings {
+                retention_daily_years: years,
+                ..Default::default()
+            };
+            assert!(validate_monitoring_settings(&monitoring).is_ok());
+        }
+    }
+
+    #[test]
+    fn monitoring_validation_rejects_daily_retention_outside_supported_range() {
+        for years in [0, 11] {
+            let monitoring = MonitoringSettings {
+                retention_daily_years: years,
+                ..Default::default()
+            };
+            let error = validate_monitoring_settings(&monitoring)
+                .expect_err("daily retention outside 1–10 years must be rejected");
+            assert_eq!(
+                error.body.get("detail").and_then(|value| value.as_str()),
+                Some("monitoring.retention_daily_years must be between 1 and 10")
+            );
+        }
+    }
+
     // Regression: the GET /api/settings response must surface agent_sandbox,
     // ai_config, preview_gateway, multi_node, and insecure_tls so the UI can
     // render (and round-trip) resource/runtime/network settings. An earlier
@@ -1430,6 +1804,129 @@ mod tests {
         assert!(json.contains("\"clickhouse_url_set\":true"));
     }
 
+    #[test]
+    fn response_surfaces_observability_compression_settings() {
+        let mut settings = AppSettings::default();
+        settings.observability_compression.proxy_logs_after_hours = 12;
+        settings.observability_compression.otel_spans_after_hours = 48;
+
+        let response = AppSettingsResponse::from(settings);
+
+        assert_eq!(
+            response.observability_compression.proxy_logs_after_hours,
+            12
+        );
+        assert_eq!(
+            response.observability_compression.otel_spans_after_hours,
+            48
+        );
+    }
+
+    #[test]
+    fn response_surfaces_observability_retention_settings() {
+        let mut settings = AppSettings::default();
+        settings.observability_retention.proxy_logs_days = 14;
+        settings.observability_retention.otel_spans_days = 60;
+
+        let response = AppSettingsResponse::from(settings);
+
+        assert_eq!(response.observability_retention.proxy_logs_days, 14);
+        assert_eq!(response.observability_retention.otel_spans_days, 60);
+        assert_eq!(response.observability_retention.otel_logs_days, 90);
+        assert_eq!(response.observability_retention.otel_metrics_days, 90);
+    }
+
+    #[test]
+    fn response_uses_active_timescale_policies_and_service_count() {
+        let policies = EffectiveTelemetryPolicies {
+            metrics_raw_days: Some(14),
+            metrics_hourly_days: Some(120),
+            metrics_daily_years: Some(3),
+            proxy_logs_compression_hours: Some(12),
+            otel_spans_compression_hours: Some(18),
+            proxy_logs_retention_days: Some(21),
+            otel_spans_retention_days: Some(75),
+            otel_logs_retention_days: Some(45),
+            otel_metrics_retention_days: Some(60),
+        };
+
+        let response = AppSettingsResponse::from(AppSettings::default())
+            .with_effective_store(false)
+            .with_effective_timescale_state(policies, Some(7));
+
+        assert_eq!(response.monitored_services_count, Some(7));
+        assert_eq!(response.monitoring.retention_raw_days, 14);
+        assert_eq!(response.monitoring.retention_hourly_days, 120);
+        assert_eq!(response.monitoring.retention_daily_years, 3);
+        assert_eq!(
+            response.observability_compression.proxy_logs_after_hours,
+            12
+        );
+        assert_eq!(
+            response.observability_compression.otel_spans_after_hours,
+            18
+        );
+        assert_eq!(response.observability_retention.proxy_logs_days, 21);
+        assert_eq!(response.observability_retention.otel_spans_days, 75);
+        assert_eq!(response.observability_retention.otel_logs_days, 45);
+        assert_eq!(response.observability_retention.otel_metrics_days, 60);
+    }
+
+    #[test]
+    fn response_does_not_overlay_clickhouse_backed_values() {
+        let mut settings = AppSettings::default();
+        settings.monitoring.store = MetricsStoreKind::ClickHouse;
+        let configured_monitoring = settings.monitoring.clone();
+        let configured_compression = settings.observability_compression.clone();
+        let configured_proxy_retention = settings.observability_retention.proxy_logs_days;
+        let configured_span_retention = settings.observability_retention.otel_spans_days;
+        let configured_metric_retention = settings.observability_retention.otel_metrics_days;
+
+        let response = AppSettingsResponse::from(settings)
+            .with_effective_store(true)
+            .with_effective_timescale_state(
+                EffectiveTelemetryPolicies {
+                    metrics_raw_days: Some(1),
+                    proxy_logs_compression_hours: Some(1),
+                    otel_spans_compression_hours: Some(1),
+                    proxy_logs_retention_days: Some(1),
+                    otel_spans_retention_days: Some(1),
+                    otel_logs_retention_days: Some(45),
+                    otel_metrics_retention_days: Some(60),
+                    ..Default::default()
+                },
+                Some(3),
+            );
+
+        assert_eq!(
+            response.monitoring.retention_raw_days,
+            configured_monitoring.retention_raw_days
+        );
+        assert_eq!(
+            response.monitoring.retention_hourly_days,
+            configured_monitoring.retention_hourly_days
+        );
+        assert_eq!(
+            response.monitoring.retention_daily_years,
+            configured_monitoring.retention_daily_years
+        );
+        assert_eq!(response.observability_compression, configured_compression);
+        assert_eq!(
+            response.observability_retention.proxy_logs_days,
+            configured_proxy_retention
+        );
+        assert_eq!(
+            response.observability_retention.otel_spans_days,
+            configured_span_retention
+        );
+        assert_eq!(response.observability_retention.otel_logs_days, 45);
+        assert_eq!(
+            response.observability_retention.otel_metrics_days,
+            configured_metric_retention
+        );
+        assert_eq!(response.monitored_services_count, Some(3));
+    }
+
     // The effective metrics store reconciles the `store` toggle with the
     // server's ClickHouse env-var state, mirroring `build_ch_metrics_store`.
     #[test]
@@ -1444,11 +1941,19 @@ mod tests {
             MetricsStoreKind::TimescaleDb,
             "ClickHouse selected but env vars unset must fall back to TimescaleDB"
         );
+        assert_eq!(
+            response.effective_observability_store,
+            MetricsStoreKind::TimescaleDb
+        );
 
         // store=click_house AND env vars configured → runtime uses ClickHouse.
         let response = AppSettingsResponse::from(settings).with_effective_store(true);
         assert_eq!(
             response.effective_metrics_store,
+            MetricsStoreKind::ClickHouse
+        );
+        assert_eq!(
+            response.effective_observability_store,
             MetricsStoreKind::ClickHouse
         );
 
@@ -1457,6 +1962,11 @@ mod tests {
         assert_eq!(
             response.effective_metrics_store,
             MetricsStoreKind::TimescaleDb
+        );
+        assert_eq!(
+            response.effective_observability_store,
+            MetricsStoreKind::ClickHouse,
+            "proxy logs and spans use ClickHouse whenever its server config is available"
         );
     }
 

@@ -12,6 +12,83 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  compose-security:
+    name: Compose Security
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # The toolchain stage (apk deps, bun, wasm-pack/wasm-bindgen-cli compiled
+      # from source) only changes when the Dockerfile does, so cache it as
+      # image layers. It doubles as the build container below: compiling
+      # inside it produces the same musl binary the production builder stage
+      # would, but with a cargo target dir that persists across runs — the
+      # one thing an in-Docker build can never have.
+      - name: Build toolchain image (GHA layer cache)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: toolchain
+          load: true
+          tags: temps-toolchain:ci
+          cache-from: type=gha,scope=compose-security-toolchain
+          cache-to: type=gha,scope=compose-security-toolchain,mode=max
+
+      - name: Cache cargo target dir (musl, fast profile)
+        uses: actions/cache@v6
+        with:
+          path: ci-build-cache
+          key: compose-security-musl-${{ hashFiles('Cargo.lock', 'Dockerfile') }}
+          restore-keys: |
+            compose-security-musl-
+
+      # Mirrors the Dockerfile builder stage (WASM -> web UI -> cargo build)
+      # inside the toolchain container, with target/ and the cargo registry
+      # mounted from the persistent cache so rebuilds are incremental. Uses
+      # the `fast` profile (release semantics, parallel codegen, no LTO);
+      # production images keep the default `release` profile.
+      - name: Build temps binary in toolchain container
+        run: |
+          mkdir -p ci-build-cache/target ci-build-cache/cargo-registry ci-prebuilt
+          docker run --rm \
+            --volume "$PWD":/build --workdir /build \
+            --volume "$PWD/ci-build-cache/target":/build/target \
+            --volume "$PWD/ci-build-cache/cargo-registry":/usr/local/cargo/registry \
+            temps-toolchain:ci \
+            sh -ec '
+              git config --global --add safe.directory /build
+              cd /build/crates/temps-captcha-wasm && bun install && npm run build
+              cd /build/web && bun install && \
+                RSBUILD_OUTPUT_PATH=/build/crates/temps-cli/dist bun run build
+              cd /build
+              cargo build --profile fast --bin temps --package temps-cli
+              cp target/fast/temps ci-prebuilt/temps
+              chown -R '"$(id -u):$(id -g)"' /build/target /usr/local/cargo/registry \
+                ci-prebuilt crates/temps-cli/dist
+            '
+          chmod +x ci-prebuilt/temps
+
+      # Assemble the production runtime stage around the prebuilt binary —
+      # the builder stage is skipped entirely, so this takes ~1 minute.
+      - name: Build temps image from prebuilt binary
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: temps-compose-security:ci
+          build-args: |
+            TEMPS_ARTIFACTS=artifacts-prebuilt
+
+      - name: Validate secure Compose defaults
+        env:
+          COMPOSE_SECURITY_OVERRIDE: .github/compose-security.prebuilt.yml
+          COMPOSE_SECURITY_PREBUILT: "1"
+        run: scripts/test-compose-security.sh
+
   check:
     name: Cargo Check
     runs-on: ubuntu-latest

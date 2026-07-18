@@ -1,6 +1,8 @@
 import {
+  checkCommitExistsOptions,
   getEnvironmentsOptions,
   getProjectBySlugOptions,
+  getRepositoryByNameOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { EnvironmentResponse, ProjectResponse } from '@/api/client/types.gen'
 import { Button } from '@/components/ui/button'
@@ -25,8 +27,30 @@ import { useQuery } from '@tanstack/react-query'
 import { useMemo, useState, useEffect } from 'react'
 import { toast } from 'sonner'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { AlertTriangle } from 'lucide-react'
+import {
+  AlertTriangle,
+  CheckCircle2,
+  GitCommitHorizontal,
+  Loader2,
+  RefreshCw,
+} from 'lucide-react'
 import { BranchSelector } from './BranchSelector'
+
+const COMMIT_SHA_PATTERN = /^[0-9a-f]{7,40}$/i
+
+function isValidCommitSha(commit: string) {
+  return COMMIT_SHA_PATTERN.test(commit.trim())
+}
+
+function formatCommitDate(date: string) {
+  const parsedDate = new Date(date)
+  if (Number.isNaN(parsedDate.getTime())) return date
+
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  }).format(parsedDate)
+}
 
 interface RedeploymentModalProps {
   project: ProjectResponse
@@ -111,66 +135,121 @@ export function RedeploymentModal({
     'branch' | 'commit' | 'tag'
   >(defaultType || 'branch')
   const [availableBranches, setAvailableBranches] = useState<string[]>([])
-  const [branchNotFound, setBranchNotFound] = useState(false)
+  const [commitToCheck, setCommitToCheck] = useState('')
 
   // Derive effective values (either user-selected or initial/default)
   const effectiveBranch = selectedBranch !== '' ? selectedBranch : initialBranch
   const effectiveEnvironment = selectedEnvironment ?? initialEnvironment
+  const normalizedCommit = selectedCommit.trim()
+  const commitFormatIsValid = isValidCommitSha(normalizedCommit)
+  const branchNotFound = Boolean(
+    effectiveBranch &&
+    availableBranches.length > 0 &&
+    !availableBranches.includes(effectiveBranch)
+  )
+  const projectDetails = projectQuery.data ?? project
+  const shouldLookUpCommit = Boolean(
+    projectDetails.git_provider_connection_id &&
+    projectDetails.repo_owner &&
+    projectDetails.repo_name
+  )
+
+  const repositoryQuery = useQuery({
+    ...getRepositoryByNameOptions({
+      path: {
+        owner: projectDetails.repo_owner || '',
+        name: projectDetails.repo_name || '',
+      },
+      query: {
+        connection_id: projectDetails.git_provider_connection_id || 0,
+      },
+    }),
+    enabled:
+      isOpen &&
+      mode === 'new' &&
+      deploymentType === 'commit' &&
+      shouldLookUpCommit,
+  })
+
+  const commitQuery = useQuery({
+    ...checkCommitExistsOptions({
+      path: {
+        repository_id: repositoryQuery.data?.id || 0,
+        commit_sha: commitToCheck,
+      },
+    }),
+    enabled:
+      isOpen &&
+      deploymentType === 'commit' &&
+      !!repositoryQuery.data?.id &&
+      !!commitToCheck,
+    retry: false,
+  })
+
+  const checkedCurrentCommit =
+    !!commitToCheck && commitToCheck === normalizedCommit.toLowerCase()
+  const commitIsVerified = Boolean(
+    checkedCurrentCommit && commitQuery.data?.exists && commitQuery.data.commit
+  )
 
   // Reset form state when modal opens or default values change
   useEffect(() => {
     if (isOpen) {
+      // The dialog is controlled by its parent, so opening it is the boundary
+      // where draft selections must be reset to the latest defaults.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setSelectedBranch('')
       setSelectedEnvironment(null)
       setSelectedCommit(defaultCommit || '')
       setSelectedTag(defaultTag || '')
       setDeploymentType(defaultType || 'branch')
-      setBranchNotFound(false)
     }
   }, [isOpen, defaultCommit, defaultTag, defaultType])
 
-  // Auto-select the repo's default branch once it resolves, so the modal opens
-  // with the default branch pre-selected instead of an empty "Select a branch"
-  // state. Only fills an empty selection — never overrides a user's pick or an
-  // environment-derived branch.
-  useEffect(() => {
-    if (!isOpen || mode !== 'new' || deploymentType !== 'branch') return
-    if (selectedBranch || !initialBranch) return
-    setSelectedBranch(initialBranch)
-  }, [isOpen, mode, deploymentType, selectedBranch, initialBranch])
+  const handleEnvironmentChange = (value: string) => {
+    const environmentId = value ? parseInt(value) : null
+    setSelectedEnvironment(environmentId)
 
-  // When environment selection changes, automatically select its branch
-  useEffect(() => {
-    if (!selectedEnvironment || !environmentsQuery.data) return
+    if (!environmentId || !environmentsQuery.data || isImageDeploy) return
 
     const selectedEnv = environmentsQuery.data.find(
-      (env: EnvironmentResponse) => env.id === selectedEnvironment
+      (env: EnvironmentResponse) => env.id === environmentId
+    )
+    if (selectedEnv?.branch) {
+      setDeploymentType('branch')
+      setSelectedBranch(selectedEnv.branch)
+    }
+  }
+
+  // Avoid issuing a provider API request for every character after the
+  // minimum SHA length. Pasting or pausing on a syntactically valid SHA
+  // resolves the commit details after a short debounce.
+  useEffect(() => {
+    const canCheckCommit =
+      isOpen &&
+      deploymentType === 'commit' &&
+      shouldLookUpCommit &&
+      commitFormatIsValid
+    const nextCommit = canCheckCommit ? normalizedCommit.toLowerCase() : ''
+
+    const timeoutId = window.setTimeout(
+      () => {
+        setCommitToCheck(nextCommit)
+      },
+      canCheckCommit ? 350 : 0
     )
 
-    if (!selectedEnv?.branch) return
-
-    // Set branch type and switch to branch deployment mode
-    setDeploymentType('branch')
-    setSelectedBranch(selectedEnv.branch)
-    setBranchNotFound(false)
-  }, [selectedEnvironment, environmentsQuery.data])
-
-  // Check if the selected branch exists in available branches (after branches load)
-  useEffect(() => {
-    if (!selectedBranch || availableBranches.length === 0) {
-      setBranchNotFound(false)
-      return
-    }
-    setBranchNotFound(!availableBranches.includes(selectedBranch))
-  }, [selectedBranch, availableBranches])
+    return () => window.clearTimeout(timeoutId)
+  }, [
+    commitFormatIsValid,
+    deploymentType,
+    isOpen,
+    normalizedCommit,
+    shouldLookUpCommit,
+  ])
 
   const validateCommit = (commit: string) => {
-    const commitRegex = /^[0-9a-f]{7,40}$/
-    if (!commit.trim()) return true // Optional
-    if (!commitRegex.test(commit)) {
-      return false
-    }
-    return true
+    return isValidCommitSha(commit)
   }
 
   const handleConfirm = async () => {
@@ -178,7 +257,8 @@ export function RedeploymentModal({
     // the prebuilt image. In redeploy mode the environment is fixed; in new
     // mode the user picks it.
     if (isImageDeploy) {
-      const envId = mode === 'redeploy' ? defaultEnvironment : effectiveEnvironment
+      const envId =
+        mode === 'redeploy' ? defaultEnvironment : effectiveEnvironment
       if (!envId) {
         toast.error('No environment specified for deployment')
         return
@@ -205,7 +285,17 @@ export function RedeploymentModal({
 
     // In new mode, validate and use selected/effective values
     if (deploymentType === 'commit' && !validateCommit(selectedCommit)) {
-      toast.error('Invalid commit hash')
+      toast.error(
+        'Enter a commit hash containing 7 to 40 hexadecimal characters'
+      )
+      return
+    }
+    if (
+      deploymentType === 'commit' &&
+      shouldLookUpCommit &&
+      !commitIsVerified
+    ) {
+      toast.error('Wait for the commit to be verified before deploying')
       return
     }
     if (!effectiveEnvironment) {
@@ -222,22 +312,27 @@ export function RedeploymentModal({
 
     await onConfirm({
       branch: deploymentType === 'branch' ? effectiveBranch : undefined,
-      commit: deploymentType === 'commit' ? selectedCommit : undefined,
+      commit:
+        deploymentType === 'commit'
+          ? normalizedCommit.toLowerCase()
+          : undefined,
       tag: deploymentType === 'tag' ? selectedTag : undefined,
       environmentId: effectiveEnvironment,
     })
   }
 
   // Get environment name for redeploy mode
-  const environmentName = environmentsQuery.data?.find(
-    (env: EnvironmentResponse) => env.id === defaultEnvironment
-  )?.name || environmentsQuery.data?.find(
-    (env: EnvironmentResponse) => env.id === defaultEnvironment
-  )?.slug
+  const environmentName =
+    environmentsQuery.data?.find(
+      (env: EnvironmentResponse) => env.id === defaultEnvironment
+    )?.name ||
+    environmentsQuery.data?.find(
+      (env: EnvironmentResponse) => env.id === defaultEnvironment
+    )?.slug
 
   return (
     <Dialog open={isOpen} onOpenChange={onClose}>
-      <DialogContent>
+      <DialogContent className="sm:max-w-[640px]">
         <DialogHeader>
           <DialogTitle>
             {mode === 'redeploy' ? 'Redeploy' : 'Deploy Project'}
@@ -256,13 +351,18 @@ export function RedeploymentModal({
             <div className="space-y-3 rounded-md border bg-muted/50 p-4">
               <div className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-2">
                 <div className="text-sm font-medium">Image:</div>
-                <div className="truncate text-sm font-mono" title={imageRef || ''}>
+                <div
+                  className="truncate text-sm font-mono"
+                  title={imageRef || ''}
+                >
                   {imageRef || 'N/A'}
                 </div>
                 {mode === 'redeploy' ? (
                   <>
                     <div className="text-sm font-medium">Environment:</div>
-                    <div className="text-sm">{environmentName || 'Loading...'}</div>
+                    <div className="text-sm">
+                      {environmentName || 'Loading...'}
+                    </div>
                   </>
                 ) : null}
               </div>
@@ -272,9 +372,7 @@ export function RedeploymentModal({
                 <Label htmlFor="image-environment">Environment</Label>
                 <Select
                   value={effectiveEnvironment?.toString() || ''}
-                  onValueChange={(value) =>
-                    setSelectedEnvironment(value ? parseInt(value) : null)
-                  }
+                  onValueChange={handleEnvironmentChange}
                   disabled={environmentsQuery.isLoading}
                 >
                   <SelectTrigger>
@@ -305,7 +403,9 @@ export function RedeploymentModal({
                 disabled={
                   isLoading ||
                   !imageRef ||
-                  (mode === 'redeploy' ? !defaultEnvironment : !effectiveEnvironment)
+                  (mode === 'redeploy'
+                    ? !defaultEnvironment
+                    : !effectiveEnvironment)
                 }
               >
                 {isLoading
@@ -359,7 +459,10 @@ export function RedeploymentModal({
               <Button variant="outline" onClick={onClose} disabled={isLoading}>
                 Cancel
               </Button>
-              <Button onClick={handleConfirm} disabled={isLoading || !defaultEnvironment}>
+              <Button
+                onClick={handleConfirm}
+                disabled={isLoading || !defaultEnvironment}
+              >
                 {isLoading ? 'Redeploying...' : 'Redeploy'}
               </Button>
             </DialogFooter>
@@ -386,15 +489,20 @@ export function RedeploymentModal({
                       <Alert className="border-amber-200 bg-amber-50">
                         <AlertTriangle className="h-4 w-4 text-amber-600" />
                         <AlertDescription className="text-amber-800">
-                          The branch "{selectedBranch}" for this environment was not found in the repository.
-                          You can continue with the current branch name, or switch to deploy by commit hash.
+                          The branch “{effectiveBranch}” for this environment
+                          was not found in the repository. You can continue with
+                          the current branch name, or switch to deploy by commit
+                          hash.
                         </AlertDescription>
                       </Alert>
                     )}
-                    {deploymentType === 'branch' && selectedEnvironment && !availableBranches.includes(selectedBranch) && availableBranches.length > 0 ? (
+                    {deploymentType === 'branch' &&
+                    selectedEnvironment &&
+                    !availableBranches.includes(selectedBranch) &&
+                    availableBranches.length > 0 ? (
                       <div className="space-y-2">
                         <Input
-                          value={selectedBranch}
+                          value={effectiveBranch}
                           onChange={(e) => setSelectedBranch(e.target.value)}
                           placeholder="Enter branch name manually"
                           disabled={isLoading}
@@ -405,26 +513,139 @@ export function RedeploymentModal({
                         repoOwner={projectQuery.data?.repo_owner || ''}
                         repoName={projectQuery.data?.repo_name || ''}
                         connectionId={
-                          projectQuery.data?.git_provider_connection_id || undefined
+                          projectQuery.data?.git_provider_connection_id ||
+                          undefined
                         }
                         gitUrl={(projectQuery.data as any)?.git_url}
-                        defaultBranch={initialBranch || projectQuery.data?.main_branch}
-                        value={selectedBranch}
+                        defaultBranch={
+                          initialBranch || projectQuery.data?.main_branch
+                        }
+                        value={effectiveBranch}
                         onChange={(branch) => {
                           setSelectedBranch(branch)
-                          setBranchNotFound(false)
                         }}
-                        onBranchesLoaded={(branches) => setAvailableBranches(branches)}
+                        onBranchesLoaded={(branches) =>
+                          setAvailableBranches(branches)
+                        }
                         disabled={isLoading}
                       />
                     )}
                   </TabsContent>
-                  <TabsContent value="commit">
-                    <Input
-                      value={selectedCommit}
-                      onChange={(e) => setSelectedCommit(e.target.value)}
-                      placeholder="Enter commit hash"
-                    />
+                  <TabsContent value="commit" className="space-y-3">
+                    <div className="space-y-1.5">
+                      <Input
+                        value={selectedCommit}
+                        onChange={(e) => setSelectedCommit(e.target.value)}
+                        placeholder="Enter commit hash"
+                        spellCheck={false}
+                        autoComplete="off"
+                        className="font-mono"
+                        aria-invalid={
+                          normalizedCommit.length > 0 && !commitFormatIsValid
+                        }
+                        aria-describedby="commit-lookup-status"
+                      />
+                      {normalizedCommit.length > 0 && !commitFormatIsValid && (
+                        <p className="text-xs text-destructive">
+                          Use 7 to 40 hexadecimal characters.
+                        </p>
+                      )}
+                    </div>
+
+                    <div id="commit-lookup-status" aria-live="polite">
+                      {commitFormatIsValid && shouldLookUpCommit && (
+                        <>
+                          {(repositoryQuery.isLoading ||
+                            !checkedCurrentCommit ||
+                            commitQuery.isLoading) &&
+                            !repositoryQuery.isError && (
+                              <div className="flex items-center gap-2 rounded-md border bg-muted/30 px-3 py-2.5 text-sm text-muted-foreground">
+                                <Loader2 className="h-4 w-4 animate-spin" />
+                                Checking commit with the Git provider…
+                              </div>
+                            )}
+
+                          {(repositoryQuery.isError || commitQuery.isError) && (
+                            <Alert variant="destructive">
+                              <AlertTriangle className="h-4 w-4" />
+                              <AlertDescription className="flex items-center justify-between gap-3">
+                                <span>
+                                  Commit details could not be loaded. Check the
+                                  Git provider connection and try again.
+                                </span>
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  size="sm"
+                                  className="shrink-0"
+                                  onClick={() => {
+                                    if (repositoryQuery.isError) {
+                                      void repositoryQuery.refetch()
+                                    } else {
+                                      void commitQuery.refetch()
+                                    }
+                                  }}
+                                >
+                                  <RefreshCw className="mr-1.5 h-3.5 w-3.5" />
+                                  Retry
+                                </Button>
+                              </AlertDescription>
+                            </Alert>
+                          )}
+
+                          {checkedCurrentCommit &&
+                            commitQuery.data &&
+                            !commitQuery.data.exists && (
+                              <Alert variant="destructive">
+                                <AlertTriangle className="h-4 w-4" />
+                                <AlertDescription>
+                                  This commit was not found in{' '}
+                                  <span className="font-medium">
+                                    {projectDetails.repo_owner}/
+                                    {projectDetails.repo_name}
+                                  </span>
+                                  .
+                                </AlertDescription>
+                              </Alert>
+                            )}
+
+                          {commitIsVerified && commitQuery.data?.commit && (
+                            <div className="overflow-hidden rounded-md border bg-muted/20">
+                              <div className="flex items-center justify-between gap-3 border-b bg-muted/40 px-3 py-2">
+                                <div className="flex min-w-0 items-center gap-2 text-sm font-medium">
+                                  <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
+                                  Commit found
+                                </div>
+                                <div className="flex items-center gap-1.5 font-mono text-xs text-muted-foreground">
+                                  <GitCommitHorizontal className="h-3.5 w-3.5" />
+                                  {commitQuery.data.commit.sha.slice(0, 12)}
+                                </div>
+                              </div>
+                              <div className="space-y-2.5 px-3 py-3">
+                                <p className="max-h-24 overflow-y-auto whitespace-pre-wrap text-sm leading-relaxed">
+                                  {commitQuery.data.commit.message}
+                                </p>
+                                <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
+                                  <span className="font-medium text-foreground">
+                                    {commitQuery.data.commit.author}
+                                  </span>
+                                  <span aria-hidden="true">·</span>
+                                  <span>
+                                    {formatCommitDate(
+                                      commitQuery.data.commit.date
+                                    )}
+                                  </span>
+                                  <span aria-hidden="true">·</span>
+                                  <span className="truncate">
+                                    {commitQuery.data.commit.author_email}
+                                  </span>
+                                </div>
+                              </div>
+                            </div>
+                          )}
+                        </>
+                      )}
+                    </div>
                   </TabsContent>
                   <TabsContent value="tag">
                     <Input
@@ -440,9 +661,7 @@ export function RedeploymentModal({
                 <Label htmlFor="environment">Environment</Label>
                 <Select
                   value={effectiveEnvironment?.toString() || ''}
-                  onValueChange={(value) =>
-                    setSelectedEnvironment(value ? parseInt(value) : null)
-                  }
+                  onValueChange={handleEnvironmentChange}
                   disabled={environmentsQuery.isLoading}
                 >
                   <SelectTrigger>
@@ -471,7 +690,12 @@ export function RedeploymentModal({
               <Button
                 onClick={handleConfirm}
                 disabled={
-                  isLoading || !effectiveEnvironment || environmentsQuery.isLoading
+                  isLoading ||
+                  !effectiveEnvironment ||
+                  environmentsQuery.isLoading ||
+                  (deploymentType === 'commit' &&
+                    (!commitFormatIsValid ||
+                      (shouldLookUpCommit && !commitIsVerified)))
                 }
               >
                 {isLoading ? 'Deploying...' : 'Deploy'}

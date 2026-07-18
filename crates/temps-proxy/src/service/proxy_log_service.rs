@@ -623,7 +623,8 @@ impl ProxyLogService {
     /// Get a single proxy log by ID.
     ///
     /// `proxy_logs` is a TimescaleDB hypertable partitioned by `timestamp`
-    /// (1-day chunks, compressed after 7 days), so a bare `WHERE id = $1`
+    /// (1-day chunks, compressed after 24 hours by default), so a bare
+    /// `WHERE id = $1`
     /// cannot exclude any chunk and must decompress every compressed chunk —
     /// observed as multi-second lookups. When the caller knows the row's event
     /// time (the list endpoint returns it), a ±1-day bound reduces the lookup
@@ -649,10 +650,10 @@ impl ProxyLogService {
             return Ok(log);
         }
 
-        // Compression policy compresses chunks older than 7 days; probing the
+        // Compression defaults to chunks older than 24 hours; probing that
         // uncompressed window first keeps the common case (recent log, no
         // timestamp supplied) off the decompression path.
-        let recent_cutoff = Utc::now() - chrono::Duration::days(7);
+        let recent_cutoff = Utc::now() - chrono::Duration::hours(24);
         let log = proxy_logs::Entity::find()
             .filter(proxy_logs::Column::Id.eq(id))
             .filter(proxy_logs::Column::Timestamp.gte(recent_cutoff))

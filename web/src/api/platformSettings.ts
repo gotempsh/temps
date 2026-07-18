@@ -123,12 +123,35 @@ export interface MonitoringSettings {
   clickhouse_url?: string | null
 }
 
+export interface ObservabilityCompressionSettings {
+  /** Compress immutable proxy-log chunks after this many hours. */
+  proxy_logs_after_hours: number
+  /** Compress immutable OpenTelemetry span chunks after this many hours. */
+  otel_spans_after_hours: number
+}
+
+export interface ObservabilityRetentionSettings {
+  /** Raw proxy request-log retention in days. */
+  proxy_logs_days: number
+  /** OpenTelemetry span/trace retention in days. */
+  otel_spans_days: number
+  /** OpenTelemetry log-event retention in days. */
+  otel_logs_days: number
+  /** OpenTelemetry metric-point retention in days. */
+  otel_metrics_days: number
+}
+
+/** Per-managed-domain hostname layout (configured under DNS providers, not here). */
+export type PublicHostnameStrategy = 'standard' | 'flat'
+
 // Re-export the types from the API for consistency
 export interface PlatformSettings extends AppSettingsResponse {
   external_url: string | null
   internal_url: string | null
   letsencrypt: LetsEncryptSettings
   preview_domain: string
+  /** Public address synced DNS records point at (IP → A/AAAA, else CNAME). */
+  edge_target?: string | null
   screenshots: ScreenshotSettings
   security_headers: SecurityHeadersSettings
   rate_limiting: RateLimitSettings
@@ -137,6 +160,12 @@ export interface PlatformSettings extends AppSettingsResponse {
   insecure_tls: boolean
   attack_mode?: boolean
   build_limits: BuildLimitsSettings
+  /** Enabled, running services included in the metrics scrape cycle. */
+  monitored_services_count: number | null
+  observability_compression: ObservabilityCompressionSettings
+  observability_retention: ObservabilityRetentionSettings
+  /** Effective backend for proxy logs and OTel spans. */
+  effective_observability_store: MetricsStoreKind
   /** Set to true by `temps setup` once initial configuration has been applied.
    * The web onboarding wizard checks this and skips itself when true. */
   setup_complete: boolean
@@ -162,8 +191,8 @@ export async function getPlatformSettings(): Promise<PlatformSettings> {
     throw new Error('Settings endpoint returned no data')
   }
 
-  // Cast to include extended fields not yet present in generated OpenAPI types.
-  // The server contract guarantees these are populated.
+  // OpenAPI represents Rust `Option<T>` response fields as optional, while the
+  // settings handler serializes this complete response object on every read.
   return response.data as PlatformSettings
 }
 
@@ -180,13 +209,13 @@ export async function updatePlatformSettings(
 
   validateSettings(updated)
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const body: any = {
     dns_provider: updated.dns_provider,
     external_url: updated.external_url,
     internal_url: updated.internal_url,
     letsencrypt: updated.letsencrypt,
     preview_domain: updated.preview_domain,
+    edge_target: updated.edge_target,
     screenshots: updated.screenshots,
     security_headers: updated.security_headers,
     rate_limiting: updated.rate_limiting,
@@ -196,6 +225,8 @@ export async function updatePlatformSettings(
     attack_mode: updated.attack_mode,
     build_limits: updated.build_limits,
     monitoring: updated.monitoring,
+    observability_compression: updated.observability_compression,
+    observability_retention: updated.observability_retention,
   }
   const result = await updateSettings({ body })
   if (result.error) {

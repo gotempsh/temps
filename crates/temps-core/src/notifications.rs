@@ -54,7 +54,7 @@ pub trait NotificationService: Send + Sync {
     /// [`is_configured`] returns true if *any* notification provider is
     /// enabled (including a Slack-only setup), which is the wrong gate for
     /// features that genuinely require email delivery (password reset,
-    /// magic links, verification). Default impl conservatively returns
+    /// verification). Default impl conservatively returns
     /// false so callers don't advertise email-only features without a real
     /// email provider.
     async fn is_email_provider_configured(&self) -> Result<bool, NotificationError> {

@@ -374,15 +374,16 @@ impl From<ai_pending_actions::Model> for PendingActionResponse {
     }
 }
 
-/// Toggle-only gate: the project must have opted into AI use — either the
-/// read-only debug chat (`ai_debug_chat_enabled`) OR write actions
-/// (`ai_write_actions_enabled`). Write actions are *proposed and confirmed
-/// inside this chat*, so enabling the more-privileged capability must never
-/// block the chat itself (otherwise a project with write on but debug-chat off
-/// could never open the chat to use it). Used by the read/archive handlers so
-/// that disabling both consistently revokes access (403) to existing chat
-/// content — reading/archiving history must not require an AI provider to be
-/// configured, only a per-project opt-in.
+/// Toggle-only gate: read-only chat is enabled by default; only an explicit
+/// opt-out (`ai_debug_chat_enabled = Some(false)`) disables it. Write actions
+/// (`ai_write_actions_enabled`) remain a separate manual opt-in — they are
+/// *proposed and confirmed inside this chat*, so enabling the more-privileged
+/// capability must never block the chat itself (otherwise a project with
+/// write on but debug-chat explicitly off could never open the chat to use
+/// it). Used by the read/archive handlers so that an explicit opt-out
+/// consistently revokes access (403) to existing chat content —
+/// reading/archiving history must not require an AI provider to be
+/// configured.
 async fn ensure_chat_enabled(db: &DatabaseConnection, project_id: i32) -> Result<(), Problem> {
     let project = temps_entities::projects::Entity::find_by_id(project_id)
         .one(db)
@@ -392,12 +393,14 @@ async fn ensure_chat_enabled(db: &DatabaseConnection, project_id: i32) -> Result
                 .with_detail(e.to_string())
         })?;
     let enabled = project
-        .map(|p| matches!(p.ai_debug_chat_enabled, Some(true)) || p.ai_write_actions_enabled)
+        .map(|p| !matches!(p.ai_debug_chat_enabled, Some(false)) || p.ai_write_actions_enabled)
         .unwrap_or(false);
     if !enabled {
         return Err(problemdetails::new(axum::http::StatusCode::FORBIDDEN)
             .with_title("AI Chat Disabled")
-            .with_detail("Enable AI chat for this project to use it."));
+            .with_detail(
+                "AI chat has been disabled for this project. Re-enable it in the project's AI settings.",
+            ));
     }
     Ok(())
 }
@@ -1204,12 +1207,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ensure_chat_enabled_403_when_toggle_null() {
+    async fn test_ensure_chat_enabled_allows_when_toggle_null() {
         let db = db_returning(Some(project_with_toggle(7, None)));
-        let err = ensure_chat_enabled(&db, 7)
+        ensure_chat_enabled(&db, 7)
             .await
-            .expect_err("toggle null (default off) must be denied");
-        assert_eq!(err.status_code, StatusCode::FORBIDDEN);
+            .expect("toggle null (default on) must be allowed");
     }
 
     #[tokio::test]

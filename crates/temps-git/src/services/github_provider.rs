@@ -1573,7 +1573,10 @@ impl GitProviderService for GitHubProvider {
         // GitHub API endpoint for getting a commit
         let url = format!(
             "{}/repos/{}/{}/commits/{}",
-            self.api_url, owner, repo, reference
+            self.api_url,
+            owner,
+            repo,
+            urlencoding::encode(reference)
         );
 
         let response = self
@@ -1582,6 +1585,12 @@ impl GitProviderService for GitHubProvider {
 
         if !response.status().is_success() {
             let status = response.status();
+            if status == reqwest::StatusCode::NOT_FOUND {
+                return Err(GitProviderError::CommitNotFound {
+                    repository: format!("{}/{}", owner, repo),
+                    commit_sha: reference.to_string(),
+                });
+            }
             let error_text = response
                 .text()
                 .await

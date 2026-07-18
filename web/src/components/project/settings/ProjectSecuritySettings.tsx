@@ -91,7 +91,7 @@ export function ProjectSecuritySettings({
   } = useForm<FormData>({
     defaultValues: {
       attack_mode: project.attack_mode ?? false,
-      ai_debug_chat_enabled: project.ai_debug_chat_enabled ?? false,
+      ai_debug_chat_enabled: project.ai_debug_chat_enabled ?? true,
       ai_alert_summaries_enabled: project.ai_alert_summaries_enabled ?? false,
       ai_write_actions_enabled: project.ai_write_actions_enabled ?? false,
       security: {
@@ -147,8 +147,8 @@ export function ProjectSecuritySettings({
         projectSettings.attack_mode = data.attack_mode
       }
       if (
-        (data.ai_debug_chat_enabled ?? false) !==
-        (project.ai_debug_chat_enabled ?? false)
+        (data.ai_debug_chat_enabled ?? true) !==
+        (project.ai_debug_chat_enabled ?? true)
       ) {
         projectSettings.ai_debug_chat_enabled = data.ai_debug_chat_enabled
       }
@@ -163,8 +163,7 @@ export function ProjectSecuritySettings({
         (data.ai_write_actions_enabled ?? false) !==
         (project.ai_write_actions_enabled ?? false)
       ) {
-        projectSettings.ai_write_actions_enabled =
-          data.ai_write_actions_enabled
+        projectSettings.ai_write_actions_enabled = data.ai_write_actions_enabled
       }
 
       if (Object.keys(projectSettings).length > 0) {
@@ -327,8 +326,9 @@ export function ProjectSecuritySettings({
             AI Assistance
           </CardTitle>
           <CardDescription>
-            Opt in to AI features powered by your configured AI provider. Off by
-            default; uses your own provider key and counts against its budget.
+            AI features powered by your configured AI provider, using your own
+            provider key and budget. Read-only chat is on by default; write
+            actions and alert summaries are opt-in.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
@@ -336,13 +336,14 @@ export function ProjectSecuritySettings({
             <div className="space-y-0.5">
               <Label htmlFor="ai-debug-chat">AI debugging chat</Label>
               <p className="text-sm text-muted-foreground">
-                Offer a “Debug with AI” chat on failed deployments to
-                investigate and fix problems.
+                Read-only AI chat for this project — debugging failed
+                deployments, analytics insights, and more. On by default; turn
+                off to disable the chat entirely.
               </p>
             </div>
             <Switch
               id="ai-debug-chat"
-              checked={watch('ai_debug_chat_enabled') ?? false}
+              checked={watch('ai_debug_chat_enabled') ?? true}
               onCheckedChange={(checked) =>
                 setValue('ai_debug_chat_enabled', checked, {
                   shouldDirty: true,
@@ -350,6 +351,16 @@ export function ProjectSecuritySettings({
               }
             />
           </div>
+          {(watch('ai_debug_chat_enabled') ?? true) === false &&
+            (watch('ai_write_actions_enabled') ?? false) === true && (
+              <Alert>
+                <AlertDescription>
+                  AI chat remains accessible because write actions are enabled —
+                  proposed changes are reviewed and confirmed inside the chat.
+                  To disable AI entirely, also turn off write actions below.
+                </AlertDescription>
+              </Alert>
+            )}
           <Separator />
           <div className="flex items-center justify-between">
             <div className="space-y-0.5">

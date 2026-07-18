@@ -17,6 +17,13 @@ import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { FileText, RefreshCw } from 'lucide-react'
 import React, { useMemo } from 'react'
+import {
+  InsightsPanel,
+  InsightsToggleButton,
+  derivePagesInsights,
+  useInsightsOpen,
+} from './insights'
+import type { AiInsightContext } from './insights'
 import { PageListItem } from './PageListItem'
 
 interface PagesProps {
@@ -33,6 +40,7 @@ export function Pages({
   environment,
 }: PagesProps) {
   const [isRefreshing, setIsRefreshing] = React.useState(false)
+  const [insightsOpen, setInsightsOpen] = useInsightsOpen()
 
   // Fetch page paths
   const { data, isLoading, error, refetch } = useQuery({
@@ -48,11 +56,13 @@ export function Pages({
     enabled: !!startDate && !!endDate,
   })
 
+  const pagePaths = data?.page_paths
+
   // Build comma-separated page paths for batch sparkline query
   const pagePathsCsv = useMemo(() => {
-    if (!data?.page_paths || data.page_paths.length === 0) return ''
-    return data.page_paths.map((p) => p.page_path).join(',')
-  }, [data?.page_paths])
+    if (!pagePaths || pagePaths.length === 0) return ''
+    return pagePaths.map((p) => p.page_path).join(',')
+  }, [pagePaths])
 
   // Fetch all sparklines in a single batch request
   const { data: sparklineData } = useQuery({
@@ -68,22 +78,46 @@ export function Pages({
     enabled: !!startDate && !!endDate && pagePathsCsv.length > 0,
   })
 
+  const sparklines = sparklineData?.sparklines
+
   // Index sparklines by page_path for O(1) lookup
   const sparklinesByPath = useMemo(() => {
     const map = new Map<string, PagePathSparkline>()
-    if (sparklineData?.sparklines) {
-      for (const sparkline of sparklineData.sparklines) {
+    if (sparklines) {
+      for (const sparkline of sparklines) {
         map.set(sparkline.page_path, sparkline)
       }
     }
     return map
-  }, [sparklineData?.sparklines])
+  }, [sparklines])
 
   const handleRefresh = React.useCallback(async () => {
     setIsRefreshing(true)
     await refetch()
     setTimeout(() => setIsRefreshing(false), 1000)
   }, [refetch])
+
+  const insights = useMemo(
+    () => derivePagesInsights(pagePaths ?? []),
+    [pagePaths]
+  )
+
+  const aiContext = useMemo<AiInsightContext | undefined>(() => {
+    if (!pagePaths?.length) return undefined
+    return {
+      surface: 'top pages',
+      rangeStart: startDate?.toISOString(),
+      rangeEnd: endDate?.toISOString(),
+      stats: {
+        pages: pagePaths.slice(0, 10).map((p) => ({
+          path: p.page_path,
+          page_views: p.page_view_count,
+          sessions: p.session_count,
+          avg_time_seconds: p.avg_time_seconds ?? null,
+        })),
+      },
+    }
+  }, [pagePaths, startDate, endDate])
 
   if (error) {
     return (
@@ -107,91 +141,105 @@ export function Pages({
   }
 
   return (
-    <Card>
-      <CardHeader>
-        <div className="flex items-center justify-between">
-          <div>
-            <CardTitle>Pages</CardTitle>
-            <CardDescription>
-              {startDate && endDate
-                ? `${format(startDate, 'LLL dd, y')} - ${format(endDate, 'LLL dd, y')}`
-                : 'Page performance metrics'}
-            </CardDescription>
-          </div>
-          <div className="flex items-center gap-2">
-            {!isLoading && data && (
-              <Badge variant="secondary">
-                {data.page_paths?.length || 0} pages
-              </Badge>
-            )}
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={handleRefresh}
-              disabled={isLoading || isRefreshing}
-              className="gap-2"
-            >
-              <RefreshCw
-                className={`h-4 w-4 ${isLoading || isRefreshing ? 'animate-spin' : ''}`}
+    <div className="flex flex-col gap-4 sm:gap-6">
+      {insightsOpen && (
+        <InsightsPanel
+          insights={insights}
+          isLoading={isLoading}
+          aiContext={aiContext}
+          project={{ id: project.id, slug: project.slug, name: project.name }}
+        />
+      )}
+      <Card>
+        <CardHeader>
+          <div className="flex items-center justify-between">
+            <div>
+              <CardTitle>Pages</CardTitle>
+              <CardDescription>
+                {startDate && endDate
+                  ? `${format(startDate, 'LLL dd, y')} - ${format(endDate, 'LLL dd, y')}`
+                  : 'Page performance metrics'}
+              </CardDescription>
+            </div>
+            <div className="flex items-center gap-2">
+              {!isLoading && data && (
+                <Badge variant="secondary">
+                  {data.page_paths?.length || 0} pages
+                </Badge>
+              )}
+              <InsightsToggleButton
+                open={insightsOpen}
+                onToggle={setInsightsOpen}
               />
-              Refresh
-            </Button>
-          </div>
-        </div>
-      </CardHeader>
-      <CardContent className="p-0">
-        {isLoading ? (
-          <div className="divide-y">
-            {[...Array(5)].map((_, i) => (
-              <div
-                key={`page-skeleton-${i}`}
-                className="flex items-center gap-4 p-4"
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleRefresh}
+                disabled={isLoading || isRefreshing}
+                className="gap-2"
               >
-                {/* Page info skeleton — matches PageListItem layout */}
-                <div className="flex-1 min-w-0">
-                  <Skeleton
-                    className="h-4 mb-2"
-                    style={{ width: `${140 + (i % 3) * 40}px` }}
-                  />
-                  <div className="flex items-center gap-4">
-                    <Skeleton className="h-3 w-24" />
-                    <Skeleton className="h-3 w-16" />
-                  </div>
-                </div>
-                {/* Mini chart skeleton */}
-                <Skeleton className="w-24 h-10 rounded" />
-                {/* Trend icon skeleton */}
-                <Skeleton className="h-4 w-4 rounded-full" />
-              </div>
-            ))}
-          </div>
-        ) : !data?.page_paths || data.page_paths.length === 0 ? (
-          <div className="p-8">
-            <div className="flex flex-col items-center justify-center text-center">
-              <div className="h-12 w-12 rounded-full bg-muted flex items-center justify-center mb-4">
-                <FileText className="h-6 w-6 text-muted-foreground" />
-              </div>
-              <p className="text-sm font-medium">No page data found</p>
-              <p className="text-sm text-muted-foreground mt-1">
-                Page data will appear once users visit your application
-              </p>
+                <RefreshCw
+                  className={`h-4 w-4 ${isLoading || isRefreshing ? 'animate-spin' : ''}`}
+                />
+                Refresh
+              </Button>
             </div>
           </div>
-        ) : (
-          <div className="divide-y">
-            {data.page_paths.map((pageData) => (
-              <PageListItem
-                key={pageData.page_path}
-                pagePath={pageData.page_path}
-                sessions={pageData.session_count || 0}
-                avgTime={pageData.avg_time_seconds || 0}
-                project={project}
-                sparkline={sparklinesByPath.get(pageData.page_path)}
-              />
-            ))}
-          </div>
-        )}
-      </CardContent>
-    </Card>
+        </CardHeader>
+        <CardContent className="p-0">
+          {isLoading ? (
+            <div className="divide-y">
+              {[...Array(5)].map((_, i) => (
+                <div
+                  key={`page-skeleton-${i}`}
+                  className="flex items-center gap-4 p-4"
+                >
+                  {/* Page info skeleton — matches PageListItem layout */}
+                  <div className="flex-1 min-w-0">
+                    <Skeleton
+                      className="h-4 mb-2"
+                      style={{ width: `${140 + (i % 3) * 40}px` }}
+                    />
+                    <div className="flex items-center gap-4">
+                      <Skeleton className="h-3 w-24" />
+                      <Skeleton className="h-3 w-16" />
+                    </div>
+                  </div>
+                  {/* Mini chart skeleton */}
+                  <Skeleton className="w-24 h-10 rounded" />
+                  {/* Trend icon skeleton */}
+                  <Skeleton className="h-4 w-4 rounded-full" />
+                </div>
+              ))}
+            </div>
+          ) : !data?.page_paths || data.page_paths.length === 0 ? (
+            <div className="p-8">
+              <div className="flex flex-col items-center justify-center text-center">
+                <div className="h-12 w-12 rounded-full bg-muted flex items-center justify-center mb-4">
+                  <FileText className="h-6 w-6 text-muted-foreground" />
+                </div>
+                <p className="text-sm font-medium">No page data found</p>
+                <p className="text-sm text-muted-foreground mt-1">
+                  Page data will appear once users visit your application
+                </p>
+              </div>
+            </div>
+          ) : (
+            <div className="divide-y">
+              {data.page_paths.map((pageData) => (
+                <PageListItem
+                  key={pageData.page_path}
+                  pagePath={pageData.page_path}
+                  sessions={pageData.session_count || 0}
+                  avgTime={pageData.avg_time_seconds || 0}
+                  project={project}
+                  sparkline={sparklinesByPath.get(pageData.page_path)}
+                />
+              ))}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+    </div>
   )
 }

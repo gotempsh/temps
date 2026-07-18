@@ -4,6 +4,7 @@ use std::env::consts::{ARCH, OS};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::{debug, info};
 
 const GITHUB_RELEASES_API: &str = "https://api.github.com/repos/gotempsh/temps/releases";
@@ -66,6 +67,19 @@ impl UpgradeChannel {
         match self {
             Self::Stable => !release.prerelease,
             Self::Beta => true,
+        }
+    }
+
+    /// Infer the channel an *installed* binary is on from its version tag.
+    /// A prerelease tag (`v1.2.0-beta.4` — anything with a `-` after the
+    /// core version) means the host opted into beta at install/upgrade
+    /// time; a plain tag (`v1.2.0`) means stable. Used by the startup
+    /// update notifier, which has no `--channel` flag to consult.
+    pub fn for_installed_version(tag: &str) -> Self {
+        if tag.trim().trim_start_matches('v').contains('-') {
+            Self::Beta
+        } else {
+            Self::Stable
         }
     }
 }
@@ -568,6 +582,240 @@ pub fn current_version_tag() -> String {
     }
 
     version.to_string()
+}
+
+/// How long a single background update check may take before it's abandoned.
+const UPDATE_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Delay before the first startup check so it never competes with startup
+/// work (DB migrations, plugin init, proxy bind) for I/O or log attention.
+const UPDATE_CHECK_STARTUP_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Default re-check interval. Two hours stays comfortably below GitHub's
+/// unauthenticated API limit while surfacing releases promptly.
+const DEFAULT_UPDATE_CHECK_INTERVAL_HOURS: u64 = 2;
+const DEFAULT_UPDATE_CHECK_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(DEFAULT_UPDATE_CHECK_INTERVAL_HOURS * 60 * 60);
+const UPDATE_CHECK_INTERVAL_ENV: &str = "TEMPS_UPDATE_CHECK_INTERVAL_HOURS";
+const MIN_UPDATE_CHECK_INTERVAL_HOURS: u64 = 1;
+const MAX_UPDATE_CHECK_INTERVAL_HOURS: u64 = 168;
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+enum UpdateCheckIntervalError {
+    #[error("value '{value}' is not a whole number of hours")]
+    InvalidNumber { value: String },
+    #[error("{hours} hours is outside the supported range 1..=168")]
+    OutOfRange { hours: u64 },
+    #[error("value is not valid UTF-8")]
+    NotUnicode,
+}
+
+fn parse_update_check_interval_hours(value: &str) -> Result<u64, UpdateCheckIntervalError> {
+    let hours =
+        value
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| UpdateCheckIntervalError::InvalidNumber {
+                value: value.to_string(),
+            })?;
+    if !(MIN_UPDATE_CHECK_INTERVAL_HOURS..=MAX_UPDATE_CHECK_INTERVAL_HOURS).contains(&hours) {
+        return Err(UpdateCheckIntervalError::OutOfRange { hours });
+    }
+    Ok(hours)
+}
+
+pub fn configured_update_check_interval() -> std::time::Duration {
+    let configured_hours = match std::env::var(UPDATE_CHECK_INTERVAL_ENV) {
+        Ok(value) => match parse_update_check_interval_hours(&value) {
+            Ok(hours) => hours,
+            Err(error) => {
+                tracing::warn!(
+                    variable = UPDATE_CHECK_INTERVAL_ENV,
+                    value = %value,
+                    error = %error,
+                    default_hours = DEFAULT_UPDATE_CHECK_INTERVAL_HOURS,
+                    "Invalid update-check interval; using the default"
+                );
+                return DEFAULT_UPDATE_CHECK_INTERVAL;
+            }
+        },
+        Err(std::env::VarError::NotPresent) => DEFAULT_UPDATE_CHECK_INTERVAL_HOURS,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            let error = UpdateCheckIntervalError::NotUnicode;
+            tracing::warn!(
+                variable = UPDATE_CHECK_INTERVAL_ENV,
+                error = %error,
+                default_hours = DEFAULT_UPDATE_CHECK_INTERVAL_HOURS,
+                "Invalid update-check interval; using the default"
+            );
+            return DEFAULT_UPDATE_CHECK_INTERVAL;
+        }
+    };
+    let interval = std::time::Duration::from_secs(configured_hours * 60 * 60);
+    tracing::info!(
+        interval_hours = configured_hours,
+        variable = UPDATE_CHECK_INTERVAL_ENV,
+        "Release update-check cadence configured"
+    );
+    interval
+}
+
+/// A newer release the background notifier found for this install's channel.
+pub struct UpdateNotice {
+    pub current_version: String,
+    pub latest_version: String,
+    pub channel: UpgradeChannel,
+    /// GitHub release page (release notes) for the newer version.
+    pub release_url: String,
+}
+
+/// Prerelease identifier with semver §11 ordering: numeric identifiers
+/// compare numerically and rank below alphanumeric ones (`Num` before
+/// `Alpha` in the enum gives that via derived `Ord`).
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum PreIdent {
+    Num(u64),
+    Alpha(String),
+}
+
+/// Sort key for a `vMAJOR.MINOR.PATCH[-pre]` tag, ordered per semver:
+/// core version first, then "release beats prerelease" (the `bool`), then
+/// prerelease identifiers element-wise (a longer identifier list wins a
+/// shared prefix, which is exactly `Vec`'s derived ordering).
+type VersionSortKey = ((u64, u64, u64), bool, Vec<PreIdent>);
+
+/// Parse a tag into its ordering key. `None` when the tag isn't
+/// version-shaped — callers must treat that as "not comparable", never as
+/// older or newer.
+fn version_sort_key(tag: &str) -> Option<VersionSortKey> {
+    let v = tag.trim().trim_start_matches('v');
+    let (core, pre) = match v.split_once('-') {
+        Some((core, pre)) => (core, Some(pre)),
+        None => (v, None),
+    };
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let (is_release, idents) = match pre {
+        None => (true, Vec::new()),
+        Some(p) => (
+            false,
+            p.split('.')
+                .map(|ident| {
+                    ident
+                        .parse::<u64>()
+                        .map(PreIdent::Num)
+                        .unwrap_or_else(|_| PreIdent::Alpha(ident.to_string()))
+                })
+                .collect(),
+        ),
+    };
+    Some(((major, minor, patch), is_release, idents))
+}
+
+/// Is `candidate` strictly newer than `current`? Conservative by design:
+/// if either tag doesn't parse as a version, the answer is `false` — the
+/// notifier would rather stay silent than nag a dev build or a fork with
+/// exotic tags. This is deliberately stricter than `temps upgrade`, which
+/// treats any tag difference as upgradeable (including downgrades the
+/// operator explicitly pins with `--version`).
+fn is_newer_version(candidate: &str, current: &str) -> bool {
+    match (version_sort_key(candidate), version_sort_key(current)) {
+        (Some(candidate_key), Some(current_key)) => candidate_key > current_key,
+        _ => false,
+    }
+}
+
+/// One background update check: fetch the newest release on this install's
+/// channel and return a notice if it is strictly newer than the running
+/// binary. Every failure path (network, GitHub quota, unparsable tags)
+/// collapses to `None` with a debug log — the notifier is advisory and must
+/// never surface errors to an operator who didn't ask for a check.
+pub async fn check_for_newer_release() -> Option<UpdateNotice> {
+    let current_version = current_version_tag();
+    let channel = UpgradeChannel::for_installed_version(&current_version);
+
+    let release = match tokio::time::timeout(
+        UPDATE_CHECK_TIMEOUT,
+        fetch_latest_release_in_channel(channel),
+    )
+    .await
+    {
+        Ok(Ok(release)) => release,
+        Ok(Err(e)) => {
+            debug!(
+                "Update check on '{}' channel failed: {}",
+                channel.as_str(),
+                e
+            );
+            return None;
+        }
+        Err(_) => {
+            debug!(
+                "Update check on '{}' channel timed out after {:?}",
+                channel.as_str(),
+                UPDATE_CHECK_TIMEOUT
+            );
+            return None;
+        }
+    };
+
+    if is_newer_version(&release.tag_name, &current_version) {
+        Some(UpdateNotice {
+            current_version,
+            latest_version: release.tag_name,
+            channel,
+            release_url: release.html_url,
+        })
+    } else {
+        debug!(
+            "temps {} is up to date on '{}' channel (latest published: {})",
+            current_version,
+            channel.as_str(),
+            release.tag_name
+        );
+        None
+    }
+}
+
+/// Background task for `temps serve`: check for a newer release shortly
+/// after startup, then re-check at the configured interval. Each hit is published into the
+/// shared `UpdateStatusSlot`, which `GET /settings/update-status` serves so
+/// the web console can render an upgrade banner; a single WARN line covers
+/// headless/log-only operators. Never returns; the caller detaches it on a
+/// long-lived runtime.
+pub async fn update_notifier_loop(
+    slot: Arc<temps_core::UpdateStatusSlot>,
+    interval: std::time::Duration,
+) {
+    tokio::time::sleep(UPDATE_CHECK_STARTUP_DELAY).await;
+    loop {
+        if let Some(notice) = check_for_newer_release().await {
+            tracing::warn!(
+                current_version = %notice.current_version,
+                latest_version = %notice.latest_version,
+                channel = notice.channel.as_str(),
+                "A new temps release is available: {} -> {} ({} channel). \
+                 See {} or run `temps upgrade`.",
+                notice.current_version,
+                notice.latest_version,
+                notice.channel.as_str(),
+                temps_core::UPGRADE_DOCS_URL
+            );
+            slot.set(temps_core::AvailableUpdate {
+                current_version: notice.current_version,
+                latest_version: notice.latest_version,
+                channel: notice.channel.as_str().to_string(),
+                release_url: notice.release_url,
+                checked_at: chrono::Utc::now(),
+            });
+        }
+        tokio::time::sleep(interval).await;
+    }
 }
 
 /// Determine the platform target string matching release asset names.
@@ -1306,6 +1554,96 @@ mod tests {
         }
 
         version.to_string()
+    }
+
+    // ── Startup update notifier ──────────────────────────────────────────
+    //
+    // The notifier decides (a) which channel an installed binary tracks and
+    // (b) whether a published tag is strictly newer. Both rules are pinned
+    // here because a regression means either nagging stable hosts about
+    // betas or silently never telling anyone about releases.
+
+    #[test]
+    fn test_installed_channel_stable_for_plain_tag() {
+        assert_eq!(
+            UpgradeChannel::for_installed_version("v1.2.0"),
+            UpgradeChannel::Stable
+        );
+    }
+
+    #[test]
+    fn test_installed_channel_beta_for_prerelease_tag() {
+        assert_eq!(
+            UpgradeChannel::for_installed_version("v1.2.0-beta.4"),
+            UpgradeChannel::Beta
+        );
+        assert_eq!(
+            UpgradeChannel::for_installed_version("v1.2.0-rc.1"),
+            UpgradeChannel::Beta
+        );
+    }
+
+    #[test]
+    fn test_is_newer_version_core_ordering() {
+        assert!(is_newer_version("v0.2.0", "v0.1.9"));
+        assert!(is_newer_version("v1.0.0", "v0.9.9"));
+        assert!(is_newer_version("v0.1.10", "v0.1.9"));
+        assert!(!is_newer_version("v0.1.9", "v0.1.9"));
+        // Never flag a downgrade: a host running a newer (e.g. unreleased)
+        // version than the latest published tag must stay silent.
+        assert!(!is_newer_version("v0.1.8", "v0.1.9"));
+    }
+
+    #[test]
+    fn test_is_newer_version_prerelease_ordering() {
+        // Release beats its own prereleases…
+        assert!(is_newer_version("v1.0.0", "v1.0.0-beta.2"));
+        assert!(!is_newer_version("v1.0.0-beta.2", "v1.0.0"));
+        // …prereleases order among themselves numerically…
+        assert!(is_newer_version("v1.0.0-beta.10", "v1.0.0-beta.2"));
+        // …and a prerelease of the NEXT version beats the current release.
+        assert!(is_newer_version("v1.1.0-beta.1", "v1.0.0"));
+    }
+
+    #[test]
+    fn test_is_newer_version_unparsable_tags_stay_silent() {
+        // Fork/dev tags that aren't vX.Y.Z-shaped must never trigger the
+        // banner in either position.
+        assert!(!is_newer_version("nightly", "v1.0.0"));
+        assert!(!is_newer_version("v2.0.0", "local-dev"));
+        assert!(!is_newer_version("v1.2", "v1.1.0"));
+        assert!(!is_newer_version("v1.2.3.4", "v1.1.0"));
+    }
+
+    #[test]
+    fn test_update_check_interval_defaults_to_two_hours() {
+        assert_eq!(
+            DEFAULT_UPDATE_CHECK_INTERVAL,
+            std::time::Duration::from_secs(2 * 60 * 60)
+        );
+    }
+
+    #[test]
+    fn test_update_check_interval_parser_accepts_bounded_whole_hours() {
+        assert_eq!(parse_update_check_interval_hours("1"), Ok(1));
+        assert_eq!(parse_update_check_interval_hours(" 2 "), Ok(2));
+        assert_eq!(parse_update_check_interval_hours("168"), Ok(168));
+    }
+
+    #[test]
+    fn test_update_check_interval_parser_rejects_invalid_values() {
+        assert!(matches!(
+            parse_update_check_interval_hours("0"),
+            Err(UpdateCheckIntervalError::OutOfRange { hours: 0 })
+        ));
+        assert!(matches!(
+            parse_update_check_interval_hours("169"),
+            Err(UpdateCheckIntervalError::OutOfRange { hours: 169 })
+        ));
+        assert!(matches!(
+            parse_update_check_interval_hours("1.5"),
+            Err(UpdateCheckIntervalError::InvalidNumber { .. })
+        ));
     }
 
     // ── Channel logic ─────────────────────────────────────────────────────

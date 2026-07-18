@@ -55,6 +55,12 @@ pub struct AppState {
     /// case. Resolved once in `configure_routes` via
     /// `context.get_service::<dyn temps_core::ProjectAccessChecker>()`.
     pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+    /// Resolves the per-managed-domain public hostname strategy (Standard/Flat).
+    pub hostname_resolver: Arc<dyn temps_core::PublicHostnameResolver>,
+    /// Optional metrics store, present only when metrics collection is
+    /// enabled. Serves container CPU/memory history (written by the
+    /// container health monitor under `source_kind = container`).
+    pub metrics_store: Option<Arc<dyn temps_metrics::MetricsStore>>,
 }
 
 use crate::services::types::Deployment;
@@ -845,6 +851,31 @@ pub struct ContainerMetricsResponse {
     /// Timestamp of metrics collection
     #[schema(example = "2025-10-12T12:15:47.609192Z")]
     pub timestamp: String,
+}
+
+/// Query parameters for the container metrics history endpoint.
+#[derive(Deserialize, ToSchema, utoipa::IntoParams)]
+pub struct ContainerMetricsHistoryQuery {
+    /// Dotted metric name, e.g. `container.cpu_percent` or
+    /// `container.memory_used_bytes`.
+    pub metric: String,
+    /// Time window: `1h`, `6h`, `24h`, or `7d` (defaults to `1h`).
+    #[serde(default = "default_metrics_range")]
+    pub range: String,
+}
+
+fn default_metrics_range() -> String {
+    "1h".to_string()
+}
+
+/// One bucketed data point of a container resource metric time series.
+#[derive(Serialize, ToSchema)]
+pub struct ContainerMetricHistoryPoint {
+    /// Bucket timestamp (ISO 8601 with `Z` suffix).
+    #[schema(example = "2025-10-12T12:15:00+00:00")]
+    pub time: String,
+    /// Averaged metric value for the bucket.
+    pub value: f64,
 }
 
 /// Response indicating success of container state change

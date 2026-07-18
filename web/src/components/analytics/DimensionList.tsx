@@ -26,6 +26,13 @@ import { format } from 'date-fns'
 import { ArrowLeft, ChevronRight, Search } from 'lucide-react'
 import * as React from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
+import {
+  InsightsPanel,
+  InsightsToggleButton,
+  deriveBreakdownInsights,
+  useInsightsOpen,
+} from './insights'
+import type { AiInsightContext, BreakdownFlavor } from './insights'
 
 /**
  * Maximum rows fetched from the backend. The property-breakdown and
@@ -167,6 +174,26 @@ export function isDimensionKey(
   return !!value && value in DIMENSIONS
 }
 
+/** How each dimension's insights are narrated (see `deriveBreakdownInsights`). */
+const FLAVORS: Record<DimensionKey, BreakdownFlavor> = {
+  events: 'generic',
+  referrers: 'acquisition',
+  browsers: 'tech',
+  operating_systems: 'tech',
+  devices: 'tech',
+  countries: 'geo',
+  regions: 'geo',
+  cities: 'geo',
+  channels: 'acquisition',
+  languages: 'geo',
+  pages: 'content',
+  utm_source: 'acquisition',
+  utm_medium: 'acquisition',
+  utm_campaign: 'acquisition',
+  utm_term: 'acquisition',
+  utm_content: 'acquisition',
+}
+
 interface DimensionListProps {
   project: ProjectResponse
   dimension: DimensionKey
@@ -194,6 +221,7 @@ export function DimensionList({
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
   const [search, setSearch] = React.useState('')
+  const [insightsOpen, setInsightsOpen] = useInsightsOpen()
 
   /**
    * Only the `events` dimension currently has a per-value detail page
@@ -286,156 +314,199 @@ export function DimensionList({
 
   const reachedCap = rows.length >= MAX_ROWS
 
+  const insights = React.useMemo(
+    () =>
+      deriveBreakdownInsights({
+        rows,
+        singular: config.singular,
+        plural: config.plural,
+        flavor: FLAVORS[dimension],
+      }),
+    [rows, config.singular, config.plural, dimension]
+  )
+
+  const aiContext = React.useMemo<AiInsightContext | undefined>(() => {
+    if (rows.length === 0) return undefined
+    return {
+      surface: config.title.toLowerCase(),
+      rangeStart: startDate?.toISOString(),
+      rangeEnd: endDate?.toISOString(),
+      stats: {
+        unit: 'unique visitors',
+        [config.plural.replace(/\s+/g, '_')]: rows
+          .slice(0, 10)
+          .map((row) => ({ name: row.value, visitors: row.count })),
+      },
+    }
+  }, [rows, config.title, config.plural, startDate, endDate])
+
   return (
-    <Card>
-      <CardHeader>
-        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-          <div className="flex items-center gap-2">
-            <Button
-              variant="ghost"
-              size="icon"
-              className="h-7 w-7"
-              onClick={onBack}
-              aria-label="Back to overview"
-            >
-              <ArrowLeft className="h-4 w-4" />
-            </Button>
-            <div>
-              <CardTitle>{config.title}</CardTitle>
-              <CardDescription>
-                {startDate && endDate
-                  ? `${format(startDate, 'LLL dd, y')} - ${format(endDate, 'LLL dd, y')}`
-                  : 'Select a date range'}
-              </CardDescription>
+    <div className="flex flex-col gap-4 sm:gap-6">
+      {insightsOpen && (
+        <InsightsPanel
+          insights={insights}
+          isLoading={isLoading}
+          aiContext={aiContext}
+          project={{ id: project.id, slug: project.slug, name: project.name }}
+        />
+      )}
+      <Card>
+        <CardHeader>
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex items-center gap-2">
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-7 w-7"
+                onClick={onBack}
+                aria-label="Back to overview"
+              >
+                <ArrowLeft className="h-4 w-4" />
+              </Button>
+              <div>
+                <CardTitle>{config.title}</CardTitle>
+                <CardDescription>
+                  {startDate && endDate
+                    ? `${format(startDate, 'LLL dd, y')} - ${format(endDate, 'LLL dd, y')}`
+                    : 'Select a date range'}
+                </CardDescription>
+              </div>
+            </div>
+            <div className="flex w-full items-center gap-2 sm:w-auto">
+              <InsightsToggleButton
+                open={insightsOpen}
+                onToggle={setInsightsOpen}
+              />
+              <div className="relative w-full sm:w-[260px]">
+                <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  placeholder={`Filter ${config.plural}...`}
+                  className="pl-8"
+                />
+              </div>
             </div>
           </div>
-          <div className="relative w-full sm:w-[260px]">
-            <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-            <Input
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder={`Filter ${config.plural}...`}
-              className="pl-8"
-            />
-          </div>
-        </div>
-      </CardHeader>
-      <CardContent>
-        {isLoading ? (
-          <div className="space-y-2 py-4">
-            {[...Array(10)].map((_, i) => (
-              <div
-                key={`skel-${i}`}
-                className="flex items-center justify-between"
+        </CardHeader>
+        <CardContent>
+          {isLoading ? (
+            <div className="space-y-2 py-4">
+              {[...Array(10)].map((_, i) => (
+                <div
+                  key={`skel-${i}`}
+                  className="flex items-center justify-between"
+                >
+                  <div className="h-4 w-[200px] bg-muted animate-pulse rounded" />
+                  <div className="h-4 w-[100px] bg-muted animate-pulse rounded" />
+                </div>
+              ))}
+            </div>
+          ) : error ? (
+            <div className="flex flex-col items-center justify-center py-8 text-center">
+              <p className="text-sm text-muted-foreground mb-2">
+                Failed to load {config.plural}
+              </p>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => window.location.reload()}
               >
-                <div className="h-4 w-[200px] bg-muted animate-pulse rounded" />
-                <div className="h-4 w-[100px] bg-muted animate-pulse rounded" />
-              </div>
-            ))}
-          </div>
-        ) : error ? (
-          <div className="flex flex-col items-center justify-center py-8 text-center">
-            <p className="text-sm text-muted-foreground mb-2">
-              Failed to load {config.plural}
-            </p>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => window.location.reload()}
-            >
-              Try again
-            </Button>
-          </div>
-        ) : !filteredRows.length ? (
-          <div className="flex flex-col items-center justify-center py-12 text-center">
-            <p className="text-sm text-muted-foreground">
-              {rows.length === 0
-                ? 'No data available for the selected period'
-                : `No ${config.plural} match "${search}"`}
-            </p>
-          </div>
-        ) : (
-          <div className="overflow-x-auto">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead className="w-[60px] text-right">#</TableHead>
-                  <TableHead>{capitalize(config.singular)}</TableHead>
-                  <TableHead className="text-right">Visitors</TableHead>
-                  <TableHead className="text-right">Share</TableHead>
-                  <TableHead className="hidden md:table-cell w-[200px]" />
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {filteredRows.map((row, idx) => {
-                  const rank = rows.findIndex((r) => r.value === row.value) + 1
-                  const href = getRowHref(row.value)
-                  const clickable = !!href
-                  return (
-                    <TableRow
-                      key={`${row.value}-${idx}`}
-                      className={
-                        clickable ? 'cursor-pointer hover:bg-muted/50' : ''
-                      }
-                      onClick={(e) => {
-                        if (!href) return
-                        if (e.metaKey || e.ctrlKey) {
-                          window.open(href, '_blank')
-                        } else {
-                          navigate(href)
+                Try again
+              </Button>
+            </div>
+          ) : !filteredRows.length ? (
+            <div className="flex flex-col items-center justify-center py-12 text-center">
+              <p className="text-sm text-muted-foreground">
+                {rows.length === 0
+                  ? 'No data available for the selected period'
+                  : `No ${config.plural} match "${search}"`}
+              </p>
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead className="w-[60px] text-right">#</TableHead>
+                    <TableHead>{capitalize(config.singular)}</TableHead>
+                    <TableHead className="text-right">Visitors</TableHead>
+                    <TableHead className="text-right">Share</TableHead>
+                    <TableHead className="hidden md:table-cell w-[200px]" />
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {filteredRows.map((row, idx) => {
+                    const rank =
+                      rows.findIndex((r) => r.value === row.value) + 1
+                    const href = getRowHref(row.value)
+                    const clickable = !!href
+                    return (
+                      <TableRow
+                        key={`${row.value}-${idx}`}
+                        className={
+                          clickable ? 'cursor-pointer hover:bg-muted/50' : ''
                         }
-                      }}
-                    >
-                      <TableCell className="text-right text-muted-foreground tabular-nums">
-                        {rank}
-                      </TableCell>
-                      <TableCell className="font-medium break-all">
-                        <span className="inline-flex items-center gap-1">
-                          {row.value}
-                          {clickable && (
-                            <ChevronRight className="h-3 w-3 text-muted-foreground" />
-                          )}
-                        </span>
-                      </TableCell>
-                      <TableCell className="text-right font-mono tabular-nums">
-                        {row.count.toLocaleString()}
-                      </TableCell>
-                      <TableCell className="text-right tabular-nums text-muted-foreground">
-                        {row.percentage.toFixed(1)}%
-                      </TableCell>
-                      <TableCell className="hidden md:table-cell">
-                        <div className="relative h-2 bg-muted rounded-full overflow-hidden">
-                          <div
-                            className="absolute inset-y-0 left-0 bg-primary rounded-full"
-                            style={{
-                              width: `${Math.min(row.percentage, 100)}%`,
-                            }}
-                          />
-                        </div>
-                      </TableCell>
-                    </TableRow>
-                  )
-                })}
-              </TableBody>
-            </Table>
-          </div>
-        )}
-      </CardContent>
-      {!isLoading && !error && rows.length > 0 && (
-        <CardFooter className="flex-col items-start gap-1 text-sm">
-          <div className="leading-none text-muted-foreground">
-            Showing {filteredRows.length.toLocaleString()} of{' '}
-            {rows.length.toLocaleString()} {config.plural} by unique visitors
-          </div>
-          {reachedCap && (
-            <div className="leading-none text-xs text-muted-foreground">
-              Limited to top {MAX_ROWS} by the analytics API. Narrow the date
-              range to surface less-frequent {config.plural}.
+                        onClick={(e) => {
+                          if (!href) return
+                          if (e.metaKey || e.ctrlKey) {
+                            window.open(href, '_blank')
+                          } else {
+                            navigate(href)
+                          }
+                        }}
+                      >
+                        <TableCell className="text-right text-muted-foreground tabular-nums">
+                          {rank}
+                        </TableCell>
+                        <TableCell className="font-medium break-all">
+                          <span className="inline-flex items-center gap-1">
+                            {row.value}
+                            {clickable && (
+                              <ChevronRight className="h-3 w-3 text-muted-foreground" />
+                            )}
+                          </span>
+                        </TableCell>
+                        <TableCell className="text-right font-mono tabular-nums">
+                          {row.count.toLocaleString()}
+                        </TableCell>
+                        <TableCell className="text-right tabular-nums text-muted-foreground">
+                          {row.percentage.toFixed(1)}%
+                        </TableCell>
+                        <TableCell className="hidden md:table-cell">
+                          <div className="relative h-2 bg-muted rounded-full overflow-hidden">
+                            <div
+                              className="absolute inset-y-0 left-0 bg-primary rounded-full"
+                              style={{
+                                width: `${Math.min(row.percentage, 100)}%`,
+                              }}
+                            />
+                          </div>
+                        </TableCell>
+                      </TableRow>
+                    )
+                  })}
+                </TableBody>
+              </Table>
             </div>
           )}
-        </CardFooter>
-      )}
-    </Card>
+        </CardContent>
+        {!isLoading && !error && rows.length > 0 && (
+          <CardFooter className="flex-col items-start gap-1 text-sm">
+            <div className="leading-none text-muted-foreground">
+              Showing {filteredRows.length.toLocaleString()} of{' '}
+              {rows.length.toLocaleString()} {config.plural} by unique visitors
+            </div>
+            {reachedCap && (
+              <div className="leading-none text-xs text-muted-foreground">
+                Limited to top {MAX_ROWS} by the analytics API. Narrow the date
+                range to surface less-frequent {config.plural}.
+              </div>
+            )}
+          </CardFooter>
+        )}
+      </Card>
+    </div>
   )
 }
 

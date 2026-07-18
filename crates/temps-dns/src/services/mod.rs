@@ -14,6 +14,7 @@
 
 pub mod deployment_publisher;
 pub mod dns_registry;
+pub mod hostname_sync;
 pub mod provider_service;
 pub mod record_service;
 
@@ -22,7 +23,9 @@ pub use dns_registry::{
     ChangeSet, DnsRegistry, DnsRegistryError, EndpointDraft, OwnerKind, RecordType, ResolverHealth,
     StaleResolver, ZoneSnapshot,
 };
+pub use hostname_sync::{HostChange, HostnameModeResult, RecordChange};
 pub use provider_service::{
-    AddManagedDomainRequest, CreateProviderRequest, DnsProviderService, UpdateProviderRequest,
+    AddManagedDomainRequest, CreateProviderRequest, DnsProviderService, UpdateManagedDomainRequest,
+    UpdateProviderRequest,
 };
 pub use record_service::{DnsOperationResult, DnsRecordService, ManualDnsInstructions};

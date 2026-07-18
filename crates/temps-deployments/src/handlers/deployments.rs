@@ -24,17 +24,18 @@ use temps_auth::RequireAuth;
 use temps_auth::{
     permission_guard, project_access_guard, project_permission_guard, project_scope_guard,
 };
-use temps_core::{AuditContext, RequestMetadata};
+use temps_core::{AppSettings, AuditContext, PublicHostnameStrategy, RequestMetadata};
 use tracing::{debug, error, info, warn};
 use utoipa::OpenApi;
 
 use crate::handlers::types::{
     ActivityDay, ActivityGraphQuery, ActivityGraphResponse, ContainerActionResponse,
     ContainerDetailResponse, ContainerInfoResponse, ContainerListResponse, ContainerLogsQuery,
-    ContainerMetricsResponse, DeploymentContainerLogContentResponse,
-    DeploymentContainerLogResponse, DeploymentContainerLogsListResponse, DeploymentJobResponse,
-    DeploymentJobsResponse, DeploymentListResponse, DeploymentResponse, DeploymentStateResponse,
-    EnvVarResponse, PromoteDeploymentRequest, ResourceLimitsResponse,
+    ContainerMetricHistoryPoint, ContainerMetricsHistoryQuery, ContainerMetricsResponse,
+    DeploymentContainerLogContentResponse, DeploymentContainerLogResponse,
+    DeploymentContainerLogsListResponse, DeploymentJobResponse, DeploymentJobsResponse,
+    DeploymentListResponse, DeploymentResponse, DeploymentStateResponse, EnvVarResponse,
+    PromoteDeploymentRequest, ResourceLimitsResponse,
 };
 use temps_core::problemdetails;
 use temps_core::problemdetails::Problem;
@@ -54,6 +55,37 @@ use temps_core::problemdetails::Problem;
 // defence-in-depth measure for the ADR-028 Phase B rollout. Adding the guard
 // to every handler in this file would be redundant noise: the token is already
 // rejected by the earlier `permission_guard!` call.
+fn public_url_for_hostname(settings: &AppSettings, hostname: &str) -> String {
+    let (protocol, port) = if let Some(ref external_url) = settings.external_url {
+        if let Ok(parsed) = url::Url::parse(external_url) {
+            (parsed.scheme().to_string(), parsed.port())
+        } else if external_url.starts_with("http://") {
+            ("http".to_string(), None)
+        } else {
+            ("https".to_string(), None)
+        }
+    } else {
+        ("https".to_string(), None)
+    };
+
+    let port =
+        port.filter(|p| !((protocol == "https" && *p == 443) || (protocol == "http" && *p == 80)));
+
+    match port {
+        Some(port) => format!("{}://{}:{}", protocol, hostname, port),
+        None => format!("{}://{}", protocol, hostname),
+    }
+}
+
+fn public_service_url(
+    settings: &AppSettings,
+    strategy: PublicHostnameStrategy,
+    environment: &str,
+    service: &str,
+) -> String {
+    let hostname = strategy.service_hostname(&settings.preview_domain, environment, service);
+    public_url_for_hostname(settings, &hostname)
+}
 
 #[derive(OpenApi)]
 #[openapi(
@@ -81,6 +113,7 @@ use temps_core::problemdetails::Problem;
         start_container,
         restart_container,
         get_container_metrics,
+        get_container_metrics_history,
         stream_container_metrics,
         get_activity_graph
     ),
@@ -98,6 +131,8 @@ use temps_core::problemdetails::Problem;
         EnvVarResponse,
         ResourceLimitsResponse,
         ContainerMetricsResponse,
+        ContainerMetricsHistoryQuery,
+        ContainerMetricHistoryPoint,
         ContainerActionResponse,
         ActivityGraphQuery,
         ActivityGraphResponse,
@@ -224,6 +259,10 @@ pub fn configure_routes() -> Router<Arc<super::types::AppState>> {
         .route(
             "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/metrics",
             get(get_container_metrics),
+        )
+        .route(
+            "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/metrics/history",
+            get(get_container_metrics_history),
         )
         .route(
             "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/metrics/stream",
@@ -877,28 +916,10 @@ pub async fn list_containers(
         .await
         .ok()
         .flatten();
-    let preview_domain = settings_row
+    let app_settings = settings_row
         .as_ref()
-        .and_then(|s| {
-            s.data
-                .get("preview_domain")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        })
-        .unwrap_or_else(|| "localho.st".to_string());
-    // Derive the URL scheme from external_url so HTTP-only installs
-    // (sslip.io quick/local modes) don't emit dead https:// links.
-    let url_scheme = settings_row
-        .as_ref()
-        .and_then(|s| s.data.get("external_url").and_then(|v| v.as_str()))
-        .map(|u| {
-            if u.starts_with("http://") {
-                "http"
-            } else {
-                "https"
-            }
-        })
-        .unwrap_or("https");
+        .map(|s| AppSettings::from_json(s.data.clone()))
+        .unwrap_or_default();
 
     let env_subdomain = temps_entities::environments::Entity::find_by_id(environment_id)
         .one(state.db.as_ref())
@@ -906,6 +927,13 @@ pub async fn list_containers(
         .ok()
         .flatten()
         .map(|e| e.subdomain);
+
+    // Resolve the hostname strategy for this instance's preview domain once,
+    // before the synchronous response-building closure below.
+    let hostname_strategy = state
+        .hostname_resolver
+        .strategy_for(&app_settings.preview_domain)
+        .await;
 
     // Read public_ports from project's preset_config
     let public_ports: Vec<temps_entities::preset::ComposePublicPort> =
@@ -935,15 +963,9 @@ pub async fn list_containers(
                 if !is_public {
                     return None;
                 }
-                env_subdomain.as_ref().map(|sub| {
-                    let label = format!("{}-{}", svc, sub);
-                    let label = if label.len() > 63 {
-                        label[..63].trim_end_matches('-').to_string()
-                    } else {
-                        label
-                    };
-                    format!("{}://{}.{}", url_scheme, label, preview_domain)
-                })
+                env_subdomain
+                    .as_ref()
+                    .map(|sub| public_service_url(&app_settings, hostname_strategy, sub, svc))
             });
             ContainerInfoResponse::from_info(info, node_name, service_name, service_url)
         })
@@ -1685,26 +1707,10 @@ pub async fn get_container_detail(
                 .await
                 .ok()
                 .flatten();
-            let preview_domain = settings_row2
+            let app_settings = settings_row2
                 .as_ref()
-                .and_then(|s| {
-                    s.data
-                        .get("preview_domain")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                })
-                .unwrap_or_else(|| "localho.st".to_string());
-            let url_scheme2 = settings_row2
-                .as_ref()
-                .and_then(|s| s.data.get("external_url").and_then(|v| v.as_str()))
-                .map(|u| {
-                    if u.starts_with("http://") {
-                        "http"
-                    } else {
-                        "https"
-                    }
-                })
-                .unwrap_or("https");
+                .map(|s| AppSettings::from_json(s.data.clone()))
+                .unwrap_or_default();
 
             let env_subdomain = temps_entities::environments::Entity::find_by_id(environment_id)
                 .one(state.db.as_ref())
@@ -1713,15 +1719,13 @@ pub async fn get_container_detail(
                 .flatten()
                 .map(|e| e.subdomain);
 
-            env_subdomain.map(|sub| {
-                let label = format!("{}-{}", svc_name, sub);
-                let label = if label.len() > 63 {
-                    label[..63].trim_end_matches('-').to_string()
-                } else {
-                    label
-                };
-                format!("{}://{}.{}", url_scheme2, label, preview_domain)
-            })
+            let hostname_strategy = state
+                .hostname_resolver
+                .strategy_for(&app_settings.preview_domain)
+                .await;
+
+            env_subdomain
+                .map(|sub| public_service_url(&app_settings, hostname_strategy, &sub, svc_name))
         } else {
             None
         }
@@ -1967,6 +1971,93 @@ pub async fn get_container_metrics(
         network_tx_bytes: stats.network_tx_bytes,
         timestamp: stats.timestamp.to_rfc3339(),
     };
+
+    Ok(Json(response).into_response())
+}
+
+/// Fetch a time-series range for a single container resource metric
+/// (recorded by the container health monitor every ~30s).
+///
+/// Useful metric names: `container.cpu_percent`,
+/// `container.cpu_utilization_percent`, `container.memory_used_bytes`,
+/// `container.memory_percent`, `container.network_rx_bytes_delta`,
+/// `container.network_tx_bytes_delta`.
+#[utoipa::path(
+    tag = "Containers",
+    get,
+    path = "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/metrics/history",
+    operation_id = "ContainerMetricsGetHistory",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("environment_id" = i32, Path, description = "Environment ID"),
+        ("container_id" = String, Path, description = "Container ID"),
+        ContainerMetricsHistoryQuery,
+    ),
+    responses(
+        (status = 200, description = "Metric time series data points", body = Vec<ContainerMetricHistoryPoint>),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Container not found"),
+        (status = 503, description = "Metrics store not available"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_container_metrics_history(
+    State(state): State<Arc<AppState>>,
+    Path((project_id, environment_id, container_id)): Path<(i32, i32, String)>,
+    Query(params): Query<ContainerMetricsHistoryQuery>,
+    RequireAuth(auth): RequireAuth,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, EnvironmentsRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
+
+    let store = state.metrics_store.as_ref().ok_or_else(|| {
+        problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+            .with_title("Metrics Unavailable")
+            .with_detail("Metric collection is not enabled on this server")
+    })?;
+
+    // Resolves the docker container ID to its `deployment_containers` row and
+    // verifies it belongs to this project/environment (404 otherwise).
+    let (container, _) = state
+        .deployment_service
+        .get_container_detail(project_id, environment_id, container_id.clone())
+        .await?;
+
+    let (window, step) = temps_metrics::range_to_step(&params.range);
+    let now = chrono::Utc::now();
+
+    let query = temps_metrics::RangeQuery {
+        source_kind: temps_metrics::SourceKind::Container,
+        source_id: container.id,
+        monotonic: temps_metrics::is_monotonic_counter(&params.metric),
+        name: params.metric.clone(),
+        from: now - window,
+        to: now,
+        step,
+    };
+
+    let points = store.query_range(query).await.map_err(|e| {
+        error!(
+            project_id,
+            environment_id,
+            container_id = %container_id,
+            metric = %params.metric,
+            error = %e,
+            "Failed to query container metric range"
+        );
+        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Internal Server Error")
+            .with_detail(format!("Failed to query metrics: {}", e))
+    })?;
+
+    let response: Vec<ContainerMetricHistoryPoint> = points
+        .into_iter()
+        .map(|(ts, v)| ContainerMetricHistoryPoint {
+            time: ts.to_rfc3339(),
+            value: v,
+        })
+        .collect();
 
     Ok(Json(response).into_response())
 }
@@ -3361,6 +3452,9 @@ mod tests {
             ),
             deployment_gate: None,
             project_access_checker: None,
+            hostname_resolver: Arc::new(temps_core::StandardHostnameResolver)
+                as Arc<dyn temps_core::PublicHostnameResolver>,
+            metrics_store: None,
         })
     }
 

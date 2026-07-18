@@ -14,6 +14,8 @@ use tokio_postgres::{Client, NoTls, Row};
 use tokio_postgres_rustls::MakeRustlsConnect;
 use tracing::{debug, error, warn};
 
+const FILTER_WHERE_PLACEHOLDER: &str = "status = 'active' AND created_at > '2025-01-01'";
+
 /// Escape a SQL identifier by doubling any internal double-quote characters.
 /// Prevents identifier injection when used inside `"..."` quoting.
 fn escape_ident(name: &str) -> String {
@@ -69,6 +71,17 @@ pub struct PostgresSource {
 }
 
 impl PostgresSource {
+    fn starts_with_sql_keyword(input: &str, keyword: &str) -> bool {
+        let Some(rest) = input.trim_start().strip_prefix(keyword) else {
+            return false;
+        };
+
+        match rest.chars().next() {
+            None => true,
+            Some(c) => !(c.is_ascii_alphanumeric() || c == '_' || c == '$' || !c.is_ascii()),
+        }
+    }
+
     /// Create a new PostgreSQL data source
     pub async fn connect(
         host: &str,
@@ -202,34 +215,169 @@ pub async fn connect_with_self_signed_tls(
 }
 
 impl PostgresSource {
-    /// Strip SQL string literals to avoid false positives when scanning for dangerous patterns.
-    /// Replaces content inside single-quoted strings with empty strings.
-    fn strip_sql_string_literals(sql: &str) -> String {
-        let mut result = String::with_capacity(sql.len());
-        let mut in_string = false;
-        let mut chars = sql.chars().peekable();
+    /// Return the byte length of a PostgreSQL dollar-quote delimiter at the
+    /// start of `sql`. Tags follow unquoted identifier rules, except that `$`
+    /// is not permitted inside the tag.
+    fn dollar_quote_delimiter_len(sql: &str) -> Option<usize> {
+        let after_dollar = sql.strip_prefix('$')?;
+        if after_dollar.starts_with('$') {
+            return Some(2);
+        }
 
-        while let Some(c) = chars.next() {
-            if in_string {
-                if c == '\'' {
-                    // Check for escaped quote ('')
-                    if chars.peek() == Some(&'\'') {
-                        chars.next(); // skip the escaped quote
-                    } else {
-                        in_string = false;
-                        result.push('\'');
-                    }
-                }
-                // Skip characters inside string literals
-            } else if c == '\'' {
-                in_string = true;
-                result.push('\'');
-            } else {
-                result.push(c);
+        let mut chars = after_dollar.char_indices();
+        let (_, first) = chars.next()?;
+        // PostgreSQL accepts any high-bit character in an unquoted identifier,
+        // including characters Rust does not classify as alphabetic.
+        if !(first == '_' || first.is_ascii_alphabetic() || !first.is_ascii()) {
+            return None;
+        }
+
+        for (index, character) in chars {
+            if character == '$' {
+                return Some(1 + index + character.len_utf8());
+            }
+            if !(character == '_' || character.is_ascii_alphanumeric() || !character.is_ascii()) {
+                return None;
             }
         }
 
-        result
+        None
+    }
+
+    /// Strip SQL string literals to avoid false positives when scanning for dangerous patterns.
+    /// Replaces content inside single-quoted strings with empty strings while
+    /// honoring PostgreSQL `E'...'` escapes and dollar-quoted strings.
+    /// Ambiguous backslash-escaped quotes in ordinary strings are rejected so
+    /// validation is independent of the server's `standard_conforming_strings`
+    /// setting.
+    fn strip_sql_string_literals(sql: &str) -> Result<String> {
+        let mut result = String::with_capacity(sql.len());
+        let mut position = 0;
+
+        while position < sql.len() {
+            let remaining = &sql[position..];
+
+            let at_token_boundary = sql[..position].chars().next_back().is_none_or(|previous| {
+                !(previous.is_ascii_alphanumeric()
+                    || previous == '_'
+                    || previous == '$'
+                    || !previous.is_ascii())
+            });
+            if let Some(delimiter_len) = at_token_boundary
+                .then(|| Self::dollar_quote_delimiter_len(remaining))
+                .flatten()
+            {
+                let delimiter = &remaining[..delimiter_len];
+                let content = &remaining[delimiter_len..];
+                let closing_offset = content.find(delimiter).ok_or_else(|| {
+                    DataError::InvalidQuery(
+                        "Unterminated dollar-quoted string in WHERE clause".to_string(),
+                    )
+                })?;
+                result.push_str("''");
+                position += delimiter_len + closing_offset + delimiter_len;
+                continue;
+            }
+
+            let Some(character) = remaining.chars().next() else {
+                break;
+            };
+            if character == '"' {
+                position += character.len_utf8();
+                let mut terminated = false;
+                while position < sql.len() {
+                    let identifier_remaining = &sql[position..];
+                    let Some(identifier_char) = identifier_remaining.chars().next() else {
+                        break;
+                    };
+                    position += identifier_char.len_utf8();
+                    if identifier_char == '"' {
+                        if sql[position..].starts_with('"') {
+                            position += '"'.len_utf8();
+                        } else {
+                            terminated = true;
+                            break;
+                        }
+                    }
+                }
+
+                if !terminated {
+                    return Err(DataError::InvalidQuery(
+                        "Unterminated quoted identifier in WHERE clause".to_string(),
+                    ));
+                }
+                // Keep a quoted-identifier placeholder so `"function"(...)`
+                // is still recognized as a forbidden function call.
+                result.push_str("\"\"");
+                continue;
+            }
+            if character != '\'' {
+                result.push(character);
+                position += character.len_utf8();
+                continue;
+            }
+
+            let prefix = &sql[..position];
+            let escape_string = (prefix.ends_with('e') || prefix.ends_with('E'))
+                && prefix[..prefix.len() - 1]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|previous| {
+                        !(previous.is_ascii_alphanumeric()
+                            || previous == '_'
+                            || previous == '$'
+                            || !previous.is_ascii())
+                    });
+            result.push('\'');
+            position += character.len_utf8();
+            let mut terminated = false;
+
+            while position < sql.len() {
+                let string_remaining = &sql[position..];
+                let Some(string_char) = string_remaining.chars().next() else {
+                    break;
+                };
+                position += string_char.len_utf8();
+
+                if string_char == '\\' {
+                    if escape_string {
+                        let Some(escaped) = sql[position..].chars().next() else {
+                            return Err(DataError::InvalidQuery(
+                                "Unterminated escape sequence in WHERE clause string literal"
+                                    .to_string(),
+                            ));
+                        };
+                        position += escaped.len_utf8();
+                        continue;
+                    }
+
+                    if sql[position..].starts_with('\'') {
+                        return Err(DataError::InvalidQuery(
+                            "Backslash-escaped quotes require an explicit PostgreSQL E string"
+                                .to_string(),
+                        ));
+                    }
+                }
+
+                if string_char == '\'' {
+                    if sql[position..].starts_with('\'') {
+                        position += '\''.len_utf8();
+                    } else {
+                        result.push('\'');
+                        terminated = true;
+                        break;
+                    }
+                }
+            }
+
+            if !terminated {
+                return Err(DataError::InvalidQuery(
+                    "Unterminated string literal in WHERE clause".to_string(),
+                ));
+            }
+        }
+
+        Ok(result)
     }
 
     /// Validate that a sort_by field name is a safe SQL identifier.
@@ -281,16 +429,18 @@ impl PostgresSource {
     /// patterns while structural checks block injection vectors like subqueries,
     /// UNION, and function calls that could bypass simple pattern matching.
     fn validate_sql(sql: &str) -> Result<()> {
-        let sql_lower = sql.trim().to_lowercase();
+        let sql_trimmed = sql.trim();
 
-        if sql_lower.is_empty() {
+        if sql_trimmed.is_empty() {
             return Err(DataError::InvalidQuery(
                 "WHERE clause cannot be empty".to_string(),
             ));
         }
 
         // Strip string literals to avoid false positives on content inside quotes
-        let without_strings = Self::strip_sql_string_literals(&sql_lower);
+        // Lex case-sensitive dollar tags and quoted identifiers before
+        // lowercasing the remaining SQL for keyword comparisons.
+        let without_strings = Self::strip_sql_string_literals(sql_trimmed)?.to_lowercase();
 
         // STRUCTURAL CHECKS: Block injection vectors that denylist alone cannot catch
 
@@ -301,26 +451,76 @@ impl PostgresSource {
             ));
         }
 
-        // Prevent subqueries via parenthesized SELECT
-        // This blocks: (SELECT ...), EXISTS (SELECT ...), IN (SELECT ...)
+        // Prevent subqueries through every parenthesized PostgreSQL query form.
         if without_strings.contains('(') {
-            // Allow simple IN lists like: id IN (1, 2, 3) but block any subqueries
-            // by checking if SELECT appears after any opening paren
-            let paren_content_has_select = without_strings.match_indices('(').any(|(idx, _)| {
-                let after_paren = &without_strings[idx..];
-                // Check if there's a SELECT between this ( and its matching )
-                after_paren
-                    .find(')')
-                    .map(|close_idx| {
-                        let inner = &after_paren[1..close_idx];
-                        inner.contains("select")
-                    })
-                    .unwrap_or(false)
-            });
-            if paren_content_has_select {
+            // PostgreSQL query expressions can start with SELECT, TABLE,
+            // VALUES, or WITH. `IN (TABLE private_ids)` is a valid subquery and
+            // must not be mistaken for a simple IN-list. Check every opening
+            // parenthesis because query expressions can be nested in grouping
+            // parentheses. Keyword boundaries avoid rejecting quoted columns
+            // such as `"table"` or identifiers such as `selected_id`.
+            const QUERY_EXPRESSION_STARTERS: [&str; 4] = ["select", "table", "values", "with"];
+            let paren_starts_query_expression =
+                without_strings.match_indices('(').any(|(idx, _)| {
+                    let after_paren = &without_strings[idx + 1..];
+                    QUERY_EXPRESSION_STARTERS
+                        .iter()
+                        .any(|keyword| Self::starts_with_sql_keyword(after_paren, keyword))
+                });
+            if paren_starts_query_expression {
                 return Err(DataError::InvalidQuery(
                     "Subqueries are not allowed in the data browser".to_string(),
                 ));
+            }
+
+            // Block function-call syntax. A keyword denylist cannot be complete:
+            // data-returning functions such as query_to_xml/database_to_xml/
+            // table_to_xml take their SQL payload as a *string literal*, which is
+            // stripped before the denylist runs, so `1=1 AND query_to_xml('select
+            // ... from users', true, false, '') IS NOT NULL` slips through and
+            // exfiltrates other tables. Reject any identifier immediately
+            // preceding `(` (i.e. a function call); only grouping parens and
+            // `IN (...)`/`AND (...)`/`OR (...)`/`NOT (...)` are permitted. This
+            // blocks explicit function-call syntax; PostgreSQL operators and
+            // casts remain available to ordinary WHERE expressions.
+            const PAREN_ALLOWED_PREFIXES: [&str; 4] = ["in", "and", "or", "not"];
+            for (idx, _) in without_strings.match_indices('(') {
+                let preceding = without_strings[..idx].trim_end();
+
+                // A closing double quote immediately before `(` terminates a
+                // quoted PostgreSQL identifier. A closing single quote can
+                // occur here after string stripping when a Unicode-escaped
+                // identifier uses PostgreSQL's optional `UESCAPE 'x'` clause.
+                // Both forms are function calls. Do not allow quoted versions
+                // of IN/AND/OR/NOT: quoted names are identifiers, never SQL
+                // keywords.
+                if matches!(preceding.chars().last(), Some('"' | '\'')) {
+                    return Err(DataError::InvalidQuery(
+                        "Function calls are not allowed in the data browser".to_string(),
+                    ));
+                }
+
+                // PostgreSQL permits `$` and non-ASCII characters in unquoted
+                // identifier continuations. Include them here so identifiers
+                // such as `evil$function(...)` and `fünction(...)` cannot evade
+                // the function-call check.
+                let ident_rev: String = preceding
+                    .chars()
+                    .rev()
+                    .take_while(|c| {
+                        c.is_ascii_alphanumeric() || *c == '_' || *c == '$' || !c.is_ascii()
+                    })
+                    .collect();
+                let ident: String = ident_rev.chars().rev().collect();
+                let before_ident = preceding[..preceding.len() - ident.len()].trim_end();
+                let is_qualified = before_ident.ends_with('.');
+                if !ident.is_empty()
+                    && (is_qualified || !PAREN_ALLOWED_PREFIXES.contains(&ident.as_str()))
+                {
+                    return Err(DataError::InvalidQuery(
+                        "Function calls are not allowed in the data browser".to_string(),
+                    ));
+                }
             }
         }
 
@@ -1290,7 +1490,7 @@ impl temps_query::QuerySchemaProvider for PostgresSource {
                     ],
                     // UI hints embedded as custom properties
                     "x-ui-widget": "textarea",
-                    "x-ui-placeholder": "status = 'active' AND created_at > NOW() - INTERVAL '7 days'",
+                    "x-ui-placeholder": FILTER_WHERE_PLACEHOLDER,
                     "x-ui-rows": 3
                 }
             },
@@ -1348,6 +1548,11 @@ impl temps_query::QuerySchemaProvider for PostgresSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use testcontainers::{
+        core::{ContainerPort, WaitFor},
+        runners::AsyncRunner,
+        GenericImage, ImageExt,
+    };
 
     #[test]
     fn test_pg_type_mapping() {
@@ -1460,6 +1665,20 @@ mod tests {
     }
 
     #[test]
+    fn test_sql_injection_alternate_query_expression_subqueries() {
+        assert_sql_rejected("7 IN (TABLE private_ids)");
+        assert_sql_rejected("7 in (\nTaBlE\tprivate_ids)");
+        assert_sql_rejected("7 IN ((TABLE private_ids))");
+        assert_sql_rejected("7 IN (VALUES (7))");
+        assert_sql_rejected("7 IN (WITH ids AS (TABLE private_ids) TABLE ids)");
+
+        // Token boundaries must not reject ordinary identifiers that merely
+        // contain a query-expression keyword.
+        assert_sql_allowed("selected_id IN (1, 2)");
+        assert_sql_allowed("\"table\" IN (1, 2)");
+    }
+
+    #[test]
     fn test_sql_injection_drop_table() {
         assert_sql_rejected("1=1; DROP TABLE users");
         assert_sql_rejected("drop table users");
@@ -1535,6 +1754,228 @@ mod tests {
     #[test]
     fn test_sql_injection_set_config() {
         assert_sql_rejected("set_config('log_statement', 'all', false)");
+    }
+
+    // Regression for security review finding #4: data-returning functions carry
+    // their SQL payload inside a string literal, which is stripped before the
+    // denylist runs — so these were NOT on the denylist and slipped through.
+    // The structural "no function calls" rule blocks the whole class.
+    #[test]
+    fn test_sql_injection_xml_function_exfiltration() {
+        assert_sql_rejected(
+            "1=1 AND query_to_xml('select * from users', true, false, '') IS NOT NULL",
+        );
+        assert_sql_rejected("database_to_xml(true, false, '') IS NOT NULL");
+        assert_sql_rejected("table_to_xml('users', true, false, '') IS NOT NULL");
+    }
+
+    #[test]
+    fn test_escape_string_cannot_hide_function_call() {
+        assert_sql_rejected(
+            r"E'x\'' IS NOT NULL AND query_to_xml('select secret from private_secrets', true, false, '')::text LIKE '%synthetic-secret%'",
+        );
+        assert_sql_allowed(r"name = E'O\'Brien'");
+        assert_sql_rejected(r"name = 'O\'Brien'");
+        assert_sql_rejected("name = 'unterminated");
+    }
+
+    #[test]
+    fn test_dollar_quoted_string_cannot_hide_function_call() {
+        assert_sql_rejected(
+            "$tag$'$tag$ IS NOT NULL AND query_to_xml('select secret from private_secrets', true, false, '')::text LIKE '%synthetic-secret%' AND $tail$'$tail$ IS NOT NULL",
+        );
+        assert_sql_allowed("name = $$O'Brien$$");
+        assert_sql_allowed("name = $person$O'Brien$person$");
+        assert_sql_allowed("name = $Tag$O'Brien$Tag$");
+        assert_sql_rejected("name = $Tag$O'Brien$tag$");
+        assert_sql_allowed("name = $💣$O'Brien$💣$");
+        assert_sql_rejected("name = $💣$unterminated");
+        assert_sql_allowed("identifier$tag$ = 1");
+        assert_sql_rejected("name = $person$unterminated");
+    }
+
+    #[test]
+    fn test_quoted_identifier_cannot_hide_function_call() {
+        assert_sql_rejected(
+            "\"'\" IS NOT NULL AND query_to_xml('select secret from private_secrets', true, false, '')::text LIKE '%synthetic-secret%' AND \"'\" IS NOT NULL",
+        );
+        assert_sql_allowed("\"O'Brien\" = 1");
+        assert_sql_allowed("U&\"O\\0027Brien\" = 1");
+        assert_sql_allowed("\"contains \"\"quote\"\"\" = 1");
+        assert_sql_rejected("\"unterminated = 1");
+    }
+
+    #[test]
+    fn test_sql_injection_quoted_function_identifier_exfiltration() {
+        // PostgreSQL allows function identifiers to be quoted and optionally
+        // schema-qualified. The closing quote must still be recognized as a
+        // function-call prefix.
+        assert_sql_rejected(
+            "1=1 AND \"query_to_xml\"('select * from users', true, false, '') IS NOT NULL",
+        );
+        assert_sql_rejected(
+            "pg_catalog.\"query_to_xml\"('select * from users', true, false, '') IS NOT NULL",
+        );
+        assert_sql_rejected(
+            "\"pg_catalog\".\"query_to_xml\"('select * from users', true, false, '') IS NOT NULL",
+        );
+        assert_sql_rejected(
+            "U&\"query_to_xml\" UESCAPE '!'('select * from users', true, false, '') IS NOT NULL",
+        );
+        assert_sql_rejected(
+            "pg_catalog.U&\"query_to_xml\" UESCAPE '!'('select * from users', true, false, '') IS NOT NULL",
+        );
+        assert_sql_rejected("\"length\"(password) > 0");
+    }
+
+    #[test]
+    fn test_sql_injection_postgres_identifier_characters_before_call() {
+        // PostgreSQL accepts `$` and non-ASCII bytes after the first identifier
+        // character. They must not turn the extracted prefix into an empty or
+        // partial identifier.
+        assert_sql_rejected("evil$function(secret) IS NOT NULL");
+        assert_sql_rejected("fünction(secret) IS NOT NULL");
+    }
+
+    #[test]
+    fn test_sql_injection_qualified_grouping_keyword_function_calls() {
+        // These final identifiers are allowed only as SQL grouping keywords.
+        // Once schema-qualified, PostgreSQL parses them as function names.
+        assert_sql_rejected("public.in()");
+        assert_sql_rejected("public.and()");
+        assert_sql_rejected("public.or()");
+        assert_sql_rejected("public.not()");
+        assert_sql_rejected("public . in ()");
+    }
+
+    #[test]
+    fn test_filter_placeholder_obeys_no_function_call_contract() {
+        assert_sql_allowed(FILTER_WHERE_PLACEHOLDER);
+        assert_sql_rejected("created_at > NOW() - INTERVAL '7 days'");
+    }
+
+    #[tokio::test]
+    async fn test_quoted_function_identifier_rejected_by_real_query_paths() {
+        let container = match GenericImage::new("postgres", "18-alpine")
+            .with_exposed_port(ContainerPort::Tcp(5432))
+            .with_wait_for(WaitFor::message_on_stderr(
+                "database system is ready to accept connections",
+            ))
+            .with_env_var("POSTGRES_DB", "postgres")
+            .with_env_var("POSTGRES_USER", "postgres")
+            .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+            .start()
+            .await
+        {
+            Ok(container) => container,
+            Err(error) => {
+                eprintln!("Docker unavailable; skipping PostgreSQL regression test: {error}");
+                return;
+            }
+        };
+
+        let host = container
+            .get_host()
+            .await
+            .expect("started PostgreSQL container must expose its host")
+            .to_string();
+        let port = container
+            .get_host_port_ipv4(5432)
+            .await
+            .expect("started PostgreSQL container must expose port 5432");
+
+        // The container can emit its first readiness line during initialization;
+        // retry while the final server process comes online.
+        let source = {
+            let mut connected = None;
+            for _ in 0..10 {
+                match PostgresSource::connect(&host, port, "postgres", "", "postgres").await {
+                    Ok(source) => {
+                        connected = Some(source);
+                        break;
+                    }
+                    Err(_) => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
+                }
+            }
+            connected.expect("PostgreSQL test container must become reachable")
+        };
+
+        source
+            .execute_raw(
+                r#"CREATE TABLE public.public_users (id integer PRIMARY KEY, "'" integer NOT NULL);
+                   INSERT INTO public.public_users VALUES (1, 1);
+                   CREATE TABLE public.private_secrets (secret text NOT NULL);
+                   INSERT INTO public.private_secrets VALUES ('synthetic-secret');
+                   CREATE TABLE public.private_ids (id integer NOT NULL);
+                   INSERT INTO public.private_ids VALUES (7);
+                   CREATE FUNCTION public."in"() RETURNS boolean LANGUAGE sql STABLE AS
+                   $$ SELECT EXISTS (
+                       SELECT 1 FROM public.private_secrets
+                       WHERE secret = 'synthetic-secret'
+                   ) $$;"#,
+            )
+            .await
+            .expect("test tables must be created");
+
+        let path = ContainerPath::from_slice(&["postgres", "public"]);
+        let attacks = [
+            "\"query_to_xml\"('select secret from private_secrets', true, false, '')::text LIKE '%synthetic-secret%'",
+            "U&\"query_to_xml\" UESCAPE '!'('select secret from private_secrets', true, false, '')::text LIKE '%synthetic-secret%'",
+            "pg_catalog.U&\"query_to_xml\" UESCAPE '!'('select secret from private_secrets', true, false, '')::text LIKE '%synthetic-secret%'",
+            "public.in()",
+            "7 IN (TABLE private_ids)",
+            "7 in (\nTaBlE\tprivate_ids)",
+            r"E'x\'' IS NOT NULL AND query_to_xml('select secret from private_secrets', true, false, '')::text LIKE '%synthetic-secret%'",
+            "$tag$'$tag$ IS NOT NULL AND query_to_xml('select secret from private_secrets', true, false, '')::text LIKE '%synthetic-secret%' AND $tail$'$tail$ IS NOT NULL",
+            "$💣$'$💣$ IS NOT NULL AND query_to_xml('select secret from private_secrets', true, false, '')::text LIKE '%synthetic-secret%' AND $tail$'$tail$ IS NOT NULL",
+            "\"'\" IS NOT NULL AND query_to_xml('select secret from private_secrets', true, false, '')::text LIKE '%synthetic-secret%' AND \"'\" IS NOT NULL",
+        ];
+
+        for attack in attacks {
+            // Prove each expression is valid PostgreSQL and the quoted function
+            // executes when it is not intercepted by the data-explorer validator.
+            let direct_row = source
+                .client
+                .query_one(&format!("SELECT {attack} FROM public_users"), &[])
+                .await
+                .expect("quoted query_to_xml call must be valid PostgreSQL");
+            assert!(direct_row.get::<_, bool>(0));
+
+            let filters = Some(serde_json::json!({ "where": attack }));
+            let query_error = source
+                .query(
+                    &path,
+                    "public_users",
+                    filters.clone(),
+                    QueryOptions::default(),
+                )
+                .await
+                .expect_err("query path must reject a quoted function identifier");
+            assert!(matches!(query_error, DataError::InvalidQuery(_)));
+
+            let count_error = source
+                .count(&path, "public_users", filters)
+                .await
+                .expect_err("count path must reject a quoted function identifier");
+            assert!(matches!(count_error, DataError::InvalidQuery(_)));
+        }
+    }
+
+    #[test]
+    fn test_sql_injection_arbitrary_function_call_blocked() {
+        // Any function call is rejected, so we never have to enumerate them.
+        assert_sql_rejected("length(password) > 0");
+        assert_sql_rejected("1=1 AND cast(secret AS text) = 'x'");
+        assert_sql_rejected("upper(name) = 'ADMIN'");
+    }
+
+    #[test]
+    fn test_function_call_block_allows_grouping_and_in_lists() {
+        // The new rule must not break legitimate grouping or IN-lists.
+        assert_sql_allowed("(status = 'active' OR status = 'pending') AND id > 10");
+        assert_sql_allowed("id IN (1, 2, 3)");
+        assert_sql_allowed("id IN (1,2,3) AND NOT (deleted = true)");
+        assert_sql_allowed("age >= 18 AND age <= 65");
     }
 
     #[test]

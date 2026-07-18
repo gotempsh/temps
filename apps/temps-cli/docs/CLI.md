@@ -1419,7 +1419,7 @@ The CLI respects the following environment variables:
 
 Configuration is stored in:
 - **Config file**: `~/.temps/config.json`
-- **Credentials**: `~/.temps/.secrets`
+- **Credentials**: stored securely under `~/.temps/` with restricted permissions (mode 0600), managed by `login`/`logout`
 
 Use `temps configure show` to view current configuration.
 

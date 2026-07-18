@@ -314,6 +314,11 @@ pub struct DnsProviderCapabilities {
     pub auto_ssl: bool,
     /// Supports wildcard records
     pub wildcard: bool,
+    /// Benefits from the flat (single-label) generated-hostname layout. True for
+    /// providers whose wildcard TLS only covers one label below the apex (e.g.
+    /// Cloudflare Free/Pro Universal SSL); the UI surfaces and recommends the
+    /// Flat hostname mode for such providers.
+    pub flat_hostnames: bool,
 }
 
 /// Core DNS provider trait
@@ -340,6 +345,20 @@ pub trait DnsProvider: Send + Sync {
     /// Check if the provider can manage a specific domain
     async fn can_manage_domain(&self, domain: &str) -> bool {
         self.get_zone(domain).await.ok().flatten().is_some()
+    }
+
+    /// Verify the provider's token can actually manage this zone.
+    ///
+    /// Unlike [`can_manage_domain`], this distinguishes a permission failure
+    /// (token lacks zone scope → [`DnsError::PermissionDenied`]) from a missing
+    /// zone ([`DnsError::ZoneNotFound`]), so the UI can flag a token that was
+    /// configured without access to the zones it needs to manage.
+    async fn check_zone_access(&self, domain: &str) -> Result<(), DnsError> {
+        match self.get_zone(domain).await {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(DnsError::ZoneNotFound(domain.to_string())),
+            Err(e) => Err(e),
+        }
     }
 
     /// List all records in a zone
@@ -452,6 +471,7 @@ impl DnsProvider for ManualDnsProvider {
             proxy: false,
             auto_ssl: false,
             wildcard: true,
+            flat_hostnames: false,
         }
     }
 
@@ -943,6 +963,7 @@ mod tests {
         assert!(!caps.proxy);
         assert!(!caps.auto_ssl);
         assert!(!caps.wildcard);
+        assert!(!caps.flat_hostnames);
     }
 
     // ==================== ManualDnsProvider tests ====================

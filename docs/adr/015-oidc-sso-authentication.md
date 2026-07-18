@@ -4,6 +4,16 @@
 **Date:** 2026-05-15
 **Author:** David Viejo
 
+> **Amendment (2026-07-17): Magic-link login removed.** Passwordless magic-link
+> login has been removed from `temps-auth` entirely. It had no first-party
+> consumer — the login screen never offered it and no client read its
+> availability flag — and it was a live unauthenticated login endpoint, i.e.
+> pure attack surface. Wherever this ADR names magic link as the account-recovery
+> path for an SSO-only user or an IdP-down outage, that role is now served by the
+> **password-reset flow**, which can set an initial password on a passwordless
+> SSO account. The coexistence and "cannot be disabled in Community" arguments
+> below still apply, but to **email/password** as the sole non-OIDC method.
+
 ## Context
 
 Temps' current authentication surface (`crates/temps-auth/src/auth_service.rs`) is password + magic-link + MFA + session cookies, plus per-user GitHub OAuth used only for repo access (not login). Every developer who runs Temps gets the same login screen: email + password.

@@ -444,45 +444,47 @@ pub fn redact_url_password(url: &str) -> String {
 /// }
 /// ```
 pub async fn validate_domain_async(domain: &str) -> Result<(), UrlValidationError> {
-    // Resolve DNS to get all IP addresses
-    let lookup_result = tokio::net::lookup_host(format!("{}:443", domain)).await;
+    resolve_and_validate_domain(domain, 443).await.map(|_| ())
+}
 
-    let addrs = match lookup_result {
-        Ok(addrs) => addrs,
-        Err(e) => {
-            return Err(UrlValidationError::DnsResolutionFailed(format!(
-                "Failed to resolve {}: {}",
-                domain, e
-            )));
-        }
-    };
+/// Resolve `domain:port` and return the socket addresses, **rejecting the whole
+/// domain if any resolved IP is non-public** (loopback, RFC1918, link-local,
+/// etc.).
+///
+/// Unlike [`validate_domain_async`], this returns the validated addresses so a
+/// caller can pin its HTTP client to them. Pinning closes the DNS-rebinding
+/// window: without it, a hostname validated as public here can re-resolve to
+/// `127.0.0.1` / `169.254.169.254` / an RFC1918 address by the time the client
+/// dials it. Dialing the exact addresses validated here removes that gap.
+pub async fn resolve_and_validate_domain(
+    domain: &str,
+    port: u16,
+) -> Result<Vec<std::net::SocketAddr>, UrlValidationError> {
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(format!("{}:{}", domain, port))
+        .await
+        .map_err(|e| {
+            UrlValidationError::DnsResolutionFailed(format!("Failed to resolve {}: {}", domain, e))
+        })?
+        .collect();
 
-    // Validate all resolved IP addresses
-    let mut has_valid_ip = false;
-    for addr in addrs {
-        let validation_result = match addr.ip() {
-            IpAddr::V4(ip) => validate_ipv4(&ip),
-            IpAddr::V6(ip) => validate_ipv6(&ip),
-        };
-
-        match validation_result {
-            Ok(()) => {
-                has_valid_ip = true;
-            }
-            Err(_) => {
-                // If any resolved IP is blocked, reject the entire domain
-                return Err(UrlValidationError::DomainResolvesToBlockedIp);
-            }
-        }
-    }
-
-    if !has_valid_ip {
+    if addrs.is_empty() {
         return Err(UrlValidationError::DnsResolutionFailed(
             "No valid IP addresses found for domain".to_string(),
         ));
     }
 
-    Ok(())
+    for addr in &addrs {
+        let validation_result = match addr.ip() {
+            IpAddr::V4(ip) => validate_ipv4(&ip),
+            IpAddr::V6(ip) => validate_ipv6(&ip),
+        };
+        if validation_result.is_err() {
+            // If any resolved IP is blocked, reject the entire domain.
+            return Err(UrlValidationError::DomainResolvesToBlockedIp);
+        }
+    }
+
+    Ok(addrs)
 }
 
 #[cfg(test)]
@@ -663,6 +665,28 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    // Regression for security review finding #8 (SSRF via DNS rebinding). The
+    // delivery path re-resolves and pins to the addresses this returns; a
+    // hostname that resolves to a loopback/internal IP must be rejected, and the
+    // returned addresses (used for pinning) must be exactly the resolved ones.
+    #[tokio::test]
+    async fn resolve_and_validate_domain_rejects_loopback() {
+        // localhost always resolves to 127.0.0.1 / ::1 — the rebinding target.
+        assert!(matches!(
+            resolve_and_validate_domain("localhost", 443).await,
+            Err(UrlValidationError::DomainResolvesToBlockedIp)
+        ));
+    }
+
+    #[tokio::test]
+    async fn resolve_and_validate_domain_returns_addrs_for_public_host() {
+        let addrs = resolve_and_validate_domain("example.com", 443)
+            .await
+            .expect("example.com resolves to public IPs");
+        assert!(!addrs.is_empty());
+        assert!(addrs.iter().all(|a| a.port() == 443));
     }
 
     // ── validate_git_url: only https:// is accepted ──────────────────────

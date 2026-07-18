@@ -238,11 +238,12 @@ impl ConversationService {
     /// that project's chats, matching the instance-wide `ProjectsRead` model and
     /// the dock copy. We deliberately do NOT filter by `created_by`.
     ///
-    /// Conversations whose project has AI disabled — neither `ai_debug_chat_enabled`
-    /// NOR `ai_write_actions_enabled` — are EXCLUDED so a disabled project's chats
-    /// never surface in the global switcher. This must mirror `ensure_chat_enabled`
-    /// (the per-project gate): a project with write actions on but the read-only
-    /// debug-chat toggle off is still enabled, so its chats must appear here.
+    /// Conversations whose project has explicitly opted out of AI chat
+    /// (`ai_debug_chat_enabled = false` without write actions) are EXCLUDED so
+    /// a disabled project's chats never surface in the global switcher. This
+    /// must mirror `ensure_chat_enabled` (the per-project gate): read-only
+    /// chat is on by default, and a project with write actions on is always
+    /// enabled, so those chats must appear here.
     ///
     /// Bounded by [`Self::LIST_ALL_LIMIT`] (most-recently-active first) so the
     /// response can't grow unbounded with thread count — a resource-exhaustion
@@ -272,7 +273,7 @@ impl ConversationService {
             .into_iter()
             .map(|p| {
                 let enabled =
-                    matches!(p.ai_debug_chat_enabled, Some(true)) || p.ai_write_actions_enabled;
+                    !matches!(p.ai_debug_chat_enabled, Some(false)) || p.ai_write_actions_enabled;
                 (p.id, (p.name, p.slug, enabled))
             })
             .collect();
@@ -1926,8 +1927,9 @@ mod tests {
         assert_eq!(alpha.project_slug.as_deref(), Some("alpha"));
     }
 
-    // list_all_conversations: a conversation whose project has the toggle off (or
-    // NULL) is EXCLUDED from the global switcher, even though its row is active.
+    // list_all_conversations: a conversation whose project has explicitly opted
+    // out (toggle = false) is EXCLUDED from the global switcher, even though its
+    // row is active. NULL means default-on, so those chats stay visible.
     #[tokio::test]
     async fn test_list_all_conversations_excludes_disabled_projects() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
@@ -1945,9 +1947,18 @@ mod tests {
         let svc = db_service(db);
 
         let items = svc.list_all_conversations().await.expect("query ok");
-        assert_eq!(items.len(), 1, "only the enabled project's chat survives");
-        assert_eq!(items[0].conversation.project_id, 7);
-        assert_eq!(items[0].conversation.public_id, "pubEnabled");
+        assert_eq!(
+            items.len(),
+            2,
+            "explicit opt-out is excluded; default (NULL) stays visible"
+        );
+        assert!(items
+            .iter()
+            .all(|i| i.conversation.public_id != "pubDisabled"));
+        assert!(items
+            .iter()
+            .any(|i| i.conversation.public_id == "pubEnabled"));
+        assert!(items.iter().any(|i| i.conversation.public_id == "pubNull"));
     }
 
     // list_all_conversations: also excludes conversations whose project row is

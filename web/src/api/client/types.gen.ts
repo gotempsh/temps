@@ -220,6 +220,14 @@ export type AddEventsResponse = {
 export type AddManagedDomainApiRequest = {
     auto_manage?: boolean;
     domain: string;
+    /**
+     * Generated hostname layout: `"standard"` (default) or `"flat"`.
+     */
+    generated_hostname_mode?: string | null;
+    /**
+     * Opt in to reconciling generated hostnames into this domain's DNS zone.
+     */
+    sync_generated_records?: boolean;
 };
 
 export type AdminGateResponse = {
@@ -986,6 +994,13 @@ export type AppSettings = {
     disk_space_alert?: DiskSpaceAlertSettings;
     dns_provider?: DnsProviderSettings;
     docker_registry?: DockerRegistrySettings;
+    /**
+     * Public edge target that generated DNS records point at when a managed
+     * domain opts into automatic record sync. An IPv4/IPv6 address produces an
+     * `A`/`AAAA` record; anything else is treated as a `CNAME` target. `None`
+     * disables DNS record sync regardless of per-domain opt-in.
+     */
+    edge_target?: string | null;
     external_url?: string | null;
     /**
      * Skip TLS certificate verification on outbound HTTP clients built by the
@@ -1011,6 +1026,16 @@ export type AppSettings = {
      */
     monitoring?: MonitoringSettings;
     multi_node?: MultiNodeSettings;
+    /**
+     * TimescaleDB compression delays for immutable observability data.
+     * Changes are applied at runtime by the Settings API.
+     */
+    observability_compression?: ObservabilityCompressionSettings;
+    /**
+     * Retention windows for raw proxy and OpenTelemetry telemetry.
+     * TimescaleDB policies are updated at runtime by the Settings API.
+     */
+    observability_retention?: ObservabilityRetentionSettings;
     on_demand_tls?: OnDemandTlsSettings;
     preview_domain?: string;
     preview_gateway?: PreviewGatewaySettings;
@@ -1062,6 +1087,10 @@ export type AppSettingsResponse = {
     dns_provider: DnsProviderSettingsMasked;
     docker_registry: DockerRegistrySettingsMasked;
     /**
+     * Public edge target that synced DNS records point at (IP → A/AAAA, else CNAME).
+     */
+    edge_target?: string | null;
+    /**
      * The storage backend the runtime is **actually** using for metrics,
      * after reconciling the `monitoring.store` toggle with the server's
      * `TEMPS_CLICKHOUSE_*` configuration. When `monitoring.store` is
@@ -1071,12 +1100,32 @@ export type AppSettingsResponse = {
      * effective backend and warns when it diverges from the configured store.
      */
     effective_metrics_store: MetricsStoreKind;
+    /**
+     * Storage backend actually used for proxy logs, OTel spans, and OTel
+     * metrics. OTel logs remain TimescaleDB-backed. Unlike resource metrics,
+     * these domains switch to ClickHouse whenever the server-level ClickHouse
+     * connection is configured; they do not use the monitoring store toggle.
+     */
+    effective_observability_store: MetricsStoreKind;
     external_url?: string | null;
     insecure_tls: boolean;
     internal_url?: string | null;
     letsencrypt: LetsEncryptSettings;
+    /**
+     * Number of enabled, running services the MetricsScraper currently
+     * includes. Used for the lightweight storage estimate in the UI.
+     */
+    monitored_services_count?: number | null;
     monitoring: MonitoringSettingsMasked;
     multi_node: MultiNodeSettingsMasked;
+    /**
+     * TimescaleDB compression delays for immutable proxy logs and OTel spans.
+     */
+    observability_compression: ObservabilityCompressionSettings;
+    /**
+     * Retention windows for raw proxy logs and OpenTelemetry data.
+     */
+    observability_retention: ObservabilityRetentionSettings;
     preview_domain: string;
     preview_gateway: PreviewGatewaySettingsMasked;
     rate_limiting: RateLimitSettings;
@@ -1092,6 +1141,20 @@ export type AppSettingsResponse = {
      * wizard checks this field on load and skips itself when true.
      */
     setup_complete: boolean;
+};
+
+/**
+ * Request to apply a hostname mode (recompute + optional DNS sync).
+ */
+export type ApplyHostnameModeRequest = {
+    /**
+     * Target mode to apply: `"standard"` or `"flat"`.
+     */
+    mode: string;
+    /**
+     * Also reconcile the provider's DNS zone for the affected hostnames.
+     */
+    sync_dns?: boolean;
 };
 
 export type ArchiveMode = 'off' | 'on' | 'always' | 'unknown';
@@ -2157,6 +2220,7 @@ export type CmdResponse = {
 };
 
 export type CommitExistsResponse = {
+    commit?: null | CommitInfo;
     commit_sha?: string | null;
     exists: boolean;
 };
@@ -2485,6 +2549,35 @@ export type ContainerLogsQuery = {
      * Include timestamps in log output (default: false)
      */
     timestamps?: boolean;
+};
+
+/**
+ * One bucketed data point of a container resource metric time series.
+ */
+export type ContainerMetricHistoryPoint = {
+    /**
+     * Bucket timestamp (ISO 8601 with `Z` suffix).
+     */
+    time: string;
+    /**
+     * Averaged metric value for the bucket.
+     */
+    value: number;
+};
+
+/**
+ * Query parameters for the container metrics history endpoint.
+ */
+export type ContainerMetricsHistoryQuery = {
+    /**
+     * Dotted metric name, e.g. `container.cpu_percent` or
+     * `container.memory_used_bytes`.
+     */
+    metric: string;
+    /**
+     * Time window: `1h`, `6h`, `24h`, or `7d` (defaults to `1h`).
+     */
+    range?: string;
 };
 
 /**
@@ -4806,6 +4899,11 @@ export type DnsProviderResponse = {
      */
     credentials: unknown;
     description?: string | null;
+    /**
+     * Whether this provider benefits from the flat hostname mode (e.g. Cloudflare
+     * Universal SSL). The UI surfaces/recommends the Flat toggle when true.
+     */
+    flat_hostnames_supported: boolean;
     id: number;
     is_active: boolean;
     last_error?: string | null;
@@ -4871,6 +4969,22 @@ export type DnsRecord = {
      * Zone/domain this record belongs to
      */
     zone: string;
+};
+
+/**
+ * A single DNS record change the Cloudflare sync would make.
+ */
+export type DnsRecordChange = {
+    /**
+     * `"create"`, `"update"`, or `"delete"`.
+     */
+    action: string;
+    name: string;
+    /**
+     * Record type, e.g. `"A"` or `"CNAME"`.
+     */
+    record_type: string;
+    value: string;
 };
 
 /**
@@ -5256,6 +5370,13 @@ export type EmailProviderResponse = {
 
 export type EmailProviderTypeRoute = 'ses' | 'scaleway' | 'smtp';
 
+/**
+ * Request body carrying just an email address (password-reset request).
+ */
+export type EmailRequest = {
+    email: string;
+};
+
 export type EmailResponse = {
     bcc_addresses?: Array<string> | null;
     cc_addresses?: Array<string> | null;
@@ -5321,7 +5442,6 @@ export type EmailStatsResponse = {
 
 export type EmailStatusResponse = {
     email_configured: boolean;
-    magic_link_available: boolean;
     oidc_providers: Array<OidcProviderSummary>;
     password_reset_available: boolean;
 };
@@ -6032,6 +6152,114 @@ export type EventDetailResponse = {
      * Number of unique visitors who triggered this event
      */
     unique_visitors: number;
+};
+
+/**
+ * Query parameters for the raw event entries list
+ */
+export type EventEntriesQuery = {
+    end_date: string;
+    environment_id?: number | null;
+    /**
+     * The specific event name to list occurrences for
+     */
+    event_name: string;
+    /**
+     * Page number (1-based, default: 1)
+     */
+    page?: number | null;
+    /**
+     * Items per page (default: 20, max: 100)
+     */
+    per_page?: number | null;
+    project_id: number;
+    start_date: string;
+};
+
+/**
+ * Paginated response for raw event entries
+ */
+export type EventEntriesResponse = {
+    /**
+     * Individual event occurrences, most recent first
+     */
+    entries: Array<EventEntryInfo>;
+    /**
+     * The event name
+     */
+    event_name: string;
+    /**
+     * Current page number
+     */
+    page: number;
+    /**
+     * Items per page
+     */
+    per_page: number;
+    /**
+     * Total number of occurrences of this event in the date range
+     */
+    total_count: number;
+};
+
+/**
+ * A single raw occurrence of an event, including its custom JSON properties
+ */
+export type EventEntryInfo = {
+    /**
+     * Browser name
+     */
+    browser?: string | null;
+    /**
+     * City of the visitor at the time of the event
+     */
+    city?: string | null;
+    /**
+     * Country of the visitor at the time of the event
+     */
+    country?: string | null;
+    /**
+     * ISO country code (2-letter)
+     */
+    country_code?: string | null;
+    /**
+     * Device type (Desktop, Mobile, Tablet)
+     */
+    device_type?: string | null;
+    /**
+     * Full URL where the event was triggered
+     */
+    href: string;
+    /**
+     * Event row ID
+     */
+    id: number;
+    /**
+     * Page path where the event was triggered
+     */
+    page_path: string;
+    /**
+     * Custom event properties as JSON (null when the event carried no data)
+     */
+    props?: {
+        [key: string]: unknown;
+    } | null;
+    /**
+     * Session ID the event belongs to (if any)
+     */
+    session_id?: string | null;
+    /**
+     * When the event occurred
+     */
+    timestamp: string;
+    /**
+     * Visitor numeric ID (if known)
+     */
+    visitor_id?: number | null;
+    /**
+     * Visitor UUID (if known)
+     */
+    visitor_uuid?: string | null;
 };
 
 /**
@@ -7567,6 +7795,35 @@ export type HistogramSummary = {
     sum: number;
 };
 
+/**
+ * A single generated-hostname change in a flatten preview/apply.
+ */
+export type HostnameChange = {
+    /**
+     * Row id of the affected record.
+     */
+    id: number;
+    /**
+     * `"deployment"` or `"environment"`.
+     */
+    kind: string;
+    new: string;
+    old: string;
+};
+
+/**
+ * Combined preview of a hostname-mode change.
+ */
+export type HostnamePreviewResponse = {
+    dns_changes: Array<DnsRecordChange>;
+    hostname_changes: Array<HostnameChange>;
+    total: number;
+    /**
+     * Whether the provider token can manage this zone (None if not checked).
+     */
+    zone_access_ok?: boolean | null;
+};
+
 export type HourlyPageSessions = {
     avg_duration_seconds: number;
     event_count: number;
@@ -8695,10 +8952,6 @@ export type LogsResponse = {
     data: Array<LogRecord>;
 };
 
-export type MagicLinkRequest = {
-    email: string;
-};
-
 /**
  * Managed domain response
  */
@@ -8706,12 +8959,28 @@ export type ManagedDomainResponse = {
     auto_manage: boolean;
     created_at: string;
     domain: string;
+    /**
+     * Generated hostname layout: `"standard"` or `"flat"`.
+     */
+    generated_hostname_mode: string;
     id: number;
     provider_id: number;
+    /**
+     * Whether generated hostnames are reconciled into the provider's DNS zone.
+     */
+    sync_generated_records: boolean;
     updated_at: string;
     verification_error?: string | null;
     verified: boolean;
     verified_at?: string | null;
+    /**
+     * Detail for a failed zone-access check.
+     */
+    zone_access_error?: string | null;
+    /**
+     * Last token zone-access check: `Some(true)`/`Some(false)`/`None` (unchecked).
+     */
+    zone_access_ok?: boolean | null;
     zone_id?: string | null;
 };
 
@@ -9535,6 +9804,23 @@ export type NotificationProviderResponse = {
 };
 
 /**
+ * TimescaleDB compression policy configuration for append-only observability
+ * tables. Values are expressed in hours so operators can choose sub-day
+ * windows while keeping the API representation unambiguous.
+ */
+export type ObservabilityCompressionSettings = {
+    /**
+     * Compress OpenTelemetry span chunks after this many hours. Defaults to
+     * 24 hours.
+     */
+    otel_spans_after_hours?: number;
+    /**
+     * Compress proxy-log chunks after this many hours. Defaults to 24 hours.
+     */
+    proxy_logs_after_hours?: number;
+};
+
+/**
  * Discriminated union of every row that can appear in the Observe list.
  *
  * Serializes to `{ "type": "request" | "span" | ... , ...rest }` so the UI
@@ -9556,6 +9842,30 @@ export type ObservabilityEvent = (RequestRow & {
 }) | (RevenueRow & {
     type: 'revenue';
 });
+
+/**
+ * Retention policy configuration for raw observability tables. Values are in
+ * days. The Settings API applies them to TimescaleDB; ClickHouse-backed proxy
+ * logs and spans retain their storage-level per-row TTL behavior.
+ */
+export type ObservabilityRetentionSettings = {
+    /**
+     * Retain OpenTelemetry log events for this many days.
+     */
+    otel_logs_days?: number;
+    /**
+     * Retain OpenTelemetry metric points for this many days.
+     */
+    otel_metrics_days?: number;
+    /**
+     * Retain OpenTelemetry spans (traces) for this many days.
+     */
+    otel_spans_days?: number;
+    /**
+     * Retain proxy request logs for this many days.
+     */
+    proxy_logs_days?: number;
+};
 
 export type OidcProviderResponse = {
     client_id: string;
@@ -11709,6 +12019,15 @@ export type ProxyRequest = {
      */
     username?: string | null;
 };
+
+/**
+ * Public hostname generation mode for Temps-managed preview routes.
+ *
+ * The mode is stored per managed domain (`dns_managed_domains.generated_hostname_mode`)
+ * rather than globally, so a provider such as Cloudflare can offer the flat layout
+ * required by its Universal SSL wildcard cert without changing every domain's behaviour.
+ */
+export type PublicHostnameStrategy = 'standard' | 'flat';
 
 /**
  * Response for preset detection
@@ -16029,6 +16348,25 @@ export type UpdateKvResponse = {
     success: boolean;
 };
 
+/**
+ * Request to update a managed domain's settings.
+ */
+export type UpdateManagedDomainApiRequest = {
+    /**
+     * Toggle automatic DNS management for this domain.
+     */
+    auto_manage?: boolean | null;
+    /**
+     * `"standard"` or `"flat"`. Persisted as-is; switching to `"flat"` does not
+     * recompute existing hostnames — use the apply endpoint for that.
+     */
+    generated_hostname_mode?: string | null;
+    /**
+     * Toggle DNS record sync for this domain.
+     */
+    sync_generated_records?: boolean | null;
+};
+
 export type UpdateMcpRequest = {
     config: {
         [key: string]: unknown;
@@ -16313,6 +16651,44 @@ export type UpdateSpeedMetricsPayload = {
      * Interaction to Next Paint (milliseconds)
      */
     inp?: number | null;
+};
+
+/**
+ * Result of the background release-update check, driving the web console's
+ * upgrade banner. All optional fields are set together iff
+ * `update_available` is true.
+ */
+export type UpdateStatusResponse = {
+    /**
+     * Channel the install tracks: `stable` or `beta`.
+     */
+    channel?: string | null;
+    /**
+     * When the check that found the update ran (ISO 8601, UTC).
+     */
+    checked_at?: string | null;
+    /**
+     * Version tag of the running binary, e.g. `v0.1.0-beta.45`.
+     */
+    current_version?: string | null;
+    /**
+     * Docs page with upgrade instructions. Always present so the UI links
+     * the same page regardless of update state.
+     */
+    docs_url: string;
+    /**
+     * Newest published tag on this install's channel.
+     */
+    latest_version?: string | null;
+    /**
+     * Release-notes page (GitHub release) for the newer version.
+     */
+    release_url?: string | null;
+    /**
+     * True when a newer release than the running binary has been published
+     * on this install's channel.
+     */
+    update_available: boolean;
 };
 
 export type UpdateTokenRequest = {
@@ -18795,6 +19171,62 @@ export type GetEventDetailResponses = {
 
 export type GetEventDetailResponse = GetEventDetailResponses[keyof GetEventDetailResponses];
 
+export type GetEventEntriesData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Event name to list occurrences for
+         */
+        event_name: string;
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID (optional)
+         */
+        environment_id?: number;
+        /**
+         * Start date (ISO 8601)
+         */
+        start_date: string;
+        /**
+         * End date (ISO 8601)
+         */
+        end_date: string;
+        /**
+         * Page number (1-based, default: 1)
+         */
+        page?: number;
+        /**
+         * Items per page (default: 20, max: 100)
+         */
+        per_page?: number;
+    };
+    url: '/analytics/event-entries';
+};
+
+export type GetEventEntriesErrors = {
+    /**
+     * Invalid parameters
+     */
+    400: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetEventEntriesResponses = {
+    /**
+     * Successfully retrieved event entries
+     */
+    200: EventEntriesResponse;
+};
+
+export type GetEventEntriesResponse = GetEventEntriesResponses[keyof GetEventEntriesResponses];
+
 export type GetEventVisitorsData = {
     body?: never;
     path?: never;
@@ -20673,65 +21105,6 @@ export type LoginResponses = {
 
 export type LoginResponse = LoginResponses[keyof LoginResponses];
 
-export type RequestMagicLinkData = {
-    body: MagicLinkRequest;
-    path?: never;
-    query?: never;
-    url: '/auth/magic-link/request';
-};
-
-export type RequestMagicLinkErrors = {
-    /**
-     * Bad request
-     */
-    400: unknown;
-    /**
-     * Email service not configured
-     */
-    503: unknown;
-};
-
-export type RequestMagicLinkResponses = {
-    /**
-     * Magic link sent if email exists
-     */
-    200: AuthResponse;
-};
-
-export type RequestMagicLinkResponse = RequestMagicLinkResponses[keyof RequestMagicLinkResponses];
-
-export type VerifyMagicLinkData = {
-    body?: never;
-    path?: never;
-    query: {
-        /**
-         * Magic link token
-         */
-        token: string;
-    };
-    url: '/auth/magic-link/verify';
-};
-
-export type VerifyMagicLinkErrors = {
-    /**
-     * Invalid or expired token
-     */
-    400: unknown;
-    /**
-     * Internal server error
-     */
-    500: unknown;
-};
-
-export type VerifyMagicLinkResponses = {
-    /**
-     * Magic link verified, session cookie set
-     */
-    200: AuthResponse;
-};
-
-export type VerifyMagicLinkResponse = VerifyMagicLinkResponses[keyof VerifyMagicLinkResponses];
-
 export type OidcCallbackData = {
     body?: never;
     path?: never;
@@ -20786,7 +21159,7 @@ export type ListPublicProvidersResponses = {
 export type ListPublicProvidersResponse = ListPublicProvidersResponses[keyof ListPublicProvidersResponses];
 
 export type RequestPasswordResetData = {
-    body: MagicLinkRequest;
+    body: EmailRequest;
     path?: never;
     query?: never;
     url: '/auth/password-reset/request';
@@ -23059,6 +23432,117 @@ export type RemoveManagedDomainResponses = {
 };
 
 export type RemoveManagedDomainResponse = RemoveManagedDomainResponses[keyof RemoveManagedDomainResponses];
+
+export type UpdateManagedDomainData = {
+    body: UpdateManagedDomainApiRequest;
+    path: {
+        provider_id: number;
+        domain: string;
+    };
+    query?: never;
+    url: '/dns-providers/{provider_id}/domains/{domain}';
+};
+
+export type UpdateManagedDomainErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Domain not found
+     */
+    404: unknown;
+};
+
+export type UpdateManagedDomainResponses = {
+    /**
+     * Managed domain updated
+     */
+    200: ManagedDomainResponse;
+};
+
+export type UpdateManagedDomainResponse = UpdateManagedDomainResponses[keyof UpdateManagedDomainResponses];
+
+export type ApplyHostnameModeData = {
+    body: ApplyHostnameModeRequest;
+    path: {
+        provider_id: number;
+        domain: string;
+    };
+    query?: never;
+    url: '/dns-providers/{provider_id}/domains/{domain}/apply-hostname-mode';
+};
+
+export type ApplyHostnameModeErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions or token lacks zone access
+     */
+    403: unknown;
+    /**
+     * Domain not found
+     */
+    404: unknown;
+};
+
+export type ApplyHostnameModeResponses = {
+    /**
+     * Hostname mode applied
+     */
+    200: HostnamePreviewResponse;
+};
+
+export type ApplyHostnameModeResponse = ApplyHostnameModeResponses[keyof ApplyHostnameModeResponses];
+
+export type PreviewHostnameModeData = {
+    body?: never;
+    path: {
+        provider_id: number;
+        domain: string;
+    };
+    query: {
+        /**
+         * Target mode: standard|flat
+         */
+        mode: string;
+        /**
+         * Include DNS record changes
+         */
+        sync?: boolean;
+    };
+    url: '/dns-providers/{provider_id}/domains/{domain}/hostname-preview';
+};
+
+export type PreviewHostnameModeErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Domain not found
+     */
+    404: unknown;
+};
+
+export type PreviewHostnameModeResponses = {
+    /**
+     * Hostname mode preview
+     */
+    200: HostnamePreviewResponse;
+};
+
+export type PreviewHostnameModeResponse = PreviewHostnameModeResponses[keyof PreviewHostnameModeResponses];
 
 export type VerifyManagedDomainData = {
     body?: never;
@@ -37475,6 +37959,64 @@ export type GetContainerMetricsResponses = {
 
 export type GetContainerMetricsResponse = GetContainerMetricsResponses[keyof GetContainerMetricsResponses];
 
+export type ContainerMetricsGetHistoryData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Container ID
+         */
+        container_id: string;
+    };
+    query: {
+        /**
+         * Dotted metric name, e.g. `container.cpu_percent` or
+         * `container.memory_used_bytes`.
+         */
+        metric: string;
+        /**
+         * Time window: `1h`, `6h`, `24h`, or `7d` (defaults to `1h`).
+         */
+        range?: string;
+    };
+    url: '/projects/{project_id}/environments/{environment_id}/containers/{container_id}/metrics/history';
+};
+
+export type ContainerMetricsGetHistoryErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Container not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * Metrics store not available
+     */
+    503: unknown;
+};
+
+export type ContainerMetricsGetHistoryResponses = {
+    /**
+     * Metric time series data points
+     */
+    200: Array<ContainerMetricHistoryPoint>;
+};
+
+export type ContainerMetricsGetHistoryResponse = ContainerMetricsGetHistoryResponses[keyof ContainerMetricsGetHistoryResponses];
+
 export type StreamContainerMetricsData = {
     body?: never;
     path: {
@@ -42800,6 +43342,10 @@ export type CheckCommitExistsData = {
 
 export type CheckCommitExistsErrors = {
     /**
+     * Invalid commit SHA
+     */
+    400: unknown;
+    /**
      * Unauthorized
      */
     401: unknown;
@@ -42808,9 +43354,17 @@ export type CheckCommitExistsErrors = {
      */
     404: unknown;
     /**
+     * Commit lookup rate limit exceeded
+     */
+    429: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
+    /**
+     * Git provider request failed
+     */
+    502: unknown;
 };
 
 export type CheckCommitExistsResponses = {
@@ -43944,6 +44498,33 @@ export type DownloadGlobalSkillArchiveResponses = {
 
 export type DownloadGlobalSkillArchiveResponse = DownloadGlobalSkillArchiveResponses[keyof DownloadGlobalSkillArchiveResponses];
 
+export type GetUpdateStatusData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/settings/update-status';
+};
+
+export type GetUpdateStatusErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+};
+
+export type GetUpdateStatusResponses = {
+    /**
+     * Release update status for this install
+     */
+    200: UpdateStatusResponse;
+};
+
+export type GetUpdateStatusResponse = GetUpdateStatusResponses[keyof GetUpdateStatusResponses];
+
 export type ListProjectTemplatesData = {
     body?: never;
     path?: never;
@@ -44262,7 +44843,7 @@ export type ChangePasswordSelfErrors = {
      */
     401: unknown;
     /**
-     * Account has no password set (SSO/magic-link only)
+     * Account has no password set (SSO only)
      */
     403: unknown;
     /**

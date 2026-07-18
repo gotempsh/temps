@@ -8,7 +8,6 @@ mod auth_service;
 mod avatar;
 pub mod cli_auth_handler;
 pub mod cli_device_handler;
-pub mod client_ip;
 pub mod context;
 mod decorators;
 mod deployment_token_service;
@@ -32,11 +31,11 @@ mod temps_middleware;
 mod types;
 mod user_service;
 
-pub use client_ip::resolve_client_ip;
 pub use decorators::*;
 pub use macros::*;
 pub use middleware::*;
 pub use permission_attribute::*;
+pub use temps_core::resolve_client_ip;
 
 pub use context::*;
 pub use permissions::*;
@@ -48,7 +47,7 @@ pub use plugin::AuthPlugin;
 
 // Export services
 pub use apikey_service::{ApiKeyService, CreateApiKeyRequest, CreateApiKeyResponse};
-pub use auth_service::AuthService;
+pub use auth_service::{validate_password_complexity, AuthService};
 pub use deployment_token_service::{
     DeploymentTokenValidationError, DeploymentTokenValidationService, ValidatedDeploymentToken,
 };

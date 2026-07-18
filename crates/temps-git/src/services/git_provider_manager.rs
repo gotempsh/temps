@@ -14,7 +14,7 @@ use super::git_provider::{
 };
 use temps_config::ConfigService;
 use temps_core::{JobQueue, UtcDateTime};
-use temps_entities::{git_provider_connections, git_providers, repositories};
+use temps_entities::{git_provider_connections, git_providers, projects, repositories};
 
 // OAuth scope constants
 const GITLAB_OAUTH_SCOPES: &str = "api read_api read_repository";
@@ -4301,9 +4301,6 @@ impl GitProviderManager {
         tag: Option<String>,
         commit: String,
     ) -> Result<(), GitProviderManagerError> {
-        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-        use temps_entities::projects;
-
         // Branch/tag deletions send the all-zeros "null SHA" in the `after`
         // field (GitHub, GitLab, and others all follow this Git convention).
         // There is no commit to deploy, so creating a deployment from it would
@@ -4331,24 +4328,61 @@ impl GitProviderManager {
                 GitProviderManagerError::DatabaseError(e)
             })?;
 
-        if matching_projects.is_empty() {
-            tracing::warn!(
-                "No projects found for repository {}/{}, skipping push event",
-                owner,
-                repo
+        self.queue_push_event_for_projects(branch, tag, commit, matching_projects)
+            .await
+            .map(|_| ())
+    }
+
+    /// Handle an authenticated push event for a pre-authorized set of projects.
+    ///
+    /// Secret-in-path webhook handlers must use this method after token lookup so
+    /// the authenticated token owner, not untrusted payload repository fields,
+    /// determines which projects can receive deployment jobs.
+    pub async fn handle_push_event_for_projects(
+        &self,
+        branch: Option<String>,
+        tag: Option<String>,
+        commit: String,
+        projects: Vec<projects::Model>,
+    ) -> Result<usize, GitProviderManagerError> {
+        self.queue_push_event_for_projects(branch, tag, commit, projects)
+            .await
+    }
+
+    async fn queue_push_event_for_projects(
+        &self,
+        branch: Option<String>,
+        tag: Option<String>,
+        commit: String,
+        matching_projects: Vec<projects::Model>,
+    ) -> Result<usize, GitProviderManagerError> {
+        // Branch/tag deletions send the all-zeros "null SHA" in the `after`
+        // field. There is no commit to deploy, so skip them before queueing.
+        if commit.is_empty() || commit.chars().all(|c| c == '0') {
+            tracing::info!(
+                "Ignoring push event with null SHA (branch/tag deletion), branch: {:?}, tag: {:?}",
+                branch,
+                tag
             );
-            return Ok(());
+            return Ok(0);
+        }
+
+        if matching_projects.is_empty() {
+            tracing::warn!("No authorized projects found, skipping push event");
+            return Ok(0);
         }
 
         tracing::info!(
-            "Found {} projects for repository {}/{}, queueing push events",
-            matching_projects.len(),
-            owner,
-            repo
+            "Found {} authorized projects, queueing push events",
+            matching_projects.len()
         );
+
+        let triggered = matching_projects.len();
 
         // Queue a GitPushEventJob for each project
         for project in matching_projects {
+            let owner = project.repo_owner.clone();
+            let repo = project.repo_name.clone();
             let push_job = temps_core::GitPushEventJob {
                 owner: owner.clone(),
                 repo: repo.clone(),
@@ -4384,7 +4418,7 @@ impl GitProviderManager {
             }
         }
 
-        Ok(())
+        Ok(triggered)
     }
 
     /// Push files to a repository using native git operations (git2 library)

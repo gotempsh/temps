@@ -29,7 +29,6 @@ pub use super::external_services::Entity as ExternalServices;
 pub use super::git_provider_connections::Entity as GitProviderConnections;
 pub use super::git_providers::Entity as GitProviders;
 pub use super::ip_geolocations::Entity as IpGeolocations;
-pub use super::magic_link_tokens::Entity as MagicLinkTokens;
 pub use super::notification_preferences::Entity as NotificationPreferences;
 pub use super::notification_providers::Entity as NotificationProviders;
 pub use super::notifications::Entity as Notifications;

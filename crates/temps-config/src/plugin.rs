@@ -69,12 +69,18 @@ impl TempsPlugin for ConfigPlugin {
         let route_table_refresher =
             context.get_service::<dyn temps_core::route_table::RouteTableRefresher>();
 
+        // Update-notifier slot, when the host process runs one (`temps serve`
+        // registers it; the standalone proxy's isolated plugin context does
+        // not). Optional: without it, update-status just reports "no update".
+        let update_status = context.get_service::<temps_core::UpdateStatusSlot>();
+
         // Create SettingsState
         let settings_state = Arc::new(SettingsState {
             config_service,
             audit_service,
             route_table_refresher,
             enrollment_token_service,
+            update_status,
         });
 
         // Configure routes with the state

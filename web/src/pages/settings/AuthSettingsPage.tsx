@@ -178,8 +178,7 @@ export function AuthSettingsPage() {
               SSO providers
             </CardTitle>
             <CardDescription>
-              Password and magic-link login keep working alongside any SSO
-              provider you add.
+              Password login keeps working alongside any SSO provider you add.
             </CardDescription>
           </CardHeader>
           <CardContent>

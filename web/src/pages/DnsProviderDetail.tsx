@@ -1,13 +1,17 @@
 import {
   addManagedDomain,
+  applyHostnameMode,
   deleteDnsProvider as deleteProvider,
   getDnsProvider as getProvider,
   listManagedDomains,
   listProviderZones,
+  previewHostnameMode,
   removeManagedDomain,
   testProviderConnection,
+  updateManagedDomain,
   updateProvider,
   verifyManagedDomain,
+  type HostnamePreviewResponse,
   type ManagedDomainResponse,
   type UpdateDnsProviderRequest,
 } from '@/api/client'
@@ -209,7 +213,9 @@ export default function DnsProviderDetail() {
 
   const testConnectionMut = useMutation({
     mutationFn: async () => {
-      const response = await testProviderConnection({ path: { id: providerId } })
+      const response = await testProviderConnection({
+        path: { id: providerId },
+      })
       return response.data
     },
     onSuccess: (result) => {
@@ -280,6 +286,84 @@ export default function DnsProviderDetail() {
     },
     onError: (err: Error) => {
       toast.error('Failed to verify domain', {
+        description: err.message,
+      })
+    },
+  })
+
+  // Per-domain hostname mode: preview before an explicit, breaking apply.
+  const [hostnamePreview, setHostnamePreview] = useState<{
+    domain: string
+    target: 'standard' | 'flat'
+    syncDns: boolean
+    result: HostnamePreviewResponse
+  } | null>(null)
+
+  const previewModeMut = useMutation({
+    mutationFn: (vars: {
+      domain: string
+      target: 'standard' | 'flat'
+      syncDns: boolean
+    }) =>
+      previewHostnameMode({
+        path: { provider_id: providerId, domain: vars.domain },
+        query: { mode: vars.target, sync: vars.syncDns },
+      }).then(({ data, error }) => {
+        if (error) throw error
+        if (!data) throw new Error('Hostname preview returned no data')
+        return data
+      }),
+    onSuccess: (result, vars) => {
+      setHostnamePreview({ ...vars, result })
+    },
+    onError: (err: Error) => {
+      toast.error('Failed to preview hostname change', {
+        description: err.message,
+      })
+    },
+  })
+
+  const applyModeMut = useMutation({
+    mutationFn: (vars: {
+      domain: string
+      target: 'standard' | 'flat'
+      syncDns: boolean
+    }) =>
+      applyHostnameMode({
+        path: { provider_id: providerId, domain: vars.domain },
+        body: { mode: vars.target, sync_dns: vars.syncDns },
+      }).then(({ data, error }) => {
+        if (error) throw error
+        if (!data) throw new Error('Hostname apply returned no data')
+        return data
+      }),
+    onSuccess: () => {
+      toast.success('Hostname mode applied')
+      setHostnamePreview(null)
+      refetchDomains()
+    },
+    onError: (err: Error) => {
+      toast.error('Failed to apply hostname mode', {
+        description: err.message,
+      })
+    },
+  })
+
+  const syncToggleMut = useMutation({
+    mutationFn: (vars: { domain: string; enabled: boolean }) =>
+      updateManagedDomain({
+        path: { provider_id: providerId, domain: vars.domain },
+        body: { sync_generated_records: vars.enabled },
+      }).then(({ data, error }) => {
+        if (error) throw error
+        if (!data) throw new Error('Managed domain update returned no data')
+        return data
+      }),
+    onSuccess: () => {
+      refetchDomains()
+    },
+    onError: (err: Error) => {
+      toast.error('Failed to update DNS sync setting', {
         description: err.message,
       })
     },
@@ -386,9 +470,13 @@ export default function DnsProviderDetail() {
               <ArrowLeft className="h-4 w-4" />
             </Button>
             <div className="flex items-start gap-3 min-w-0">
-              <div className="shrink-0">{getProviderIcon(provider.provider_type)}</div>
+              <div className="shrink-0">
+                {getProviderIcon(provider.provider_type)}
+              </div>
               <div className="min-w-0">
-                <h1 className="text-xl sm:text-2xl font-bold truncate">{provider.name}</h1>
+                <h1 className="text-xl sm:text-2xl font-bold truncate">
+                  {provider.name}
+                </h1>
                 <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-sm text-muted-foreground">
                   <span>{formatProviderType(provider.provider_type)}</span>
                   <span className="hidden sm:inline">•</span>
@@ -446,7 +534,10 @@ export default function DnsProviderDetail() {
             </Badge>
           )}
           {provider.last_error && (
-            <Badge variant="outline" className="flex items-center gap-1 text-destructive">
+            <Badge
+              variant="outline"
+              className="flex items-center gap-1 text-destructive"
+            >
               <AlertCircle className="h-3 w-3" />
               {provider.last_error}
             </Badge>
@@ -533,10 +624,7 @@ export default function DnsProviderDetail() {
               >
                 <RefreshCw className="h-4 w-4" />
               </Button>
-              <Button
-                size="sm"
-                onClick={() => setIsAddDomainDialogOpen(true)}
-              >
+              <Button size="sm" onClick={() => setIsAddDomainDialogOpen(true)}>
                 <Plus className="mr-2 h-4 w-4" />
                 Add Domain
               </Button>
@@ -581,6 +669,26 @@ export default function DnsProviderDetail() {
                         {domain.auto_manage && (
                           <Badge variant="outline">Auto-managed</Badge>
                         )}
+                        <Badge
+                          variant={
+                            domain.generated_hostname_mode === 'flat'
+                              ? 'default'
+                              : 'outline'
+                          }
+                        >
+                          {domain.generated_hostname_mode === 'flat'
+                            ? 'Flat hostnames'
+                            : 'Standard hostnames'}
+                        </Badge>
+                        {domain.zone_access_ok === false && (
+                          <Badge
+                            variant="destructive"
+                            className="flex items-center gap-1"
+                          >
+                            <XCircle className="h-3 w-3" />
+                            Token lacks zone access
+                          </Badge>
+                        )}
                       </div>
                       {domain.zone_id && (
                         <p className="truncate text-sm text-muted-foreground">
@@ -592,15 +700,51 @@ export default function DnsProviderDetail() {
                           {domain.verification_error}
                         </p>
                       )}
+                      {domain.zone_access_error && (
+                        <p className="truncate text-sm text-destructive">
+                          {domain.zone_access_error}
+                        </p>
+                      )}
+                      {provider?.flat_hostnames_supported && (
+                        <div className="flex flex-wrap items-center gap-4 pt-1">
+                          <label className="flex items-center gap-2 text-sm">
+                            <Switch
+                              checked={
+                                domain.generated_hostname_mode === 'flat'
+                              }
+                              onCheckedChange={(checked) =>
+                                previewModeMut.mutate({
+                                  domain: domain.domain,
+                                  target: checked ? 'flat' : 'standard',
+                                  syncDns: domain.sync_generated_records,
+                                })
+                              }
+                              disabled={previewModeMut.isPending}
+                            />
+                            Flat hostnames (Universal SSL)
+                          </label>
+                          <label className="flex items-center gap-2 text-sm">
+                            <Switch
+                              checked={domain.sync_generated_records}
+                              onCheckedChange={(checked) =>
+                                syncToggleMut.mutate({
+                                  domain: domain.domain,
+                                  enabled: checked,
+                                })
+                              }
+                              disabled={syncToggleMut.isPending}
+                            />
+                            Sync DNS records
+                          </label>
+                        </div>
+                      )}
                     </div>
                     <div className="flex shrink-0 items-center gap-2">
                       {!domain.verified && (
                         <Button
                           variant="outline"
                           size="sm"
-                          onClick={() =>
-                            verifyDomainMut.mutate(domain.domain)
-                          }
+                          onClick={() => verifyDomainMut.mutate(domain.domain)}
                           disabled={verifyDomainMut.isPending}
                         >
                           {verifyDomainMut.isPending ? (
@@ -626,14 +770,114 @@ export default function DnsProviderDetail() {
         </Card>
       </div>
 
+      {/* Hostname mode preview / confirm dialog */}
+      <Dialog
+        open={!!hostnamePreview}
+        onOpenChange={(open) => {
+          if (!open) setHostnamePreview(null)
+        }}
+      >
+        <DialogContent className="max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>
+              Switch {hostnamePreview?.domain} to{' '}
+              {hostnamePreview?.target === 'flat' ? 'Flat' : 'Standard'}{' '}
+              hostnames
+            </DialogTitle>
+            <DialogDescription>
+              This is a breaking change: generated hostnames are recomputed,
+              routes reload, and certificates re-issue. Existing nested
+              hostnames stop resolving. Custom domains are not affected.
+            </DialogDescription>
+          </DialogHeader>
+
+          {hostnamePreview?.result.zone_access_ok === false && (
+            <Alert variant="destructive">
+              <AlertCircle className="h-4 w-4" />
+              <AlertTitle>Token cannot access this zone</AlertTitle>
+              <AlertDescription>
+                DNS records will not be synced until the provider token is
+                granted access to the zone.
+              </AlertDescription>
+            </Alert>
+          )}
+
+          <div className="max-h-80 space-y-4 overflow-y-auto">
+            <div>
+              <p className="mb-1 text-sm font-medium">
+                Hostname changes (
+                {hostnamePreview?.result.hostname_changes.length ?? 0})
+              </p>
+              {hostnamePreview?.result.hostname_changes.length ? (
+                <ul className="space-y-1 text-sm">
+                  {hostnamePreview.result.hostname_changes.map((c, i) => (
+                    <li key={i} className="font-mono text-xs">
+                      {c.old} → {c.new}
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="text-sm text-muted-foreground">
+                  No generated hostnames change.
+                </p>
+              )}
+            </div>
+
+            {hostnamePreview?.syncDns && (
+              <div>
+                <p className="mb-1 text-sm font-medium">
+                  DNS record changes (
+                  {hostnamePreview?.result.dns_changes.length ?? 0})
+                </p>
+                {hostnamePreview?.result.dns_changes.length ? (
+                  <ul className="space-y-1 text-sm">
+                    {hostnamePreview.result.dns_changes.map((c, i) => (
+                      <li key={i} className="font-mono text-xs">
+                        {c.action} {c.record_type} {c.name}
+                        {c.value ? ` → ${c.value}` : ''}
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="text-sm text-muted-foreground">
+                    No DNS record changes.
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
+
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setHostnamePreview(null)}>
+              Cancel
+            </Button>
+            <Button
+              onClick={() =>
+                hostnamePreview &&
+                applyModeMut.mutate({
+                  domain: hostnamePreview.domain,
+                  target: hostnamePreview.target,
+                  syncDns: hostnamePreview.syncDns,
+                })
+              }
+              disabled={applyModeMut.isPending}
+            >
+              {applyModeMut.isPending ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                'Apply change'
+              )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {/* Edit Dialog */}
       <Dialog open={isEditDialogOpen} onOpenChange={setIsEditDialogOpen}>
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Edit DNS Provider</DialogTitle>
-            <DialogDescription>
-              Update the provider settings
-            </DialogDescription>
+            <DialogDescription>Update the provider settings</DialogDescription>
           </DialogHeader>
           <Form {...editForm}>
             <form

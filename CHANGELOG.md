@@ -5,16 +5,132 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.0-beta.50] - 2026-07-17
 
 ### Added
 
-- **Daily returning-visitor metric**: The analytics overview now reports visitors active in the selected period who were previously seen in the same project and environment, making daily audience retention visible across TimescaleDB and ClickHouse backends.
+- **backup:** Dump only critical table data in control-plane backups ([#367](https://github.com/gotempsh/temps/issues/367))
+- **proxy:** Trust CF-Connecting-IP from verified Cloudflare egress ranges ([#368](https://github.com/gotempsh/temps/issues/368))
+- **monitoring:** Track container CPU/memory for external services ([#371](https://github.com/gotempsh/temps/issues/371))
+- **observability:** Compress immutable telemetry after 24h ([#370](https://github.com/gotempsh/temps/issues/370))
+- **telemetry:** Aggregated anonymous error_summary event ([#373](https://github.com/gotempsh/temps/issues/373))
+- **telemetry-api:** Accept error_summary event ([#374](https://github.com/gotempsh/temps/issues/374))
+- **auth:** Let deployment tokens call the AI gateway (ai_gateway:execute) ([#377](https://github.com/gotempsh/temps/issues/377))
+
+### CI
+
+- **compose-security:** Cache Docker toolchain layers and prebuild with fast profile ([#362](https://github.com/gotempsh/temps/issues/362))
+
+### Documentation
+
+- **skill:** Add remote-over-SSH install method to temps-platform-setup ([#366](https://github.com/gotempsh/temps/issues/366))
 
 ### Fixed
 
 - **Email SNS webhook security and durability**: SES notifications now require an exact topic ARN configured on the active SES provider, validate AWS confirmation/certificate endpoints, correlate recipients and provider ownership, commit events and domain-scoped suppressions atomically, and deduplicate retries before acknowledging SNS. Upgrades preserve legacy global suppression safety by copying those entries to every existing sending domain, then enforce tenant-scoped ownership for future changes.
 - **No-op visitor deduplication migration**: `m20260705_000001_add_visitor_unique_index` now skips bulk foreign-key rewrites when no duplicate `(visitor_id, project_id)` pairs exist, preventing TimescaleDB from eagerly decompressing unrelated hypertable chunks and exceeding `timescaledb.max_tuples_decompressed_per_dml_transaction` during upgrades.
+- **core:** Resolve request IP trust-awarely for audit/logging ([#363](https://github.com/gotempsh/temps/issues/363))
+- **skill:** Remove piped shell install and explicit credential paths from docs ([#365](https://github.com/gotempsh/temps/issues/365))
+- **deployments:** Emit deploy_succeeded telemetry on the real success path ([#372](https://github.com/gotempsh/temps/issues/372))
+- **webhooks:** Pin delivery to validated IP to close DNS-rebinding SSRF ([#332](https://github.com/gotempsh/temps/issues/332))
+- **observability:** Read active Timescale policies ([#378](https://github.com/gotempsh/temps/issues/378))
+
+## [0.1.0-beta.49] - 2026-07-16
+
+### Added
+
+- **analytics:** Add insights panel with stat and AI insights
+- **analytics:** Put insights behind a compact toggle button
+- **ai-chat:** Default-on read-only chat; route analytics AI insights through project chat
+- **analytics:** Add raw event entries drill-down with JSON props view ([#359](https://github.com/gotempsh/temps/issues/359))
+- **settings:** Show web-console banner when a newer release is available ([#353](https://github.com/gotempsh/temps/issues/353))
+
+### Fixed
+
+- **analytics:** Harden AI insights prompt + warn on partial AI disable
+- **proxy:** Harden preview cookie session handling ([#361](https://github.com/gotempsh/temps/issues/361))
+
+### Miscellaneous
+
+- **web:** Replace rocketship logo assets with the t brand mark ([#358](https://github.com/gotempsh/temps/issues/358))
+
+### Performance
+
+- **metrics:** Time-bound external-service latest-metric queries ([#364](https://github.com/gotempsh/temps/issues/364))
+
+## [0.1.0-beta.48] - 2026-07-15
+
+### Added
+
+- **skills:** Add estimate-temps-savings skill ([#357](https://github.com/gotempsh/temps/issues/357))
+
+### Fixed
+
+- **backup:** Stop stranding failed uploads that block retention cleanup ([#356](https://github.com/gotempsh/temps/issues/356))
+
+### Miscellaneous
+
+- **mcp:** Remove @temps-sdk/mcp package ([#355](https://github.com/gotempsh/temps/issues/355)) [**BREAKING**]
+
+## [0.1.0-beta.47] - 2026-07-15
+
+### Added
+
+- **error-tracking:** Deep-link error alert emails, verify Slack stays HTML-free ([#308](https://github.com/gotempsh/temps/issues/308))
+- **analytics:** Add daily returning visitor metric ([#346](https://github.com/gotempsh/temps/issues/346))
+- **backups:** Add retention cleanup and manual deletion ([#336](https://github.com/gotempsh/temps/issues/336))
+- **monitoring:** Monitor all mounted disks for disk-space alerts ([#349](https://github.com/gotempsh/temps/issues/349))
+- **settings:** Add flat public hostname strategy ([#146](https://github.com/gotempsh/temps/issues/146))
+
+### CI
+
+- Remove dependabot auto-merge workflow ([#345](https://github.com/gotempsh/temps/issues/345))
+
+### Fixed
+
+- **metrics:** Don't UNION checkpoint queries across pg_stat_checkpointer/bgwriter ([#290](https://github.com/gotempsh/temps/issues/290))
+- **metrics:** Use mongodb's re-exported bson instead of a standalone dep ([#291](https://github.com/gotempsh/temps/issues/291))
+- **migrations:** Skip empty visitor deduplication rewrites ([#294](https://github.com/gotempsh/temps/issues/294))
+- **deployer:** Harden compose deployments
+- **deployer:** Close compose security policy bypasses from review
+- **deployer:** Reject interpolation bypass and confine compose paths
+- **deployer:** Prevent compose conflict container deletion
+- **deployer:** Fold inline compose override allow-list into host-escape hardening
+- **deployer:** Close compose host-escape bypasses found in review
+- **core:** Update node pki for rcgen 0.14
+- **deps:** Resolve RustSec advisory updates
+- **proxy:** Update test cert generation for rcgen 0.14
+- **deployer:** Close volumes_from and absolute bind-mount host-escape bypasses
+- **deployer:** Close remaining compose host-escape gaps from review
+- **deployer:** Close compose symlink escape paths
+- **deployments:** Cap hosted website memory by default ([#164](https://github.com/gotempsh/temps/issues/164))
+- **deps:** Unbreak build — pin aws-smithy (schema 0.1.0) and revert sqlx to 0.8 ([#333](https://github.com/gotempsh/temps/issues/333))
+- **auth:** Prevent MFA challenge session from authenticating real requests ([#326](https://github.com/gotempsh/temps/issues/326))
+- **web:** Satisfy ESLint 10 assignment rules
+- **git:** Constant-time comparison for GitHub webhook HMAC signatures ([#334](https://github.com/gotempsh/temps/issues/334))
+- **auth:** Close assign_role privilege-escalation (admin gate + single target) ([#324](https://github.com/gotempsh/temps/issues/324))
+- **webhooks:** Close retry_delivery cross-tenant IDOR ([#329](https://github.com/gotempsh/temps/issues/329))
+- **otel:** Make otel_spans compression effective by dropping trace_id from segmentby ([#348](https://github.com/gotempsh/temps/issues/348))
+- **compose:** Require DB/Redis secrets, stop publishing internal ports on 0.0.0.0 ([#330](https://github.com/gotempsh/temps/issues/330))
+- **git:** Bind webhook tokens to projects ([#335](https://github.com/gotempsh/temps/issues/335))
+- **query-postgres:** Block function-call SQLi bypass in data-explorer WHERE clauses ([#328](https://github.com/gotempsh/temps/issues/328))
+
+### Miscellaneous
+
+- **deployer:** Narrow compose hardening scope
+- **deps-dev:** Bump @eslint/js from 9.37.0 to 10.0.1 in /web
+
+### Performance
+
+- **web:** Lazy-load and paginate proxy traffic-by-project table ([#292](https://github.com/gotempsh/temps/issues/292))
+
+### Styling
+
+- **deployer:** Cargo fmt compose policy
+
+### Testing
+
+- **metrics:** Regression coverage for pg_stat_checkpointer/bgwriter query ([#293](https://github.com/gotempsh/temps/issues/293))
 
 ## [0.1.0-beta.46] - 2026-07-12
 

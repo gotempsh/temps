@@ -231,28 +231,43 @@ async fn bitbucket_webhook_events(
         None
     };
 
-    // Dispatch through the existing push-event machinery (shared by push and PR).
-    let triggered = if let Err(e) = state
-        .git_provider_manager
-        .handle_push_event(
-            repo_owner.clone(),
-            repo_name.clone(),
-            branch.clone(),
-            tag.clone(),
-            commit_sha.clone(),
-        )
-        .await
-    {
-        error!(
+    let authorized_projects =
+        matched_projects_for_repository(matched_projects, repo_owner.as_str(), repo_name.as_str());
+
+    if authorized_projects.is_empty() {
+        warn!(
             hook_uuid = %hook_uuid,
             repo_owner = %repo_owner,
             repo_name = %repo_name,
-            event_key = %event_key,
-            "Failed to handle Bitbucket event: {:?}", e
+            "Bitbucket webhook token matched projects for a different repository — ignoring"
         );
-        0
-    } else {
-        matched_projects.len()
+        return axum::Json(BitbucketWebhookResponse {
+            message: "processed".to_string(),
+        });
+    }
+
+    // Dispatch only to projects authenticated by the matched delivery token.
+    let triggered = match state
+        .git_provider_manager
+        .handle_push_event_for_projects(
+            branch.clone(),
+            tag.clone(),
+            commit_sha.clone(),
+            authorized_projects,
+        )
+        .await
+    {
+        Ok(triggered) => triggered,
+        Err(e) => {
+            error!(
+                hook_uuid = %hook_uuid,
+                repo_owner = %repo_owner,
+                repo_name = %repo_name,
+                event_key = %event_key,
+                "Failed to handle Bitbucket event: {:?}", e
+            );
+            0
+        }
     };
 
     info!(
@@ -362,9 +377,78 @@ fn extract_push_ref_and_commit(payload: &serde_json::Value) -> (String, String) 
     (git_ref, commit_sha)
 }
 
+fn matched_projects_for_repository(
+    projects: Vec<temps_entities::projects::Model>,
+    repo_owner: &str,
+    repo_name: &str,
+) -> Vec<temps_entities::projects::Model> {
+    projects
+        .into_iter()
+        .filter(|project| {
+            project.repo_owner.eq_ignore_ascii_case(repo_owner)
+                && project.repo_name.eq_ignore_ascii_case(repo_name)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_project(id: i32, repo_owner: &str, repo_name: &str) -> temps_entities::projects::Model {
+        let now = chrono::Utc::now();
+        temps_entities::projects::Model {
+            id,
+            name: format!("project-{id}"),
+            repo_name: repo_name.to_string(),
+            repo_owner: repo_owner.to_string(),
+            directory: "/".to_string(),
+            main_branch: "main".to_string(),
+            preset: temps_entities::preset::Preset::Vite,
+            preset_config: None,
+            deployment_config: None,
+            created_at: now,
+            updated_at: now,
+            slug: format!("project-{id}"),
+            is_deleted: false,
+            deleted_at: None,
+            last_deployment: None,
+            is_public_repo: false,
+            git_url: None,
+            git_provider_connection_id: None,
+            attack_mode: false,
+            ai_alert_summaries_enabled: None,
+            ai_debug_chat_enabled: None,
+            ai_write_actions_enabled: false,
+            cross_project_trace_sharing: true,
+            enable_preview_environments: false,
+            preview_envs_on_demand: false,
+            preview_envs_idle_timeout_seconds: 300,
+            preview_envs_wake_timeout_seconds: 30,
+            source_type: temps_entities::source_type::SourceType::Git,
+            gitlab_webhook_id: None,
+            gitlab_webhook_signing_token: None,
+            gitea_webhook_signing_token: None,
+            bitbucket_webhook_token: None,
+            bitbucket_webhook_hook_id: None,
+            generic_webhook_token: None,
+        }
+    }
+
+    #[test]
+    fn test_matched_projects_for_repository_filters_token_matches_by_repo() {
+        let projects = vec![
+            test_project(1, "attacker", "demo"),
+            test_project(2, "victim", "prod"),
+        ];
+
+        let authorized = matched_projects_for_repository(projects, "ATTACKER", "Demo");
+
+        assert_eq!(authorized.len(), 1);
+        assert_eq!(authorized[0].id, 1);
+        assert_eq!(authorized[0].repo_owner, "attacker");
+        assert_eq!(authorized[0].repo_name, "demo");
+    }
 
     // ── extract_push_ref_and_commit ───────────────────────────────────────────
 

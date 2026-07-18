@@ -1,10 +1,12 @@
 import { ExternalServiceInfo, ProjectResponse } from '@/api/client'
 import {
+  externalServiceMetricsGetRangeOptions,
   linkServiceToProjectMutation,
   listProjectServicesOptions,
   listServicesOptions,
   unlinkServiceFromProjectMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { MetricSparkline } from '@/components/charts/metric-sparkline'
 import { CreateServiceButton } from '@/components/storage/CreateServiceButton'
 import EmptyStateStorage from '@/components/storage/EmptyStateStorage'
 import { Badge } from '@/components/ui/badge'
@@ -20,7 +22,7 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { ServiceLogo } from '@/components/ui/service-logo'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
-import { cn } from '@/lib/utils'
+import { cn, formatBytes } from '@/lib/utils'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   ChevronRight,
@@ -40,14 +42,60 @@ import { toast } from 'sonner'
 function getProjectResourcePath(
   serviceType: string,
   projectSlug: string,
-  environment = 'production',
+  environment = 'production'
 ): string {
-  if (serviceType === 's3' || serviceType === 'rustfs' || serviceType === 'minio') {
+  if (
+    serviceType === 's3' ||
+    serviceType === 'rustfs' ||
+    serviceType === 'minio'
+  ) {
     return `${projectSlug}-${environment}`.replace(/_/g, '-').toLowerCase()
   }
   const raw = `${projectSlug}_${environment}`.toLowerCase()
   const normalized = raw.replace(/[^a-z0-9]/g, '_')
   return /^\d/.test(normalized) ? `db_${normalized}` : normalized
+}
+
+/**
+ * Compact 1h sparkline + current value for one container resource metric of
+ * a linked service. Renders nothing when the service has no metric history
+ * (monitoring disabled, service stopped) so unmonitored rows stay clean.
+ */
+function ResourceSparkline({
+  serviceId,
+  metric,
+  label,
+  format,
+}: {
+  serviceId: number
+  metric: string
+  label: string
+  format: (value: number) => string
+}) {
+  const { data } = useQuery({
+    ...externalServiceMetricsGetRangeOptions({
+      path: { id: serviceId },
+      query: { metric, range: '1h' },
+    }),
+    staleTime: 30_000,
+    refetchInterval: 30_000,
+    // Metrics disabled on the service → the endpoint 503s; don't retry-spam.
+    retry: false,
+  })
+
+  if (!data?.length) return null
+
+  const values = data.map((p) => p.value)
+  const last = values[values.length - 1]
+
+  return (
+    <div className="hidden w-24 shrink-0 flex-col items-stretch gap-0.5 lg:flex">
+      <MetricSparkline data={values} height={16} />
+      <span className="text-right text-[10px] tabular-nums text-muted-foreground">
+        {label} {format(last)}
+      </span>
+    </div>
+  )
 }
 
 function ServiceRow({
@@ -67,7 +115,7 @@ function ServiceRow({
 
   const primaryHref = isLinked
     ? `/storage/${service.id}/browse?path=${encodeURIComponent(
-        getProjectResourcePath(service.service_type, projectSlug),
+        getProjectResourcePath(service.service_type, projectSlug)
       )}`
     : `/storage/${service.id}`
 
@@ -87,7 +135,7 @@ function ServiceRow({
       className={cn(
         'group flex items-center gap-4 px-3 py-3',
         'cursor-pointer transition-colors',
-        'hover:bg-muted/60 focus-visible:bg-muted/60 focus-visible:outline-none',
+        'hover:bg-muted/60 focus-visible:bg-muted/60 focus-visible:outline-none'
       )}
     >
       <div className="shrink-0">
@@ -115,6 +163,23 @@ function ServiceRow({
             : ''}
         </p>
       </div>
+
+      {isLinked ? (
+        <>
+          <ResourceSparkline
+            serviceId={service.id}
+            metric="container.cpu_percent"
+            label="CPU"
+            format={(v) => `${v.toFixed(1)}%`}
+          />
+          <ResourceSparkline
+            serviceId={service.id}
+            metric="container.memory_used_bytes"
+            label="Mem"
+            format={formatBytes}
+          />
+        </>
+      ) : null}
 
       <div
         className="flex items-center gap-1"
@@ -166,7 +231,9 @@ function ServiceRow({
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="w-48">
-            <DropdownMenuItem onSelect={() => navigate(`/storage/${service.id}`)}>
+            <DropdownMenuItem
+              onSelect={() => navigate(`/storage/${service.id}`)}
+            >
               View details
             </DropdownMenuItem>
             {isLinked ? (
@@ -174,8 +241,8 @@ function ServiceRow({
                 onSelect={() =>
                   navigate(
                     `/storage/${service.id}/browse?path=${encodeURIComponent(
-                      getProjectResourcePath(service.service_type, projectSlug),
-                    )}`,
+                      getProjectResourcePath(service.service_type, projectSlug)
+                    )}`
                   )
                 }
               >
@@ -293,7 +360,8 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
           Databases
         </h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          Link Postgres, MongoDB, Redis, or S3-compatible services to this project.
+          Link Postgres, MongoDB, Redis, or S3-compatible services to this
+          project.
           {totalCount > 0 ? (
             <span className="ml-1 tabular-nums">
               {linkedCount} of {totalCount} linked.
@@ -317,7 +385,10 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
       <div className="flex-1 overflow-auto">
         <div className="space-y-6 p-4 md:p-6">
           {header}
-          <ul role="list" className="divide-y divide-border rounded-lg border border-border">
+          <ul
+            role="list"
+            className="divide-y divide-border rounded-lg border border-border"
+          >
             {[...Array(4)].map((_, i) => (
               <li key={i} className="flex items-center gap-4 px-3 py-3">
                 <div className="size-8 shrink-0 animate-pulse rounded-md bg-muted" />
@@ -344,8 +415,8 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
             <AlertTitle>How databases work in Temps</AlertTitle>
             <AlertDescription className="text-muted-foreground">
               One service (e.g. Postgres) hosts databases for{' '}
-              <strong>all your projects</strong>. When you link a service
-              here, Temps automatically creates a dedicated{' '}
+              <strong>all your projects</strong>. When you link a service here,
+              Temps automatically creates a dedicated{' '}
               <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs">
                 {`<project>_<env>`}
               </code>{' '}
@@ -360,10 +431,10 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
   }
 
   const linkedServices = services.filter((s) =>
-    servicesLinked?.some((l) => l.service.id === s.id),
+    servicesLinked?.some((l) => l.service.id === s.id)
   )
   const availableServices = services.filter(
-    (s) => !servicesLinked?.some((l) => l.service.id === s.id),
+    (s) => !servicesLinked?.some((l) => l.service.id === s.id)
   )
 
   return (
@@ -394,7 +465,10 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
                 {linkedServices.length}
               </span>
             </div>
-            <ul role="list" className="divide-y divide-border rounded-lg border border-border overflow-hidden">
+            <ul
+              role="list"
+              className="divide-y divide-border rounded-lg border border-border overflow-hidden"
+            >
               {linkedServices.map((service) => (
                 <ServiceRow
                   key={service.id}
@@ -417,7 +491,10 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
                 {availableServices.length}
               </span>
             </div>
-            <ul role="list" className="divide-y divide-border rounded-lg border border-border overflow-hidden">
+            <ul
+              role="list"
+              className="divide-y divide-border rounded-lg border border-border overflow-hidden"
+            >
               {availableServices.map((service) => (
                 <ServiceRow
                   key={service.id}

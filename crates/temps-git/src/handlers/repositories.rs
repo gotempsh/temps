@@ -6,9 +6,15 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::{permission_check, Permission, RequireAuth};
+use temps_auth::{permission_check, AuthContext, AuthSource, Permission, RequireAuth};
 use temps_core::{error_builder::ErrorBuilder, problemdetails::Problem};
+use tracing::warn;
 use utoipa::{IntoParams, OpenApi, ToSchema};
+
+use crate::services::{
+    cache::CommitCacheKey,
+    git_provider::{Commit, GitProviderError},
+};
 
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct ConnectionQueryParams {
@@ -53,6 +59,57 @@ pub struct TagListResponse {
 pub struct CommitExistsResponse {
     pub exists: bool,
     pub commit_sha: Option<String>,
+    /// Commit metadata when the requested SHA exists.
+    pub commit: Option<CommitInfo>,
+}
+
+impl CommitExistsResponse {
+    fn missing() -> Self {
+        Self {
+            exists: false,
+            commit_sha: None,
+            commit: None,
+        }
+    }
+
+    fn found(commit: Commit) -> Self {
+        let commit_sha = commit.sha.clone();
+        Self {
+            exists: true,
+            commit_sha: Some(commit_sha),
+            commit: Some(commit.into()),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+enum CommitShaValidationError {
+    #[error("commit SHA must contain between 7 and 40 hexadecimal characters")]
+    InvalidLength,
+    #[error("commit SHA must contain only hexadecimal characters")]
+    NonHexadecimal,
+}
+
+fn normalize_commit_sha(commit_sha: &str) -> Result<String, CommitShaValidationError> {
+    if !(7..=40).contains(&commit_sha.len()) {
+        return Err(CommitShaValidationError::InvalidLength);
+    }
+    if !commit_sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(CommitShaValidationError::NonHexadecimal);
+    }
+    Ok(commit_sha.to_ascii_lowercase())
+}
+
+fn commit_lookup_principal(auth: &AuthContext) -> String {
+    match &auth.source {
+        AuthSource::Session { user } | AuthSource::CliToken { user } => {
+            format!("user:{}", user.id)
+        }
+        AuthSource::ApiKey { key_id, .. } => format!("api-key:{}", key_id),
+        AuthSource::DeploymentToken { token_id, .. } => {
+            format!("deployment-token:{}", token_id)
+        }
+    }
 }
 
 /// Get repository branches
@@ -531,9 +588,12 @@ pub async fn get_tags_by_repository_id(
     ),
     responses(
         (status = 200, description = "Commit existence check result", body = CommitExistsResponse),
+        (status = 400, description = "Invalid commit SHA"),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Repository not found"),
-        (status = 500, description = "Internal server error")
+        (status = 429, description = "Commit lookup rate limit exceeded"),
+        (status = 500, description = "Internal server error"),
+        (status = 502, description = "Git provider request failed")
     ),
     tag = "Repositories",
     security(
@@ -548,6 +608,13 @@ pub async fn check_commit_exists(
     // Check permission
     permission_check!(auth, Permission::GitRepositoriesRead);
 
+    let commit_sha = normalize_commit_sha(&commit_sha).map_err(|error| {
+        ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Invalid Commit SHA")
+            .detail(error.to_string())
+            .build()
+    })?;
+
     // Find the repository by ID
     let repository = state
         .git_provider_manager
@@ -556,6 +623,19 @@ pub async fn check_commit_exists(
 
     // Check if repository has a git provider connection
     let connection_id = repository.git_provider_connection_id;
+
+    let cache_key = CommitCacheKey::new(
+        connection_id,
+        repository.owner.clone(),
+        repository.name.clone(),
+        commit_sha.clone(),
+    );
+    if let Some(cached_commit) = state.cache_manager.commits.get(&cache_key).await {
+        return Ok(Json(match cached_commit {
+            Some(commit) => CommitExistsResponse::found(commit),
+            None => CommitExistsResponse::missing(),
+        }));
+    }
 
     // Get the connection and provider
     let connection = state
@@ -591,21 +671,59 @@ pub async fn check_commit_exists(
                 .build()
         })?;
 
-    // Check if commit exists using the git provider
-    let exists = provider_service
-        .check_commit_exists(
+    let principal = commit_lookup_principal(&auth);
+    state
+        .cache_manager
+        .commit_lookup_rate_limiter
+        .check(&principal)
+        .await
+        .map_err(|retry_after_seconds| {
+            ErrorBuilder::new(StatusCode::TOO_MANY_REQUESTS)
+                .title("Commit Lookup Rate Limit Exceeded")
+                .detail("Too many uncached commit lookups. Please retry later.")
+                .value("retry_after_seconds", retry_after_seconds)
+                .build()
+        })?;
+
+    let commit_result = provider_service
+        .get_commit(
             &access_token,
             &repository.owner,
             &repository.name,
             &commit_sha,
         )
-        .await
-        .unwrap_or(false); // If there's an error checking, assume it doesn't exist
+        .await;
 
-    Ok(Json(CommitExistsResponse {
-        exists,
-        commit_sha: if exists { Some(commit_sha) } else { None },
-    }))
+    match commit_result {
+        Ok(commit) => {
+            state
+                .cache_manager
+                .commits
+                .set(cache_key, Some(commit.clone()))
+                .await;
+            Ok(Json(CommitExistsResponse::found(commit)))
+        }
+        Err(GitProviderError::CommitNotFound { .. }) => {
+            state.cache_manager.commits.set(cache_key, None).await;
+            Ok(Json(CommitExistsResponse::missing()))
+        }
+        Err(error @ GitProviderError::RateLimitExceeded) => Err(error.into()),
+        Err(error) => {
+            warn!(
+                repository_id,
+                connection_id,
+                owner = %repository.owner,
+                repository = %repository.name,
+                commit_sha = %commit_sha,
+                error = %error,
+                "Git provider commit lookup failed"
+            );
+            Err(ErrorBuilder::new(StatusCode::BAD_GATEWAY)
+                .title("Failed to fetch commit details")
+                .detail("The git provider could not complete the commit lookup.")
+                .build())
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -629,6 +747,18 @@ pub struct CommitInfo {
     /// Commit date in ISO 8601 format
     #[schema(value_type = String, format = DateTime, example = "2025-10-12T12:15:47.609192Z")]
     pub date: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<crate::services::git_provider::Commit> for CommitInfo {
+    fn from(commit: crate::services::git_provider::Commit) -> Self {
+        Self {
+            sha: commit.sha,
+            message: commit.message,
+            author: commit.author,
+            author_email: commit.author_email,
+            date: commit.date,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -767,3 +897,77 @@ pub async fn list_commits_by_repository_id(
     )
 )]
 pub struct RepositoriesApiDoc;
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_commit_sha, CommitExistsResponse, CommitShaValidationError};
+    use crate::services::git_provider::Commit;
+
+    #[test]
+    fn missing_commit_response_has_no_commit_metadata() {
+        let response = CommitExistsResponse::missing();
+
+        assert!(!response.exists);
+        assert!(response.commit_sha.is_none());
+        assert!(response.commit.is_none());
+    }
+
+    #[test]
+    fn found_commit_response_includes_provider_metadata() {
+        let response = CommitExistsResponse::found(Commit {
+            sha: "0123456789abcdef".to_string(),
+            message: "Show commit details".to_string(),
+            author: "Temps Contributor".to_string(),
+            author_email: "contributor@example.com".to_string(),
+            date: chrono::DateTime::UNIX_EPOCH,
+        });
+
+        assert!(response.exists);
+        assert_eq!(response.commit_sha.as_deref(), Some("0123456789abcdef"));
+        let commit = response.commit.as_ref();
+        assert_eq!(
+            commit.map(|value| value.sha.as_str()),
+            Some("0123456789abcdef")
+        );
+        assert_eq!(
+            commit.map(|value| value.message.as_str()),
+            Some("Show commit details")
+        );
+        assert_eq!(
+            commit.map(|value| value.author.as_str()),
+            Some("Temps Contributor")
+        );
+        assert_eq!(
+            commit.map(|value| value.date),
+            Some(chrono::DateTime::UNIX_EPOCH)
+        );
+    }
+
+    #[test]
+    fn commit_sha_validation_normalizes_hex_case() {
+        assert_eq!(
+            normalize_commit_sha("ABCDEF1234567"),
+            Ok("abcdef1234567".to_string())
+        );
+    }
+
+    #[test]
+    fn commit_sha_validation_rejects_short_long_and_non_hex_values() {
+        assert_eq!(
+            normalize_commit_sha("abcdef"),
+            Err(CommitShaValidationError::InvalidLength)
+        );
+        assert_eq!(
+            normalize_commit_sha("01234567890123456789012345678901234567890"),
+            Err(CommitShaValidationError::InvalidLength)
+        );
+        assert_eq!(
+            normalize_commit_sha("abcdefg"),
+            Err(CommitShaValidationError::NonHexadecimal)
+        );
+        assert_eq!(
+            normalize_commit_sha("abcdef/123456"),
+            Err(CommitShaValidationError::NonHexadecimal)
+        );
+    }
+}

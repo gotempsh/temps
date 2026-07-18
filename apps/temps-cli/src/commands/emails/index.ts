@@ -8,10 +8,11 @@ import {
   getEmailStats,
   validateEmail,
 } from '../../api/sdk.gen.js'
+import type { EmailResponse } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptText, promptConfirm } from '../../ui/prompts.js'
-import { newline, header, icons, json, colors, success, info, warning, keyValue } from '../../ui/output.js'
+import { newline, header, icons, json, colors, success, info, warning, keyValue, formatDate } from '../../ui/output.js'
 
 interface ListOptions {
   json?: boolean
@@ -139,15 +140,15 @@ async function listEmailsAction(options: ListOptions): Promise<void> {
     return
   }
 
-  const columns: TableColumn<Record<string, unknown>>[] = [
-    { header: 'ID', key: 'id', width: 6 },
-    { header: 'To', key: 'to', color: (v) => colors.bold(v) },
+  const columns: TableColumn<EmailResponse>[] = [
+    { header: 'ID', key: 'id', width: 8 },
+    { header: 'To', accessor: (e) => e.to_addresses.join(', '), color: (v) => colors.bold(v) },
     { header: 'Subject', key: 'subject', color: (v) => v.length > 40 ? v.slice(0, 40) + '...' : v },
     { header: 'Status', key: 'status', color: (v) => statusBadge(v === 'delivered' || v === 'sent' ? 'active' : v === 'failed' ? 'error' : 'pending') },
-    { header: 'Sent', accessor: (e) => e.created_at ? new Date(e.created_at as string).toLocaleDateString() : '-' },
+    { header: 'Sent', accessor: (e) => e.sent_at ? new Date(e.sent_at).toLocaleDateString() : new Date(e.created_at).toLocaleDateString() },
   ]
 
-  printTable(emailsData as Record<string, unknown>[], columns, { style: 'minimal' })
+  printTable(emailsData, columns, { style: 'minimal' })
   newline()
 }
 
@@ -247,35 +248,62 @@ async function showEmail(options: ShowOptions): Promise<void> {
     return
   }
 
-  const emailData = email as Record<string, unknown>
+  newline()
+  header(`${icons.info} Email #${email.id}`)
+  keyValue('From', email.from_name ? `${email.from_name} <${email.from_address}>` : email.from_address)
+  keyValue('To', email.to_addresses.join(', '))
+  if (email.cc_addresses && email.cc_addresses.length > 0) {
+    keyValue('CC', email.cc_addresses.join(', '))
+  }
+  if (email.bcc_addresses && email.bcc_addresses.length > 0) {
+    keyValue('BCC', email.bcc_addresses.join(', '))
+  }
+  keyValue('Subject', email.subject)
+  keyValue('Status', statusBadge(
+    email.status === 'delivered' || email.status === 'sent' ? 'active' :
+    email.status === 'failed' ? 'error' : 'pending'
+  ))
+  keyValue('Created', formatDate(email.created_at))
+  if (email.sent_at) {
+    keyValue('Sent', formatDate(email.sent_at))
+  }
+  if (email.domain_id !== null && email.domain_id !== undefined) {
+    keyValue('Domain ID', email.domain_id)
+  }
+  if (email.project_id !== null && email.project_id !== undefined) {
+    keyValue('Project ID', email.project_id)
+  }
+  if (email.tags && email.tags.length > 0) {
+    keyValue('Tags', email.tags.join(', '))
+  }
 
   newline()
-  header(`${icons.info} Email #${emailData.id}`)
-  keyValue('To', emailData.to as string)
-  if (emailData.from) {
-    keyValue('From', emailData.from as string)
+  header('Tracking')
+  keyValue('Open Tracking', email.track_opens ? colors.success('Enabled') : 'Disabled')
+  keyValue('Opens', email.open_count)
+  if (email.first_opened_at) {
+    keyValue('First Opened', formatDate(email.first_opened_at))
   }
-  keyValue('Subject', emailData.subject as string)
-  keyValue('Status', statusBadge(
-    (emailData.status as string) === 'delivered' || (emailData.status as string) === 'sent' ? 'active' :
-    (emailData.status as string) === 'failed' ? 'error' : 'pending'
-  ))
-  if (emailData.created_at) {
-    keyValue('Sent', new Date(emailData.created_at as string).toLocaleString())
-  }
-  if (emailData.delivered_at) {
-    keyValue('Delivered', new Date(emailData.delivered_at as string).toLocaleString())
+  keyValue('Click Tracking', email.track_clicks ? colors.success('Enabled') : 'Disabled')
+  keyValue('Clicks', email.click_count)
+  if (email.first_clicked_at) {
+    keyValue('First Clicked', formatDate(email.first_clicked_at))
   }
 
-  if (emailData.body) {
+  const body = email.text_body || email.html_body
+  if (body) {
     newline()
     header('Body')
-    console.log(`  ${emailData.body}`)
+    // Email bodies are attacker-controlled (anything sent through the
+    // platform's send API) — strip ANSI/control escape sequences before
+    // printing so a crafted body can't manipulate the cursor, hide/spoof
+    // output, or set the terminal window title.
+    console.log(`  ${body.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '')}`)
   }
 
-  if (emailData.error_message) {
+  if (email.error_message) {
     newline()
-    warning(`Error: ${emailData.error_message}`)
+    warning(`Error: ${email.error_message}`)
   }
 
   newline()
@@ -298,27 +326,13 @@ async function emailStats(options: StatsOptions): Promise<void> {
     return
   }
 
-  const statsData = stats as Record<string, unknown>
-
   newline()
   header(`${icons.info} Email Statistics`)
-  if (statsData.total_sent !== undefined) {
-    keyValue('Total Sent', String(statsData.total_sent))
-  }
-  if (statsData.total_delivered !== undefined) {
-    keyValue('Total Delivered', colors.success(String(statsData.total_delivered)))
-  }
-  if (statsData.total_failed !== undefined) {
-    keyValue('Total Failed', colors.error(String(statsData.total_failed)))
-  }
-  if (statsData.total_pending !== undefined) {
-    keyValue('Total Pending', colors.warning(String(statsData.total_pending)))
-  }
-  if (statsData.delivery_rate !== undefined) {
-    const rate = statsData.delivery_rate as number
-    const rateColor = rate >= 95 ? colors.success : rate >= 80 ? colors.warning : colors.error
-    keyValue('Delivery Rate', rateColor(`${rate.toFixed(1)}%`))
-  }
+  keyValue('Total', stats.total)
+  keyValue('Sent', colors.success(String(stats.sent)))
+  keyValue('Queued', colors.warning(String(stats.queued)))
+  keyValue('Failed', colors.error(String(stats.failed)))
+  keyValue('Captured (no provider configured)', stats.captured)
   newline()
 }
 

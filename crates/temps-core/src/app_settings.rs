@@ -17,6 +17,11 @@ pub struct AppSettings {
     /// `external_url`, which is the public-facing address.
     pub internal_url: Option<String>,
     pub preview_domain: String,
+    /// Public edge target that generated DNS records point at when a managed
+    /// domain opts into automatic record sync. An IPv4/IPv6 address produces an
+    /// `A`/`AAAA` record; anything else is treated as a `CNAME` target. `None`
+    /// disables DNS record sync regardless of per-domain opt-in.
+    pub edge_target: Option<String>,
 
     // Screenshot settings
     pub screenshots: ScreenshotSettings,
@@ -79,6 +84,14 @@ pub struct AppSettings {
     /// Metrics observability settings. Controls the MetricsStore backend,
     /// scrape interval, and tiered retention windows.
     pub monitoring: MonitoringSettings,
+
+    /// TimescaleDB compression delays for immutable observability data.
+    /// Changes are applied at runtime by the Settings API.
+    pub observability_compression: ObservabilityCompressionSettings,
+
+    /// Retention windows for raw proxy and OpenTelemetry telemetry.
+    /// TimescaleDB policies are updated at runtime by the Settings API.
+    pub observability_retention: ObservabilityRetentionSettings,
 
     /// Set to `true` by `temps setup` (all modes) once initial configuration
     /// has been applied. The web onboarding wizard reads this from the server
@@ -687,12 +700,71 @@ pub struct MonitoringSettings {
     pub retention_hourly_days: u32,
 
     /// How many years of daily-aggregate data to keep (converted to days internally).
-    #[schema(minimum = 1, example = 2)]
+    #[schema(minimum = 1, maximum = 10, example = 2)]
     pub retention_daily_years: u32,
 
     /// ClickHouse DSN, required only when `store = "click_house"`.
     /// Example: `"http://localhost:8123"`.
     pub clickhouse_url: Option<String>,
+}
+
+/// TimescaleDB compression policy configuration for append-only observability
+/// tables. Values are expressed in hours so operators can choose sub-day
+/// windows while keeping the API representation unambiguous.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct ObservabilityCompressionSettings {
+    /// Compress proxy-log chunks after this many hours. Defaults to 24 hours.
+    #[schema(minimum = 1, maximum = 720, example = 24)]
+    pub proxy_logs_after_hours: u32,
+
+    /// Compress OpenTelemetry span chunks after this many hours. Defaults to
+    /// 24 hours.
+    #[schema(minimum = 1, maximum = 2160, example = 24)]
+    pub otel_spans_after_hours: u32,
+}
+
+impl Default for ObservabilityCompressionSettings {
+    fn default() -> Self {
+        Self {
+            proxy_logs_after_hours: 24,
+            otel_spans_after_hours: 24,
+        }
+    }
+}
+
+/// Retention policy configuration for raw observability tables. Values are in
+/// days. The Settings API applies them to TimescaleDB; ClickHouse-backed proxy
+/// logs and spans retain their storage-level per-row TTL behavior.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct ObservabilityRetentionSettings {
+    /// Retain proxy request logs for this many days.
+    #[schema(minimum = 1, maximum = 3650, example = 30)]
+    pub proxy_logs_days: u32,
+
+    /// Retain OpenTelemetry spans (traces) for this many days.
+    #[schema(minimum = 1, maximum = 3650, example = 90)]
+    pub otel_spans_days: u32,
+
+    /// Retain OpenTelemetry log events for this many days.
+    #[schema(minimum = 1, maximum = 3650, example = 90)]
+    pub otel_logs_days: u32,
+
+    /// Retain OpenTelemetry metric points for this many days.
+    #[schema(minimum = 1, maximum = 3650, example = 90)]
+    pub otel_metrics_days: u32,
+}
+
+impl Default for ObservabilityRetentionSettings {
+    fn default() -> Self {
+        Self {
+            proxy_logs_days: 30,
+            otel_spans_days: 90,
+            otel_logs_days: 90,
+            otel_metrics_days: 90,
+        }
+    }
 }
 
 impl Default for MonitoringSettings {
@@ -716,6 +788,7 @@ impl Default for AppSettings {
             external_url: None,
             internal_url: None,
             preview_domain: DEFAULT_LOCAL_DOMAIN.to_string(),
+            edge_target: None,
             screenshots: ScreenshotSettings::default(),
             letsencrypt: LetsEncryptSettings::default(),
             dns_provider: DnsProviderSettings::default(),
@@ -733,6 +806,8 @@ impl Default for AppSettings {
             build_limits: BuildLimitsSettings::default(),
             cluster_dns: ClusterDnsSettings::default(),
             monitoring: MonitoringSettings::default(),
+            observability_compression: ObservabilityCompressionSettings::default(),
+            observability_retention: ObservabilityRetentionSettings::default(),
             setup_complete: false,
             require_mfa_for_admins: false,
             console_version: None,
@@ -973,6 +1048,37 @@ mod tests {
     }
 
     #[test]
+    fn legacy_settings_json_uses_observability_retention_defaults() {
+        let parsed = AppSettings::from_json(serde_json::json!({
+            "external_url": "https://paas.example.com",
+            "preview_domain": "localho.st"
+        }));
+
+        assert_eq!(
+            parsed.observability_retention,
+            ObservabilityRetentionSettings::default()
+        );
+        assert_eq!(parsed.observability_retention.proxy_logs_days, 30);
+        assert_eq!(parsed.observability_retention.otel_spans_days, 90);
+    }
+
+    #[test]
+    fn observability_retention_round_trips_through_json() {
+        let mut settings = AppSettings::default();
+        settings.observability_retention.proxy_logs_days = 14;
+        settings.observability_retention.otel_spans_days = 60;
+        settings.observability_retention.otel_logs_days = 45;
+        settings.observability_retention.otel_metrics_days = 30;
+
+        let parsed = AppSettings::from_json(settings.to_json());
+
+        assert_eq!(
+            parsed.observability_retention,
+            settings.observability_retention
+        );
+    }
+
+    #[test]
     fn on_demand_tls_defaults_are_off_and_sensible() {
         let s = OnDemandTlsSettings::default();
         assert!(!s.enabled, "on-demand TLS must be opt-in (off by default)");
@@ -1059,5 +1165,34 @@ mod tests {
         let json = s.to_json();
         let back = AppSettings::from_json(json);
         assert!(back.require_mfa_for_admins);
+    }
+
+    #[test]
+    fn observability_compression_defaults_to_24_hours() {
+        let compression = ObservabilityCompressionSettings::default();
+        assert_eq!(compression.proxy_logs_after_hours, 24);
+        assert_eq!(compression.otel_spans_after_hours, 24);
+    }
+
+    #[test]
+    fn legacy_settings_get_24_hour_observability_compression_defaults() {
+        let parsed = AppSettings::from_json(serde_json::json!({
+            "external_url": "https://paas.example.com",
+            "preview_domain": "localho.st"
+        }));
+
+        assert_eq!(parsed.observability_compression.proxy_logs_after_hours, 24);
+        assert_eq!(parsed.observability_compression.otel_spans_after_hours, 24);
+    }
+
+    #[test]
+    fn observability_compression_round_trips_through_json() {
+        let mut settings = AppSettings::default();
+        settings.observability_compression.proxy_logs_after_hours = 12;
+        settings.observability_compression.otel_spans_after_hours = 48;
+
+        let parsed = AppSettings::from_json(settings.to_json());
+        assert_eq!(parsed.observability_compression.proxy_logs_after_hours, 12);
+        assert_eq!(parsed.observability_compression.otel_spans_after_hours, 48);
     }
 }

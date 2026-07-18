@@ -299,6 +299,32 @@ impl WorkflowExecutionService {
                 // is now handled by the MarkDeploymentCompleteJob that runs as part of the workflow.
                 // We don't perform any additional updates here to avoid duplicate database writes.
 
+                // Anonymous telemetry: the executor only returns Ok once every
+                // required job — including MarkDeploymentCompleteJob, which
+                // flips the deployment to "completed" — has succeeded, so this
+                // is the canonical terminal success point. The Completed arm in
+                // update_deployment_status_with_reason is NOT reached on this
+                // path (finalization bypasses it), so success must be emitted
+                // here to pair with the deploy_attempted event above.
+                let telemetry = self.telemetry();
+                telemetry.report(
+                    temps_core::telemetry::TelemetryEvent::new(
+                        temps_core::telemetry::TelemetryEventKind::DeploySucceeded,
+                    )
+                    .with("source_type", project.source_type.to_string())
+                    .with("preset", project.preset.to_string())
+                    .with("is_preview", environment.is_preview),
+                );
+                // Once-per-instance: "this instance shipped its first deploy".
+                telemetry.report_once(
+                    "first_deploy_succeeded",
+                    temps_core::telemetry::TelemetryEvent::new(
+                        temps_core::telemetry::TelemetryEventKind::FirstDeploySucceeded,
+                    )
+                    .with("source_type", project.source_type.to_string())
+                    .with("preset", project.preset.to_string()),
+                );
+
                 // NOW teardown previous deployment for zero-downtime deployment
                 // This happens AFTER the new deployment is fully running
                 info!("Checking for previous deployments to teardown after successful deployment");
@@ -1663,10 +1689,11 @@ impl WorkflowExecutionService {
                 ))
             })?;
 
-        // Non-identifying deploy labels for telemetry (best-effort). Looked up
-        // once here so both the success and failure telemetry below can report
-        // which preset / source type the deploy used — that's what lets us see
-        // *which* presets fail most, not just the overall failure rate.
+        // Non-identifying deploy labels for the failure telemetry below —
+        // best-effort lookup so deploy_failed can report which preset / source
+        // type the deploy used. That's what lets us see *which* presets fail
+        // most, not just the overall failure rate. (Success telemetry is
+        // emitted in execute_deployment_workflow, not here.)
         let (telemetry_source_type, telemetry_preset) =
             match projects::Entity::find_by_id(updated_deployment.project_id)
                 .one(self.db.as_ref())
@@ -1725,31 +1752,14 @@ impl WorkflowExecutionService {
                     );
                 }
 
-                // Anonymous telemetry: this is the single canonical terminal
-                // success point for a deployment. `first_deploy_succeeded` is
-                // emitted alongside; the central API dedupes it per instance.
-                // Both carry the non-identifying preset/source_type so success
-                // rates can be sliced by build type.
-                let telemetry = self.telemetry();
-                telemetry.report(
-                    temps_core::telemetry::TelemetryEvent::new(
-                        temps_core::telemetry::TelemetryEventKind::DeploySucceeded,
-                    )
-                    .with_opt("source_type", telemetry_source_type.clone())
-                    .with_opt("preset", telemetry_preset.clone()),
-                );
-                // Once-per-instance: "this instance shipped its first deploy".
-                // Guard so it fires once (the central API previously deduped
-                // this; report_once makes the binary itself emit exactly once),
-                // not on every successful deploy.
-                telemetry.report_once(
-                    "first_deploy_succeeded",
-                    temps_core::telemetry::TelemetryEvent::new(
-                        temps_core::telemetry::TelemetryEventKind::FirstDeploySucceeded,
-                    )
-                    .with_opt("source_type", telemetry_source_type.clone())
-                    .with_opt("preset", telemetry_preset.clone()),
-                );
+                // Anonymous telemetry for deploy success is NOT emitted here.
+                // On the real success path, finalization is done by
+                // MarkDeploymentCompleteJob (which writes state="completed"
+                // directly), so this Completed arm is never reached for a
+                // normal deploy. `deploy_succeeded` / `first_deploy_succeeded`
+                // are emitted in execute_deployment_workflow's Ok arm instead —
+                // emitting here as well would double-count if this arm ever
+                // gains a caller.
             }
             temps_entities::types::PipelineStatus::Failed => {
                 let event = Job::DeploymentFailed(temps_core::DeploymentFailedJob {
@@ -2768,8 +2778,20 @@ mod tests {
             docker,
         );
 
+        // Capture telemetry so we can assert the deploy funnel events fire at
+        // the right points (attempted always; succeeded/failed on the matching
+        // terminal outcome).
+        let telemetry = Arc::new(CapturingTelemetryReporter::default());
+        service.set_telemetry(telemetry.clone());
+
         // Execute workflow - this will use mock services so should succeed
         let result = service.execute_deployment_workflow(deployment.id).await;
+
+        // deploy_attempted fires unconditionally once jobs are loaded.
+        assert!(
+            telemetry.has_event("deploy_attempted"),
+            "deploy_attempted telemetry must fire for every workflow execution"
+        );
 
         // Note: This might fail due to the mock implementations not being complete enough
         // But the structure should be correct
@@ -2783,14 +2805,61 @@ mod tests {
 
                 assert_eq!(updated_deployment.state, "deployed");
                 // Note: container_id field removed after workflow refactoring
+
+                // The success funnel events must fire on the Ok path — this is
+                // the only place they are emitted (MarkDeploymentCompleteJob
+                // bypasses update_deployment_status_with_reason on success).
+                assert!(
+                    telemetry.has_event("deploy_succeeded"),
+                    "deploy_succeeded telemetry must fire when the workflow completes"
+                );
+                assert!(
+                    telemetry.has_event("first_deploy_succeeded"),
+                    "first_deploy_succeeded telemetry must fire on the first successful deploy"
+                );
             }
             Err(e) => {
                 // Log error for debugging
                 eprintln!("Workflow execution error (expected in unit test): {}", e);
-                // In unit tests with mocks, some failures are expected
+                // In unit tests with mocks, some failures are expected — but a
+                // failed workflow must never report success.
+                assert!(
+                    !telemetry.has_event("deploy_succeeded"),
+                    "deploy_succeeded telemetry must not fire when the workflow fails"
+                );
             }
         }
 
         Ok(())
+    }
+
+    /// Telemetry reporter that records every event so tests can assert which
+    /// deploy-funnel events fired.
+    #[derive(Default)]
+    struct CapturingTelemetryReporter {
+        events: std::sync::Mutex<Vec<temps_core::telemetry::TelemetryEvent>>,
+    }
+
+    impl CapturingTelemetryReporter {
+        fn has_event(&self, event_type: &str) -> bool {
+            self.events
+                .lock()
+                .expect("telemetry capture lock poisoned")
+                .iter()
+                .any(|e| e.event_type == event_type)
+        }
+    }
+
+    impl temps_core::telemetry::TelemetryReporter for CapturingTelemetryReporter {
+        fn report(&self, event: temps_core::telemetry::TelemetryEvent) {
+            self.events
+                .lock()
+                .expect("telemetry capture lock poisoned")
+                .push(event);
+        }
+
+        fn is_enabled(&self) -> bool {
+            true
+        }
     }
 }
