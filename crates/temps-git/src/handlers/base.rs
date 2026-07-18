@@ -155,6 +155,16 @@ impl From<GitProviderError> for Problem {
                 .with_type("https://docs.temps.sh/errors/api_error")
                 .with_title("API Error")
                 .with_detail(msg),
+            GitProviderError::CommitNotFound {
+                repository,
+                commit_sha,
+            } => problem_new(StatusCode::NOT_FOUND)
+                .with_type("https://docs.temps.sh/errors/commit_not_found")
+                .with_title("Commit Not Found")
+                .with_detail(format!(
+                    "Commit '{}' was not found in repository '{}'",
+                    commit_sha, repository
+                )),
             GitProviderError::RepositoryAlreadyExists { ref name } => {
                 problem_new(StatusCode::CONFLICT)
                     .with_type("https://docs.temps.sh/errors/repository_already_exists")

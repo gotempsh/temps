@@ -160,6 +160,9 @@ export function RedeploymentModal({
         owner: projectDetails.repo_owner || '',
         name: projectDetails.repo_name || '',
       },
+      query: {
+        connection_id: projectDetails.git_provider_connection_id || 0,
+      },
     }),
     enabled:
       isOpen &&
