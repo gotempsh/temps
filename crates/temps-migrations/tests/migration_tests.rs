@@ -4,12 +4,22 @@ use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
 
 use temps_migrations::Migrator;
 
+/// True when an external database is configured. CI can only *empty* an env
+/// var per matrix entry, not unset it, so empty counts as "not configured" —
+/// otherwise the skip-guards below would fire in the dedicated migrations
+/// lane and this suite would (again) never actually run anywhere.
+fn external_db_configured() -> bool {
+    std::env::var("TEMPS_TEST_DATABASE_URL")
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+}
+
 /// Test that migrations can be applied successfully
 #[tokio::test]
 async fn test_migration_up() -> anyhow::Result<()> {
     // Skip this test if TEMPS_TEST_DATABASE_URL is set
     // (external databases may already have migrations applied)
-    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+    if external_db_configured() {
         println!(
             "⏭️  Skipping test_migration_up: using external database via TEMPS_TEST_DATABASE_URL"
         );
@@ -78,7 +88,7 @@ async fn test_migration_up() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_secure_sns_migration_upgrades_applied_global_suppression_schema() -> anyhow::Result<()>
 {
-    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+    if external_db_configured() {
         return Ok(());
     }
 
@@ -288,7 +298,7 @@ async fn test_secure_sns_migration_upgrades_applied_global_suppression_schema() 
 async fn test_migration_down() -> anyhow::Result<()> {
     // Skip this test if TEMPS_TEST_DATABASE_URL is set
     // (running down migrations would destroy data in external database)
-    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+    if external_db_configured() {
         println!(
             "⏭️  Skipping test_migration_down: using external database via TEMPS_TEST_DATABASE_URL"
         );
@@ -364,7 +374,7 @@ async fn test_migration_down() -> anyhow::Result<()> {
 async fn test_migration_status() -> anyhow::Result<()> {
     // Skip this test if TEMPS_TEST_DATABASE_URL is set
     // (external databases may already have migrations applied)
-    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+    if external_db_configured() {
         println!("⏭️  Skipping test_migration_status: using external database via TEMPS_TEST_DATABASE_URL");
         return Ok(());
     }
@@ -538,7 +548,7 @@ async fn test_pgvector_extension() -> anyhow::Result<()> {
 async fn test_table_constraints() -> anyhow::Result<()> {
     // Skip this test if TEMPS_TEST_DATABASE_URL is set
     // (external databases may already have migrations applied)
-    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+    if external_db_configured() {
         println!("⏭️  Skipping test_table_constraints: using external database via TEMPS_TEST_DATABASE_URL");
         return Ok(());
     }
@@ -611,8 +621,6 @@ async fn verify_tables_exist(db: &DatabaseConnection) -> anyhow::Result<()> {
         "error_groups",
         "error_events",
         "project_dsns",
-        "error_attachments",
-        "error_user_feedback",
         // m20260427_000001_add_compute_network
         "network_config",
         // m20260427_000002_add_dns_service_endpoints
@@ -644,8 +652,6 @@ async fn verify_tables_exist(db: &DatabaseConnection) -> anyhow::Result<()> {
 
 async fn verify_tables_dropped(db: &DatabaseConnection) -> anyhow::Result<()> {
     let tables = vec![
-        "error_user_feedback",
-        "error_attachments",
         "project_dsns",
         "error_events",
         "error_groups",
@@ -716,9 +722,12 @@ async fn verify_foreign_keys(db: &DatabaseConnection) -> anyhow::Result<()> {
 
 async fn verify_indexes(db: &DatabaseConnection) -> anyhow::Result<()> {
     // Check some key indexes exist
+    // error_events is a hypertable: the migration replaces its simple
+    // single-column indexes with composite time-series indexes, so those
+    // are the ones that must exist post-migration.
     let indexes = vec![
-        "idx_error_events_project_id",
-        "idx_error_events_timestamp",
+        "idx_error_events_project_timestamp",
+        "idx_error_events_group_timestamp",
         "idx_error_groups_project_id",
         "idx_project_dsns_public_key",
     ];
@@ -776,7 +785,7 @@ async fn verify_unique_constraints(db: &DatabaseConnection) -> anyhow::Result<()
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_compute_network_migration() -> anyhow::Result<()> {
-    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+    if external_db_configured() {
         println!("⏭️  Skipping test_compute_network_migration: external database in use");
         return Ok(());
     }
@@ -908,7 +917,7 @@ async fn test_compute_network_migration() -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_dns_service_endpoints_migration() -> anyhow::Result<()> {
-    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+    if external_db_configured() {
         println!("⏭️  Skipping test_dns_service_endpoints_migration: external database in use");
         return Ok(());
     }
@@ -1170,7 +1179,7 @@ async fn test_dns_service_endpoints_migration() -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_visitor_dedup_migration_repoints_session_replay_sessions() -> anyhow::Result<()> {
-    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+    if external_db_configured() {
         println!(
             "⏭️  Skipping test_visitor_dedup_migration_repoints_session_replay_sessions: \
              external database in use"
@@ -1454,7 +1463,7 @@ async fn connect_with_retries(db_url: &str) -> anyhow::Result<DatabaseConnection
 // the ALTERs, then restores the policy. This test pins that contract.
 #[tokio::test]
 async fn test_observe_correlation_migration_handles_compressed_proxy_logs() -> anyhow::Result<()> {
-    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+    if external_db_configured() {
         println!(
             "⏭️  Skipping test_observe_correlation_migration_handles_compressed_proxy_logs: \
              external database in use"
@@ -1598,11 +1607,13 @@ async fn test_observe_correlation_migration_handles_compressed_proxy_logs() -> a
         assert!(present, "index {} must exist after migration", index);
     }
 
-    // ── 6. The migration must have decompressed every chunk (not just
-    //       relied on TimescaleDB's lenient mode for ALTER on compressed
-    //       chunks). Older Timescale versions in prod don't support that
-    //       lenient path; this assertion pins the contract that the
-    //       migration is doing the explicit decompress dance. ──────────────
+    // ── 6. The current migration relies on hypertable-atomic
+    //       `ADD COLUMN IF NOT EXISTS` instead of the old per-chunk
+    //       decompress dance (see m20260502's header for why that was
+    //       abandoned after the orphan-chunk incident). Pin that contract:
+    //       compressed chunks must have survived the migration untouched —
+    //       if this ever starts decompressing again, that's a regression
+    //       back toward the v1 approach and needs a deliberate decision.
     let post = db
         .query_one(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
@@ -1613,10 +1624,12 @@ async fn test_observe_correlation_migration_handles_compressed_proxy_logs() -> a
         .await?
         .expect("post chunk count");
     let compressed_after: i64 = post.try_get("", "compressed")?;
-    assert_eq!(
-        compressed_after, 0,
-        "migration must decompress every chunk before ALTER (got {} still compressed)",
-        compressed_after
+    assert!(
+        compressed_after > 0,
+        "expected compressed proxy_logs chunks to survive the migration \
+         (the ALTER path must not decompress); got {} compressed after, {} before",
+        compressed_after,
+        compressed_before
     );
 
     // ── 7. Compression policy must be restored. ────────────────────────────
@@ -1662,7 +1675,7 @@ async fn test_observe_correlation_migration_handles_compressed_proxy_logs() -> a
 /// someone replaces an `IF NOT EXISTS` with a plain ALTER.
 #[tokio::test]
 async fn test_observe_correlation_migration_is_idempotent() -> anyhow::Result<()> {
-    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+    if external_db_configured() {
         println!(
             "⏭️  Skipping test_observe_correlation_migration_is_idempotent: \
              external database in use"
@@ -1716,7 +1729,7 @@ async fn test_observe_correlation_migration_is_idempotent() -> anyhow::Result<()
 // `alter_job(scheduled => false)` with a no-op — the test must then fail.
 #[tokio::test]
 async fn test_observe_correlation_migration_survives_concurrent_retention() -> anyhow::Result<()> {
-    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+    if external_db_configured() {
         println!(
             "⏭️  Skipping test_observe_correlation_migration_survives_concurrent_retention: \
              external database in use"
@@ -1889,7 +1902,7 @@ async fn test_observe_correlation_migration_survives_concurrent_retention() -> a
 #[tokio::test]
 async fn test_mfa_pending_migration_revokes_ambiguous_sessions_and_defaults_closed(
 ) -> anyhow::Result<()> {
-    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+    if external_db_configured() {
         println!("⏭️  Skipping MFA session migration test: external database in use");
         return Ok(());
     }

@@ -39,7 +39,10 @@ ALTER TABLE backup_jobs
 
         db.execute_unprepared(
             r#"
-ALTER TABLE backup_jobs DROP COLUMN IF EXISTS max_runtime_secs;
+-- IF EXISTS on the table too: m20260517_000002 drops backup_jobs with a
+-- no-op down(), so a full rollback reaches this migration with the table
+-- already gone.
+ALTER TABLE IF EXISTS backup_jobs DROP COLUMN IF EXISTS max_runtime_secs;
             "#,
         )
         .await?;
