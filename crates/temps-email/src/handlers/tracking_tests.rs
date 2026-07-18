@@ -115,9 +115,13 @@ mod tests {
             server_config,
             db.db.clone(),
         ));
+        let tracking_setup_service = Arc::new(crate::services::TrackingSetupService::new(
+            provider_service.clone(),
+            db.db.clone(),
+        ));
         let tracking_service = Arc::new(TrackingService::with_base_url(
             db.db.clone(),
-            config_service,
+            config_service.clone(),
             "http://localhost:3000".to_string(),
         ));
         let suppression_service = Arc::new(SuppressionService::new(db.db.clone()));
@@ -139,6 +143,8 @@ mod tests {
             audit_service: Arc::new(MockAuditLogger),
             dns_provider_service: None,
             telemetry: Arc::new(temps_core::telemetry::NoopTelemetryReporter),
+            tracking_setup_service,
+            config_service,
         });
 
         (db, app_state)

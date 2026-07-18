@@ -2,7 +2,8 @@
 
 use crate::providers::{EmailProviderType, SmtpEncryption};
 use crate::services::{
-    DomainService, EmailService, ProviderService, TrackingService, ValidationService,
+    DomainService, EmailService, ProviderService, TrackingService, TrackingSetupService,
+    ValidationService,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
@@ -22,6 +23,12 @@ pub struct AppState {
     /// DNS provider service for automatic DNS record setup
     pub dns_provider_service: Option<Arc<DnsProviderService>>,
     pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
+    /// AWS-side auto-setup for SES event tracking (SNS topic + webhook
+    /// subscription + SESv2 event destination).
+    pub tracking_setup_service: Arc<TrackingSetupService>,
+    /// For computing the public tracking webhook URL from the configured
+    /// external URL at request time (it can change without a restart).
+    pub config_service: Arc<temps_config::ConfigService>,
 }
 
 // ========================================
@@ -215,6 +222,42 @@ pub struct EmailProviderResponse {
     pub created_at: String,
     #[schema(example = "2025-12-03T10:30:00Z")]
     pub updated_at: String,
+}
+
+/// Live status of the SES event-tracking pipeline for one provider.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct EmailTrackingStatusResponse {
+    /// Public webhook endpoint SNS must deliver events to.
+    #[schema(example = "https://temps.example.com/api/t/webhook/ses")]
+    pub webhook_url: String,
+    /// Only SES providers support SNS event tracking.
+    pub supports_event_tracking: bool,
+    pub sns_topic_arn: Option<String>,
+    /// When the SNS subscription for the current topic was confirmed.
+    /// `null` with a topic set usually means the subscription is still
+    /// pending — most often because the endpoint was subscribed before the
+    /// topic ARN was saved here.
+    #[schema(example = "2026-07-18T10:30:00Z")]
+    pub subscription_confirmed_at: Option<String>,
+    /// Most recent delivered/bounced/complained event recorded for an email
+    /// sent through this provider. `null` means no provider feedback has
+    /// arrived yet.
+    #[schema(example = "2026-07-18T10:31:00Z")]
+    pub last_event_at: Option<String>,
+}
+
+/// Result of the one-click AWS-side event-tracking setup.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct EmailTrackingSetupResponse {
+    #[schema(example = "arn:aws:sns:us-east-1:123456789012:temps-email-events-1")]
+    pub topic_arn: String,
+    pub webhook_url: String,
+    /// The webhook subscription was requested; SNS confirms it
+    /// asynchronously through the webhook itself.
+    pub subscription_requested: bool,
+    /// The SESv2 event destination (bounce/complaint/delivery) is attached
+    /// to the `temps-tracking` configuration set.
+    pub event_destination_attached: bool,
 }
 
 /// Request body for testing an email provider

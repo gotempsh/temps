@@ -22,5 +22,6 @@ pub use plugin::EmailPlugin;
 pub use providers::{EmailProvider, EmailProviderType};
 pub use services::{
     DomainService, EmailService, ProviderService, SuppressionReason, SuppressionService,
-    TrackingService, ValidateEmailRequest, ValidateEmailResponse, ValidationService,
+    TrackingService, TrackingSetupResult, TrackingSetupService, ValidateEmailRequest,
+    ValidateEmailResponse, ValidationService,
 };

@@ -1,0 +1,73 @@
+export const metadata = {
+  title: 'Transactional Email',
+  description: 'Send transactional email through AWS SES, Scaleway, or any SMTP server — with domain verification, open/click tracking, bounce and complaint handling, and a local capture mode.',
+  alternates: {
+    canonical: '/docs/email',
+  },
+}
+
+export const sections = [
+  { title: 'Overview', id: 'overview' },
+  { title: 'Providers', id: 'providers' },
+  { title: 'Domains & DNS', id: 'domains' },
+  { title: 'Sending', id: 'sending' },
+  { title: 'Open & Click Tracking', id: 'open-click-tracking' },
+  { title: 'Delivery Events', id: 'delivery-events' },
+  { title: 'Suppression List', id: 'suppression-list' },
+  { title: 'Capture Mode', id: 'capture-mode' },
+]
+
+# Transactional Email
+
+Temps includes a transactional email service: bring your own provider, verify your sending domains, and get delivery observability — opens, clicks, bounces, and complaints — without a third-party email dashboard. {{ className: 'lead' }}
+
+## Overview {{ id: 'overview' }}
+
+The email service is built around three pieces:
+
+- **Providers** — the upstream service that actually delivers mail: AWS SES, Scaleway Transactional Email, or a generic SMTP server. Credentials are encrypted at rest.
+- **Domains** — sending domains bound to a provider, verified via DNS records (SPF, DKIM, and provider-specific records) that Temps can create automatically when your DNS is managed by a configured DNS provider.
+- **Emails** — every send is recorded with its status (`queued`, `sent`, `failed`, or `captured`), full headers, and a per-email event timeline.
+
+## Providers {{ id: 'providers' }}
+
+Configure providers under **Email → Providers**. Each provider stores its region and encrypted credentials:
+
+| Provider | Credentials | Delivery events |
+| --- | --- | --- |
+| AWS SES | Access key ID + secret | Bounces, complaints, deliveries via SNS |
+| Scaleway | API key + project ID | Not yet supported |
+| SMTP | Host, port, optional auth | Not available |
+
+Use **Test provider** after saving — it sends a test email to your own account address through the provider so failures surface immediately instead of on your first real send.
+
+## Domains & DNS {{ id: 'domains' }}
+
+Add a sending domain under **Email → Domains** and Temps shows the DNS records the provider requires. If the domain's DNS zone is managed by a DNS provider configured in Temps, **Setup DNS** creates the records for you; otherwise create them manually and hit **Verify**.
+
+Emails can only be sent from verified domains.
+
+## Sending {{ id: 'sending' }}
+
+Send through the HTTP API (`POST /api/emails`) or any SDK generated from the OpenAPI spec. Each send records the full message, the provider's message ID (used to correlate delivery events later), and appears in **Email → Sent** with live status.
+
+## Open & Click Tracking {{ id: 'open-click-tracking' }}
+
+When enabled per email, Temps injects a tracking pixel and rewrites links through the instance to record opens and clicks. Two things to know:
+
+- Events land on the email's **Activity** timeline and in **Email → Analytics**.
+- Both mechanisms require your instance's external URL to be reachable by recipients. **Do not enable click tracking on a non-public instance** — rewritten links point at your instance, so unreachable means every link in the email is broken for the recipient.
+
+## Delivery Events {{ id: 'delivery-events' }}
+
+Bounces, complaints, and delivery confirmations come from the provider, not from the recipient — for SES they arrive through an SNS topic subscribed to your instance's webhook. This requires one-time AWS-side setup; see [Set up email event tracking](/docs/set-up-email-event-tracking) for the one-click flow and the manual steps.
+
+Once configured, the provider dialog shows the subscription state ("confirmed" vs "pending") and the time of the last event received, so a broken pipeline is visible instead of silently delivering nothing.
+
+## Suppression List {{ id: 'suppression-list' }}
+
+Hard bounces and complaints automatically add the recipient to a per-domain suppression list. Suppressed recipients are skipped on future sends to protect your sender reputation. Transient (soft) bounces do not suppress.
+
+## Capture Mode {{ id: 'capture-mode' }}
+
+Environments without a provider — or with capture explicitly enabled — record outgoing email with status `captured` instead of delivering it. The full rendered message is inspectable in the UI, which makes it a safe default for preview and development environments.

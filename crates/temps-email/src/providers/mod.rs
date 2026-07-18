@@ -9,6 +9,7 @@ mod traits;
 pub mod mock;
 
 pub use scaleway::{ScalewayCredentials, ScalewayProvider};
+pub(crate) use ses::DEFAULT_CONFIGURATION_SET;
 pub use ses::{SesCredentials, SesProvider};
 pub use smtp::{SmtpCredentials, SmtpEncryption, SmtpProvider};
 pub use traits::*;

@@ -239,7 +239,21 @@ async fn ses_webhook_handler(State(state): State<Arc<TrackingState>>, body: Stri
     match sns_message.message_type.as_str() {
         "SubscriptionConfirmation" => {
             match state.sns_verifier.confirm_subscription(&sns_message).await {
-                Ok(_) => StatusCode::OK.into_response(),
+                Ok(_) => {
+                    // Surface pipeline health in the provider setup UI: a
+                    // recorded confirmation is what distinguishes "working"
+                    // from "subscribed before the topic was authorized and
+                    // now stuck pending". Best-effort — the confirmation
+                    // itself already succeeded against AWS.
+                    if let Err(e) = state
+                        .provider_service
+                        .mark_sns_subscription_confirmed(topic_arn)
+                        .await
+                    {
+                        error!("Failed to record SNS subscription confirmation: {}", e);
+                    }
+                    StatusCode::OK.into_response()
+                }
                 Err(e) => {
                     error!("Failed to confirm SNS subscription: {}", e);
                     StatusCode::INTERNAL_SERVER_ERROR.into_response()

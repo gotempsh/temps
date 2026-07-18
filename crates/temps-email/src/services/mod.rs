@@ -7,6 +7,9 @@ mod suppression_service;
 mod tracking_service;
 #[cfg(test)]
 mod tracking_service_integration_tests;
+#[cfg(test)]
+mod tracking_setup_integration_tests;
+mod tracking_setup_service;
 mod validation;
 
 pub use domain_service::{CreateDomainRequest, DomainService, DomainWithDnsRecords};
@@ -20,6 +23,7 @@ pub use provider_service::{
 };
 pub use suppression_service::{SuppressionReason, SuppressionService};
 pub use tracking_service::{ExtractedLink, TrackingEvent, TrackingService, TransformResult};
+pub use tracking_setup_service::{TrackingSetupResult, TrackingSetupService};
 pub use validation::{
     MiscResult, MxResult, ProxyConfig, ReachabilityStatus, SmtpResult, SyntaxResult,
     ValidateEmailRequest, ValidateEmailResponse, ValidationConfig, ValidationService,

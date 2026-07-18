@@ -60,6 +60,7 @@ import {
   Send,
   Server,
 } from 'lucide-react'
+import { EmailTrackingSetup } from './EmailTrackingSetup'
 import { AWSIcon } from '@/components/icons/AWSIcon'
 import { ScalewayIcon } from '@/components/icons/ScalewayIcon'
 import { useEffect, useState } from 'react'
@@ -874,6 +875,7 @@ function EditProviderDialog({
                       </FormItem>
                     )}
                   />
+                  {provider && <EmailTrackingSetup providerId={provider.id} />}
                   <FormField
                     control={form.control}
                     name="access_key_id"

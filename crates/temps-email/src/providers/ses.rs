@@ -67,8 +67,11 @@ pub struct SesCredentials {
     pub endpoint_url: Option<String>,
 }
 
-/// Default configuration set name for SES event tracking
-const DEFAULT_CONFIGURATION_SET: &str = "temps-tracking";
+/// Default configuration set name for SES event tracking. Shared with the
+/// event-tracking auto-setup service, which attaches the SNS event
+/// destination to this same set so every send (they all pass through it —
+/// see `send_email`) reports bounces/complaints/deliveries.
+pub(crate) const DEFAULT_CONFIGURATION_SET: &str = "temps-tracking";
 
 /// AWS SES provider implementation
 pub struct SesProvider {

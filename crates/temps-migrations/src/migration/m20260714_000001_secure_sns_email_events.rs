@@ -19,6 +19,14 @@ impl MigrationTrait for Migration {
                 ALTER TABLE email_providers
                     ADD COLUMN IF NOT EXISTS sns_topic_arn TEXT NULL;
 
+                -- When the SNS HTTPS subscription for sns_topic_arn was last
+                -- confirmed. NULL means "never confirmed for the current
+                -- topic" — the setup UI uses this to distinguish a pending
+                -- subscription (endpoint subscribed before the topic was
+                -- authorized) from a working pipeline.
+                ALTER TABLE email_providers
+                    ADD COLUMN IF NOT EXISTS sns_subscription_confirmed_at TIMESTAMPTZ NULL;
+
                 DROP INDEX IF EXISTS idx_email_events_provider_msg_id;
                 CREATE INDEX IF NOT EXISTS idx_email_events_provider_message_id
                     ON email_events (provider_message_id)
@@ -98,6 +106,8 @@ impl MigrationTrait for Migration {
 
                 ALTER TABLE email_events DROP COLUMN IF EXISTS idempotency_key;
                 ALTER TABLE email_providers DROP COLUMN IF EXISTS sns_topic_arn;
+                ALTER TABLE email_providers
+                    DROP COLUMN IF EXISTS sns_subscription_confirmed_at;
 
                 DROP INDEX IF EXISTS idx_suppressed_recipients_domain_email;
 

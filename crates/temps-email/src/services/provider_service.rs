@@ -175,6 +175,27 @@ impl ProviderService {
         Ok(providers)
     }
 
+    /// Record a successful SNS subscription confirmation for every active
+    /// SES provider bound to `topic_arn`. Called from the tracking webhook
+    /// after a `SubscriptionConfirmation` is validated and confirmed, so the
+    /// setup UI can show "subscription confirmed" instead of leaving the
+    /// operator to infer pipeline health from the absence of events.
+    pub async fn mark_sns_subscription_confirmed(&self, topic_arn: &str) -> Result<(), EmailError> {
+        use sea_orm::sea_query::Expr;
+
+        email_providers::Entity::update_many()
+            .col_expr(
+                email_providers::Column::SnsSubscriptionConfirmedAt,
+                Expr::value(chrono::Utc::now()),
+            )
+            .filter(email_providers::Column::ProviderType.eq("ses"))
+            .filter(email_providers::Column::IsActive.eq(true))
+            .filter(email_providers::Column::SnsTopicArn.eq(topic_arn))
+            .exec(self.db.as_ref())
+            .await?;
+        Ok(())
+    }
+
     /// Resolve SNS authorization from live provider configuration. This is
     /// intentionally queried per webhook so provider rotation/deactivation
     /// takes effect without restarting Temps.
@@ -287,6 +308,9 @@ impl ProviderService {
         if let Some(topic_arn) = sns_topic_arn {
             if existing.sns_topic_arn != topic_arn {
                 active.sns_topic_arn = Set(topic_arn);
+                // A subscription confirmation vouches only for the topic it
+                // happened on — rotating or clearing the topic invalidates it.
+                active.sns_subscription_confirmed_at = Set(None);
                 changed_fields.push("sns_topic_arn".to_string());
             }
         }
@@ -329,6 +353,27 @@ impl ProviderService {
             provider: updated,
             changed_fields,
         })
+    }
+
+    /// Decrypt and parse a provider's stored SES credentials. Fails for
+    /// non-SES providers. Keeps decryption encapsulated here so callers
+    /// (e.g. the event-tracking setup service) never touch the
+    /// EncryptionService directly.
+    pub fn ses_credentials(
+        &self,
+        provider: &email_providers::Model,
+    ) -> Result<SesCredentials, EmailError> {
+        if EmailProviderType::from_str(&provider.provider_type)? != EmailProviderType::Ses {
+            return Err(EmailError::Validation(format!(
+                "Provider {} is not an SES provider",
+                provider.id
+            )));
+        }
+        let credentials_json = self
+            .encryption_service
+            .decrypt_string(&provider.credentials)
+            .map_err(|e| EmailError::Decryption(e.to_string()))?;
+        Ok(serde_json::from_str(&credentials_json)?)
     }
 
     /// Create an email provider instance from a database model
@@ -931,6 +976,7 @@ mod tests {
             region: "us-east-1".to_string(),
             credentials: "encrypted".to_string(),
             sns_topic_arn: Some("arn:aws:sns:us-east-1:123456789012:temps-events".to_string()),
+            sns_subscription_confirmed_at: None,
             is_active: true,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -963,6 +1009,7 @@ mod tests {
             region: "us-east-1".to_string(),
             credentials: "encrypted".to_string(),
             sns_topic_arn: Some("arn:aws:sns:us-east-1:123456789012:temps-events".to_string()),
+            sns_subscription_confirmed_at: None,
             is_active: true,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -1008,6 +1055,7 @@ mod tests {
             region: "us-east-1".to_string(),
             credentials: encrypted,
             sns_topic_arn: None,
+            sns_subscription_confirmed_at: None,
             is_active: true,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -1045,6 +1093,7 @@ mod tests {
             region: "fr-par".to_string(),
             credentials: encrypted,
             sns_topic_arn: None,
+            sns_subscription_confirmed_at: None,
             is_active: true,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),

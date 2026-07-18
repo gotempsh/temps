@@ -32,6 +32,8 @@ reqwest = { workspace = true }
 
 # AWS SES
 aws-sdk-sesv2 = { version = "1", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
+# AWS SNS — event-tracking auto-setup (topic creation + webhook subscription)
+aws-sdk-sns = { version = "1", default-features = false, features = ["rt-tokio", "rustls"] }
 aws-config = { workspace = true }
 
 # Generic SMTP transport
