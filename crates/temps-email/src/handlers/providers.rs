@@ -660,14 +660,20 @@ pub async fn get_email_tracking_status(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EmailProvidersRead);
 
-    let provider = state
-        .provider_service
-        .get(id)
-        .await
-        .map_err(|_| not_found().detail("Provider not found").build())?;
+    let provider = state.provider_service.get(id).await.map_err(|e| match e {
+        crate::EmailError::ProviderNotFound(_) => not_found().detail("Provider not found").build(),
+        other => {
+            error!("Failed to load email provider {id}: {other}");
+            internal_server_error()
+                .detail("Failed to load provider")
+                .build()
+        }
+    })?;
 
     let webhook_url = tracking_webhook_url(&state).await?;
-    let supports_event_tracking = provider.provider_type == "ses";
+    let supports_event_tracking = EmailProviderType::from_str(&provider.provider_type)
+        .map(|t| t == EmailProviderType::Ses)
+        .unwrap_or(false);
 
     let last_event_at = if supports_event_tracking {
         state
@@ -721,11 +727,15 @@ pub async fn setup_email_tracking(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EmailProvidersWrite);
 
-    let provider = state
-        .provider_service
-        .get(id)
-        .await
-        .map_err(|_| not_found().detail("Provider not found").build())?;
+    let provider = state.provider_service.get(id).await.map_err(|e| match e {
+        crate::EmailError::ProviderNotFound(_) => not_found().detail("Provider not found").build(),
+        other => {
+            error!("Failed to load email provider {id}: {other}");
+            internal_server_error()
+                .detail("Failed to load provider")
+                .build()
+        }
+    })?;
 
     let webhook_url = tracking_webhook_url(&state).await?;
 

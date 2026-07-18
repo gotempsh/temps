@@ -84,7 +84,10 @@ const SETUP_IAM_POLICY = `{
         "sesv2:CreateConfigurationSetEventDestination",
         "sesv2:UpdateConfigurationSetEventDestination"
       ],
-      "Resource": "*"
+      "Resource": [
+        "arn:aws:sns:*:*:temps-email-events-*",
+        "arn:aws:ses:*:*:configuration-set/temps-tracking"
+      ]
     }
   ]
 }`
