@@ -53,6 +53,27 @@ pub struct TagListResponse {
 pub struct CommitExistsResponse {
     pub exists: bool,
     pub commit_sha: Option<String>,
+    /// Commit metadata when the requested SHA exists.
+    pub commit: Option<CommitInfo>,
+}
+
+impl CommitExistsResponse {
+    fn missing() -> Self {
+        Self {
+            exists: false,
+            commit_sha: None,
+            commit: None,
+        }
+    }
+
+    fn found(commit: crate::services::git_provider::Commit) -> Self {
+        let commit_sha = commit.sha.clone();
+        Self {
+            exists: true,
+            commit_sha: Some(commit_sha),
+            commit: Some(commit.into()),
+        }
+    }
 }
 
 /// Get repository branches
@@ -533,7 +554,8 @@ pub async fn get_tags_by_repository_id(
         (status = 200, description = "Commit existence check result", body = CommitExistsResponse),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Repository not found"),
-        (status = 500, description = "Internal server error")
+        (status = 500, description = "Internal server error"),
+        (status = 502, description = "Git provider request failed")
     ),
     tag = "Repositories",
     security(
@@ -591,7 +613,8 @@ pub async fn check_commit_exists(
                 .build()
         })?;
 
-    // Check if commit exists using the git provider
+    // Check existence first because provider-specific get-commit errors do not
+    // consistently distinguish a missing SHA from an upstream failure.
     let exists = provider_service
         .check_commit_exists(
             &access_token,
@@ -600,12 +623,39 @@ pub async fn check_commit_exists(
             &commit_sha,
         )
         .await
-        .unwrap_or(false); // If there's an error checking, assume it doesn't exist
+        .map_err(|error| {
+            ErrorBuilder::new(StatusCode::BAD_GATEWAY)
+                .title("Failed to verify commit")
+                .detail(format!(
+                    "Failed to verify commit '{}' in repository '{}/{}': {}",
+                    commit_sha, repository.owner, repository.name, error
+                ))
+                .build()
+        })?;
 
-    Ok(Json(CommitExistsResponse {
-        exists,
-        commit_sha: if exists { Some(commit_sha) } else { None },
-    }))
+    if !exists {
+        return Ok(Json(CommitExistsResponse::missing()));
+    }
+
+    let commit = provider_service
+        .get_commit(
+            &access_token,
+            &repository.owner,
+            &repository.name,
+            &commit_sha,
+        )
+        .await
+        .map_err(|error| {
+            ErrorBuilder::new(StatusCode::BAD_GATEWAY)
+                .title("Failed to fetch commit details")
+                .detail(format!(
+                    "Commit '{}' exists in repository '{}/{}', but its details could not be fetched: {}",
+                    commit_sha, repository.owner, repository.name, error
+                ))
+                .build()
+        })?;
+
+    Ok(Json(CommitExistsResponse::found(commit)))
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -629,6 +679,18 @@ pub struct CommitInfo {
     /// Commit date in ISO 8601 format
     #[schema(value_type = String, format = DateTime, example = "2025-10-12T12:15:47.609192Z")]
     pub date: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<crate::services::git_provider::Commit> for CommitInfo {
+    fn from(commit: crate::services::git_provider::Commit) -> Self {
+        Self {
+            sha: commit.sha,
+            message: commit.message,
+            author: commit.author,
+            author_email: commit.author_email,
+            date: commit.date,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -767,3 +829,49 @@ pub async fn list_commits_by_repository_id(
     )
 )]
 pub struct RepositoriesApiDoc;
+
+#[cfg(test)]
+mod tests {
+    use super::CommitExistsResponse;
+    use crate::services::git_provider::Commit;
+
+    #[test]
+    fn missing_commit_response_has_no_commit_metadata() {
+        let response = CommitExistsResponse::missing();
+
+        assert!(!response.exists);
+        assert!(response.commit_sha.is_none());
+        assert!(response.commit.is_none());
+    }
+
+    #[test]
+    fn found_commit_response_includes_provider_metadata() {
+        let response = CommitExistsResponse::found(Commit {
+            sha: "0123456789abcdef".to_string(),
+            message: "Show commit details".to_string(),
+            author: "Temps Contributor".to_string(),
+            author_email: "contributor@example.com".to_string(),
+            date: chrono::DateTime::UNIX_EPOCH,
+        });
+
+        assert!(response.exists);
+        assert_eq!(response.commit_sha.as_deref(), Some("0123456789abcdef"));
+        let commit = response.commit.as_ref();
+        assert_eq!(
+            commit.map(|value| value.sha.as_str()),
+            Some("0123456789abcdef")
+        );
+        assert_eq!(
+            commit.map(|value| value.message.as_str()),
+            Some("Show commit details")
+        );
+        assert_eq!(
+            commit.map(|value| value.author.as_str()),
+            Some("Temps Contributor")
+        );
+        assert_eq!(
+            commit.map(|value| value.date),
+            Some(chrono::DateTime::UNIX_EPOCH)
+        );
+    }
+}

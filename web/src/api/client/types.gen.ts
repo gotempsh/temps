@@ -2202,6 +2202,10 @@ export type CmdResponse = {
 };
 
 export type CommitExistsResponse = {
+    /**
+     * Commit metadata when the requested SHA exists.
+     */
+    commit?: CommitInfo | null;
     commit_sha?: string | null;
     exists: boolean;
 };
@@ -43172,6 +43176,10 @@ export type CheckCommitExistsErrors = {
      * Internal server error
      */
     500: unknown;
+    /**
+     * Git provider request failed
+     */
+    502: unknown;
 };
 
 export type CheckCommitExistsResponses = {
