@@ -3,8 +3,13 @@ import {
   getEnvironmentsOptions,
   getProjectBySlugOptions,
   getRepositoryByNameOptions,
+  getTagsByRepositoryIdOptions,
 } from '@/api/client/@tanstack/react-query.gen'
-import { EnvironmentResponse, ProjectResponse } from '@/api/client/types.gen'
+import type {
+  CommitInfo,
+  EnvironmentResponse,
+  ProjectResponse,
+} from '@/api/client/types.gen'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -33,6 +38,7 @@ import {
   GitCommitHorizontal,
   Loader2,
   RefreshCw,
+  Tag as TagIcon,
 } from 'lucide-react'
 import { BranchSelector } from './BranchSelector'
 
@@ -50,6 +56,53 @@ function formatCommitDate(date: string) {
     dateStyle: 'medium',
     timeStyle: 'short',
   }).format(parsedDate)
+}
+
+function CommitDetailsCard({
+  commit,
+  label,
+  reference,
+}: {
+  commit: CommitInfo
+  label: string
+  reference?: string
+}) {
+  return (
+    <div className="overflow-hidden rounded-md border bg-muted/20">
+      <div className="flex items-center justify-between gap-3 border-b bg-muted/40 px-3 py-2">
+        <div className="flex min-w-0 items-center gap-2 text-sm font-medium">
+          <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
+          {label}
+        </div>
+        <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
+          {reference && (
+            <span className="flex min-w-0 items-center gap-1 font-medium text-foreground">
+              <TagIcon className="h-3.5 w-3.5 shrink-0" />
+              <span className="max-w-40 truncate" title={reference}>
+                {reference}
+              </span>
+            </span>
+          )}
+          <span className="flex shrink-0 items-center gap-1 font-mono">
+            <GitCommitHorizontal className="h-3.5 w-3.5" />
+            {commit.sha.slice(0, 12)}
+          </span>
+        </div>
+      </div>
+      <div className="space-y-2.5 px-3 py-3">
+        <p className="max-h-24 overflow-y-auto whitespace-pre-wrap text-sm leading-relaxed">
+          {commit.message}
+        </p>
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
+          <span className="font-medium text-foreground">{commit.author}</span>
+          <span aria-hidden="true">·</span>
+          <span>{formatCommitDate(commit.date)}</span>
+          <span aria-hidden="true">·</span>
+          <span className="truncate">{commit.author_email}</span>
+        </div>
+      </div>
+    </div>
+  )
 }
 
 interface RedeploymentModalProps {
@@ -136,19 +189,22 @@ export function RedeploymentModal({
   >(defaultType || 'branch')
   const [availableBranches, setAvailableBranches] = useState<string[]>([])
   const [commitToCheck, setCommitToCheck] = useState('')
+  const [tagToCheck, setTagToCheck] = useState('')
 
   // Derive effective values (either user-selected or initial/default)
   const effectiveBranch = selectedBranch !== '' ? selectedBranch : initialBranch
   const effectiveEnvironment = selectedEnvironment ?? initialEnvironment
   const normalizedCommit = selectedCommit.trim()
+  const normalizedTag = selectedTag.trim()
   const commitFormatIsValid = isValidCommitSha(normalizedCommit)
+  const tagHasValue = normalizedTag.length > 0
   const branchNotFound = Boolean(
     effectiveBranch &&
     availableBranches.length > 0 &&
     !availableBranches.includes(effectiveBranch)
   )
   const projectDetails = projectQuery.data ?? project
-  const shouldLookUpCommit = Boolean(
+  const shouldLookUpGitReference = Boolean(
     projectDetails.git_provider_connection_id &&
     projectDetails.repo_owner &&
     projectDetails.repo_name
@@ -167,8 +223,9 @@ export function RedeploymentModal({
     enabled:
       isOpen &&
       mode === 'new' &&
-      deploymentType === 'commit' &&
-      shouldLookUpCommit,
+      (deploymentType === 'commit' ||
+        (deploymentType === 'tag' && tagHasValue)) &&
+      shouldLookUpGitReference,
   })
 
   const commitQuery = useQuery({
@@ -190,6 +247,48 @@ export function RedeploymentModal({
     !!commitToCheck && commitToCheck === normalizedCommit.toLowerCase()
   const commitIsVerified = Boolean(
     checkedCurrentCommit && commitQuery.data?.exists && commitQuery.data.commit
+  )
+
+  const tagsQuery = useQuery({
+    ...getTagsByRepositoryIdOptions({
+      path: { repository_id: repositoryQuery.data?.id || 0 },
+      query: { fresh: true },
+    }),
+    enabled:
+      isOpen &&
+      deploymentType === 'tag' &&
+      !!repositoryQuery.data?.id &&
+      !!tagToCheck,
+    retry: false,
+    staleTime: 60_000,
+  })
+
+  const checkedCurrentTag =
+    !!tagToCheck && tagToCheck === normalizedTag && tagHasValue
+  const matchingTag = checkedCurrentTag
+    ? tagsQuery.data?.tags.find((tag) => tag.name === tagToCheck)
+    : undefined
+
+  const tagCommitQuery = useQuery({
+    ...checkCommitExistsOptions({
+      path: {
+        repository_id: repositoryQuery.data?.id || 0,
+        commit_sha: matchingTag?.commit_sha || '',
+      },
+    }),
+    enabled:
+      isOpen &&
+      deploymentType === 'tag' &&
+      !!repositoryQuery.data?.id &&
+      !!matchingTag?.commit_sha,
+    retry: false,
+  })
+
+  const tagIsVerified = Boolean(
+    checkedCurrentTag &&
+    matchingTag &&
+    tagCommitQuery.data?.exists &&
+    tagCommitQuery.data.commit
   )
 
   // Reset form state when modal opens or default values change
@@ -228,7 +327,7 @@ export function RedeploymentModal({
     const canCheckCommit =
       isOpen &&
       deploymentType === 'commit' &&
-      shouldLookUpCommit &&
+      shouldLookUpGitReference &&
       commitFormatIsValid
     const nextCommit = canCheckCommit ? normalizedCommit.toLowerCase() : ''
 
@@ -245,7 +344,33 @@ export function RedeploymentModal({
     deploymentType,
     isOpen,
     normalizedCommit,
-    shouldLookUpCommit,
+    shouldLookUpGitReference,
+  ])
+
+  // Tag names are matched case-sensitively against the provider's tag list.
+  // Debouncing avoids flashing a not-found state while a tag is being typed.
+  useEffect(() => {
+    const canCheckTag =
+      isOpen &&
+      deploymentType === 'tag' &&
+      shouldLookUpGitReference &&
+      tagHasValue
+    const nextTag = canCheckTag ? normalizedTag : ''
+
+    const timeoutId = window.setTimeout(
+      () => {
+        setTagToCheck(nextTag)
+      },
+      canCheckTag ? 350 : 0
+    )
+
+    return () => window.clearTimeout(timeoutId)
+  }, [
+    deploymentType,
+    isOpen,
+    normalizedTag,
+    shouldLookUpGitReference,
+    tagHasValue,
   ])
 
   const validateCommit = (commit: string) => {
@@ -292,10 +417,22 @@ export function RedeploymentModal({
     }
     if (
       deploymentType === 'commit' &&
-      shouldLookUpCommit &&
+      shouldLookUpGitReference &&
       !commitIsVerified
     ) {
       toast.error('Wait for the commit to be verified before deploying')
+      return
+    }
+    if (deploymentType === 'tag' && !tagHasValue) {
+      toast.error('Enter a tag name')
+      return
+    }
+    if (
+      deploymentType === 'tag' &&
+      shouldLookUpGitReference &&
+      !tagIsVerified
+    ) {
+      toast.error('Wait for the tag to be verified before deploying')
       return
     }
     if (!effectiveEnvironment) {
@@ -316,7 +453,7 @@ export function RedeploymentModal({
         deploymentType === 'commit'
           ? normalizedCommit.toLowerCase()
           : undefined,
-      tag: deploymentType === 'tag' ? selectedTag : undefined,
+      tag: deploymentType === 'tag' ? normalizedTag : undefined,
       environmentId: effectiveEnvironment,
     })
   }
@@ -553,7 +690,7 @@ export function RedeploymentModal({
                     </div>
 
                     <div id="commit-lookup-status" aria-live="polite">
-                      {commitFormatIsValid && shouldLookUpCommit && (
+                      {commitFormatIsValid && shouldLookUpGitReference && (
                         <>
                           {(repositoryQuery.isLoading ||
                             !checkedCurrentCommit ||
@@ -610,49 +747,121 @@ export function RedeploymentModal({
                             )}
 
                           {commitIsVerified && commitQuery.data?.commit && (
-                            <div className="overflow-hidden rounded-md border bg-muted/20">
-                              <div className="flex items-center justify-between gap-3 border-b bg-muted/40 px-3 py-2">
-                                <div className="flex min-w-0 items-center gap-2 text-sm font-medium">
-                                  <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
-                                  Commit found
-                                </div>
-                                <div className="flex items-center gap-1.5 font-mono text-xs text-muted-foreground">
-                                  <GitCommitHorizontal className="h-3.5 w-3.5" />
-                                  {commitQuery.data.commit.sha.slice(0, 12)}
-                                </div>
-                              </div>
-                              <div className="space-y-2.5 px-3 py-3">
-                                <p className="max-h-24 overflow-y-auto whitespace-pre-wrap text-sm leading-relaxed">
-                                  {commitQuery.data.commit.message}
-                                </p>
-                                <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
-                                  <span className="font-medium text-foreground">
-                                    {commitQuery.data.commit.author}
-                                  </span>
-                                  <span aria-hidden="true">·</span>
-                                  <span>
-                                    {formatCommitDate(
-                                      commitQuery.data.commit.date
-                                    )}
-                                  </span>
-                                  <span aria-hidden="true">·</span>
-                                  <span className="truncate">
-                                    {commitQuery.data.commit.author_email}
-                                  </span>
-                                </div>
-                              </div>
-                            </div>
+                            <CommitDetailsCard
+                              commit={commitQuery.data.commit}
+                              label="Commit found"
+                            />
                           )}
                         </>
                       )}
                     </div>
                   </TabsContent>
-                  <TabsContent value="tag">
-                    <Input
-                      value={selectedTag}
-                      onChange={(e) => setSelectedTag(e.target.value)}
-                      placeholder="Enter tag name"
-                    />
+                  <TabsContent value="tag" className="space-y-3">
+                    <div className="space-y-1.5">
+                      <Input
+                        value={selectedTag}
+                        onChange={(e) => setSelectedTag(e.target.value)}
+                        placeholder="Enter tag name"
+                        spellCheck={false}
+                        autoComplete="off"
+                        className="font-mono"
+                        aria-invalid={selectedTag.length > 0 && !tagHasValue}
+                        aria-describedby="tag-lookup-status"
+                      />
+                      {selectedTag.length > 0 && !tagHasValue && (
+                        <p className="text-xs text-destructive">
+                          Enter a non-empty tag name.
+                        </p>
+                      )}
+                    </div>
+
+                    <div id="tag-lookup-status" aria-live="polite">
+                      {tagHasValue && shouldLookUpGitReference && (
+                        <>
+                          {(repositoryQuery.isLoading ||
+                            !checkedCurrentTag ||
+                            tagsQuery.isLoading ||
+                            (!!matchingTag && tagCommitQuery.isLoading)) &&
+                            !repositoryQuery.isError &&
+                            !tagsQuery.isError &&
+                            !tagCommitQuery.isError && (
+                              <div className="flex items-center gap-2 rounded-md border bg-muted/30 px-3 py-2.5 text-sm text-muted-foreground">
+                                <Loader2 className="h-4 w-4 animate-spin" />
+                                Checking tag with the Git provider…
+                              </div>
+                            )}
+
+                          {(repositoryQuery.isError ||
+                            tagsQuery.isError ||
+                            tagCommitQuery.isError) && (
+                            <Alert variant="destructive">
+                              <AlertTriangle className="h-4 w-4" />
+                              <AlertDescription className="flex items-center justify-between gap-3">
+                                <span>
+                                  Tag details could not be loaded. Check the Git
+                                  provider connection and try again.
+                                </span>
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  size="sm"
+                                  className="shrink-0"
+                                  onClick={() => {
+                                    if (repositoryQuery.isError) {
+                                      void repositoryQuery.refetch()
+                                    } else if (tagsQuery.isError) {
+                                      void tagsQuery.refetch()
+                                    } else {
+                                      void tagCommitQuery.refetch()
+                                    }
+                                  }}
+                                >
+                                  <RefreshCw className="mr-1.5 h-3.5 w-3.5" />
+                                  Retry
+                                </Button>
+                              </AlertDescription>
+                            </Alert>
+                          )}
+
+                          {checkedCurrentTag &&
+                            tagsQuery.data &&
+                            !matchingTag && (
+                              <Alert variant="destructive">
+                                <AlertTriangle className="h-4 w-4" />
+                                <AlertDescription>
+                                  Tag “{normalizedTag}” was not found in{' '}
+                                  <span className="font-medium">
+                                    {projectDetails.repo_owner}/
+                                    {projectDetails.repo_name}
+                                  </span>
+                                  . Tag names are case-sensitive.
+                                </AlertDescription>
+                              </Alert>
+                            )}
+
+                          {checkedCurrentTag &&
+                            matchingTag &&
+                            tagCommitQuery.data &&
+                            !tagCommitQuery.data.exists && (
+                              <Alert variant="destructive">
+                                <AlertTriangle className="h-4 w-4" />
+                                <AlertDescription>
+                                  Tag “{normalizedTag}” exists, but its commit
+                                  could not be found.
+                                </AlertDescription>
+                              </Alert>
+                            )}
+
+                          {tagIsVerified && tagCommitQuery.data?.commit && (
+                            <CommitDetailsCard
+                              commit={tagCommitQuery.data.commit}
+                              label="Tag found"
+                              reference={normalizedTag}
+                            />
+                          )}
+                        </>
+                      )}
+                    </div>
                   </TabsContent>
                 </Tabs>
               </div>
@@ -695,7 +904,10 @@ export function RedeploymentModal({
                   environmentsQuery.isLoading ||
                   (deploymentType === 'commit' &&
                     (!commitFormatIsValid ||
-                      (shouldLookUpCommit && !commitIsVerified)))
+                      (shouldLookUpGitReference && !commitIsVerified))) ||
+                  (deploymentType === 'tag' &&
+                    (!tagHasValue ||
+                      (shouldLookUpGitReference && !tagIsVerified)))
                 }
               >
                 {isLoading ? 'Deploying...' : 'Deploy'}

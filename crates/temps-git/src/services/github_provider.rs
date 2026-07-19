@@ -11,6 +11,24 @@ use reqwest;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info};
 
+const MAX_GITHUB_TAGS: usize = 1_000;
+
+fn append_github_tags(
+    tags: &mut Vec<GitProviderTag>,
+    page_items: Vec<octocrab::models::repos::Tag>,
+) {
+    let remaining = MAX_GITHUB_TAGS.saturating_sub(tags.len());
+    tags.extend(
+        page_items
+            .into_iter()
+            .take(remaining)
+            .map(|tag| GitProviderTag {
+                name: tag.name,
+                commit_sha: tag.commit.sha,
+            }),
+    );
+}
+
 // Response structs for API calls
 
 /// Request body for `POST /app/installations/{id}/access_tokens`.
@@ -1131,23 +1149,42 @@ impl GitProviderService for GitHubProvider {
     ) -> Result<Vec<GitProviderTag>, GitProviderError> {
         let octocrab = self.get_octocrab_client(access_token).await?;
 
-        // Get all tags using Octocrab
-        let tags = octocrab
+        let mut page = octocrab
             .repos(owner, repo)
             .list_tags()
+            .per_page(100u8)
             .send()
             .await
-            .map_err(|e| GitProviderError::ApiError(format!("Failed to list tags: {}", e)))?;
+            .map_err(|error| {
+                GitProviderError::ApiError(format!(
+                    "Failed to list tags for {}/{} (page 1): {}",
+                    owner, repo, error
+                ))
+            })?;
 
-        // Convert Octocrab tags to our GitProviderTag type
-        let tags = tags
-            .items
-            .into_iter()
-            .map(|t| GitProviderTag {
-                name: t.name,
-                commit_sha: t.commit.sha,
-            })
-            .collect();
+        // GitHub defaults to 30 tags and the previous implementation silently
+        // ignored every later page. Follow pagination while retaining the same
+        // 1,000-tag memory bound used by the other providers.
+        let mut tags = Vec::new();
+        loop {
+            append_github_tags(&mut tags, page.take_items());
+            if tags.len() >= MAX_GITHUB_TAGS {
+                break;
+            }
+
+            page = match octocrab
+                .get_page::<octocrab::models::repos::Tag>(&page.next)
+                .await
+                .map_err(|error| {
+                    GitProviderError::ApiError(format!(
+                        "Failed to paginate tags for {}/{}: {}",
+                        owner, repo, error
+                    ))
+                })? {
+                Some(next_page) => next_page,
+                None => break,
+            };
+        }
 
         Ok(tags)
     }
@@ -2633,6 +2670,38 @@ mod archive_redirect_tests {
         // `codeload.github.com.` ends with `com.`, not `.github.com` → rejected.
         // Locks in url-crate parsing behavior against dependency bumps.
         assert!(check(None, "https://codeload.github.com./foo").is_err());
+    }
+}
+
+#[cfg(test)]
+mod tag_pagination_tests {
+    use super::*;
+
+    fn github_tag(index: usize) -> octocrab::models::repos::Tag {
+        serde_json::from_value(serde_json::json!({
+            "name": format!("v1.0.{index}"),
+            "commit": {
+                "sha": format!("{index:040x}"),
+                "url": format!("https://api.github.com/repos/temps/example/commits/{index}")
+            },
+            "zipball_url": format!("https://api.github.com/repos/temps/example/zipball/v1.0.{index}"),
+            "tarball_url": format!("https://api.github.com/repos/temps/example/tarball/v1.0.{index}"),
+            "node_id": format!("tag-{index}")
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn appending_github_tag_pages_maps_commit_shas_and_enforces_the_cap() {
+        let mut tags = Vec::new();
+        let page = (0..=MAX_GITHUB_TAGS).map(github_tag).collect();
+
+        append_github_tags(&mut tags, page);
+
+        assert_eq!(tags.len(), MAX_GITHUB_TAGS);
+        assert_eq!(tags[0].name, "v1.0.0");
+        assert_eq!(tags[0].commit_sha, format!("{:040x}", 0));
+        assert_eq!(tags[MAX_GITHUB_TAGS - 1].name, "v1.0.999");
     }
 }
 
