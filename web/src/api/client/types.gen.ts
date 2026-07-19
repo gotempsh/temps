@@ -24234,7 +24234,12 @@ export type CheckDomainStatusResponse = CheckDomainStatusResponses[keyof CheckDo
 export type ListEmailDomainsData = {
     body?: never;
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * Only return domains belonging to this provider
+         */
+        provider_id?: number | null;
+    };
     url: '/email-domains';
 };
 

@@ -2,7 +2,6 @@
 
 import {
   createEmailProvider as createProvider2,
-  deleteEmailProvider as deleteProvider2,
   listEmailProviders as listProviders2,
   testProvider,
   updateEmailProvider as updateProvider2,
@@ -60,14 +59,18 @@ import {
   Send,
   Server,
 } from 'lucide-react'
-import { EmailTrackingSetup } from './EmailTrackingSetup'
 import { AWSIcon } from '@/components/icons/AWSIcon'
 import { ScalewayIcon } from '@/components/icons/ScalewayIcon'
 import { useEffect, useState } from 'react'
 import { useForm } from 'react-hook-form'
+import { useNavigate } from 'react-router-dom'
 import { toast } from 'sonner'
 import { z } from 'zod'
-import { problemMessage } from './sharedUtils'
+import {
+  deleteEmailProvider,
+  problemMessage,
+  readMaskedCreds,
+} from './sharedUtils'
 
 // Types for email providers — alias over SDK response
 type EmailProvider = EmailProviderResponse
@@ -203,15 +206,6 @@ async function createEmailProvider(
   return response.data
 }
 
-async function deleteEmailProvider(id: number): Promise<void> {
-  const response = await deleteProvider2({ path: { id } })
-  if (response.error) {
-    throw new Error(
-      problemMessage(response.error, 'Failed to delete email provider')
-    )
-  }
-}
-
 async function updateEmailProviderApi(
   id: number,
   body: UpdateEmailProviderRequest
@@ -223,32 +217,6 @@ async function updateEmailProviderApi(
     )
   }
   return response.data
-}
-
-/**
- * The backend returns credentials as a freeform JSON value masked for display
- * (e.g. `{"host":"...", "port":587, "encryption":"starttls", "username":"AKIA...XYZ"}`).
- * This pulls out only the non-secret fields we need to prefill the edit form.
- */
-function readMaskedCreds(credentials: unknown): {
-  host?: string
-  port?: number
-  encryption?: 'starttls' | 'tls' | 'none'
-  accept_invalid_certs?: boolean
-} {
-  if (!credentials || typeof credentials !== 'object') return {}
-  const c = credentials as Record<string, unknown>
-  const enc = typeof c.encryption === 'string' ? c.encryption : undefined
-  return {
-    host: typeof c.host === 'string' ? c.host : undefined,
-    port: typeof c.port === 'number' ? c.port : undefined,
-    encryption:
-      enc === 'starttls' || enc === 'tls' || enc === 'none' ? enc : undefined,
-    accept_invalid_certs:
-      typeof c.accept_invalid_certs === 'boolean'
-        ? c.accept_invalid_certs
-        : undefined,
-  }
 }
 
 async function testEmailProvider(
@@ -315,7 +283,7 @@ function providerTypeLabel(type: 'ses' | 'scaleway' | 'smtp'): string {
   }
 }
 
-function TestEmailDialog({
+export function TestEmailDialog({
   open,
   onOpenChange,
   providerId,
@@ -444,6 +412,7 @@ function ProviderCard({
   onEditClick: (provider: EmailProvider) => void
 }) {
   const [isDeleting, setIsDeleting] = useState(false)
+  const navigate = useNavigate()
 
   const handleDelete = () => {
     setIsDeleting(true)
@@ -455,7 +424,10 @@ function ProviderCard({
   }
 
   return (
-    <Card>
+    <Card
+      onClick={() => navigate(`/email/providers/${provider.id}`)}
+      className="cursor-pointer transition-colors hover:bg-muted/40"
+    >
       <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
         <div className="flex items-center gap-3">
           <ProviderIcon type={provider.provider_type} />
@@ -468,7 +440,10 @@ function ProviderCard({
             </p>
           </div>
         </div>
-        <div className="flex items-center gap-2">
+        <div
+          className="flex items-center gap-2"
+          onClick={(e) => e.stopPropagation()}
+        >
           <Badge variant={provider.is_active ? 'default' : 'secondary'}>
             {provider.is_active ? 'Active' : 'Inactive'}
           </Badge>
@@ -610,7 +585,7 @@ interface EditProviderDialogProps {
   onSuccess: () => void
 }
 
-function EditProviderDialog({
+export function EditProviderDialog({
   provider,
   open,
   onOpenChange,
@@ -860,13 +835,14 @@ function EditProviderDialog({
                         </FormControl>
                         <FormDescription>
                           Exact SNS topic authorized to send SES delivery,
-                          bounce, and complaint events for this provider.
+                          bounce, and complaint events for this provider. To set
+                          this up automatically, close this dialog and open the
+                          provider&apos;s detail page.
                         </FormDescription>
                         <FormMessage />
                       </FormItem>
                     )}
                   />
-                  {provider && <EmailTrackingSetup providerId={provider.id} />}
                   <FormField
                     control={form.control}
                     name="access_key_id"

@@ -41,6 +41,8 @@ Configure providers under **Email → Providers**. Each provider stores its regi
 
 Use **Test provider** after saving — it sends a test email to your own account address through the provider so failures surface immediately instead of on your first real send.
 
+Click a provider to open its detail page: the domains assigned to it, its configuration, and — for SES — the delivery event tracking setup below.
+
 ## Domains & DNS {{ id: 'domains' }}
 
 Add a sending domain under **Email → Domains** and Temps shows the DNS records the provider requires. If the domain's DNS zone is managed by a DNS provider configured in Temps, **Setup DNS** creates the records for you; otherwise create them manually and hit **Verify**.
@@ -62,7 +64,7 @@ When enabled per email, Temps injects a tracking pixel and rewrites links throug
 
 Bounces, complaints, and delivery confirmations come from the provider, not from the recipient — for SES they arrive through an SNS topic subscribed to your instance's webhook. This requires one-time AWS-side setup; see [Set up email event tracking](/docs/set-up-email-event-tracking) for the one-click flow and the manual steps.
 
-Once configured, the provider dialog shows the subscription state ("confirmed" vs "pending") and the time of the last event received, so a broken pipeline is visible instead of silently delivering nothing.
+Once configured, the provider's detail page shows the subscription state ("confirmed" vs "pending") and the time of the last event received, so a broken pipeline is visible instead of silently delivering nothing.
 
 ## Suppression List {{ id: 'suppression-list' }}
 

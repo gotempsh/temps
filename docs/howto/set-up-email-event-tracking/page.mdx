@@ -24,7 +24,7 @@ Wire AWS SES to your Temps instance so bounces, complaints, and delivery confirm
 
 - `delivered`, `bounced`, and `complained` events on the per-email Activity timeline and in Email Analytics.
 - Automatic per-domain suppression of hard-bounced and complaining recipients.
-- Pipeline health in the provider dialog: subscription confirmed/pending, and the time of the last event received.
+- Pipeline health on the provider's detail page: subscription confirmed/pending, and the time of the last event received.
 
 Events flow SES → SNS topic → HTTPS webhook on your instance (`/api/t/webhook/ses`). Temps verifies each message's SNS signature and only accepts topics bound to an active SES provider.
 
@@ -35,7 +35,7 @@ Events flow SES → SNS topic → HTTPS webhook on your instance (`/api/t/webhoo
 
 ## Automatic setup {{ id: 'automatic-setup' }}
 
-Open the SES provider in **Email → Providers → Edit** and press **Set up automatically** in the *Delivery event tracking* section. Using the provider's stored credentials, Temps:
+Open the SES provider's detail page (**Email → Providers → click the provider**) and press **Set up automatically** in the *Delivery event tracking* section. Using the provider's stored credentials, Temps:
 
 1. Creates (or reuses) an SNS topic named `temps-email-events-{provider-id}` in the provider's region.
 2. Saves the topic ARN on the provider — this authorizes the topic *before* anything subscribes to it.
@@ -79,11 +79,11 @@ If you prefer creating resources yourself, **the order matters**:
 1. Create an SNS topic in the **same region** as the provider.
 2. Paste the topic ARN into the provider's **SNS Topic ARN** field in Temps and **save**. Temps only auto-confirms subscription requests for topics it already knows about — subscribing first leaves the subscription stuck in "pending" forever, with no error shown anywhere.
 3. In the SES console, add an event destination to the `temps-tracking` configuration set for **bounce, complaint, and delivery** events, publishing to your topic.
-4. Subscribe your webhook URL — shown in the provider dialog, of the form `https://your-instance.example.com/api/t/webhook/ses` — to the topic with protocol HTTPS. Temps confirms the subscription automatically.
+4. Subscribe your webhook URL — shown on the provider's detail page, of the form `https://your-instance.example.com/api/t/webhook/ses` — to the topic with protocol HTTPS. Temps confirms the subscription automatically.
 
 ## Verify it works {{ id: 'verify' }}
 
-1. The provider dialog should show **Subscription confirmed** within seconds of setup.
+1. The provider's detail page should show **Subscription confirmed** within seconds of setup.
 2. Send a test to SES's bounce simulator: `bounce@simulator.amazonses.com`. A `bounced` event should appear on the email's timeline shortly after, and the recipient lands on the domain's suppression list.
 3. `success@simulator.amazonses.com` produces a `delivered` event; `complaint@simulator.amazonses.com` a `complained` event.
 

@@ -360,6 +360,12 @@ pub struct EmailDomainWithDnsResponse {
     pub dns_records: Vec<DnsRecordResponse>,
 }
 
+#[derive(Debug, Deserialize, ToSchema, IntoParams)]
+pub struct ListDomainsQuery {
+    /// Only return domains belonging to this provider
+    pub provider_id: Option<i32>,
+}
+
 /// Request to setup DNS records using a configured DNS provider
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetupDnsRequest {
