@@ -100,7 +100,7 @@ fn normalize_commit_sha(commit_sha: &str) -> Result<String, CommitShaValidationE
     Ok(commit_sha.to_ascii_lowercase())
 }
 
-fn commit_lookup_principal(auth: &AuthContext) -> String {
+fn provider_lookup_principal(auth: &AuthContext) -> String {
     match &auth.source {
         AuthSource::Session { user } | AuthSource::CliToken { user } => {
             format!("user:{}", user.id)
@@ -232,6 +232,7 @@ pub async fn get_repository_branches(
         (status = 200, description = "List of tags", body = TagListResponse),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Repository not found"),
+        (status = 429, description = "Fresh tag lookup rate limit exceeded"),
         (status = 500, description = "Internal server error")
     ),
     tag = "Repositories",
@@ -307,6 +308,22 @@ pub async fn get_repository_tags(
                 .collect();
             return Ok(Json(TagListResponse { tags: tag_infos }));
         }
+    }
+
+    if params.fresh {
+        let principal = provider_lookup_principal(&auth);
+        state
+            .cache_manager
+            .tag_refresh_rate_limiter
+            .check(&principal)
+            .await
+            .map_err(|retry_after_seconds| {
+                ErrorBuilder::new(StatusCode::TOO_MANY_REQUESTS)
+                    .title("Tag Refresh Rate Limit Exceeded")
+                    .detail("Too many fresh tag lookups. Please retry later.")
+                    .value("retry_after_seconds", retry_after_seconds)
+                    .build()
+            })?;
     }
 
     // Get tags from the git provider
@@ -473,6 +490,7 @@ pub async fn get_branches_by_repository_id(
         (status = 200, description = "List of tags", body = TagListResponse),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Repository not found"),
+        (status = 429, description = "Fresh tag lookup rate limit exceeded"),
         (status = 500, description = "Internal server error")
     ),
     tag = "Repositories",
@@ -551,6 +569,22 @@ pub async fn get_tags_by_repository_id(
                 .collect();
             return Ok(Json(TagListResponse { tags: tag_infos }));
         }
+    }
+
+    if params.fresh {
+        let principal = provider_lookup_principal(&auth);
+        state
+            .cache_manager
+            .tag_refresh_rate_limiter
+            .check(&principal)
+            .await
+            .map_err(|retry_after_seconds| {
+                ErrorBuilder::new(StatusCode::TOO_MANY_REQUESTS)
+                    .title("Tag Refresh Rate Limit Exceeded")
+                    .detail("Too many fresh tag lookups. Please retry later.")
+                    .value("retry_after_seconds", retry_after_seconds)
+                    .build()
+            })?;
     }
 
     // Get tags from the git provider using owner and repo from repository
@@ -671,7 +705,7 @@ pub async fn check_commit_exists(
                 .build()
         })?;
 
-    let principal = commit_lookup_principal(&auth);
+    let principal = provider_lookup_principal(&auth);
     state
         .cache_manager
         .commit_lookup_rate_limiter

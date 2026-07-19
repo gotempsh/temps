@@ -28,7 +28,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Alert, AlertDescription } from '@/components/ui/alert'
-import { useQuery } from '@tanstack/react-query'
+import { hashKey, useQuery } from '@tanstack/react-query'
 import { useMemo, useState, useEffect } from 'react'
 import { toast } from 'sonner'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
@@ -249,18 +249,24 @@ export function RedeploymentModal({
     checkedCurrentCommit && commitQuery.data?.exists && commitQuery.data.commit
   )
 
+  const tagsQueryOptions = getTagsByRepositoryIdOptions({
+    path: { repository_id: repositoryQuery.data?.id || 0 },
+    query: { fresh: true },
+  })
   const tagsQuery = useQuery({
-    ...getTagsByRepositoryIdOptions({
-      path: { repository_id: repositoryQuery.data?.id || 0 },
-      query: { fresh: true },
-    }),
+    ...tagsQueryOptions,
+    // The endpoint returns the repository's full tag list, but verification is
+    // tied to one user-entered tag. Including it in the client query key forces
+    // a new provider-backed check when the tag changes instead of reusing a
+    // previously verified list for a different deployment decision.
+    queryKeyHashFn: (queryKey) => hashKey([...queryKey, tagToCheck]),
     enabled:
       isOpen &&
       deploymentType === 'tag' &&
       !!repositoryQuery.data?.id &&
       !!tagToCheck,
     retry: false,
-    staleTime: 60_000,
+    staleTime: 0,
   })
 
   const checkedCurrentTag =
@@ -286,7 +292,9 @@ export function RedeploymentModal({
 
   const tagIsVerified = Boolean(
     checkedCurrentTag &&
+    !tagsQuery.isFetching &&
     matchingTag &&
+    !tagCommitQuery.isFetching &&
     tagCommitQuery.data?.exists &&
     tagCommitQuery.data.commit
   )
@@ -401,7 +409,10 @@ export function RedeploymentModal({
 
       await onConfirm({
         branch: defaultType === 'branch' ? defaultBranch : undefined,
-        commit: defaultType === 'commit' ? defaultCommit : undefined,
+        commit:
+          defaultType === 'commit' || defaultType === 'tag'
+            ? defaultCommit
+            : undefined,
         tag: defaultType === 'tag' ? defaultTag : undefined,
         environmentId: defaultEnvironment,
       })
@@ -452,7 +463,9 @@ export function RedeploymentModal({
       commit:
         deploymentType === 'commit'
           ? normalizedCommit.toLowerCase()
-          : undefined,
+          : deploymentType === 'tag'
+            ? tagCommitQuery.data?.commit?.sha.toLowerCase()
+            : undefined,
       tag: deploymentType === 'tag' ? normalizedTag : undefined,
       environmentId: effectiveEnvironment,
     })
@@ -780,8 +793,8 @@ export function RedeploymentModal({
                         <>
                           {(repositoryQuery.isLoading ||
                             !checkedCurrentTag ||
-                            tagsQuery.isLoading ||
-                            (!!matchingTag && tagCommitQuery.isLoading)) &&
+                            tagsQuery.isFetching ||
+                            (!!matchingTag && tagCommitQuery.isFetching)) &&
                             !repositoryQuery.isError &&
                             !tagsQuery.isError &&
                             !tagCommitQuery.isError && (

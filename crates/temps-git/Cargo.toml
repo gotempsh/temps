@@ -19,6 +19,7 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 base64 = "0.22"
 futures = { workspace = true }
+rustls = { workspace = true }
 
 [dependencies]
 temps-auth = { path = "../temps-auth" }

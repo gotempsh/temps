@@ -7,7 +7,8 @@ use tokio::sync::{Mutex, RwLock};
 
 const DEFAULT_CACHE_MAX_ENTRIES: usize = 10_000;
 const COMMIT_LOOKUP_REQUESTS_PER_MINUTE: usize = 60;
-const COMMIT_LOOKUP_MAX_PRINCIPALS: usize = 10_000;
+const TAG_REFRESH_REQUESTS_PER_MINUTE: usize = 5;
+const PROVIDER_LOOKUP_MAX_PRINCIPALS: usize = 10_000;
 
 /// Cache entry with expiration time
 #[derive(Clone, Debug)]
@@ -169,20 +170,20 @@ pub struct CommitCacheKey {
 }
 
 #[derive(Debug)]
-struct CommitLookupWindow {
+struct ProviderLookupWindow {
     requests: VecDeque<Instant>,
     last_seen: Instant,
 }
 
-/// Bounded, per-principal sliding-window limiter for provider commit lookups.
-pub struct CommitLookupRateLimiter {
-    windows: Mutex<HashMap<String, CommitLookupWindow>>,
+/// Bounded, per-principal sliding-window limiter for upstream provider lookups.
+pub struct ProviderLookupRateLimiter {
+    windows: Mutex<HashMap<String, ProviderLookupWindow>>,
     max_requests: usize,
     window: Duration,
     max_principals: usize,
 }
 
-impl CommitLookupRateLimiter {
+impl ProviderLookupRateLimiter {
     pub fn new(max_requests: usize, window: Duration, max_principals: usize) -> Self {
         Self {
             windows: Mutex::new(HashMap::new()),
@@ -211,7 +212,7 @@ impl CommitLookupRateLimiter {
 
         let entry = windows
             .entry(principal.to_string())
-            .or_insert_with(|| CommitLookupWindow {
+            .or_insert_with(|| ProviderLookupWindow {
                 requests: VecDeque::new(),
                 last_seen: now,
             });
@@ -311,7 +312,12 @@ pub struct GitProviderCacheManager {
     pub commits: GitProviderCache<CommitCacheKey, Option<crate::services::git_provider::Commit>>,
 
     /// Per-user or API-key limiter for cache-miss provider lookups.
-    pub commit_lookup_rate_limiter: CommitLookupRateLimiter,
+    pub commit_lookup_rate_limiter: ProviderLookupRateLimiter,
+
+    /// Per-user or API-key limiter for cache-bypassing tag refreshes. A single
+    /// refresh can paginate through up to ten provider pages, so this is
+    /// intentionally stricter than the immutable commit lookup limiter.
+    pub tag_refresh_rate_limiter: ProviderLookupRateLimiter,
 
     /// Cache for public repository branches (15 minutes TTL - shorter due to rate limits)
     pub public_branches:
@@ -327,10 +333,15 @@ impl GitProviderCacheManager {
             branches: GitProviderCache::new(60), // 60 minutes for branches
             tags: GitProviderCache::new(60),     // 60 minutes for tags
             commits: GitProviderCache::new(30),  // 30 minutes for commits
-            commit_lookup_rate_limiter: CommitLookupRateLimiter::new(
+            commit_lookup_rate_limiter: ProviderLookupRateLimiter::new(
                 COMMIT_LOOKUP_REQUESTS_PER_MINUTE,
                 Duration::from_secs(60),
-                COMMIT_LOOKUP_MAX_PRINCIPALS,
+                PROVIDER_LOOKUP_MAX_PRINCIPALS,
+            ),
+            tag_refresh_rate_limiter: ProviderLookupRateLimiter::new(
+                TAG_REFRESH_REQUESTS_PER_MINUTE,
+                Duration::from_secs(60),
+                PROVIDER_LOOKUP_MAX_PRINCIPALS,
             ),
             public_branches: GitProviderCache::new(15), // 15 minutes for public branches (rate limit aware)
             public_presets: GitProviderCache::new(30),  // 30 minutes for public presets
@@ -447,7 +458,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_lookup_rate_limiter_is_scoped_by_principal() {
-        let limiter = CommitLookupRateLimiter::new(1, Duration::from_secs(60), 10);
+        let limiter = ProviderLookupRateLimiter::new(1, Duration::from_secs(60), 10);
 
         assert!(limiter.check("user:1").await.is_ok());
         assert!(limiter.check("user:1").await.is_err());
@@ -456,13 +467,37 @@ mod tests {
 
     #[tokio::test]
     async fn commit_lookup_rate_limiter_bounds_principal_memory() {
-        let limiter = CommitLookupRateLimiter::new(1, Duration::from_secs(60), 2);
+        let limiter = ProviderLookupRateLimiter::new(1, Duration::from_secs(60), 2);
 
         assert!(limiter.check("user:1").await.is_ok());
         assert!(limiter.check("user:2").await.is_ok());
         assert!(limiter.check("user:3").await.is_ok());
 
         assert!(limiter.windows.lock().await.len() <= 2);
+    }
+
+    #[tokio::test]
+    async fn tag_refresh_rate_limiter_uses_the_stricter_provider_budget() {
+        let manager = GitProviderCacheManager::new();
+
+        for _ in 0..TAG_REFRESH_REQUESTS_PER_MINUTE {
+            assert!(manager
+                .tag_refresh_rate_limiter
+                .check("user:1")
+                .await
+                .is_ok());
+        }
+
+        assert!(manager
+            .tag_refresh_rate_limiter
+            .check("user:1")
+            .await
+            .is_err());
+        assert!(manager
+            .tag_refresh_rate_limiter
+            .check("user:2")
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
