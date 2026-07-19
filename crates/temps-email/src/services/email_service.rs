@@ -210,8 +210,17 @@ impl EmailService {
         };
 
         if !suppressed.is_empty() {
+            // Addresses go to `debug!` only — `info!` (and any field
+            // persisted where a caller with send+read access could read it
+            // back, like `error_message` below) must not let one recipient
+            // enumerate another recipient's bounce/complaint history.
             info!(
-                "Dropping suppressed recipient(s) from email {}: {:?}",
+                "Dropping {} suppressed recipient(s) from email {}",
+                suppressed.len(),
+                email_id
+            );
+            debug!(
+                "Suppressed recipient(s) dropped from email {}: {:?}",
                 email_id, suppressed
             );
         }
@@ -223,16 +232,20 @@ impl EmailService {
         // sending an email with no primary recipient.
         if to.is_empty() {
             info!(
-                "Refusing to send email {} — all recipient(s) suppressed: {:?}",
+                "Refusing to send email {} — {} recipient(s) suppressed",
+                email_id,
+                suppressed.len()
+            );
+            debug!(
+                "Email {} refused — suppressed recipient(s): {:?}",
                 email_id, suppressed
             );
 
             let mut active_model: emails::ActiveModel = email_model.into();
             active_model.status = Set("captured".to_string());
-            active_model.error_message = Set(Some(format!(
-                "Recipient(s) suppressed (previous hard bounce or complaint): {}",
-                suppressed.join(", ")
-            )));
+            active_model.error_message = Set(Some(
+                "Recipient(s) suppressed (previous hard bounce or complaint)".to_string(),
+            ));
             active_model.sent_at = Set(Some(Utc::now()));
 
             active_model.update(self.db.as_ref()).await?;
