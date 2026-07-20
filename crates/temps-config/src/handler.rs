@@ -1009,19 +1009,23 @@ fn validate_monitoring_settings(monitoring: &MonitoringSettings) -> Result<(), P
             .detail("monitoring.retention_daily_years must be between 1 and 10")
             .build());
     }
-    if monitoring.store == MetricsStoreKind::ClickHouse {
-        match &monitoring.clickhouse_url {
-            None => {
-                return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
-                    .detail("monitoring.clickhouse_url is required when store is ClickHouse")
-                    .build());
-            }
-            Some(url) if url::Url::parse(url).is_err() => {
-                return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
-                    .detail("monitoring.clickhouse_url is not a valid URL")
-                    .build());
-            }
-            _ => {}
+    // `monitoring.clickhouse_url` is legacy, optional config: the runtime
+    // builds the ClickHouse metrics store from the server's TEMPS_CLICKHOUSE_*
+    // env configuration (`build_ch_metrics_store`), never from this setting.
+    // Requiring it when store == ClickHouse made the store unswitchable from
+    // the UI (which has no URL field) even on servers where ClickHouse is
+    // fully configured. Validate the URL only when one is supplied; the
+    // env-not-configured case is surfaced by `effective_metrics_store` and
+    // the console's mismatch warning instead of a save-time rejection.
+    if let Some(url) = monitoring
+        .clickhouse_url
+        .as_deref()
+        .filter(|u| !u.trim().is_empty())
+    {
+        if url::Url::parse(url).is_err() {
+            return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .detail("monitoring.clickhouse_url is not a valid URL")
+                .build());
         }
     }
     Ok(())
@@ -1182,9 +1186,8 @@ async fn update_settings(
             }
             // ClickHouse DSN: the GET response masks it to `clickhouse_url_set`
             // (it can embed credentials), so a client round-trip that doesn't
-            // re-supply it would otherwise wipe the stored DSN — and then trip
-            // the "clickhouse_url required when store is ClickHouse" validation
-            // below on an unrelated save. Restore from the DB when absent.
+            // re-supply it would otherwise wipe the stored DSN on an unrelated
+            // save. Restore from the DB when absent.
             if settings
                 .monitoring
                 .clickhouse_url
@@ -1663,6 +1666,35 @@ mod tests {
         assert_eq!(
             error.body.get("detail").and_then(|value| value.as_str()),
             Some("observability_retention.otel_logs_days must be between 1 and 3650")
+        );
+    }
+
+    // The ClickHouse metrics store is built from TEMPS_CLICKHOUSE_* env
+    // config, not from monitoring.clickhouse_url — selecting the ClickHouse
+    // store without a settings-level URL must be a valid save (the UI has no
+    // URL field; env-not-configured is reported via effective_metrics_store).
+    #[test]
+    fn monitoring_validation_accepts_clickhouse_store_without_url() {
+        let monitoring = MonitoringSettings {
+            store: MetricsStoreKind::ClickHouse,
+            clickhouse_url: None,
+            ..Default::default()
+        };
+        assert!(validate_monitoring_settings(&monitoring).is_ok());
+    }
+
+    #[test]
+    fn monitoring_validation_rejects_malformed_clickhouse_url() {
+        let monitoring = MonitoringSettings {
+            store: MetricsStoreKind::ClickHouse,
+            clickhouse_url: Some("not a url".into()),
+            ..Default::default()
+        };
+        let error = validate_monitoring_settings(&monitoring)
+            .expect_err("malformed clickhouse_url must be rejected");
+        assert_eq!(
+            error.body.get("detail").and_then(|value| value.as_str()),
+            Some("monitoring.clickhouse_url is not a valid URL")
         );
     }
 
