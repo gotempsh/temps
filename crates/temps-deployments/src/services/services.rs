@@ -3216,6 +3216,22 @@ impl DeploymentService {
             );
         }
 
+        // Anonymous telemetry: this is the explicit "user clicked Cancel"
+        // path (the other emission site, in WorkflowExecutionService, only
+        // fires as a fallback when the executor detects a "cancelled" error
+        // without this method having already set the state — see that
+        // file's comment). Deliberately NOT emitted from the supersede
+        // (cancel_in_flight_deployments) or bulk-shutdown
+        // (cancel_running_deployments) paths, since those fire automatically
+        // on every push / restart and would swamp the funnel signal with
+        // non-user-initiated noise.
+        self.telemetry().report(
+            temps_core::telemetry::TelemetryEvent::new(
+                temps_core::telemetry::TelemetryEventKind::DeployCancelled,
+            )
+            .with("trigger", "user"),
+        );
+
         info!(
             "Successfully cancelled deployment {} for project {} - workflow will stop at next checkpoint",
             deployment_id, project_id
