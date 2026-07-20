@@ -666,7 +666,10 @@ impl Default for OnDemandTlsSettings {
 pub enum MetricsStoreKind {
     /// Default: TimescaleDB (same PostgreSQL instance used by the control plane).
     TimescaleDb,
-    /// Optional: ClickHouse cluster — requires `clickhouse_url` to be set.
+    /// Optional: ClickHouse cluster. The runtime store is built from the
+    /// `TEMPS_CLICKHOUSE_*` server env configuration; selecting this without
+    /// that configuration falls back to TimescaleDB (reported via
+    /// `effective_metrics_store`).
     ClickHouse,
 }
 
@@ -703,7 +706,9 @@ pub struct MonitoringSettings {
     #[schema(minimum = 1, maximum = 10, example = 2)]
     pub retention_daily_years: u32,
 
-    /// ClickHouse DSN, required only when `store = "click_house"`.
+    /// ClickHouse DSN (legacy, optional). The runtime metrics store is built
+    /// from the `TEMPS_CLICKHOUSE_*` env vars, never from this field; it is
+    /// retained for compatibility and operator reference only.
     /// Example: `"http://localhost:8123"`.
     pub clickhouse_url: Option<String>,
 }

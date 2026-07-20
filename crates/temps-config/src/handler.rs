@@ -1199,10 +1199,27 @@ async fn update_settings(
             }
         }
         Err(e) => {
-            tracing::warn!(
-                "Could not fetch current settings to preserve sensitive fields: {}",
+            // Abort rather than proceed: the preservation block above did not
+            // run, so saving now would silently overwrite every masked
+            // sensitive field the client legitimately omitted (ClickHouse DSN,
+            // preview-gateway shared_secret, join token hash, AI provider
+            // credentials) with empty values. A failed save the operator can
+            // retry is strictly better than an unannounced credential wipe.
+            tracing::error!(
+                "Could not fetch current settings to preserve sensitive fields; \
+                 aborting settings save: {}",
                 e
             );
+            return Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title("Settings Save Aborted")
+                .detail(format!(
+                    "Could not load current settings to preserve masked sensitive \
+                     fields (ClickHouse DSN, shared secrets, provider credentials); \
+                     the save was aborted to avoid wiping them. Retry the save; if \
+                     this persists, check database connectivity: {}",
+                    e
+                ))
+                .build());
         }
     }
 
