@@ -155,6 +155,7 @@ mod m20260714_000001_fix_otel_spans_compression_segmentby;
 mod m20260714_000001_secure_sns_email_events;
 mod m20260716_000001_observability_compression_24h;
 mod m20260717_000001_drop_magic_link_tokens;
+mod m20260720_000001_audit_logs_keep_history_on_user_delete;
 
 pub struct Migrator;
 
@@ -315,6 +316,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260714_000001_secure_sns_email_events::Migration),
             Box::new(m20260716_000001_observability_compression_24h::Migration),
             Box::new(m20260717_000001_drop_magic_link_tokens::Migration),
+            Box::new(m20260720_000001_audit_logs_keep_history_on_user_delete::Migration),
         ]
     }
 }

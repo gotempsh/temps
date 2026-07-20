@@ -23,3 +23,6 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 axum = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+sea-orm = { workspace = true, features = ["mock"] }

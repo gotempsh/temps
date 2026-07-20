@@ -1239,9 +1239,10 @@ export type AuditLogResponse = {
     operation_type: string;
     user?: null | AuditLogUserInfo;
     /**
-     * The user who performed the action
+     * The user who performed the action (`null` when that account has
+     * since been deleted; `data` retains the original actor context)
      */
-    user_id: number;
+    user_id?: number | null;
 };
 
 /**

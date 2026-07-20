@@ -15,8 +15,9 @@ pub struct AuditLogResponse {
     /// The type of action that was performed
     #[schema(example = "USER_LOGIN")]
     pub operation_type: String,
-    /// The user who performed the action
-    pub user_id: i32,
+    /// The user who performed the action (`null` when that account has
+    /// since been deleted; `data` retains the original actor context)
+    pub user_id: Option<i32>,
     /// User details who performed the action
     pub user: Option<AuditLogUserInfo>,
     /// IP address details
