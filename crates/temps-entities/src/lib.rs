@@ -152,6 +152,7 @@ pub mod log_chunks;
 pub mod log_events;
 
 // Standalone sandbox API (Vercel-compatible)
+pub mod sandbox_events;
 pub mod sandboxes;
 
 // Workflow memory

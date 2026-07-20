@@ -935,7 +935,7 @@ async fn fetch_specific_release(version: &str) -> anyhow::Result<GitHubRelease> 
 }
 
 /// Download a release asset as bytes.
-async fn download_asset(url: &str) -> anyhow::Result<Vec<u8>> {
+pub(crate) async fn download_asset(url: &str) -> anyhow::Result<Vec<u8>> {
     let client = reqwest::Client::new();
     let response = client
         .get(url)
@@ -959,7 +959,7 @@ async fn download_asset(url: &str) -> anyhow::Result<Vec<u8>> {
 }
 
 /// Download a release asset as text (for checksums).
-async fn download_asset_text(url: &str) -> anyhow::Result<String> {
+pub(crate) async fn download_asset_text(url: &str) -> anyhow::Result<String> {
     let client = reqwest::Client::new();
     let response = client
         .get(url)
@@ -982,7 +982,7 @@ async fn download_asset_text(url: &str) -> anyhow::Result<String> {
 }
 
 /// Verify SHA256 checksum of downloaded data.
-fn verify_checksum(data: &[u8], checksum_text: &str) -> anyhow::Result<()> {
+pub(crate) fn verify_checksum(data: &[u8], checksum_text: &str) -> anyhow::Result<()> {
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();

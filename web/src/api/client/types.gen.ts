@@ -478,6 +478,13 @@ export type AgentSandboxSettings = {
      * Runtime preset: "node", "bun", "python", "rust", "go", "full", or "custom"
      */
     runtime?: string;
+    /**
+     * Default isolation backend for sandboxes: "docker" (default) or
+     * "firecracker" (ADR-029; requires `temps firecracker setup`). Only
+     * consulted when the Firecracker backend probes available — otherwise
+     * Docker is used regardless.
+     */
+    sandbox_backend?: string | null;
 };
 
 /**
@@ -3607,7 +3614,20 @@ export type CreateS3SourceRequest = {
 
 export type CreateSandboxBody = {
     _runtime?: string | null;
+    /**
+     * Isolation backend: `"docker"` (default) or `"firecracker"` (ADR-029,
+     * hardware-virtualized microVM — requires a host provisioned with
+     * `temps firecracker setup`). Omit for the platform default; existing
+     * clients are unaffected. Requesting an unavailable backend fails with
+     * 400 rather than silently downgrading isolation.
+     */
+    backend?: string | null;
     cpu_limit?: number | null;
+    /**
+     * Root disk size in MB (Firecracker only; Docker ignores it). Omit for
+     * the platform default (1 GiB).
+     */
+    disk_size_mb?: number | null;
     /**
      * Extra env vars baked into the container on create.
      */
@@ -12599,6 +12619,13 @@ export type ResetPasswordRequest = {
     token: string;
 };
 
+export type ResizeSandboxBody = {
+    /**
+     * New root disk size in MB. Grow-only; must exceed the current size.
+     */
+    disk_size_mb: number;
+};
+
 /**
  * One entry in the computed env-var view that merges manual and integration
  * sources and tags each result with its origin. `value_preview` is always
@@ -12966,6 +12993,58 @@ export type RoleInfo = {
     permissions: Array<string>;
 };
 
+/**
+ * A cached rootfs image (Firecracker backend). Digest-keyed build artifact
+ * shared by all VMs created from the same image.
+ */
+export type RootfsCacheEntry = {
+    /**
+     * Actual on-disk size in bytes (sparse-aware).
+     */
+    bytes: number;
+    /**
+     * Image digest this rootfs was built from (the cache key).
+     */
+    digest: string;
+    /**
+     * IDs of live sandboxes whose per-VM disk was cloned from this entry.
+     * Empty means the entry is reclaimable — no sandbox needs it.
+     */
+    referenced_by: Array<string>;
+};
+
+/**
+ * Outcome of a rootfs garbage-collection pass.
+ */
+export type RootfsGcReport = {
+    freed_bytes: number;
+    /**
+     * Digests of cache entries removed because no sandbox referenced them.
+     */
+    removed_digests: Array<string>;
+};
+
+/**
+ * Snapshot of a backend's rootfs storage for the management API. Backends
+ * without a rootfs concept (Docker, local) return an empty report.
+ */
+export type RootfsReport = {
+    cache: Array<RootfsCacheEntry>;
+    cache_bytes: number;
+    vm_bytes: number;
+    vms: Array<RootfsVmEntry>;
+};
+
+/**
+ * A per-sandbox rootfs disk (Firecracker backend). One per non-destroyed
+ * sandbox — the authoritative storage, independent of the cache.
+ */
+export type RootfsVmEntry = {
+    bytes: number;
+    running: boolean;
+    sandbox_name: string;
+};
+
 export type RouteRefreshResponse = {
     /**
      * Human-readable message
@@ -13082,12 +13161,46 @@ export type SandboxDomainResponse = {
 };
 
 /**
+ * One entry in a sandbox's operations timeline.
+ */
+export type SandboxEvent = {
+    /**
+     * Unix epoch milliseconds.
+     */
+    at: number;
+    /**
+     * Optional structured context (shape depends on `event_type`).
+     */
+    detail?: unknown;
+    /**
+     * Machine-readable operation (`created`, `stopped`, `resumed`,
+     * `restarted`, `timeout_extended`, `resized`, `preview_password_set`,
+     * `preview_password_cleared`, `source_seeded`, `destroyed`).
+     */
+    event_type: string;
+};
+
+export type SandboxEventsResponse = {
+    events: Array<SandboxEvent>;
+};
+
+/**
  * Inner `sandbox` object in `@vercel/sandbox` responses. Strict shape —
  * the SDK's zod validator rejects missing required fields.
  */
 export type SandboxInner = {
+    /**
+     * Isolation backend: "docker" | "firecracker". `None` on legacy rows
+     * created before the backend was recorded.
+     */
+    backend?: string | null;
     createdAt: number;
     cwd: string;
+    /**
+     * Configured root disk size in MB (Firecracker). `None` when unknown or
+     * the default.
+     */
+    disk_size_mb?: number | null;
     id: string;
     image?: string | null;
     memory: number;
@@ -45149,6 +45262,34 @@ export type CreateSandboxResponses = {
 
 export type CreateSandboxResponse = CreateSandboxResponses[keyof CreateSandboxResponses];
 
+export type RootfsReportData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/v1/sandboxes/rootfs';
+};
+
+export type RootfsReportResponses = {
+    /**
+     * Rootfs storage report
+     */
+    200: unknown;
+};
+
+export type RootfsGcData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/v1/sandboxes/rootfs/gc';
+};
+
+export type RootfsGcResponses = {
+    /**
+     * Reclaimed cache entries
+     */
+    200: unknown;
+};
+
 export type GetSandboxData = {
     body?: never;
     path: {
@@ -45307,6 +45448,24 @@ export type DomainResponses = {
 };
 
 export type DomainResponse2 = DomainResponses[keyof DomainResponses];
+
+export type ListEventsData = {
+    body?: never;
+    path: {
+        id: string;
+    };
+    query?: never;
+    url: '/v1/sandboxes/{id}/events';
+};
+
+export type ListEventsResponses = {
+    /**
+     * Operations timeline
+     */
+    200: SandboxEventsResponse;
+};
+
+export type ListEventsResponse = ListEventsResponses[keyof ListEventsResponses];
 
 export type ExecData = {
     body: ExecBody;
@@ -45721,6 +45880,31 @@ export type SetPreviewPasswordResponses = {
 };
 
 export type SetPreviewPasswordResponse2 = SetPreviewPasswordResponses[keyof SetPreviewPasswordResponses];
+
+export type ResizeSandboxData = {
+    body: ResizeSandboxBody;
+    path: {
+        id: string;
+    };
+    query?: never;
+    url: '/v1/sandboxes/{id}/resize';
+};
+
+export type ResizeSandboxErrors = {
+    /**
+     * Invalid size or unsupported backend
+     */
+    400: unknown;
+};
+
+export type ResizeSandboxResponses = {
+    /**
+     * Resized
+     */
+    200: SandboxResponse;
+};
+
+export type ResizeSandboxResponse = ResizeSandboxResponses[keyof ResizeSandboxResponses];
 
 export type RestartSandboxData = {
     body?: never;

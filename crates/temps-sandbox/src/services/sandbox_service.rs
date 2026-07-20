@@ -18,12 +18,12 @@ use std::time::Duration;
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
 };
 
 use temps_agents::sandbox::SandboxCreateConfig;
 use temps_config::ConfigService;
-use temps_entities::sandboxes;
+use temps_entities::{sandbox_events, sandboxes};
 use temps_git::GitProviderManager;
 
 use crate::error::{from_agent_error, SandboxError};
@@ -80,6 +80,9 @@ pub struct CreateSandboxRequest {
     pub cpu_limit: Option<f64>,
     pub memory_limit_mb: Option<u64>,
     pub pids_limit: Option<i64>,
+    /// Root disk size in MB. Only honored by the Firecracker backend
+    /// (Docker ignores it). `None` uses the provider default (1 GiB).
+    pub disk_size_mb: Option<u64>,
     /// Optional initial content to seed into the work dir.
     pub source: Option<SandboxSource>,
     /// Optional preview-URL password applied atomically at create. Same
@@ -92,6 +95,11 @@ pub struct CreateSandboxRequest {
     /// `metadata` JSON column and surfaced as `routes[]` in the SDK-
     /// shaped responses.
     pub ports: Vec<u16>,
+    /// Isolation backend: "docker" (default) or "firecracker". `None` →
+    /// the host's configured default (docker unless the operator changed
+    /// it). Unknown values are a validation error, and requesting a
+    /// backend the host doesn't have fails create rather than downgrading.
+    pub backend: Option<String>,
 }
 
 /// Output DTO — what the service returns to handlers and what handlers
@@ -114,6 +122,11 @@ pub struct SandboxSummary {
     /// column). Empty when the sandbox was created without declaring
     /// any ports.
     pub ports: Vec<u16>,
+    /// Isolation backend the sandbox runs on ("docker" | "firecracker").
+    /// `None` on rows created before the column existed.
+    pub backend: Option<String>,
+    /// Configured root disk size in MB (from metadata). `None` = default.
+    pub disk_size_mb: Option<u64>,
 }
 
 impl From<&sandboxes::Model> for SandboxSummary {
@@ -128,7 +141,20 @@ impl From<&sandboxes::Model> for SandboxSummary {
             expires_at: m.expires_at,
             preview_password_hint: m.preview_password_hint.clone(),
             ports: ports_from_metadata(m.metadata.as_ref()),
+            backend: m.backend.clone(),
+            disk_size_mb: m
+                .metadata
+                .as_ref()
+                .and_then(|v| v.get("disk_size_mb"))
+                .and_then(|v| v.as_u64()),
         }
+    }
+}
+
+fn source_kind(source: &SandboxSource) -> &'static str {
+    match source {
+        SandboxSource::Git { .. } => "git",
+        SandboxSource::Tarball { .. } => "tarball",
     }
 }
 
@@ -280,6 +306,37 @@ impl SandboxService {
         let now = Utc::now();
         let expires_at = now + chrono::Duration::seconds(timeout as i64);
 
+        // Validate the requested backend before any DB/container work.
+        // Only the two public backends are accepted — "local" is a dev
+        // fallback, never a caller choice. `None` = host default (docker
+        // unless the operator changed it), so existing clients see no
+        // behavior change.
+        let backend = match req.backend.as_deref() {
+            None => None,
+            Some("docker") => Some(temps_agents::sandbox::SandboxBackend::Docker),
+            Some("firecracker") => Some(temps_agents::sandbox::SandboxBackend::Firecracker),
+            Some(other) => {
+                return Err(SandboxError::Validation {
+                    message: format!(
+                        "unknown backend '{}' (expected \"docker\" or \"firecracker\")",
+                        other
+                    ),
+                })
+            }
+        };
+
+        // Fail closed if the caller asked for a backend this host can't
+        // provide (e.g. `firecracker` on a Docker-only host). Isolation
+        // level is a security property — silently downgrading to Docker
+        // would be worse than a clear error.
+        if let Some(b) = backend {
+            if !self.registry.provider_arc().supports_backend(b) {
+                return Err(SandboxError::Validation {
+                    message: format!("backend '{}' is not available on this host", b),
+                });
+            }
+        }
+
         // Validate + hash the optional preview password *before* any
         // container/workdir work starts. A caller passing junk should fail
         // fast with a 400 rather than leaving an orphan container behind.
@@ -299,10 +356,15 @@ impl SandboxService {
             None => None,
         };
 
-        let metadata_value = if req.ports.is_empty() {
-            None
-        } else {
-            Some(serde_json::json!({ "ports": req.ports }))
+        let metadata_value = {
+            let mut meta = serde_json::Map::new();
+            if !req.ports.is_empty() {
+                meta.insert("ports".into(), serde_json::json!(req.ports));
+            }
+            if let Some(disk) = req.disk_size_mb {
+                meta.insert("disk_size_mb".into(), serde_json::json!(disk));
+            }
+            (!meta.is_empty()).then_some(serde_json::Value::Object(meta))
         };
         let active = sandboxes::ActiveModel {
             public_id: Set(public_id_value.clone()),
@@ -320,7 +382,7 @@ impl SandboxService {
             preview_password_hint: Set(preview.as_ref().map(|p| p.hint.clone())),
             ..Default::default()
         };
-        let row = active.insert(self.db.as_ref()).await?;
+        let mut row = active.insert(self.db.as_ref()).await?;
 
         // Allocate host-side working directory.
         let host_work_dir = self.data_root.join(&public_id_value);
@@ -347,21 +409,51 @@ impl SandboxService {
             container_name_override: Some(container_label.clone()),
             host_work_dir,
             workspace_volume: None,
-            image: req.image,
+            image: req.image.clone(),
             cpu_limit: req.cpu_limit,
             memory_limit_mb: req.memory_limit_mb,
             pids_limit: req.pids_limit,
+            disk_size_mb: req.disk_size_mb,
             network_mode: None,
             env_vars: req.env,
             idle_timeout: Duration::from_secs(timeout),
+            backend,
         };
 
-        if let Err(e) = self.registry.create(config).await {
-            self.mark_destroyed(row.id).await.ok();
-            return Err(SandboxError::CreateFailed {
-                user_id,
-                reason: e.to_string(),
-            });
+        let handle = match self.registry.create(config).await {
+            Ok(h) => h,
+            Err(e) => {
+                self.mark_destroyed(row.id).await.ok();
+                return Err(SandboxError::CreateFailed {
+                    user_id,
+                    reason: e.to_string(),
+                });
+            }
+        };
+
+        // Persist the *effective* backend + image the provider actually
+        // used. When the request omitted them, the host default / backend
+        // default decided; the handle carries the real answers. Stored so
+        // the API/UI show what actually booted (e.g. "alpine:3.20") instead
+        // of a vague "platform default".
+        let effective_image =
+            (req.image.is_none() && !handle.image.is_empty()).then(|| handle.image.clone());
+        if let Err(e) = self
+            .record_backend(row.id, handle.backend, effective_image.clone())
+            .await
+        {
+            tracing::warn!(
+                "failed to record backend/image for sandbox {}: {}",
+                public_id_value,
+                e
+            );
+        }
+        // Mirror the recorded values into the in-memory row so the create
+        // response matches what a later GET returns (record_backend wrote
+        // them to the DB after the initial insert).
+        row.backend = Some(handle.backend.to_string());
+        if let Some(image) = effective_image {
+            row.image = Some(image);
         }
 
         // If the caller asked us to seed the work dir, run the clone /
@@ -382,7 +474,24 @@ impl SandboxService {
                 self.mark_destroyed(row.id).await.ok();
                 return Err(e);
             }
+            self.record_event(
+                row.id,
+                "source_seeded",
+                Some(serde_json::json!({ "type": source_kind(&source) })),
+            )
+            .await;
         }
+
+        self.record_event(
+            row.id,
+            "created",
+            Some(serde_json::json!({
+                "backend": row.backend,
+                "image": row.image,
+                "disk_size_mb": req.disk_size_mb,
+            })),
+        )
+        .await;
 
         tracing::info!(
             "Created standalone sandbox {} (internal {}) for user {}",
@@ -671,6 +780,7 @@ TEMPS_ASKPASS_EOF\n\
                 e
             );
         }
+        self.record_event(row.id, "destroyed", None).await;
         self.mark_destroyed(row.id).await?;
         Ok(())
     }
@@ -700,10 +810,12 @@ TEMPS_ASKPASS_EOF\n\
             .await
             .map_err(|e| from_agent_error(public_id_value, e))?;
         let now = Utc::now();
+        let sandbox_id = row.id;
         let mut active: sandboxes::ActiveModel = row.into();
         active.status = Set("stopped".to_string());
         active.last_activity_at = Set(now);
         let updated = active.update(self.db.as_ref()).await?;
+        self.record_event(sandbox_id, "stopped", None).await;
         Ok(updated)
     }
 
@@ -732,11 +844,13 @@ TEMPS_ASKPASS_EOF\n\
             .map_err(|e| from_agent_error(public_id_value, e))?;
         let now = Utc::now();
         let new_expires = now + chrono::Duration::seconds(row.timeout_secs as i64);
+        let sandbox_id = row.id;
         let mut active: sandboxes::ActiveModel = row.into();
         active.status = Set("running".to_string());
         active.last_activity_at = Set(now);
         active.expires_at = Set(new_expires);
         let updated = active.update(self.db.as_ref()).await?;
+        self.record_event(sandbox_id, "resumed", None).await;
         Ok(updated)
     }
 
@@ -761,9 +875,71 @@ TEMPS_ASKPASS_EOF\n\
             .await
             .map_err(|e| from_agent_error(public_id_value, e))?;
         let now = Utc::now();
+        let sandbox_id = row.id;
         let mut active: sandboxes::ActiveModel = row.into();
         active.last_activity_at = Set(now);
         let updated = active.update(self.db.as_ref()).await?;
+        self.record_event(sandbox_id, "restarted", None).await;
+        Ok(updated)
+    }
+
+    /// Grow the sandbox's root disk to `new_size_mb`. Firecracker only —
+    /// the resize is done offline (stop → grow ext4 → start), so the VM
+    /// reboots but its filesystem and data survive. Grow-only. Records a
+    /// `resized` event and persists the new size in `metadata`.
+    pub async fn resize_sandbox(
+        &self,
+        public_id_value: &str,
+        user_id: i32,
+        new_size_mb: u64,
+    ) -> Result<sandboxes::Model, SandboxError> {
+        const MIN_DISK_MB: u64 = 256;
+        const MAX_DISK_MB: u64 = 64 * 1024;
+        if !(MIN_DISK_MB..=MAX_DISK_MB).contains(&new_size_mb) {
+            return Err(SandboxError::Validation {
+                message: format!(
+                    "disk_size_mb must be between {} and {}",
+                    MIN_DISK_MB, MAX_DISK_MB
+                ),
+            });
+        }
+        let row = self.find_by_public_id(public_id_value, user_id).await?;
+        if row.backend.as_deref() != Some("firecracker") {
+            return Err(SandboxError::Validation {
+                message: "disk resize is only supported on Firecracker sandboxes".into(),
+            });
+        }
+        let old_mb = row
+            .metadata
+            .as_ref()
+            .and_then(|v| v.get("disk_size_mb"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1024);
+        let sandbox_id = row.id;
+
+        self.registry
+            .resize_disk(row.id, public_id_value, new_size_mb)
+            .await
+            .map_err(|e| from_agent_error(public_id_value, e))?;
+
+        // Persist the new size into metadata (preserving ports).
+        let mut meta = row
+            .metadata
+            .clone()
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        meta.insert("disk_size_mb".into(), serde_json::json!(new_size_mb));
+        let mut active: sandboxes::ActiveModel = row.into();
+        active.metadata = Set(Some(serde_json::Value::Object(meta)));
+        active.last_activity_at = Set(Utc::now());
+        let updated = active.update(self.db.as_ref()).await?;
+
+        self.record_event(
+            sandbox_id,
+            "resized",
+            Some(serde_json::json!({ "from_mb": old_mb, "to_mb": new_size_mb })),
+        )
+        .await;
         Ok(updated)
     }
 
@@ -820,11 +996,21 @@ TEMPS_ASKPASS_EOF\n\
             });
         }
         let row = self.find_by_public_id(public_id_value, user_id).await?;
+        let sandbox_id = row.id;
         let new_expires = row.expires_at + chrono::Duration::seconds(extra_secs as i64);
         let mut active: sandboxes::ActiveModel = row.into();
         active.expires_at = Set(new_expires);
         active.last_activity_at = Set(Utc::now());
         let updated = active.update(self.db.as_ref()).await?;
+        self.record_event(
+            sandbox_id,
+            "timeout_extended",
+            Some(serde_json::json!({
+                "extra_secs": extra_secs,
+                "expires_at": new_expires.to_rfc3339(),
+            })),
+        )
+        .await;
         Ok(updated)
     }
 
@@ -859,6 +1045,97 @@ TEMPS_ASKPASS_EOF\n\
         Ok(())
     }
 
+    /// Rootfs storage inventory across backends (Firecracker cache + per-VM
+    /// disks). Powers the management API's inspection endpoint.
+    pub async fn rootfs_report(&self) -> Result<temps_agents::sandbox::RootfsReport, SandboxError> {
+        self.registry
+            .provider_arc()
+            .rootfs_report()
+            .await
+            .map_err(|e| SandboxError::Unavailable {
+                reason: format!("rootfs report: {}", e),
+            })
+    }
+
+    /// Reclaim rootfs cache entries not backing any live sandbox.
+    pub async fn gc_rootfs(&self) -> Result<temps_agents::sandbox::RootfsGcReport, SandboxError> {
+        self.registry
+            .provider_arc()
+            .gc_rootfs()
+            .await
+            .map_err(|e| SandboxError::Unavailable {
+                reason: format!("rootfs gc: {}", e),
+            })
+    }
+
+    /// Append one operation to a sandbox's timeline. Best-effort — a failed
+    /// insert is logged, never fatal to the operation it records.
+    async fn record_event(
+        &self,
+        sandbox_id: i32,
+        event_type: &str,
+        detail: Option<serde_json::Value>,
+    ) {
+        let active = sandbox_events::ActiveModel {
+            sandbox_id: Set(sandbox_id),
+            event_type: Set(event_type.to_string()),
+            detail: Set(detail),
+            created_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        if let Err(e) = active.insert(self.db.as_ref()).await {
+            tracing::warn!(
+                "failed to record '{}' event for sandbox {}: {}",
+                event_type,
+                sandbox_id,
+                e
+            );
+        }
+    }
+
+    /// The operations timeline for a sandbox, newest first. Ownership is
+    /// enforced by resolving the sandbox through `find_by_public_id`.
+    pub async fn list_events(
+        &self,
+        public_id_value: &str,
+        user_id: i32,
+        limit: u64,
+    ) -> Result<Vec<sandbox_events::Model>, SandboxError> {
+        // Bounded — the timeline is append-only and a UI only ever shows the
+        // most recent slice. Cap the page so a long-lived sandbox can't force
+        // an unbounded scan.
+        let limit = limit.clamp(1, 500);
+        let row = self.find_by_public_id(public_id_value, user_id).await?;
+        let events = sandbox_events::Entity::find()
+            .filter(sandbox_events::Column::SandboxId.eq(row.id))
+            .order_by_desc(sandbox_events::Column::CreatedAt)
+            .order_by_desc(sandbox_events::Column::Id)
+            .limit(limit)
+            .all(self.db.as_ref())
+            .await?;
+        Ok(events)
+    }
+
+    /// Persist the effective backend (and, when the request didn't specify
+    /// one, the resolved image) a sandbox runs on.
+    async fn record_backend(
+        &self,
+        id: i32,
+        backend: temps_agents::sandbox::SandboxBackend,
+        effective_image: Option<String>,
+    ) -> Result<(), SandboxError> {
+        let mut active = sandboxes::ActiveModel {
+            id: Set(id),
+            backend: Set(Some(backend.to_string())),
+            ..Default::default()
+        };
+        if let Some(image) = effective_image {
+            active.image = Set(Some(image));
+        }
+        active.update(self.db.as_ref()).await?;
+        Ok(())
+    }
+
     // ── Preview password ────────────────────────────────────────────────
 
     /// Set (or rotate) the preview password for a sandbox. The plaintext
@@ -885,10 +1162,13 @@ TEMPS_ASKPASS_EOF\n\
                 reason,
             }
         })?;
+        let sandbox_id = row.id;
         let mut active: sandboxes::ActiveModel = row.into();
         active.preview_password_hash = Set(Some(hp.hash));
         active.preview_password_hint = Set(Some(hp.hint.clone()));
         active.update(self.db.as_ref()).await?;
+        self.record_event(sandbox_id, "preview_password_set", None)
+            .await;
         Ok(hp.hint)
     }
 
@@ -901,10 +1181,16 @@ TEMPS_ASKPASS_EOF\n\
         user_id: i32,
     ) -> Result<(), SandboxError> {
         let row = self.find_by_public_id(public_id_value, user_id).await?;
+        let had_password = row.preview_password_hash.is_some();
+        let sandbox_id = row.id;
         let mut active: sandboxes::ActiveModel = row.into();
         active.preview_password_hash = Set(None);
         active.preview_password_hint = Set(None);
         active.update(self.db.as_ref()).await?;
+        if had_password {
+            self.record_event(sandbox_id, "preview_password_cleared", None)
+                .await;
+        }
         Ok(())
     }
 
@@ -1036,6 +1322,7 @@ mod tests {
             work_dir: "/workspace".into(),
             timeout_secs: 3600,
             metadata: None,
+            backend: None,
             created_at: now,
             last_activity_at: now,
             expires_at: now,

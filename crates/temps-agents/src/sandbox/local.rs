@@ -33,6 +33,8 @@ impl SandboxProvider for LocalSandboxProvider {
             sandbox_id: sandbox_name.clone(),
             sandbox_name,
             work_dir: config.host_work_dir,
+            backend: super::SandboxBackend::Local,
+            image: String::new(),
         })
     }
 
@@ -246,6 +248,8 @@ impl SandboxProvider for LocalSandboxProvider {
                 sandbox_id: format!("local-sandbox-{}", run_id),
                 sandbox_name: format!("local-sandbox-{}", run_id),
                 work_dir: autopilot_dir,
+                backend: super::SandboxBackend::Local,
+                image: String::new(),
             }));
         }
 
@@ -255,10 +259,16 @@ impl SandboxProvider for LocalSandboxProvider {
                 sandbox_id: format!("local-sandbox-{}", run_id),
                 sandbox_name: format!("local-sandbox-{}", run_id),
                 work_dir: autofixer_dir,
+                backend: super::SandboxBackend::Local,
+                image: String::new(),
             }));
         }
 
         Ok(None)
+    }
+
+    fn supports_backend(&self, backend: super::SandboxBackend) -> bool {
+        matches!(backend, super::SandboxBackend::Local)
     }
 
     fn name(&self) -> &str {
@@ -294,9 +304,11 @@ mod tests {
             cpu_limit: None,
             memory_limit_mb: None,
             pids_limit: None,
+            disk_size_mb: None,
             network_mode: None,
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(3600),
+            backend: None,
         }
     }
 
@@ -351,6 +363,8 @@ mod tests {
             sandbox_id: "test".to_string(),
             sandbox_name: "test".to_string(),
             work_dir: std::env::temp_dir(),
+            backend: crate::sandbox::SandboxBackend::Local,
+            image: String::new(),
         };
 
         let result = provider.exec(&handle, vec![], HashMap::new(), None).await;
@@ -367,6 +381,8 @@ mod tests {
             sandbox_id: "test".to_string(),
             sandbox_name: "test".to_string(),
             work_dir: work_dir.clone(),
+            backend: crate::sandbox::SandboxBackend::Local,
+            image: String::new(),
         };
 
         assert!(provider.is_alive(&handle).await.unwrap());

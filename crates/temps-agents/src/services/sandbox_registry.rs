@@ -218,9 +218,11 @@ mod tests {
             cpu_limit: None,
             memory_limit_mb: None,
             pids_limit: None,
+            disk_size_mb: None,
             network_mode: None,
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(3600),
+            backend: None,
         }
     }
 

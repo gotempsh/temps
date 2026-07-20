@@ -166,6 +166,17 @@ impl StandaloneSandboxRegistry {
         self.provider.restart(&handle).await
     }
 
+    /// Grow the sandbox's root disk (Firecracker only). Same recovery.
+    pub async fn resize_disk(
+        &self,
+        id: i32,
+        public_id: &str,
+        new_size_mb: u64,
+    ) -> Result<(), AgentError> {
+        let handle = self.get_or_recover(id, public_id).await?;
+        self.provider.resize_disk(&handle, new_size_mb).await
+    }
+
     /// Recover handles for sandboxes that were running when the server
     /// last stopped. Called on startup. Unlike `StandaloneSandboxRegistry::get`,
     /// this doesn't error on missing containers — it just skips them and
@@ -260,6 +271,8 @@ mod tests {
                 sandbox_id: format!("docker-id-{}", config.run_id),
                 sandbox_name: format!("temps-sandbox-{}", config.run_id),
                 work_dir: PathBuf::from("/workspace"),
+                backend: temps_agents::sandbox::SandboxBackend::Docker,
+                image: String::new(),
             })
         }
 
@@ -353,6 +366,8 @@ mod tests {
                 sandbox_id: id.clone(),
                 sandbox_name: format!("temps-sandbox-{}", container_name),
                 work_dir: PathBuf::from("/workspace"),
+                backend: temps_agents::sandbox::SandboxBackend::Docker,
+                image: String::new(),
             }))
         }
 
@@ -487,6 +502,8 @@ mod tests {
                 sandbox_id: "docker-id-42".to_string(),
                 sandbox_name: "temps-sandbox-abc123".to_string(),
                 work_dir: PathBuf::from("/workspace"),
+                backend: temps_agents::sandbox::SandboxBackend::Docker,
+                image: String::new(),
             },
         );
 

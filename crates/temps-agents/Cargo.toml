@@ -9,6 +9,7 @@ homepage.workspace = true
 
 [dependencies]
 temps-core = { path = "../temps-core" }
+temps-vm-agent = { path = "../temps-vm-agent" }
 temps-entities = { path = "../temps-entities" }
 temps-database = { path = "../temps-database" }
 temps-git = { path = "../temps-git" }

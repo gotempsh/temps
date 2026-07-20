@@ -915,7 +915,7 @@ export function DomainDetail() {
 
   return (
     <div className="flex-1 overflow-auto">
-      <div className="max-w-7xl mx-auto space-y-6 p-4 sm:p-6">
+      <div className="w-full space-y-6 p-4 sm:p-6">
         {/* Header (shared across variants) */}
         <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
           <div className="flex items-start gap-3 min-w-0 sm:items-center sm:gap-4">

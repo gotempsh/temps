@@ -10783,6 +10783,7 @@ dependencies = [
  "temps-error-tracking",
  "temps-git",
  "temps-notifications",
+ "temps-vm-agent",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -13002,6 +13003,16 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "temps-vm-agent"
+version = "0.1.0-beta.50"
+dependencies = [
+ "hex",
+ "libc",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

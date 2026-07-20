@@ -571,9 +571,11 @@ impl AgentExecutor {
             cpu_limit: Some(cpu_limit),
             memory_limit_mb: Some(memory_limit_mb),
             pids_limit: None,
+            disk_size_mb: None,
             network_mode: Some(global_sandbox.network_mode.clone()),
             env_vars: sandbox_env,
             idle_timeout: Duration::from_secs(timeout_seconds as u64 + 60),
+            backend: None,
         };
         self.run_service
             .append_log(

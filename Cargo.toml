@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     # Application crates
     "crates/temps-cli",
+    "crates/temps-vm-agent",
     # Library crates
     "crates/temps-core",
     "crates/temps-ai",

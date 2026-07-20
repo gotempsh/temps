@@ -314,6 +314,13 @@ pub struct AgentSandboxSettings {
     /// Network access level: "full" (unrestricted), "restricted" (Temps network only), "none" (no network)
     #[schema(example = "full")]
     pub network_mode: String,
+    /// Default isolation backend for sandboxes: "docker" (default) or
+    /// "firecracker" (ADR-029; requires `temps firecracker setup`). Only
+    /// consulted when the Firecracker backend probes available — otherwise
+    /// Docker is used regardless.
+    #[serde(default)]
+    #[schema(example = "docker")]
+    pub sandbox_backend: Option<String>,
 }
 
 /// Global AI configuration settings. Controls the default config repo
@@ -361,6 +368,7 @@ impl Default for AgentSandboxSettings {
             cpu_limit: 4.0,
             memory_limit_mb: 8192,
             network_mode: "full".to_string(),
+            sandbox_backend: None,
         }
     }
 }

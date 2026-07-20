@@ -9,6 +9,8 @@ export type SandboxView = {
   name: string
   status: string
   image: string | null
+  backend?: string | null
+  disk_size_mb?: number | null
   work_dir: string
   created_at: string
   expires_at: string
@@ -30,6 +32,8 @@ export function toSandboxView(inner: SandboxInner): SandboxView {
     name: inner.name,
     status: inner.status,
     image: inner.image ?? null,
+    backend: inner.backend ?? null,
+    disk_size_mb: inner.disk_size_mb ?? null,
     work_dir: inner.cwd,
     created_at: new Date(createdMs).toISOString(),
     expires_at: new Date(expiresMs).toISOString(),

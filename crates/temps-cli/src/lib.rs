@@ -10,9 +10,9 @@ pub mod commands;
 use clap::{Parser, Subcommand};
 use commands::{
     AgentCommand, ApiKeyCommand, BackfillCommand, BackupCommand, BuildCommand, DeployCommand,
-    DoctorCommand, DomainCommand, EdgeCommand, JoinCommand, MigrateCommand, NetworkCommand,
-    NodeCommand, ProxyCommand, ResetPasswordCommand, SandboxCommand, ServeCommand, ServicesCommand,
-    SetupCommand, UpgradeCommand,
+    DoctorCommand, DomainCommand, EdgeCommand, FirecrackerCommand, JoinCommand, MigrateCommand,
+    NetworkCommand, NodeCommand, ProxyCommand, ResetPasswordCommand, SandboxCommand, ServeCommand,
+    ServicesCommand, SetupCommand, UpgradeCommand,
 };
 use tracing_subscriber::{layer::SubscriberExt, Layer};
 
@@ -86,6 +86,8 @@ pub enum Commands {
     Edge(EdgeCommand),
     /// Manage standalone sandboxes via the Vercel-compatible `/v1/sandbox/*` API
     Sandbox(SandboxCommand),
+    /// Provision and manage the Firecracker microVM sandbox backend
+    Firecracker(FirecrackerCommand),
 }
 
 /// Install the global tracing subscriber. Safe to call once per process.
@@ -281,6 +283,7 @@ pub fn dispatch(
         Commands::Network(network_cmd) => network_cmd.execute(),
         Commands::Edge(edge_cmd) => edge_cmd.execute(),
         Commands::Sandbox(sandbox_cmd) => sandbox_cmd.execute(),
+        Commands::Firecracker(firecracker_cmd) => firecracker_cmd.execute(),
     }
 }
 

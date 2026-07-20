@@ -29,7 +29,7 @@ export default function ProxyLogDetailPage() {
 
   if (!logId) {
     return (
-      <div className="container max-w-7xl mx-auto py-8">
+      <div className="w-full py-8">
         <div className="text-center">
           <h2 className="text-2xl font-bold">Invalid Log ID</h2>
           <p className="text-muted-foreground mt-2">
@@ -45,7 +45,7 @@ export default function ProxyLogDetailPage() {
   }
 
   return (
-    <div className="container max-w-7xl mx-auto py-8">
+    <div className="w-full py-8">
       <div className="space-y-6">
         {/* Header */}
         <div className="flex items-center justify-between">
