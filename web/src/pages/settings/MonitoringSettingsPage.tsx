@@ -219,21 +219,45 @@ export function MonitoringSettingsPage() {
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
-          <div className="flex items-center justify-between rounded-lg border border-border bg-muted/30 px-4 py-3">
+          <div className="flex flex-col gap-3 rounded-lg border border-border bg-muted/30 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
             <div className="flex items-center gap-2">
               <Database className="h-4 w-4 text-muted-foreground" />
               <div>
                 <p className="text-sm font-medium">Storage backend</p>
                 <p className="text-xs text-muted-foreground">
-                  Follows the server configuration — ClickHouse activates only
-                  when the <code className="font-mono">TEMPS_CLICKHOUSE_*</code>{' '}
-                  env vars are set, otherwise metrics use TimescaleDB.
+                  ClickHouse is used only when this setting selects it{' '}
+                  <em>and</em> the{' '}
+                  <code className="font-mono">TEMPS_CLICKHOUSE_*</code> env vars
+                  are set on the server; otherwise metrics fall back to
+                  TimescaleDB. Changing the backend takes effect after the
+                  server restarts.
                 </p>
               </div>
             </div>
-            <span className="rounded-md bg-background px-2.5 py-1 text-xs font-medium text-foreground ring-1 ring-inset ring-border">
-              {effectiveStore === 'click_house' ? 'ClickHouse' : 'TimescaleDB'}
-            </span>
+            <div className="flex items-center gap-2">
+              <span className="rounded-md bg-background px-2.5 py-1 text-xs font-medium text-foreground ring-1 ring-inset ring-border">
+                Active:{' '}
+                {effectiveStore === 'click_house'
+                  ? 'ClickHouse'
+                  : 'TimescaleDB'}
+              </span>
+              <Select
+                value={storeKind}
+                onValueChange={(v) =>
+                  setValue('monitoring.store', v as MetricsStoreKind, {
+                    shouldDirty: true,
+                  })
+                }
+              >
+                <SelectTrigger className="w-full sm:w-[160px]">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="timescale_db">TimescaleDB</SelectItem>
+                  <SelectItem value="click_house">ClickHouse</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
           </div>
 
           {/* The DB toggle says ClickHouse but the runtime fell back to
