@@ -217,7 +217,8 @@ pub async fn get_proxy_log_by_id(
     get,
     path = "/proxy-logs/request/{request_id}",
     params(
-        ("request_id" = String, Path, description = "Request ID from pingora")
+        ("request_id" = String, Path, description = "Request ID from pingora"),
+        ProxyLogByIdQuery
     ),
     responses(
         (status = 200, description = "Proxy log found", body = ProxyLogResponse),
@@ -229,9 +230,10 @@ pub async fn get_proxy_log_by_id(
 pub async fn get_proxy_log_by_request_id(
     State(service): State<Arc<ProxyLogService>>,
     Path(request_id): Path<String>,
+    Query(query): Query<ProxyLogByIdQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let log = service
-        .get_by_request_id(&request_id)
+        .get_by_request_id(&request_id, query.timestamp.map(|t| t.into()))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 

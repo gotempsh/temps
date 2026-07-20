@@ -203,8 +203,9 @@ impl ProxyLogStorage for TimescaleDbProxyLogStore {
     async fn get_by_request_id(
         &self,
         request_id: &str,
+        timestamp: Option<UtcDateTime>,
     ) -> Result<Option<proxy_logs::Model>, ProxyLogServiceError> {
-        self.reader.get_by_request_id(request_id).await
+        self.reader.get_by_request_id(request_id, timestamp).await
     }
 
     async fn get_today_count(

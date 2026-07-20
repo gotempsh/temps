@@ -12,15 +12,17 @@ export default function RequestLogsList({
   const navigate = useNavigate()
 
   const handleRowClick = (
-    logId: number,
+    requestId: string,
     _projectId: number,
     timestamp: string
   ) => {
-    // The row's timestamp lets the detail endpoint bound its hypertable
-    // lookup to the right chunks instead of scanning the whole retention
-    // window.
+    // Navigate by request_id, not serial id: the ClickHouse backend has no
+    // serial id column (list rows surface id=0 there), while request_id
+    // resolves under both backends. The row's timestamp lets the detail
+    // endpoint bound its lookup to the right chunks/partitions instead of
+    // scanning the whole retention window.
     navigate(
-      `/projects/${projectResponse.slug}/logs/${logId}?ts=${encodeURIComponent(timestamp)}`
+      `/projects/${projectResponse.slug}/logs/${encodeURIComponent(requestId)}?ts=${encodeURIComponent(timestamp)}`
     )
   }
 

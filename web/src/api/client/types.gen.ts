@@ -815,16 +815,6 @@ export type AllocEntry = {
     underlay_address: string;
 };
 
-export type AnalyticsMetrics = {
-    average_visit_duration: number;
-    bounce_rate: number;
-    engagement_rate: number;
-    total_page_views: number;
-    total_visits: number;
-    unique_visitors: number;
-    views_per_visit: number;
-};
-
 export type AnalyticsSessionEventsResponse = {
     events: Array<SessionEvent>;
     session_id: string;
@@ -9494,7 +9484,9 @@ export type MonitorStatus = {
  */
 export type MonitoringSettings = {
     /**
-     * ClickHouse DSN, required only when `store = "click_house"`.
+     * ClickHouse DSN (legacy, optional). The runtime metrics store is built
+     * from the `TEMPS_CLICKHOUSE_*` env vars, never from this field; it is
+     * retained for compatibility and operator reference only.
      * Example: `"http://localhost:8123"`.
      */
     clickhouse_url?: string | null;
@@ -42347,7 +42339,16 @@ export type GetProxyLogByRequestIdData = {
          */
         request_id: string;
     };
-    query?: never;
+    query?: {
+        /**
+         * Event time of the log row (ISO 8601). When provided, the lookup is
+         * bounded to the hypertable chunks around this instant instead of
+         * scanning (and decompressing) the whole retention window. The list
+         * endpoint already returns this value per row — always pass it when
+         * navigating from a list.
+         */
+        timestamp?: string | null;
+    };
     url: '/proxy-logs/request/{request_id}';
 };
 
@@ -43156,6 +43157,10 @@ export type GetRepositoryTagsErrors = {
      */
     404: unknown;
     /**
+     * Fresh tag lookup rate limit exceeded
+     */
+    429: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -43407,6 +43412,10 @@ export type GetTagsByRepositoryIdErrors = {
      * Repository not found
      */
     404: unknown;
+    /**
+     * Fresh tag lookup rate limit exceeded
+     */
+    429: unknown;
     /**
      * Internal server error
      */

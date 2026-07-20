@@ -276,7 +276,9 @@ export function ProxyLogsDataTable({
     getInitialVisibleColumns()
   )
 
-  const [expandedRows, setExpandedRows] = useState<Set<number>>(new Set())
+  // Keyed by request_id, not serial id: the ClickHouse backend surfaces id=0
+  // on every row, which would make id-keyed expansion toggle all rows at once.
+  const [expandedRows, setExpandedRows] = useState<Set<string>>(new Set())
 
   // Sync ALL state to URL search params
   const syncToUrl = useCallback(() => {
@@ -299,13 +301,13 @@ export function ProxyLogsDataTable({
     syncToUrl()
   }, [syncToUrl])
 
-  const toggleRow = useCallback((logId: number) => {
+  const toggleRow = useCallback((requestId: string) => {
     setExpandedRows((prev) => {
       const next = new Set(prev)
-      if (next.has(logId)) {
-        next.delete(logId)
+      if (next.has(requestId)) {
+        next.delete(requestId)
       } else {
-        next.add(logId)
+        next.add(requestId)
       }
       return next
     })
@@ -1228,14 +1230,14 @@ export function ProxyLogsDataTable({
                   </TableHeader>
                   <TableBody>
                     {data.logs.map((log: ProxyLogResponse) => {
-                      const isExpanded = expandedRows.has(log.id)
+                      const isExpanded = expandedRows.has(log.request_id)
                       const visibleCount = columns.filter((col) =>
                         visibleColumns.has(col.key)
                       ).length
 
                       return (
                         <ProxyLogTableRow
-                          key={log.id}
+                          key={log.request_id}
                           log={log}
                           isExpanded={isExpanded}
                           visibleColumns={visibleColumns}
@@ -1244,7 +1246,7 @@ export function ProxyLogsDataTable({
                             if (onRowClick) {
                               onRowClick(log)
                             } else {
-                              toggleRow(log.id)
+                              toggleRow(log.request_id)
                             }
                           }}
                           getStatusBadgeVariant={getStatusBadgeVariant}
@@ -1607,7 +1609,7 @@ function ProxyLogInlineDetail({ log }: { log: ProxyLogResponse }) {
       {/* Link to full detail page */}
       <div className="flex justify-end">
         <Link
-          to={`/proxy-logs/${log.id}?ts=${encodeURIComponent(log.timestamp)}`}
+          to={`/proxy-logs/${encodeURIComponent(log.request_id)}?ts=${encodeURIComponent(log.timestamp)}`}
           className="inline-flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
           onClick={(e) => e.stopPropagation()}
         >

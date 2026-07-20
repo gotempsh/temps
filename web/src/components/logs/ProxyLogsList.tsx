@@ -38,7 +38,7 @@ import { useSearchParams } from 'react-router-dom'
 
 interface ProxyLogsListProps {
   project: ProjectResponse
-  onRowClick?: (logId: number, projectId: number, timestamp: string) => void
+  onRowClick?: (requestId: string, projectId: number, timestamp: string) => void
   showEnvironmentFilter?: boolean
 }
 
@@ -304,12 +304,12 @@ export default function ProxyLogsList({
   }
 
   const handleRowClick = (
-    logId: number,
+    requestId: string,
     logProjectId: number,
     timestamp: string
   ) => {
     if (onRowClick) {
-      onRowClick(logId, logProjectId, timestamp)
+      onRowClick(requestId, logProjectId, timestamp)
     }
   }
 
@@ -667,7 +667,7 @@ export default function ProxyLogsList({
                         ))
                       : logs?.logs.map((log) => (
                           <TableRow
-                            key={log.id}
+                            key={log.request_id}
                             className={
                               onRowClick
                                 ? 'cursor-pointer hover:bg-muted/50'
@@ -677,7 +677,7 @@ export default function ProxyLogsList({
                               onRowClick &&
                               log.project_id &&
                               handleRowClick(
-                                log.id,
+                                log.request_id,
                                 log.project_id,
                                 log.timestamp
                               )

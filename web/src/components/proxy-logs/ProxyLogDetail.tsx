@@ -1,4 +1,7 @@
-import { getProxyLogByIdOptions } from '@/api/client/@tanstack/react-query.gen'
+import {
+  getProxyLogByIdOptions,
+  getProxyLogByRequestIdOptions,
+} from '@/api/client/@tanstack/react-query.gen'
 import { Badge } from '@/components/ui/badge'
 import {
   Card,
@@ -33,7 +36,12 @@ import {
 } from 'lucide-react'
 
 interface ProxyLogDetailProps {
-  logId: number
+  /**
+   * request_id of the log row (list links navigate with it — it resolves
+   * under both the TimescaleDB and ClickHouse backends), or a legacy
+   * numeric serial id from an old deep-link.
+   */
+  logId: string
   /**
    * Event time of the log row, forwarded from the list link. Bounds the
    * backend's hypertable lookup; without it the lookup falls back to a
@@ -63,16 +71,27 @@ function getDeviceIcon(deviceType: string | null | undefined) {
 }
 
 export function ProxyLogDetail({ logId, timestamp }: ProxyLogDetailProps) {
+  const isLegacyNumericId = /^\d+$/.test(logId)
+
+  const byId = useQuery({
+    ...getProxyLogByIdOptions({
+      path: { id: parseInt(logId, 10) },
+      query: timestamp ? { timestamp } : undefined,
+    }),
+    enabled: isLegacyNumericId,
+  })
+  const byRequestId = useQuery({
+    ...getProxyLogByRequestIdOptions({
+      path: { request_id: logId },
+      query: timestamp ? { timestamp } : undefined,
+    }),
+    enabled: !isLegacyNumericId,
+  })
   const {
     data: log,
     isLoading,
     error,
-  } = useQuery({
-    ...getProxyLogByIdOptions({
-      path: { id: logId },
-      query: timestamp ? { timestamp } : undefined,
-    }),
-  })
+  } = isLegacyNumericId ? byId : byRequestId
 
   if (isLoading) {
     return (
