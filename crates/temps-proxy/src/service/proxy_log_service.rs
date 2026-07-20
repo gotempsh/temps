@@ -168,6 +168,22 @@ pub struct ProxyLogService {
     storage: Option<Arc<dyn crate::storage::ProxyLogStorage>>,
 }
 
+/// The ±1-day lookup window around a row's event time, used to bound
+/// hypertable/partition scans in the single-row lookups. Uses checked
+/// arithmetic and saturates at the representable range so a hostile or absurd
+/// `timestamp` query parameter (e.g. `+262142-12-31`) can never panic the
+/// handler on overflow — a bare `ts + Duration::days(1)` would `expect()`.
+fn day_window(ts: UtcDateTime) -> (UtcDateTime, UtcDateTime) {
+    let day = chrono::Duration::days(1);
+    let lo = ts
+        .checked_sub_signed(day)
+        .unwrap_or(chrono::DateTime::<Utc>::MIN_UTC);
+    let hi = ts
+        .checked_add_signed(day)
+        .unwrap_or(chrono::DateTime::<Utc>::MAX_UTC);
+    (lo, hi)
+}
+
 impl ProxyLogService {
     /// Construct a service that talks directly to TimescaleDB (the default).
     pub fn new(db: Arc<DatabaseConnection>, ip_service: Arc<temps_geo::IpAddressService>) -> Self {
@@ -641,10 +657,11 @@ impl ProxyLogService {
         }
 
         if let Some(ts) = timestamp {
+            let (lo, hi) = day_window(ts);
             let log = proxy_logs::Entity::find()
                 .filter(proxy_logs::Column::Id.eq(id))
-                .filter(proxy_logs::Column::Timestamp.gte(ts - chrono::Duration::days(1)))
-                .filter(proxy_logs::Column::Timestamp.lte(ts + chrono::Duration::days(1)))
+                .filter(proxy_logs::Column::Timestamp.gte(lo))
+                .filter(proxy_logs::Column::Timestamp.lte(hi))
                 .one(self.db.as_ref())
                 .await?;
             return Ok(log);
@@ -687,11 +704,17 @@ impl ProxyLogService {
             return storage.get_by_request_id(request_id, timestamp).await;
         }
 
+        // request_id has no unique index (a hypertable can't enforce uniqueness
+        // without the partitioning column), so on the off chance of a collision
+        // pick the newest row — matching the ClickHouse backend's
+        // `ORDER BY timestamp DESC LIMIT 1`.
         if let Some(ts) = timestamp {
+            let (lo, hi) = day_window(ts);
             let log = proxy_logs::Entity::find()
                 .filter(proxy_logs::Column::RequestId.eq(request_id))
-                .filter(proxy_logs::Column::Timestamp.gte(ts - chrono::Duration::days(1)))
-                .filter(proxy_logs::Column::Timestamp.lte(ts + chrono::Duration::days(1)))
+                .filter(proxy_logs::Column::Timestamp.gte(lo))
+                .filter(proxy_logs::Column::Timestamp.lte(hi))
+                .order_by_desc(proxy_logs::Column::Timestamp)
                 .one(self.db.as_ref())
                 .await?;
             return Ok(log);
@@ -701,6 +724,7 @@ impl ProxyLogService {
         let log = proxy_logs::Entity::find()
             .filter(proxy_logs::Column::RequestId.eq(request_id))
             .filter(proxy_logs::Column::Timestamp.gte(recent_cutoff))
+            .order_by_desc(proxy_logs::Column::Timestamp)
             .one(self.db.as_ref())
             .await?;
         if log.is_some() {
@@ -709,6 +733,7 @@ impl ProxyLogService {
 
         let log = proxy_logs::Entity::find()
             .filter(proxy_logs::Column::RequestId.eq(request_id))
+            .order_by_desc(proxy_logs::Column::Timestamp)
             .one(self.db.as_ref())
             .await?;
         Ok(log)
@@ -2680,10 +2705,13 @@ mod tests {
         ProxyLogService::new(db, ip_service)
     }
 
-    /// With a timestamp the lookup issues a single query bounded to ±1 day
-    /// around the event time so the hypertable can exclude chunks.
+    /// Happy-path smoke test: with a timestamp supplied the lookup takes the
+    /// single-query bounded branch and maps the row back. (MockDatabase returns
+    /// queued rows regardless of the WHERE clause, so it can't assert the ±1-day
+    /// bounds themselves; the bounding is covered structurally by the code and
+    /// the overflow test below.)
     #[tokio::test]
-    async fn get_by_request_id_with_timestamp_is_time_bounded() {
+    async fn get_by_request_id_with_timestamp_maps_row() {
         let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
             .append_query_results(vec![vec![sample_proxy_log_model("req-abc")]])
             .into_connection();
@@ -2695,6 +2723,22 @@ mod tests {
             .expect("lookup succeeds")
             .expect("row found");
         assert_eq!(found.request_id, "req-abc");
+    }
+
+    /// A hostile/absurd timestamp (near chrono's max) must not panic on the
+    /// `ts + 1 day` overflow — the window saturates instead.
+    #[tokio::test]
+    async fn get_by_request_id_extreme_timestamp_does_not_panic() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<proxy_logs::Model>::new()])
+            .into_connection();
+        let service = service_with_mock_db(db);
+
+        let result = service
+            .get_by_request_id("req-x", Some(chrono::DateTime::<Utc>::MAX_UTC))
+            .await
+            .expect("saturating window, no overflow panic");
+        assert!(result.is_none());
     }
 
     /// Without a timestamp the recent uncompressed window is probed first;

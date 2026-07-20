@@ -196,7 +196,7 @@ export function AiCrawlerActivityFeed({
       ) : (
         <div className="divide-y rounded-md border">
           {logs.map((log) => (
-            <FeedRow key={log.id} log={log} />
+            <FeedRow key={log.request_id} log={log} />
           ))}
         </div>
       )}
@@ -268,7 +268,7 @@ function FeedRow({ log }: { log: ProxyLogResponse }) {
 
   return (
     <Link
-      to={`/proxy-logs/${log.id}?ts=${encodeURIComponent(log.timestamp)}`}
+      to={`/proxy-logs/${encodeURIComponent(log.request_id)}?ts=${encodeURIComponent(log.timestamp)}`}
       className="flex items-center gap-3 px-3 py-2.5 text-sm transition-colors hover:bg-muted/50"
     >
       <AiAgentLogo provider={providerName} agent={log.bot_name} size={22} />

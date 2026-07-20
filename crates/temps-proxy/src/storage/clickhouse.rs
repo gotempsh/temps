@@ -1073,8 +1073,16 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
 
         let mut q = self.client.query(&sql).bind(request_id);
         if let Some(ts) = timestamp {
-            let lo = ts - chrono::Duration::days(1);
-            let hi = ts + chrono::Duration::days(1);
+            // Checked arithmetic saturating at the representable range: a bare
+            // `ts + Duration::days(1)` panics on overflow, and `ts` comes from a
+            // user-supplied query parameter.
+            let day = chrono::Duration::days(1);
+            let lo = ts
+                .checked_sub_signed(day)
+                .unwrap_or(chrono::DateTime::<Utc>::MIN_UTC);
+            let hi = ts
+                .checked_add_signed(day)
+                .unwrap_or(chrono::DateTime::<Utc>::MAX_UTC);
             q = q.bind(lo.timestamp_millis()).bind(hi.timestamp_millis());
         }
         let row = q.fetch_optional::<ChProxyLogReadRow>().await.map_err(|e| {
