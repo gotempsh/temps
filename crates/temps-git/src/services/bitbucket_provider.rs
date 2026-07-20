@@ -947,6 +947,13 @@ impl GitProviderService for BitbucketProvider {
             .send_with_retry(|| self.apply_auth(client.get(&url)))
             .await?;
 
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(GitProviderError::CommitNotFound {
+                repository: format!("{}/{}", owner, repo),
+                commit_sha: reference.to_string(),
+            });
+        }
+
         if !response.status().is_success() {
             return Err(GitProviderError::ApiError(format!(
                 "Failed to get commit {} for {}/{}: {}",

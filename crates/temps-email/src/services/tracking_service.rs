@@ -250,7 +250,7 @@ impl TrackingService {
         // Record the event
         let event = email_events::ActiveModel {
             email_id: Set(email_id),
-            event_type: Set("open".to_string()),
+            event_type: Set("opened".to_string()),
             ip_address: Set(ip_address),
             user_agent: Set(user_agent),
             ..Default::default()
@@ -296,7 +296,7 @@ impl TrackingService {
         // Record the event
         let event = email_events::ActiveModel {
             email_id: Set(email_id),
-            event_type: Set("click".to_string()),
+            event_type: Set("clicked".to_string()),
             link_url: Set(Some(redirect_url.clone())),
             link_index: Set(Some(link_index)),
             ip_address: Set(ip_address),
@@ -342,7 +342,8 @@ impl TrackingService {
             email_events::Entity::find().filter(email_events::Column::EmailId.eq(email_id));
 
         if let Some(et) = event_type {
-            query = query.filter(email_events::Column::EventType.eq(et));
+            query =
+                query.filter(email_events::Column::EventType.eq(normalize_event_type_filter(et)));
         }
 
         let events = query
@@ -380,9 +381,9 @@ impl TrackingService {
                     WHERE click_count > 0
                       AND (track_opens = true OR track_clicks = true)) AS emails_with_clicks,
                 (SELECT COUNT(DISTINCT email_id) FROM email_events
-                    WHERE event_type = 'bounce') AS emails_with_bounces,
+                    WHERE event_type = 'bounced') AS emails_with_bounces,
                 (SELECT COUNT(DISTINCT email_id) FROM email_events
-                    WHERE event_type = 'complaint') AS emails_with_complaints
+                    WHERE event_type = 'complained') AS emails_with_complaints
         "#;
 
         let row = StatsRow::find_by_statement(Statement::from_string(
@@ -432,7 +433,8 @@ impl TrackingService {
         let mut query = email_events::Entity::find();
 
         if let Some(et) = event_type {
-            query = query.filter(email_events::Column::EventType.eq(et));
+            query =
+                query.filter(email_events::Column::EventType.eq(normalize_event_type_filter(et)));
         }
 
         let paginator = query
@@ -452,6 +454,20 @@ impl TrackingService {
             .all(self.db.as_ref())
             .await?;
         Ok(links)
+    }
+}
+
+/// Map the short, public-facing event-type filter values documented on the
+/// tracking-events endpoints ("open", "click") onto the canonical form
+/// persisted in `email_events.event_type` ("opened", "clicked", ...).
+/// Values already in canonical form pass through unchanged.
+fn normalize_event_type_filter(event_type: &str) -> &str {
+    match event_type {
+        "open" => "opened",
+        "click" => "clicked",
+        "bounce" => "bounced",
+        "complaint" => "complained",
+        other => other,
     }
 }
 

@@ -94,6 +94,7 @@ pub mod sessions;
 pub mod source_type;
 pub mod static_asset_cache;
 pub mod static_bundles;
+pub mod suppressed_recipients;
 pub mod tls_acme_certificates;
 pub mod types;
 pub mod upstream_config;
@@ -103,7 +104,6 @@ pub mod users;
 // OpenTelemetry entities
 
 pub mod events;
-pub mod magic_link_tokens;
 pub mod session_replay_events;
 pub mod session_replay_sessions;
 pub mod settings;

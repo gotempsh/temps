@@ -31,10 +31,11 @@ use utoipa::OpenApi;
 use crate::handlers::types::{
     ActivityDay, ActivityGraphQuery, ActivityGraphResponse, ContainerActionResponse,
     ContainerDetailResponse, ContainerInfoResponse, ContainerListResponse, ContainerLogsQuery,
-    ContainerMetricsResponse, DeploymentContainerLogContentResponse,
-    DeploymentContainerLogResponse, DeploymentContainerLogsListResponse, DeploymentJobResponse,
-    DeploymentJobsResponse, DeploymentListResponse, DeploymentResponse, DeploymentStateResponse,
-    EnvVarResponse, PromoteDeploymentRequest, ResourceLimitsResponse,
+    ContainerMetricHistoryPoint, ContainerMetricsHistoryQuery, ContainerMetricsResponse,
+    DeploymentContainerLogContentResponse, DeploymentContainerLogResponse,
+    DeploymentContainerLogsListResponse, DeploymentJobResponse, DeploymentJobsResponse,
+    DeploymentListResponse, DeploymentResponse, DeploymentStateResponse, EnvVarResponse,
+    PromoteDeploymentRequest, ResourceLimitsResponse,
 };
 use temps_core::problemdetails;
 use temps_core::problemdetails::Problem;
@@ -112,6 +113,7 @@ fn public_service_url(
         start_container,
         restart_container,
         get_container_metrics,
+        get_container_metrics_history,
         stream_container_metrics,
         get_activity_graph
     ),
@@ -129,6 +131,8 @@ fn public_service_url(
         EnvVarResponse,
         ResourceLimitsResponse,
         ContainerMetricsResponse,
+        ContainerMetricsHistoryQuery,
+        ContainerMetricHistoryPoint,
         ContainerActionResponse,
         ActivityGraphQuery,
         ActivityGraphResponse,
@@ -255,6 +259,10 @@ pub fn configure_routes() -> Router<Arc<super::types::AppState>> {
         .route(
             "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/metrics",
             get(get_container_metrics),
+        )
+        .route(
+            "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/metrics/history",
+            get(get_container_metrics_history),
         )
         .route(
             "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/metrics/stream",
@@ -1967,6 +1975,93 @@ pub async fn get_container_metrics(
     Ok(Json(response).into_response())
 }
 
+/// Fetch a time-series range for a single container resource metric
+/// (recorded by the container health monitor every ~30s).
+///
+/// Useful metric names: `container.cpu_percent`,
+/// `container.cpu_utilization_percent`, `container.memory_used_bytes`,
+/// `container.memory_percent`, `container.network_rx_bytes_delta`,
+/// `container.network_tx_bytes_delta`.
+#[utoipa::path(
+    tag = "Containers",
+    get,
+    path = "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/metrics/history",
+    operation_id = "ContainerMetricsGetHistory",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("environment_id" = i32, Path, description = "Environment ID"),
+        ("container_id" = String, Path, description = "Container ID"),
+        ContainerMetricsHistoryQuery,
+    ),
+    responses(
+        (status = 200, description = "Metric time series data points", body = Vec<ContainerMetricHistoryPoint>),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Container not found"),
+        (status = 503, description = "Metrics store not available"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_container_metrics_history(
+    State(state): State<Arc<AppState>>,
+    Path((project_id, environment_id, container_id)): Path<(i32, i32, String)>,
+    Query(params): Query<ContainerMetricsHistoryQuery>,
+    RequireAuth(auth): RequireAuth,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, EnvironmentsRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
+
+    let store = state.metrics_store.as_ref().ok_or_else(|| {
+        problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+            .with_title("Metrics Unavailable")
+            .with_detail("Metric collection is not enabled on this server")
+    })?;
+
+    // Resolves the docker container ID to its `deployment_containers` row and
+    // verifies it belongs to this project/environment (404 otherwise).
+    let (container, _) = state
+        .deployment_service
+        .get_container_detail(project_id, environment_id, container_id.clone())
+        .await?;
+
+    let (window, step) = temps_metrics::range_to_step(&params.range);
+    let now = chrono::Utc::now();
+
+    let query = temps_metrics::RangeQuery {
+        source_kind: temps_metrics::SourceKind::Container,
+        source_id: container.id,
+        monotonic: temps_metrics::is_monotonic_counter(&params.metric),
+        name: params.metric.clone(),
+        from: now - window,
+        to: now,
+        step,
+    };
+
+    let points = store.query_range(query).await.map_err(|e| {
+        error!(
+            project_id,
+            environment_id,
+            container_id = %container_id,
+            metric = %params.metric,
+            error = %e,
+            "Failed to query container metric range"
+        );
+        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Internal Server Error")
+            .with_detail(format!("Failed to query metrics: {}", e))
+    })?;
+
+    let response: Vec<ContainerMetricHistoryPoint> = points
+        .into_iter()
+        .map(|(ts, v)| ContainerMetricHistoryPoint {
+            time: ts.to_rfc3339(),
+            value: v,
+        })
+        .collect();
+
+    Ok(Json(response).into_response())
+}
+
 /// Stream container metrics via Server-Sent Events (SSE)
 #[utoipa::path(
     tag = "Containers",
@@ -3359,6 +3454,7 @@ mod tests {
             project_access_checker: None,
             hostname_resolver: Arc::new(temps_core::StandardHostnameResolver)
                 as Arc<dyn temps_core::PublicHostnameResolver>,
+            metrics_store: None,
         })
     }
 

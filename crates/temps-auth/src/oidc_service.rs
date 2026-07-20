@@ -760,7 +760,7 @@ impl OidcService {
             // Without this, an attacker who can sign up at a
             // configured IdP with `victim@example.com` (unverified)
             // could take over the victim's pre-existing Temps account
-            // (password / magic-link account) on first SSO login.
+            // (password-based account) on first SSO login.
             // The OIDC spec's `email_verified` claim is exactly the
             // signal we need; if the IdP doesn't set it (or sets
             // false), refuse to link and fall through to the

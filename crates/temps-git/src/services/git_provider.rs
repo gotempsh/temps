@@ -23,6 +23,12 @@ pub enum GitProviderError {
     #[error("API error: {0}")]
     ApiError(String),
 
+    #[error("Commit '{commit_sha}' not found in repository '{repository}'")]
+    CommitNotFound {
+        repository: String,
+        commit_sha: String,
+    },
+
     #[error("A repository named '{name}' already exists on this account")]
     RepositoryAlreadyExists { name: String },
 

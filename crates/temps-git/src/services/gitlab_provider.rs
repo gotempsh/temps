@@ -1280,6 +1280,12 @@ impl GitProviderService for GitLabProvider {
 
         if !response.status().is_success() {
             let status = response.status();
+            if status == reqwest::StatusCode::NOT_FOUND {
+                return Err(GitProviderError::CommitNotFound {
+                    repository: format!("{}/{}", owner, repo),
+                    commit_sha: reference.to_string(),
+                });
+            }
             let error_text = response
                 .text()
                 .await

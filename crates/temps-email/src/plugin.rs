@@ -13,8 +13,8 @@ use utoipa::OpenApi as OpenApiTrait;
 
 use crate::handlers::{self, AppState, EmailApiDoc};
 use crate::services::{
-    DomainService, EmailService, ProviderService, TrackingService, ValidationConfig,
-    ValidationService,
+    DomainService, EmailService, ProviderService, SuppressionService, TrackingService,
+    TrackingSetupService, ValidationConfig, ValidationService,
 };
 use temps_dns::services::DnsProviderService;
 
@@ -58,21 +58,34 @@ impl TempsPlugin for EmailPlugin {
 
             // Create TrackingService — uses ConfigService to get external URL dynamically
             let config_service = context.require_service::<temps_config::ConfigService>();
-            let tracking_service = Arc::new(TrackingService::new(db.clone(), config_service));
+            let tracking_service =
+                Arc::new(TrackingService::new(db.clone(), config_service.clone()));
             context.register_service(tracking_service.clone());
 
-            // Create EmailService with tracking support
+            // Create SuppressionService — bounce/complaint do-not-send list
+            let suppression_service = Arc::new(SuppressionService::new(db.clone()));
+            context.register_service(suppression_service.clone());
+
+            // Create EmailService with tracking + suppression support
             let email_service = Arc::new(EmailService::new(
                 db.clone(),
                 provider_service.clone(),
                 domain_service.clone(),
                 tracking_service.clone(),
+                suppression_service.clone(),
             ));
             context.register_service(email_service.clone());
 
             // Create ValidationService with default config
             let validation_service = Arc::new(ValidationService::new(ValidationConfig::default()));
             context.register_service(validation_service.clone());
+
+            // AWS-side auto-setup for SES event tracking
+            let tracking_setup_service = Arc::new(TrackingSetupService::new(
+                provider_service.clone(),
+                db.clone(),
+            ));
+            context.register_service(tracking_setup_service.clone());
 
             // Get AuditService dependency from other plugins
             let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
@@ -96,6 +109,8 @@ impl TempsPlugin for EmailPlugin {
                 audit_service,
                 dns_provider_service,
                 telemetry,
+                tracking_setup_service,
+                config_service,
             });
             context.register_service(app_state);
 

@@ -351,14 +351,33 @@ impl MigrationTrait for Migration {
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        // IF EXISTS on all three: m20260401_000001 renames/drops these
+        // tables (autopilot -> agents) and its down() does not restore
+        // autopilot_configs, so a full rollback reaches this point with
+        // some of them already gone.
         manager
-            .drop_table(Table::drop().table(AutopilotRunLogs::Table).to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(AutopilotRunLogs::Table)
+                    .if_exists()
+                    .to_owned(),
+            )
             .await?;
         manager
-            .drop_table(Table::drop().table(AutopilotRuns::Table).to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(AutopilotRuns::Table)
+                    .if_exists()
+                    .to_owned(),
+            )
             .await?;
         manager
-            .drop_table(Table::drop().table(AutopilotConfigs::Table).to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(AutopilotConfigs::Table)
+                    .if_exists()
+                    .to_owned(),
+            )
             .await?;
         Ok(())
     }

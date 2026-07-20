@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -21,7 +21,8 @@ use tracing::{error, info, warn};
 use super::audit::{EmailDomainCreatedAudit, EmailDomainDeletedAudit, EmailDomainVerifiedAudit};
 use super::types::{
     AppState, CreateEmailDomainRequest, DnsRecordResponse, DnsRecordSetupResult,
-    EmailDomainResponse, EmailDomainWithDnsResponse, SetupDnsRequest, SetupDnsResponse,
+    EmailDomainResponse, EmailDomainWithDnsResponse, ListDomainsQuery, SetupDnsRequest,
+    SetupDnsResponse,
 };
 use crate::errors::EmailError;
 use crate::services::CreateDomainRequest;
@@ -176,6 +177,7 @@ pub async fn create_email_domain(
     tag = "Email Domains",
     get,
     path = "/email-domains",
+    params(ListDomainsQuery),
     responses(
         (status = 200, description = "List of email domains", body = Vec<EmailDomainResponse>),
         (status = 401, description = "Unauthorized"),
@@ -187,10 +189,15 @@ pub async fn create_email_domain(
 pub async fn list_email_domains(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
+    Query(query): Query<ListDomainsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EmailDomainsRead);
 
-    let domains = state.domain_service.list().await.map_err(|e| {
+    let domains = match query.provider_id {
+        Some(provider_id) => state.domain_service.list_by_provider(provider_id).await,
+        None => state.domain_service.list().await,
+    }
+    .map_err(|e| {
         error!("Failed to list email domains: {}", e);
         internal_server_error()
             .detail("Failed to list domains")

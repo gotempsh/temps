@@ -25,15 +25,20 @@ use tracing::{debug, error, warn};
 use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
-use crate::event_service::{EmailEventService, EmailEventStats, ListEmailEventsOptions};
+use crate::event_service::{
+    EmailEventService, EmailEventStats, ListEmailEventsOptions, SnsProcessingOutcome,
+};
 use crate::hmac::verify_tracking_hmac;
 use crate::sns::SnsVerifier;
+use temps_email::{ProviderService, SuppressionService};
 
 /// Shared state for tracking handlers
 pub struct TrackingState {
     pub event_service: Arc<EmailEventService>,
     pub sns_verifier: Arc<SnsVerifier>,
     pub hmac_key: Vec<u8>,
+    pub suppression_service: Arc<SuppressionService>,
+    pub provider_service: Arc<ProviderService>,
 }
 
 /// OpenAPI documentation
@@ -157,6 +162,16 @@ async fn click_handler(
         return Redirect::temporary("/").into_response();
     }
 
+    // Reject private/loopback/link-local/cloud-metadata targets — the URL
+    // here comes from whatever HTML the sender submitted (rewritten +
+    // HMAC-signed at send time, not filtered), so without this check a
+    // sender could embed an internal URL and get our own domain to 302
+    // recipients into it. Mirrors the same SSRF check temps-email's
+    // should_track_link() applies at rewrite time instead of redirect time.
+    if temps_core::url_validation::validate_external_url(&url).is_err() {
+        return Redirect::temporary("/").into_response();
+    }
+
     // Fire-and-forget: record click event
     let event_service = state.event_service.clone();
     let ip = extract_ip(&headers);
@@ -192,6 +207,29 @@ async fn ses_webhook_handler(State(state): State<Arc<TrackingState>>, body: Stri
         }
     };
 
+    let topic_arn = match state.sns_verifier.validate_topic(&sns_message) {
+        Ok(topic) => topic,
+        Err(error) => {
+            warn!("SNS topic validation failed: {}", error);
+            return StatusCode::FORBIDDEN.into_response();
+        }
+    };
+    match state
+        .provider_service
+        .is_sns_topic_authorized(topic_arn)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            warn!("SNS topic is not configured on an active SES provider");
+            return StatusCode::FORBIDDEN.into_response();
+        }
+        Err(error) => {
+            error!("Failed to resolve SNS topic authorization: {}", error);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+
     // Verify signature
     if let Err(e) = state.sns_verifier.verify_signature(&sns_message).await {
         warn!("SNS signature verification failed: {}", e);
@@ -201,7 +239,21 @@ async fn ses_webhook_handler(State(state): State<Arc<TrackingState>>, body: Stri
     match sns_message.message_type.as_str() {
         "SubscriptionConfirmation" => {
             match state.sns_verifier.confirm_subscription(&sns_message).await {
-                Ok(_) => StatusCode::OK.into_response(),
+                Ok(_) => {
+                    // Surface pipeline health in the provider setup UI: a
+                    // recorded confirmation is what distinguishes "working"
+                    // from "subscribed before the topic was authorized and
+                    // now stuck pending". Best-effort — the confirmation
+                    // itself already succeeded against AWS.
+                    if let Err(e) = state
+                        .provider_service
+                        .mark_sns_subscription_confirmed(topic_arn)
+                        .await
+                    {
+                        error!("Failed to record SNS subscription confirmation: {}", e);
+                    }
+                    StatusCode::OK.into_response()
+                }
                 Err(e) => {
                     error!("Failed to confirm SNS subscription: {}", e);
                     StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -220,43 +272,42 @@ async fn ses_webhook_handler(State(state): State<Arc<TrackingState>>, body: Stri
             let provider_message_id = ses_event.mail.message_id.clone();
             let (event_type, metadata, recipients) = SnsVerifier::map_ses_event(&ses_event);
 
-            // Record an event for each recipient
-            let event_service = state.event_service.clone();
-            let sns_msg_id = sns_message.message_id.clone();
+            // Only a *permanent* bounce means the mailbox is really gone —
+            // a transient/soft bounce (mailbox full, greylisting, etc.) is
+            // expected to succeed on a later send and must not suppress it.
+            let is_hard_bounce = ses_event
+                .bounce
+                .as_ref()
+                .map(|b| b.bounce_type == "Permanent")
+                .unwrap_or(false);
+            let is_complaint = event_type == "complained";
 
-            tokio::spawn(async move {
-                for recipient in &recipients {
-                    if let Err(e) = event_service
-                        .record_event(
-                            // Look up email by provider_message_id — for now, use a nil UUID
-                            // since we need a DB lookup. The provider_message_id is stored
-                            // for correlation.
-                            Uuid::nil(),
-                            &event_type,
-                            Some(format!("{}:{}", sns_msg_id, recipient)),
-                            Some(recipient.clone()),
-                            metadata.clone(),
-                            None,
-                            None,
-                        )
-                        .await
-                    {
-                        warn!(
-                            "Failed to record {} event for {}: {}",
-                            event_type, provider_message_id, e
-                        );
-                    }
-                }
+            if recipients.is_empty() {
+                warn!("SES {} event contained no recipients", event_type);
+                return StatusCode::BAD_REQUEST.into_response();
+            }
 
-                debug!(
-                    "Processed SES {} event for message {}, {} recipients",
-                    event_type,
-                    provider_message_id,
-                    recipients.len()
-                );
-            });
-
-            StatusCode::OK.into_response()
+            let suppression_reason = if is_complaint {
+                Some(temps_email::SuppressionReason::Complained)
+            } else if is_hard_bounce {
+                Some(temps_email::SuppressionReason::Bounced)
+            } else {
+                None
+            };
+            let processing_result = state
+                .event_service
+                .process_sns_event(
+                    state.suppression_service.as_ref(),
+                    topic_arn,
+                    &sns_message.message_id,
+                    &provider_message_id,
+                    &event_type,
+                    &recipients,
+                    metadata,
+                    suppression_reason,
+                )
+                .await;
+            sns_processing_response(processing_result, &event_type, &provider_message_id)
         }
         "UnsubscribeConfirmation" => {
             warn!("Received SNS UnsubscribeConfirmation — ignored");
@@ -265,6 +316,42 @@ async fn ses_webhook_handler(State(state): State<Arc<TrackingState>>, body: Stri
         other => {
             warn!("Unknown SNS message type: {}", other);
             StatusCode::OK.into_response()
+        }
+    }
+}
+
+fn sns_processing_response(
+    result: Result<SnsProcessingOutcome, crate::errors::EmailTrackingError>,
+    event_type: &str,
+    provider_message_id: &str,
+) -> Response {
+    match result {
+        Ok(SnsProcessingOutcome::Processed) => {
+            debug!(
+                "Durably processed SES {} event for message {}",
+                event_type, provider_message_id
+            );
+            StatusCode::OK.into_response()
+        }
+        Ok(SnsProcessingOutcome::AlreadyProcessed) => StatusCode::OK.into_response(),
+        Ok(SnsProcessingOutcome::Unmatched) => {
+            warn!(
+                "Retrying SES {} event for not-yet-correlated provider message {}",
+                event_type, provider_message_id
+            );
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+        Err(crate::errors::EmailTrackingError::RecipientMismatch { .. })
+        | Err(crate::errors::EmailTrackingError::TopicMismatch { .. }) => {
+            warn!("Ignoring terminal SNS correlation mismatch");
+            StatusCode::OK.into_response()
+        }
+        Err(error) => {
+            error!(
+                "Failed to durably process SES {} event for {}: {}",
+                event_type, provider_message_id, error
+            );
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
 }
@@ -526,7 +613,7 @@ async fn get_email_event_stats(
 pub fn public_routes() -> Router<Arc<TrackingState>> {
     Router::new()
         .route("/t/pixel/{email_id}/{hmac}", get(pixel_handler))
-        .route("/t/click/{email_id}/{hmac}/{url:.*}", get(click_handler))
+        .route("/t/click/{email_id}/{hmac}/{*url}", get(click_handler))
         .route("/t/webhook/ses", post(ses_webhook_handler))
 }
 
@@ -541,4 +628,27 @@ pub fn api_routes() -> Router<Arc<TrackingState>> {
 /// All routes merged
 pub fn configure_routes() -> Router<Arc<TrackingState>> {
     Router::new().merge(public_routes()).merge(api_routes())
+}
+
+#[cfg(test)]
+mod route_tests {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    #[test]
+    fn public_tracking_routes_use_valid_axum_patterns() {
+        let _router = super::public_routes();
+    }
+
+    #[test]
+    fn unmatched_sns_notification_returns_retryable_status() {
+        let response = super::sns_processing_response(
+            Ok(super::SnsProcessingOutcome::Unmatched),
+            "bounced",
+            "provider-message-id",
+        )
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
 }

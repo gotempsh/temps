@@ -189,6 +189,11 @@ const EmailDomainDetail = lazy(() =>
     default: m.EmailDomainDetail,
   }))
 )
+const EmailProviderDetail = lazy(() =>
+  import('./pages/EmailProviderDetail').then((m) => ({
+    default: m.EmailProviderDetail,
+  }))
+)
 const AuditLogs = lazy(() =>
   import('./pages/AuditLogs').then((m) => ({ default: m.AuditLogs }))
 )
@@ -524,6 +529,7 @@ const FullAppRoutes = () => {
                 <Route path="/storage/:id/members/add" element={<AddClusterMember />} />
                 <Route path="/email" element={<Email />} />
                 <Route path="/email/domains/:id" element={<EmailDomainDetail />} />
+                <Route path="/email/providers/:id" element={<EmailProviderDetail />} />
                 <Route path="/email/:id" element={<EmailDetail />} />
                 <Route path="/ai-gateway" element={<AiGateway />} />
                 <Route path="/agent-sandbox" element={<AgentSandboxLayout />}>

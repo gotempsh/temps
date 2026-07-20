@@ -134,6 +134,8 @@ pub enum DeploymentTokenPermission {
     EventsWrite,
     /// Read error tracking data
     ErrorsRead,
+    /// Execute AI gateway requests (chat completions, embeddings)
+    AiGatewayExecute,
     /// Full access (all permissions)
     FullAccess,
 }
@@ -147,6 +149,7 @@ impl DeploymentTokenPermission {
             DeploymentTokenPermission::AnalyticsRead => "analytics:read",
             DeploymentTokenPermission::EventsWrite => "events:write",
             DeploymentTokenPermission::ErrorsRead => "errors:read",
+            DeploymentTokenPermission::AiGatewayExecute => "ai_gateway:execute",
             DeploymentTokenPermission::FullAccess => "*",
         }
     }
@@ -160,6 +163,7 @@ impl DeploymentTokenPermission {
             "analytics:read" => Some(DeploymentTokenPermission::AnalyticsRead),
             "events:write" => Some(DeploymentTokenPermission::EventsWrite),
             "errors:read" => Some(DeploymentTokenPermission::ErrorsRead),
+            "ai_gateway:execute" => Some(DeploymentTokenPermission::AiGatewayExecute),
             "*" | "full_access" => Some(DeploymentTokenPermission::FullAccess),
             _ => None,
         }
@@ -173,6 +177,7 @@ impl DeploymentTokenPermission {
             DeploymentTokenPermission::AnalyticsRead,
             DeploymentTokenPermission::EventsWrite,
             DeploymentTokenPermission::ErrorsRead,
+            DeploymentTokenPermission::AiGatewayExecute,
             DeploymentTokenPermission::FullAccess,
         ]
     }

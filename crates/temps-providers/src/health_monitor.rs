@@ -30,6 +30,7 @@ use temps_entities::{
     backup_schedule_services, backup_schedules, external_service_health_checks, external_services,
     s3_sources,
 };
+use temps_metrics::{MetricKind, MetricPoint, MetricsStore, SourceKind};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -89,6 +90,17 @@ pub struct ExternalServiceHealthMonitor {
     /// service id. The health loop ticks every `poll_interval_secs`; we gate
     /// archiving so it only fires once per service's `binlog_archive_interval`.
     last_binlog_archive: Arc<Mutex<HashMap<i32, Instant>>>,
+    /// Optional metrics store. When set, container CPU/memory samples for
+    /// running services with `metrics_enabled` are written to it on every
+    /// health tick (`container.cpu_percent`, `container.memory_used_bytes`,
+    /// `container.memory_percent` with `source_kind = database`).
+    metrics_store: Option<Arc<dyn MetricsStore>>,
+    /// Previous raw docker-stats sample per service (`service_id` →
+    /// `container_name` → sample). The 30s poll interval is the CPU delta
+    /// window; the first tick per container seeds the baseline and emits
+    /// memory only.
+    stats_baselines:
+        Arc<Mutex<HashMap<i32, HashMap<String, bollard::models::ContainerStatsResponse>>>>,
 }
 
 impl ExternalServiceHealthMonitor {
@@ -108,7 +120,18 @@ impl ExternalServiceHealthMonitor {
             docker,
             encryption_service,
             last_binlog_archive: Arc::new(Mutex::new(HashMap::new())),
+            metrics_store: None,
+            stats_baselines: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Attach a metrics store. When set, the monitor writes container
+    /// CPU/memory samples for every running service with `metrics_enabled`
+    /// alongside its health probes, giving external services the same
+    /// resource-usage history deployment containers already have.
+    pub fn with_metrics_store(mut self, store: Arc<dyn MetricsStore>) -> Self {
+        self.metrics_store = Some(store);
+        self
     }
 
     /// Run forever. Spawn this onto a background task.
@@ -152,6 +175,8 @@ impl ExternalServiceHealthMonitor {
 
         debug!("Health-checking {} external service(s)", services.len());
 
+        let service_ids: Vec<i32> = services.iter().map(|s| s.id).collect();
+
         for service in services {
             if let Err(e) = self.check_service(&service).await {
                 warn!(
@@ -159,6 +184,13 @@ impl ExternalServiceHealthMonitor {
                     service.id, service.name, e
                 );
             }
+        }
+
+        // Drop stats baselines for services that no longer exist so the map
+        // doesn't grow forever as services are created and deleted.
+        {
+            let mut baselines = self.stats_baselines.lock().await;
+            baselines.retain(|id, _| service_ids.contains(id));
         }
 
         Ok(())
@@ -296,7 +328,103 @@ impl ExternalServiceHealthMonitor {
             self.maybe_archive_mariadb_binlogs(service).await;
         }
 
+        // 5. Container resource metrics: sample docker stats for every
+        //    member container and write CPU/memory points to the metrics
+        //    store. Gated on the same per-service `metrics_enabled` flag the
+        //    engine-metrics scraper uses. Failures are logged and swallowed —
+        //    metrics must never disrupt health monitoring.
+        if service.status == "running" && service.metrics_enabled {
+            if let Some(store) = self.metrics_store.clone() {
+                self.record_container_metrics(&store, service).await;
+            }
+        }
+
         Ok(())
+    }
+
+    /// Sample container stats for one service and write the resulting
+    /// CPU/memory points to the metrics store.
+    ///
+    /// Written points (all `Gauge`, `source_kind = database`,
+    /// `source_id = external_services.id`):
+    /// - `container.cpu_percent` — docker-CLI formula, 100% == one core.
+    ///   Absent on the first tick per container (no delta baseline yet).
+    /// - `container.memory_used_bytes` — RSS excluding page cache.
+    /// - `container.memory_percent` — usage relative to the container's
+    ///   memory limit (host RAM when no limit is set — same semantics as
+    ///   the live stats endpoint).
+    ///
+    /// Cluster members are distinguished by the `role` / `container_name`
+    /// labels. Containers whose sample failed (stopped, remote node) emit
+    /// no points rather than zeros.
+    async fn record_container_metrics(
+        &self,
+        store: &Arc<dyn MetricsStore>,
+        service: &external_services::Model,
+    ) {
+        let report = {
+            let mut baselines = self.stats_baselines.lock().await;
+            let service_baselines = baselines.entry(service.id).or_default();
+            match self
+                .manager
+                .sample_service_stats(service, service_baselines)
+                .await
+            {
+                Ok(report) => report,
+                Err(e) => {
+                    debug!(
+                        service_id = service.id,
+                        service = %service.name,
+                        "Container stats sampling failed: {}", e
+                    );
+                    return;
+                }
+            }
+        };
+
+        let now = Utc::now();
+        let mut points = Vec::with_capacity(report.members.len() * 3);
+
+        for member in &report.members {
+            let mut labels = HashMap::new();
+            labels.insert("role".to_string(), member.role.clone());
+            labels.insert("container_name".to_string(), member.container_name.clone());
+
+            let make_point = |name: &str, value: f64| MetricPoint {
+                time: now,
+                source_kind: SourceKind::Database,
+                source_id: service.id,
+                name: name.to_string(),
+                value,
+                kind: MetricKind::Gauge,
+                engine: Some(service.service_type.clone()),
+                environment: None,
+                node_id: service.node_id,
+                labels: labels.clone(),
+            };
+
+            if let Some(cpu) = member.cpu_percent {
+                points.push(make_point("container.cpu_percent", cpu));
+            }
+            if let Some(mem) = member.memory_usage_bytes {
+                points.push(make_point("container.memory_used_bytes", mem as f64));
+            }
+            if let Some(mem_pct) = member.memory_percent {
+                points.push(make_point("container.memory_percent", mem_pct));
+            }
+        }
+
+        if points.is_empty() {
+            return;
+        }
+
+        if let Err(e) = store.write_batch(points).await {
+            warn!(
+                service_id = service.id,
+                service = %service.name,
+                "Failed to write container metrics: {}", e
+            );
+        }
     }
 
     /// Per-service MariaDB binlog archiver tick. Gated so the actual ship only

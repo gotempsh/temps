@@ -489,6 +489,10 @@ impl TempsPlugin for DeploymentsPlugin {
                     as Arc<dyn temps_core::PublicHostnameResolver>
             });
 
+        // Optional: metrics store for container CPU/memory history, present
+        // only when metrics collection is enabled on this server.
+        let metrics_store = context.get_service::<dyn temps_metrics::MetricsStore>();
+
         let app_state = Arc::new(handlers::types::AppState {
             deployment_service,
             log_service,
@@ -510,6 +514,7 @@ impl TempsPlugin for DeploymentsPlugin {
             deployment_gate,
             project_access_checker,
             hostname_resolver,
+            metrics_store,
         });
 
         let deployments_routes = handlers::deployments::configure_routes();

@@ -85,20 +85,27 @@ temps --version
 ### Method 1b: Headless / AI-agent install
 
 When an AI agent (or any non-interactive/CI context) wants to spin up a
-throwaway Temps instance to try it out, run `deploy.sh` in **non-interactive
-mode**. It skips every prompt, suppresses banners/spinners, and writes a
-machine-readable JSON result.
+throwaway Temps instance to try it out, run `deploy.sh` with `--yes`: every
+confirmation takes its default answer, value prompts are answered by flags,
+and the run ends with a machine-readable JSON result. Without a terminal
+and without `--yes`, the script fails fast at the first prompt with
+guidance (it never hangs waiting for input that can't arrive).
 
 The same download-verify-run flow applies in headless mode — never pipe the
 installer straight into a shell, even in automation:
 
 ```bash
 # Local-only instance on this machine (127.0.0.1.sslip.io, HTTP, no domain).
-# --non-interactive is auto-enabled when there is no controlling terminal.
+# Download first (same rule as Method 1 — never pipe a remote script into a
+# shell), verify the checksum, then run.
 curl -fsSL https://temps.sh/deploy.sh -o deploy.sh
 curl -fsSL https://temps.sh/deploy.sh.sha256 -o deploy.sh.sha256
 sha256sum -c deploy.sh.sha256   # abort unless it prints: deploy.sh: OK
-bash deploy.sh --mode local --non-interactive
+bash deploy.sh --mode local --yes
+
+# On a server with a public IP, use quick mode instead. It requires --email
+# (the Let's Encrypt contact address — ACME has no fallback):
+bash deploy.sh --mode quick --email you@example.com --yes
 
 # The structured result (console URL, admin credentials, API key) is written to:
 #   ~/.temps/setup-result.json   (mode 0600)
@@ -107,22 +114,28 @@ bash deploy.sh --mode local --non-interactive
 # chat output, or generated files.
 ```
 
-The final stdout line is also machine-readable (secret fields shown redacted
+The final stdout line carries the same JSON, so it can be harvested from
+command output without knowing the file path (secret fields shown redacted
 here — the real output contains live credentials, so never paste it anywhere):
 
 ```
-::temps:result:: {"status":"ok","mode":"local","console_url":"http://console.127.0.0.1.sslip.io:8080","admin_email":"admin@127.0.0.1.sslip.io","admin_password":"<redacted>","api_key":"<redacted>","domain":"127.0.0.1.sslip.io","channel":"stable"}
+::temps:result:: {"status":"ok","mode":"local","channel":"beta","console_url":"http://console.127.0.0.1.sslip.io:8080","apps_url_pattern":"http://<project>.127.0.0.1.sslip.io:8080","domain":"127.0.0.1.sslip.io","admin_email":"admin@127.0.0.1.sslip.io","admin_password":"<redacted>","api_key":"<redacted>"}
 ```
 
-**Result fields:** `status` (`ok` | `degraded`), `mode`, `channel`,
-`console_url`, `apps_url_pattern` (with a `<project>` placeholder),
-`domain`, `admin_email`, `admin_password`, `api_key`.
+**Result fields:** `status`, `mode`, `channel`, `console_url`,
+`apps_url_pattern` (with a `<project>` placeholder), `domain`,
+`admin_email`, `admin_password`, `api_key` (minted for headless installs;
+`null` otherwise). The file is written with mode 0600 — treat it as a
+secrets file.
 
 **Flags for agents:**
 - `--mode local` — this machine, loopback sslip.io, HTTP (default headless mode)
 - `--mode quick` — server with a public IP, public sslip.io domain
-- `--non-interactive` / `--yes` / `-y` — force headless (auto-enabled with no TTY)
-- `--output-json <path>` — write the result somewhere other than `~/.temps/setup-result.json`
+- `--yes` / `-y` / `--non-interactive` — accept every confirmation's default
+  answer (required for headless — it is NOT auto-enabled)
+- `--email <address>` — Let's Encrypt contact + admin login email; required
+  with `--yes` in quick mode
+- `--domain <domain>` — pre-answer the domain prompt (advanced mode)
 - `--channel beta` — install a prerelease binary
 
 After setup, the agent can immediately deploy using the returned `api_key`.
@@ -141,6 +154,113 @@ both.
 
 > Advanced/manual-DNS mode is **TTY-only** — it needs interactive DNS-record
 > entry. Agents must use `--mode local` or `--mode quick`.
+
+### Method 1c: Remote server over SSH (e.g. a fresh Hetzner VPS)
+
+When the target is a remote machine you can already reach over SSH — a
+Hetzner Cloud VPS, a DigitalOcean Droplet, any Ubuntu/Debian box — run the
+same installer through SSH from your workstation. `ssh host 'bash ...'`
+provides no TTY, so run it headless exactly like Method 1b — `--email` plus
+`--yes` — and it writes the same machine-readable result. (Any prompt that
+would need a terminal fails fast with guidance instead of hanging.)
+
+**Prerequisites:**
+
+- SSH access as `root` or a sudo-capable user, with key-based auth (e.g. the
+  SSH key you attached when provisioning the Hetzner server)
+- Ubuntu/Debian recommended; 3 vCPU / 4 GB RAM is the reference footprint
+  (Hetzner cpx22)
+- Inbound ports **80** and **443** open in the cloud firewall (Hetzner Cloud
+  → Firewalls), plus 22 for SSH
+- No separate managed database needed — the installer sets up Docker and a
+  TimescaleDB container on the server itself
+
+**Steps:**
+
+```bash
+SERVER=root@<SERVER_IP>
+
+# 1. Verify connectivity (key auth only, fail instead of prompting)
+ssh -o BatchMode=yes "$SERVER" 'echo ok'
+
+# 2. Download the installer locally and review it (same rule as Method 1 —
+#    never pipe a remote script into a shell)
+curl -fsSL https://temps.sh/deploy.sh -o deploy.sh
+less deploy.sh
+
+# 3. Copy the reviewed script to the server and run it headless
+scp deploy.sh "$SERVER":/tmp/deploy.sh
+ssh "$SERVER" 'bash /tmp/deploy.sh --mode quick --email you@example.com --yes'
+
+# 4. Read the structured result (console URL, admin creds, API key) in place —
+#    avoid copying the secrets file to your machine
+ssh "$SERVER" 'cat ~/.temps/setup-result.json'
+```
+
+`--mode quick` publishes the console at `https://console.<SERVER_IP>.sslip.io`
+using the server's public IP — no DNS records required to get started. The
+console and apps get real Let's Encrypt certificates automatically via
+on-demand TLS (the installer falls back to HTTP if the certificate manager
+can't activate, e.g. when port 80/443 isn't reachable — the result JSON
+carries whichever scheme is live).
+
+**Point your local CLI at the new instance:**
+
+```bash
+RESULT=$(ssh "$SERVER" 'cat ~/.temps/setup-result.json')
+bunx @temps-sdk/cli configure set apiUrl "$(printf '%s' "$RESULT" | jq -r .console_url)/api"
+bunx @temps-sdk/cli login --api-key "$(printf '%s' "$RESULT" | jq -r .api_key)"
+bunx @temps-sdk/cli projects list   # smoke test
+```
+
+**Which modes work over SSH:**
+
+| Mode | Over SSH | What you get |
+|------|----------|--------------|
+| `quick` | Plain `ssh`, headless: `--email <addr> --yes` | Console at `https://console.<SERVER_IP>.sslip.io` (on-demand TLS) — zero DNS setup |
+| `advanced` | `ssh -t` (interactive wizard); `--domain`/`--email` pre-answer its prompts | Your own domain + wildcard Let's Encrypt certificate |
+| `local` | Not useful remotely | Binds `127.0.0.1.sslip.io` — only reachable from the server itself |
+
+**Advanced mode over SSH (custom domain + wildcard TLS):**
+
+The advanced wizard is interactive, so force a TTY with `-t`. Pass
+`--domain` and `--email` to pre-answer its value prompts — the wizard then
+only stops where a human is genuinely needed. Running it inside `tmux` on
+the server protects the wizard if your SSH connection drops mid-run:
+
+```bash
+ssh -t "$SERVER" 'tmux new -A -s temps-setup \
+  "bash /tmp/deploy.sh --mode advanced --domain yourdomain.com --email you@example.com"'
+```
+
+With both flags supplied, what remains interactive is the **manual DNS-01
+challenge** (by design — it proves you control the domain): the wizard
+prints `_acme-challenge.<domain>` TXT values for you to add at your DNS
+provider, waits for you to press Enter, and validates once they propagate
+(it retries up to 5 times, so propagation delays are fine — keep the
+session open while you edit DNS). It also reminds you to add the A records
+(`<domain>` and `*.<domain>` → the server's public IP) that route traffic
+to the instance. The admin email/password prompts default to `--email` and
+a generated password, so Enter accepts them.
+
+Do not combine `advanced` with `--yes` — the DNS-01 pause cannot be
+auto-answered, and the script will say so and exit.
+
+Alternatively, start with `quick` to get running immediately and attach a
+real domain later with `bunx @temps-sdk/cli domains add --domain
+yourdomain.com` followed by `domains verify`.
+
+**Security notes:**
+
+- `setup-result.json` contains the admin password and an API key — treat it
+  as a secrets file. Read it over SSH as shown rather than downloading it,
+  and never paste its contents into logs, chat, or committed files.
+- Keep SSH host-key checking on (no `StrictHostKeyChecking=no`). Connect
+  once interactively to accept the fingerprint, or pre-seed `known_hosts`
+  from your provider's console.
+- Later upgrades run the same way: `ssh "$SERVER" '~/.temps/bin/temps
+  upgrade'` (the explicit path matters — non-interactive SSH shells may not
+  source the rc file that puts `~/.temps/bin` on `PATH`).
 
 ### Method 2: Docker Compose (Production)
 
@@ -440,7 +560,7 @@ temps configure reset
 
 **Configuration files:**
 - **Config**: `~/.temps/config.json` (API URL, output format)
-- **Credentials**: `~/.temps/.secrets` (API tokens, mode 0600)
+- **Credentials**: stored securely under `~/.temps/` with restricted permissions (mode 0600), managed by `login`/`logout`
 
 **Environment variables** (override config):
 
@@ -1009,7 +1129,7 @@ temps deployments status <deployment-id>
 | File | Purpose | Location |
 |------|---------|----------|
 | `config.json` | CLI configuration | `~/.temps/config.json` |
-| `.secrets` | API tokens | `~/.temps/.secrets` |
+| credentials store | API tokens (managed by `login`/`logout`) | under `~/.temps/` (mode 0600) |
 | `encryption_key` | Encryption key | `~/.temps/encryption_key` |
 | `GeoLite2-City.mmdb` | Geolocation database | `~/.temps/GeoLite2-City.mmdb` |
 
@@ -1078,9 +1198,9 @@ source, pin `git clone` to a release tag rather than the default branch.
      ask for the value (it won't be echoed or stored in history).
   3. **CI secret stores** — inject tokens at runtime from your platform's
      secret manager; never hard-code them in pipeline files.
-- The CLI stores credentials in `~/.temps/.secrets` with restricted
-  permissions (mode 0600), managed by `login`/`logout`. Don't copy that
-  file or commit it to version control.
+- The CLI stores credentials under `~/.temps/` with restricted
+  permissions (mode 0600), managed by `login`/`logout`. Don't copy the
+  credentials file or commit it to version control.
 - All environment variables set via `temps environments vars set` /
   `temps environments vars import` are encrypted at rest and masked in the
   UI — but the local `.env` files you import from are not. Keep them out of

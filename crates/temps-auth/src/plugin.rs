@@ -153,7 +153,7 @@ impl TempsPlugin for AuthPlugin {
                     .description(Some(
                         "Complete API for authentication, authorization, and user management. \
                         Includes login/logout, MFA, user CRUD operations, role management, \
-                        magic links, password reset, and email verification.",
+                        password reset, and email verification.",
                     ))
                     .version("1.0.0")
                     .build(),

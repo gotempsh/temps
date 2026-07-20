@@ -9,7 +9,141 @@ use futures_util::StreamExt;
 use octocrab::{Octocrab, OctocrabBuilder};
 use reqwest;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use tracing::{debug, error, info};
+
+const MAX_GITHUB_TAGS: usize = 1_000;
+const MAX_GITHUB_TAG_PAGES: usize = 10;
+const MAX_GITHUB_BRANCHES: usize = 1_000;
+const MAX_GITHUB_BRANCH_PAGES: usize = 10;
+
+fn append_github_tags(
+    tags: &mut Vec<GitProviderTag>,
+    page_items: Vec<octocrab::models::repos::Tag>,
+) {
+    let remaining = MAX_GITHUB_TAGS.saturating_sub(tags.len());
+    tags.extend(
+        page_items
+            .into_iter()
+            .take(remaining)
+            .map(|tag| GitProviderTag {
+                name: tag.name,
+                commit_sha: tag.commit.sha,
+            }),
+    );
+}
+
+/// Validate a provider-supplied pagination link before issuing another request.
+///
+/// GitHub Enterprise may use a path prefix such as `/api/v3`. Returning only
+/// the validated path and query keeps Octocrab's authentication and base-URI
+/// middleware in control of the final destination.
+fn github_pagination_route(api_url: &str, next_url: &str) -> Result<String, GitProviderError> {
+    let base_url = url::Url::parse(api_url).map_err(|error| {
+        GitProviderError::ApiError(format!("Invalid configured GitHub API URL: {error}"))
+    })?;
+    let next_url = match url::Url::parse(next_url) {
+        Ok(url) => url,
+        Err(url::ParseError::RelativeUrlWithoutBase) => {
+            base_url.join(next_url).map_err(|error| {
+                GitProviderError::ApiError(format!(
+                    "Invalid relative GitHub pagination URL: {error}"
+                ))
+            })?
+        }
+        Err(error) => {
+            return Err(GitProviderError::ApiError(format!(
+                "Invalid GitHub pagination URL: {error}"
+            )))
+        }
+    };
+
+    let same_origin = next_url.scheme() == base_url.scheme()
+        && next_url.host_str().map(str::to_ascii_lowercase)
+            == base_url.host_str().map(str::to_ascii_lowercase)
+        && next_url.port_or_known_default() == base_url.port_or_known_default();
+    if !same_origin
+        || !next_url.username().is_empty()
+        || next_url.password().is_some()
+        || next_url.fragment().is_some()
+    {
+        return Err(GitProviderError::ApiError(
+            "GitHub pagination URL must use the configured API origin without credentials or fragments"
+                .to_string(),
+        ));
+    }
+
+    let base_path = base_url.path().trim_end_matches('/');
+    if !base_path.is_empty()
+        && next_url.path() != base_path
+        && !next_url
+            .path()
+            .strip_prefix(base_path)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+    {
+        return Err(GitProviderError::ApiError(
+            "GitHub pagination URL escaped the configured API path".to_string(),
+        ));
+    }
+
+    let mut route = next_url.path().to_string();
+    if let Some(query) = next_url.query() {
+        route.push('?');
+        route.push_str(query);
+    }
+    Ok(route)
+}
+
+async fn collect_guarded_github_pages<T: serde::de::DeserializeOwned>(
+    octocrab: &Octocrab,
+    api_url: &str,
+    mut page: octocrab::Page<T>,
+    max_items: usize,
+    max_pages: usize,
+    resource: &str,
+    repository: (&str, &str),
+) -> Result<Vec<T>, GitProviderError> {
+    let (owner, repo) = repository;
+    let mut items = Vec::new();
+    let mut pages_fetched = 1usize;
+    let mut visited_next_routes = HashSet::new();
+
+    loop {
+        let remaining = max_items.saturating_sub(items.len());
+        items.extend(page.take_items().into_iter().take(remaining));
+        if items.len() >= max_items {
+            break;
+        }
+
+        let Some(next_url) = page.next.as_ref() else {
+            break;
+        };
+        if pages_fetched >= max_pages {
+            return Err(GitProviderError::ApiError(format!(
+                "GitHub {resource} pagination for {owner}/{repo} exceeded the {max_pages}-page safety limit"
+            )));
+        }
+        let next_route = github_pagination_route(api_url, &next_url.to_string())?;
+        if !visited_next_routes.insert(next_route.clone()) {
+            return Err(GitProviderError::ApiError(format!(
+                "GitHub {resource} pagination for {owner}/{repo} repeated page URL"
+            )));
+        }
+
+        page = octocrab
+            .get::<octocrab::Page<T>, _, _>(&next_route, None::<&()>)
+            .await
+            .map_err(|error| {
+                GitProviderError::ApiError(format!(
+                    "Failed to paginate {resource} for {owner}/{repo} (page {}): {error}",
+                    pages_fetched + 1
+                ))
+            })?;
+        pages_fetched += 1;
+    }
+
+    Ok(items)
+}
 
 // Response structs for API calls
 
@@ -154,21 +288,19 @@ impl GitHubProvider {
 
     /// Create an Octocrab client with the given access token
     async fn get_octocrab_client(&self, access_token: &str) -> Result<Octocrab, GitProviderError> {
-        // Note: Octocrab doesn't support custom base URLs through the builder
-        // For GitHub Enterprise support, we'd need to use the underlying reqwest client
-        // For now, we'll only support the default GitHub API with Octocrab
+        let mut builder = OctocrabBuilder::new().personal_token(access_token.to_string());
         if self.api_url != "https://api.github.com" {
-            return Err(GitProviderError::Other(
-                "Custom API URLs are not supported with Octocrab integration yet".to_string(),
-            ));
+            builder = builder.base_uri(self.api_url.clone()).map_err(|error| {
+                GitProviderError::Other(format!(
+                    "Failed to configure GitHub API URL '{}': {}",
+                    self.api_url, error
+                ))
+            })?;
         }
 
-        let octocrab = OctocrabBuilder::new()
-            .personal_token(access_token.to_string())
-            .build()
-            .map_err(|e| {
-                GitProviderError::Other(format!("Failed to build Octocrab client: {}", e))
-            })?;
+        let octocrab = builder.build().map_err(|e| {
+            GitProviderError::Other(format!("Failed to build Octocrab client: {}", e))
+        })?;
 
         Ok(octocrab)
     }
@@ -1094,11 +1226,9 @@ impl GitProviderService for GitHubProvider {
     ) -> Result<Vec<Branch>, GitProviderError> {
         let octocrab = self.get_octocrab_client(access_token).await?;
 
-        // Fetch the first page with the maximum page size, then walk every
-        // remaining page so callers always see the complete branch list.
-        // GitHub paginates branches at 30 items per page by default; without
-        // `all_pages` we'd silently truncate repos like ours where `main`
-        // sorts past page 1.
+        // Fetch the first page with the maximum page size, then walk bounded,
+        // same-origin pages so callers see large branch lists without trusting
+        // provider-controlled Link targets.
         let first_page = octocrab
             .repos(owner, repo)
             .list_branches()
@@ -1107,9 +1237,16 @@ impl GitProviderService for GitHubProvider {
             .await
             .map_err(|e| GitProviderError::ApiError(format!("Failed to list branches: {}", e)))?;
 
-        let all = octocrab.all_pages(first_page).await.map_err(|e| {
-            GitProviderError::ApiError(format!("Failed to paginate branches: {}", e))
-        })?;
+        let all = collect_guarded_github_pages(
+            &octocrab,
+            &self.api_url,
+            first_page,
+            MAX_GITHUB_BRANCHES,
+            MAX_GITHUB_BRANCH_PAGES,
+            "branch",
+            (owner, repo),
+        )
+        .await?;
 
         let branches = all
             .into_iter()
@@ -1131,23 +1268,34 @@ impl GitProviderService for GitHubProvider {
     ) -> Result<Vec<GitProviderTag>, GitProviderError> {
         let octocrab = self.get_octocrab_client(access_token).await?;
 
-        // Get all tags using Octocrab
-        let tags = octocrab
+        let page = octocrab
             .repos(owner, repo)
             .list_tags()
+            .per_page(100u8)
             .send()
             .await
-            .map_err(|e| GitProviderError::ApiError(format!("Failed to list tags: {}", e)))?;
+            .map_err(|error| {
+                GitProviderError::ApiError(format!(
+                    "Failed to list tags for {}/{} (page 1): {}",
+                    owner, repo, error
+                ))
+            })?;
 
-        // Convert Octocrab tags to our GitProviderTag type
-        let tags = tags
-            .items
-            .into_iter()
-            .map(|t| GitProviderTag {
-                name: t.name,
-                commit_sha: t.commit.sha,
-            })
-            .collect();
+        // GitHub defaults to 30 tags and the previous implementation silently
+        // ignored every later page. Follow pagination while retaining the same
+        // 1,000-tag memory bound used by the other providers.
+        let raw_tags = collect_guarded_github_pages(
+            &octocrab,
+            &self.api_url,
+            page,
+            MAX_GITHUB_TAGS,
+            MAX_GITHUB_TAG_PAGES,
+            "tag",
+            (owner, repo),
+        )
+        .await?;
+        let mut tags = Vec::with_capacity(raw_tags.len());
+        append_github_tags(&mut tags, raw_tags);
 
         Ok(tags)
     }
@@ -1573,7 +1721,10 @@ impl GitProviderService for GitHubProvider {
         // GitHub API endpoint for getting a commit
         let url = format!(
             "{}/repos/{}/{}/commits/{}",
-            self.api_url, owner, repo, reference
+            self.api_url,
+            owner,
+            repo,
+            urlencoding::encode(reference)
         );
 
         let response = self
@@ -1582,6 +1733,12 @@ impl GitProviderService for GitHubProvider {
 
         if !response.status().is_success() {
             let status = response.status();
+            if status == reqwest::StatusCode::NOT_FOUND {
+                return Err(GitProviderError::CommitNotFound {
+                    repository: format!("{}/{}", owner, repo),
+                    commit_sha: reference.to_string(),
+                });
+            }
             let error_text = response
                 .text()
                 .await
@@ -2624,6 +2781,346 @@ mod archive_redirect_tests {
         // `codeload.github.com.` ends with `com.`, not `.github.com` → rejected.
         // Locks in url-crate parsing behavior against dependency bumps.
         assert!(check(None, "https://codeload.github.com./foo").is_err());
+    }
+}
+
+#[cfg(test)]
+mod tag_pagination_tests {
+    use super::*;
+
+    fn install_test_crypto_provider() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    fn provider(api_url: String) -> GitHubProvider {
+        GitHubProvider::new(
+            Some(api_url),
+            AuthMethod::PersonalAccessToken {
+                token: "test-token".to_string(),
+            },
+        )
+    }
+
+    fn github_tag_json(index: usize) -> serde_json::Value {
+        serde_json::json!({
+            "name": format!("v1.0.{index}"),
+            "commit": {
+                "sha": format!("{index:040x}"),
+                "url": format!("https://api.github.com/repos/temps/example/commits/{index}")
+            },
+            "zipball_url": format!("https://api.github.com/repos/temps/example/zipball/v1.0.{index}"),
+            "tarball_url": format!("https://api.github.com/repos/temps/example/tarball/v1.0.{index}"),
+            "node_id": format!("tag-{index}")
+        })
+    }
+
+    fn github_tag(index: usize) -> octocrab::models::repos::Tag {
+        serde_json::from_value(github_tag_json(index)).unwrap()
+    }
+
+    fn github_branch_json(index: usize) -> serde_json::Value {
+        serde_json::json!({
+            "name": format!("branch-{index}"),
+            "commit": {
+                "sha": format!("{index:040x}"),
+                "url": format!("https://api.github.com/repos/temps/example/commits/{index}")
+            },
+            "protected": false
+        })
+    }
+
+    #[test]
+    fn appending_github_tag_pages_maps_commit_shas_and_enforces_the_cap() {
+        let mut tags = Vec::new();
+        let page = (0..=MAX_GITHUB_TAGS).map(github_tag).collect();
+
+        append_github_tags(&mut tags, page);
+
+        assert_eq!(tags.len(), MAX_GITHUB_TAGS);
+        assert_eq!(tags[0].name, "v1.0.0");
+        assert_eq!(tags[0].commit_sha, format!("{:040x}", 0));
+        assert_eq!(tags[MAX_GITHUB_TAGS - 1].name, "v1.0.999");
+    }
+
+    #[test]
+    fn pagination_route_allows_only_the_configured_api_origin_and_path() {
+        let base = "https://ghe.example.com/api/v3";
+
+        assert_eq!(
+            github_pagination_route(
+                base,
+                "https://ghe.example.com/api/v3/repos/temps/example/tags?page=2"
+            )
+            .unwrap(),
+            "/api/v3/repos/temps/example/tags?page=2"
+        );
+        assert_eq!(
+            github_pagination_route(base, "/api/v3/repos/temps/example/tags?page=2").unwrap(),
+            "/api/v3/repos/temps/example/tags?page=2"
+        );
+        assert!(github_pagination_route(
+            base,
+            "https://evil.example/api/v3/repos/temps/example/tags?page=2"
+        )
+        .is_err());
+        assert!(github_pagination_route(
+            base,
+            "https://127.0.0.1/api/v3/repos/temps/example/tags?page=2"
+        )
+        .is_err());
+        assert!(
+            github_pagination_route(base, "https://169.254.169.254/latest/meta-data/iam").is_err()
+        );
+        assert!(github_pagination_route(
+            base,
+            "https://ghe.example.com@evil.example/api/v3/repos/temps/example/tags?page=2"
+        )
+        .is_err());
+        assert!(github_pagination_route(
+            base,
+            "http://ghe.example.com/api/v3/repos/temps/example/tags?page=2"
+        )
+        .is_err());
+        assert!(github_pagination_route(
+            base,
+            "https://ghe.example.com:444/api/v3/repos/temps/example/tags?page=2"
+        )
+        .is_err());
+        assert!(github_pagination_route(
+            base,
+            "https://ghe.example.com/repos/temps/example/tags?page=2"
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn list_branches_rejects_cross_origin_and_path_escape_links() {
+        install_test_crypto_provider();
+
+        for path_escape in [false, true] {
+            let mut server = mockito::Server::new_async().await;
+            let next_url = if path_escape {
+                format!("{}/outside/branches?page=2", server.url())
+            } else {
+                "http://169.254.169.254/latest/meta-data/iam".to_string()
+            };
+            let first_page = server
+                .mock("GET", "/api/v3/repos/temps/example/branches")
+                .match_query(mockito::Matcher::Exact("per_page=100".to_string()))
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_header("link", &format!("<{next_url}>; rel=\"next\""))
+                .with_body(serde_json::json!([github_branch_json(1)]).to_string())
+                .create_async()
+                .await;
+
+            let error = provider(format!("{}/api/v3", server.url()))
+                .list_branches("test-token", "temps", "example")
+                .await
+                .expect_err("unsafe branch pagination URL must fail closed");
+
+            assert!(error.to_string().contains("GitHub pagination URL"));
+            first_page.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn list_branches_rejects_a_repeated_next_page_url() {
+        install_test_crypto_provider();
+        let mut server = mockito::Server::new_async().await;
+        let next_url = format!(
+            "{}/repos/temps/example/branches?per_page=100&page=2",
+            server.url()
+        );
+        let link = format!("<{next_url}>; rel=\"next\"");
+        let first_page = server
+            .mock("GET", "/repos/temps/example/branches")
+            .match_query(mockito::Matcher::Exact("per_page=100".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_header("link", &link)
+            .with_body(serde_json::json!([github_branch_json(1)]).to_string())
+            .create_async()
+            .await;
+        let repeated_page = server
+            .mock("GET", "/repos/temps/example/branches")
+            .match_query(mockito::Matcher::Exact("per_page=100&page=2".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_header("link", &link)
+            .with_body("[]")
+            .create_async()
+            .await;
+
+        let error = provider(server.url())
+            .list_branches("test-token", "temps", "example")
+            .await
+            .expect_err("repeated branch pagination URL must fail closed");
+
+        assert!(error.to_string().contains("repeated page URL"));
+        first_page.assert_async().await;
+        repeated_page.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn list_branches_enforces_the_page_limit() {
+        install_test_crypto_provider();
+        let mut server = mockito::Server::new_async().await;
+        let first_next_url = format!(
+            "{}/repos/temps/example/branches?per_page=100&page=2",
+            server.url()
+        );
+        let first_page = server
+            .mock("GET", "/repos/temps/example/branches")
+            .match_query(mockito::Matcher::Exact("per_page=100".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_header("link", &format!("<{first_next_url}>; rel=\"next\""))
+            .with_body(serde_json::json!([github_branch_json(1)]).to_string())
+            .create_async()
+            .await;
+        let mut later_pages = Vec::new();
+        for page in 2..=MAX_GITHUB_BRANCH_PAGES {
+            let next_url = format!(
+                "{}/repos/temps/example/branches?per_page=100&page={}",
+                server.url(),
+                page + 1
+            );
+            later_pages.push(
+                server
+                    .mock("GET", "/repos/temps/example/branches")
+                    .match_query(mockito::Matcher::Exact(format!("per_page=100&page={page}")))
+                    .with_status(200)
+                    .with_header("content-type", "application/json")
+                    .with_header("link", &format!("<{next_url}>; rel=\"next\""))
+                    .with_body(serde_json::json!([github_branch_json(page)]).to_string())
+                    .create_async()
+                    .await,
+            );
+        }
+
+        let error = provider(server.url())
+            .list_branches("test-token", "temps", "example")
+            .await
+            .expect_err("branch pagination must stop at its page limit");
+
+        assert!(error.to_string().contains("10-page safety limit"));
+        first_page.assert_async().await;
+        for page in later_pages {
+            page.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn list_tags_follows_github_link_pagination() {
+        install_test_crypto_provider();
+        let mut server = mockito::Server::new_async().await;
+        let next_url = format!(
+            "{}/repos/temps/example/tags?per_page=100&page=2",
+            server.url()
+        );
+        let first_page = server
+            .mock("GET", "/repos/temps/example/tags")
+            .match_query(mockito::Matcher::Exact("per_page=100".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_header("link", &format!("<{next_url}>; rel=\"next\""))
+            .with_body(serde_json::json!([github_tag_json(1)]).to_string())
+            .create_async()
+            .await;
+        let second_page = server
+            .mock("GET", "/repos/temps/example/tags")
+            .match_query(mockito::Matcher::Exact("per_page=100&page=2".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::json!([github_tag_json(2)]).to_string())
+            .create_async()
+            .await;
+
+        let tags = provider(server.url())
+            .list_tags("test-token", "temps", "example")
+            .await
+            .expect("two-page tag listing should succeed");
+
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[0].name, "v1.0.1");
+        assert_eq!(tags[1].name, "v1.0.2");
+        first_page.assert_async().await;
+        second_page.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn list_tags_rejects_a_repeated_next_page_url() {
+        install_test_crypto_provider();
+        let mut server = mockito::Server::new_async().await;
+        let next_url = format!(
+            "{}/repos/temps/example/tags?per_page=100&page=2",
+            server.url()
+        );
+        let link = format!("<{next_url}>; rel=\"next\"");
+        let first_page = server
+            .mock("GET", "/repos/temps/example/tags")
+            .match_query(mockito::Matcher::Exact("per_page=100".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_header("link", &link)
+            .with_body(serde_json::json!([github_tag_json(1)]).to_string())
+            .create_async()
+            .await;
+        let repeated_page = server
+            .mock("GET", "/repos/temps/example/tags")
+            .match_query(mockito::Matcher::Exact("per_page=100&page=2".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_header("link", &link)
+            .with_body("[]")
+            .create_async()
+            .await;
+
+        let error = provider(server.url())
+            .list_tags("test-token", "temps", "example")
+            .await
+            .expect_err("repeated pagination URL must fail closed");
+
+        assert!(error.to_string().contains("repeated page URL"));
+        first_page.assert_async().await;
+        repeated_page.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn list_tags_reports_the_failing_later_page() {
+        install_test_crypto_provider();
+        let mut server = mockito::Server::new_async().await;
+        let next_url = format!(
+            "{}/repos/temps/example/tags?per_page=100&page=2",
+            server.url()
+        );
+        let first_page = server
+            .mock("GET", "/repos/temps/example/tags")
+            .match_query(mockito::Matcher::Exact("per_page=100".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_header("link", &format!("<{next_url}>; rel=\"next\""))
+            .with_body(serde_json::json!([github_tag_json(1)]).to_string())
+            .create_async()
+            .await;
+        let failing_page = server
+            .mock("GET", "/repos/temps/example/tags")
+            .match_query(mockito::Matcher::Exact("per_page=100&page=2".to_string()))
+            .with_status(502)
+            .with_body("upstream unavailable")
+            .expect(4)
+            .create_async()
+            .await;
+
+        let error = provider(server.url())
+            .list_tags("test-token", "temps", "example")
+            .await
+            .expect_err("later-page provider failure must be returned");
+
+        assert!(error.to_string().contains("page 2"));
+        first_page.assert_async().await;
+        failing_page.assert_async().await;
     }
 }
 

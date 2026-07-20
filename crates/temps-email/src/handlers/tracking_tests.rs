@@ -24,8 +24,8 @@ mod tests {
     use crate::handlers::tracking::{public_routes, routes};
     use crate::handlers::types::AppState;
     use crate::services::{
-        DomainService, EmailService, ProviderService, TrackingService, ValidationConfig,
-        ValidationService,
+        DomainService, EmailService, ProviderService, SuppressionService, TrackingService,
+        ValidationConfig, ValidationService,
     };
 
     // ============================================
@@ -115,16 +115,22 @@ mod tests {
             server_config,
             db.db.clone(),
         ));
+        let tracking_setup_service = Arc::new(crate::services::TrackingSetupService::new(
+            provider_service.clone(),
+            db.db.clone(),
+        ));
         let tracking_service = Arc::new(TrackingService::with_base_url(
             db.db.clone(),
-            config_service,
+            config_service.clone(),
             "http://localhost:3000".to_string(),
         ));
+        let suppression_service = Arc::new(SuppressionService::new(db.db.clone()));
         let email_service = Arc::new(EmailService::new(
             db.db.clone(),
             provider_service.clone(),
             domain_service.clone(),
             tracking_service.clone(),
+            suppression_service,
         ));
         let validation_service = Arc::new(ValidationService::new(ValidationConfig::default()));
 
@@ -137,6 +143,8 @@ mod tests {
             audit_service: Arc::new(MockAuditLogger),
             dns_provider_service: None,
             telemetry: Arc::new(temps_core::telemetry::NoopTelemetryReporter),
+            tracking_setup_service,
+            config_service,
         });
 
         (db, app_state)
@@ -549,9 +557,9 @@ mod tests {
         let events: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0]["event_type"], "open");
+        assert_eq!(events[0]["event_type"], "opened");
         assert_eq!(events[0]["ip_address"], "1.1.1.1");
-        assert_eq!(events[1]["event_type"], "click");
+        assert_eq!(events[1]["event_type"], "clicked");
         assert_eq!(events[1]["ip_address"], "2.2.2.2");
         assert_eq!(events[1]["link_index"], 0);
         assert_eq!(events[1]["link_url"], "https://example.com/page1");
@@ -600,7 +608,7 @@ mod tests {
         let events: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(events.len(), 2, "Should only return open events");
-        assert!(events.iter().all(|e| e["event_type"] == "open"));
+        assert!(events.iter().all(|e| e["event_type"] == "opened"));
     }
 
     // ============================================
@@ -745,10 +753,10 @@ mod tests {
         let events: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0]["event_type"], "open");
+        assert_eq!(events[0]["event_type"], "opened");
         assert_eq!(events[0]["ip_address"], "127.0.0.1"); // from RequestMetadata
         assert_eq!(events[0]["user_agent"], "test-agent");
-        assert_eq!(events[1]["event_type"], "click");
+        assert_eq!(events[1]["event_type"], "clicked");
         assert_eq!(events[1]["link_url"], "https://example.com/page1");
 
         // Step 6: Verify the database state directly

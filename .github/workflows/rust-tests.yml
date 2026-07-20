@@ -491,13 +491,25 @@ jobs:
             filter: >-
               package(temps-deployments) or package(temps-backup) or
               package(temps-vulnerability-scanner) or package(temps-import-docker) or
-              package(temps-migrations) or package(temps-database) or
+              package(temps-database) or
               package(temps-blob) or package(temps-query-s3) or
               package(temps-query-redis) or package(temps-query-mongodb) or
               package(temps-query-postgres) or package(temps-embeddings) or
               package(temps-config) or package(temps-notifications) or
               package(temps-deployer) or package(temps-logs) or
               package(temps-domains) or package(temps-projects)
+            test_threads: "1"
+          - group: migrations
+            # temps-migrations' up()/down() tests guard on
+            # TEMPS_TEST_DATABASE_URL and skip-as-pass when it's set (a full
+            # migration cycle would destroy a shared database). Inside the
+            # shared-DB groups above that guard always fired, so this suite
+            # had never actually run in CI. This entry runs it for real:
+            # the env var is left unset (see the run step's conditional) and
+            # each test provisions its own disposable TimescaleDB via
+            # testcontainers.
+            archive: default
+            filter: package(temps-migrations)
             test_threads: "1"
 
     steps:
@@ -562,7 +574,11 @@ jobs:
       - name: Run integration tests
         env:
           RUST_BACKTRACE: 1
-          TEMPS_TEST_DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db
+          # The migrations group must NOT see this variable: its tests
+          # skip-as-pass against external databases (see matrix comment).
+          # GitHub env vars can't be conditionally omitted, only emptied —
+          # the test-side guard treats empty as unset to close that gap.
+          TEMPS_TEST_DATABASE_URL: ${{ matrix.group != 'migrations' && 'postgresql://test_user:test_password@localhost:5432/test_db' || '' }}
         run: cargo nextest run --archive-file test-binaries-${{ matrix.archive }}.tar.zst --workspace-remap . -E '${{ matrix.filter }}' --test-threads=${{ matrix.test_threads }} ${{ matrix.extra_args }}
   # ---------------------------------------------------------------------------
   # Phase 2b: MariaDB PITR full-chain E2E

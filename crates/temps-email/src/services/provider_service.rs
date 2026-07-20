@@ -1,8 +1,8 @@
 //! Provider service for managing email provider configurations
 
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait,
+    PaginatorTrait, QueryFilter, QueryOrder,
 };
 use std::sync::Arc;
 use temps_core::EncryptionService;
@@ -97,10 +97,24 @@ impl ProviderService {
         &self,
         request: CreateProviderRequest,
     ) -> Result<email_providers::Model, EmailError> {
+        self.create_with_sns_topic(request, None).await
+    }
+
+    /// Create a provider with its non-secret SNS authorization binding.
+    pub async fn create_with_sns_topic(
+        &self,
+        request: CreateProviderRequest,
+        sns_topic_arn: Option<String>,
+    ) -> Result<email_providers::Model, EmailError> {
         debug!(
             "Creating email provider: {} ({})",
             request.name, request.provider_type
         );
+        validate_sns_topic_binding(
+            &request.provider_type,
+            &request.region,
+            sns_topic_arn.as_deref(),
+        )?;
 
         // Serialize credentials to JSON
         let credentials_json = match &request.credentials {
@@ -120,6 +134,7 @@ impl ProviderService {
             provider_type: Set(request.provider_type.to_string()),
             region: Set(request.region),
             credentials: Set(encrypted_credentials),
+            sns_topic_arn: Set(sns_topic_arn),
             is_active: Set(true),
             ..Default::default()
         };
@@ -158,6 +173,40 @@ impl ProviderService {
             .await?;
 
         Ok(providers)
+    }
+
+    /// Record a successful SNS subscription confirmation for every active
+    /// SES provider bound to `topic_arn`. Called from the tracking webhook
+    /// after a `SubscriptionConfirmation` is validated and confirmed, so the
+    /// setup UI can show "subscription confirmed" instead of leaving the
+    /// operator to infer pipeline health from the absence of events.
+    pub async fn mark_sns_subscription_confirmed(&self, topic_arn: &str) -> Result<(), EmailError> {
+        use sea_orm::sea_query::Expr;
+
+        email_providers::Entity::update_many()
+            .col_expr(
+                email_providers::Column::SnsSubscriptionConfirmedAt,
+                Expr::value(chrono::Utc::now()),
+            )
+            .filter(email_providers::Column::ProviderType.eq("ses"))
+            .filter(email_providers::Column::IsActive.eq(true))
+            .filter(email_providers::Column::SnsTopicArn.eq(topic_arn))
+            .exec(self.db.as_ref())
+            .await?;
+        Ok(())
+    }
+
+    /// Resolve SNS authorization from live provider configuration. This is
+    /// intentionally queried per webhook so provider rotation/deactivation
+    /// takes effect without restarting Temps.
+    pub async fn is_sns_topic_authorized(&self, topic_arn: &str) -> Result<bool, EmailError> {
+        let count = email_providers::Entity::find()
+            .filter(email_providers::Column::ProviderType.eq("ses"))
+            .filter(email_providers::Column::IsActive.eq(true))
+            .filter(email_providers::Column::SnsTopicArn.eq(topic_arn))
+            .count(self.db.as_ref())
+            .await?;
+        Ok(count > 0)
     }
 
     /// Delete a provider
@@ -205,10 +254,27 @@ impl ProviderService {
         id: i32,
         request: UpdateProviderRequest,
     ) -> Result<UpdateProviderOutcome, EmailError> {
+        self.update_with_sns_topic(id, request, None).await
+    }
+
+    /// Update a provider and, when supplied, rotate its SNS topic binding
+    /// without requiring the encrypted AWS credentials to be re-entered.
+    pub async fn update_with_sns_topic(
+        &self,
+        id: i32,
+        request: UpdateProviderRequest,
+        sns_topic_arn: Option<Option<String>>,
+    ) -> Result<UpdateProviderOutcome, EmailError> {
         debug!("Updating email provider {}", id);
 
         let existing = self.get(id).await?;
         let existing_type = EmailProviderType::from_str(&existing.provider_type)?;
+        let effective_region = request.region.as_deref().unwrap_or(&existing.region);
+        let effective_sns_topic = sns_topic_arn
+            .as_ref()
+            .map(|topic| topic.as_deref())
+            .unwrap_or(existing.sns_topic_arn.as_deref());
+        validate_sns_topic_binding(&existing_type, effective_region, effective_sns_topic)?;
         let mut changed_fields: Vec<String> = Vec::new();
 
         let mut active: email_providers::ActiveModel = existing.clone().into();
@@ -236,6 +302,16 @@ impl ProviderService {
             if is_active != existing.is_active {
                 active.is_active = Set(is_active);
                 changed_fields.push("is_active".to_string());
+            }
+        }
+
+        if let Some(topic_arn) = sns_topic_arn {
+            if existing.sns_topic_arn != topic_arn {
+                active.sns_topic_arn = Set(topic_arn);
+                // A subscription confirmation vouches only for the topic it
+                // happened on — rotating or clearing the topic invalidates it.
+                active.sns_subscription_confirmed_at = Set(None);
+                changed_fields.push("sns_topic_arn".to_string());
             }
         }
 
@@ -277,6 +353,27 @@ impl ProviderService {
             provider: updated,
             changed_fields,
         })
+    }
+
+    /// Decrypt and parse a provider's stored SES credentials. Fails for
+    /// non-SES providers. Keeps decryption encapsulated here so callers
+    /// (e.g. the event-tracking setup service) never touch the
+    /// EncryptionService directly.
+    pub fn ses_credentials(
+        &self,
+        provider: &email_providers::Model,
+    ) -> Result<SesCredentials, EmailError> {
+        if EmailProviderType::from_str(&provider.provider_type)? != EmailProviderType::Ses {
+            return Err(EmailError::Validation(format!(
+                "Provider {} is not an SES provider",
+                provider.id
+            )));
+        }
+        let credentials_json = self
+            .encryption_service
+            .decrypt_string(&provider.credentials)
+            .map_err(|e| EmailError::Decryption(e.to_string()))?;
+        Ok(serde_json::from_str(&credentials_json)?)
     }
 
     /// Create an email provider instance from a database model
@@ -458,6 +555,39 @@ impl ProviderService {
 }
 
 /// Mask a string, showing only first 4 and last 4 characters
+fn validate_sns_topic_binding(
+    provider_type: &EmailProviderType,
+    region: &str,
+    topic_arn: Option<&str>,
+) -> Result<(), EmailError> {
+    let Some(topic_arn) = topic_arn else {
+        return Ok(());
+    };
+    if *provider_type != EmailProviderType::Ses {
+        return Err(EmailError::Validation(
+            "sns_topic_arn is only valid for SES providers".to_string(),
+        ));
+    }
+    let parts: Vec<&str> = topic_arn.split(':').collect();
+    let valid_partition = parts
+        .get(1)
+        .is_some_and(|partition| matches!(*partition, "aws" | "aws-us-gov" | "aws-cn"));
+    if parts.len() != 6
+        || parts[0] != "arn"
+        || !valid_partition
+        || parts[2] != "sns"
+        || parts[3] != region
+        || parts[4].len() != 12
+        || !parts[4].bytes().all(|byte| byte.is_ascii_digit())
+        || parts[5].is_empty()
+    {
+        return Err(EmailError::Validation(format!(
+            "sns_topic_arn must be an SNS topic ARN for provider region {region}"
+        )));
+    }
+    Ok(())
+}
+
 fn mask_string(s: &str) -> String {
     if s.len() <= 8 {
         "***".to_string()
@@ -625,7 +755,8 @@ pub(crate) fn render_test_email_text(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sea_orm::{DatabaseBackend, MockDatabase};
+    use sea_orm::{DatabaseBackend, MockDatabase, Value};
+    use std::collections::BTreeMap;
     use temps_database::test_utils::TestDatabase;
 
     // Helper to create a test encryption service
@@ -797,6 +928,108 @@ mod tests {
         assert!(EmailProviderType::from_str("invalid").is_err());
     }
 
+    #[tokio::test]
+    async fn sns_topic_authorization_requires_active_ses_provider_and_exact_topic() {
+        let topic_arn = "arn:aws:sns:us-east-1:123456789012:temps-events";
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![BTreeMap::from([(
+                "num_items",
+                Value::BigInt(Some(1)),
+            )])]])
+            .into_connection();
+        let db = Arc::new(db);
+        let service = ProviderService::new(db.clone(), create_test_encryption_service());
+
+        assert!(service.is_sns_topic_authorized(topic_arn).await.unwrap());
+
+        drop(service);
+        let db = Arc::try_unwrap(db).expect("provider service released DB");
+        let log = db.into_transaction_log();
+        let sql = log[0].statements()[0].sql.to_lowercase();
+        assert!(sql.contains("provider_type"));
+        assert!(sql.contains("is_active"));
+        assert!(sql.contains("sns_topic_arn"));
+    }
+
+    #[tokio::test]
+    async fn sns_topic_authorization_rejects_unmatched_topic() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![BTreeMap::from([(
+                "num_items",
+                Value::BigInt(Some(0)),
+            )])]])
+            .into_connection();
+        let service = ProviderService::new(Arc::new(db), create_test_encryption_service());
+
+        assert!(!service
+            .is_sns_topic_authorized("arn:aws:sns:us-east-1:123456789012:wrong")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn changing_region_revalidates_preserved_sns_topic() {
+        let provider = email_providers::Model {
+            id: 1,
+            name: "Test SES".to_string(),
+            provider_type: "ses".to_string(),
+            region: "us-east-1".to_string(),
+            credentials: "encrypted".to_string(),
+            sns_topic_arn: Some("arn:aws:sns:us-east-1:123456789012:temps-events".to_string()),
+            sns_subscription_confirmed_at: None,
+            is_active: true,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[provider]])
+            .into_connection();
+        let service = ProviderService::new(Arc::new(db), create_test_encryption_service());
+
+        let result = service
+            .update_with_sns_topic(
+                1,
+                UpdateProviderRequest {
+                    region: Some("eu-west-1".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await;
+
+        assert!(matches!(result, Err(EmailError::Validation(_))));
+    }
+
+    #[tokio::test]
+    async fn explicit_null_clears_sns_topic_binding() {
+        let provider = email_providers::Model {
+            id: 1,
+            name: "Test SES".to_string(),
+            provider_type: "ses".to_string(),
+            region: "us-east-1".to_string(),
+            credentials: "encrypted".to_string(),
+            sns_topic_arn: Some("arn:aws:sns:us-east-1:123456789012:temps-events".to_string()),
+            sns_subscription_confirmed_at: None,
+            is_active: true,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let mut cleared = provider.clone();
+        cleared.sns_topic_arn = None;
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[provider], [cleared]])
+            .into_connection();
+        let service = ProviderService::new(Arc::new(db), create_test_encryption_service());
+
+        let outcome = service
+            .update_with_sns_topic(1, UpdateProviderRequest::default(), Some(None))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.provider.sns_topic_arn, None);
+        assert_eq!(outcome.changed_fields, ["sns_topic_arn"]);
+    }
+
     #[test]
     fn test_get_masked_credentials_ses() {
         let encryption_service = create_test_encryption_service();
@@ -821,6 +1054,8 @@ mod tests {
             provider_type: "ses".to_string(),
             region: "us-east-1".to_string(),
             credentials: encrypted,
+            sns_topic_arn: None,
+            sns_subscription_confirmed_at: None,
             is_active: true,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -857,6 +1092,8 @@ mod tests {
             provider_type: "scaleway".to_string(),
             region: "fr-par".to_string(),
             credentials: encrypted,
+            sns_topic_arn: None,
+            sns_subscription_confirmed_at: None,
             is_active: true,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),

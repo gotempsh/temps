@@ -3,6 +3,7 @@
 import {
   deleteEmailDomain,
   getDomain,
+  getEmailStats,
   listDnsProviders,
   listEmailProviders,
   setupDns,
@@ -10,6 +11,7 @@ import {
   type DnsProviderResponse,
   type EmailDomainWithDnsResponse,
   type EmailProviderResponse,
+  type EmailStatsResponse,
   type SetupDnsResponse,
 } from '@/api/client'
 import {
@@ -59,10 +61,14 @@ import { cn } from '@/lib/utils'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertCircle,
+  Archive,
   ArrowLeft,
   CheckCircle2,
+  Clock,
   Globe,
   Loader2,
+  Mail,
+  MailX,
   RefreshCw,
   Settings2,
   Trash2,
@@ -71,16 +77,7 @@ import {
 import { useEffect, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { toast } from 'sonner'
-
-function problemMessage(error: unknown, fallback: string): string {
-  if (error && typeof error === 'object' && 'detail' in error) {
-    const detail = (error as { detail?: unknown }).detail
-    if (typeof detail === 'string' && detail.length > 0) {
-      return detail
-    }
-  }
-  return fallback
-}
+import { problemMessage } from '@/components/email/sharedUtils'
 
 async function fetchDomain(id: number): Promise<EmailDomainWithDnsResponse> {
   const response = await getDomain({ path: { id } })
@@ -106,6 +103,58 @@ async function fetchDnsProviders(): Promise<DnsProviderResponse[]> {
   return response.data ?? []
 }
 
+// NOTE: EmailAnalytics.tsx's bounce/complaint/open/click *rate* stats come
+// from `/emails/events/stats` (get_global_event_stats), which has no
+// domain_id filter at all (global-only). `getEmailStats` (/emails/stats,
+// used by EmailsSentList.tsx) does support a domain_id filter, so that's
+// what we use here for domain-scoped delivery stats.
+async function fetchEmailStats(domainId: number): Promise<EmailStatsResponse> {
+  const response = await getEmailStats({ query: { domain_id: domainId } })
+  if (response.error || !response.data) {
+    throw new Error(problemMessage(response.error, 'Failed to fetch email stats'))
+  }
+  return response.data
+}
+
+function StatCard({
+  title,
+  value,
+  icon: Icon,
+}: {
+  title: string
+  value: number
+  icon: React.ComponentType<{ className?: string }>
+}) {
+  return (
+    <Card>
+      <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+        <CardTitle className="text-sm font-medium">{title}</CardTitle>
+        <Icon className="h-4 w-4 text-muted-foreground" />
+      </CardHeader>
+      <CardContent>
+        <div className="text-2xl font-bold">{value.toLocaleString()}</div>
+      </CardContent>
+    </Card>
+  )
+}
+
+function StatsSkeleton() {
+  return (
+    <div className="grid gap-4 grid-cols-2 md:grid-cols-5">
+      {[1, 2, 3, 4, 5].map((i) => (
+        <Card key={i}>
+          <CardHeader className="pb-2">
+            <Skeleton className="h-4 w-16" />
+          </CardHeader>
+          <CardContent>
+            <Skeleton className="h-8 w-12" />
+          </CardContent>
+        </Card>
+      ))}
+    </div>
+  )
+}
+
 export function EmailDomainDetail() {
   const { id: idParam } = useParams<{ id: string }>()
   const id = idParam ? parseInt(idParam, 10) : undefined
@@ -123,6 +172,16 @@ export function EmailDomainDetail() {
   } = useQuery({
     queryKey: ['email-domain', id],
     queryFn: () => fetchDomain(id!),
+    enabled: !!id,
+  })
+
+  const {
+    data: emailStats,
+    isLoading: isLoadingStats,
+    error: statsError,
+  } = useQuery({
+    queryKey: ['email-stats', id],
+    queryFn: () => fetchEmailStats(id!),
     enabled: !!id,
   })
 
@@ -423,6 +482,31 @@ export function EmailDomainDetail() {
               {domain.verification_error}
             </AlertDescription>
           </Alert>
+        )}
+
+        {/* Delivery status stats for this domain */}
+        {isLoadingStats ? (
+          <StatsSkeleton />
+        ) : statsError ? (
+          <Alert variant="destructive">
+            <AlertCircle className="h-4 w-4" />
+            <AlertTitle>Failed to load email stats</AlertTitle>
+            <AlertDescription>
+              {statsError instanceof Error
+                ? statsError.message
+                : 'Could not fetch delivery stats for this domain.'}
+            </AlertDescription>
+          </Alert>
+        ) : (
+          emailStats && (
+            <div className="grid gap-4 grid-cols-2 md:grid-cols-5">
+              <StatCard title="Total Emails" value={emailStats.total} icon={Mail} />
+              <StatCard title="Sent" value={emailStats.sent} icon={CheckCircle2} />
+              <StatCard title="Captured" value={emailStats.captured} icon={Archive} />
+              <StatCard title="Queued" value={emailStats.queued} icon={Clock} />
+              <StatCard title="Failed" value={emailStats.failed} icon={MailX} />
+            </div>
+          )
         )}
 
         {/* Two-column layout: DNS setup on left, overview on right */}

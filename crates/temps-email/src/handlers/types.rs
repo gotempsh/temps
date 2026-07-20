@@ -2,9 +2,10 @@
 
 use crate::providers::{EmailProviderType, SmtpEncryption};
 use crate::services::{
-    DomainService, EmailService, ProviderService, TrackingService, ValidationService,
+    DomainService, EmailService, ProviderService, TrackingService, TrackingSetupService,
+    ValidationService,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use temps_core::AuditLogger;
@@ -22,6 +23,12 @@ pub struct AppState {
     /// DNS provider service for automatic DNS record setup
     pub dns_provider_service: Option<Arc<DnsProviderService>>,
     pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
+    /// AWS-side auto-setup for SES event tracking (SNS topic + webhook
+    /// subscription + SESv2 event destination).
+    pub tracking_setup_service: Arc<TrackingSetupService>,
+    /// For computing the public tracking webhook URL from the configured
+    /// external URL at request time (it can change without a restart).
+    pub config_service: Arc<temps_config::ConfigService>,
 }
 
 // ========================================
@@ -143,6 +150,9 @@ pub struct CreateEmailProviderRequest {
     /// Cloud region. For SMTP this is informational only — the host/port carry the real routing.
     #[schema(example = "us-east-1")]
     pub region: String,
+    /// Exact SNS topic allowed to deliver SES events for this provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sns_topic_arn: Option<String>,
     /// AWS SES credentials (required if provider_type is ses)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ses_credentials: Option<SesCredentialsRequest>,
@@ -170,6 +180,14 @@ pub struct UpdateEmailProviderRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "us-east-1")]
     pub region: Option<String>,
+    /// Rotate or clear the exact SNS topic allowed for this SES provider.
+    /// Omit to preserve it, send `null` to clear it, or send a string to set it.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_optional",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub sns_topic_arn: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_active: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -180,6 +198,14 @@ pub struct UpdateEmailProviderRequest {
     pub smtp_credentials: Option<SmtpCredentialsRequest>,
 }
 
+fn deserialize_present_optional<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct EmailProviderResponse {
     pub id: i32,
@@ -188,6 +214,7 @@ pub struct EmailProviderResponse {
     pub provider_type: EmailProviderTypeRoute,
     #[schema(example = "us-east-1")]
     pub region: String,
+    pub sns_topic_arn: Option<String>,
     pub is_active: bool,
     /// Masked credentials for display
     pub credentials: serde_json::Value,
@@ -195,6 +222,42 @@ pub struct EmailProviderResponse {
     pub created_at: String,
     #[schema(example = "2025-12-03T10:30:00Z")]
     pub updated_at: String,
+}
+
+/// Live status of the SES event-tracking pipeline for one provider.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct EmailTrackingStatusResponse {
+    /// Public webhook endpoint SNS must deliver events to.
+    #[schema(example = "https://temps.example.com/api/t/webhook/ses")]
+    pub webhook_url: String,
+    /// Only SES providers support SNS event tracking.
+    pub supports_event_tracking: bool,
+    pub sns_topic_arn: Option<String>,
+    /// When the SNS subscription for the current topic was confirmed.
+    /// `null` with a topic set usually means the subscription is still
+    /// pending — most often because the endpoint was subscribed before the
+    /// topic ARN was saved here.
+    #[schema(example = "2026-07-18T10:30:00Z")]
+    pub subscription_confirmed_at: Option<String>,
+    /// Most recent delivered/bounced/complained event recorded for an email
+    /// sent through this provider. `null` means no provider feedback has
+    /// arrived yet.
+    #[schema(example = "2026-07-18T10:31:00Z")]
+    pub last_event_at: Option<String>,
+}
+
+/// Result of the one-click AWS-side event-tracking setup.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct EmailTrackingSetupResponse {
+    #[schema(example = "arn:aws:sns:us-east-1:123456789012:temps-email-events-1")]
+    pub topic_arn: String,
+    pub webhook_url: String,
+    /// The webhook subscription was requested; SNS confirms it
+    /// asynchronously through the webhook itself.
+    pub subscription_requested: bool,
+    /// The SESv2 event destination (bounce/complaint/delivery) is attached
+    /// to the `temps-tracking` configuration set.
+    pub event_destination_attached: bool,
 }
 
 /// Request body for testing an email provider
@@ -295,6 +358,12 @@ pub struct EmailDomainResponse {
 pub struct EmailDomainWithDnsResponse {
     pub domain: EmailDomainResponse,
     pub dns_records: Vec<DnsRecordResponse>,
+}
+
+#[derive(Debug, Deserialize, ToSchema, IntoParams)]
+pub struct ListDomainsQuery {
+    /// Only return domains belonging to this provider
+    pub provider_id: Option<i32>,
 }
 
 /// Request to setup DNS records using a configured DNS provider
@@ -458,4 +527,27 @@ pub struct ListEmailsQuery {
     pub page: Option<u64>,
     #[schema(example = 20)]
     pub page_size: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UpdateEmailProviderRequest;
+
+    #[test]
+    fn update_provider_sns_topic_is_tri_state() {
+        let omitted: UpdateEmailProviderRequest =
+            serde_json::from_value(serde_json::json!({})).expect("omitted topic request");
+        assert_eq!(omitted.sns_topic_arn, None);
+
+        let cleared: UpdateEmailProviderRequest =
+            serde_json::from_value(serde_json::json!({ "sns_topic_arn": null }))
+                .expect("cleared topic request");
+        assert_eq!(cleared.sns_topic_arn, Some(None));
+
+        let topic = "arn:aws:sns:us-east-1:123456789012:temps-events";
+        let rotated: UpdateEmailProviderRequest =
+            serde_json::from_value(serde_json::json!({ "sns_topic_arn": topic }))
+                .expect("rotated topic request");
+        assert_eq!(rotated.sns_topic_arn, Some(Some(topic.to_string())));
+    }
 }

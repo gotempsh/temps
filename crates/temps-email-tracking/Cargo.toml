@@ -54,6 +54,16 @@ lol_html = "3"
 # HTTP client for SNS cert fetching + subscription confirmation
 reqwest = { workspace = true }
 
+# RSA signature verification for AWS SNS message authenticity (SignatureVersion
+# 1 = SHA1, 2 = SHA256). Pinned to the 0.10 digest generation rather than the
+# workspace's sha2 (0.11, used above for HMAC click-tracking signatures,
+# unrelated) because `rsa` 0.9's Pkcs1v15Sign requires digest 0.10's
+# AssociatedOid trait.
+rsa = "0.9"
+sha1 = { version = "0.10", features = ["oid"] }
+sha2-rsa = { package = "sha2", version = "0.10", features = ["oid"] }
+x509-parser = "0.18"
+
 [dev-dependencies]
 tokio-test = "0.4"
 temps-migrations = { path = "../temps-migrations" }

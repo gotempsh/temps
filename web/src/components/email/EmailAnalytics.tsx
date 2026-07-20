@@ -30,7 +30,6 @@ import {
   ChevronRight,
   Eye,
   Globe,
-  Mail,
   MailWarning,
   Monitor,
   MousePointerClick,
@@ -39,6 +38,8 @@ import {
 } from 'lucide-react'
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { EventBadge } from './shared'
+import { parseUserAgent } from './sharedUtils'
 
 // Types
 interface EmailEventStats {
@@ -132,57 +133,6 @@ function RateCard({
       </CardContent>
     </Card>
   )
-}
-
-function EventIcon({ type }: { type: string }) {
-  switch (type) {
-    case 'open':
-    case 'opened':
-      return <Eye className="h-3.5 w-3.5 text-blue-500" />
-    case 'click':
-    case 'clicked':
-      return <MousePointerClick className="h-3.5 w-3.5 text-green-500" />
-    case 'delivered':
-      return <Send className="h-3.5 w-3.5 text-emerald-500" />
-    case 'bounced':
-      return <MailWarning className="h-3.5 w-3.5 text-red-500" />
-    case 'complained':
-      return <AlertTriangle className="h-3.5 w-3.5 text-orange-500" />
-    default:
-      return <Mail className="h-3.5 w-3.5 text-muted-foreground" />
-  }
-}
-
-function EventBadge({ type }: { type: string }) {
-  const config: Record<string, { variant: 'default' | 'secondary' | 'destructive' | 'outline'; label: string }> = {
-    opened: { variant: 'secondary', label: 'Opened' },
-    clicked: { variant: 'default', label: 'Clicked' },
-    delivered: { variant: 'outline', label: 'Delivered' },
-    bounced: { variant: 'destructive', label: 'Bounced' },
-    complained: { variant: 'destructive', label: 'Complained' },
-  }
-
-  const c = config[type] || { variant: 'outline' as const, label: type }
-
-  return (
-    <Badge variant={c.variant} className="gap-1 text-xs">
-      <EventIcon type={type} />
-      {c.label}
-    </Badge>
-  )
-}
-
-function parseUserAgent(ua: string): string {
-  if (ua.includes('Gmail')) return 'Gmail'
-  if (ua.includes('Yahoo')) return 'Yahoo Mail'
-  if (ua.includes('Outlook') || ua.includes('Microsoft')) return 'Outlook'
-  if (ua.includes('Thunderbird')) return 'Thunderbird'
-  if (ua.includes('Apple Mail') || ua.includes('AppleWebKit')) return 'Apple Mail'
-  if (ua.includes('Chrome')) return 'Chrome'
-  if (ua.includes('Firefox')) return 'Firefox'
-  if (ua.includes('Safari')) return 'Safari'
-  if (ua.length > 50) return ua.substring(0, 50) + '...'
-  return ua
 }
 
 export function EmailAnalytics() {
@@ -312,8 +262,11 @@ export function EmailAnalytics() {
               <SelectContent>
                 <SelectItem value="all">All events</SelectItem>
                 <SelectItem value="delivered">Delivered</SelectItem>
-                <SelectItem value="opened">Opened</SelectItem>
-                <SelectItem value="clicked">Clicked</SelectItem>
+                {/* Stored event_type values are "open"/"click" — see
+                    tracking_service.rs record_open/record_click. The endpoint
+                    filters by exact match, so these values must match storage. */}
+                <SelectItem value="open">Opened</SelectItem>
+                <SelectItem value="click">Clicked</SelectItem>
                 <SelectItem value="bounced">Bounced</SelectItem>
                 <SelectItem value="complained">Complained</SelectItem>
               </SelectContent>
@@ -348,7 +301,7 @@ export function EmailAnalytics() {
                         onClick={() => navigate(`/email/${event.email_id}`)}
                       >
                         <TableCell>
-                          <EventBadge type={event.event_type} />
+                          <EventBadge type={event.event_type} iconClassName="h-3.5 w-3.5" />
                         </TableCell>
                         <TableCell className="hidden md:table-cell">
                           {event.recipient ? (

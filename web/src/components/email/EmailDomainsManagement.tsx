@@ -78,6 +78,7 @@ import { useForm } from 'react-hook-form'
 import { useNavigate } from 'react-router-dom'
 import { toast } from 'sonner'
 import { z } from 'zod'
+import { problemMessage } from './sharedUtils'
 
 // Types
 type DnsRecordStatus = 'unknown' | 'verified' | 'pending' | 'failed'
@@ -98,16 +99,6 @@ const createDomainSchema = z.object({
 })
 
 type CreateDomainFormData = z.infer<typeof createDomainSchema>
-
-function problemMessage(error: unknown, fallback: string): string {
-  if (error && typeof error === 'object' && 'detail' in error) {
-    const detail = (error as { detail?: unknown }).detail
-    if (typeof detail === 'string' && detail.length > 0) {
-      return detail
-    }
-  }
-  return fallback
-}
 
 // API functions
 async function listEmailDomains(): Promise<EmailDomain[]> {
@@ -331,58 +322,60 @@ export function DnsRecordsTable({ records }: { records: DnsRecord[] }) {
   }
 
   return (
-    <div className="rounded-md border">
-      <Table>
-        <TableHeader>
-          <TableRow>
-            <TableHead className="w-[100px]">Type</TableHead>
-            <TableHead>Name</TableHead>
-            <TableHead>Value</TableHead>
-            <TableHead className="w-[80px]">Priority</TableHead>
-            <TableHead className="w-[100px]">Status</TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {records.map((record, index) => (
-            <TableRow
-              key={index}
-              className={
-                record.status === 'verified'
-                  ? 'bg-emerald-50/50 dark:bg-emerald-950/20'
-                  : record.status === 'failed'
-                    ? 'bg-red-50/50 dark:bg-red-950/20'
-                    : ''
-              }
-            >
-              <TableCell>
-                <Badge variant="outline">{record.record_type}</Badge>
-              </TableCell>
-              <TableCell>
-                <div className="flex items-center gap-2">
-                  <span className="break-all font-mono text-xs">{record.name}</span>
-                  <CopyButton
-                    value={record.name}
-                    className="h-6 w-6 shrink-0 rounded-md p-0 hover:bg-accent hover:text-accent-foreground"
-                  />
-                </div>
-              </TableCell>
-              <TableCell>
-                <div className="flex items-center gap-2">
-                  <span className="break-all font-mono text-xs">{record.value}</span>
-                  <CopyButton
-                    value={record.value}
-                    className="h-6 w-6 shrink-0 rounded-md p-0 hover:bg-accent hover:text-accent-foreground"
-                  />
-                </div>
-              </TableCell>
-              <TableCell>{record.priority ?? '-'}</TableCell>
-              <TableCell>
-                <DnsRecordStatusBadge status={record.status} />
-              </TableCell>
+    <div className="-mx-6 overflow-x-auto whitespace-nowrap sm:mx-0 sm:rounded-md sm:border">
+      <div className="inline-block min-w-full px-6 align-middle sm:px-0">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead className="w-[100px] whitespace-nowrap">Type</TableHead>
+              <TableHead className="whitespace-nowrap">Name</TableHead>
+              <TableHead className="whitespace-nowrap">Value</TableHead>
+              <TableHead className="w-[80px] whitespace-nowrap">Priority</TableHead>
+              <TableHead className="w-[100px] whitespace-nowrap">Status</TableHead>
             </TableRow>
-          ))}
-        </TableBody>
-      </Table>
+          </TableHeader>
+          <TableBody>
+            {records.map((record, index) => (
+              <TableRow
+                key={index}
+                className={
+                  record.status === 'verified'
+                    ? 'bg-emerald-50/50 dark:bg-emerald-950/20'
+                    : record.status === 'failed'
+                      ? 'bg-red-50/50 dark:bg-red-950/20'
+                      : ''
+                }
+              >
+                <TableCell>
+                  <Badge variant="outline">{record.record_type}</Badge>
+                </TableCell>
+                <TableCell>
+                  <div className="flex items-center gap-2">
+                    <span className="font-mono text-xs">{record.name}</span>
+                    <CopyButton
+                      value={record.name}
+                      className="h-6 w-6 shrink-0 rounded-md p-0 hover:bg-accent hover:text-accent-foreground"
+                    />
+                  </div>
+                </TableCell>
+                <TableCell>
+                  <div className="flex items-center gap-2">
+                    <span className="font-mono text-xs">{record.value}</span>
+                    <CopyButton
+                      value={record.value}
+                      className="h-6 w-6 shrink-0 rounded-md p-0 hover:bg-accent hover:text-accent-foreground"
+                    />
+                  </div>
+                </TableCell>
+                <TableCell>{record.priority ?? '-'}</TableCell>
+                <TableCell>
+                  <DnsRecordStatusBadge status={record.status} />
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </div>
     </div>
   )
 }

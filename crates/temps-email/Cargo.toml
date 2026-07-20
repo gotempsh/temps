@@ -32,6 +32,11 @@ reqwest = { workspace = true }
 
 # AWS SES
 aws-sdk-sesv2 = { version = "1", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
+# AWS SNS — event-tracking auto-setup (topic creation + webhook subscription).
+# Same feature set as aws-sdk-sesv2: modern default-https-client, NOT the
+# deprecated `rustls` feature, which drags in the legacy rustls 0.21 /
+# rustls-webpki 0.101 stack (RUSTSEC-2026-0098/0099/0104).
+aws-sdk-sns = { version = "1.101", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-config = { workspace = true }
 
 # Generic SMTP transport

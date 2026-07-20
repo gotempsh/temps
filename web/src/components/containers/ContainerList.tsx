@@ -1,8 +1,10 @@
 import { ContainerInfoResponse, ProjectResponse } from '@/api/client'
 import {
+  containerMetricsGetHistoryOptions,
   getContainerMetricsOptions,
   listContainersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
+import { MetricSparkline } from '@/components/charts/metric-sparkline'
 import { formatCpuUsage } from '@/lib/cpu-format'
 import {
   DropdownMenu,
@@ -30,10 +32,7 @@ import { useNavigate } from 'react-router-dom'
 interface ContainerListProps {
   project: ProjectResponse
   environmentId: string
-  onAction?: (
-    containerId: string,
-    action: 'start' | 'stop' | 'restart'
-  ) => void
+  onAction?: (containerId: string, action: 'start' | 'stop' | 'restart') => void
 }
 
 export function ContainerList({
@@ -206,6 +205,27 @@ function ContainerRow({
         </div>
       </div>
 
+      {running && (
+        <>
+          <HistorySparkline
+            project={project}
+            environmentId={environmentId}
+            containerId={container.container_id}
+            metric="container.cpu_percent"
+            label="CPU"
+            format={(v) => `${v.toFixed(1)}%`}
+          />
+          <HistorySparkline
+            project={project}
+            environmentId={environmentId}
+            containerId={container.container_id}
+            metric="container.memory_used_bytes"
+            label="Mem"
+            format={formatBytes}
+          />
+        </>
+      )}
+
       <div
         className="flex items-center gap-1 shrink-0"
         onClick={(e) => e.stopPropagation()}
@@ -264,14 +284,66 @@ function ContainerRow({
   )
 }
 
+/**
+ * Compact 1h sparkline + current value for one container resource metric
+ * (history recorded every ~30s by the container health monitor). Renders
+ * nothing when there's no history yet (metrics store disabled, container
+ * just started) so rows stay clean.
+ */
+function HistorySparkline({
+  project,
+  environmentId,
+  containerId,
+  metric,
+  label,
+  format,
+}: {
+  project: ProjectResponse
+  environmentId: string
+  containerId: string
+  metric: string
+  label: string
+  format: (value: number) => string
+}) {
+  const { data } = useQuery({
+    ...containerMetricsGetHistoryOptions({
+      path: {
+        project_id: project.id,
+        environment_id: parseInt(environmentId),
+        container_id: containerId,
+      },
+      query: { metric, range: '1h' },
+    }),
+    staleTime: 30_000,
+    refetchInterval: 30_000,
+    // Metrics store disabled → the endpoint 503s; don't retry-spam.
+    retry: false,
+  })
+
+  if (!data?.length) return null
+
+  const values = data.map((p) => p.value)
+  const last = values[values.length - 1]
+
+  return (
+    <div className="hidden w-24 shrink-0 flex-col items-stretch gap-0.5 lg:flex">
+      <MetricSparkline data={values} height={16} />
+      <span className="text-right text-[10px] tabular-nums text-neutral-500 dark:text-neutral-400">
+        {label} {format(last)}
+      </span>
+    </div>
+  )
+}
+
 function UptimeInline({ createdAt }: { createdAt: string }) {
-  const [label, setLabel] = useState(() => formatUptime(createdAt))
+  // The label is derived from `createdAt` at render time; the interval only
+  // forces a periodic re-render so the elapsed time stays fresh.
+  const [, setTick] = useState(0)
   useEffect(() => {
-    setLabel(formatUptime(createdAt))
-    const id = setInterval(() => setLabel(formatUptime(createdAt)), 30_000)
+    const id = setInterval(() => setTick((t) => t + 1), 30_000)
     return () => clearInterval(id)
-  }, [createdAt])
-  return <span className="tabular-nums">{label} uptime</span>
+  }, [])
+  return <span className="tabular-nums">{formatUptime(createdAt)} uptime</span>
 }
 
 function formatUptime(createdAt: string): string {

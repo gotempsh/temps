@@ -75,6 +75,15 @@ pub struct UpdateWebhookRequest {
     pub enabled: Option<bool>,
 }
 
+/// Shared reqwest settings for webhook delivery. Redirects are disabled so a
+/// redirect chain cannot bounce a request to an internal target.
+fn webhook_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent("Temps-Webhook/1.0")
+        .redirect(reqwest::redirect::Policy::none())
+}
+
 /// Webhook service for managing and delivering webhooks
 pub struct WebhookService {
     db: Arc<DatabaseConnection>,
@@ -88,10 +97,7 @@ impl WebhookService {
         db: Arc<DatabaseConnection>,
         encryption_service: Arc<temps_core::EncryptionService>,
     ) -> Self {
-        let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .user_agent("Temps-Webhook/1.0")
-            .redirect(reqwest::redirect::Policy::none()) // SECURITY: Disable redirects to prevent SSRF via redirect chains
+        let http_client = webhook_client_builder()
             .build()
             .expect("Failed to create HTTP client");
 
@@ -271,6 +277,41 @@ impl WebhookService {
         Ok(results)
     }
 
+    /// Build the HTTP client to use for a single delivery.
+    ///
+    /// For domain hosts, re-resolve at delivery time, reject any non-public IP,
+    /// and pin the client to the validated addresses so reqwest dials exactly
+    /// those IPs. This closes the DNS-rebinding window between create-time
+    /// validation and delivery (the host cannot re-resolve to 127.0.0.1 /
+    /// 169.254.169.254 / RFC1918 at send time). IP-literal hosts involve no DNS,
+    /// so the shared client is reused.
+    async fn delivery_client_for(&self, url: &str) -> Result<reqwest::Client, WebhookError> {
+        let parsed = url::Url::parse(url).map_err(|e| {
+            WebhookError::InvalidConfiguration(format!("Invalid webhook URL: {}", e))
+        })?;
+
+        match parsed.host() {
+            Some(url::Host::Domain(domain)) => {
+                let port = parsed.port_or_known_default().unwrap_or(443);
+                let addrs = temps_core::url_validation::resolve_and_validate_domain(domain, port)
+                    .await
+                    .map_err(|e| {
+                        WebhookError::InvalidConfiguration(format!(
+                            "Webhook URL failed SSRF re-validation at delivery: {}",
+                            e
+                        ))
+                    })?;
+                webhook_client_builder()
+                    .resolve_to_addrs(domain, &addrs)
+                    .build()
+                    .map_err(WebhookError::from)
+            }
+            // IP-literal (or no) host: no DNS resolution happens, so there is no
+            // rebinding window. The create-time IP validation still applies.
+            _ => Ok(self.http_client.clone()),
+        }
+    }
+
     /// Deliver a webhook to its configured URL
     async fn deliver_webhook(
         &self,
@@ -325,34 +366,42 @@ impl WebhookService {
             }
         };
 
-        // Send HTTP request
-        let mut request_builder = self
-            .http_client
-            .post(&webhook.url)
-            .header("Content-Type", "application/json")
-            .header("X-Webhook-Event", event.event_type.as_str())
-            .header("X-Webhook-Delivery", &delivery_record.id.to_string())
-            .header("X-Webhook-Timestamp", &timestamp);
+        // Build a delivery client pinned to the validated IP (SSRF/rebinding
+        // guard). A re-validation failure aborts the send and is recorded as a
+        // failed delivery rather than silently connecting to an internal target.
+        let (success, status_code, error_message) =
+            match self.delivery_client_for(&webhook.url).await {
+                Err(e) => (false, None, Some(e.to_string())),
+                Ok(http_client) => {
+                    // Send HTTP request
+                    let mut request_builder = http_client
+                        .post(&webhook.url)
+                        .header("Content-Type", "application/json")
+                        .header("X-Webhook-Event", event.event_type.as_str())
+                        .header("X-Webhook-Delivery", &delivery_record.id.to_string())
+                        .header("X-Webhook-Timestamp", &timestamp);
 
-        if let Some(sig) = &signature {
-            request_builder = request_builder.header("X-Webhook-Signature", sig);
-        }
+                    if let Some(sig) = &signature {
+                        request_builder = request_builder.header("X-Webhook-Signature", sig);
+                    }
 
-        let response = request_builder.body(payload).send().await;
+                    let response = request_builder.body(payload).send().await;
 
-        let (success, status_code, error_message) = match response {
-            Ok(resp) => {
-                let status = resp.status();
-                // SECURITY: Do NOT store response body to prevent data exfiltration via SSRF
-                // Response bodies could contain sensitive data from internal services
-                let is_success = status.is_success();
-                (is_success, Some(status.as_u16()), None)
-            }
-            Err(e) => {
-                let error_msg = Self::format_webhook_error(&e, &webhook.url);
-                (false, None, Some(error_msg))
-            }
-        };
+                    match response {
+                        Ok(resp) => {
+                            let status = resp.status();
+                            // SECURITY: Do NOT store response body to prevent data exfiltration via SSRF
+                            // Response bodies could contain sensitive data from internal services
+                            let is_success = status.is_success();
+                            (is_success, Some(status.as_u16()), None)
+                        }
+                        Err(e) => {
+                            let error_msg = Self::format_webhook_error(&e, &webhook.url);
+                            (false, None, Some(error_msg))
+                        }
+                    }
+                }
+            };
 
         // Update delivery record with result
         let mut delivery_update: temps_entities::webhook_deliveries::ActiveModel =

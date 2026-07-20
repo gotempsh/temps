@@ -297,8 +297,6 @@ pub async fn verify_mfa_challenge(
         register,
         login,
         email_status,
-        request_magic_link,
-        verify_magic_link,
         request_password_reset,
         reset_password,
         verify_email,
@@ -333,7 +331,7 @@ pub async fn verify_mfa_challenge(
             MfaRequiredResponse,
             RegisterRequest,
             LoginRequest,
-            MagicLinkRequest,
+            EmailRequest,
             ResetPasswordRequest,
             AuthResponse,
             EmailStatusResponse,
@@ -362,7 +360,7 @@ pub async fn verify_mfa_challenge(
         title = "Authentication & User Management API",
         description = "Complete API for authentication, authorization, and user management. \
         Includes login/logout, MFA, user CRUD operations, role management, \
-        magic links, password reset, and email verification.",
+        password reset and email verification.",
         version = "1.0.0"
     ),
     tags(
@@ -390,8 +388,6 @@ pub fn configure_routes() -> Router<Arc<AuthState>> {
             "/auth/cli/device/poll",
             post(crate::cli_device_handler::cli_device_poll),
         )
-        .route("/auth/magic-link/request", post(request_magic_link))
-        .route("/auth/magic-link/verify", get(verify_magic_link))
         .route("/auth/password-reset/request", post(request_password_reset))
         .route("/auth/password-reset/verify", post(reset_password))
         .route(
@@ -459,8 +455,9 @@ pub struct LoginRequest {
     pub password: String,
 }
 
+/// Request body carrying just an email address (password-reset request).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct MagicLinkRequest {
+pub struct EmailRequest {
     pub email: String,
 }
 
@@ -490,12 +487,6 @@ impl From<LoginRequest> for crate::auth_service::LoginRequest {
     }
 }
 
-impl From<MagicLinkRequest> for crate::auth_service::MagicLinkRequest {
-    fn from(req: MagicLinkRequest) -> Self {
-        crate::auth_service::MagicLinkRequest { email: req.email }
-    }
-}
-
 impl From<ResetPasswordRequest> for crate::auth_service::ResetPasswordRequest {
     fn from(req: ResetPasswordRequest) -> Self {
         crate::auth_service::ResetPasswordRequest {
@@ -516,7 +507,6 @@ pub struct AuthResponse {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct EmailStatusResponse {
     pub email_configured: bool,
-    pub magic_link_available: bool,
     pub password_reset_available: bool,
     pub oidc_providers: Vec<crate::oidc_types::OidcProviderSummary>,
 }
@@ -807,131 +797,6 @@ pub async fn login(
 }
 
 #[utoipa::path(
-    post,
-    path = "/auth/magic-link/request",
-    request_body = MagicLinkRequest,
-    responses(
-        (status = 200, description = "Magic link sent if email exists", body = AuthResponse),
-        (status = 400, description = "Bad request"),
-        (status = 503, description = "Email service not configured")
-    ),
-    tag = "Authentication"
-)]
-pub async fn request_magic_link(
-    State(state): State<Arc<AuthState>>,
-    Json(request): Json<MagicLinkRequest>,
-) -> Result<impl IntoResponse, temps_core::problemdetails::Problem> {
-    if !state.auth_service.is_email_configured().await {
-        return Err(problem_new(StatusCode::SERVICE_UNAVAILABLE)
-            .with_title("Email Service Not Configured")
-            .with_detail(
-                "Magic link authentication is not available without email configuration",
-            ));
-    }
-
-    match state
-        .auth_service
-        .send_magic_link(request.clone().into())
-        .await
-    {
-        Ok(_) => Ok(Json(AuthResponse {
-            success: true,
-            message: "If an account exists with this email, a magic link has been sent".to_string(),
-            user_id: None,
-            mfa_required: false,
-        })),
-        Err(_) => {
-            warn!("Failed to send magic link to email: {}", request.email);
-            // Always return success to prevent email enumeration
-            Ok(Json(AuthResponse {
-                success: true,
-                message: "If an account exists with this email, a magic link has been sent"
-                    .to_string(),
-                user_id: None,
-                mfa_required: false,
-            }))
-        }
-    }
-}
-
-#[utoipa::path(
-    get,
-    path = "/auth/magic-link/verify",
-    params(
-        ("token" = String, Query, description = "Magic link token")
-    ),
-    responses(
-        (status = 200, description = "Magic link verified, session cookie set", body = AuthResponse),
-        (status = 400, description = "Invalid or expired token"),
-        (status = 500, description = "Internal server error")
-    ),
-    tag = "Authentication"
-)]
-pub async fn verify_magic_link(
-    State(state): State<Arc<AuthState>>,
-    Query(query): Query<VerifyTokenQuery>,
-    Extension(metadata): Extension<RequestMetadata>,
-) -> Result<impl IntoResponse, temps_core::problemdetails::Problem> {
-    match state.auth_service.verify_magic_link(&query.token).await {
-        Ok(user) => {
-            // Create session
-            match state.auth_service.create_session(user.id).await {
-                Ok(session_token) => {
-                    // Encrypt the session token
-                    let encrypted_token = state.cookie_crypto.encrypt(&session_token)?;
-
-                    // Create session cookie headers using pre-calculated secure flag
-                    let headers = state
-                        .auth_service
-                        .create_session_cookie(&encrypted_token, metadata.is_secure);
-
-                    // Create audit log for successful magic link login
-                    if let Err(e) = state
-                        .audit_service
-                        .create_audit_log(&LoginAudit {
-                            context: AuditContext {
-                                user_id: user.id,
-                                ip_address: Some(metadata.ip_address.to_string()),
-                                user_agent: metadata.user_agent.as_str().to_string(),
-                            },
-                            success: true,
-                            login_method: "magic_link".to_string(),
-                        })
-                        .await
-                    {
-                        error!("Failed to create audit log: {}", e);
-                    }
-
-                    Ok((
-                        headers,
-                        Json(AuthResponse {
-                            success: true,
-                            message: "Login successful".to_string(),
-                            user_id: Some(user.id),
-                            mfa_required: false,
-                        }),
-                    ))
-                }
-                Err(e) => {
-                    error!("Failed to create session after magic link: {}", e);
-                    Err(problem_new(StatusCode::INTERNAL_SERVER_ERROR)
-                        .with_title("Session Error")
-                        .with_detail("Could not create your session. Please try again."))
-                }
-            }
-        }
-        Err(e) => {
-            warn!("Magic link verification failed: {}", e);
-            Err(problem_new(StatusCode::BAD_REQUEST)
-                .with_title("Invalid or Expired Link")
-                .with_detail(
-                    "This magic link is invalid or has expired. Please request a new one.",
-                ))
-        }
-    }
-}
-
-#[utoipa::path(
     get,
     path = "/auth/email-status",
     responses(
@@ -950,7 +815,6 @@ pub async fn email_status(State(state): State<Arc<AuthState>>) -> Json<EmailStat
 
     Json(EmailStatusResponse {
         email_configured,
-        magic_link_available: email_configured,
         password_reset_available: email_configured,
         oidc_providers,
     })
@@ -959,7 +823,7 @@ pub async fn email_status(State(state): State<Arc<AuthState>>) -> Json<EmailStat
 #[utoipa::path(
     post,
     path = "/auth/password-reset/request",
-    request_body = MagicLinkRequest,
+    request_body = EmailRequest,
     responses(
         (status = 200, description = "Reset email sent if account exists", body = AuthResponse),
         (status = 503, description = "Email service not configured")
@@ -968,7 +832,7 @@ pub async fn email_status(State(state): State<Arc<AuthState>>) -> Json<EmailStat
 )]
 pub async fn request_password_reset(
     State(state): State<Arc<AuthState>>,
-    Json(body): Json<MagicLinkRequest>,
+    Json(body): Json<EmailRequest>,
 ) -> Result<impl IntoResponse, temps_core::problemdetails::Problem> {
     if !state.auth_service.is_email_configured().await {
         return Err(problem_new(StatusCode::SERVICE_UNAVAILABLE)
@@ -1865,7 +1729,7 @@ async fn setup_mfa(
         (status = 204, description = "Password updated"),
         (status = 400, description = "Validation error (weak password, same as current, MFA missing)"),
         (status = 401, description = "Current password incorrect or MFA code invalid"),
-        (status = 403, description = "Account has no password set (SSO/magic-link only)"),
+        (status = 403, description = "Account has no password set (SSO only)"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -1952,9 +1816,7 @@ async fn change_password_self(
             }
             crate::auth_service::AuthError::NoPasswordSet => problem_new(StatusCode::FORBIDDEN)
                 .with_title("No Password On Account")
-                .with_detail(
-                    "This account uses SSO or magic-link login and has no password to change.",
-                ),
+                .with_detail("This account uses SSO login and has no password to change."),
             other => {
                 error!("Password change failed: {}", other);
                 problem_new(StatusCode::INTERNAL_SERVER_ERROR)

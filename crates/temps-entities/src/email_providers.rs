@@ -16,6 +16,12 @@ pub struct Model {
     pub region: String,
     /// Encrypted JSON with provider credentials
     pub credentials: String,
+    /// Exact AWS SNS topic authorized to deliver this SES provider's events.
+    pub sns_topic_arn: Option<String>,
+    /// When the SNS HTTPS subscription for `sns_topic_arn` was last
+    /// confirmed. NULL = never confirmed for the current topic; cleared on
+    /// every topic change.
+    pub sns_subscription_confirmed_at: Option<DBDateTime>,
     pub is_active: bool,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
