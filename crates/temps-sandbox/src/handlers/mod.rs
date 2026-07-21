@@ -59,6 +59,10 @@ pub struct SandboxAppState {
         sandboxes::domain,
         sandboxes::set_preview_password,
         sandboxes::clear_preview_password,
+        sandboxes::resize_sandbox,
+        sandboxes::list_events,
+        sandboxes::rootfs_report,
+        sandboxes::rootfs_gc,
     ),
     components(schemas(
         sandboxes::CreateSandboxBody,
@@ -86,6 +90,13 @@ pub struct SandboxAppState {
         sandboxes::SandboxDomainResponse,
         sandboxes::SetPreviewPasswordBody,
         sandboxes::SetPreviewPasswordResponse,
+        sandboxes::ResizeSandboxBody,
+        sandboxes::SandboxEvent,
+        sandboxes::SandboxEventsResponse,
+        temps_agents::sandbox::RootfsReport,
+        temps_agents::sandbox::RootfsCacheEntry,
+        temps_agents::sandbox::RootfsVmEntry,
+        temps_agents::sandbox::RootfsGcReport,
     )),
     tags(
         (name = "Sandboxes", description = "Standalone sandbox API (`/v1/sandboxes/*`) for running isolated containers.")
@@ -139,6 +150,10 @@ mod tests {
             "/v1/sandboxes/{id}/fs/mkdir",
             "/v1/sandboxes/{id}/domain",
             "/v1/sandboxes/{id}/preview-password",
+            "/v1/sandboxes/{id}/events",
+            "/v1/sandboxes/{id}/resize",
+            "/v1/sandboxes/rootfs",
+            "/v1/sandboxes/rootfs/gc",
         ] {
             assert!(
                 paths.contains_key(expected),

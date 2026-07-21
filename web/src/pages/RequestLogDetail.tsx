@@ -1,6 +1,9 @@
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
-import { getProxyLogByIdOptions } from '@/api/client/@tanstack/react-query.gen'
+import {
+  getProxyLogByIdOptions,
+  getProxyLogByRequestIdOptions,
+} from '@/api/client/@tanstack/react-query.gen'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -31,19 +34,35 @@ export default function RequestLogDetail({
   // lookup. Absent on bare deep-links, which fall back to a wider scan.
   const ts = searchParams.get('ts')
 
-  const {
-    data: logDetail,
-    isLoading,
-    error,
-  } = useQuery({
+  // The list navigates by request_id (resolves under both the TimescaleDB
+  // and ClickHouse backends — the latter has no serial id column). Purely
+  // numeric params are legacy serial-id deep-links and keep using the by-id
+  // endpoint.
+  const isLegacyNumericId = /^\d+$/.test(logId || '')
+
+  const byId = useQuery({
     ...getProxyLogByIdOptions({
       path: {
         id: parseInt(logId || '0'),
       },
       query: ts ? { timestamp: ts } : undefined,
     }),
-    enabled: !!logId,
+    enabled: !!logId && isLegacyNumericId,
   })
+  const byRequestId = useQuery({
+    ...getProxyLogByRequestIdOptions({
+      path: {
+        request_id: logId || '',
+      },
+      query: ts ? { timestamp: ts } : undefined,
+    }),
+    enabled: !!logId && !isLegacyNumericId,
+  })
+  const {
+    data: logDetail,
+    isLoading,
+    error,
+  } = isLegacyNumericId ? byId : byRequestId
 
   const getStatusColor = (status: number) => {
     if (status >= 200 && status < 300) return 'bg-green-100 text-green-800'

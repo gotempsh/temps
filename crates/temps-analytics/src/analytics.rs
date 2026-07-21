@@ -818,37 +818,49 @@ impl Analytics for AnalyticsService {
             return Ok(None);
         }
 
-        // Get basic statistics
+        // Get basic statistics.
+        // Bounce and session duration are derived from per-session page_view
+        // counts and event timestamps at query time — the events.is_bounce and
+        // events.time_on_page columns are never populated by the ingest path,
+        // so aggregating them would always return 0.
         let stats_query = r#"
-            WITH visitor_stats AS (
+            WITH session_stats AS (
+                SELECT
+                    session_id,
+                    COUNT(*) FILTER (WHERE event_type = 'page_view') as page_views,
+                    EXTRACT(EPOCH FROM (MAX(timestamp) - MIN(timestamp))) as duration_seconds
+                FROM events
+                WHERE visitor_id = $1
+                  AND session_id IS NOT NULL
+                GROUP BY session_id
+            ),
+            visitor_stats AS (
                 SELECT
                     MIN(timestamp) as first_seen,
                     MAX(timestamp) as last_seen,
                     COUNT(DISTINCT session_id) as total_sessions,
                     COUNT(*) FILTER (WHERE event_type = 'page_view') as total_page_views,
                     COUNT(*) as total_events,
-                    COALESCE(SUM(time_on_page), 0) as total_time_seconds,
-                    COUNT(DISTINCT session_id) FILTER (WHERE is_bounce = true) as bounce_sessions,
                     COUNT(*) FILTER (WHERE event_type NOT IN ('page_view', 'page_leave')) as engagement_events
                 FROM events
                 WHERE visitor_id = $1
             )
             SELECT
-                first_seen,
-                last_seen,
-                total_sessions,
-                total_page_views,
-                total_events,
-                CASE WHEN total_sessions > 0
-                     THEN total_time_seconds::float / total_sessions::float
-                     ELSE 0 END as average_session_duration,
-                CASE WHEN total_sessions > 0
-                     THEN bounce_sessions::float / total_sessions::float * 100
-                     ELSE 0 END as bounce_rate,
-                CASE WHEN total_events > 0
-                     THEN engagement_events::float / total_events::float * 100
+                vs.first_seen,
+                vs.last_seen,
+                vs.total_sessions,
+                vs.total_page_views,
+                vs.total_events,
+                COALESCE((SELECT AVG(duration_seconds) FROM session_stats), 0)::float8
+                    as average_session_duration,
+                COALESCE(
+                    (SELECT (COUNT(*) FILTER (WHERE page_views <= 1))::float
+                            / NULLIF(COUNT(*), 0)::float * 100
+                     FROM session_stats), 0)::float8 as bounce_rate,
+                CASE WHEN vs.total_events > 0
+                     THEN vs.engagement_events::float / vs.total_events::float * 100
                      ELSE 0 END as engagement_rate
-            FROM visitor_stats
+            FROM visitor_stats vs
             "#;
 
         #[derive(FromQueryResult)]
@@ -1124,11 +1136,13 @@ impl Analytics for AnalyticsService {
                     EXTRACT(EPOCH FROM (MAX(e.timestamp) - MIN(e.timestamp))) as duration_seconds,
                     COUNT(*) FILTER (WHERE e.event_type = 'page_view') as page_views,
                     COUNT(*) as events_count,
-                    COUNT(DISTINCT rl.id) as requests_count,
                     (ARRAY_AGG(e.page_path ORDER BY e.timestamp ASC))[1]                        as entry_path,
                     (ARRAY_AGG(e.page_path ORDER BY e.timestamp DESC))[1]                       as exit_path,
                     MIN(e.referrer) as referrer,
-                    BOOL_OR(e.is_bounce) as is_bounced,
+                    -- A bounce is a session with at most one page view.
+                    -- Computed from the pageview count: events.is_bounce is
+                    -- never populated by the ingest path.
+                    COUNT(*) FILTER (WHERE e.event_type = 'page_view') <= 1 as is_bounced,
                     -- A session is engaged if the visitor spent real attention:
                     -- at least 10s of measured wall-clock time, OR fired a
                     -- genuine interaction event. Auto-fired view events
@@ -1142,7 +1156,6 @@ impl Analytics for AnalyticsService {
                         ) > 0
                     ) as is_engaged
                 FROM events e
-                LEFT JOIN request_logs rl ON rl.session_id = e.id AND rl.project_id = e.project_id
                 -- Tolerate both the bare-UUID format (new events, after the
                 -- session-cookie normalisation fix) and the legacy v2|uuid|ts
                 -- format stored by older versions of the analytics ingest path.
@@ -1157,22 +1170,37 @@ impl Analytics for AnalyticsService {
                 GROUP BY rs.id
             )
             SELECT
-                session_id,
-                started_at,
-                ended_at,
-                COALESCE(duration_seconds, 0)::bigint as duration_seconds,
-                page_views,
-                events_count,
-                requests_count,
-                entry_path,
-                exit_path,
-                referrer,
-                is_bounced,
-                is_engaged,
-                COUNT(*) OVER() as total_sessions
-            FROM session_stats
-            ORDER BY started_at DESC
-            LIMIT $2
+                limited.*,
+                -- Proxy request count for the session. proxy_logs is the live
+                -- request-log table (request_logs is defined in the schema but
+                -- never written). Counted after LIMIT via
+                -- idx_proxy_logs_session_id so this does at most $2 index
+                -- lookups; a NULL session_id matches nothing and yields 0.
+                -- The project_id guard is defense-in-depth (session ids are
+                -- globally unique PKs already); the IS NULL arm keeps proxy
+                -- rows written before project attribution.
+                (SELECT COUNT(*) FROM proxy_logs pl
+                 WHERE pl.session_id = limited.session_id
+                   AND (pl.project_id IS NULL OR pl.project_id = $3)) as requests_count
+            FROM (
+                SELECT
+                    session_id,
+                    started_at,
+                    ended_at,
+                    COALESCE(duration_seconds, 0)::bigint as duration_seconds,
+                    page_views,
+                    events_count,
+                    entry_path,
+                    exit_path,
+                    referrer,
+                    is_bounced,
+                    is_engaged,
+                    COUNT(*) OVER() as total_sessions
+                FROM session_stats
+                ORDER BY started_at DESC
+                LIMIT $2
+            ) limited
+            ORDER BY limited.started_at DESC
             "#;
 
         #[derive(FromQueryResult)]
@@ -1200,7 +1228,11 @@ impl Analytics for AnalyticsService {
         let results = SessionResult::find_by_statement(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             sql_query,
-            vec![visitor_id.into(), (limit_val as i64).into()],
+            vec![
+                visitor_id.into(),
+                (limit_val as i64).into(),
+                visitor.project_id.into(),
+            ],
         ))
         .all(self.db.as_ref())
         .await?;
@@ -1286,7 +1318,9 @@ impl Analytics for AnalyticsService {
                     rs.utm_source,
                     rs.utm_medium,
                     rs.utm_campaign,
-                    BOOL_OR(e.is_bounce) as is_bounced,
+                    -- A bounce is a session with at most one page view;
+                    -- events.is_bounce is never populated by the ingest path.
+                    COUNT(*) FILTER (WHERE e.event_type = 'page_view') <= 1 as is_bounced,
                     COUNT(*) FILTER (WHERE e.event_type NOT IN ('page_view', 'page_leave', 'heartbeat', 'web_vitals')) > 0 as is_engaged
                 FROM events e
                 -- Tolerate both bare-UUID and legacy v2|uuid|ts formats in
@@ -1393,10 +1427,6 @@ impl Analytics for AnalyticsService {
                     e.page_path,
                     e.page_title,
                     e.referrer,
-                    e.is_entry,
-                    e.is_exit,
-                    e.is_bounce,
-                    e.session_page_number,
                     e.scroll_depth,
                     e.session_id,
                     COALESCE(e.props, e.event_data::jsonb, '{{}}'::jsonb) as event_data,
@@ -1464,10 +1494,6 @@ impl Analytics for AnalyticsService {
                         ))::int
                     ELSE NULL
                 END as computed_time_on_page,
-                ase.is_entry,
-                ase.is_exit,
-                ase.is_bounce,
-                ase.session_page_number,
                 ase.scroll_depth,
                 ase.event_data,
                 ase.rs_id
@@ -1490,10 +1516,6 @@ impl Analytics for AnalyticsService {
             page_title: Option<String>,
             referrer: Option<String>,
             computed_time_on_page: Option<i32>,
-            is_entry: bool,
-            is_exit: bool,
-            is_bounce: bool,
-            session_page_number: Option<i32>,
             scroll_depth: Option<i32>,
             event_data: serde_json::Value,
             rs_id: i32,
@@ -1543,14 +1565,38 @@ impl Analytics for AnalyticsService {
                     page_title: row.page_title,
                     referrer: row.referrer,
                     time_on_page,
-                    is_entry: row.is_entry,
-                    is_exit: row.is_exit,
-                    is_bounce: row.is_bounce,
-                    session_page_number: row.session_page_number,
+                    is_entry: false,
+                    is_exit: false,
+                    is_bounce: false,
+                    session_page_number: None,
                     scroll_depth: row.scroll_depth,
                     event_data,
                 },
             );
+        }
+
+        // Derive session-flow flags from event order within each session. The
+        // events.is_entry / is_exit / is_bounce / session_page_number columns
+        // are never populated by the ingest path, so they are computed here.
+        // Events are already ordered by occurred_at ASC per session (SQL
+        // ORDER BY ase.rs_id, ase.occurred_at ASC).
+        for events in events_by_session.values_mut() {
+            let pv_indices: Vec<usize> = events
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.event_type == "page_view")
+                .map(|(i, _)| i)
+                .collect();
+            let pv_count = pv_indices.len();
+            for (n, &idx) in pv_indices.iter().enumerate() {
+                events[idx].session_page_number = Some((n + 1) as i32);
+                events[idx].is_entry = n == 0;
+                events[idx].is_exit = n + 1 == pv_count;
+            }
+            let bounced = pv_count <= 1;
+            for event in events.iter_mut() {
+                event.is_bounce = bounced;
+            }
         }
 
         // Step 4: Build the response - sessions ordered newest first with their events
@@ -2581,10 +2627,7 @@ WHERE project_id = $1
                     date_trunc('{}', timestamp) as time_bucket,
                     COUNT(DISTINCT session_id) as session_count,
                     COUNT(*) as event_count,
-                    AVG(time_on_page::float) as avg_time_on_page,
-                    COUNT(DISTINCT visitor_id) as unique_visitors,
-                    SUM(CASE WHEN is_bounce THEN 1 ELSE 0 END)::float /
-                        NULLIF(COUNT(DISTINCT session_id), 0) * 100 as bounce_rate
+                    AVG(time_on_page::float) as avg_time_on_page
                 FROM events
                 WHERE project_id = $3
                     AND page_path = $4
@@ -2916,6 +2959,35 @@ WHERE project_id = $1
                 total_projects AS (
                     SELECT COUNT(*) AS n
                     FROM projects p
+                ),
+                -- Bounce and engagement are derived per session at query time:
+                -- a bounce is a session with at most one page view; an engaged
+                -- session lasted >= 10s or fired a genuine interaction event
+                -- (auto-fired *_viewed events excluded — they trigger from
+                -- intersection observers for bots too). The events.is_bounce
+                -- column is never populated by the ingest path.
+                session_stats AS (
+                    SELECT
+                        session_id,
+                        COUNT(*) FILTER (WHERE event_type = 'page_view') AS page_views,
+                        COUNT(*) FILTER (
+                            WHERE event_type NOT IN ('page_view', 'page_leave')
+                              AND event_type NOT LIKE '%\_viewed' ESCAPE '\'
+                        ) AS interaction_events,
+                        EXTRACT(EPOCH FROM (MAX(timestamp) - MIN(timestamp))) AS duration_seconds
+                    FROM events
+                    WHERE timestamp >= $1 AND timestamp < $2
+                      AND session_id IS NOT NULL
+                    GROUP BY session_id
+                ),
+                session_rates AS (
+                    SELECT
+                        COALESCE((COUNT(*) FILTER (WHERE page_views <= 1))::float
+                                 / NULLIF(COUNT(*), 0)::float * 100, 0) AS avg_bounce_rate,
+                        COALESCE((COUNT(*) FILTER (WHERE duration_seconds >= 10
+                                                      OR interaction_events > 0))::float
+                                 / NULLIF(COUNT(*), 0)::float * 100, 0) AS avg_engagement_rate
+                    FROM session_stats
                 )
             SELECT
                 unique_visitors.n AS unique_visitors,
@@ -2923,9 +2995,9 @@ WHERE project_id = $1
                 total_page_views.n AS total_page_views,
                 total_events.n AS total_events,
                 total_projects.n AS total_projects,
-                0.0::double precision as avg_bounce_rate,
-                0.0::double precision as avg_engagement_rate
-            FROM unique_visitors, total_visits, total_page_views, total_events, total_projects
+                session_rates.avg_bounce_rate::double precision AS avg_bounce_rate,
+                session_rates.avg_engagement_rate::double precision AS avg_engagement_rate
+            FROM unique_visitors, total_visits, total_page_views, total_events, total_projects, session_rates
         "#;
 
         #[derive(FromQueryResult)]
@@ -3114,10 +3186,6 @@ WHERE project_id = $1
                     e.page_path,
                     e.timestamp,
                     e.visitor_id,
-                    e.is_entry,
-                    e.is_exit,
-                    e.is_bounce,
-                    e.session_page_number,
                     e.referrer,
                     e.browser,
                     e.operating_system,
@@ -3136,6 +3204,18 @@ WHERE project_id = $1
                       {env_filter}
                 )
                 AND e.event_type IN ('page_view', 'page_leave')
+            ),
+            -- Session-flow position of every page_view within its session.
+            -- The events.is_entry / is_exit / is_bounce / session_page_number
+            -- columns are never populated by the ingest path, so they are
+            -- derived from event order here instead.
+            pv_order AS (
+                SELECT
+                    event_id,
+                    ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY timestamp ASC) as pv_number,
+                    COUNT(*) OVER (PARTITION BY session_id) as pv_total
+                FROM session_events
+                WHERE event_type = 'page_view'
             ),
             -- Priority 1: next page_leave for same session+page within 30 min
             p1 AS (
@@ -3188,10 +3268,10 @@ WHERE project_id = $1
                             p1.pv_ts + INTERVAL '30 seconds'
                         ) - p1.pv_ts
                     ))::int as computed_time_on_page,
-                    se.is_entry,
-                    se.is_exit,
-                    se.is_bounce,
-                    se.session_page_number,
+                    (po.pv_number = 1) as is_entry,
+                    (po.pv_number = po.pv_total) as is_exit,
+                    (po.pv_total <= 1) as is_bounce,
+                    po.pv_number::int as session_page_number,
                     se.referrer,
                     se.browser,
                     se.operating_system,
@@ -3202,6 +3282,7 @@ WHERE project_id = $1
                 FROM p1
                 JOIN p2 ON p1.event_id = p2.event_id
                 JOIN session_events se ON se.event_id = p1.event_id
+                JOIN pv_order po ON po.event_id = p1.event_id
                 LEFT JOIN visitor v ON se.visitor_id = v.id
                 LEFT JOIN ip_geolocations g ON se.ip_geolocation_id = g.id
             )
@@ -3458,7 +3539,6 @@ WHERE project_id = $1
                     e.page_path,
                     e.timestamp,
                     e.visitor_id,
-                    e.is_bounce,
                     e.referrer
                 FROM events e
                 WHERE e.session_id IN (
@@ -3469,9 +3549,27 @@ WHERE project_id = $1
                       AND event_type = 'page_view'
                       AND timestamp >= $3
                       AND timestamp < $4
+                      AND is_crawler = false
                       {env_filter}
                 )
                 AND e.event_type IN ('page_view', 'page_leave')
+            ),
+            -- Per-session rollup across ALL pages the session visited.
+            -- Bounce/entry/exit are session-level facts derived at query time:
+            -- the events.is_bounce / is_entry / is_exit columns are never
+            -- populated by the ingest path. A bounce is a session with at most
+            -- one page view; an entry session for this page is one whose first
+            -- page view was this page.
+            session_pv AS (
+                SELECT
+                    session_id,
+                    COUNT(*) FILTER (WHERE event_type = 'page_view') as page_views,
+                    (ARRAY_AGG(page_path ORDER BY timestamp ASC)
+                        FILTER (WHERE event_type = 'page_view'))[1] as entry_path,
+                    (ARRAY_AGG(page_path ORDER BY timestamp DESC)
+                        FILTER (WHERE event_type = 'page_view'))[1] as exit_path
+                FROM session_events
+                GROUP BY session_id
             ),
             -- Priority 1: next page_leave for same session+page within 30 min
             p1 AS (
@@ -3516,7 +3614,6 @@ WHERE project_id = $1
                     se.visitor_id,
                     p1.session_id,
                     p1.pv_ts as timestamp,
-                    se.is_bounce,
                     se.referrer,
                     EXTRACT(EPOCH FROM (
                         COALESCE(
@@ -3524,19 +3621,18 @@ WHERE project_id = $1
                             p2.next_page_view_ts,
                             p1.pv_ts + INTERVAL '30 seconds'
                         ) - p1.pv_ts
-                    )) as time_on_page_seconds,
-                    ROW_NUMBER() OVER (PARTITION BY p1.session_id ORDER BY p1.pv_ts ASC) as event_order_asc,
-                    ROW_NUMBER() OVER (PARTITION BY p1.session_id ORDER BY p1.pv_ts DESC) as event_order_desc
+                    )) as time_on_page_seconds
                 FROM p1
                 JOIN p2 ON p1.event_id = p2.event_id
                 JOIN session_events se ON se.event_id = p1.event_id
             ),
             session_stats AS (
                 SELECT
-                    COUNT(DISTINCT session_id) as total_sessions,
-                    COUNT(*) FILTER (WHERE event_order_asc = 1) as entry_count,
-                    COUNT(*) FILTER (WHERE event_order_desc = 1) as exit_count
-                FROM page_events
+                    COUNT(*) as total_sessions,
+                    COUNT(*) FILTER (WHERE entry_path = $2) as entry_count,
+                    COUNT(*) FILTER (WHERE exit_path = $2) as exit_count,
+                    COUNT(*) FILTER (WHERE entry_path = $2 AND page_views <= 1) as bounce_count
+                FROM session_pv
             )
             SELECT
                 COUNT(DISTINCT pe.visitor_id) as unique_visitors,
@@ -3547,8 +3643,11 @@ WHERE project_id = $1
                         THEN pe.time_on_page_seconds
                     END
                 ), 0)::float8 as avg_time_on_page,
-                CASE WHEN COUNT(*) > 0
-                     THEN (COUNT(*) FILTER (WHERE pe.is_bounce = true))::float / COUNT(*)::float * 100
+                -- Bounce rate: sessions that entered on this page and viewed
+                -- nothing else, over sessions that entered on this page
+                -- (the Plausible/GA definition).
+                CASE WHEN ss.entry_count > 0
+                     THEN ss.bounce_count::float / ss.entry_count::float * 100
                      ELSE 0 END as bounce_rate,
                 CASE WHEN ss.total_sessions > 0
                      THEN ss.entry_count::float / ss.total_sessions::float * 100
@@ -3558,7 +3657,7 @@ WHERE project_id = $1
                      ELSE 0 END as exit_rate
             FROM page_events pe
             CROSS JOIN session_stats ss
-            GROUP BY ss.total_sessions, ss.entry_count, ss.exit_count
+            GROUP BY ss.total_sessions, ss.entry_count, ss.exit_count, ss.bounce_count
             "#,
             env_filter = env_filter
         );
@@ -3836,6 +3935,7 @@ WHERE project_id = $1
             "e.timestamp >= $2".to_string(),
             "e.timestamp <= $3".to_string(),
             "e.event_type = 'page_view'".to_string(),
+            "e.is_crawler = false".to_string(),
         ];
         let mut values: Vec<sea_orm::Value> =
             vec![project_id.into(), start_date.into(), end_date.into()];
@@ -3849,22 +3949,75 @@ WHERE project_id = $1
 
         let where_clause = where_conditions.join(" AND ");
 
-        // Query 1: Page-level stats (entry, exit, bounce, views, avg time)
+        // Query 1: Page-level stats (entry, exit, bounce, views, avg time).
+        // Entry/exit/bounce are session-level facts derived at query time from
+        // each session's first/last page view and pageview count — the
+        // events.is_entry / is_exit / is_bounce columns are never populated by
+        // the ingest path. The window predicate appears twice ({where_clause})
+        // but binds the same $n parameters, so both scans ride
+        // idx_events_project_timestamp with chunk exclusion.
         let page_stats_sql = format!(
             r#"
+            WITH ranked AS (
+                -- Window-sorted rather than ARRAY_AGG(...)[1]: ordered-set
+                -- aggregates accumulate every row of a session into an array
+                -- before taking the first element, so memory grows with total
+                -- pageviews in the window. A sort by (session_id, timestamp)
+                -- spills to disk as a well-behaved external merge sort and the
+                -- downstream GROUP BY streams over the already-sorted input.
+                SELECT
+                    e.session_id,
+                    e.page_path,
+                    ROW_NUMBER() OVER w as rn,
+                    COUNT(*) OVER (PARTITION BY e.session_id) as pv_total
+                FROM events e
+                WHERE {where_clause} AND e.session_id IS NOT NULL
+                WINDOW w AS (PARTITION BY e.session_id ORDER BY e.timestamp ASC, e.id ASC)
+            ),
+            sessions AS (
+                SELECT
+                    session_id,
+                    MAX(page_path) FILTER (WHERE rn = 1) as entry_path,
+                    MAX(page_path) FILTER (WHERE rn = pv_total) as exit_path,
+                    MAX(pv_total) as page_views
+                FROM ranked
+                GROUP BY session_id
+            ),
+            entry_stats AS (
+                SELECT
+                    entry_path as page_path,
+                    COUNT(*) as entry_count,
+                    COUNT(*) FILTER (WHERE page_views <= 1) as bounce_count
+                FROM sessions
+                GROUP BY entry_path
+            ),
+            exit_stats AS (
+                SELECT exit_path as page_path, COUNT(*) as exit_count
+                FROM sessions
+                GROUP BY exit_path
+            ),
+            page_views_agg AS (
+                SELECT
+                    e.page_path,
+                    COUNT(*) as total_views,
+                    (AVG(e.time_on_page) FILTER (WHERE e.time_on_page IS NOT NULL AND e.time_on_page > 0))::float8 as avg_time_on_page
+                FROM events e
+                WHERE {where_clause}
+                GROUP BY e.page_path
+            )
             SELECT
-                e.page_path,
-                COUNT(*) as total_views,
-                COUNT(*) FILTER (WHERE e.is_entry = true) as entry_count,
-                COUNT(*) FILTER (WHERE e.is_exit = true) as exit_count,
-                COUNT(*) FILTER (WHERE e.is_bounce = true) as bounce_count,
-                (AVG(e.time_on_page) FILTER (WHERE e.time_on_page IS NOT NULL AND e.time_on_page > 0))::float8 as avg_time_on_page
-            FROM events e
-            WHERE {}
-            GROUP BY e.page_path
-            ORDER BY total_views DESC
+                p.page_path,
+                p.total_views,
+                COALESCE(en.entry_count, 0) as entry_count,
+                COALESCE(ex.exit_count, 0) as exit_count,
+                COALESCE(en.bounce_count, 0) as bounce_count,
+                p.avg_time_on_page
+            FROM page_views_agg p
+            LEFT JOIN entry_stats en ON en.page_path = p.page_path
+            LEFT JOIN exit_stats ex ON ex.page_path = p.page_path
+            ORDER BY p.total_views DESC
             "#,
-            where_clause
+            where_clause = where_clause
         );
 
         #[derive(FromQueryResult)]
@@ -5050,6 +5203,226 @@ mod tests {
             details.is_engaged,
             "is_engaged must be true when session duration >= 10s (subquery 5)"
         );
+
+        cleanup_test_analytics!(db);
+        Ok(())
+    }
+
+    /// Bounce, entry, and exit are derived at query time from per-session
+    /// page_view counts and event order — the events.is_bounce / is_entry /
+    /// is_exit columns are written as false by the ingest path and never
+    /// updated. This test inserts events exactly as the ingest path does
+    /// (all flags false) and asserts every read path still reports bounces.
+    #[tokio::test]
+    async fn test_bounce_derived_from_session_pageview_counts() -> anyhow::Result<()> {
+        use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+        use temps_entities::{
+            deployments, environments, events, projects, request_sessions, visitor,
+        };
+
+        let (service, db, _container) =
+            create_test_analytics_service!("test_bounce_from_pageviews");
+
+        let project = projects::Entity::find()
+            .filter(projects::Column::Slug.eq("test_project"))
+            .one(db.as_ref())
+            .await?
+            .expect("test project must exist from insert_test_data");
+        let environment = environments::Entity::find()
+            .filter(environments::Column::ProjectId.eq(project.id))
+            .one(db.as_ref())
+            .await?
+            .expect("test environment must exist from insert_test_data");
+        let deployment = deployments::Entity::find()
+            .filter(deployments::Column::ProjectId.eq(project.id))
+            .one(db.as_ref())
+            .await?
+            .expect("test deployment must exist from insert_test_data");
+
+        let now = chrono::Utc::now();
+        // Seeded test data lives at 2024-01-01, so a window around `now`
+        // only sees the sessions created here.
+        let window_start = now - chrono::Duration::hours(1);
+        let window_end = now + chrono::Duration::hours(1);
+
+        let insert_visitor = |uuid: &str| {
+            let db = db.clone();
+            let project_id = project.id;
+            let environment_id = environment.id;
+            let uuid = uuid.to_string();
+            async move {
+                visitor::ActiveModel {
+                    visitor_id: Set(uuid),
+                    project_id: Set(project_id),
+                    environment_id: Set(environment_id),
+                    first_seen: Set(chrono::Utc::now()),
+                    last_seen: Set(chrono::Utc::now()),
+                    ..Default::default()
+                }
+                .insert(db.as_ref())
+                .await
+            }
+        };
+        let visitor_a = insert_visitor("bounce-test-visitor-a").await?;
+        let visitor_b = insert_visitor("bounce-test-visitor-b").await?;
+
+        let session_a_uuid = "aaaaaaaa-0000-4000-8000-000000000001";
+        let session_b_uuid = "bbbbbbbb-0000-4000-8000-000000000002";
+        let session_a = request_sessions::ActiveModel {
+            session_id: Set(session_a_uuid.to_string()),
+            started_at: Set(now - chrono::Duration::minutes(10)),
+            last_accessed_at: Set(now - chrono::Duration::minutes(10)),
+            visitor_id: Set(Some(visitor_a.id)),
+            data: Set("{}".to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        let session_b = request_sessions::ActiveModel {
+            session_id: Set(session_b_uuid.to_string()),
+            started_at: Set(now - chrono::Duration::minutes(10)),
+            last_accessed_at: Set(now - chrono::Duration::minutes(5)),
+            visitor_id: Set(Some(visitor_b.id)),
+            data: Set("{}".to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        // Insert page_view events with the flags exactly as the ingest path
+        // writes them: is_bounce / is_entry / is_exit all false.
+        let insert_page_view =
+            |visitor_id: i32, session_uuid: &str, path: &str, ts: chrono::DateTime<chrono::Utc>| {
+                let db = db.clone();
+                let project_id = project.id;
+                let environment_id = environment.id;
+                let deployment_id = deployment.id;
+                let session_uuid = session_uuid.to_string();
+                let path = path.to_string();
+                async move {
+                    events::ActiveModel {
+                        project_id: Set(project_id),
+                        environment_id: Set(Some(environment_id)),
+                        deployment_id: Set(Some(deployment_id)),
+                        visitor_id: Set(Some(visitor_id)),
+                        session_id: Set(Some(session_uuid)),
+                        event_type: Set("page_view".to_string()),
+                        page_path: Set(path.clone()),
+                        hostname: Set("example.com".to_string()),
+                        pathname: Set(path.clone()),
+                        href: Set(format!("https://example.com{path}")),
+                        timestamp: Set(ts),
+                        is_entry: Set(false),
+                        is_exit: Set(false),
+                        is_bounce: Set(false),
+                        is_crawler: Set(false),
+                        ..Default::default()
+                    }
+                    .insert(db.as_ref())
+                    .await
+                }
+            };
+
+        // Visitor A: single page view on /landing → bounce.
+        insert_page_view(
+            visitor_a.id,
+            session_a_uuid,
+            "/landing",
+            now - chrono::Duration::minutes(10),
+        )
+        .await?;
+        // Visitor B: /landing then /other → not a bounce.
+        insert_page_view(
+            visitor_b.id,
+            session_b_uuid,
+            "/landing",
+            now - chrono::Duration::minutes(10),
+        )
+        .await?;
+        insert_page_view(
+            visitor_b.id,
+            session_b_uuid,
+            "/other",
+            now - chrono::Duration::minutes(5),
+        )
+        .await?;
+
+        // 1. Visitor sessions list derives is_bounced from pageview counts.
+        let sessions_a = service
+            .get_visitor_sessions_by_id(visitor_a.id, None)
+            .await?
+            .expect("visitor A must exist");
+        assert_eq!(sessions_a.sessions.len(), 1);
+        assert!(
+            sessions_a.sessions[0].is_bounced,
+            "single-pageview session must be a bounce"
+        );
+        assert_eq!(
+            sessions_a.sessions[0].session_id, session_a.id,
+            "session id must come from request_sessions"
+        );
+
+        let sessions_b = service
+            .get_visitor_sessions_by_id(visitor_b.id, None)
+            .await?
+            .expect("visitor B must exist");
+        assert_eq!(sessions_b.sessions.len(), 1);
+        assert!(
+            !sessions_b.sessions[0].is_bounced,
+            "two-pageview session must not be a bounce"
+        );
+        assert_eq!(sessions_b.sessions[0].page_views, 2);
+        assert_eq!(sessions_b.sessions[0].session_id, session_b.id);
+
+        // 2. Visitor statistics derive bounce_rate from per-session counts.
+        let stats_a = service
+            .get_visitor_statistics(visitor_a.id)
+            .await?
+            .expect("visitor A stats must exist");
+        assert_eq!(
+            stats_a.bounce_rate, 100.0,
+            "visitor A's only session bounced → 100%"
+        );
+        let stats_b = service
+            .get_visitor_statistics(visitor_b.id)
+            .await?
+            .expect("visitor B stats must exist");
+        assert_eq!(
+            stats_b.bounce_rate, 0.0,
+            "visitor B's only session did not bounce → 0%"
+        );
+
+        // 3. Page detail: 2 sessions entered on /landing, 1 bounced → 50%.
+        let detail = service
+            .get_page_path_detail(project.id, "/landing", window_start, window_end, None, None)
+            .await?;
+        assert_eq!(
+            detail.bounce_rate, 50.0,
+            "1 of 2 entry sessions on /landing bounced"
+        );
+        assert_eq!(
+            detail.entry_rate, 100.0,
+            "both sessions entered on /landing"
+        );
+        assert_eq!(detail.exit_rate, 50.0, "only session A exited on /landing");
+
+        // 4. Page flow: entry/exit/bounce counts derived per session.
+        let flow = service
+            .get_page_flow(project.id, window_start, window_end, None, None, None, None)
+            .await?;
+        let landing = flow
+            .top_entry_pages
+            .iter()
+            .find(|p| p.page_path == "/landing")
+            .expect("/landing must be a top entry page");
+        assert_eq!(landing.entry_count, 2, "both sessions entered on /landing");
+        assert_eq!(landing.bounce_count, 1, "session A bounced on /landing");
+        let other_exit = flow
+            .top_exit_pages
+            .iter()
+            .find(|p| p.page_path == "/other")
+            .expect("/other must be a top exit page");
+        assert_eq!(other_exit.exit_count, 1, "session B exited on /other");
 
         cleanup_test_analytics!(db);
         Ok(())

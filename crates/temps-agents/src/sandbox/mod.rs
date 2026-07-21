@@ -1,7 +1,9 @@
 pub mod docker;
+pub mod firecracker;
 pub mod git_credential_bundle;
 pub mod local;
 pub mod pty_agent_bundle;
+pub mod routing;
 pub mod user;
 
 pub use user::{
@@ -59,6 +61,40 @@ impl KillSignal {
     }
 }
 
+/// Which isolation backend a sandbox runs on (ADR-029). Docker containers
+/// and Firecracker microVMs coexist on the same host behind the same
+/// `SandboxProvider` seam; `routing::RoutingSandboxProvider` dispatches
+/// between them. `Local` is the dev-only fork-exec fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SandboxBackend {
+    Docker,
+    Firecracker,
+    Local,
+}
+
+impl std::str::FromStr for SandboxBackend {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "docker" => Ok(Self::Docker),
+            "firecracker" => Ok(Self::Firecracker),
+            "local" => Ok(Self::Local),
+            other => Err(format!("unknown sandbox backend '{}'", other)),
+        }
+    }
+}
+
+impl std::fmt::Display for SandboxBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Docker => "docker",
+            Self::Firecracker => "firecracker",
+            Self::Local => "local",
+        })
+    }
+}
+
 /// A handle to an active sandbox. Opaque to callers — the internal fields
 /// are provider-specific (Docker container ID, Vercel sandbox ID, etc.).
 #[derive(Debug, Clone)]
@@ -69,6 +105,17 @@ pub struct SandboxHandle {
     pub sandbox_name: String,
     /// Path to the repository inside the sandbox. See `sandbox::user::SANDBOX_WORK_DIR`.
     pub work_dir: PathBuf,
+    /// Which backend owns this sandbox, stamped by the concrete provider
+    /// that created or recovered it. Callers read this instead of parsing
+    /// the container-name prefix: the routing provider dispatches on it and
+    /// the standalone API persists it to `sandboxes.backend` for display.
+    pub backend: SandboxBackend,
+    /// The image the provider actually resolved to. When the request omitted
+    /// an image, this is the backend's default (e.g. `alpine:3.20` for
+    /// Firecracker) rather than empty — so the API can show what really
+    /// booted instead of a vague "platform default". Empty on recovered
+    /// handles (the DB already holds the recorded value).
+    pub image: String,
 }
 
 /// Configuration for creating a new sandbox.
@@ -108,12 +155,61 @@ pub struct SandboxCreateConfig {
     /// Maximum number of processes / threads (PID cgroup limit). When None
     /// the provider default applies.
     pub pids_limit: Option<i64>,
+    /// Root disk size in megabytes. Only the Firecracker backend honors it
+    /// (the per-VM ext4 is grown to this size); Docker ignores it. `None`
+    /// uses the provider default (1 GiB). Values below the image's content
+    /// size are clamped up so the image always fits.
+    pub disk_size_mb: Option<u64>,
     /// Network access: "full", "restricted", "none"
     pub network_mode: Option<String>,
     /// Environment variables to inject (ANTHROPIC_API_KEY, etc.)
     pub env_vars: HashMap<String, String>,
     /// Maximum time the sandbox should stay alive without activity
     pub idle_timeout: Duration,
+    /// Isolation backend for this sandbox. `None` = the host's configured
+    /// default. Only meaningful when the registered provider is the
+    /// routing provider; single-backend hosts ignore it.
+    pub backend: Option<SandboxBackend>,
+}
+
+/// A cached rootfs image (Firecracker backend). Digest-keyed build artifact
+/// shared by all VMs created from the same image.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct RootfsCacheEntry {
+    /// Image digest this rootfs was built from (the cache key).
+    pub digest: String,
+    /// Actual on-disk size in bytes (sparse-aware).
+    pub bytes: u64,
+    /// IDs of live sandboxes whose per-VM disk was cloned from this entry.
+    /// Empty means the entry is reclaimable — no sandbox needs it.
+    pub referenced_by: Vec<String>,
+}
+
+/// A per-sandbox rootfs disk (Firecracker backend). One per non-destroyed
+/// sandbox — the authoritative storage, independent of the cache.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct RootfsVmEntry {
+    pub sandbox_name: String,
+    pub bytes: u64,
+    pub running: bool,
+}
+
+/// Snapshot of a backend's rootfs storage for the management API. Backends
+/// without a rootfs concept (Docker, local) return an empty report.
+#[derive(Debug, Clone, Default, serde::Serialize, utoipa::ToSchema)]
+pub struct RootfsReport {
+    pub cache_bytes: u64,
+    pub cache: Vec<RootfsCacheEntry>,
+    pub vm_bytes: u64,
+    pub vms: Vec<RootfsVmEntry>,
+}
+
+/// Outcome of a rootfs garbage-collection pass.
+#[derive(Debug, Clone, Default, serde::Serialize, utoipa::ToSchema)]
+pub struct RootfsGcReport {
+    /// Digests of cache entries removed because no sandbox referenced them.
+    pub removed_digests: Vec<String>,
+    pub freed_bytes: u64,
 }
 
 /// Result of executing a command inside a sandbox.
@@ -342,6 +438,28 @@ pub trait SandboxProvider: Send + Sync {
         self.start(handle).await
     }
 
+    /// Grow the sandbox's root disk to `new_size_mb`. Only the Firecracker
+    /// backend supports this (Docker containers have no fixed disk to
+    /// resize). Grow-only — shrinking is rejected. The Firecracker impl
+    /// stops the VM, grows the backing ext4 offline, and restarts it, so the
+    /// filesystem is resized without any in-guest tooling; the VM reboots
+    /// (data persists) rather than resizing fully live. Default: unsupported.
+    async fn resize_disk(
+        &self,
+        handle: &SandboxHandle,
+        new_size_mb: u64,
+    ) -> Result<(), AgentError> {
+        let _ = new_size_mb;
+        Err(AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: handle.sandbox_id.clone(),
+            reason: format!(
+                "resize_disk is not supported by sandbox provider '{}'",
+                self.name()
+            ),
+        })
+    }
+
     /// Attempt to recover a sandbox after server restart (by naming convention).
     /// Returns `None` if no recoverable sandbox exists for this run.
     async fn recover(&self, run_id: i32) -> Result<Option<SandboxHandle>, AgentError>;
@@ -358,6 +476,18 @@ pub trait SandboxProvider: Send + Sync {
         Ok(None)
     }
 
+    /// Whether this provider can create sandboxes on `backend`. Consumers
+    /// call this before create so a request for an unprovisioned backend
+    /// (e.g. `firecracker` on a Docker-only host) fails with a clear error
+    /// instead of silently downgrading. Concrete single-backend providers
+    /// answer for their own backend; the routing provider answers for every
+    /// backend it has registered. Default is permissive for backwards
+    /// compatibility, so every concrete provider overrides it.
+    fn supports_backend(&self, backend: SandboxBackend) -> bool {
+        let _ = backend;
+        true
+    }
+
     /// Provider name for logging and error messages.
     fn name(&self) -> &str;
 
@@ -370,6 +500,20 @@ pub trait SandboxProvider: Send + Sync {
 
     /// Delete and rebuild the sandbox image. Returns the image name.
     async fn rebuild_image(&self) -> Result<String, AgentError>;
+
+    /// Report rootfs storage for the management API. Default: empty —
+    /// backends without a rootfs cache (Docker, local) have nothing to show.
+    async fn rootfs_report(&self) -> Result<RootfsReport, AgentError> {
+        Ok(RootfsReport::default())
+    }
+
+    /// Reclaim rootfs cache entries not backing any live sandbox. Default:
+    /// a no-op empty report. Safe to call any time — live VMs hold their own
+    /// per-VM disks, so evicting an unreferenced cache entry only forces a
+    /// reconversion on the next create from that image.
+    async fn gc_rootfs(&self) -> Result<RootfsGcReport, AgentError> {
+        Ok(RootfsGcReport::default())
+    }
 
     /// Rebuild the image with progress reporting. Each build log line is sent
     /// via `on_progress`. Default implementation delegates to `rebuild_image`

@@ -58,7 +58,6 @@ pub struct AppState {
         get_recent_activity,
     ),
     components(schemas(
-        AnalyticsMetrics,
         ViewsOverTime,
         ViewItem,
         PathVisitorsResponse,

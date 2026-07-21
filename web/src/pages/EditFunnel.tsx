@@ -109,7 +109,7 @@ export function EditFunnel({ project, funnelId }: EditFunnelProps) {
 
   if (isLoading) {
     return (
-      <div className="w-full max-w-7xl mx-auto space-y-6 p-6">
+      <div className="w-full space-y-6 p-6">
         <div className="flex items-center gap-4">
           <Button variant="ghost" size="icon" disabled>
             <ArrowLeft className="h-4 w-4" />
@@ -134,7 +134,7 @@ export function EditFunnel({ project, funnelId }: EditFunnelProps) {
 
   if (!funnel) {
     return (
-      <div className="w-full max-w-7xl mx-auto space-y-6 p-6">
+      <div className="w-full space-y-6 p-6">
         <div className="flex items-center gap-4">
           <Button
             variant="ghost"
@@ -183,7 +183,7 @@ export function EditFunnel({ project, funnelId }: EditFunnelProps) {
       </div>
 
       {/* API Limitation Notice */}
-      <div className="w-full max-w-7xl mx-auto px-6 pt-6">
+      <div className="w-full px-6 pt-6">
         <Alert>
           <AlertDescription>
             <strong>Note:</strong> Currently, you can only edit the funnel name

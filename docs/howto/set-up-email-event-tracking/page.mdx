@@ -57,9 +57,9 @@ Sending email needs no new permissions. The **setup step only** additionally req
       "Action": [
         "sns:CreateTopic",
         "sns:Subscribe",
-        "sesv2:CreateConfigurationSet",
-        "sesv2:CreateConfigurationSetEventDestination",
-        "sesv2:UpdateConfigurationSetEventDestination"
+        "ses:CreateConfigurationSet",
+        "ses:CreateConfigurationSetEventDestination",
+        "ses:UpdateConfigurationSetEventDestination"
       ],
       "Resource": [
         "arn:aws:sns:*:*:temps-email-events-*",

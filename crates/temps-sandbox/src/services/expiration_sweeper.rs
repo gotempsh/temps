@@ -153,6 +153,7 @@ mod tests {
             work_dir: "/workspace".to_string(),
             timeout_secs: 3600,
             metadata: None,
+            backend: None,
             created_at: now,
             last_activity_at: now,
             expires_at: now + chrono::Duration::seconds(expires_in_secs),

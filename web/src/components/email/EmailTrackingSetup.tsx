@@ -80,9 +80,9 @@ const SETUP_IAM_POLICY = `{
       "Action": [
         "sns:CreateTopic",
         "sns:Subscribe",
-        "sesv2:CreateConfigurationSet",
-        "sesv2:CreateConfigurationSetEventDestination",
-        "sesv2:UpdateConfigurationSetEventDestination"
+        "ses:CreateConfigurationSet",
+        "ses:CreateConfigurationSetEventDestination",
+        "ses:UpdateConfigurationSetEventDestination"
       ],
       "Resource": [
         "arn:aws:sns:*:*:temps-email-events-*",

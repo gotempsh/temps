@@ -1117,6 +1117,8 @@ impl DockerSandboxProvider {
                     sandbox_id: container_id,
                     sandbox_name: container_name.to_string(),
                     work_dir: PathBuf::from(CONTAINER_WORK_DIR),
+                    backend: super::SandboxBackend::Docker,
+                    image: String::new(),
                 }))
             }
             Err(_) => Ok(None),
@@ -1586,6 +1588,8 @@ impl SandboxProvider for DockerSandboxProvider {
             sandbox_id: container.id,
             sandbox_name: container_name,
             work_dir: PathBuf::from(CONTAINER_WORK_DIR),
+            backend: super::SandboxBackend::Docker,
+            image: image.to_string(),
         })
     }
 
@@ -2183,6 +2187,10 @@ impl SandboxProvider for DockerSandboxProvider {
         self.recover_container(&full_name).await
     }
 
+    fn supports_backend(&self, backend: super::SandboxBackend) -> bool {
+        matches!(backend, super::SandboxBackend::Docker)
+    }
+
     fn name(&self) -> &str {
         "docker"
     }
@@ -2758,9 +2766,11 @@ mod tests {
             cpu_limit: Some(1.0),
             memory_limit_mb: Some(512),
             pids_limit: None,
+            disk_size_mb: None,
             network_mode: Some("none".to_string()),
             env_vars: HashMap::from([("TEST_VAR".to_string(), "test_value".to_string())]),
             idle_timeout: Duration::from_secs(120),
+            backend: None,
         };
 
         // Some dev environments (macOS Docker Desktop's virtiofs / userns-remap
@@ -3102,9 +3112,11 @@ mod tests {
             cpu_limit: Some(1.0),
             memory_limit_mb: Some(256),
             pids_limit: None,
+            disk_size_mb: None,
             network_mode: Some("none".to_string()),
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(60),
+            backend: None,
         };
 
         let handle = provider.create(create_config).await.unwrap();
@@ -3321,9 +3333,11 @@ mod tests {
             cpu_limit: Some(1.0),
             memory_limit_mb: Some(256),
             pids_limit: None,
+            disk_size_mb: None,
             network_mode: Some("none".to_string()),
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(60),
+            backend: None,
         };
 
         let handle = provider

@@ -38,17 +38,6 @@ pub struct ViewsOverTime {
     pub present_index: usize,
 }
 
-#[derive(Serialize, ToSchema)]
-pub struct AnalyticsMetrics {
-    pub unique_visitors: i64,
-    pub total_visits: i64,
-    pub total_page_views: i64,
-    pub views_per_visit: f64,
-    pub average_visit_duration: f64,
-    pub bounce_rate: f64,
-    pub engagement_rate: f64,
-}
-
 #[derive(Debug, Serialize, ToSchema)]
 pub struct LocationCount {
     pub location: String,

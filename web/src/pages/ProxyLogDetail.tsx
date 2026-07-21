@@ -11,7 +11,9 @@ export default function ProxyLogDetailPage() {
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
   const { setBreadcrumbs } = useBreadcrumbs()
-  const logId = parseInt(id || '0', 10)
+  // request_id string on links from the list (works under both storage
+  // backends), or a legacy numeric serial id on old deep-links.
+  const logId = id ?? ''
   // Row timestamp forwarded by list links; bounds the backend's hypertable
   // lookup. Absent on bare deep-links, which fall back to a wider scan.
   const ts = searchParams.get('ts') ?? undefined
@@ -19,15 +21,15 @@ export default function ProxyLogDetailPage() {
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Proxy Logs', href: '/proxy-logs' },
-      { label: `Log #${logId}` },
+      { label: `Log ${logId}` },
     ])
   }, [setBreadcrumbs, logId])
 
-  usePageTitle(`Proxy Log #${logId}`)
+  usePageTitle(`Proxy Log ${logId}`)
 
-  if (!id || isNaN(logId)) {
+  if (!logId) {
     return (
-      <div className="container max-w-7xl mx-auto py-8">
+      <div className="w-full py-8">
         <div className="text-center">
           <h2 className="text-2xl font-bold">Invalid Log ID</h2>
           <p className="text-muted-foreground mt-2">
@@ -43,7 +45,7 @@ export default function ProxyLogDetailPage() {
   }
 
   return (
-    <div className="container max-w-7xl mx-auto py-8">
+    <div className="w-full py-8">
       <div className="space-y-6">
         {/* Header */}
         <div className="flex items-center justify-between">
@@ -61,7 +63,7 @@ export default function ProxyLogDetailPage() {
                 Proxy Log Details
               </h2>
               <p className="text-muted-foreground">
-                Detailed information about proxy request #{logId}
+                Detailed information about proxy request {logId}
               </p>
             </div>
           </div>

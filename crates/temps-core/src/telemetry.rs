@@ -40,6 +40,7 @@ pub enum TelemetryEventKind {
     DeployAttempted,
     DeploySucceeded,
     DeployFailed,
+    DeployCancelled,
     RollbackTriggered,
     FirstDeploySucceeded,
 
@@ -111,6 +112,7 @@ impl TelemetryEventKind {
             Self::DeployAttempted => "deploy_attempted",
             Self::DeploySucceeded => "deploy_succeeded",
             Self::DeployFailed => "deploy_failed",
+            Self::DeployCancelled => "deploy_cancelled",
             Self::RollbackTriggered => "rollback_triggered",
             Self::FirstDeploySucceeded => "first_deploy_succeeded",
 
@@ -165,6 +167,7 @@ impl TelemetryEventKind {
             Self::DeployAttempted,
             Self::DeploySucceeded,
             Self::DeployFailed,
+            Self::DeployCancelled,
             Self::RollbackTriggered,
             Self::FirstDeploySucceeded,
             Self::ProjectCreated,
@@ -316,9 +319,9 @@ mod tests {
     fn all_covers_every_variant() {
         // If a variant is added but not added to all(), as_str() on it will be
         // missing from the list and this length check is a cheap tripwire.
-        // 37 events (34 initial + instance_heartbeat + project_created_from_template
-        // + error_summary).
-        assert_eq!(TelemetryEventKind::all().len(), 37);
+        // 38 events (34 initial + instance_heartbeat + project_created_from_template
+        // + error_summary + deploy_cancelled).
+        assert_eq!(TelemetryEventKind::all().len(), 38);
     }
 
     #[test]

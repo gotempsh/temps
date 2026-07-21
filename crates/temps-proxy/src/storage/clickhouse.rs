@@ -1044,8 +1044,21 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
     async fn get_by_request_id(
         &self,
         request_id: &str,
+        timestamp: Option<UtcDateTime>,
     ) -> Result<Option<proxy_logs::Model>, ProxyLogServiceError> {
-        let sql = "SELECT \
+        // request_id is the 3rd ORDER BY element, so a request_id-only lookup
+        // has no sort-key prefix and scans every partition. When the caller
+        // knows the row's event time (the list endpoint returns it per row), a
+        // ±1-day timestamp bound prunes the scan to the monthly partition(s)
+        // that can contain the row.
+        let time_clause = if timestamp.is_some() {
+            " AND timestamp >= fromUnixTimestamp64Milli(?) \
+              AND timestamp <= fromUnixTimestamp64Milli(?)"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT \
                 toUnixTimestamp64Milli(timestamp) AS timestamp_ms, method, path, query_string, \
                 host, status_code, response_time_ms, request_source, is_system_request, \
                 routing_status, project_id, environment_id, deployment_id, session_id, visitor_id, \
@@ -1053,20 +1066,31 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                 request_id, ip_geolocation_id, browser, browser_version, operating_system, \
                 device_type, is_bot, bot_name, request_size_bytes, response_size_bytes, cache_status \
              FROM proxy_logs \
-             WHERE request_id = ? \
+             WHERE request_id = ?{time_clause} \
              ORDER BY timestamp DESC \
-             LIMIT 1";
+             LIMIT 1"
+        );
 
-        let row = self
-            .client
-            .query(sql)
-            .bind(request_id)
-            .fetch_optional::<ChProxyLogReadRow>()
-            .await
-            .map_err(|e| ProxyLogServiceError::ClickHouse {
+        let mut q = self.client.query(&sql).bind(request_id);
+        if let Some(ts) = timestamp {
+            // Checked arithmetic saturating at the representable range: a bare
+            // `ts + Duration::days(1)` panics on overflow, and `ts` comes from a
+            // user-supplied query parameter.
+            let day = chrono::Duration::days(1);
+            let lo = ts
+                .checked_sub_signed(day)
+                .unwrap_or(chrono::DateTime::<Utc>::MIN_UTC);
+            let hi = ts
+                .checked_add_signed(day)
+                .unwrap_or(chrono::DateTime::<Utc>::MAX_UTC);
+            q = q.bind(lo.timestamp_millis()).bind(hi.timestamp_millis());
+        }
+        let row = q.fetch_optional::<ChProxyLogReadRow>().await.map_err(|e| {
+            ProxyLogServiceError::ClickHouse {
                 operation: "get_by_request_id".to_string(),
                 reason: e.to_string(),
-            })?;
+            }
+        })?;
 
         Ok(row.map(ChProxyLogReadRow::into_model))
     }

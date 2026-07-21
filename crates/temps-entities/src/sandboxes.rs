@@ -50,6 +50,12 @@ pub struct Model {
     #[sea_orm(column_type = "JsonBinary")]
     pub metadata: Option<serde_json::Value>,
 
+    /// Isolation backend the sandbox actually runs on: "docker" or
+    /// "firecracker". Recorded at create time from the effective backend
+    /// the provider chose (which may be the host default when the request
+    /// omitted one). `None` on rows created before this column existed.
+    pub backend: Option<String>,
+
     pub created_at: DBDateTime,
     pub last_activity_at: DBDateTime,
     pub expires_at: DBDateTime,

@@ -83,7 +83,7 @@ export function ImportProject() {
     <div className="min-h-screen bg-background text-foreground">
       {/* Mini header with repository info */}
       <div className="border-b bg-card">
-        <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
+        <div className="w-full px-4 sm:px-6 lg:px-8">
           <div className="flex items-center justify-between h-16">
             <div className="flex items-center gap-4">
               <div className="flex items-center gap-2">
@@ -120,7 +120,7 @@ export function ImportProject() {
       </div>
 
       {/* Main content */}
-      <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-8">
+      <div className="w-full px-4 sm:px-6 lg:px-8 py-8">
         {!Number.isFinite(repositoryId) ? (
           <Card>
             <CardContent className="pt-6">

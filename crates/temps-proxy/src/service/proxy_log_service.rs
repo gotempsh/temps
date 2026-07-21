@@ -168,6 +168,22 @@ pub struct ProxyLogService {
     storage: Option<Arc<dyn crate::storage::ProxyLogStorage>>,
 }
 
+/// The ±1-day lookup window around a row's event time, used to bound
+/// hypertable/partition scans in the single-row lookups. Uses checked
+/// arithmetic and saturates at the representable range so a hostile or absurd
+/// `timestamp` query parameter (e.g. `+262142-12-31`) can never panic the
+/// handler on overflow — a bare `ts + Duration::days(1)` would `expect()`.
+fn day_window(ts: UtcDateTime) -> (UtcDateTime, UtcDateTime) {
+    let day = chrono::Duration::days(1);
+    let lo = ts
+        .checked_sub_signed(day)
+        .unwrap_or(chrono::DateTime::<Utc>::MIN_UTC);
+    let hi = ts
+        .checked_add_signed(day)
+        .unwrap_or(chrono::DateTime::<Utc>::MAX_UTC);
+    (lo, hi)
+}
+
 impl ProxyLogService {
     /// Construct a service that talks directly to TimescaleDB (the default).
     pub fn new(db: Arc<DatabaseConnection>, ip_service: Arc<temps_geo::IpAddressService>) -> Self {
@@ -641,10 +657,11 @@ impl ProxyLogService {
         }
 
         if let Some(ts) = timestamp {
+            let (lo, hi) = day_window(ts);
             let log = proxy_logs::Entity::find()
                 .filter(proxy_logs::Column::Id.eq(id))
-                .filter(proxy_logs::Column::Timestamp.gte(ts - chrono::Duration::days(1)))
-                .filter(proxy_logs::Column::Timestamp.lte(ts + chrono::Duration::days(1)))
+                .filter(proxy_logs::Column::Timestamp.gte(lo))
+                .filter(proxy_logs::Column::Timestamp.lte(hi))
                 .one(self.db.as_ref())
                 .await?;
             return Ok(log);
@@ -669,16 +686,54 @@ impl ProxyLogService {
         Ok(log)
     }
 
-    /// Get proxy logs by request ID (for tracing)
+    /// Get proxy logs by request ID (for tracing).
+    ///
+    /// Same hypertable caveat as [`Self::get_by_id`]: a bare
+    /// `WHERE request_id = $1` cannot exclude any chunk. When the caller knows
+    /// the row's event time (the list endpoint returns it per row), a ±1-day
+    /// bound reduces the lookup to the couple of chunks that can contain the
+    /// row; otherwise the recent uncompressed window is probed first and the
+    /// unbounded scan only runs as a last resort so bare deep-links keep
+    /// resolving.
     pub async fn get_by_request_id(
         &self,
         request_id: &str,
+        timestamp: Option<UtcDateTime>,
     ) -> Result<Option<proxy_logs::Model>, ProxyLogServiceError> {
         if let Some(storage) = &self.storage {
-            return storage.get_by_request_id(request_id).await;
+            return storage.get_by_request_id(request_id, timestamp).await;
         }
+
+        // request_id has no unique index (a hypertable can't enforce uniqueness
+        // without the partitioning column), so on the off chance of a collision
+        // pick the newest row — matching the ClickHouse backend's
+        // `ORDER BY timestamp DESC LIMIT 1`.
+        if let Some(ts) = timestamp {
+            let (lo, hi) = day_window(ts);
+            let log = proxy_logs::Entity::find()
+                .filter(proxy_logs::Column::RequestId.eq(request_id))
+                .filter(proxy_logs::Column::Timestamp.gte(lo))
+                .filter(proxy_logs::Column::Timestamp.lte(hi))
+                .order_by_desc(proxy_logs::Column::Timestamp)
+                .one(self.db.as_ref())
+                .await?;
+            return Ok(log);
+        }
+
+        let recent_cutoff = Utc::now() - chrono::Duration::hours(24);
         let log = proxy_logs::Entity::find()
             .filter(proxy_logs::Column::RequestId.eq(request_id))
+            .filter(proxy_logs::Column::Timestamp.gte(recent_cutoff))
+            .order_by_desc(proxy_logs::Column::Timestamp)
+            .one(self.db.as_ref())
+            .await?;
+        if log.is_some() {
+            return Ok(log);
+        }
+
+        let log = proxy_logs::Entity::find()
+            .filter(proxy_logs::Column::RequestId.eq(request_id))
+            .order_by_desc(proxy_logs::Column::Timestamp)
             .one(self.db.as_ref())
             .await?;
         Ok(log)
@@ -2596,5 +2651,114 @@ mod tests {
             .expect("populated raw bucket");
         assert!((cagg_busy.avg_response_time_ms - 50.0).abs() < 1e-9);
         assert!((cagg_busy.avg_response_time_ms - raw_busy.avg_response_time_ms).abs() < 1e-9);
+    }
+
+    fn sample_proxy_log_model(request_id: &str) -> proxy_logs::Model {
+        let timestamp = Utc::now();
+        proxy_logs::Model {
+            id: 1,
+            timestamp,
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            query_string: None,
+            host: "example.test".to_string(),
+            status_code: 200,
+            response_time_ms: Some(5),
+            request_source: "proxy".to_string(),
+            is_system_request: false,
+            routing_status: "routed".to_string(),
+            project_id: Some(1),
+            environment_id: None,
+            deployment_id: None,
+            container_id: None,
+            upstream_host: None,
+            error_message: None,
+            client_ip: None,
+            user_agent: None,
+            referrer: None,
+            request_id: request_id.to_string(),
+            ip_geolocation_id: None,
+            browser: None,
+            browser_version: None,
+            operating_system: None,
+            device_type: None,
+            is_bot: None,
+            bot_name: None,
+            request_size_bytes: None,
+            response_size_bytes: None,
+            cache_status: None,
+            request_headers: None,
+            response_headers: None,
+            created_date: timestamp.date_naive(),
+            session_id: None,
+            visitor_id: None,
+            trace_id: None,
+            error_group_id: None,
+        }
+    }
+
+    fn service_with_mock_db(db: sea_orm::DatabaseConnection) -> ProxyLogService {
+        std::env::set_var("TEMPS_GEO_MOCK", "true");
+        let db = Arc::new(db);
+        let geoip = Arc::new(temps_geo::GeoIpService::new().expect("mock geoip"));
+        let ip_service = Arc::new(temps_geo::IpAddressService::new(db.clone(), geoip));
+        ProxyLogService::new(db, ip_service)
+    }
+
+    /// Happy-path smoke test: with a timestamp supplied the lookup takes the
+    /// single-query bounded branch and maps the row back. (MockDatabase returns
+    /// queued rows regardless of the WHERE clause, so it can't assert the ±1-day
+    /// bounds themselves; the bounding is covered structurally by the code and
+    /// the overflow test below.)
+    #[tokio::test]
+    async fn get_by_request_id_with_timestamp_maps_row() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![sample_proxy_log_model("req-abc")]])
+            .into_connection();
+        let service = service_with_mock_db(db);
+
+        let found = service
+            .get_by_request_id("req-abc", Some(Utc::now()))
+            .await
+            .expect("lookup succeeds")
+            .expect("row found");
+        assert_eq!(found.request_id, "req-abc");
+    }
+
+    /// A hostile/absurd timestamp (near chrono's max) must not panic on the
+    /// `ts + 1 day` overflow — the window saturates instead.
+    #[tokio::test]
+    async fn get_by_request_id_extreme_timestamp_does_not_panic() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<proxy_logs::Model>::new()])
+            .into_connection();
+        let service = service_with_mock_db(db);
+
+        let result = service
+            .get_by_request_id("req-x", Some(chrono::DateTime::<Utc>::MAX_UTC))
+            .await
+            .expect("saturating window, no overflow panic");
+        assert!(result.is_none());
+    }
+
+    /// Without a timestamp the recent uncompressed window is probed first;
+    /// only when that misses does the unbounded scan run, so a bare deep-link
+    /// still resolves an old row.
+    #[tokio::test]
+    async fn get_by_request_id_without_timestamp_falls_back_to_unbounded_scan() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results(vec![
+                Vec::<proxy_logs::Model>::new(),
+                vec![sample_proxy_log_model("req-old")],
+            ])
+            .into_connection();
+        let service = service_with_mock_db(db);
+
+        let found = service
+            .get_by_request_id("req-old", None)
+            .await
+            .expect("lookup succeeds")
+            .expect("row found via fallback scan");
+        assert_eq!(found.request_id, "req-old");
     }
 }

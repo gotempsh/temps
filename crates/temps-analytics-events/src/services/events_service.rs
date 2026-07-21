@@ -981,6 +981,7 @@ WHERE project_id = $1
                       AND timestamp >= $2::timestamp
                       AND timestamp <= $3::timestamp
                       AND visitor_id IS NOT NULL
+                      AND is_crawler = false
                       AND ($4::int IS NULL OR environment_id = $4)
                       AND ($5::int IS NULL OR deployment_id = $5)
                 )
@@ -1030,15 +1031,21 @@ WHERE project_id = $1
             "visitors" => {
                 "COUNT(DISTINCT visitor_id) FILTER (WHERE visitor_id IS NOT NULL)::bigint"
             }
-            "page_views" | "paths" => "COUNT(*) FILTER (WHERE event_type = 'page_view')::bigint",
+            "page_views" => "COUNT(*) FILTER (WHERE event_type = 'page_view')::bigint",
+            "paths" => {
+                "COUNT(DISTINCT page_path) FILTER (WHERE event_type = 'page_view')::bigint"
+            }
             _ => {
                 return Err(EventsError::Validation(format!(
-                    "Invalid metric '{}'. Valid options: sessions, visitors, returning_visitors, page_views",
+                    "Invalid metric '{}'. Valid options: sessions, visitors, returning_visitors, page_views, paths",
                     metric
                 )))
             }
         };
 
+        // Crawler traffic is excluded so these headline counts agree with the
+        // per-page analytics queries, which already filter is_crawler; bot
+        // activity has its own dedicated AI-crawler views.
         let query = format!(
             r#"
             SELECT
@@ -1047,6 +1054,7 @@ WHERE project_id = $1
             WHERE project_id = $1
               AND timestamp >= $2::timestamp
               AND timestamp <= $3::timestamp
+              AND is_crawler = false
               AND ($4::int IS NULL OR environment_id = $4)
               AND ($5::int IS NULL OR deployment_id = $5)
             "#,

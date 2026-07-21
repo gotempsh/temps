@@ -496,7 +496,7 @@ export function AgentSandboxSandboxPage() {
           and auto-dismisses when the user saves successfully. */}
       {isDirty && (
         <div className="fixed bottom-0 left-0 right-0 border-t bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80 shadow-lg z-30">
-          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-3 flex items-center justify-between gap-3">
+          <div className="w-full px-4 sm:px-6 lg:px-8 py-3 flex items-center justify-between gap-3">
             <p className="text-sm text-muted-foreground">
               You have unsaved sandbox changes.
             </p>

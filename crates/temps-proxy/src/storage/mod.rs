@@ -97,9 +97,15 @@ pub trait ProxyLogStorage: Send + Sync {
     ) -> Result<Option<proxy_logs::Model>, ProxyLogServiceError>;
 
     /// Fetch a single proxy log by its (unique) request id, for tracing joins.
+    ///
+    /// `timestamp` is the row's known event time (the list endpoint returns it
+    /// per row). It bounds the lookup the same way as [`Self::get_by_id`]:
+    /// chunk exclusion on the TimescaleDB hypertable, partition pruning on the
+    /// ClickHouse table.
     async fn get_by_request_id(
         &self,
         request_id: &str,
+        timestamp: Option<UtcDateTime>,
     ) -> Result<Option<proxy_logs::Model>, ProxyLogServiceError>;
 
     /// `stats/today` — total request count since UTC midnight.

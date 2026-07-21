@@ -115,13 +115,20 @@ unless aligning to a specific pixel asset.
 
 ### 4.1 Page wrapper
 
-Every top-level page uses the same wrapper:
+Every top-level page uses the same **full-width** wrapper — content fills the
+available space next to the sidebar rather than being capped and centered.
+Readability of individual blocks is handled per-section (grids, `max-w-*` on
+prose/forms where a narrow measure helps), not by constraining the whole page.
 
 ```tsx
-<div className="mx-auto w-full max-w-7xl p-4 sm:p-6 lg:p-8">
+<div className="w-full p-4 sm:p-6 lg:p-8">
   {/* content */}
 </div>
 ```
+
+Do **not** wrap a page in `mx-auto max-w-7xl` (or similar) — that leaves large
+empty gutters on wide displays. If a specific block reads better narrow, cap
+that block, e.g. a settings form in `<div className="max-w-2xl">`.
 
 ### 4.2 Vertical rhythm
 

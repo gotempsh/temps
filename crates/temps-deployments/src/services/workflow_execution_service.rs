@@ -1810,6 +1810,23 @@ impl WorkflowExecutionService {
                         deployment_id
                     );
                 }
+
+                // Anonymous telemetry: this arm only runs when the workflow
+                // executor itself detected a "cancelled" error and the
+                // deployment wasn't already marked cancelled (see the
+                // `deployment.state != "cancelled"` guard in
+                // execute_deployment_workflow's Err arm above) — i.e. a
+                // cancellation whose origin wasn't the explicit user-cancel
+                // path in DeploymentService::cancel_deployment (which emits
+                // its own `deploy_cancelled` with trigger="user"). Tagging
+                // this one "workflow" keeps the two mutually exclusive so
+                // the funnel is never double-counted.
+                self.telemetry().report(
+                    temps_core::telemetry::TelemetryEvent::new(
+                        temps_core::telemetry::TelemetryEventKind::DeployCancelled,
+                    )
+                    .with("trigger", "workflow"),
+                );
             }
             _ => {}
         }

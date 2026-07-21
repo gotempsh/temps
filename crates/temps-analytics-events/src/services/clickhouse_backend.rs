@@ -905,6 +905,7 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
                   AND timestamp >= fromUnixTimestamp64Milli(?)
                   AND timestamp <= fromUnixTimestamp64Milli(?)
                   AND visitor_id IS NOT NULL
+                  AND is_crawler = 0
                   AND (? = 0 OR environment_id = ?)
                   AND (? = 0 OR deployment_id = ?)
                   AND visitor_id IN (
@@ -948,14 +949,16 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
         let count_expr = match q.metric.as_str() {
             "sessions" => "uniq(session_id)",
             "visitors" => "uniq(visitor_id)",
-            "page_views" | "paths" => "countIf(event_type = 'page_view')",
+            "page_views" => "countIf(event_type = 'page_view')",
+            "paths" => "uniqIf(page_path, event_type = 'page_view')",
             other => {
                 return Err(EventsError::Validation(format!(
-                    "Invalid metric '{other}'. Valid options: sessions, visitors, returning_visitors, page_views"
+                    "Invalid metric '{other}'. Valid options: sessions, visitors, returning_visitors, page_views, paths"
                 )))
             }
         };
 
+        // Crawler traffic excluded to match the Timescale impl.
         let sql = format!(
             r#"
             SELECT {count_expr} AS value
@@ -963,6 +966,7 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
             WHERE project_id = ?
               AND timestamp >= fromUnixTimestamp64Milli(?)
               AND timestamp <= fromUnixTimestamp64Milli(?)
+              AND is_crawler = 0
               AND (? = 0 OR environment_id = ?)
               AND (? = 0 OR deployment_id = ?)
             "#

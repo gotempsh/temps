@@ -9,6 +9,7 @@ export type {
   ListSandboxesOptions,
   ListSandboxesPage,
   SandboxConfig,
+  SandboxEvent,
   SandboxSource,
   SandboxSummary,
   StatInfo,

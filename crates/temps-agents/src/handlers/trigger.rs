@@ -778,6 +778,7 @@ pub async fn smoke_test_agent(
             cpu_limit: Some(1.0),
             memory_limit_mb: Some(512),
             pids_limit: None,
+            disk_size_mb: None,
             // Use the default egress-filtered bridge network (same as production
             // sandboxes).  The old "host" override was a security hole: it gave
             // the smoke-test container unrestricted access to all host-network
@@ -788,6 +789,7 @@ pub async fn smoke_test_agent(
             network_mode: None,
             env_vars: test_env,
             idle_timeout: std::time::Duration::from_secs(60),
+            backend: None,
         };
 
         let _handle = match registry.get_or_create(sandbox_config).await {
