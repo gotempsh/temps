@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-beta.51] - 2026-07-21
+
+### Added
+
+- **deployments:** Preview commits before deployment ([#379](https://github.com/gotempsh/temps/issues/379))
+- **email:** Dedup shared email UI helpers, working event filters, per-domain delivery stats ([#307](https://github.com/gotempsh/temps/issues/307))
+- **deployments:** Preview tag commits before deployment ([#383](https://github.com/gotempsh/temps/issues/383))
+- **email:** Add provider detail page with domains and delivery tracking setup ([#382](https://github.com/gotempsh/temps/issues/382))
+- **telemetry:** Add deploy_cancelled event ([#385](https://github.com/gotempsh/temps/issues/385))
+- **web:** Add metrics storage backend selector to monitoring settings ([#399](https://github.com/gotempsh/temps/issues/399))
+- **sandbox:** Firecracker microVM backend alongside Docker (ADR-029)
+
+### Fixed
+
+- **cli:** Type email command output and sanitize rendered bodies ([#306](https://github.com/gotempsh/temps/issues/306))
+- **email:** Secure SES SNS event processing with one-click tracking setup ([#297](https://github.com/gotempsh/temps/issues/297))
+- **email:** Stop leaking suppressed recipient addresses via logs/error_message ([#380](https://github.com/gotempsh/temps/issues/380))
+- **web:** Make DNS records table horizontally scroll on mobile ([#381](https://github.com/gotempsh/temps/issues/381))
+- **email:** Correct SES IAM action namespace from sesv2: to ses: ([#384](https://github.com/gotempsh/temps/issues/384))
+- **analytics:** Derive bounce/entry/exit from session pageviews at query time ([#398](https://github.com/gotempsh/temps/issues/398))
+- **sandbox:** Address PR #400 review — CI, OpenAPI/SDK, guard, security
+- **sandbox:** Satisfy clippy + vercel-compat guardrail (PR #400 CI)
+- **cli:** Update sandbox_url tests to canonical plural route
+- **proxy:** Resolve request-log detail by request_id across storage backends ([#402](https://github.com/gotempsh/temps/issues/402))
+- **audit:** Keep audit history when a user account is deleted ([#386](https://github.com/gotempsh/temps/issues/386))
+
+### Miscellaneous
+
+- **auth:** Remove magic-link login ([#375](https://github.com/gotempsh/temps/issues/375))
+
 ## [0.1.0-beta.50] - 2026-07-17
 
 ### Added
@@ -27,8 +57,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Email SNS webhook security and durability**: SES notifications now require an exact topic ARN configured on the active SES provider, validate AWS confirmation/certificate endpoints, correlate recipients and provider ownership, commit events and domain-scoped suppressions atomically, and deduplicate retries before acknowledging SNS. Upgrades preserve legacy global suppression safety by copying those entries to every existing sending domain, then enforce tenant-scoped ownership for future changes.
-- **No-op visitor deduplication migration**: `m20260705_000001_add_visitor_unique_index` now skips bulk foreign-key rewrites when no duplicate `(visitor_id, project_id)` pairs exist, preventing TimescaleDB from eagerly decompressing unrelated hypertable chunks and exceeding `timescaledb.max_tuples_decompressed_per_dml_transaction` during upgrades.
 - **core:** Resolve request IP trust-awarely for audit/logging ([#363](https://github.com/gotempsh/temps/issues/363))
 - **skill:** Remove piped shell install and explicit credential paths from docs ([#365](https://github.com/gotempsh/temps/issues/365))
 - **deployments:** Emit deploy_succeeded telemetry on the real success path ([#372](https://github.com/gotempsh/temps/issues/372))
