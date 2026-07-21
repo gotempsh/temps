@@ -42414,10 +42414,20 @@ export type GetProxyLogsData = {
 
 export type GetProxyLogsErrors = {
     /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
      * Internal server error
      */
-    500: unknown;
+    500: ProblemDetails;
 };
+
+export type GetProxyLogsError = GetProxyLogsErrors[keyof GetProxyLogsErrors];
 
 export type GetProxyLogsResponses = {
     /**
@@ -42434,6 +42444,19 @@ export type ListKnownAiAgentsData = {
     query?: never;
     url: '/proxy-logs/ai-agents/known';
 };
+
+export type ListKnownAiAgentsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+};
+
+export type ListKnownAiAgentsError = ListKnownAiAgentsErrors[keyof ListKnownAiAgentsErrors];
 
 export type ListKnownAiAgentsResponses = {
     /**
@@ -42467,14 +42490,24 @@ export type GetProxyLogByRequestIdData = {
 
 export type GetProxyLogByRequestIdErrors = {
     /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
      * Proxy log not found
      */
-    404: unknown;
+    404: ProblemDetails;
     /**
      * Internal server error
      */
-    500: unknown;
+    500: ProblemDetails;
 };
+
+export type GetProxyLogByRequestIdError = GetProxyLogByRequestIdErrors[keyof GetProxyLogByRequestIdErrors];
 
 export type GetProxyLogByRequestIdResponses = {
     /**
@@ -42522,12 +42555,22 @@ export type GetAiAgentPagesErrors = {
     /**
      * Invalid parameters
      */
-    400: unknown;
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
     /**
      * Internal server error
      */
-    500: unknown;
+    500: ProblemDetails;
 };
+
+export type GetAiAgentPagesError = GetAiAgentPagesErrors[keyof GetAiAgentPagesErrors];
 
 export type GetAiAgentPagesResponses = {
     /**
@@ -42576,12 +42619,22 @@ export type GetAiAgentBreakdownErrors = {
     /**
      * Invalid parameters
      */
-    400: unknown;
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
     /**
      * Internal server error
      */
-    500: unknown;
+    500: ProblemDetails;
 };
+
+export type GetAiAgentBreakdownError = GetAiAgentBreakdownErrors[keyof GetAiAgentBreakdownErrors];
 
 export type GetAiAgentBreakdownResponses = {
     /**
@@ -42629,12 +42682,22 @@ export type GetAiAgentTimelineErrors = {
     /**
      * Invalid parameters
      */
-    400: unknown;
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
     /**
      * Internal server error
      */
-    500: unknown;
+    500: ProblemDetails;
 };
+
+export type GetAiAgentTimelineError = GetAiAgentTimelineErrors[keyof GetAiAgentTimelineErrors];
 
 export type GetAiAgentTimelineResponses = {
     /**
@@ -42683,12 +42746,22 @@ export type GetAiPageBreakdownErrors = {
     /**
      * Invalid parameters
      */
-    400: unknown;
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
     /**
      * Internal server error
      */
-    500: unknown;
+    500: ProblemDetails;
 };
+
+export type GetAiPageBreakdownError = GetAiPageBreakdownErrors[keyof GetAiPageBreakdownErrors];
 
 export type GetAiPageBreakdownResponses = {
     /**
@@ -42737,12 +42810,22 @@ export type GetAiStatusBreakdownErrors = {
     /**
      * Invalid parameters
      */
-    400: unknown;
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
     /**
      * Internal server error
      */
-    500: unknown;
+    500: ProblemDetails;
 };
+
+export type GetAiStatusBreakdownError = GetAiStatusBreakdownErrors[keyof GetAiStatusBreakdownErrors];
 
 export type GetAiStatusBreakdownResponses = {
     /**
@@ -42781,12 +42864,22 @@ export type GetProjectsHealthErrors = {
     /**
      * Invalid parameters
      */
-    400: unknown;
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
     /**
      * Internal server error
      */
-    500: unknown;
+    500: ProblemDetails;
 };
+
+export type GetProjectsHealthError = GetProjectsHealthErrors[keyof GetProjectsHealthErrors];
 
 export type GetProjectsHealthResponses = {
     /**
@@ -42875,12 +42968,22 @@ export type GetTimeBucketStatsErrors = {
     /**
      * Invalid parameters
      */
-    400: unknown;
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
     /**
      * Internal server error
      */
-    500: unknown;
+    500: ProblemDetails;
 };
+
+export type GetTimeBucketStatsError = GetTimeBucketStatsErrors[keyof GetTimeBucketStatsErrors];
 
 export type GetTimeBucketStatsResponses = {
     /**
@@ -42949,10 +43052,20 @@ export type GetTodayStatsData = {
 
 export type GetTodayStatsErrors = {
     /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
      * Internal server error
      */
-    500: unknown;
+    500: ProblemDetails;
 };
+
+export type GetTodayStatsError = GetTodayStatsErrors[keyof GetTodayStatsErrors];
 
 export type GetTodayStatsResponses = {
     /**
@@ -42986,14 +43099,24 @@ export type GetProxyLogByIdData = {
 
 export type GetProxyLogByIdErrors = {
     /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
      * Proxy log not found
      */
-    404: unknown;
+    404: ProblemDetails;
     /**
      * Internal server error
      */
-    500: unknown;
+    500: ProblemDetails;
 };
+
+export type GetProxyLogByIdError = GetProxyLogByIdErrors[keyof GetProxyLogByIdErrors];
 
 export type GetProxyLogByIdResponses = {
     /**

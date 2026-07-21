@@ -6,14 +6,31 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use temps_auth::{permission_guard, RequireAuth};
+use temps_core::problemdetails::{self, Problem, ProblemDetails};
 use temps_core::{DateTime, UtcDateTime};
 use utoipa::{IntoParams, ToSchema};
 
 use crate::service::proxy_log_service::{
     AiAgentBreakdownRow, AiAgentPageRow, AiAgentTimelineRow, AiPageBreakdownRow,
     AiStatusBreakdownRow, AiTimelineGroupBy, ProjectHealthSummary, ProxyLogResponse,
-    ProxyLogService, StatsFilters, TimeBucketStats, TodayStatsResponse,
+    ProxyLogService, ProxyLogServiceError, StatsFilters, TimeBucketStats, TodayStatsResponse,
 };
+
+impl From<ProxyLogServiceError> for Problem {
+    fn from(error: ProxyLogServiceError) -> Self {
+        match error {
+            ProxyLogServiceError::InvalidFilter(_) => problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid Filter Parameters")
+                .with_detail(error.to_string()),
+            ProxyLogServiceError::DatabaseError(_) | ProxyLogServiceError::ClickHouse { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Internal Server Error")
+                    .with_detail(error.to_string())
+            }
+        }
+    }
+}
 
 /// Query parameters for listing proxy logs
 #[derive(Debug, Deserialize, IntoParams)]
@@ -140,14 +157,20 @@ pub struct ProxyLogsPaginatedResponse {
     params(ProxyLogsQuery),
     responses(
         (status = 200, description = "List of proxy logs", body = ProxyLogsPaginatedResponse),
-        (status = 500, description = "Internal server error")
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
+    security(("bearer_auth" = [])),
     tag = "Proxy Logs"
 )]
 pub async fn get_proxy_logs(
+    RequireAuth(auth): RequireAuth,
     State(service): State<Arc<ProxyLogService>>,
     Query(query): Query<ProxyLogsQuery>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, LogsRead);
+
     let page = query.page.unwrap_or(1);
     let page_size = std::cmp::min(query.page_size.unwrap_or(20), 100);
     let start_date = query.start_date.map(|d| d.into());
@@ -155,7 +178,7 @@ pub async fn get_proxy_logs(
     let (logs, total) = service
         .list_with_filters(start_date, end_date, query, page, page_size)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(Problem::from)?;
 
     let total_pages = (total as f64 / page_size as f64).ceil() as u64;
 
@@ -191,24 +214,32 @@ pub struct ProxyLogByIdQuery {
     ),
     responses(
         (status = 200, description = "Proxy log found", body = ProxyLogResponse),
-        (status = 404, description = "Proxy log not found"),
-        (status = 500, description = "Internal server error")
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 404, description = "Proxy log not found", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
+    security(("bearer_auth" = [])),
     tag = "Proxy Logs"
 )]
 pub async fn get_proxy_log_by_id(
+    RequireAuth(auth): RequireAuth,
     State(service): State<Arc<ProxyLogService>>,
     Path(id): Path<i32>,
     Query(query): Query<ProxyLogByIdQuery>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, LogsRead);
+
     let log = service
         .get_by_id(id, query.timestamp.map(|t| t.into()))
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(Problem::from)?;
 
     match log {
         Some(log) => Ok(Json(ProxyLogResponse::from(log))),
-        None => Err((StatusCode::NOT_FOUND, "Proxy log not found".to_string())),
+        None => Err(problemdetails::new(StatusCode::NOT_FOUND)
+            .with_title("Proxy Log Not Found")
+            .with_detail(format!("Proxy log {id} not found"))),
     }
 }
 
@@ -222,24 +253,32 @@ pub async fn get_proxy_log_by_id(
     ),
     responses(
         (status = 200, description = "Proxy log found", body = ProxyLogResponse),
-        (status = 404, description = "Proxy log not found"),
-        (status = 500, description = "Internal server error")
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 404, description = "Proxy log not found", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
+    security(("bearer_auth" = [])),
     tag = "Proxy Logs"
 )]
 pub async fn get_proxy_log_by_request_id(
+    RequireAuth(auth): RequireAuth,
     State(service): State<Arc<ProxyLogService>>,
     Path(request_id): Path<String>,
     Query(query): Query<ProxyLogByIdQuery>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, LogsRead);
+
     let log = service
         .get_by_request_id(&request_id, query.timestamp.map(|t| t.into()))
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(Problem::from)?;
 
     match log {
         Some(log) => Ok(Json(ProxyLogResponse::from(log))),
-        None => Err((StatusCode::NOT_FOUND, "Proxy log not found".to_string())),
+        None => Err(problemdetails::new(StatusCode::NOT_FOUND)
+            .with_title("Proxy Log Not Found")
+            .with_detail(format!("Proxy log with request ID {request_id} not found"))),
     }
 }
 
@@ -355,14 +394,20 @@ pub struct TimeBucketStatsResponse {
     params(StatsQuery),
     responses(
         (status = 200, description = "Today's request count", body = TodayStatsResponse),
-        (status = 500, description = "Internal server error")
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
+    security(("bearer_auth" = [])),
     tag = "Proxy Logs"
 )]
 async fn get_today_stats(
+    RequireAuth(auth): RequireAuth,
     State(service): State<Arc<ProxyLogService>>,
     Query(query): Query<StatsQuery>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, AnalyticsRead);
+
     let filters = if query.method.is_some()
         || query.client_ip.is_some()
         || query.project_id.is_some()
@@ -384,7 +429,7 @@ async fn get_today_stats(
     let count = service
         .get_today_count(filters)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(Problem::from)?;
 
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
 
@@ -401,15 +446,21 @@ async fn get_today_stats(
     params(TimeBucketStatsQuery),
     responses(
         (status = 200, description = "Time-bucketed statistics", body = TimeBucketStatsResponse),
-        (status = 400, description = "Invalid parameters"),
-        (status = 500, description = "Internal server error")
+        (status = 400, description = "Invalid parameters", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
+    security(("bearer_auth" = [])),
     tag = "Proxy Logs"
 )]
 async fn get_time_bucket_stats(
+    RequireAuth(auth): RequireAuth,
     State(service): State<Arc<ProxyLogService>>,
     Query(query): Query<TimeBucketStatsQuery>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, AnalyticsRead);
+
     let filters = if query.method.is_some()
         || query.client_ip.is_some()
         || query.project_id.is_some()
@@ -451,7 +502,7 @@ async fn get_time_bucket_stats(
             filters,
         )
         .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        .map_err(Problem::from)?;
 
     Ok(Json(TimeBucketStatsResponse {
         stats,
@@ -490,15 +541,26 @@ pub struct ProjectsHealthResponse {
     params(ProjectsHealthQuery),
     responses(
         (status = 200, description = "Health summaries per project", body = ProjectsHealthResponse),
-        (status = 400, description = "Invalid parameters"),
-        (status = 500, description = "Internal server error")
+        (status = 400, description = "Invalid parameters", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
+    security(("bearer_auth" = [])),
     tag = "Proxy Logs"
 )]
 async fn get_projects_health(
+    RequireAuth(auth): RequireAuth,
     State(service): State<Arc<ProxyLogService>>,
     Query(query): Query<ProjectsHealthQuery>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, AnalyticsRead);
+    // NOTE: `project_ids` is caller-supplied and not yet scoped to the caller's
+    // team membership — a user with analytics:read can request health for any
+    // project. Per-project authorization (team-based `project_access_guard!`)
+    // is tracked as a follow-up; it needs a `ProjectAccessChecker` threaded onto
+    // this plugin's route state, which these handlers don't yet carry.
+
     let project_ids: Vec<i32> = query
         .project_ids
         .split(',')
@@ -506,17 +568,15 @@ async fn get_projects_health(
         .collect();
 
     if project_ids.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "project_ids must contain at least one valid ID".to_string(),
-        ));
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Parameters")
+            .with_detail("project_ids must contain at least one valid ID"));
     }
 
     if project_ids.len() > 100 {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Maximum 100 project IDs allowed".to_string(),
-        ));
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Parameters")
+            .with_detail("Maximum 100 project IDs allowed"));
     }
 
     let end_time = query.end_time.unwrap_or_else(chrono::Utc::now);
@@ -525,16 +585,15 @@ async fn get_projects_health(
         .unwrap_or_else(|| end_time - chrono::Duration::hours(1));
 
     if start_time >= end_time {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "start_time must be before end_time".to_string(),
-        ));
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Parameters")
+            .with_detail("start_time must be before end_time"));
     }
 
     let summaries = service
         .get_projects_health_summary(&project_ids, start_time, end_time, query.is_bot)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(Problem::from)?;
 
     let projects: std::collections::HashMap<String, ProjectHealthSummary> = summaries
         .into_iter()
@@ -594,25 +653,30 @@ pub struct KnownAiAgentsResponse {
     params(AiAgentBreakdownQuery),
     responses(
         (status = 200, description = "AI agent breakdown", body = AiAgentBreakdownResponse),
-        (status = 400, description = "Invalid parameters"),
-        (status = 500, description = "Internal server error")
+        (status = 400, description = "Invalid parameters", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
+    security(("bearer_auth" = [])),
     tag = "Proxy Logs"
 )]
 async fn get_ai_agent_breakdown(
+    RequireAuth(auth): RequireAuth,
     State(service): State<Arc<ProxyLogService>>,
     Query(query): Query<AiAgentBreakdownQuery>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, AnalyticsRead);
+
     let end_time = query.end_time.unwrap_or_else(chrono::Utc::now);
     let start_time = query
         .start_time
         .unwrap_or_else(|| end_time - chrono::Duration::days(7));
 
     if start_time >= end_time {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "start_time must be before end_time".to_string(),
-        ));
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Parameters")
+            .with_detail("start_time must be before end_time"));
     }
 
     let limit = query.limit.unwrap_or(20);
@@ -627,7 +691,7 @@ async fn get_ai_agent_breakdown(
             limit,
         )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(Problem::from)?;
 
     Ok(Json(AiAgentBreakdownResponse {
         items,
@@ -651,25 +715,30 @@ pub struct AiPageBreakdownResponse {
     params(AiAgentBreakdownQuery),
     responses(
         (status = 200, description = "AI page breakdown", body = AiPageBreakdownResponse),
-        (status = 400, description = "Invalid parameters"),
-        (status = 500, description = "Internal server error")
+        (status = 400, description = "Invalid parameters", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
+    security(("bearer_auth" = [])),
     tag = "Proxy Logs"
 )]
 async fn get_ai_page_breakdown(
+    RequireAuth(auth): RequireAuth,
     State(service): State<Arc<ProxyLogService>>,
     Query(query): Query<AiAgentBreakdownQuery>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, AnalyticsRead);
+
     let end_time = query.end_time.unwrap_or_else(chrono::Utc::now);
     let start_time = query
         .start_time
         .unwrap_or_else(|| end_time - chrono::Duration::days(7));
 
     if start_time >= end_time {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "start_time must be before end_time".to_string(),
-        ));
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Parameters")
+            .with_detail("start_time must be before end_time"));
     }
 
     let limit = query.limit.unwrap_or(50);
@@ -684,7 +753,7 @@ async fn get_ai_page_breakdown(
             limit,
         )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(Problem::from)?;
 
     Ok(Json(AiPageBreakdownResponse {
         items,
@@ -756,35 +825,41 @@ fn auto_bucket_for_window(start: UtcDateTime, end: UtcDateTime) -> &'static str 
     params(AiAgentTimelineQuery),
     responses(
         (status = 200, description = "AI agent timeline", body = AiAgentTimelineResponse),
-        (status = 400, description = "Invalid parameters"),
-        (status = 500, description = "Internal server error")
+        (status = 400, description = "Invalid parameters", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
+    security(("bearer_auth" = [])),
     tag = "Proxy Logs"
 )]
 async fn get_ai_agent_timeline(
+    RequireAuth(auth): RequireAuth,
     State(service): State<Arc<ProxyLogService>>,
     Query(query): Query<AiAgentTimelineQuery>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, AnalyticsRead);
+
     let end_time = query.end_time.unwrap_or_else(chrono::Utc::now);
     let start_time = query
         .start_time
         .unwrap_or_else(|| end_time - chrono::Duration::days(7));
 
     if start_time >= end_time {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "start_time must be before end_time".to_string(),
-        ));
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Parameters")
+            .with_detail("start_time must be before end_time"));
     }
 
     let group_by = match query.group_by.as_deref() {
         Some("agent") => AiTimelineGroupBy::Agent,
         Some("provider") | None => AiTimelineGroupBy::Provider,
         Some(other) => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("group_by must be 'provider' or 'agent', got '{}'", other),
-            ));
+            return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid Parameters")
+                .with_detail(format!(
+                    "group_by must be 'provider' or 'agent', got '{other}'"
+                )));
         }
     };
 
@@ -794,10 +869,11 @@ async fn get_ai_agent_timeline(
     // via `is_valid_interval` as defense-in-depth.
     if let Some(ref b) = query.bucket {
         if !ProxyLogService::is_valid_interval(b) {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "bucket must be a valid interval, e.g. '1 hour', '6 hours' or '1 day'".to_string(),
-            ));
+            return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid Parameters")
+                .with_detail(
+                    "bucket must be a valid interval, e.g. '1 hour', '6 hours' or '1 day'",
+                ));
         }
     }
 
@@ -816,7 +892,7 @@ async fn get_ai_agent_timeline(
             group_by,
         )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(Problem::from)?;
 
     Ok(Json(AiAgentTimelineResponse {
         items,
@@ -846,31 +922,36 @@ pub struct AiStatusBreakdownResponse {
     params(AiAgentBreakdownQuery),
     responses(
         (status = 200, description = "AI status breakdown", body = AiStatusBreakdownResponse),
-        (status = 400, description = "Invalid parameters"),
-        (status = 500, description = "Internal server error")
+        (status = 400, description = "Invalid parameters", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
+    security(("bearer_auth" = [])),
     tag = "Proxy Logs"
 )]
 async fn get_ai_status_breakdown(
+    RequireAuth(auth): RequireAuth,
     State(service): State<Arc<ProxyLogService>>,
     Query(query): Query<AiAgentBreakdownQuery>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, AnalyticsRead);
+
     let end_time = query.end_time.unwrap_or_else(chrono::Utc::now);
     let start_time = query
         .start_time
         .unwrap_or_else(|| end_time - chrono::Duration::days(7));
 
     if start_time >= end_time {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "start_time must be before end_time".to_string(),
-        ));
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Parameters")
+            .with_detail("start_time must be before end_time"));
     }
 
     let items = service
         .get_ai_status_breakdown(query.project_id, query.environment_id, start_time, end_time)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(Problem::from)?;
 
     Ok(Json(AiStatusBreakdownResponse {
         items,
@@ -887,11 +968,18 @@ async fn get_ai_status_breakdown(
     get,
     path = "/proxy-logs/ai-agents/known",
     responses(
-        (status = 200, description = "Known AI agents", body = KnownAiAgentsResponse)
+        (status = 200, description = "Known AI agents", body = KnownAiAgentsResponse),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails)
     ),
+    security(("bearer_auth" = [])),
     tag = "Proxy Logs"
 )]
-async fn list_known_ai_agents() -> impl IntoResponse {
+async fn list_known_ai_agents(
+    RequireAuth(auth): RequireAuth,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, AnalyticsRead);
+
     let items: Vec<AiAgentDescriptor> = crate::ai_agent_detector::known_agents()
         .iter()
         .map(|(_, m)| AiAgentDescriptor {
@@ -900,7 +988,7 @@ async fn list_known_ai_agents() -> impl IntoResponse {
             purpose: m.purpose.as_str().to_string(),
         })
         .collect();
-    Json(KnownAiAgentsResponse { items })
+    Ok(Json(KnownAiAgentsResponse { items }))
 }
 
 /// Query parameters for the per-agent pages breakdown.
@@ -944,20 +1032,25 @@ pub struct AiAgentPagesResponse {
     params(AiAgentPagesQuery),
     responses(
         (status = 200, description = "Pages breakdown for the requested agent", body = AiAgentPagesResponse),
-        (status = 400, description = "Invalid parameters"),
-        (status = 500, description = "Internal server error")
+        (status = 400, description = "Invalid parameters", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
+    security(("bearer_auth" = [])),
     tag = "Proxy Logs"
 )]
 async fn get_ai_agent_pages(
+    RequireAuth(auth): RequireAuth,
     State(service): State<Arc<ProxyLogService>>,
     Query(query): Query<AiAgentPagesQuery>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, AnalyticsRead);
+
     if query.agent.trim().is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "agent parameter is required".to_string(),
-        ));
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Parameters")
+            .with_detail("agent parameter is required"));
     }
 
     let end_time = query.end_time.unwrap_or_else(chrono::Utc::now);
@@ -966,10 +1059,9 @@ async fn get_ai_agent_pages(
         .unwrap_or_else(|| end_time - chrono::Duration::days(7));
 
     if start_time >= end_time {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "start_time must be before end_time".to_string(),
-        ));
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Parameters")
+            .with_detail("start_time must be before end_time"));
     }
 
     let limit = query.limit.unwrap_or(50);
@@ -984,7 +1076,7 @@ async fn get_ai_agent_pages(
             limit,
         )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(Problem::from)?;
 
     Ok(Json(AiAgentPagesResponse {
         agent: query.agent,
