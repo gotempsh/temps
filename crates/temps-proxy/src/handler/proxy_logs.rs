@@ -23,10 +23,21 @@ impl From<ProxyLogServiceError> for Problem {
             ProxyLogServiceError::InvalidFilter(_) => problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Invalid Filter Parameters")
                 .with_detail(error.to_string()),
-            ProxyLogServiceError::DatabaseError(_) | ProxyLogServiceError::ClickHouse { .. } => {
+            // The ClickHouse error's `reason` is the stringified client error,
+            // which can embed the internal endpoint host or schema fragments —
+            // don't reflect it to the caller. Log the full detail and surface
+            // only the operation name.
+            ProxyLogServiceError::ClickHouse { operation, reason } => {
+                tracing::error!(operation, reason, "ClickHouse proxy-log query failed");
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
-                    .with_detail(error.to_string())
+                    .with_detail(format!("Storage error during {operation}"))
+            }
+            ProxyLogServiceError::DatabaseError(e) => {
+                tracing::error!(error = %e, "proxy-log database query failed");
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Internal Server Error")
+                    .with_detail("Database error")
             }
         }
     }
@@ -555,11 +566,16 @@ async fn get_projects_health(
     Query(query): Query<ProjectsHealthQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsRead);
-    // NOTE: `project_ids` is caller-supplied and not yet scoped to the caller's
-    // team membership — a user with analytics:read can request health for any
-    // project. Per-project authorization (team-based `project_access_guard!`)
-    // is tracked as a follow-up; it needs a `ProjectAccessChecker` threaded onto
-    // this plugin's route state, which these handlers don't yet carry.
+    // NOTE (tracked follow-up — cross-project authorization): none of the
+    // proxy-log handlers yet scope reads to the caller's team membership. This
+    // affects three classes: (a) handlers with a `project_id`/`project_ids`
+    // filter (this one, get_proxy_logs, and the stats/AI endpoints), (b) the
+    // by-id/by-request-id lookups which carry no project filter at all and must
+    // check the returned row's project_id post-fetch, and (c) deployment-token
+    // cross-project access (`project_scope_guard!`). Closing it needs a
+    // `ProjectAccessChecker` threaded onto this plugin's route state, which
+    // these handlers don't yet carry. The anonymous-access hole is already
+    // closed by the RequireAuth + permission_guard! above.
 
     let project_ids: Vec<i32> = query
         .project_ids
