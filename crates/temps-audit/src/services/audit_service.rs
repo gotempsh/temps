@@ -233,6 +233,11 @@ pub const REDACTION_MARKER: &str = "[REDACTED]";
 /// strings would rewrite unrelated payload values wholesale.
 const MIN_SCRUB_IDENTIFIER_LEN: usize = 3;
 
+/// Maximum identifier length — no real email/username/name exceeds this, and
+/// an unbounded value would be lowercased and compared against every string
+/// in every payload of the scan.
+const MAX_SCRUB_IDENTIFIER_LEN: usize = 512;
+
 /// Replace every JSON string value that exactly equals one of `targets`
 /// (case-insensitive) with [`REDACTION_MARKER`], recursing through objects
 /// and arrays. Returns the number of values replaced.
@@ -262,24 +267,14 @@ fn redact_matching_values(value: &mut serde_json::Value, targets: &[String]) -> 
 }
 
 impl AuditService {
-    /// Redact the given identifier values (a deleted user's email, username,
-    /// name) from every `audit_logs.data` payload, in place. The structural
-    /// record — row, operation type, timestamps, non-matching context — is
-    /// preserved; only string values exactly matching an identifier become
-    /// [`REDACTION_MARKER`]. This covers both rows the user authored and rows
-    /// *about* them (e.g. the deletion event recorded under the acting
-    /// admin's identity).
-    ///
-    /// Explicit operator action for erasure requests — never invoked
-    /// automatically. Callers are responsible for auditing the scrub itself.
-    ///
-    /// Content-integrity plugins that fingerprint audit payloads will flag
-    /// scrubbed rows as modified; that is the honest signal for an in-place
-    /// redaction and is documented at the API layer.
-    pub async fn scrub_pii_values(
-        &self,
-        identifiers: Vec<String>,
-    ) -> Result<ScrubOutcome, AuditScrubError> {
+    /// Normalize and validate scrub identifiers, returning the lowercased
+    /// match targets. Public so the handler can reject a bad request BEFORE
+    /// writing the scrub-start audit entry (avoiding start entries for
+    /// requests that never scrub anything); [`Self::scrub_pii_values`] runs
+    /// the same validation again as defense in depth.
+    pub fn validate_scrub_identifiers(
+        identifiers: &[String],
+    ) -> Result<Vec<String>, AuditScrubError> {
         let targets: Vec<String> = identifiers
             .iter()
             .map(|v| v.trim().to_lowercase())
@@ -300,13 +295,53 @@ impl AuditService {
                 ),
             });
         }
+        if let Some(long) = targets.iter().find(|v| v.len() > MAX_SCRUB_IDENTIFIER_LEN) {
+            return Err(AuditScrubError::Validation {
+                message: format!(
+                    "Identifier of length {} exceeds the maximum of {} characters",
+                    long.len(),
+                    MAX_SCRUB_IDENTIFIER_LEN
+                ),
+            });
+        }
+
+        Ok(targets)
+    }
+
+    /// Redact the given identifier values (a deleted user's email, username,
+    /// name) from every `audit_logs.data` payload, in place. The structural
+    /// record — row, operation type, timestamps, non-matching context — is
+    /// preserved; only string values exactly matching an identifier become
+    /// [`REDACTION_MARKER`]. This covers both rows the user authored and rows
+    /// *about* them (e.g. the deletion event recorded under the acting
+    /// admin's identity).
+    ///
+    /// Explicit operator action for erasure requests — never invoked
+    /// automatically. Callers are responsible for auditing the scrub itself.
+    ///
+    /// Content-integrity plugins that fingerprint audit payloads will flag
+    /// scrubbed rows as modified; that is the honest signal for an in-place
+    /// redaction and is documented at the API layer.
+    pub async fn scrub_pii_values(
+        &self,
+        identifiers: Vec<String>,
+    ) -> Result<ScrubOutcome, AuditScrubError> {
+        let targets = Self::validate_scrub_identifiers(&identifiers)?;
 
         let mut rows_scanned = 0u64;
         let mut rows_scrubbed = 0u64;
 
         // Page by ascending id so concurrent inserts (which get higher ids)
-        // cannot shift earlier pages under the scan.
+        // cannot shift earlier pages under the scan. The scrub's own meta
+        // records (start entry + completion receipt) are excluded: they carry
+        // no erasure-target PII by construction, and scrubbing them would let
+        // an operator redact the attribution context (ip/user-agent) out of
+        // the very records documenting a scrub.
         let mut pages = temps_entities::audit_logs::Entity::find()
+            .filter(
+                temps_entities::audit_logs::Column::OperationType
+                    .is_not_in(["AUDIT_DATA_SCRUB_STARTED", "AUDIT_DATA_SCRUBBED"]),
+            )
             .order_by_asc(temps_entities::audit_logs::Column::Id)
             .paginate(self.db.as_ref(), 500);
 
@@ -455,6 +490,19 @@ mod tests {
         let service = service_with(db);
 
         let result = service.scrub_pii_values(vec!["   ".to_string()]).await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            AuditScrubError::Validation { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_scrub_rejects_too_long_identifier() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let service = service_with(db);
+
+        let result = service.scrub_pii_values(vec!["x".repeat(513)]).await;
 
         assert!(matches!(
             result.unwrap_err(),

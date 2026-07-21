@@ -1326,6 +1326,20 @@ mod tests {
         assert!(!Role::Reader.has_permission(&Permission::EmailsSend));
     }
 
+    #[test]
+    fn test_audit_write_is_admin_only() {
+        // AuditWrite gates the audit PII scrub — the only mutation of audit
+        // data in the system. Admin tiers only.
+        assert!(Role::Admin.has_permission(&Permission::AuditWrite));
+        assert!(Role::PlatformAdmin.has_permission(&Permission::AuditWrite));
+
+        // Everyone else can at most read audit logs, never modify them.
+        assert!(!Role::User.has_permission(&Permission::AuditWrite));
+        assert!(!Role::Reader.has_permission(&Permission::AuditWrite));
+        assert!(!Role::ApiReader.has_permission(&Permission::AuditWrite));
+        assert!(!Role::MetricsIngest.has_permission(&Permission::AuditWrite));
+    }
+
     // Deployment token permission tests
     #[test]
     fn test_deployment_token_permissions_exist() {

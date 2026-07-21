@@ -17,7 +17,7 @@ use super::types::{
     AuditLogIpInfo, AuditLogResponse, AuditLogUserInfo, ListAuditLogsQuery, ScrubAuditDataRequest,
     ScrubAuditDataResponse,
 };
-use crate::audit::AuditDataScrubbedAudit;
+use crate::audit::{AuditDataScrubStartedAudit, AuditDataScrubbedAudit};
 use crate::services::AuditScrubError;
 
 #[derive(OpenApi)]
@@ -208,19 +208,47 @@ async fn scrub_audit_logs(
         }
     }
 
+    // Reject invalid input before writing the scrub-start entry, so bad
+    // requests don't leave dangling start entries with no receipt.
+    crate::services::AuditService::validate_scrub_identifiers(&identifiers)?;
+
+    let context = AuditContext {
+        user_id: auth.user_id(),
+        ip_address: Some(metadata.ip_address.clone()),
+        user_agent: metadata.user_agent.clone(),
+    };
+
+    // Record the start BEFORE any row is mutated, and fail closed if that
+    // write fails: a scrub that dies mid-scan has already rewritten earlier
+    // pages, and without this entry those [REDACTED] markers would carry no
+    // attribution. A start entry without a completion receipt below means
+    // the scrub did not finish and should be re-run.
+    let started = AuditDataScrubStartedAudit {
+        context: context.clone(),
+        identifier_fields: identifier_fields.clone(),
+    };
+    app_state
+        .audit_service
+        .create_audit_log_typed(&started)
+        .await
+        .map_err(|e| {
+            error!("Refusing to scrub: could not record scrub-start audit entry: {e}");
+            temps_core::error_builder::ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .type_("https://temps.sh/probs/audit-error")
+                .title("Audit Scrub Error")
+                .detail("Could not record the scrub-start audit entry; no rows were modified")
+                .build()
+        })?;
+
     let outcome = app_state
         .audit_service
         .scrub_pii_values(identifiers)
         .await?;
 
-    // Record the scrub itself — counts and which identifier kinds were
-    // provided, never the values being erased.
+    // Completion receipt — counts and which identifier kinds were provided,
+    // never the values being erased.
     let audit = AuditDataScrubbedAudit {
-        context: AuditContext {
-            user_id: auth.user_id(),
-            ip_address: Some(metadata.ip_address.clone()),
-            user_agent: metadata.user_agent.clone(),
-        },
+        context,
         identifier_fields,
         rows_scanned: outcome.rows_scanned,
         rows_scrubbed: outcome.rows_scrubbed,
