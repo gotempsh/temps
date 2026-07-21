@@ -27,6 +27,14 @@ pub trait AuditOperation: Send + Sync {
     /// Returns the user ID who performed the operation
     fn user_id(&self) -> i32;
 
+    /// Actor recorded on the audit row's user reference. `None` for events
+    /// with no resolvable account (e.g. a login attempt against an unknown
+    /// email). Defaults to `user_id()` for the many operations that always
+    /// act on behalf of a known user.
+    fn actor_user_id(&self) -> Option<i32> {
+        Some(self.user_id())
+    }
+
     /// Returns the IP address if available
     fn ip_address(&self) -> Option<String>;
 

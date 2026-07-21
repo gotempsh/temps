@@ -47,7 +47,7 @@ impl AuditService {
         let data_json = operation.serialize()?;
 
         let new_audit_log = audit_logs::ActiveModel {
-            user_id: Set(Some(operation.user_id())),
+            user_id: Set(operation.actor_user_id()),
             operation_type: Set(operation.operation_type()),
             user_agent: Set(operation.user_agent().to_string()),
             ip_address_id: Set(ip_address_id_val),
