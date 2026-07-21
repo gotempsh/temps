@@ -279,13 +279,15 @@ function describe(
   const webhookName = get<string>(data, 'webhook_name')
   const providerName = get<string>(data, 'provider_name')
   const sessionId = get<string | number>(data, 'session_id')
+  const attemptedEmail = get<string>(data, 'attempted_email')
+  const failureReason = get<string>(data, 'reason')
 
   switch (op) {
     // Auth
     case 'LOGIN_SUCCESS':
       return 'Logged in successfully'
     case 'LOGIN_FAILURE':
-      return 'Failed login attempt'
+      return `Failed login attempt${attemptedEmail ? ` for ${attemptedEmail}` : ''}${failureReason ? ` (${humanize(failureReason).toLowerCase()})` : ''}`
     case 'USER_LOGOUT':
       return 'Logged out'
     case 'AUTH_INITIATED':
@@ -316,6 +318,8 @@ function describe(
       return `${user?.name ?? 'User'} disabled multi-factor authentication`
     case 'MFA_VERIFIED':
       return `${user?.name ?? 'User'} verified multi-factor authentication`
+    case 'MFA_VERIFICATION_FAILED':
+      return 'Rejected an MFA verification code'
 
     // External services
     case 'EXTERNAL_SERVICE_CREATED':

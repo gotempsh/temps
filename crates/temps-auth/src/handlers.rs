@@ -1,8 +1,9 @@
 use super::AuthState;
 use crate::audit::{
-    ConcurrentSessionDetectedAudit, EmailVerifiedAudit, LoginAudit, LogoutAudit, MfaDisabledAudit,
-    MfaEnabledAudit, MfaVerifiedAudit, PasswordResetAudit, RoleAssignedAudit, RoleRemovedAudit,
-    UpdatedFields, UserCreatedAudit, UserDeletedAudit, UserRestoredAudit, UserUpdatedAudit,
+    ConcurrentSessionDetectedAudit, EmailVerifiedAudit, LoginAudit, LoginFailedAudit, LogoutAudit,
+    MfaDisabledAudit, MfaEnabledAudit, MfaVerificationFailedAudit, MfaVerifiedAudit,
+    PasswordResetAudit, RoleAssignedAudit, RoleRemovedAudit, UpdatedFields, UserCreatedAudit,
+    UserDeletedAudit, UserRestoredAudit, UserUpdatedAudit,
 };
 use crate::avatar::generate_avatar_data_url;
 use crate::context::AuthContext;
@@ -281,6 +282,22 @@ pub async fn verify_mfa_challenge(
         }
         Err(e) => {
             error!("MFA verification failed: {}", e);
+            // Record the rejected challenge so a code-guessing attempt on a
+            // half-authenticated session leaves a trail. The account behind
+            // the challenge session is not resolved on this path, so the
+            // actor stays unset. Volume is bounded by the MFA rate limiter.
+            if let Err(audit_err) = auth_state
+                .audit_service
+                .create_audit_log(&MfaVerificationFailedAudit {
+                    user_id: None,
+                    ip_address: Some(metadata.ip_address.to_string()),
+                    user_agent: metadata.user_agent.as_str().to_string(),
+                    reason: "invalid_or_expired_code".to_string(),
+                })
+                .await
+            {
+                error!("Failed to create audit log: {}", audit_err);
+            }
             Err(problem_new(StatusCode::UNAUTHORIZED)
                 .with_title("MFA Verification Failed")
                 .with_detail("The verification code is incorrect or has expired. Please try again with a new code from your authenticator app."))
@@ -731,16 +748,18 @@ pub async fn login(
                         ))
                     }
                     Err(e) => {
+                        // The credentials were already verified, so the actor
+                        // is known here. (This previously logged user_id 0,
+                        // which the audit FK rejected -- the row never landed.)
                         if let Err(e) = state
                             .audit_service
-                            .create_audit_log(&LoginAudit {
-                                context: AuditContext {
-                                    user_id: 0,
-                                    ip_address: Some(metadata.ip_address.to_string()),
-                                    user_agent: metadata.user_agent.as_str().to_string(),
-                                },
-                                success: false,
+                            .create_audit_log(&LoginFailedAudit {
+                                user_id: Some(user.id),
+                                attempted_email: login_email.clone(),
+                                ip_address: Some(metadata.ip_address.to_string()),
+                                user_agent: metadata.user_agent.as_str().to_string(),
                                 login_method: "password".to_string(),
+                                reason: "session_creation_failed".to_string(),
                             })
                             .await
                         {
@@ -757,6 +776,24 @@ pub async fn login(
         Err(e) => match e {
             crate::auth_service::UserAuthError::InvalidCredentials
             | crate::auth_service::UserAuthError::UserNotFound => {
+                // Record the rejected attempt so credential probing leaves a
+                // trail. The account may not exist, so the actor is optional;
+                // the attempted email preserves the claimed identity either
+                // way. Volume is bounded by the login rate limiter.
+                if let Err(audit_err) = state
+                    .audit_service
+                    .create_audit_log(&LoginFailedAudit {
+                        user_id: None,
+                        attempted_email: login_email.clone(),
+                        ip_address: Some(metadata.ip_address.to_string()),
+                        user_agent: metadata.user_agent.as_str().to_string(),
+                        login_method: "password".to_string(),
+                        reason: "invalid_credentials".to_string(),
+                    })
+                    .await
+                {
+                    error!("Failed to create audit log: {}", audit_err);
+                }
                 Err(problem_new(StatusCode::UNAUTHORIZED)
                     .with_title("Invalid Credentials")
                     .with_detail("Invalid email or password."))
@@ -776,6 +813,20 @@ pub async fn login(
                     email = %login_email,
                     "Login blocked: MFA is required for this role but is not enrolled"
                 );
+                if let Err(audit_err) = state
+                    .audit_service
+                    .create_audit_log(&LoginFailedAudit {
+                        user_id: Some(user_id),
+                        attempted_email: login_email.clone(),
+                        ip_address: Some(metadata.ip_address.to_string()),
+                        user_agent: metadata.user_agent.as_str().to_string(),
+                        login_method: "password".to_string(),
+                        reason: "mfa_required_for_role".to_string(),
+                    })
+                    .await
+                {
+                    error!("Failed to create audit log: {}", audit_err);
+                }
                 Err(problem_new(StatusCode::UNAUTHORIZED)
                     .with_title("Invalid Credentials")
                     .with_detail("Invalid email or password."))
@@ -788,6 +839,20 @@ pub async fn login(
                     error = %e,
                     "Authentication system error during login"
                 );
+                if let Err(audit_err) = state
+                    .audit_service
+                    .create_audit_log(&LoginFailedAudit {
+                        user_id: None,
+                        attempted_email: login_email.clone(),
+                        ip_address: Some(metadata.ip_address.to_string()),
+                        user_agent: metadata.user_agent.as_str().to_string(),
+                        login_method: "password".to_string(),
+                        reason: "internal_error".to_string(),
+                    })
+                    .await
+                {
+                    error!("Failed to create audit log: {}", audit_err);
+                }
                 Err(problem_new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Authentication Error")
                     .with_detail("Authentication system error. Please try again later."))
