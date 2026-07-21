@@ -11062,6 +11062,7 @@ dependencies = [
  "temps-database",
  "temps-entities",
  "temps-geo",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "utoipa",

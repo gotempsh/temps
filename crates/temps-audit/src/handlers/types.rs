@@ -93,6 +93,31 @@ pub struct ListAuditLogsQuery {
     pub offset: Option<i32>,
 }
 
+/// Request to redact a deleted user's identifier values from audit `data`
+/// payloads. At least one field must be provided; values shorter than 3
+/// characters are rejected.
+#[derive(Deserialize, Clone, ToSchema)]
+pub struct ScrubAuditDataRequest {
+    /// Email address to redact wherever it appears as a payload value
+    #[schema(example = "jane@example.com")]
+    pub email: Option<String>,
+    /// Username to redact wherever it appears as a payload value
+    #[schema(example = "jane.doe")]
+    pub username: Option<String>,
+    /// Display name to redact wherever it appears as a payload value
+    #[schema(example = "Jane Doe")]
+    pub name: Option<String>,
+}
+
+/// Outcome of a PII scrub pass over audit log payloads.
+#[derive(Serialize, ToSchema)]
+pub struct ScrubAuditDataResponse {
+    /// Number of audit rows whose payload was inspected
+    pub rows_scanned: u64,
+    /// Number of audit rows that had at least one value redacted
+    pub rows_scrubbed: u64,
+}
+
 impl From<AuditLogWithDetails> for AuditLogResponse {
     fn from(details: AuditLogWithDetails) -> Self {
         Self {

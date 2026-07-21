@@ -50,6 +50,10 @@ pub enum Permission {
 
     // Audit permissions
     AuditRead,
+    /// Modify audit log content. Only used by the PII scrub endpoint, which
+    /// redacts identifier values from `data` payloads while preserving the
+    /// structural record — granted to admin roles only.
+    AuditWrite,
 
     // Backup permissions
     BackupsRead,
@@ -258,6 +262,7 @@ impl fmt::Display for Permission {
             Permission::ApiKeysDelete => "api_keys:delete",
             Permission::ApiKeysCreate => "api_keys:create",
             Permission::AuditRead => "audit:read",
+            Permission::AuditWrite => "audit:write",
             Permission::BackupsRead => "backups:read",
             Permission::BackupsWrite => "backups:write",
             Permission::BackupsDelete => "backups:delete",
@@ -402,6 +407,7 @@ impl Permission {
             "api_keys:delete" => Some(Permission::ApiKeysDelete),
             "api_keys:create" => Some(Permission::ApiKeysCreate),
             "audit:read" => Some(Permission::AuditRead),
+            "audit:write" => Some(Permission::AuditWrite),
             "backups:read" => Some(Permission::BackupsRead),
             "backups:write" => Some(Permission::BackupsWrite),
             "backups:delete" => Some(Permission::BackupsDelete),
@@ -543,6 +549,7 @@ impl Permission {
             Permission::ApiKeysDelete,
             Permission::ApiKeysCreate,
             Permission::AuditRead,
+            Permission::AuditWrite,
             Permission::BackupsRead,
             Permission::BackupsWrite,
             Permission::BackupsDelete,
@@ -719,6 +726,7 @@ impl Role {
                 Permission::ApiKeysRead,
                 Permission::ApiKeysWrite,
                 Permission::AuditRead,
+                Permission::AuditWrite,
                 Permission::BackupsCreate,
                 Permission::BackupsDelete,
                 Permission::BackupsRead,
@@ -861,6 +869,7 @@ impl Role {
                 Permission::ApiKeysRead,
                 Permission::ApiKeysWrite,
                 Permission::AuditRead,
+                Permission::AuditWrite,
                 Permission::BackupsCreate,
                 Permission::BackupsDelete,
                 Permission::BackupsRead,

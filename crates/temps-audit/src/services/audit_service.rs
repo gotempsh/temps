@@ -207,6 +207,152 @@ impl AuditLogger for AuditService {
     }
 }
 
+/// Errors from the audit `data` PII scrub operation.
+#[derive(Debug, thiserror::Error)]
+pub enum AuditScrubError {
+    #[error("Validation error: {message}")]
+    Validation { message: String },
+
+    #[error("Database error while scrubbing audit data: {0}")]
+    Database(#[from] sea_orm::DbErr),
+}
+
+/// Result of a PII scrub pass over `audit_logs.data`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrubOutcome {
+    /// Rows whose `data` payload was inspected.
+    pub rows_scanned: u64,
+    /// Rows whose `data` payload had at least one value redacted.
+    pub rows_scrubbed: u64,
+}
+
+/// Marker written in place of a redacted value.
+pub const REDACTION_MARKER: &str = "[REDACTED]";
+
+/// Minimum identifier length accepted by the scrub — redacting very short
+/// strings would rewrite unrelated payload values wholesale.
+const MIN_SCRUB_IDENTIFIER_LEN: usize = 3;
+
+/// Replace every JSON string value that exactly equals one of `targets`
+/// (case-insensitive) with [`REDACTION_MARKER`], recursing through objects
+/// and arrays. Returns the number of values replaced.
+///
+/// Matching is by full value only — identifiers embedded inside longer
+/// strings are not detected. `targets` must already be lowercased.
+fn redact_matching_values(value: &mut serde_json::Value, targets: &[String]) -> u64 {
+    match value {
+        serde_json::Value::String(s) => {
+            if targets.iter().any(|t| s.to_lowercase() == *t) {
+                *value = serde_json::Value::String(REDACTION_MARKER.to_string());
+                1
+            } else {
+                0
+            }
+        }
+        serde_json::Value::Object(map) => map
+            .values_mut()
+            .map(|v| redact_matching_values(v, targets))
+            .sum(),
+        serde_json::Value::Array(items) => items
+            .iter_mut()
+            .map(|v| redact_matching_values(v, targets))
+            .sum(),
+        _ => 0,
+    }
+}
+
+impl AuditService {
+    /// Redact the given identifier values (a deleted user's email, username,
+    /// name) from every `audit_logs.data` payload, in place. The structural
+    /// record — row, operation type, timestamps, non-matching context — is
+    /// preserved; only string values exactly matching an identifier become
+    /// [`REDACTION_MARKER`]. This covers both rows the user authored and rows
+    /// *about* them (e.g. the deletion event recorded under the acting
+    /// admin's identity).
+    ///
+    /// Explicit operator action for erasure requests — never invoked
+    /// automatically. Callers are responsible for auditing the scrub itself.
+    ///
+    /// Content-integrity plugins that fingerprint audit payloads will flag
+    /// scrubbed rows as modified; that is the honest signal for an in-place
+    /// redaction and is documented at the API layer.
+    pub async fn scrub_pii_values(
+        &self,
+        identifiers: Vec<String>,
+    ) -> Result<ScrubOutcome, AuditScrubError> {
+        let targets: Vec<String> = identifiers
+            .iter()
+            .map(|v| v.trim().to_lowercase())
+            .filter(|v| !v.is_empty())
+            .collect();
+
+        if targets.is_empty() {
+            return Err(AuditScrubError::Validation {
+                message: "At least one identifier value to redact is required".to_string(),
+            });
+        }
+        if let Some(short) = targets.iter().find(|v| v.len() < MIN_SCRUB_IDENTIFIER_LEN) {
+            return Err(AuditScrubError::Validation {
+                message: format!(
+                    "Identifier of length {} is too short to scrub safely (minimum {} characters)",
+                    short.len(),
+                    MIN_SCRUB_IDENTIFIER_LEN
+                ),
+            });
+        }
+
+        let mut rows_scanned = 0u64;
+        let mut rows_scrubbed = 0u64;
+
+        // Page by ascending id so concurrent inserts (which get higher ids)
+        // cannot shift earlier pages under the scan.
+        let mut pages = temps_entities::audit_logs::Entity::find()
+            .order_by_asc(temps_entities::audit_logs::Column::Id)
+            .paginate(self.db.as_ref(), 500);
+
+        while let Some(batch) = pages.fetch_and_next().await? {
+            for row in batch {
+                rows_scanned += 1;
+
+                let mut payload: serde_json::Value = match serde_json::from_str(&row.data) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // Non-JSON payloads can't be selectively redacted;
+                        // leave them intact rather than destroying the record.
+                        warn!(
+                            audit_log_id = row.id,
+                            "Skipping audit row with unparsable data payload during scrub: {e}"
+                        );
+                        continue;
+                    }
+                };
+
+                if redact_matching_values(&mut payload, &targets) == 0 {
+                    continue;
+                }
+
+                let serialized =
+                    serde_json::to_string(&payload).map_err(|e| AuditScrubError::Validation {
+                        message: format!(
+                            "Failed to re-serialize scrubbed payload for audit row {}: {e}",
+                            row.id
+                        ),
+                    })?;
+
+                let mut active: temps_entities::audit_logs::ActiveModel = row.into();
+                active.data = Set(serialized);
+                active.update(self.db.as_ref()).await?;
+                rows_scrubbed += 1;
+            }
+        }
+
+        Ok(ScrubOutcome {
+            rows_scanned,
+            rows_scrubbed,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,5 +419,95 @@ mod tests {
 
         assert_eq!(details.log.user_id, Some(7));
         assert!(details.user.is_none());
+    }
+
+    // ── PII scrub ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn redact_replaces_exact_matches_recursively() {
+        let mut payload = serde_json::json!({
+            "email": "Jane@Example.com",
+            "nested": { "username": "jane.doe", "role": "admin" },
+            "list": ["jane.doe", "other"],
+            "count": 3,
+            "message": "sent to jane@example.com yesterday"
+        });
+        let targets = vec!["jane@example.com".to_string(), "jane.doe".to_string()];
+
+        let replaced = redact_matching_values(&mut payload, &targets);
+
+        // Case-insensitive full-value matches only: the email field, the
+        // nested username, and the array element — not the substring inside
+        // "message", and never non-string values.
+        assert_eq!(replaced, 3);
+        assert_eq!(payload["email"], REDACTION_MARKER);
+        assert_eq!(payload["nested"]["username"], REDACTION_MARKER);
+        assert_eq!(payload["nested"]["role"], "admin");
+        assert_eq!(payload["list"][0], REDACTION_MARKER);
+        assert_eq!(payload["list"][1], "other");
+        assert_eq!(payload["count"], 3);
+        assert_eq!(payload["message"], "sent to jane@example.com yesterday");
+    }
+
+    #[tokio::test]
+    async fn test_scrub_rejects_empty_identifier_list() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let service = service_with(db);
+
+        let result = service.scrub_pii_values(vec!["   ".to_string()]).await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            AuditScrubError::Validation { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_scrub_rejects_too_short_identifier() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let service = service_with(db);
+
+        let result = service
+            .scrub_pii_values(vec!["jane@example.com".to_string(), "ab".to_string()])
+            .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            AuditScrubError::Validation { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_scrub_updates_only_matching_rows() {
+        fn row(id: i32, data: &str) -> audit_logs::Model {
+            audit_logs::Model {
+                id,
+                data: data.to_string(),
+                ..log_row(Some(1))
+            }
+        }
+
+        let matching = row(1, r#"{"email":"jane@example.com"}"#);
+        let scrubbed = row(1, r#"{"email":"[REDACTED]"}"#);
+        let unrelated = row(2, r#"{"email":"other@example.com"}"#);
+        let unparsable = row(3, "not-json");
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // Page 1: three rows (one match, one non-match, one unparsable).
+            .append_query_results([vec![matching, unrelated, unparsable]])
+            // UPDATE ... RETURNING for the matching row.
+            .append_query_results([vec![scrubbed]])
+            // Page 2: empty — ends the scan.
+            .append_query_results([Vec::<audit_logs::Model>::new()])
+            .into_connection();
+        let service = service_with(db);
+
+        let outcome = service
+            .scrub_pii_values(vec!["jane@example.com".to_string()])
+            .await
+            .expect("scrub should succeed");
+
+        assert_eq!(outcome.rows_scanned, 3);
+        assert_eq!(outcome.rows_scrubbed, 1);
     }
 }

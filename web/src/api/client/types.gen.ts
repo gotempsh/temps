@@ -13540,6 +13540,40 @@ export type ScreenshotSettings = {
     url?: string;
 };
 
+/**
+ * Request to redact a deleted user's identifier values from audit `data`
+ * payloads. At least one field must be provided; values shorter than 3
+ * characters are rejected.
+ */
+export type ScrubAuditDataRequest = {
+    /**
+     * Email address to redact wherever it appears as a payload value
+     */
+    email?: string | null;
+    /**
+     * Display name to redact wherever it appears as a payload value
+     */
+    name?: string | null;
+    /**
+     * Username to redact wherever it appears as a payload value
+     */
+    username?: string | null;
+};
+
+/**
+ * Outcome of a PII scrub pass over audit log payloads.
+ */
+export type ScrubAuditDataResponse = {
+    /**
+     * Number of audit rows whose payload was inspected
+     */
+    rows_scanned: number;
+    /**
+     * Number of audit rows that had at least one value redacted
+     */
+    rows_scrubbed: number;
+};
+
 export type SearchLogsRequest = {
     /**
      * Filter to specific containers (Docker container IDs). Empty = all
@@ -46807,6 +46841,41 @@ export type ListAuditLogsResponses = {
 };
 
 export type ListAuditLogsResponse = ListAuditLogsResponses[keyof ListAuditLogsResponses];
+
+export type ScrubAuditLogsData = {
+    body: ScrubAuditDataRequest;
+    path?: never;
+    query?: never;
+    url: 'audit/logs/scrub';
+};
+
+export type ScrubAuditLogsErrors = {
+    /**
+     * Validation error
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ScrubAuditLogsResponses = {
+    /**
+     * Scrub completed
+     */
+    200: ScrubAuditDataResponse;
+};
+
+export type ScrubAuditLogsResponse = ScrubAuditLogsResponses[keyof ScrubAuditLogsResponses];
 
 export type GetAuditLogData = {
     body?: never;
