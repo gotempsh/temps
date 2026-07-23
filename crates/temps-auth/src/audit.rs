@@ -670,14 +670,7 @@ impl AuditOperation for LoginFailedAudit {
         "LOGIN_FAILURE".to_string()
     }
 
-    /// Only meaningful through [`AuditOperation::actor_user_id`]; the `0`
-    /// fallback satisfies the non-optional legacy signature and is never
-    /// written to the audit row.
-    fn user_id(&self) -> i32 {
-        self.user_id.unwrap_or(0)
-    }
-
-    fn actor_user_id(&self) -> Option<i32> {
+    fn user_id(&self) -> Option<i32> {
         self.user_id
     }
 
@@ -704,7 +697,8 @@ pub struct MfaVerificationFailedAudit {
     pub user_id: Option<i32>,
     pub ip_address: Option<String>,
     pub user_agent: String,
-    /// Why verification was rejected, e.g. "invalid_or_expired_code".
+    /// Why verification was rejected, e.g. "invalid_code",
+    /// "invalid_or_expired_session", or "missing_session_cookie".
     pub reason: String,
 }
 
@@ -713,14 +707,7 @@ impl AuditOperation for MfaVerificationFailedAudit {
         "MFA_VERIFICATION_FAILED".to_string()
     }
 
-    /// Only meaningful through [`AuditOperation::actor_user_id`]; the `0`
-    /// fallback satisfies the non-optional legacy signature and is never
-    /// written to the audit row.
-    fn user_id(&self) -> i32 {
-        self.user_id.unwrap_or(0)
-    }
-
-    fn actor_user_id(&self) -> Option<i32> {
+    fn user_id(&self) -> Option<i32> {
         self.user_id
     }
 
@@ -753,9 +740,8 @@ mod failure_audit_tests {
             reason: "invalid_credentials".to_string(),
         };
         assert_eq!(audit.operation_type(), "LOGIN_FAILURE");
-        assert_eq!(audit.actor_user_id(), None);
-        let json =
-            AuditOperation::serialize(&audit).expect("LoginFailedAudit serializes");
+        assert_eq!(audit.user_id(), None);
+        let json = AuditOperation::serialize(&audit).expect("LoginFailedAudit serializes");
         assert!(json.contains("nobody@example.com"));
         assert!(json.contains("invalid_credentials"));
     }
@@ -770,7 +756,7 @@ mod failure_audit_tests {
             login_method: "password".to_string(),
             reason: "mfa_required_for_role".to_string(),
         };
-        assert_eq!(audit.actor_user_id(), Some(7));
+        assert_eq!(audit.user_id(), Some(7));
     }
 
     #[test]
@@ -779,16 +765,14 @@ mod failure_audit_tests {
             user_id: None,
             ip_address: Some("203.0.113.9".to_string()),
             user_agent: "test-agent".to_string(),
-            reason: "invalid_or_expired_code".to_string(),
+            reason: "invalid_code".to_string(),
         };
         assert_eq!(audit.operation_type(), "MFA_VERIFICATION_FAILED");
-        assert_eq!(audit.actor_user_id(), None);
+        assert_eq!(audit.user_id(), None);
     }
 
     #[test]
-    fn test_existing_context_audits_keep_default_actor() {
-        // The defaulted actor_user_id() must keep routing the context user
-        // for the existing always-authenticated operations.
+    fn test_existing_context_audits_keep_known_actor() {
         let audit = LoginAudit {
             context: AuditContext {
                 user_id: 42,
@@ -798,6 +782,6 @@ mod failure_audit_tests {
             success: true,
             login_method: "password".to_string(),
         };
-        assert_eq!(audit.actor_user_id(), Some(42));
+        assert_eq!(audit.user_id(), Some(42));
     }
 }

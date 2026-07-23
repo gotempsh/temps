@@ -72,7 +72,10 @@ const OPERATION_GROUPS: OperationGroup[] = [
       { value: 'PROJECT_UPDATED', label: 'Project Updated' },
       { value: 'PROJECT_DELETED', label: 'Project Deleted' },
       { value: 'PROJECT_SETTINGS_UPDATED', label: 'Project Settings Updated' },
-      { value: 'DEPLOYMENT_CONFIG_UPDATED', label: 'Deployment Config Updated' },
+      {
+        value: 'DEPLOYMENT_CONFIG_UPDATED',
+        label: 'Deployment Config Updated',
+      },
       { value: 'ENVIRONMENT_DELETED', label: 'Environment Deleted' },
       {
         value: 'ENVIRONMENT_SETTINGS_UPDATED',
@@ -117,9 +120,7 @@ const OPERATION_GROUPS: OperationGroup[] = [
   },
   {
     label: 'Containers',
-    operations: [
-      { value: 'CONTAINER_ACTION', label: 'Container Action' },
-    ],
+    operations: [{ value: 'CONTAINER_ACTION', label: 'Container Action' }],
   },
   {
     label: 'Workspaces',
@@ -494,9 +495,7 @@ export function AuditLogs() {
                     audit_date={log.audit_date}
                     user={log.user ?? undefined}
                     ip_address={log.ip_address ?? undefined}
-                    data={
-                      log.data as Record<string, unknown> | undefined
-                    }
+                    data={log.data as Record<string, unknown> | undefined}
                   />
                 ))
               )}

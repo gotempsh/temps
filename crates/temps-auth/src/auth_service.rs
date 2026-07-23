@@ -69,6 +69,27 @@ pub enum AuthError {
     NoPasswordSet,
 }
 
+#[derive(Error, Debug)]
+pub enum MfaChallengeError {
+    #[error("MFA challenge session is invalid or expired")]
+    InvalidOrExpiredSession,
+    #[error("MFA challenge references missing user {user_id}")]
+    UserNotFound { user_id: i32 },
+    #[error("MFA code is invalid for user {user_id}")]
+    InvalidCode { user_id: i32 },
+    #[error("MFA verifier configuration is invalid for user {user_id}: {reason}")]
+    VerifierConfiguration { user_id: i32, reason: String },
+    #[error("MFA verification clock failed for user {user_id}: {reason}")]
+    VerificationClock { user_id: i32, reason: String },
+    #[error("Failed to {operation} for MFA challenge (user {user_id:?}): {source}")]
+    Database {
+        operation: &'static str,
+        user_id: Option<i32>,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+}
+
 impl From<sea_orm::DbErr> for AuthError {
     fn from(error: sea_orm::DbErr) -> Self {
         match error {
@@ -249,7 +270,7 @@ impl AuthService {
         &self,
         session_token: &str,
         code: &str,
-    ) -> Result<temps_entities::users::Model, AuthError> {
+    ) -> Result<temps_entities::users::Model, MfaChallengeError> {
         // Get the user from the temporary session. Require mfa_pending so a
         // real (fully authenticated) session token can never be spent as an
         // MFA challenge -- the discriminator cuts both ways.
@@ -258,72 +279,84 @@ impl AuthService {
             .filter(temps_entities::sessions::Column::ExpiresAt.gt(Utc::now()))
             .filter(temps_entities::sessions::Column::MfaPending.eq(true))
             .one(self.db.as_ref())
-            .await?
-            .ok_or_else(|| AuthError::GenericError("Invalid or expired session".to_string()))?;
+            .await
+            .map_err(|source| MfaChallengeError::Database {
+                operation: "load the pending session",
+                user_id: None,
+                source,
+            })?
+            .ok_or(MfaChallengeError::InvalidOrExpiredSession)?;
 
         let user = temps_entities::users::Entity::find_by_id(session.user_id)
             .one(self.db.as_ref())
-            .await?
-            .ok_or_else(|| AuthError::NotFound("User not found".to_string()))?;
+            .await
+            .map_err(|source| MfaChallengeError::Database {
+                operation: "load the challenge user",
+                user_id: Some(session.user_id),
+                source,
+            })?
+            .ok_or(MfaChallengeError::UserNotFound {
+                user_id: session.user_id,
+            })?;
 
         // Verify the MFA code
-        if !self.verify_totp_code(&user, code) {
-            return Err(AuthError::GenericError("Invalid MFA code".to_string()));
+        if !self.verify_totp_code(&user, code)? {
+            return Err(MfaChallengeError::InvalidCode { user_id: user.id });
         }
 
         // Delete the temporary session
         temps_entities::sessions::Entity::delete_many()
             .filter(temps_entities::sessions::Column::SessionToken.eq(session_token))
             .exec(self.db.as_ref())
-            .await?;
+            .await
+            .map_err(|source| MfaChallengeError::Database {
+                operation: "consume the verified pending session",
+                user_id: Some(user.id),
+                source,
+            })?;
 
         Ok(user)
     }
 
-    fn verify_totp_code(&self, user: &temps_entities::users::Model, code: &str) -> bool {
+    fn verify_totp_code(
+        &self,
+        user: &temps_entities::users::Model,
+        code: &str,
+    ) -> Result<bool, MfaChallengeError> {
         match &user.mfa_secret {
             Some(secret) => {
                 use totp_rs::{Algorithm, TOTP};
 
-                let decoded =
-                    match base32::decode(base32::Alphabet::Rfc4648 { padding: true }, secret) {
-                        Some(bytes) => bytes,
-                        None => {
-                            tracing::error!(
-                                "Failed to base32-decode MFA secret for user {}",
-                                user.id
-                            );
-                            return false;
-                        }
-                    };
+                let decoded = base32::decode(base32::Alphabet::Rfc4648 { padding: true }, secret)
+                    .ok_or(MfaChallengeError::VerifierConfiguration {
+                    user_id: user.id,
+                    reason: "stored secret is not valid base32".to_string(),
+                })?;
 
-                let secret_bytes = match Secret::Raw(decoded).to_bytes() {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        tracing::error!(
-                            "Failed to convert MFA secret to bytes for user {}: {:?}",
-                            user.id,
-                            e
-                        );
-                        return false;
+                let secret_bytes = Secret::Raw(decoded).to_bytes().map_err(|error| {
+                    MfaChallengeError::VerifierConfiguration {
+                        user_id: user.id,
+                        reason: format!("stored secret cannot be converted to bytes: {error}"),
                     }
-                };
+                })?;
 
-                let totp = match TOTP::new(Algorithm::SHA1, 6, 1, 30, secret_bytes) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        tracing::error!(
-                            "Failed to create TOTP instance for user {}: {:?}",
-                            user.id,
-                            e
-                        );
-                        return false;
+                let totp = TOTP::new(Algorithm::SHA1, 6, 1, 30, secret_bytes).map_err(|error| {
+                    MfaChallengeError::VerifierConfiguration {
+                        user_id: user.id,
+                        reason: format!("TOTP verifier cannot be initialized: {error}"),
                     }
-                };
+                })?;
 
-                totp.check_current(code).unwrap_or(false)
+                totp.check_current(code)
+                    .map_err(|error| MfaChallengeError::VerificationClock {
+                        user_id: user.id,
+                        reason: error.to_string(),
+                    })
             }
-            None => false,
+            None => Err(MfaChallengeError::VerifierConfiguration {
+                user_id: user.id,
+                reason: "stored MFA secret is missing".to_string(),
+            }),
         }
     }
     // Register a new user with email/password
@@ -889,6 +922,7 @@ mod tests {
     use super::*;
     use axum::http::HeaderMap;
     use chrono::{Duration, Utc};
+    use sea_orm::{DatabaseBackend, MockDatabase};
     use temps_database::test_utils::TestDatabase;
     use temps_entities::types::RoleType;
     use temps_entities::{sessions, settings, users};
@@ -1048,7 +1082,7 @@ mod tests {
             updated_at: Set(Utc::now()),
             mfa_enabled: Set(mfa_enabled),
             mfa_secret: if mfa_enabled {
-                Set(Some("JBSWY3DPEHPK3PXP".to_string()))
+                Set(Some("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_string()))
             } else {
                 Set(None)
             },
@@ -1245,11 +1279,7 @@ mod tests {
             .verify_mfa_challenge(&real_token, "000000")
             .await;
         assert!(
-            matches!(
-                result,
-                Err(AuthError::GenericError(ref message))
-                    if message == "Invalid or expired session"
-            ),
+            matches!(result, Err(MfaChallengeError::InvalidOrExpiredSession)),
             "A real session token must be rejected before TOTP verification, got: {result:?}"
         );
     }
@@ -1711,8 +1741,119 @@ mod tests {
             .verify_mfa_challenge(&mfa_session_token, "123456")
             .await;
 
-        assert!(result.is_err());
-        matches!(result.unwrap_err(), AuthError::GenericError(_));
+        assert!(matches!(
+            result,
+            Err(MfaChallengeError::VerifierConfiguration { user_id, .. })
+                if user_id == user.id
+        ));
+    }
+
+    fn current_totp_code(secret: &str) -> String {
+        let secret_bytes = base32::decode(base32::Alphabet::Rfc4648 { padding: true }, secret)
+            .expect("test secret should be valid base32");
+        totp_rs::TOTP::new(totp_rs::Algorithm::SHA1, 6, 1, 30, secret_bytes)
+            .expect("test TOTP should initialize")
+            .generate_current()
+            .expect("test clock should generate a TOTP")
+    }
+
+    #[tokio::test]
+    async fn test_verify_mfa_challenge_distinguishes_invalid_code() {
+        let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+            return;
+        };
+        let user =
+            create_test_user_with_mfa(&db.db, "wrong-code@example.com", "password", true).await;
+        let session_token = auth_service.create_mfa_session(user.id).await.unwrap();
+        let current_code = current_totp_code("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP");
+        let wrong_code = if current_code == "000000" {
+            "000001"
+        } else {
+            "000000"
+        };
+
+        let result = auth_service
+            .verify_mfa_challenge(&session_token, wrong_code)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(MfaChallengeError::InvalidCode { user_id }) if user_id == user.id
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_verify_mfa_challenge_distinguishes_database_failure() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom(
+                "challenge database unavailable".to_string(),
+            )])
+            .into_connection();
+        let auth_service = AuthService::new(Arc::new(db), Arc::new(MockEmailService::new()));
+
+        let result = auth_service
+            .verify_mfa_challenge("pending-session", "123456")
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(MfaChallengeError::Database {
+                operation: "load the pending session",
+                user_id: None,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_correct_mfa_code_with_consume_failure_is_not_rejected_code() {
+        let now = Utc::now();
+        let user = users::Model {
+            id: 7,
+            name: "MFA User".to_string(),
+            email: "mfa-user@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            deleted_at: None,
+            mfa_secret: Some("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_string()),
+            mfa_enabled: true,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let session = sessions::Model {
+            id: 9,
+            user_id: user.id,
+            session_token: "pending-session".to_string(),
+            expires_at: now + Duration::minutes(5),
+            mfa_pending: true,
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![session]])
+            .append_query_results([vec![user]])
+            .append_exec_errors([sea_orm::DbErr::Custom("session delete failed".to_string())])
+            .into_connection();
+        let auth_service = AuthService::new(Arc::new(db), Arc::new(MockEmailService::new()));
+        let code = current_totp_code("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP");
+
+        let result = auth_service
+            .verify_mfa_challenge("pending-session", &code)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(MfaChallengeError::Database {
+                operation: "consume the verified pending session",
+                user_id: Some(7),
+                ..
+            })
+        ));
     }
 
     #[tokio::test]
@@ -1734,8 +1875,10 @@ mod tests {
             .verify_mfa_challenge(session_token, "123456")
             .await;
 
-        assert!(result.is_err());
-        matches!(result.unwrap_err(), AuthError::GenericError(_));
+        assert!(matches!(
+            result,
+            Err(MfaChallengeError::InvalidOrExpiredSession)
+        ));
     }
 
     // Helper Method Tests
