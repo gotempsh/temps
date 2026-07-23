@@ -115,8 +115,8 @@ impl AuditOperation for AutofixerStartAudit {
     fn operation_type(&self) -> String {
         "AUTOFIXER_ANALYSIS_STARTED".to_string()
     }
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
     fn ip_address(&self) -> Option<String> {
         self.context.ip_address.clone()
@@ -141,8 +141,8 @@ impl AuditOperation for AutofixerFixAudit {
     fn operation_type(&self) -> String {
         "AUTOFIXER_FIX_STARTED".to_string()
     }
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
     fn ip_address(&self) -> Option<String> {
         self.context.ip_address.clone()
@@ -168,8 +168,8 @@ impl AuditOperation for AutofixerPrAudit {
     fn operation_type(&self) -> String {
         "AUTOFIXER_PR_CREATED".to_string()
     }
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
     fn ip_address(&self) -> Option<String> {
         self.context.ip_address.clone()

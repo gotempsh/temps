@@ -94,8 +94,8 @@ impl AuditOperation for ExternalServiceCreatedAudit {
         "EXTERNAL_SERVICE_CREATED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -117,8 +117,8 @@ impl AuditOperation for ExternalServiceUpdatedAudit {
         "EXTERNAL_SERVICE_UPDATED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -140,8 +140,8 @@ impl AuditOperation for ExternalServiceDeletedAudit {
         "EXTERNAL_SERVICE_DELETED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -163,8 +163,8 @@ impl AuditOperation for ExternalServiceStatusChangedAudit {
         "EXTERNAL_SERVICE_STATUS_CHANGED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -186,8 +186,8 @@ impl AuditOperation for ExternalServiceProjectLinkedAudit {
         "EXTERNAL_SERVICE_PROJECT_LINKED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -209,8 +209,8 @@ impl AuditOperation for ExternalServiceProjectUnlinkedAudit {
         "EXTERNAL_SERVICE_PROJECT_UNLINKED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -232,8 +232,8 @@ impl AuditOperation for ServiceHealthChecked {
         "EXTERNAL_SERVICE_HEALTH_CHECK_TRIGGERED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -255,8 +255,8 @@ impl AuditOperation for ExternalServiceClusterMemberAddedAudit {
         "EXTERNAL_SERVICE_CLUSTER_MEMBER_ADDED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -278,8 +278,8 @@ impl AuditOperation for ExternalServiceClusterMemberRemovedAudit {
         "EXTERNAL_SERVICE_CLUSTER_MEMBER_REMOVED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -301,8 +301,8 @@ impl AuditOperation for ExternalServiceClusterMemberPromotedAudit {
         "EXTERNAL_SERVICE_CLUSTER_MEMBER_PROMOTED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {

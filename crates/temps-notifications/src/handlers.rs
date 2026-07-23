@@ -61,8 +61,8 @@ impl AuditOperation for NotificationProviderAudit {
     fn operation_type(&self) -> String {
         self.action.clone()
     }
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
     fn ip_address(&self) -> Option<String> {
         self.context.ip_address.clone()
@@ -80,8 +80,8 @@ impl AuditOperation for NotificationPreferencesAudit {
     fn operation_type(&self) -> String {
         self.action.clone()
     }
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
     fn ip_address(&self) -> Option<String> {
         self.context.ip_address.clone()

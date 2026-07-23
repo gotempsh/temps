@@ -224,8 +224,8 @@ impl AuditOperation for LoginAudit {
         format!("LOGIN_{}", if self.success { "SUCCESS" } else { "FAILURE" })
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -246,8 +246,8 @@ impl AuditOperation for ConcurrentSessionDetectedAudit {
         "CONCURRENT_SESSION_DETECTED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -269,8 +269,8 @@ impl AuditOperation for UserCreatedAudit {
         "USER_CREATED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -292,8 +292,8 @@ impl AuditOperation for RoleAssignedAudit {
         "ROLE_ASSIGNED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -315,8 +315,8 @@ impl AuditOperation for RoleRemovedAudit {
         "ROLE_REMOVED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -338,8 +338,8 @@ impl AuditOperation for UserUpdatedAudit {
         "USER_UPDATED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -361,8 +361,8 @@ impl AuditOperation for UserDeletedAudit {
         "USER_DELETED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -384,8 +384,8 @@ impl AuditOperation for UserRestoredAudit {
         "USER_RESTORED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -407,8 +407,8 @@ impl AuditOperation for MfaEnabledAudit {
         "MFA_ENABLED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -430,8 +430,8 @@ impl AuditOperation for MfaDisabledAudit {
         "MFA_DISABLED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -453,8 +453,8 @@ impl AuditOperation for MfaVerifiedAudit {
         "MFA_VERIFIED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -476,8 +476,8 @@ impl AuditOperation for LogoutAudit {
         "USER_LOGOUT".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -499,8 +499,8 @@ impl AuditOperation for PasswordResetAudit {
         "PASSWORD_RESET".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -522,8 +522,8 @@ impl AuditOperation for PasswordChangedAudit {
         "PASSWORD_CHANGED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -545,8 +545,8 @@ impl AuditOperation for EmailVerifiedAudit {
         "EMAIL_VERIFIED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -568,8 +568,8 @@ impl AuditOperation for ApiKeyCreatedAudit {
         "API_KEY_CREATED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -591,8 +591,8 @@ impl AuditOperation for ApiKeyRotatedAudit {
         "API_KEY_ROTATED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -618,8 +618,8 @@ macro_rules! impl_oidc_audit_op {
                 $op.to_string()
             }
 
-            fn user_id(&self) -> i32 {
-                self.context.user_id
+            fn user_id(&self) -> Option<i32> {
+                Some(self.context.user_id)
             }
 
             fn ip_address(&self) -> Option<String> {

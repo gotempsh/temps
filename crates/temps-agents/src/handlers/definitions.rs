@@ -207,8 +207,8 @@ impl AuditOperation for DefinitionAudit {
     fn operation_type(&self) -> String {
         format!("{}_{}", self.resource_kind, self.operation)
     }
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
     fn ip_address(&self) -> Option<String> {
         self.context.ip_address.clone()

@@ -47,7 +47,7 @@ impl AuditService {
         let data_json = operation.serialize()?;
 
         let new_audit_log = audit_logs::ActiveModel {
-            user_id: Set(operation.actor_user_id()),
+            user_id: Set(operation.user_id()),
             operation_type: Set(operation.operation_type()),
             user_agent: Set(operation.user_agent().to_string()),
             ip_address_id: Set(ip_address_id_val),
@@ -236,13 +236,7 @@ mod tests {
 
     #[derive(Serialize)]
     struct TestAuditOperation {
-        user_id: i32,
-        actor_user_id: Option<i32>,
-    }
-
-    #[derive(Serialize)]
-    struct DefaultActorAuditOperation {
-        user_id: i32,
+        user_id: Option<i32>,
     }
 
     impl AuditOperation for TestAuditOperation {
@@ -250,34 +244,7 @@ mod tests {
             "TEST_OPERATION".to_string()
         }
 
-        fn user_id(&self) -> i32 {
-            self.user_id
-        }
-
-        fn actor_user_id(&self) -> Option<i32> {
-            self.actor_user_id
-        }
-
-        fn ip_address(&self) -> Option<String> {
-            None
-        }
-
-        fn user_agent(&self) -> &str {
-            "test-agent"
-        }
-
-        fn serialize(&self) -> anyhow::Result<String> {
-            serde_json::to_string(self)
-                .map_err(|error| anyhow::anyhow!("Failed to serialize test audit: {}", error))
-        }
-    }
-
-    impl AuditOperation for DefaultActorAuditOperation {
-        fn operation_type(&self) -> String {
-            "TEST_DEFAULT_ACTOR_OPERATION".to_string()
-        }
-
-        fn user_id(&self) -> i32 {
+        fn user_id(&self) -> Option<i32> {
             self.user_id
         }
 
@@ -297,11 +264,11 @@ mod tests {
 
     async fn persisted_actor_value<T: AuditOperation>(
         operation: &T,
-        actor_user_id: Option<i32>,
+        user_id: Option<i32>,
     ) -> Value {
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
-                .append_query_results([vec![log_row(actor_user_id)]])
+                .append_query_results([vec![log_row(user_id)]])
                 .into_connection(),
         );
         let geoip = Arc::new(GeoIpService::Mock(MockGeoIpService::new()));
@@ -333,22 +300,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_audit_log_persists_null_actor() {
-        let operation = TestAuditOperation {
-            user_id: 42,
-            actor_user_id: None,
-        };
+        let operation = TestAuditOperation { user_id: None };
         assert_eq!(
-            persisted_actor_value(&operation, operation.actor_user_id()).await,
+            persisted_actor_value(&operation, operation.user_id()).await,
             Value::Int(None)
         );
     }
 
     #[tokio::test]
-    async fn test_create_audit_log_persists_default_actor() {
-        let operation = DefaultActorAuditOperation { user_id: 42 };
-        assert_eq!(operation.actor_user_id(), Some(42));
+    async fn test_create_audit_log_persists_known_actor() {
+        let operation = TestAuditOperation { user_id: Some(42) };
         assert_eq!(
-            persisted_actor_value(&operation, operation.actor_user_id()).await,
+            persisted_actor_value(&operation, operation.user_id()).await,
             Value::Int(Some(42))
         );
     }

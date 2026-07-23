@@ -144,8 +144,8 @@ impl AuditOperation for AgentCreatedAudit {
     fn operation_type(&self) -> String {
         "AGENT_CREATED".to_string()
     }
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
     fn ip_address(&self) -> Option<String> {
         self.context.ip_address.clone()
@@ -163,8 +163,8 @@ impl AuditOperation for AgentUpdatedAudit {
     fn operation_type(&self) -> String {
         "AGENT_UPDATED".to_string()
     }
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
     fn ip_address(&self) -> Option<String> {
         self.context.ip_address.clone()
@@ -182,8 +182,8 @@ impl AuditOperation for AgentDeletedAudit {
     fn operation_type(&self) -> String {
         "AGENT_DELETED".to_string()
     }
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
     fn ip_address(&self) -> Option<String> {
         self.context.ip_address.clone()
