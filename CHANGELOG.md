@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-beta.53] - 2026-07-23
+
+### Added
+
+- **error-tracking:** Source context for native stack traces (Go/Rust/all languages) ([#419](https://github.com/gotempsh/temps/issues/419))
+- **web:** Add project onboarding tour
+- **web:** Add subtle "Take a tour" relaunch on project overview
+- **error-tracking:** Default source capture to the Docker build context + configurable root ([#423](https://github.com/gotempsh/temps/issues/423))
+
+### Fixed
+
+- **web:** Ignore spurious empty-string onValueChange from Radix Select ([#424](https://github.com/gotempsh/temps/issues/424))
+- **deployments:** Stop infinite reconnect loop on container logs ([#425](https://github.com/gotempsh/temps/issues/425))
+- **observability:** Read Observe feed through ClickHouse-aware storage backends ([#426](https://github.com/gotempsh/temps/issues/426))
+
+### Miscellaneous
+
+- **templates:** Update observability-starter entry for Cadence demo
+
 ## [0.1.0-beta.52] - 2026-07-22
 
 ### Added
