@@ -2041,6 +2041,73 @@ impl OtelStorage for TimescaleDbStorage {
         Ok(records)
     }
 
+    // ── Cross-project trace refs (ADR-027 Phase 0) ──────────────────────────
+
+    /// Single multi-row `INSERT … ON CONFLICT DO NOTHING` into the
+    /// `cross_project_trace_refs` control table. The `(trace_id, project_id)`
+    /// primary key discards re-recordings cheaply, so `first_seen` (DEFAULT
+    /// NOW()) keeps the earliest observation.
+    async fn record_trace_refs(&self, trace_ids: &[String], project_id: i32) -> StorageResult<u64> {
+        if trace_ids.is_empty() {
+            return Ok(0);
+        }
+
+        // Parameterized multi-row VALUES: ($1, $2), ($3, $4), … where odd
+        // params are trace_id and even are project_id.
+        let mut sql =
+            String::from("INSERT INTO cross_project_trace_refs (trace_id, project_id) VALUES ");
+        let mut param_idx = 1u32;
+        for i in 0..trace_ids.len() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("(${param_idx}, ${})", param_idx + 1));
+            param_idx += 2;
+        }
+        sql.push_str(" ON CONFLICT DO NOTHING");
+
+        let mut values: Vec<sea_orm::Value> = Vec::with_capacity(trace_ids.len() * 2);
+        for tid in trace_ids {
+            values.push(tid.clone().into());
+            values.push(project_id.into());
+        }
+
+        self.db
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                &sql,
+                values,
+            ))
+            .await?;
+
+        Ok(trace_ids.len() as u64)
+    }
+
+    async fn get_trace_ref_projects(
+        &self,
+        trace_id: &str,
+    ) -> StorageResult<Vec<super::TraceRefProject>> {
+        let rows = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT project_id, first_seen FROM cross_project_trace_refs \
+                 WHERE trace_id = $1",
+                [trace_id.into()],
+            ))
+            .await?;
+
+        Ok(rows
+            .iter()
+            .filter_map(|row| {
+                Some(super::TraceRefProject {
+                    project_id: row.try_get("", "project_id").ok()?,
+                    first_seen: row.try_get("", "first_seen").ok()?,
+                })
+            })
+            .collect())
+    }
+
     async fn upsert_insight(&self, insight: &Insight) -> StorageResult<i64> {
         let anomaly_ids_json = serde_json::to_value(&insight.anomaly_ids).unwrap_or_default();
 

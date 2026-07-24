@@ -1041,8 +1041,7 @@ impl From<CrossProjectTraceError> for Problem {
                     .with_title("Invalid Trace ID")
                     .with_detail(detail)
             }
-            CrossProjectTraceError::RecordHint { .. }
-            | CrossProjectTraceError::QuerySiblings { .. }
+            CrossProjectTraceError::QuerySiblings { .. }
             | CrossProjectTraceError::QueryProjects { .. }
             | CrossProjectTraceError::Database(_)
             | CrossProjectTraceError::Storage(_) => {

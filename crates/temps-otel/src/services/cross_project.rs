@@ -4,8 +4,13 @@
 //!
 //! 1. **Hint recording** (Phase 0): after a successful span ingest, the ingest
 //!    path fires a `TraceHintMsg` on a bounded mpsc channel.  A background
-//!    consumer calls `record_hint` to insert `(trace_id, project_id)` rows into
-//!    the `cross_project_trace_refs` control table.
+//!    consumer calls `record_hint` to insert `(trace_id, project_id)` rows via
+//!    `OtelStorage::record_trace_refs` — the Postgres
+//!    `cross_project_trace_refs` control table on the TimescaleDB backend, or
+//!    the compressed ClickHouse table of the same name when ClickHouse is
+//!    enabled (the raw tuples reached 125 GB of uncompressed Postgres heap +
+//!    b-tree in three weeks; ClickHouse stores them at a small fraction of
+//!    that).
 //!
 //! 2. **Discovery and unified waterfall** (Phases 1 & 2): `find_sibling_projects`
 //!    powers the Phase 1 "also in" banner; `get_unified_trace` fans out to each
@@ -35,14 +40,6 @@ pub enum CrossProjectTraceError {
     /// trace_id failed the 32-character lowercase hex format check.
     #[error("Invalid trace_id '{trace_id}': expected exactly 32 lowercase hex characters")]
     InvalidTraceId { trace_id: String },
-
-    /// Database error while recording cross-project hints for a project.
-    #[error("Database error recording cross-project hints for project {project_id}: {source}")]
-    RecordHint {
-        project_id: i32,
-        #[source]
-        source: sea_orm::DbErr,
-    },
 
     /// Database error while querying sibling projects for a trace.
     #[error("Database error querying sibling projects for trace {trace_id}: {source}")]
@@ -192,6 +189,13 @@ pub struct CrossProjectTraceService {
     storage: Arc<dyn OtelStorage>,
 }
 
+/// Project metadata joined onto trace refs from the Postgres `projects` table.
+struct ProjectMeta {
+    name: String,
+    slug: String,
+    sharing: bool,
+}
+
 impl CrossProjectTraceService {
     pub fn new(db: Arc<DatabaseConnection>, storage: Arc<dyn OtelStorage>) -> Self {
         Self { db, storage }
@@ -201,9 +205,11 @@ impl CrossProjectTraceService {
 
     /// Record that `project_id` holds spans for each trace_id in the set.
     ///
-    /// Issues a single multi-row `INSERT … ON CONFLICT DO NOTHING` so
-    /// subsequent batches for the same `(trace_id, project_id)` pair are
-    /// cheaply discarded at the primary-key level.  Empty sets are no-ops.
+    /// Delegates to `OtelStorage::record_trace_refs` so the ref lands on the
+    /// active backend (Postgres control table, or the ClickHouse table when
+    /// ClickHouse is enabled). Both backends give the `(trace_id, project_id)`
+    /// pair first-write-wins semantics, so re-recording is cheap and never
+    /// moves `first_seen`.  Empty sets are no-ops.
     pub async fn record_hint(
         &self,
         trace_ids: HashSet<String>,
@@ -212,41 +218,8 @@ impl CrossProjectTraceService {
         if trace_ids.is_empty() {
             return Ok(());
         }
-
-        // Build a parameterized multi-row INSERT to avoid N individual round-trips.
-        // ($1, $2), ($3, $4), …  where odd params are trace_id and even are project_id.
         let ids_vec: Vec<String> = trace_ids.into_iter().collect();
-
-        let mut sql =
-            String::from("INSERT INTO cross_project_trace_refs (trace_id, project_id) VALUES ");
-        let mut param_idx = 1u32;
-        for (i, _) in ids_vec.iter().enumerate() {
-            if i > 0 {
-                sql.push_str(", ");
-            }
-            sql.push_str(&format!("(${param_idx}, ${})", param_idx + 1));
-            param_idx += 2;
-        }
-        sql.push_str(" ON CONFLICT DO NOTHING");
-
-        let mut values: Vec<sea_orm::Value> = Vec::with_capacity(ids_vec.len() * 2);
-        for tid in &ids_vec {
-            values.push(tid.clone().into());
-            values.push(project_id.into());
-        }
-
-        self.db
-            .execute(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                &sql,
-                values,
-            ))
-            .await
-            .map_err(|e| CrossProjectTraceError::RecordHint {
-                project_id,
-                source: e,
-            })?;
-
+        self.storage.record_trace_refs(&ids_vec, project_id).await?;
         Ok(())
     }
 
@@ -325,39 +298,33 @@ impl CrossProjectTraceService {
         trace_id: &str,
         exclude_project_id: Option<i32>,
     ) -> Result<Vec<SiblingRef>, CrossProjectTraceError> {
-        let rows = self
-            .db
-            .query_all(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                r#"SELECT r.project_id, p.name AS project_name, p.slug AS project_slug, r.first_seen
-                   FROM cross_project_trace_refs r
-                   JOIN projects p ON p.id = r.project_id
-                   WHERE r.trace_id = $1
-                     AND p.cross_project_trace_sharing = TRUE
-                     AND ($2::integer IS NULL OR r.project_id != $2)
-                   ORDER BY r.first_seen ASC"#,
-                [
-                    trace_id.into(),
-                    match exclude_project_id {
-                        Some(id) => sea_orm::Value::Int(Some(id)),
-                        None => sea_orm::Value::Int(None),
-                    },
-                ],
-            ))
-            .await
-            .map_err(|e| CrossProjectTraceError::QuerySiblings {
+        // Refs come from the active storage backend; project metadata always
+        // lives in Postgres, so it is joined in a second, tiny query.
+        let mut refs = self.storage.get_trace_ref_projects(trace_id).await?;
+        refs.sort_by_key(|r| r.first_seen);
+
+        let ids: Vec<i32> = refs.iter().map(|r| r.project_id).collect();
+        let meta = self.load_project_meta(&ids).await.map_err(|e| {
+            CrossProjectTraceError::QuerySiblings {
                 trace_id: trace_id.to_string(),
                 source: e,
-            })?;
+            }
+        })?;
 
-        let siblings = rows
-            .iter()
-            .filter_map(|row| {
+        // Refs whose project no longer exists are dropped (JOIN semantics).
+        let siblings = refs
+            .into_iter()
+            .filter(|r| exclude_project_id != Some(r.project_id))
+            .filter_map(|r| {
+                let m = meta.get(&r.project_id)?;
+                if !m.sharing {
+                    return None;
+                }
                 Some(SiblingRef {
-                    project_id: row.try_get("", "project_id").ok()?,
-                    project_name: row.try_get("", "project_name").ok()?,
-                    project_slug: row.try_get("", "project_slug").ok()?,
-                    first_seen: row.try_get("", "first_seen").ok()?,
+                    project_id: r.project_id,
+                    project_name: m.name.clone(),
+                    project_slug: m.slug.clone(),
+                    first_seen: r.first_seen,
                 })
             })
             .collect();
@@ -376,38 +343,86 @@ impl CrossProjectTraceService {
         &self,
         trace_id: &str,
     ) -> Result<Vec<TraceProjectRef>, CrossProjectTraceError> {
-        let rows = self
-            .db
-            .query_all(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                r#"SELECT r.project_id, p.name AS project_name, p.slug AS project_slug, r.first_seen,
-                          p.cross_project_trace_sharing AS sharing
-                   FROM cross_project_trace_refs r
-                   JOIN projects p ON p.id = r.project_id
-                   WHERE r.trace_id = $1
-                   ORDER BY r.first_seen ASC"#,
-                [trace_id.into()],
-            ))
-            .await
-            .map_err(|e| CrossProjectTraceError::QueryProjects {
+        let mut refs = self.storage.get_trace_ref_projects(trace_id).await?;
+        refs.sort_by_key(|r| r.first_seen);
+
+        let ids: Vec<i32> = refs.iter().map(|r| r.project_id).collect();
+        let meta = self.load_project_meta(&ids).await.map_err(|e| {
+            CrossProjectTraceError::QueryProjects {
                 trace_id: trace_id.to_string(),
                 source: e,
-            })?;
+            }
+        })?;
 
-        let refs = rows
-            .iter()
-            .filter_map(|row| {
+        // Refs whose project no longer exists are dropped (JOIN semantics).
+        let refs = refs
+            .into_iter()
+            .filter_map(|r| {
+                let m = meta.get(&r.project_id)?;
                 Some(TraceProjectRef {
-                    project_id: row.try_get("", "project_id").ok()?,
-                    project_name: row.try_get("", "project_name").ok()?,
-                    project_slug: row.try_get("", "project_slug").ok()?,
-                    first_seen: row.try_get("", "first_seen").ok()?,
-                    sharing: row.try_get("", "sharing").ok()?,
+                    project_id: r.project_id,
+                    project_name: m.name.clone(),
+                    project_slug: m.slug.clone(),
+                    first_seen: r.first_seen,
+                    sharing: m.sharing,
                 })
             })
             .collect();
 
         Ok(refs)
+    }
+
+    /// Fetch name / slug / sharing flag for a set of project ids from the
+    /// Postgres `projects` table. Returns a map keyed by project id; ids with
+    /// no matching project are simply absent.
+    async fn load_project_meta(
+        &self,
+        project_ids: &[i32],
+    ) -> Result<std::collections::HashMap<i32, ProjectMeta>, sea_orm::DbErr> {
+        use std::collections::HashMap;
+        if project_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut sql = String::from(
+            "SELECT id, name, slug, cross_project_trace_sharing FROM projects WHERE id IN (",
+        );
+        for i in 0..project_ids.len() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("${}", i + 1));
+        }
+        sql.push(')');
+
+        let values: Vec<sea_orm::Value> = project_ids.iter().map(|id| (*id).into()).collect();
+        let rows = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                &sql,
+                values,
+            ))
+            .await?;
+
+        let mut map = HashMap::with_capacity(rows.len());
+        for row in &rows {
+            let id: i32 = match row.try_get("", "id") {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            map.insert(
+                id,
+                ProjectMeta {
+                    name: row.try_get("", "name").unwrap_or_default(),
+                    slug: row.try_get("", "slug").unwrap_or_default(),
+                    sharing: row
+                        .try_get("", "cross_project_trace_sharing")
+                        .unwrap_or(false),
+                },
+            );
+        }
+        Ok(map)
     }
 
     // ── Phase 2: unified waterfall assembly ─────────────────────────────────
@@ -558,11 +573,16 @@ impl CrossProjectTraceService {
 
 // ── Prune helper ─────────────────────────────────────────────────────────────
 
-/// Delete `cross_project_trace_refs` rows older than 90 days.
+/// Delete Postgres `cross_project_trace_refs` rows older than 90 days.
 ///
 /// Called by the daily background prune task in `plugin.rs`.  Returns the
 /// number of deleted rows (for logging).  Errors are logged by the caller and
 /// do not affect the prune schedule.
+///
+/// This targets the POSTGRES control table only. When the ClickHouse backend
+/// is active, new refs land in ClickHouse (expired natively by per-row TTL)
+/// and this task's remaining job is draining the legacy Postgres rows written
+/// before the cutover — after one retention window it deletes nothing.
 pub async fn prune_stale_hints(db: &DatabaseConnection) -> Result<u64, sea_orm::DbErr> {
     let result = db
         .execute(Statement::from_string(
@@ -694,6 +714,94 @@ mod tests {
         };
         assert_eq!(msg.project_id, 42);
         assert_eq!(msg.trace_ids.len(), 2);
+    }
+
+    // ── Service paths over MockOtelStorage + MockDatabase ────────────────────
+
+    fn meta_row(
+        id: i32,
+        name: &str,
+        slug: &str,
+        sharing: bool,
+    ) -> std::collections::BTreeMap<String, sea_orm::Value> {
+        [
+            ("id".to_string(), sea_orm::Value::from(id)),
+            ("name".to_string(), sea_orm::Value::from(name)),
+            ("slug".to_string(), sea_orm::Value::from(slug)),
+            (
+                "cross_project_trace_sharing".to_string(),
+                sea_orm::Value::from(sharing),
+            ),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn record_hint_dedupes_pairs_first_write_wins() {
+        use crate::test_support::MockOtelStorage;
+        use sea_orm::MockDatabase;
+
+        let storage = Arc::new(MockOtelStorage::new());
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let svc = CrossProjectTraceService::new(db, storage.clone());
+
+        let tid = "4bf92f3577b34da6a3ce929d0e0e4736".to_string();
+        let mut ids = HashSet::new();
+        ids.insert(tid.clone());
+
+        svc.record_hint(ids.clone(), 7).await.unwrap();
+        let first_seen = storage.trace_refs.lock().unwrap()[&(tid.clone(), 7)];
+        svc.record_hint(ids, 7).await.unwrap();
+
+        let refs = storage.trace_refs.lock().unwrap();
+        assert_eq!(refs.len(), 1, "re-recording must not duplicate the pair");
+        assert_eq!(refs[&(tid, 7)], first_seen, "first_seen must not move");
+    }
+
+    #[tokio::test]
+    async fn discovery_filters_sharing_exclusion_and_deleted_projects() {
+        use crate::test_support::MockOtelStorage;
+        use sea_orm::MockDatabase;
+
+        let storage = Arc::new(MockOtelStorage::new());
+        let tid = "4bf92f3577b34da6a3ce929d0e0e4736".to_string();
+        for project_id in [1, 2, 3, 4] {
+            storage
+                .record_trace_refs(std::slice::from_ref(&tid), project_id)
+                .await
+                .unwrap();
+        }
+
+        // Project meta: 1 shares, 2 opted out, 3 shares (used as `exclude`),
+        // project 4 is absent (deleted) — one result set per service call.
+        let meta = vec![
+            meta_row(1, "alpha", "alpha", true),
+            meta_row(2, "beta", "beta", false),
+            meta_row(3, "gamma", "gamma", true),
+        ];
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![meta.clone(), meta])
+                .into_connection(),
+        );
+        let svc = CrossProjectTraceService::new(db, storage);
+
+        // Siblings: opted-out (2), excluded (3), and deleted (4) all drop out.
+        let siblings = svc.find_sibling_projects(&tid, Some(3)).await.unwrap();
+        assert_eq!(siblings.len(), 1);
+        assert_eq!(siblings[0].project_id, 1);
+        assert_eq!(siblings[0].project_slug, "alpha");
+
+        // find_trace_projects keeps opted-out projects (with their flag) but
+        // still drops deleted ones.
+        let mut all = svc.find_trace_projects(&tid).await.unwrap();
+        all.sort_by_key(|p| p.project_id);
+        assert_eq!(
+            all.iter().map(|p| p.project_id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(!all[1].sharing);
     }
 
     #[test]

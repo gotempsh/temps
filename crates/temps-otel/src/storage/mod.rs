@@ -109,6 +109,23 @@ pub trait OtelStorage: Send + Sync {
     /// Query log records from the fast-query store.
     async fn query_logs(&self, query: LogQuery) -> StorageResult<Vec<LogRecord>>;
 
+    // ── Cross-project trace refs (ADR-027 Phase 0) ──────────────────
+
+    /// Record that `project_id` holds spans for each `trace_id` — the
+    /// reverse index behind cross-project trace discovery. First write
+    /// per `(trace_id, project_id)` pair wins; re-recording an existing
+    /// pair must not move its `first_seen`.
+    ///
+    /// Returns the number of pairs submitted (duplicates included — both
+    /// backends dedupe internally).
+    async fn record_trace_refs(&self, trace_ids: &[String], project_id: i32) -> StorageResult<u64>;
+
+    /// Return every `(project_id, first_seen)` pair recorded for
+    /// `trace_id`, at most one entry per project (earliest `first_seen`
+    /// wins), in no guaranteed order. Project metadata (name, slug,
+    /// sharing flag) is NOT resolved here — callers join it from Postgres.
+    async fn get_trace_ref_projects(&self, trace_id: &str) -> StorageResult<Vec<TraceRefProject>>;
+
     // ── GenAI queries ────────────────────────────────────────────────
 
     /// Query GenAI trace summaries — traces that contain spans with `gen_ai.*` attributes.
@@ -220,6 +237,39 @@ pub trait OtelStorage: Send + Sync {
     ) -> StorageResult<f64>;
 }
 
+/// A `(project_id, first_seen)` pair from the cross-project trace ref index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceRefProject {
+    pub project_id: i32,
+    pub first_seen: chrono::DateTime<chrono::Utc>,
+}
+
+/// Merge trace-ref lookups from two sources into one entry per project,
+/// keeping the earliest `first_seen` when both sources know a project.
+///
+/// Used by the ClickHouse backend to union its native rows with legacy rows
+/// still sitting in the Postgres `cross_project_trace_refs` table, so
+/// enabling ClickHouse needs no data migration: old traces resolve from
+/// Postgres until they age out, new traces resolve from ClickHouse.
+pub fn merge_trace_ref_projects(
+    a: Vec<TraceRefProject>,
+    b: Vec<TraceRefProject>,
+) -> Vec<TraceRefProject> {
+    let mut by_project: std::collections::HashMap<i32, TraceRefProject> =
+        std::collections::HashMap::new();
+    for r in a.into_iter().chain(b) {
+        by_project
+            .entry(r.project_id)
+            .and_modify(|existing| {
+                if r.first_seen < existing.first_seen {
+                    existing.first_seen = r.first_seen;
+                }
+            })
+            .or_insert(r);
+    }
+    by_project.into_values().collect()
+}
+
 /// A baseline data point for anomaly detection.
 #[derive(Debug, Clone)]
 pub struct BaselinePoint {
@@ -246,4 +296,41 @@ pub struct DeployEvent {
     pub environment_id: Option<i32>,
     pub deployed_at: chrono::DateTime<chrono::Utc>,
     pub service_name: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{DateTime, Utc};
+
+    fn r(project_id: i32, secs: i64) -> TraceRefProject {
+        TraceRefProject {
+            project_id,
+            first_seen: DateTime::<Utc>::from_timestamp(secs, 0).unwrap(),
+        }
+    }
+
+    #[test]
+    fn merge_unions_disjoint_projects() {
+        let merged = merge_trace_ref_projects(vec![r(1, 100)], vec![r(2, 200)]);
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn merge_keeps_earliest_first_seen_for_shared_project() {
+        // Same project known to both sources — earliest observation wins,
+        // regardless of which side holds it.
+        let merged = merge_trace_ref_projects(vec![r(1, 300)], vec![r(1, 100)]);
+        assert_eq!(merged, vec![r(1, 100)]);
+
+        let merged = merge_trace_ref_projects(vec![r(1, 100)], vec![r(1, 300)]);
+        assert_eq!(merged, vec![r(1, 100)]);
+    }
+
+    #[test]
+    fn merge_handles_empty_sides() {
+        assert!(merge_trace_ref_projects(vec![], vec![]).is_empty());
+        assert_eq!(merge_trace_ref_projects(vec![r(1, 1)], vec![]).len(), 1);
+        assert_eq!(merge_trace_ref_projects(vec![], vec![r(1, 1)]).len(), 1);
+    }
 }

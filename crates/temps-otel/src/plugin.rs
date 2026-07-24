@@ -474,11 +474,13 @@ impl TempsPlugin for OtelPlugin {
             // ── ADR-027 Phase 0: Cross-project trace hint pipeline ───────────
             //
             // A bounded mpsc channel (capacity 1,000) decouples span ingest
-            // latency from the Postgres hint write.  When the channel is full,
+            // latency from the hint write.  When the channel is full,
             // `do_ingest_traces` drops the hint (non-blocking try_send) and
             // warns.  The background consumer below drains the channel and
-            // calls `record_hint`, which issues a single multi-row
-            // `INSERT … ON CONFLICT DO NOTHING`.
+            // calls `record_hint`, which routes through the active storage
+            // backend: a multi-row `INSERT … ON CONFLICT DO NOTHING` into the
+            // Postgres control table, or a batched insert into the compressed
+            // ClickHouse `cross_project_trace_refs` table when CH is enabled.
             let (trace_hint_tx, mut trace_hint_rx) =
                 tokio::sync::mpsc::channel::<TraceHintMsg>(1000);
 
@@ -624,8 +626,13 @@ impl TempsPlugin for OtelPlugin {
                 });
             }
 
-            // 1d. ADR-027 Phase 0: daily prune of cross_project_trace_refs rows
-            //     older than 90 days (matching the OTel span TTL on both backends).
+            // 1d. ADR-027 Phase 0: daily prune of POSTGRES cross_project_trace_refs
+            //     rows older than 90 days (matching the OTel span TTL on both
+            //     backends). Runs unconditionally: on the TimescaleDB backend it
+            //     is the retention mechanism; on the ClickHouse backend (where
+            //     new refs expire via native per-row TTL) it drains the legacy
+            //     Postgres rows written before the cutover and becomes a no-op
+            //     after one retention window.
             //
             // Deliberately uses a periodic tokio::spawn loop rather than a
             // Job enum variant to keep the scheduler dependency minimal.

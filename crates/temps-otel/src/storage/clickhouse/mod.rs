@@ -50,7 +50,10 @@ use temps_metrics::validate_metric_name;
 
 use crate::error::OtelError;
 use crate::storage::timescaledb::TimescaleDbStorage;
-use crate::storage::{BaselinePoint, DeployEvent, MinuteAggregate, OtelStorage, StorageResult};
+use crate::storage::{
+    merge_trace_ref_projects, BaselinePoint, DeployEvent, MinuteAggregate, OtelStorage,
+    StorageResult, TraceRefProject,
+};
 use crate::types::{
     GenAiEvent, GenAiSpanDetail, GenAiTraceSummary, HealthSummary, HistogramSummary, Insight,
     InsightStatus, LogQuery, LogRecord, MetricAggregation, MetricBucket, MetricPoint, MetricQuery,
@@ -901,6 +904,38 @@ pub(crate) fn ch_query_err(operation: &str, err: ::clickhouse::error::Error) -> 
 }
 
 // ── ClickHouseOtelStorage ────────────────────────────────────────────────────
+
+// ── Cross-project trace ref row ─────────────────────────────────────────────
+
+/// ClickHouse row matching the `cross_project_trace_refs` DDL in
+/// `0006_trace_refs.sql`. Field order must match the DDL column order
+/// exactly (positional binary serialization — same rule as [`ChSpanRow`]).
+#[derive(::clickhouse::Row, Serialize, Deserialize, Debug, Clone)]
+pub struct ChTraceRefRow {
+    /// trace_id  String
+    pub trace_id: String,
+    /// project_id  Int32
+    pub project_id: i32,
+    /// first_seen  DateTime64(3, 'UTC') — stored as Unix milliseconds
+    pub first_seen: i64,
+    /// retention_days  UInt16 — stamped from the same resolver value as span
+    /// rows so refs expire on exactly the trace retention horizon.
+    pub retention_days: u16,
+    /// _version  UInt64 — INVERTED first_seen (see [`trace_ref_version`]).
+    pub _version: u64,
+}
+
+/// Dedup version for a trace-ref row: `u64::MAX - first_seen_ms`.
+///
+/// The Postgres table's `ON CONFLICT DO NOTHING` gave `(trace_id, project_id)`
+/// pairs first-write-wins semantics — `first_seen` means "earliest
+/// observation". `ReplacingMergeTree` keeps the HIGHEST version, so the
+/// version is inverted: the earliest observation gets the highest version and
+/// survives merges, preserving those semantics (including against backfilled
+/// historical rows, which are older and therefore always win).
+pub fn trace_ref_version(first_seen_ms: i64) -> u64 {
+    u64::MAX - first_seen_ms.max(0) as u64
+}
 
 /// ClickHouse-backed OTel storage.
 ///
@@ -2492,6 +2527,98 @@ impl OtelStorage for ClickHouseOtelStorage {
         self.inner.query_logs(query).await
     }
 
+    // ── Cross-project trace refs — native ClickHouse (ADR-027) ──────────────
+
+    /// Insert `(trace_id, project_id)` pairs into the ClickHouse
+    /// `cross_project_trace_refs` table. `ReplacingMergeTree` with the
+    /// inverted `_version` dedupes re-recordings while keeping the earliest
+    /// `first_seen` — the CH equivalent of the Postgres table's
+    /// `ON CONFLICT DO NOTHING`.
+    async fn record_trace_refs(&self, trace_ids: &[String], project_id: i32) -> StorageResult<u64> {
+        if trace_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let first_seen_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let retention_days = self
+            .resolver
+            .resolve(project_id, temps_core::RetentionTable::Spans);
+
+        let mut inserter = self
+            .ch
+            .insert::<ChTraceRefRow>("cross_project_trace_refs")
+            .await
+            .map_err(|e| OtelError::Storage {
+                message: format!("ClickHouse cross_project_trace_refs inserter setup failed: {e}"),
+            })?;
+        for trace_id in trace_ids {
+            inserter
+                .write(&ChTraceRefRow {
+                    trace_id: trace_id.clone(),
+                    project_id,
+                    first_seen: first_seen_ms,
+                    retention_days,
+                    _version: trace_ref_version(first_seen_ms),
+                })
+                .await
+                .map_err(|e| OtelError::Storage {
+                    message: format!("ClickHouse cross_project_trace_refs write failed: {e}"),
+                })?;
+        }
+        inserter.end().await.map_err(|e| OtelError::Storage {
+            message: format!("ClickHouse cross_project_trace_refs insert failed: {e}"),
+        })?;
+
+        Ok(trace_ids.len() as u64)
+    }
+
+    /// Union of the native ClickHouse rows and any legacy rows still in the
+    /// Postgres `cross_project_trace_refs` table (earliest `first_seen` wins
+    /// per project). The union makes enabling ClickHouse migration-free:
+    /// pre-cutover traces resolve from Postgres until they age out (or are
+    /// copied over via `temps backfill clickhouse --domain trace-refs`).
+    async fn get_trace_ref_projects(&self, trace_id: &str) -> StorageResult<Vec<TraceRefProject>> {
+        #[derive(::clickhouse::Row, Deserialize)]
+        struct RefRow {
+            project_id: i32,
+            first_seen_ms: i64,
+        }
+
+        // min(first_seen) at query time keeps the earliest observation even
+        // before ReplacingMergeTree merges collapse duplicate pairs.
+        let ch_rows = self
+            .ch
+            .query(
+                "SELECT project_id, \
+                        toInt64(toUnixTimestamp64Milli(min(first_seen))) AS first_seen_ms \
+                 FROM cross_project_trace_refs \
+                 WHERE trace_id = ? \
+                 GROUP BY project_id",
+            )
+            .bind(trace_id)
+            .fetch_all::<RefRow>()
+            .await
+            .map_err(|e| OtelError::Storage {
+                message: format!("ClickHouse cross_project_trace_refs query failed: {e}"),
+            })?;
+
+        let ch_refs: Vec<TraceRefProject> = ch_rows
+            .into_iter()
+            .map(|r| TraceRefProject {
+                project_id: r.project_id,
+                first_seen: chrono::DateTime::from_timestamp_millis(r.first_seen_ms)
+                    .unwrap_or_default(),
+            })
+            .collect();
+
+        let pg_refs = self.inner.get_trace_ref_projects(trace_id).await?;
+
+        Ok(merge_trace_ref_projects(ch_refs, pg_refs))
+    }
+
     // ── Control-row methods — always Postgres (insights, health, quota) ──────
 
     async fn upsert_insight(&self, insight: &Insight) -> StorageResult<i64> {
@@ -2714,6 +2841,17 @@ mod tests {
     use crate::types::{ResourceInfo, SpanKind, SpanRecord, SpanStatusCode};
     use chrono::Utc;
     use std::collections::BTreeMap;
+
+    /// The inverted version must give the EARLIEST observation the HIGHEST
+    /// version, so ReplacingMergeTree merges keep first-write-wins semantics.
+    #[test]
+    fn trace_ref_version_is_first_wins() {
+        let earlier = trace_ref_version(1_000);
+        let later = trace_ref_version(2_000);
+        assert!(earlier > later);
+        // Negative (pre-epoch) timestamps clamp to 0 rather than wrapping.
+        assert_eq!(trace_ref_version(-5), u64::MAX);
+    }
 
     fn make_span() -> SpanRecord {
         SpanRecord {
