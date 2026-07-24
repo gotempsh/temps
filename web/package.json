@@ -86,7 +86,7 @@
     "recharts": "3.9.2",
     "rehype-highlight": "^7.0.2",
     "remark-gfm": "^4.0.1",
-    "rrweb-player": "^2.1.0",
+    "rrweb-player": "^2.1.1",
     "slugify": "^1.6.9",
     "sonner": "^2.0.7",
     "tailwind-merge": "^3.6.0",
