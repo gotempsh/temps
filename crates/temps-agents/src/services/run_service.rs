@@ -109,11 +109,13 @@ impl AgentRunService {
         user_context: Option<String>,
         ai_provider: Option<String>,
         run_config: Option<serde_json::Value>,
+        triggered_by_user_id: Option<i32>,
     ) -> Result<agent_runs::Model, AgentError> {
         let active = agent_runs::ActiveModel {
             project_id: Set(project_id),
             config_id: Set(None),
             agent_id: Set(None),
+            triggered_by_user_id: Set(triggered_by_user_id),
             trigger_type: Set("autofixer".to_string()),
             trigger_source_type: Set(Some("error_group".to_string())),
             trigger_source_id: Set(Some(error_group_id)),
@@ -640,6 +642,7 @@ mod tests {
             prompt_text: None,
             workspace_volume: None,
             run_config: None,
+            triggered_by_user_id: None,
         }
     }
 

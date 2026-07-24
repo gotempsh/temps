@@ -545,6 +545,10 @@ impl TempsPlugin for AgentsPlugin {
             context.register_service(sandbox_provider.clone());
 
             let sandbox_registry = Arc::new(SandboxRegistry::new(sandbox_provider));
+            // Registered so the temps-sandbox plugin can inject its managed
+            // run-sandbox service (agent runs then get first-class
+            // `sandboxes` rows in the standalone sandbox API).
+            context.register_service(sandbox_registry.clone());
 
             let config_service = Arc::new(AgentConfigService::new(
                 db.clone(),

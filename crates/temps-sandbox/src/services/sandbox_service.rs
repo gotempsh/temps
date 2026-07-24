@@ -127,6 +127,9 @@ pub struct SandboxSummary {
     pub backend: Option<String>,
     /// Configured root disk size in MB (from metadata). `None` = default.
     pub disk_size_mb: Option<u64>,
+    /// Set when this sandbox executes an agent run (autofixer / workflow
+    /// agent). `None` for sandboxes created via the standalone API.
+    pub agent_run_id: Option<i32>,
 }
 
 impl From<&sandboxes::Model> for SandboxSummary {
@@ -147,6 +150,7 @@ impl From<&sandboxes::Model> for SandboxSummary {
                 .as_ref()
                 .and_then(|v| v.get("disk_size_mb"))
                 .and_then(|v| v.as_u64()),
+            agent_run_id: m.agent_run_id,
         }
     }
 }
@@ -252,7 +256,7 @@ impl SandboxService {
             .ok_or_else(|| SandboxError::NotFound {
                 sandbox_id: public_id_value.to_string(),
             })?;
-        if row.user_id != user_id {
+        if row.user_id != Some(user_id) {
             // Don't leak existence to non-owners.
             return Err(SandboxError::NotFound {
                 sandbox_id: public_id_value.to_string(),
@@ -284,6 +288,165 @@ impl SandboxService {
         let rows = paginator.fetch_page(page - 1).await?;
         let items = rows.iter().map(SandboxSummary::from).collect();
         Ok((items, total))
+    }
+
+    // ── Agent-run sandboxes ──────────────────────────────────────────────
+
+    /// Create a sandbox for an agent run (autofixer / workflow agent) as a
+    /// first-class `sandboxes` row, then create the container through the
+    /// shared provider. Called by the agents' `SandboxRegistry` via the
+    /// `RunSandboxService` seam (see `temps_agents::sandbox::managed`).
+    ///
+    /// Unlike standalone sandboxes, the container keeps the historical
+    /// `temps-sandbox-<run_id>` naming (no `container_name_override`) so
+    /// run recovery after a server restart keeps working, and the handle is
+    /// keyed by `run_id` in the agents' registry — NOT by this row's `id`.
+    /// The row is bookkeeping + API visibility; the agent run owns the
+    /// lifecycle (the expiration sweeper skips rows with `agent_run_id`).
+    pub async fn create_for_agent_run(
+        &self,
+        config: SandboxCreateConfig,
+    ) -> Result<temps_agents::sandbox::SandboxHandle, SandboxError> {
+        let run_id = config.run_id;
+
+        // A run can recreate its sandbox after a dead container — retire
+        // any previous non-destroyed row for the same run first so the API
+        // never shows two "running" sandboxes for one run.
+        let stale = sandboxes::Entity::find()
+            .filter(sandboxes::Column::AgentRunId.eq(run_id))
+            .filter(sandboxes::Column::Status.ne("destroyed"))
+            .all(self.db.as_ref())
+            .await?;
+        for row in stale {
+            self.mark_destroyed(row.id).await.ok();
+            self.record_event(
+                row.id,
+                "destroyed",
+                Some(serde_json::json!({ "reason": "superseded by new container for agent run" })),
+            )
+            .await;
+        }
+
+        let public_id_value = public_id::generate();
+        let now = Utc::now();
+        let timeout = config
+            .idle_timeout
+            .as_secs()
+            .clamp(MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS);
+        let active = sandboxes::ActiveModel {
+            public_id: Set(public_id_value.clone()),
+            user_id: Set(config.owner_user_id),
+            agent_run_id: Set(Some(run_id)),
+            name: Set(format!("temps-sandbox-{}", run_id)),
+            status: Set("running".to_string()),
+            image: Set(config.image.clone()),
+            work_dir: Set(temps_agents::sandbox::SANDBOX_WORK_DIR.to_string()),
+            timeout_secs: Set(timeout as i32),
+            metadata: Set(Some(serde_json::json!({ "source": "agent_run" }))),
+            created_at: Set(now),
+            last_activity_at: Set(now),
+            expires_at: Set(now + chrono::Duration::seconds(timeout as i64)),
+            ..Default::default()
+        };
+        let row = active.insert(self.db.as_ref()).await?;
+
+        let handle = match self.registry.provider_arc().create(config).await {
+            Ok(h) => h,
+            Err(e) => {
+                // Roll the row over to destroyed so the API doesn't show a
+                // zombie "running" sandbox for a container that never started.
+                self.mark_destroyed(row.id).await.ok();
+                return Err(SandboxError::CreateFailed {
+                    user_id: 0,
+                    reason: format!("agent run {}: {}", run_id, e),
+                });
+            }
+        };
+
+        if let Err(e) = self
+            .record_backend(
+                row.id,
+                handle.backend,
+                (!handle.image.is_empty()).then(|| handle.image.clone()),
+            )
+            .await
+        {
+            tracing::warn!(
+                "failed to record backend/image for agent-run sandbox {} (run {}): {}",
+                public_id_value,
+                run_id,
+                e
+            );
+        }
+
+        self.record_event(
+            row.id,
+            "created",
+            Some(serde_json::json!({
+                "agent_run_id": run_id,
+                "backend": handle.backend.to_string(),
+                "image": handle.image,
+            })),
+        )
+        .await;
+
+        tracing::info!(
+            "Created agent-run sandbox {} (internal {}) for run {}",
+            public_id_value,
+            row.id,
+            run_id
+        );
+
+        Ok(handle)
+    }
+
+    /// Destroy the container backing an agent run's sandbox and mark its
+    /// row(s) destroyed. `handle` is the agents' registry cached handle
+    /// when available; otherwise the container is recovered by run id.
+    pub async fn release_for_agent_run(
+        &self,
+        run_id: i32,
+        handle: Option<&temps_agents::sandbox::SandboxHandle>,
+    ) -> Result<(), SandboxError> {
+        let provider = self.registry.provider_arc();
+        let resolved = match handle {
+            Some(h) => Some(h.clone()),
+            None => provider.recover(run_id).await.unwrap_or_else(|e| {
+                tracing::warn!(
+                    "release_for_agent_run: recover for run {} failed: {}",
+                    run_id,
+                    e
+                );
+                None
+            }),
+        };
+        if let Some(h) = resolved {
+            // Agent runs are ephemeral — purge the home volume too.
+            if let Err(e) = provider.destroy(&h, true).await {
+                tracing::warn!(
+                    "Failed to destroy agent-run sandbox {} for run {}: {}",
+                    h.sandbox_name,
+                    run_id,
+                    e
+                );
+            }
+        }
+
+        let rows = sandboxes::Entity::find()
+            .filter(sandboxes::Column::AgentRunId.eq(run_id))
+            .filter(sandboxes::Column::Status.ne("destroyed"))
+            .all(self.db.as_ref())
+            .await?;
+        for row in rows {
+            self.mark_destroyed(row.id).await?;
+            self.record_event(
+                row.id,
+                "destroyed",
+                Some(serde_json::json!({ "agent_run_id": run_id })),
+            )
+            .await;
+        }
+        Ok(())
     }
 
     // ── Lifecycle ────────────────────────────────────────────────────────
@@ -368,7 +531,7 @@ impl SandboxService {
         };
         let active = sandboxes::ActiveModel {
             public_id: Set(public_id_value.clone()),
-            user_id: Set(user_id),
+            user_id: Set(Some(user_id)),
             name: Set(name.clone()),
             status: Set("running".to_string()),
             image: Set(req.image.clone()),
@@ -405,6 +568,7 @@ impl SandboxService {
             .to_string();
 
         let config = SandboxCreateConfig {
+            owner_user_id: None,
             run_id: row.id,
             container_name_override: Some(container_label.clone()),
             host_work_dir,
@@ -1315,7 +1479,8 @@ mod tests {
         let m = sandboxes::Model {
             id: 1_000_042,
             public_id: "sbx_abc1234567890def".into(),
-            user_id: 7,
+            user_id: Some(7),
+            agent_run_id: Some(42),
             name: "my-sbx".into(),
             status: "running".into(),
             image: Some("node:20".into()),
@@ -1333,5 +1498,6 @@ mod tests {
         assert_eq!(s.public_id, "sbx_abc1234567890def");
         assert_eq!(s.status, "running");
         assert_eq!(s.image.as_deref(), Some("node:20"));
+        assert_eq!(s.agent_run_id, Some(42));
     }
 }

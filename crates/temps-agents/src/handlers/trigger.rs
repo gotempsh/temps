@@ -783,6 +783,7 @@ pub async fn smoke_test_agent(
         let image = format!("temps-sandbox-{}:latest", global_sandbox.runtime);
         let sandbox_config = crate::sandbox::SandboxCreateConfig {
             run_id: test_run_id,
+            owner_user_id: Some(auth.user_id()),
             container_name_override: None,
             host_work_dir: work_dir.clone(),
             workspace_volume: None,

@@ -511,6 +511,10 @@ pub struct SandboxInner {
     pub preview_url_template: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preview_password_hint: Option<String>,
+    /// Agent run this sandbox executes (autofixer / workflow agent).
+    /// `None` for sandboxes created via this API.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_run_id: Option<i32>,
 }
 
 /// `@vercel/sandbox` wraps every single-sandbox response as
@@ -568,6 +572,7 @@ impl SandboxResponse {
                 disk_size_mb: s.disk_size_mb,
                 preview_url_template: template,
                 preview_password_hint: s.preview_password_hint,
+                agent_run_id: s.agent_run_id,
             },
             routes,
         }
@@ -2478,6 +2483,7 @@ mod tests {
             ports: vec![],
             backend: None,
             disk_size_mb: None,
+            agent_run_id: None,
         };
         let r = SandboxResponse::from(summary);
         assert_eq!(r.sandbox.id, "sbx_abc");
@@ -2504,6 +2510,7 @@ mod tests {
             ports: vec![3000, 5173],
             backend: None,
             disk_size_mb: None,
+            agent_run_id: None,
         };
         let parts = PreviewUrlParts {
             protocol: "https".into(),

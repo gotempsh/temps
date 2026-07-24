@@ -143,6 +143,27 @@ impl TempsPlugin for SandboxPlugin {
             };
             let db = context.require_service::<sea_orm::DatabaseConnection>();
 
+            // Inject this plugin's service into the agents' sandbox registry
+            // so agent runs (autofixer, workflow agents) create first-class
+            // `sandboxes` rows instead of untracked containers.
+            match (
+                context.get_service::<temps_agents::services::sandbox_registry::SandboxRegistry>(),
+                context.get_service::<SandboxService>(),
+            ) {
+                (Some(agent_registry), Some(service)) => {
+                    agent_registry.set_managed(Arc::new(
+                        crate::services::agent_run_bridge::AgentRunSandboxBridge::new(service),
+                    ));
+                    info!("Sandbox plugin: agent-run sandboxes now tracked in the sandbox API");
+                }
+                _ => {
+                    debug!(
+                        "Sandbox plugin: agents registry or sandbox service absent — \
+                         agent runs keep using the raw provider"
+                    );
+                }
+            }
+
             match sandboxes::Entity::find()
                 .filter(sandboxes::Column::Status.eq("running"))
                 .all(db.as_ref())
@@ -151,6 +172,10 @@ impl TempsPlugin for SandboxPlugin {
                 Ok(rows) => {
                     let entries: Vec<(i32, String)> = rows
                         .iter()
+                        // Agent-run sandboxes use `temps-sandbox-<run_id>`
+                        // container names and are recovered by the agents'
+                        // own registry — skip them here.
+                        .filter(|r| r.agent_run_id.is_none())
                         .map(|r| {
                             let label = r
                                 .public_id

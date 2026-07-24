@@ -365,6 +365,7 @@ pub async fn start_analysis(
             request.user_context,
             requested_provider,
             run_config,
+            Some(auth.user_id()),
         )
         .await
         .map_err(Problem::from)?;
@@ -947,6 +948,7 @@ mod tests {
             prompt_text: None,
             workspace_volume: None,
             run_config: None,
+            triggered_by_user_id: None,
         }
     }
 
