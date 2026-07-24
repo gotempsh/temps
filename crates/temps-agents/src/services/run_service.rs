@@ -97,11 +97,18 @@ impl AgentRunService {
     }
 
     /// Create a run record specifically for the autofixer (no agent_id, trigger_type="autofixer").
+    ///
+    /// `ai_provider` is the resolved provider id the run will execute with
+    /// (e.g. "claude_cli"); `run_config` is the user-chosen per-run options
+    /// JSON (provider, model, max_turns, branch) persisted so the retry
+    /// dialog can prefill exactly what this run used.
     pub async fn create_autofixer_run(
         &self,
         project_id: i32,
         error_group_id: i32,
         user_context: Option<String>,
+        ai_provider: Option<String>,
+        run_config: Option<serde_json::Value>,
     ) -> Result<agent_runs::Model, AgentError> {
         let active = agent_runs::ActiveModel {
             project_id: Set(project_id),
@@ -113,6 +120,8 @@ impl AgentRunService {
             status: Set("pending".to_string()),
             phase: Set(Some("analyzing".to_string())),
             user_context: Set(user_context),
+            ai_provider: Set(ai_provider),
+            run_config: Set(run_config),
             source: Set("committed".to_string()),
             tokens_input: Set(0),
             tokens_output: Set(0),
@@ -630,6 +639,7 @@ mod tests {
 
             prompt_text: None,
             workspace_volume: None,
+            run_config: None,
         }
     }
 

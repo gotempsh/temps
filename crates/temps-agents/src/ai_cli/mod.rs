@@ -74,6 +74,35 @@ pub trait AiCliProvider: Send + Sync {
     async fn continue_conversation(&self, config: AiRunConfig) -> Result<AiRunResult, AgentError>;
 }
 
+/// Parse raw CLI output into the common parsed shape for any provider.
+/// Codex/OpenCode don't report session ids or max-turn errors, so those
+/// fields come back as `None`/`false` for them.
+pub fn parse_output(provider: &str, output: &str) -> claude::ParsedClaudeOutput {
+    match provider {
+        "codex_cli" => {
+            let (tokens_input, tokens_output, model) = codex::parse_codex_output(output);
+            claude::ParsedClaudeOutput {
+                tokens_input,
+                tokens_output,
+                model,
+                session_id: None,
+                is_max_turns_error: false,
+            }
+        }
+        "opencode" => {
+            let (tokens_input, tokens_output, model) = opencode::parse_opencode_output(output);
+            claude::ParsedClaudeOutput {
+                tokens_input,
+                tokens_output,
+                model,
+                session_id: None,
+                is_max_turns_error: false,
+            }
+        }
+        _ => claude::parse_claude_output(output),
+    }
+}
+
 /// Create an AI CLI provider by name
 pub fn create_provider(name: &str) -> Option<Box<dyn AiCliProvider>> {
     match name {

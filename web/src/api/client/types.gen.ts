@@ -396,6 +396,7 @@ export type AgentRunResponse = {
      * run. `None` for pre-migration rows.
      */
     prompt_text?: string | null;
+    run_config?: null | AutofixRunConfig;
     /**
      * Legacy field — all runs now execute in a sandbox. Kept for
      * backwards-compatible JSON shape; always `true`.
@@ -1311,9 +1312,41 @@ export type AutoWatchParams = {
     direction?: Direction;
 };
 
+/**
+ * User-chosen per-run options, persisted as JSON in `agent_runs.run_config`.
+ * Every field is optional — unset fields fall back to the provider defaults
+ * in settings, then to built-in defaults.
+ */
+export type AutofixRunConfig = {
+    /**
+     * Branch to clone instead of the project's main branch.
+     */
+    branch?: string | null;
+    /**
+     * Per-run turn cap applied to every phase of this run. Only enforced
+     * for CLIs with a turn flag (Claude Code); Codex/OpenCode run to
+     * completion. `None` uses the provider's per-phase defaults.
+     */
+    max_turns?: number | null;
+    /**
+     * Model id for the chosen provider. `None` uses the provider's saved
+     * default model, or the CLI's own default.
+     */
+    model?: string | null;
+    /**
+     * AI provider id ("claude_cli", "codex_cli", "opencode"). `None` uses
+     * the platform default provider from agent sandbox settings.
+     */
+    provider?: string | null;
+};
+
 export type AutofixerRunResponse = {
     ai_model?: string | null;
     ai_output?: string | null;
+    /**
+     * AI provider slug this run executes with (e.g. claude_cli, codex_cli).
+     */
+    ai_provider?: string | null;
     analysis?: string | null;
     branch_name?: string | null;
     completed_at?: string | null;
@@ -1325,6 +1358,7 @@ export type AutofixerRunResponse = {
     pr_number?: number | null;
     pr_url?: string | null;
     project_id: number;
+    run_config?: null | AutofixRunConfig;
     started_at?: string | null;
     status: string;
     tokens_input: number;
@@ -11579,6 +11613,11 @@ export type ProjectResponse = {
      * Temps stores uploaded source files and shows source code in stack traces.
      */
     error_source_context_enabled: boolean;
+    /**
+     * Where auto-capture reads source from (relative to the checkout). Null =
+     * the deployment's Docker build context.
+     */
+    error_source_root?: string | null;
     git_provider_connection_id?: number | null;
     /**
      * Git clone URL for the repository (used for public repos without a provider connection)
@@ -11861,12 +11900,33 @@ export type ProviderCatalogDto = {
     id: string;
     install_command: string;
     /**
+     * Default max turns for the autofixer analysis phase. `None` = built-in
+     * default (10). Only enforced for CLIs with a turn flag (Claude Code).
+     */
+    max_turns_analysis?: number | null;
+    /**
+     * Default max turns for autofixer feedback rounds. `None` = built-in
+     * default (10).
+     */
+    max_turns_feedback?: number | null;
+    /**
+     * Default max turns for the autofixer fix phase. `None` = built-in
+     * default (20).
+     */
+    max_turns_fix?: number | null;
+    /**
      * Model ids this provider accepts, in display order. The first entry is
      * the recommended default. Empty when the provider doesn't expose model
      * selection (e.g. OpenCode), which the UI uses to hide the dropdown.
      */
     models: Array<string>;
     name: string;
+    /**
+     * True when this provider's CLI supports enforcing a turn cap. False
+     * for Codex/OpenCode, which run to completion — the UI labels their
+     * max-turns inputs accordingly.
+     */
+    supports_max_turns: boolean;
 };
 
 export type ProviderCatalogResponse = {
@@ -15133,7 +15193,31 @@ export type StaleSlot = {
 };
 
 export type StartAnalysisRequest = {
+    /**
+     * Branch to clone instead of the project's main branch.
+     */
+    branch?: string | null;
     error_group_id: number;
+    /**
+     * Per-run turn cap applied to every phase (1–200). Only enforced for
+     * CLIs with a turn flag (Claude Code). `None` uses the provider's
+     * configured defaults.
+     */
+    max_turns?: number | null;
+    /**
+     * Model id for the chosen provider. `None` uses the provider's saved
+     * default model.
+     */
+    model?: string | null;
+    /**
+     * AI provider id ("claude_cli", "codex_cli", "opencode"). `None` uses
+     * the platform default provider.
+     */
+    provider?: string | null;
+    /**
+     * Free-text notes for the model (extra context about the error, retry
+     * guidance, constraints). Included verbatim in the analysis prompt.
+     */
     user_context?: string | null;
 };
 
@@ -16072,10 +16156,30 @@ export type UpdateAiProviderRequest = {
      * value so the CLI falls back to its own default.
      */
     default_model?: string | null;
+    /**
+     * Default max turns for the autofixer analysis phase (1–200). `0`
+     * clears the stored value (built-in default applies); omitted/`None`
+     * leaves the current value unchanged — so a PATCH that only updates
+     * `default_model` doesn't wipe the turn settings.
+     */
+    max_turns_analysis?: number | null;
+    /**
+     * Default max turns for autofixer feedback rounds (1–200). `0` clears;
+     * omitted leaves unchanged.
+     */
+    max_turns_feedback?: number | null;
+    /**
+     * Default max turns for the autofixer fix phase (1–200). `0` clears;
+     * omitted leaves unchanged.
+     */
+    max_turns_fix?: number | null;
 };
 
 export type UpdateAiProviderResponse = {
     default_model?: string | null;
+    max_turns_analysis?: number | null;
+    max_turns_feedback?: number | null;
+    max_turns_fix?: number | null;
     provider_id: string;
 };
 
@@ -16619,6 +16723,12 @@ export type UpdateProjectSettingsRequest = {
      * source code shown in stack traces).
      */
     error_source_context_enabled?: boolean | null;
+    /**
+     * Set the auto-capture source root (relative to the checkout). Send an
+     * empty string to clear it back to the build-context default. Omit to
+     * leave unchanged.
+     */
+    error_source_root?: string | null;
     git_provider_connection_id?: number | null;
     main_branch?: string | null;
     preset?: string | null;

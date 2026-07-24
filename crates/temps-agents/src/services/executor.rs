@@ -4016,6 +4016,7 @@ mod tests {
 
             prompt_text: None,
             workspace_volume: None,
+            run_config: None,
         }
     }
 

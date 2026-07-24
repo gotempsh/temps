@@ -1777,6 +1777,9 @@ mod tests {
                         credentials_encrypted: Some("super-secret-blob".into()),
                         default_model: Some("sonnet".into()),
                         extra: serde_json::Value::Null,
+                        max_turns_analysis: None,
+                        max_turns_fix: None,
+                        max_turns_feedback: None,
                     },
                 )]
                 .into_iter()
@@ -1826,6 +1829,9 @@ mod tests {
                 credentials_encrypted: Some("super-secret-blob".into()),
                 default_model: None,
                 extra: serde_json::Value::Null,
+                max_turns_analysis: None,
+                max_turns_fix: None,
+                max_turns_feedback: None,
             },
         );
         settings.agent_sandbox.api_key_encrypted = Some("legacy-secret".into());

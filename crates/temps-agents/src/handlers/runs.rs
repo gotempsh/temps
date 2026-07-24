@@ -79,6 +79,10 @@ pub struct AgentRunResponse {
     /// Autofixer phase: "analyzing", "analyzed", "fixing", "fix_ready", "no_fix",
     /// "pr_created", or NULL for non-autofixer runs.
     pub phase: Option<String>,
+    /// Per-run AI options the user chose when starting an autofixer run
+    /// (provider, model, max_turns, branch). NULL for generic agent runs
+    /// and historical rows. Used to prefill the retry dialog.
+    pub run_config: Option<crate::services::autofixer::AutofixRunConfig>,
 }
 
 impl AgentRunResponse {
@@ -112,6 +116,9 @@ impl AgentRunResponse {
             ai_reasoning: model.ai_reasoning,
             ai_model: model.ai_model,
             ai_provider: model.ai_provider,
+            run_config: model
+                .run_config
+                .and_then(|v| serde_json::from_value(v).ok()),
             tokens_input: model.tokens_input,
             tokens_output: model.tokens_output,
             estimated_cost_cents: model.estimated_cost_cents,

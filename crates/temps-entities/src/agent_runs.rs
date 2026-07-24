@@ -66,6 +66,12 @@ pub struct Model {
     /// thing that removes these automatically. Nullable for historical
     /// rows and for runs that failed before volume creation.
     pub workspace_volume: Option<String>,
+    /// Per-run AI configuration chosen by the user when starting the run
+    /// (autofixer only): provider, model, max_turns, branch. Kept as JSON so
+    /// the retry dialog can prefill exactly what the run executed with.
+    /// Null for historical rows and generic agent runs.
+    #[sea_orm(column_type = "JsonBinary", nullable)]
+    pub run_config: Option<Json>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

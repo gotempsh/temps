@@ -154,6 +154,7 @@ use crate::services::secret_service::SecretService;
         autofixer::AutofixerRunResponse,
         autofixer::AutofixerRunWithLogsResponse,
         autofixer::CreatePrResponse,
+        crate::services::autofixer::AutofixRunConfig,
 
         // Preview gateway
         preview_gateway::LogsQuery,

@@ -266,6 +266,20 @@ pub struct ProviderConfig {
     /// settings). Intentionally untyped so new providers don't require
     /// schema changes.
     pub extra: serde_json::Value,
+    /// Default max agent turns for the autofixer *analysis* phase when this
+    /// provider runs it. `None` = built-in default (10). Only enforced for
+    /// CLIs that support a turn cap (Claude Code's `--max-turns`); Codex and
+    /// OpenCode run to completion regardless.
+    #[serde(default)]
+    pub max_turns_analysis: Option<i32>,
+    /// Default max agent turns for the autofixer *fix* phase.
+    /// `None` = built-in default (20).
+    #[serde(default)]
+    pub max_turns_fix: Option<i32>,
+    /// Default max agent turns for autofixer *feedback/re-analyze* rounds.
+    /// `None` = built-in default (10).
+    #[serde(default)]
+    pub max_turns_feedback: Option<i32>,
 }
 
 /// Global agent sandbox settings. Controls whether agent runs are isolated
@@ -402,6 +416,9 @@ impl AgentSandboxSettings {
                 credentials_encrypted: self.api_key_encrypted.clone(),
                 default_model: None,
                 extra: serde_json::Value::Null,
+                max_turns_analysis: None,
+                max_turns_fix: None,
+                max_turns_feedback: None,
             };
         }
         ProviderConfig::default()
