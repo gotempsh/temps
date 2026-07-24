@@ -157,11 +157,24 @@ impl AutofixerService {
             .await
             .map_err(AgentError::Database)?;
 
-        Ok(record
-            .as_ref()
-            .and_then(|r| r.data.get("agent_sandbox"))
-            .and_then(|v| serde_json::from_value::<AgentSandboxSettings>(v.clone()).ok())
-            .unwrap_or_default())
+        let Some(value) = record.as_ref().and_then(|r| r.data.get("agent_sandbox")) else {
+            // No settings row / key yet — expected on a fresh install.
+            return Ok(AgentSandboxSettings::default());
+        };
+        match serde_json::from_value::<AgentSandboxSettings>(value.clone()) {
+            Ok(settings) => Ok(settings),
+            Err(e) => {
+                // A corrupt blob would silently ignore the admin's configured
+                // provider + turn caps; log it so the drift is observable
+                // instead of falling back invisibly.
+                tracing::warn!(
+                    "Autofixer: agent_sandbox settings failed to deserialize ({}); \
+                     using defaults (configured provider/turn caps ignored)",
+                    e
+                );
+                Ok(AgentSandboxSettings::default())
+            }
+        }
     }
 
     /// Resolve the execution config for a run: per-run `run_config` overrides
@@ -170,11 +183,22 @@ impl AutofixerService {
         &self,
         run: &temps_entities::agent_runs::Model,
     ) -> Result<ResolvedAutofixConfig, AgentError> {
-        let run_config: AutofixRunConfig = run
-            .run_config
-            .clone()
-            .and_then(|v| serde_json::from_value(v).ok())
-            .unwrap_or_default();
+        let run_config: AutofixRunConfig = match run.run_config.clone() {
+            Some(v) => serde_json::from_value(v.clone()).unwrap_or_else(|e| {
+                // A stored config that won't parse means the retry dialog would
+                // silently drop the user's choices — surface it instead of
+                // vanishing. Fall back to defaults so the run can still proceed.
+                tracing::warn!(
+                    "Autofixer run {}: stored run_config failed to deserialize ({}); \
+                     falling back to defaults. Raw: {}",
+                    run.id,
+                    e,
+                    v
+                );
+                AutofixRunConfig::default()
+            }),
+            None => AutofixRunConfig::default(),
+        };
         let sandbox = self.load_sandbox_settings().await?;
         Ok(ResolvedAutofixConfig::resolve(&run_config, &sandbox))
     }
@@ -182,21 +206,32 @@ impl AutofixerService {
     /// Write the prompt to the sandbox temp file OpenCode's shell wrapper
     /// reads (`build_claude_cmd` emits `$(cat /tmp/.temps-prompt)` because
     /// OpenCode lstats long positional args as paths and fails on NAME_MAX).
-    async fn stage_opencode_prompt(&self, run_id: i32, provider: &str, prompt: &str) {
+    ///
+    /// Fails the run on a write error rather than proceeding: if the file is
+    /// missing, `$(cat /tmp/.temps-prompt)` expands to empty and OpenCode runs
+    /// against a blank message — a silent degradation the self-hosted user has
+    /// no way to diagnose. A no-op for other providers.
+    async fn stage_opencode_prompt(
+        &self,
+        run_id: i32,
+        provider: &str,
+        prompt: &str,
+    ) -> Result<(), AgentError> {
         if provider != "opencode" {
-            return;
+            return Ok(());
         }
-        if let Err(e) = self
-            .sandbox_registry
+        self.sandbox_registry
             .write_file(run_id, "/tmp/.temps-prompt", prompt.as_bytes(), 0o644)
             .await
-        {
-            tracing::warn!(
-                "Autofixer run {}: failed to write opencode prompt file: {}",
-                run_id,
-                e
-            );
-        }
+            .map_err(|e| AgentError::AiCliFailed {
+                provider: "opencode".to_string(),
+                exit_code: -1,
+                stderr: format!(
+                    "Failed to stage the prompt file for OpenCode (run {}): {}. \
+                     The run was aborted to avoid executing against an empty prompt.",
+                    run_id, e
+                ),
+            })
     }
 
     // ── Phase 1: Analysis ──────────────────────────────────────────────────────
@@ -398,7 +433,7 @@ impl AutofixerService {
 
         // Run the AI CLI inside the sandbox
         self.stage_opencode_prompt(run_id, &cfg.provider, &prompt)
-            .await;
+            .await?;
         let cmd = build_claude_cmd(
             &cfg.provider,
             &prompt,
@@ -631,7 +666,7 @@ impl AutofixerService {
         // For Claude, --continue keeps the full analysis context from the
         // same session; other providers get the self-contained prompt above.
         self.stage_opencode_prompt(run_id, &cfg.provider, &prompt)
-            .await;
+            .await?;
         let cmd = build_claude_cmd(
             &cfg.provider,
             &prompt,
@@ -1171,7 +1206,7 @@ impl AutofixerService {
 
         // For Claude, --continue resumes the same conversation in the sandbox
         self.stage_opencode_prompt(run_id, &cfg.provider, &prompt)
-            .await;
+            .await?;
         let cmd = build_claude_cmd(
             &cfg.provider,
             &prompt,
@@ -1532,22 +1567,31 @@ fn scrub_and_bound(s: &str) -> String {
     let mut out = String::with_capacity(bounded.len());
     let mut rest = bounded.as_str();
     const PREFIXES: &[&str] = &["sk-ant-", "sk-", "Bearer ", "ghp_", "gho_", "glpat-"];
-    'outer: while !rest.is_empty() {
-        for p in PREFIXES {
-            if let Some(idx) = rest.find(p) {
+    while !rest.is_empty() {
+        // Redact the EARLIEST secret in `rest` across all prefixes, not the
+        // first prefix that matches anywhere — otherwise a token whose prefix
+        // sits later in the list but earlier in the string would be emitted
+        // verbatim before the "matched" one.
+        let earliest = PREFIXES
+            .iter()
+            .filter_map(|p| rest.find(p).map(|idx| (idx, p.len())))
+            .min_by_key(|(idx, _)| *idx);
+        match earliest {
+            Some((idx, plen)) => {
                 out.push_str(&rest[..idx]);
                 out.push_str("[redacted]");
                 // Skip the prefix and the following token body (non-space run).
-                let after = &rest[idx + p.len()..];
+                let after = &rest[idx + plen..];
                 let body_end = after
                     .find(|c: char| c.is_whitespace())
                     .unwrap_or(after.len());
                 rest = &after[body_end..];
-                continue 'outer;
+            }
+            None => {
+                out.push_str(rest);
+                break;
             }
         }
-        out.push_str(rest);
-        break;
     }
     out
 }
@@ -1792,6 +1836,17 @@ mod tests {
             scrub_and_bound("plain error message"),
             "plain error message"
         );
+    }
+
+    #[test]
+    fn test_scrub_and_bound_redacts_earliest_secret_first() {
+        // `Bearer ` appears before `sk-ant-` in the string but later in the
+        // prefix list — the earlier one must still be redacted, not emitted
+        // verbatim before the "matched" one.
+        let out = scrub_and_bound("Bearer abc123 then sk-ant-xyz789 end");
+        assert!(!out.contains("abc123"), "leaked Bearer token: {}", out);
+        assert!(!out.contains("xyz789"), "leaked sk-ant token: {}", out);
+        assert_eq!(out, "[redacted] then [redacted] end");
     }
 
     #[test]
