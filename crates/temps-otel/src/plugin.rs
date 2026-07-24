@@ -433,8 +433,11 @@ impl TempsPlugin for OtelPlugin {
             };
             context.register_service(storage.clone());
 
-            // Create auth service
+            // Create auth service. Also registered in the context so
+            // `configure_routes` can inject the ADR-028 ProjectAccessChecker
+            // (registered by a later plugin) into the `tk_`-key ingest path.
             let auth_service = Arc::new(OtelAuthService::new(db.clone()));
+            context.register_service(auth_service.clone());
 
             // Create rate limiter
             let rate_limiter = Arc::new(RateLimiter::new(
@@ -732,6 +735,14 @@ impl TempsPlugin for OtelPlugin {
         let mut app_state: OtelAppState = app_state_arc.as_ref().clone();
         app_state.project_access_checker =
             context.get_service::<dyn temps_core::ProjectAccessChecker>();
+
+        // Same checker feeds the `tk_`-key ingest auth path, so team-based
+        // project access is enforced on writes exactly as on reads.
+        if let Some(checker) = app_state.project_access_checker.clone() {
+            context
+                .require_service::<OtelAuthService>()
+                .set_project_access_checker(checker);
+        }
 
         let router = handlers::configure_routes().with_state(app_state);
 
