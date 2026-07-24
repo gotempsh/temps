@@ -531,20 +531,36 @@ pub async fn update_ai_provider(
     }
 
     // Normalize the incoming model: empty string → None (clear the field).
-    // Also validate against the catalog when the provider has a non-empty
-    // model list — for free-form providers (OpenCode) we accept anything
-    // the user types, since the catalog doesn't enumerate their models.
-    let new_model = match request.default_model.as_deref() {
+    // The catalog `models` list is a convenience, not an allowlist — CLIs
+    // (especially free-form ones like OpenCode) evolve faster than this
+    // table, so we accept unknown ids. But the stored value is read back at
+    // run time and, for OpenCode, interpolated into a `bash -lc` string, so
+    // we reject shell metacharacters and cap length here to close the stored
+    // command-injection vector. Real model ids use only [A-Za-z0-9._/-:].
+    let new_model = match request.default_model.as_deref().map(str::trim) {
         None | Some("") => None,
         Some(m) => {
-            if !provider.models.is_empty() && !provider.models.contains(&m) {
-                // Allow unknown models too — the catalog `models` list is a
-                // convenience, not an allowlist. CLIs evolve faster than
-                // this table. We just trim + pass through.
-                Some(m.trim().to_string())
-            } else {
-                Some(m.trim().to_string())
+            if m.len() > 128 {
+                return Err(Problem::from(AgentError::Validation {
+                    message: format!(
+                        "model id is too long ({} chars, max 128) for provider '{}'",
+                        m.len(),
+                        provider_id
+                    ),
+                }));
             }
+            if !m
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-' | ':'))
+            {
+                return Err(Problem::from(AgentError::Validation {
+                    message: format!(
+                        "model id '{}' for provider '{}' contains invalid characters (allowed: letters, digits, . _ / - :)",
+                        m, provider_id
+                    ),
+                }));
+            }
+            Some(m.to_string())
         }
     };
 

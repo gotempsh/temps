@@ -3527,7 +3527,14 @@ pub fn build_claude_cmd(
             let mut parts = vec!["opencode run".to_string()];
             if let Some(m) = model {
                 if !m.is_empty() {
-                    parts.push(format!("--model '{}'", m));
+                    // This is the ONLY provider that interpolates the model
+                    // into a shell string (`bash -lc`); claude/codex pass it
+                    // as a discrete argv element. A single-quoted shell word
+                    // has no escape sequence for `'`, so close/literal/reopen
+                    // (`'\''`) — same guard used for env-secret values — or a
+                    // model name containing a quote is a shell-injection hole.
+                    let escaped = m.replace('\'', "'\\''");
+                    parts.push(format!("--model '{}'", escaped));
                 }
             }
             parts.push("--format json".to_string());
@@ -3716,6 +3723,37 @@ mod tests {
         let branch_name = format!("autopilot/fix/err-42-{}", short_run_id);
         assert!(branch_name.contains("ff"));
         assert!(branch_name.contains("err-42"));
+    }
+
+    #[test]
+    fn test_build_claude_cmd_claude_passes_model_as_argv() {
+        let cmd = build_claude_cmd("claude_cli", "hi", 10, false, Some("sonnet"));
+        // Model is a discrete argv element after --model; no shell involved.
+        let i = cmd
+            .iter()
+            .position(|a| a == "--model")
+            .expect("--model present");
+        assert_eq!(cmd[i + 1], "sonnet");
+    }
+
+    #[test]
+    fn test_build_claude_cmd_opencode_escapes_single_quotes() {
+        // A model string trying to break out of the single-quoted shell word
+        // must be neutralized via the '\'' close/literal/reopen sequence.
+        let malicious = "'; touch /tmp/pwned; '";
+        let cmd = build_claude_cmd("opencode", "prompt", 10, false, Some(malicious));
+        // The command is `bash -lc <script>`; inspect the script.
+        assert_eq!(cmd[0], "bash");
+        assert_eq!(cmd[1], "-lc");
+        let script = &cmd[2];
+        // The raw injection payload must NOT appear as an un-quoted token.
+        // After escaping, every literal quote becomes '\'' so the payload
+        // stays inside the --model single-quoted word.
+        assert!(
+            script.contains(r#"--model ''\''; touch /tmp/pwned; '\'''"#),
+            "opencode model not escaped: {}",
+            script
+        );
     }
 
     // ---- Fakes ----

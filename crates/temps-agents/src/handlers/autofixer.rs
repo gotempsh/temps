@@ -312,6 +312,34 @@ pub async fn start_analysis(
             }));
         }
     }
+    // Defense-in-depth: the model id reaches the CLI command builder, and for
+    // the opencode provider it is interpolated into a `bash -lc` string. The
+    // builder escapes it, but we also reject shell metacharacters and cap the
+    // length here so a hostile value can never reach a shell in any provider
+    // path (present or future). Real model ids are short and use only
+    // [A-Za-z0-9._/-].
+    if let Some(model) = request.model.as_deref().filter(|m| !m.is_empty()) {
+        if model.len() > 128 {
+            return Err(Problem::from(AgentError::Validation {
+                message: format!(
+                    "model id is too long ({} chars, max 128) for project {}",
+                    model.len(),
+                    project_id
+                ),
+            }));
+        }
+        if !model
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-' | ':'))
+        {
+            return Err(Problem::from(AgentError::Validation {
+                message: format!(
+                    "model id '{}' contains invalid characters (allowed: letters, digits, . _ / - :) for project {}",
+                    model, project_id
+                ),
+            }));
+        }
+    }
 
     let requested_provider = request.provider.clone().filter(|p| !p.is_empty());
     let has_overrides = requested_provider.is_some()
