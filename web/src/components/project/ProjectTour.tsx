@@ -1,7 +1,13 @@
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 import { Sparkles, X } from 'lucide-react'
-import { type CSSProperties, useCallback, useEffect, useState } from 'react'
+import {
+  type CSSProperties,
+  useCallback,
+  useEffect,
+  useState,
+  useSyncExternalStore,
+} from 'react'
 import { createPortal } from 'react-dom'
 import { useNavigate, useParams } from 'react-router-dom'
 
@@ -16,6 +22,29 @@ import { useNavigate, useParams } from 'react-router-dom'
 
 const SEEN_KEY = 'temps.project-tour.v1'
 export const PROJECT_TOUR_EVENT = 'temps:project-tour'
+
+// Shared active-state so pages the tour visits (analytics, errors) can skip
+// their own "no data yet, redirect to setup" logic while the tour is
+// showing them off — otherwise the tour lands on a page that immediately
+// navigates itself away to a /setup route the tour never asked for.
+let tourActive = false
+const tourActiveListeners = new Set<() => void>()
+function setTourActive(value: boolean) {
+  tourActive = value
+  for (const listener of tourActiveListeners) listener()
+}
+export function isProjectTourActive() {
+  return tourActive
+}
+export function useProjectTourActive() {
+  return useSyncExternalStore(
+    (listener) => {
+      tourActiveListeners.add(listener)
+      return () => tourActiveListeners.delete(listener)
+    },
+    () => tourActive
+  )
+}
 
 interface TourStep {
   route: string
@@ -76,10 +105,12 @@ export function ProjectTour() {
   const start = useCallback(() => {
     setIdx(0)
     setActive(true)
+    setTourActive(true)
   }, [])
 
   const finish = useCallback(() => {
     setActive(false)
+    setTourActive(false)
     try {
       window.localStorage.setItem(SEEN_KEY, '1')
     } catch {
