@@ -37,6 +37,9 @@ export function AutofixButton({ projectId, projectSlug, errorGroupId }: AutofixB
   })
 
   const latestRun = runWithLogs?.run
+  const errorMessage = latestRun?.error_message || 'Something went wrong'
+  const errorSummary =
+    errorMessage.length > 160 ? errorMessage.slice(0, 160) + '…' : errorMessage
   const goToAutofix = () => navigate(`/projects/${projectSlug}/errors/${errorGroupId}/autofix`)
 
   const phase = latestRun?.phase || latestRun?.status
@@ -75,7 +78,7 @@ export function AutofixButton({ projectId, projectSlug, errorGroupId }: AutofixB
               {latestRun && latestRun.status === 'failed' && 'Autofix failed'}
               {latestRun && latestRun.status === 'cancelled' && 'Autofix cancelled'}
             </p>
-            <p className="text-xs text-muted-foreground">
+            <p className="text-xs text-muted-foreground line-clamp-2 break-words">
               {!latestRun && 'Let AI analyze and fix this error automatically'}
               {latestRun && phase === 'analyzing' && 'Claude is reading your codebase and tracing the error'}
               {latestRun && phase === 'analyzed' && 'Root cause identified — click to review the analysis'}
@@ -83,7 +86,11 @@ export function AutofixButton({ projectId, projectSlug, errorGroupId }: AutofixB
               {latestRun && phase === 'fix_ready' && 'Code changes are ready for review'}
               {latestRun && phase === 'completed' && latestRun.pr_url && `PR #${latestRun.pr_number} created`}
               {latestRun && phase === 'completed' && !latestRun.pr_url && 'Completed'}
-              {latestRun && latestRun.status === 'failed' && (latestRun.error_message || 'Something went wrong')}
+              {latestRun && latestRun.status === 'failed' && (
+                <span title={errorMessage.length > 160 ? errorMessage : undefined}>
+                  {errorSummary}
+                </span>
+              )}
               {latestRun && latestRun.status === 'cancelled' && 'Cancelled by user'}
             </p>
           </div>

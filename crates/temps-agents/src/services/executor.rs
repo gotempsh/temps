@@ -2280,7 +2280,10 @@ impl AgentExecutor {
                 return Err(AgentError::AiCliFailed {
                     provider: config.ai_provider.clone(),
                     exit_code: exec_result.exit_code,
-                    stderr: exec_result.stdout,
+                    stderr: crate::ai_cli::summarize_cli_failure(
+                        &config.ai_provider,
+                        &exec_result.stdout,
+                    ),
                 });
             }
 

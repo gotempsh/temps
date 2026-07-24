@@ -1499,9 +1499,30 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
       {run.error_message && (
         <Alert variant="destructive">
           <AlertTriangle className="h-4 w-4" />
-          <AlertTitle>Error</AlertTitle>
-          <AlertDescription className="whitespace-pre-wrap font-mono text-xs">
-            {run.error_message}
+          <AlertTitle className="flex items-center justify-between gap-2">
+            Error
+            {run.error_message.length > 1200 && (
+              <Dialog>
+                <DialogTrigger asChild>
+                  <Button variant="outline" size="sm">
+                    View full
+                  </Button>
+                </DialogTrigger>
+                <DialogContent className="max-w-3xl">
+                  <DialogHeader>
+                    <DialogTitle>Full error message</DialogTitle>
+                  </DialogHeader>
+                  <pre className="text-xs bg-muted/40 border border-border rounded p-3 overflow-auto max-h-[70vh] whitespace-pre-wrap break-words">
+                    {run.error_message}
+                  </pre>
+                </DialogContent>
+              </Dialog>
+            )}
+          </AlertTitle>
+          <AlertDescription className="whitespace-pre-wrap font-mono text-xs max-h-48 overflow-y-auto break-words">
+            {run.error_message.length > 1200
+              ? run.error_message.slice(0, 1200) + '\n\n… (truncated)'
+              : run.error_message}
           </AlertDescription>
         </Alert>
       )}
