@@ -120,17 +120,16 @@
     "typescript-eslint": "^8.63.0"
   },
   "overrides": {
-    "brace-expansion": "^2.1.2",
+    "brace-expansion": "^5.0.8",
     "d3-color": "^3.1.0",
+    "defu": "^6.1.5",
     "flatted": "^3.4.2",
     "handlebars": "^4.7.9",
     "js-yaml": "^4.3.0",
-    "picomatch": "^2.3.2",
-    "minimatch": "^9.0.7",
-    "tar": "^7.5.7",
     "lodash": "^4.17.24",
-    "defu": "^6.1.5",
-    "brace-expansion": "^2.1.2",
-    "js-yaml": "^4.3.0"
+    "minimatch": "^10.2.5",
+    "picomatch": "^2.3.2",
+    "postcss": "^8.5.18",
+    "tar": "^7.5.7"
   }
 }
