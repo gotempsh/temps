@@ -14,8 +14,15 @@ import {
 export interface AutofixOnboardingTarget {
   projectId?: number
   projectSlug?: string
-  /** `project.git_provider_connection_id != null`. */
-  projectGitConnected?: boolean
+  /**
+   * The project's git state. A repo linked by public URL has `hasRepo` true
+   * but `connected` false — readable, but autofix can't open a PR with it.
+   */
+  projectGit?: {
+    connected: boolean
+    hasRepo: boolean
+    label?: string
+  }
 }
 
 interface AutofixOnboardingValue {

@@ -303,7 +303,14 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
           projectId={project.id}
           projectSlug={project.slug}
           errorGroupId={parseInt(errorGroupId!)}
-          gitConnected={!!project.git_provider_connection_id}
+          git={{
+            connected: !!project.git_provider_connection_id,
+            hasRepo: !!project.repo_owner && !!project.repo_name,
+            label:
+              project.repo_owner && project.repo_name
+                ? `${project.repo_owner}/${project.repo_name}`
+                : undefined,
+          }}
         />
       </div>
 

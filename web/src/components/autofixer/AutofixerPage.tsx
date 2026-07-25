@@ -33,10 +33,21 @@ function formatTimeAgo(dateStr: string): string {
 export function AutofixerPage({ project }: AutofixerPageProps) {
   const navigate = useNavigate()
   const { openOnboarding } = useAutofixOnboarding()
+  // A public URL-only repo has `hasRepo` but not `connected`: autofix can read
+  // it yet can't push a branch or open a PR, so readiness reports it as unmet
+  // with wording that names the real problem.
+  const git = {
+    connected: !!project.git_provider_connection_id,
+    hasRepo: !!project.repo_owner && !!project.repo_name,
+    label:
+      project.repo_owner && project.repo_name
+        ? `${project.repo_owner}/${project.repo_name}`
+        : undefined,
+  }
   const readiness = useAutofixReadiness({
     projectId: project.id,
     projectSlug: project.slug,
-    projectGitConnected: !!project.git_provider_connection_id,
+    projectGit: git,
   })
 
   // Fetch unresolved error groups to show fixable errors
@@ -93,7 +104,7 @@ export function AutofixerPage({ project }: AutofixerPageProps) {
                 openOnboarding({
                   projectId: project.id,
                   projectSlug: project.slug,
-                  projectGitConnected: !!project.git_provider_connection_id,
+                  projectGit: git,
                 })
               }
             >
@@ -117,7 +128,10 @@ export function AutofixerPage({ project }: AutofixerPageProps) {
         </Card>
       )}
 
-      {project.git_provider_connection_id && groups.length > 0 && (
+      {/* The error list is shown regardless of setup state — the card above
+          explains what's missing. Hiding the errors as well left the page
+          looking empty and gave no hint that autofix applies to them. */}
+      {groups.length > 0 && (
         <Card>
           <div className="overflow-x-auto">
             <Table>

@@ -14,6 +14,11 @@ export interface AutofixReadinessStep {
   title: string
   /** Shown while the step is incomplete — what the user needs to do. */
   description: string
+  /**
+   * Compact noun phrase naming what's missing, for one-line surfaces that
+   * can't fit `description` — reads as "Autofix needs {summary} …".
+   */
+  summary: string
   done: boolean
   /** Label for the resolve-this-step button. */
   ctaLabel: string
@@ -47,8 +52,24 @@ export interface AutofixReadiness {
 export function useAutofixReadiness(opts?: {
   projectId?: number
   projectSlug?: string
-  /** `project.git_provider_connection_id != null`. Omit for global callers. */
-  projectGitConnected?: boolean
+  /**
+   * The project's git state. Omit entirely for global callers (the git step is
+   * then dropped from the list).
+   *
+   * A project can be linked to a **public** repository by URL alone, which
+   * stores `repo_owner`/`repo_name` but leaves `git_provider_connection_id`
+   * NULL (see `isPublicRepo` in GitSettings). That's read-only: autofix can't
+   * push a branch or open a pull request with it, so it still counts as unmet
+   * — but the wording has to say so rather than claim no repo is connected.
+   */
+  projectGit?: {
+    /** `git_provider_connection_id != null` — authenticated, can push. */
+    connected: boolean
+    /** A repo is linked at all, even if only by public URL. */
+    hasRepo: boolean
+    /** `owner/name`, used to name the repo in the read-only message. */
+    label?: string
+  }
   /** Skip the network calls entirely (e.g. dialog closed). */
   enabled?: boolean
 }): AutofixReadiness {
@@ -78,6 +99,7 @@ export function useAutofixReadiness(opts?: {
       title: 'Connect an AI provider',
       description:
         'Save a credential for Claude or another provider so the agent can run.',
+      summary: 'an AI provider credential',
       done: providerConfigured,
       ctaLabel: 'Configure provider',
       to: '/agent-sandbox/providers',
@@ -87,6 +109,7 @@ export function useAutofixReadiness(opts?: {
       title: 'Prepare the sandbox',
       description:
         'Autofix runs inside an isolated container. Docker must be available and the agent image built.',
+      summary: 'a working sandbox',
       done: sandboxReady,
       ctaLabel: 'Open sandbox settings',
       to: '/agent-sandbox/sandbox',
@@ -94,16 +117,28 @@ export function useAutofixReadiness(opts?: {
   ]
 
   // Git only matters for a concrete project (that's where the PR is opened).
-  if (opts?.projectGitConnected !== undefined) {
+  if (opts?.projectGit) {
+    const { connected, hasRepo, label } = opts.projectGit
+    // A public URL-only link reads fine but can't push, so distinguish it from
+    // "nothing connected" — otherwise the dialog tells you to connect a repo
+    // while the settings page plainly shows one connected with a Public badge.
+    const readOnly = !connected && hasRepo
     steps.push({
       key: 'git',
-      title: 'Connect the repository',
-      description:
-        'Link a git provider with write access so autofix can open a pull request.',
-      done: opts.projectGitConnected,
-      ctaLabel: 'Connect repository',
+      title: readOnly
+        ? 'Authorize write access to the repository'
+        : 'Connect the repository',
+      description: readOnly
+        ? `${label ?? 'This repository'} is linked by public URL, which is read-only. Autofix pushes a branch and opens a pull request, so it needs a git provider connection with write access.`
+        : 'Link a git provider with write access so autofix can open a pull request.',
+      summary: readOnly
+        ? 'write access to the repository'
+        : 'a connected repository',
+      done: connected,
+      ctaLabel: readOnly ? 'Authorize access' : 'Connect repository',
       // Drops the user straight into the repo picker rather than the git
-      // settings overview, so connecting is one click from onboarding.
+      // settings overview, so connecting is one click from onboarding. The
+      // same page is where a public URL is swapped for a provider connection.
       to: opts.projectSlug
         ? `/projects/${opts.projectSlug}/git/change-repository`
         : '/settings/git-providers',

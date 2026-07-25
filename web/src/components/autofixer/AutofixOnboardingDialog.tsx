@@ -32,7 +32,7 @@ export function AutofixOnboardingDialog() {
   const readiness = useAutofixReadiness({
     projectId: target?.projectId,
     projectSlug: target?.projectSlug,
-    projectGitConnected: target?.projectGitConnected,
+    projectGit: target?.projectGit,
     enabled: isOpen,
   })
 

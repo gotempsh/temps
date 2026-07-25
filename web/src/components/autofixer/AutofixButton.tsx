@@ -14,18 +14,19 @@ interface AutofixButtonProps {
   projectSlug: string
   errorGroupId: number
   /**
-   * `project.git_provider_connection_id != null`. Passed in so the card can
-   * onboard the user when the repo isn't linked yet, instead of the caller
-   * hiding autofix entirely (which made the feature undiscoverable).
+   * The project's git state. Passed in so the card can onboard the user when
+   * the repo isn't usable yet, instead of the caller hiding autofix entirely
+   * (which made the feature undiscoverable). `connected` is false for a repo
+   * linked by public URL — readable, but autofix can't open a PR with it.
    */
-  gitConnected: boolean
+  git: { connected: boolean; hasRepo: boolean; label?: string }
 }
 
 export function AutofixButton({
   projectId,
   projectSlug,
   errorGroupId,
-  gitConnected,
+  git,
 }: AutofixButtonProps) {
   const navigate = useNavigate()
   const { openOnboarding } = useAutofixOnboarding()
@@ -33,7 +34,7 @@ export function AutofixButton({
   const readiness = useAutofixReadiness({
     projectId,
     projectSlug,
-    projectGitConnected: gitConnected,
+    projectGit: git,
   })
 
   const { data: latestAgentRun } = useQuery({
@@ -60,7 +61,7 @@ export function AutofixButton({
     openOnboarding({
       projectId,
       projectSlug,
-      projectGitConnected: gitConnected,
+      projectGit: git,
     })
 
   const latestRun = runWithLogs?.run
@@ -89,7 +90,7 @@ export function AutofixButton({
               <p className="text-sm font-medium">Fix this error with AI</p>
               <p className="text-xs text-muted-foreground">
                 {readiness.firstIncomplete
-                  ? `${readiness.firstIncomplete.title} to let AI find the root cause and open a pull request.`
+                  ? `Autofix needs ${readiness.firstIncomplete.summary} before it can find the root cause and open a pull request.`
                   : 'Let AI find the root cause and open a pull request.'}
               </p>
             </div>
