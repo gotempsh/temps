@@ -11,6 +11,7 @@ import {
 } from '@/api/client'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { CreateActionButton } from '@/components/ui/create-action-button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import {
   Dialog,
@@ -49,18 +50,10 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { formatDistanceToNow } from 'date-fns'
-import {
-  EllipsisVertical,
-  Loader2,
-  Mail,
-  Plus,
-  Send,
-  Server,
-} from 'lucide-react'
+import { EllipsisVertical, Loader2, Mail, Send, Server } from 'lucide-react'
 import { AWSIcon } from '@/components/icons/AWSIcon'
 import { ScalewayIcon } from '@/components/icons/ScalewayIcon'
 import { useEffect, useState } from 'react'
-import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
 import { useForm } from 'react-hook-form'
 import { useNavigate } from 'react-router-dom'
 import { toast } from 'sonner'
@@ -957,7 +950,6 @@ export function EditProviderDialog({
 }
 
 export function EmailProvidersManagement() {
-  const navigate = useNavigate()
   const [isTestDialogOpen, setIsTestDialogOpen] = useState(false)
   const [testingProviderId, setTestingProviderId] = useState<number | null>(
     null
@@ -967,13 +959,6 @@ export function EmailProvidersManagement() {
     null
   )
   const queryClient = useQueryClient()
-
-  // Keyboard shortcut: N to add a new provider (disabled while a dialog is open)
-  useKeyboardShortcut({
-    key: 'n',
-    path: '/email/providers/new',
-    enabled: !isEditDialogOpen && !isTestDialogOpen,
-  })
 
   const { data: providers, isLoading } = useQuery({
     queryKey: ['email-providers'],
@@ -1021,10 +1006,11 @@ export function EmailProvidersManagement() {
         </div>
 
         {hasProviders && (
-          <Button onClick={() => navigate('/email/providers/new')}>
-            <Plus className="h-4 w-4 mr-2" />
-            Add Provider
-          </Button>
+          <CreateActionButton
+            to="/email/providers/new"
+            label="Add Provider"
+            disabled={isEditDialogOpen || isTestDialogOpen}
+          />
         )}
       </div>
 
@@ -1036,10 +1022,10 @@ export function EmailProvidersManagement() {
           title="No email providers configured"
           description="Add your first email provider to start sending transactional emails from your applications."
           action={
-            <Button onClick={() => navigate('/email/providers/new')}>
-              <Plus className="h-4 w-4 mr-2" />
-              Add Provider
-            </Button>
+            <CreateActionButton
+              to="/email/providers/new"
+              label="Add Provider"
+            />
           }
         />
       ) : (
