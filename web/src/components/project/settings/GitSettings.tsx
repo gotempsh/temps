@@ -59,7 +59,6 @@ interface GitSettingsProps {
   refetch: () => void
 }
 
-
 function GitSettingsInline({ project, refetch }: GitSettingsProps) {
   const updateGitSettings = useMutation({
     ...updateGitSettingsMutation(),
@@ -78,13 +77,17 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
 
   const { data: connectionsData } = useQuery({ ...listConnectionsOptions() })
   const currentConnection = connectionsData?.connections?.find(
-    (c) => c.id === project?.git_provider_connection_id,
+    (c) => c.id === project?.git_provider_connection_id
   )
   const currentProvider = providers.find(
-    (p) => p.id === currentConnection?.provider_id,
+    (p) => p.id === currentConnection?.provider_id
   )
 
-  const { data: branchesData, isLoading: isLoadingBranches, refetch: refetchBranches } = useQuery({
+  const {
+    data: branchesData,
+    isLoading: isLoadingBranches,
+    refetch: refetchBranches,
+  } = useQuery({
     queryKey: [
       'repository-branches',
       project?.repo_owner,
@@ -92,8 +95,18 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
       project?.git_provider_connection_id,
     ],
     queryFn: async () => {
-      if (!project?.repo_owner || !project?.repo_name || !project?.git_provider_connection_id) {
-        return { branches: [] as Array<{ name: string; commit_sha: string; protected: boolean }> }
+      if (
+        !project?.repo_owner ||
+        !project?.repo_name ||
+        !project?.git_provider_connection_id
+      ) {
+        return {
+          branches: [] as Array<{
+            name: string
+            commit_sha: string
+            protected: boolean
+          }>,
+        }
       }
       const response = await getRepositoryBranches({
         path: { owner: project.repo_owner, repo: project.repo_name },
@@ -102,10 +115,15 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
       return response.data || { branches: [] }
     },
     enabled:
-      !!project?.repo_owner && !!project?.repo_name && !!project?.git_provider_connection_id,
+      !!project?.repo_owner &&
+      !!project?.repo_name &&
+      !!project?.git_provider_connection_id,
   })
-  const branches: Array<{ name: string; commit_sha: string; protected: boolean }> =
-    (branchesData?.branches as any) || []
+  const branches: Array<{
+    name: string
+    commit_sha: string
+    protected: boolean
+  }> = (branchesData?.branches as any) || []
 
   // Repository metadata (description, language, pushed_at, default_branch, clone urls)
   const { data: repositoryData } = useQuery({
@@ -130,12 +148,15 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
       })
       return (
         response.data?.repositories?.find(
-          (r: any) => r.owner === project.repo_owner && r.name === project.repo_name,
+          (r: any) =>
+            r.owner === project.repo_owner && r.name === project.repo_name
         ) || null
       )
     },
     enabled:
-      !!project?.repo_owner && !!project?.repo_name && !!project?.git_provider_connection_id,
+      !!project?.repo_owner &&
+      !!project?.repo_name &&
+      !!project?.git_provider_connection_id,
   })
 
   // Preset detection — authenticated repos
@@ -172,21 +193,25 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
   }, [publicPresetQuery.data])
   const effectivePresetData = presetQuery.data || publicPresetData
   const effectivePresetLoading =
-    presetQuery.isLoading || publicPresetQuery.isLoading || publicPresetQuery.isFetching
+    presetQuery.isLoading ||
+    publicPresetQuery.isLoading ||
+    publicPresetQuery.isFetching
 
   // ---------------- Save helpers ----------------
   // The API expects a full update; build it from current project state plus overrides.
-  const saveGitField = async (overrides: Partial<{
-    main_branch: string
-    preset: string
-    directory: string
-    preset_config: any
-    repo_owner: string
-    repo_name: string
-    git_url: string
-    is_public_repo: boolean
-    git_provider_connection_id: number | null
-  }>) => {
+  const saveGitField = async (
+    overrides: Partial<{
+      main_branch: string
+      preset: string
+      directory: string
+      preset_config: any
+      repo_owner: string
+      repo_name: string
+      git_url: string
+      is_public_repo: boolean
+      git_provider_connection_id: number | null
+    }>
+  ) => {
     const presetCfg: any = (project?.preset_config as any) || {}
     const body: Record<string, unknown> = {
       main_branch: overrides.main_branch ?? project.main_branch,
@@ -205,7 +230,9 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
       body.git_provider_connection_id = null
     } else {
       body.git_provider_connection_id =
-        overrides.git_provider_connection_id ?? project.git_provider_connection_id ?? null
+        overrides.git_provider_connection_id ??
+        project.git_provider_connection_id ??
+        null
     }
     await updateGitSettings.mutateAsync({
       body: body as any,
@@ -215,27 +242,45 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
   }
 
   // ---------------- Inline editors ----------------
-  const [editing, setEditing] = useState<null | 'branch' | 'framework' | 'directory' | 'dockerfile' | 'composePath' | 'composeOverride'>(null)
+  const [editing, setEditing] = useState<
+    | null
+    | 'branch'
+    | 'framework'
+    | 'directory'
+    | 'dockerfile'
+    | 'composePath'
+    | 'composeOverride'
+  >(null)
   const close = () => setEditing(null)
 
   // Branch editor
   const [branchDraft, setBranchDraft] = useState('')
-  useEffect(() => setBranchDraft(project.main_branch || ''), [project.main_branch])
+  useEffect(
+    () => setBranchDraft(project.main_branch || ''),
+    [project.main_branch]
+  )
 
   // Directory editor
   const [directoryDraft, setDirectoryDraft] = useState('')
-  useEffect(() => setDirectoryDraft(project.directory || './'), [project.directory])
+  useEffect(
+    () => setDirectoryDraft(project.directory || './'),
+    [project.directory]
+  )
 
   // Dockerfile path editor
   const [dockerfileDraft, setDockerfileDraft] = useState('')
   useEffect(() => {
-    setDockerfileDraft((project?.preset_config as any)?.dockerfilePath || 'Dockerfile')
+    setDockerfileDraft(
+      (project?.preset_config as any)?.dockerfilePath || 'Dockerfile'
+    )
   }, [project?.preset_config])
 
   // Compose path editor
   const [composePathDraft, setComposePathDraft] = useState('')
   useEffect(() => {
-    setComposePathDraft((project?.preset_config as any)?.composePath || 'docker-compose.yml')
+    setComposePathDraft(
+      (project?.preset_config as any)?.composePath || 'docker-compose.yml'
+    )
   }, [project?.preset_config])
 
   // Compose override editor (full-width textarea, explicit save)
@@ -246,7 +291,8 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
 
   const presetName = (project.preset || '').toString()
   const isDockerfilePreset = presetName === 'dockerfile'
-  const isComposePreset = presetName === 'docker-compose' || presetName === 'dockercompose'
+  const isComposePreset =
+    presetName === 'docker-compose' || presetName === 'dockercompose'
 
   const navigate = useNavigate()
   const goToChangeRepo = () =>
@@ -267,7 +313,7 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
       toast.success('Webhook reinstalled')
     } catch {
       toast.error(
-        'Failed to reinstall webhook — check your GitLab user has Maintainer role on the repo.',
+        'Failed to reinstall webhook — check your GitLab user has Maintainer role on the repo.'
       )
     }
   }
@@ -296,7 +342,9 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
               <GithubIcon className="size-6" />
             </div>
             <div className="space-y-1">
-              <h3 className="text-base font-semibold">No repository connected</h3>
+              <h3 className="text-base font-semibold">
+                No repository connected
+              </h3>
               <p className="text-sm text-muted-foreground">
                 Connect a Git repository to enable deployments for this project.
               </p>
@@ -349,7 +397,11 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
                   {project.repo_owner}/{project.repo_name}
                 </a>
                 <Badge variant="secondary" className="text-xs">
-                  {isPublicRepo ? 'Public' : repositoryData?.private ? 'Private' : 'Connected'}
+                  {isPublicRepo
+                    ? 'Public'
+                    : repositoryData?.private
+                      ? 'Private'
+                      : 'Connected'}
                 </Badge>
               </div>
               {repositoryData?.description && (
@@ -366,13 +418,21 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
                 {repositoryData?.default_branch && (
                   <span className="flex items-center gap-1">
                     <GitBranchIcon className="size-3" />
-                    default <span className="font-mono text-foreground">{repositoryData.default_branch}</span>
+                    default{' '}
+                    <span className="font-mono text-foreground">
+                      {repositoryData.default_branch}
+                    </span>
                   </span>
                 )}
                 {currentConnection && (
                   <span>
-                    via <span className="text-foreground">{currentConnection.account_name}</span>{' '}
-                    <span className="text-muted-foreground">({currentProvider?.name})</span>
+                    via{' '}
+                    <span className="text-foreground">
+                      {currentConnection.account_name}
+                    </span>{' '}
+                    <span className="text-muted-foreground">
+                      ({currentProvider?.name})
+                    </span>
                   </span>
                 )}
               </div>
@@ -383,7 +443,6 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
               </Button>
             </div>
           </div>
-
         </CardContent>
       </Card>
 
@@ -419,19 +478,31 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
               display={
                 <div className="flex items-center gap-2 min-w-0">
                   <GitBranchIcon className="size-4 text-muted-foreground shrink-0" />
-                  <span className="font-mono text-sm truncate">{project.main_branch}</span>
+                  <span className="font-mono text-sm truncate">
+                    {project.main_branch}
+                  </span>
                   {repositoryData?.default_branch === project.main_branch && (
-                    <Badge variant="outline" className="text-xs">default</Badge>
+                    <Badge variant="outline" className="text-xs">
+                      default
+                    </Badge>
                   )}
                   {(() => {
-                    const b = branches.find((br) => br.name === project.main_branch)
+                    const b = branches.find(
+                      (br) => br.name === project.main_branch
+                    )
                     if (b?.protected) {
-                      return <Badge variant="outline" className="text-xs">protected</Badge>
+                      return (
+                        <Badge variant="outline" className="text-xs">
+                          protected
+                        </Badge>
+                      )
                     }
                     return null
                   })()}
                   {(() => {
-                    const b = branches.find((br) => br.name === project.main_branch)
+                    const b = branches.find(
+                      (br) => br.name === project.main_branch
+                    )
                     if (b?.commit_sha) {
                       return (
                         <span className="font-mono text-xs text-muted-foreground">
@@ -452,7 +523,11 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
                     </div>
                   ) : branches.length > 0 ? (
                     <Select
-                      value={branches.some((b) => b.name === branchDraft) ? branchDraft : '__custom__'}
+                      value={
+                        branches.some((b) => b.name === branchDraft)
+                          ? branchDraft
+                          : '__custom__'
+                      }
                       onValueChange={(v) => {
                         if (v === '__custom__') {
                           setBranchDraft('')
@@ -471,7 +546,12 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
                               <GitBranchIcon className="size-4" />
                               <span className="font-mono">{b.name}</span>
                               {b.protected && (
-                                <Badge variant="outline" className="text-[10px] py-0">protected</Badge>
+                                <Badge
+                                  variant="outline"
+                                  className="text-[10px] py-0"
+                                >
+                                  protected
+                                </Badge>
                               )}
                               {b.name === repositoryData?.default_branch && (
                                 <Check className="size-3 text-green-500" />
@@ -485,12 +565,15 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
                           </SelectItem>
                         ))}
                         <SelectItem value="__custom__">
-                          <span className="text-muted-foreground">Custom branch…</span>
+                          <span className="text-muted-foreground">
+                            Custom branch…
+                          </span>
                         </SelectItem>
                       </SelectContent>
                     </Select>
                   ) : null}
-                  {(branches.length === 0 || !branches.some((b) => b.name === branchDraft)) && (
+                  {(branches.length === 0 ||
+                    !branches.some((b) => b.name === branchDraft)) && (
                     <Input
                       value={branchDraft}
                       onChange={(e) => setBranchDraft(e.target.value)}
@@ -526,7 +609,10 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
               hideSaveButtons
               display={
                 <div className="flex items-center gap-2 min-w-0">
-                  <FrameworkIcon preset={project.preset as any} className="size-5 shrink-0" />
+                  <FrameworkIcon
+                    preset={project.preset as any}
+                    className="size-5 shrink-0"
+                  />
                   <span className="text-sm truncate">{project.preset}</span>
                 </div>
               }
@@ -538,16 +624,27 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
                     error={presetQuery.error}
                     selectedPreset={(() => {
                       const dir = project.directory || './'
-                      const norm = dir === '.' || dir === './' ? 'root' : dir.startsWith('./') ? dir.slice(2) : dir
+                      const norm =
+                        dir === '.' || dir === './'
+                          ? 'root'
+                          : dir.startsWith('./')
+                            ? dir.slice(2)
+                            : dir
                       return `${project.preset}::${norm}`
                     })()}
                     onSelectPreset={async (value) => {
                       if (value === 'custom') {
-                        await saveGitField({ preset: 'custom', directory: './' })
+                        await saveGitField({
+                          preset: 'custom',
+                          directory: './',
+                        })
                       } else {
                         const [name, path] = value.split('::')
                         const dir =
-                          path && path !== 'root' && path !== '.' && path.trim() !== ''
+                          path &&
+                          path !== 'root' &&
+                          path !== '.' &&
+                          path.trim() !== ''
                             ? `./${path.startsWith('./') ? path.slice(2) : path}`
                             : './'
                         await saveGitField({ preset: name, directory: dir })
@@ -583,7 +680,9 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
               display={
                 <div className="flex items-center gap-2 min-w-0">
                   <FolderIcon className="size-4 text-muted-foreground shrink-0" />
-                  <span className="font-mono text-sm truncate">{project.directory || './'}</span>
+                  <span className="font-mono text-sm truncate">
+                    {project.directory || './'}
+                  </span>
                 </div>
               }
               editor={
@@ -604,7 +703,8 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
                 editing={editing === 'dockerfile'}
                 onStartEdit={() => {
                   setDockerfileDraft(
-                    (project?.preset_config as any)?.dockerfilePath || 'Dockerfile',
+                    (project?.preset_config as any)?.dockerfilePath ||
+                      'Dockerfile'
                   )
                   setEditing('dockerfile')
                 }}
@@ -617,7 +717,11 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
                     return
                   }
                   await saveGitField({
-                    preset_config: { ...cfg, preset: 'dockerfile', dockerfilePath: next },
+                    preset_config: {
+                      ...cfg,
+                      preset: 'dockerfile',
+                      dockerfilePath: next,
+                    },
                   })
                   toast.success('Dockerfile path updated')
                   close()
@@ -627,7 +731,8 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
                   <div className="flex items-center gap-2 min-w-0">
                     <FileIcon className="size-4 text-muted-foreground shrink-0" />
                     <span className="font-mono text-sm truncate">
-                      {(project.preset_config as any)?.dockerfilePath || 'Dockerfile'}
+                      {(project.preset_config as any)?.dockerfilePath ||
+                        'Dockerfile'}
                     </span>
                   </div>
                 }
@@ -650,7 +755,8 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
                 editing={editing === 'composePath'}
                 onStartEdit={() => {
                   setComposePathDraft(
-                    (project?.preset_config as any)?.composePath || 'docker-compose.yml',
+                    (project?.preset_config as any)?.composePath ||
+                      'docker-compose.yml'
                   )
                   setEditing('composePath')
                 }}
@@ -663,7 +769,11 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
                     return
                   }
                   await saveGitField({
-                    preset_config: { ...cfg, preset: 'docker-compose', composePath: next },
+                    preset_config: {
+                      ...cfg,
+                      preset: 'docker-compose',
+                      composePath: next,
+                    },
                   })
                   toast.success('Compose path updated')
                   close()
@@ -673,7 +783,8 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
                   <div className="flex items-center gap-2 min-w-0">
                     <FileIcon className="size-4 text-muted-foreground shrink-0" />
                     <span className="font-mono text-sm truncate">
-                      {(project.preset_config as any)?.composePath || 'docker-compose.yml'}
+                      {(project.preset_config as any)?.composePath ||
+                        'docker-compose.yml'}
                     </span>
                   </div>
                 }
@@ -711,7 +822,7 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
                     size="sm"
                     onClick={() => {
                       setOverrideDraft(
-                        (project?.preset_config as any)?.composeOverride || '',
+                        (project?.preset_config as any)?.composeOverride || ''
                       )
                       setEditing('composeOverride')
                     }}
@@ -774,7 +885,10 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
       <Card>
         <CardContent className="p-0 divide-y">
           <div className="flex items-center gap-4 p-6">
-            <Switch checked={autoDeployOn} onCheckedChange={handleAutoDeployToggle} />
+            <Switch
+              checked={autoDeployOn}
+              onCheckedChange={handleAutoDeployToggle}
+            />
             <div className="flex-1 min-w-0">
               <div className="text-sm font-medium">Automatic deployments</div>
               <p className="text-xs text-muted-foreground">
@@ -804,7 +918,7 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
               <div
                 className={cn(
                   'flex size-9 shrink-0 items-center justify-center rounded-full',
-                  hasWebhook ? 'bg-green-500/10' : 'bg-amber-500/10',
+                  hasWebhook ? 'bg-green-500/10' : 'bg-amber-500/10'
                 )}
               >
                 {hasWebhook ? (
@@ -815,7 +929,9 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
               </div>
               <div className="flex-1 min-w-0">
                 <div className="text-sm font-medium">
-                  {hasWebhook ? 'GitLab webhook installed' : 'GitLab webhook not installed'}
+                  {hasWebhook
+                    ? 'GitLab webhook installed'
+                    : 'GitLab webhook not installed'}
                 </div>
                 <p className="text-xs text-muted-foreground">
                   {hasWebhook ? (
@@ -853,7 +969,6 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
           )}
         </CardContent>
       </Card>
-
     </div>
   )
 }
@@ -884,7 +999,9 @@ function InlineRow({
   return (
     <li className="px-6 py-4">
       <div className="flex items-center gap-4">
-        <div className="w-32 shrink-0 text-sm text-muted-foreground">{label}</div>
+        <div className="w-32 shrink-0 text-sm text-muted-foreground">
+          {label}
+        </div>
         <div className="flex-1 min-w-0">
           {editing ? (
             <div
@@ -910,7 +1027,9 @@ function InlineRow({
                     Cancel
                   </Button>
                   <Button size="sm" onClick={onSave} disabled={isPending}>
-                    {isPending && <Loader2 className="size-3 mr-1 animate-spin" />}
+                    {isPending && (
+                      <Loader2 className="size-3 mr-1 animate-spin" />
+                    )}
                     Save
                   </Button>
                 </>
@@ -1090,11 +1209,15 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
     }
   }, [modeTouched, connections.length, project.git_provider_connection_id])
 
-  const [selectedConnectionId, setSelectedConnectionId] = useState<number | null>(
-    project.git_provider_connection_id || null
-  )
+  const [selectedConnectionId, setSelectedConnectionId] = useState<
+    number | null
+  >(project.git_provider_connection_id || null)
   useEffect(() => {
-    if (mode === 'connection' && !selectedConnectionId && connections.length > 0) {
+    if (
+      mode === 'connection' &&
+      !selectedConnectionId &&
+      connections.length > 0
+    ) {
       setSelectedConnectionId(connections[0].id)
     }
   }, [mode, selectedConnectionId, connections])
@@ -1222,7 +1345,9 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
                 </SelectTrigger>
                 <SelectContent>
                   {connections.map((c) => {
-                    const provider = providers.find((p) => p.id === c.provider_id)
+                    const provider = providers.find(
+                      (p) => p.id === c.provider_id
+                    )
                     return (
                       <SelectItem key={c.id} value={c.id.toString()}>
                         <div className="flex items-center gap-2">
@@ -1292,6 +1417,7 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
               <FrameworkSelector
                 presetData={presetQuery.data as any}
                 isLoading={presetQuery.isLoading}
+                error={presetQuery.error}
                 selectedPreset={preset}
                 onSelectPreset={setPreset}
               />

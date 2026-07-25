@@ -143,7 +143,11 @@ export function ImportWizard({ onCancel, className }: ImportWizardProps) {
   })
 
   // Fetch repository presets when repository and branch are selected
-  const { data: presetData, isLoading: presetLoading } = useQuery({
+  const {
+    data: presetData,
+    isLoading: presetLoading,
+    error: presetError,
+  } = useQuery({
     ...getRepositoryPresetLiveOptions({
       path: { repository_id: selectedRepository?.id || 0 },
       query: { branch: selectedBranch || undefined },
@@ -890,6 +894,7 @@ export function ImportWizard({ onCancel, className }: ImportWizardProps) {
                       <FrameworkSelector
                         presetData={presetData}
                         isLoading={presetLoading}
+                        error={presetError}
                         selectedPreset={selectedPreset}
                         onSelectPreset={handlePresetChange}
                       />

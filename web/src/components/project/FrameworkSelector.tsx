@@ -5,10 +5,11 @@ import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Skeleton } from '@/components/ui/skeleton'
-import type {
-  ProjectPresetResponse,
-  PresetResponse,
-} from '@/api/client'
+import {
+  GitConnectionExpiredAlert,
+  isGitAuthError,
+} from '@/components/git-providers/GitConnectionExpiredAlert'
+import type { ProjectPresetResponse, PresetResponse } from '@/api/client'
 import { usePresets } from '@/contexts/PresetContext'
 
 // Helper function to normalize path for consistent comparison
@@ -57,7 +58,11 @@ export function FrameworkSelector({
   // If the currently selected preset+path isn't in the detected list, inject it
   // so the user sees their current selection highlighted among detected presets
   const detectedProjects = useMemo(() => {
-    if (!selectedPreset || selectedPreset === 'custom' || rawDetectedProjects.length === 0) {
+    if (
+      !selectedPreset ||
+      selectedPreset === 'custom' ||
+      rawDetectedProjects.length === 0
+    ) {
       return rawDetectedProjects
     }
     const [selectedSlug, selectedPath] = selectedPreset.split('::')
@@ -65,7 +70,10 @@ export function FrameworkSelector({
 
     const normalizedSelectedPath = normalizePath(selectedPath)
     const alreadyExists = rawDetectedProjects.some((p) => {
-      return p.preset === selectedSlug && normalizePath(p.path) === normalizedSelectedPath
+      return (
+        p.preset === selectedSlug &&
+        normalizePath(p.path) === normalizedSelectedPath
+      )
     })
 
     if (alreadyExists) return rawDetectedProjects
@@ -180,7 +188,13 @@ export function FrameworkSelector({
       </div>
 
       {/* Show error/info alerts — must match what's actually displayed below */}
-      {error && shouldShowAllPresets && (
+      {/* An expired git credential is not a detection failure: telling the
+          user to "pick one manually" hides an auth problem that will break
+          the next step too, so it gets its own actionable state. */}
+      {error && isGitAuthError(error) && (
+        <GitConnectionExpiredAlert operation="detect this project's framework" />
+      )}
+      {error && !isGitAuthError(error) && shouldShowAllPresets && (
         <Alert>
           <AlertCircle className="h-4 w-4" />
           <AlertDescription>

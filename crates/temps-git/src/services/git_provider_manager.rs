@@ -1838,6 +1838,36 @@ impl GitProviderManager {
         }
     }
 
+    /// Classify a failed provider HTTP response into a typed error.
+    ///
+    /// Provider 401/403 responses MUST become
+    /// [`GitProviderError::AuthenticationFailed`] rather than a generic
+    /// `ApiError`, for two reasons:
+    ///
+    /// 1. [`Self::is_authentication_error`] drives the token
+    ///    force-refresh-and-retry path. A 401 flattened into `ApiError`
+    ///    silently skips that retry, so an expired-but-refreshable token
+    ///    hard-fails instead of recovering.
+    /// 2. The HTTP layer maps `AuthenticationFailed` to a distinct problem
+    ///    type, so clients can tell "reconnect this git account" apart from
+    ///    "the provider is having a bad day" and say so to the user.
+    ///
+    /// `operation` names what was being fetched, so the message stays
+    /// greppable and specific (e.g. "get tree for owner/repo@main").
+    fn classify_provider_response_error(
+        status: reqwest::StatusCode,
+        operation: &str,
+    ) -> GitProviderError {
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            GitProviderError::AuthenticationFailed(format!(
+                "provider rejected the stored credential while trying to {}: HTTP {}",
+                operation, status
+            ))
+        } else {
+            GitProviderError::ApiError(format!("Failed to {}: HTTP {}", operation, status))
+        }
+    }
+
     /// Check if a GitProviderError is an authentication error (401)
     fn is_authentication_error(&self, error: &super::git_provider::GitProviderError) -> bool {
         matches!(
@@ -3121,7 +3151,7 @@ impl GitProviderManager {
         owner: &str,
         repo: &str,
         branch: &str,
-    ) -> Result<Vec<String>, GitProviderManagerError> {
+    ) -> Result<Vec<String>, GitProviderError> {
         // For GitHub, we can use the tree API to get file list
         // For other providers, we may need different approaches
 
@@ -3145,35 +3175,23 @@ impl GitProviderManager {
                     .send()
                     .await
                     .map_err(|e| {
-                        GitProviderManagerError::ProviderError(GitProviderError::ApiError(format!(
-                            "Failed to get tree: {}",
-                            e
-                        )))
+                        GitProviderError::ApiError(format!("Failed to get tree: {}", e))
                     })?;
 
                 if !response.status().is_success() {
-                    return Err(GitProviderManagerError::ProviderError(
-                        GitProviderError::ApiError(format!(
-                            "Failed to get tree: HTTP {}",
-                            response.status()
-                        )),
+                    return Err(Self::classify_provider_response_error(
+                        response.status(),
+                        &format!("get tree for {}/{}@{}", owner, repo, branch),
                     ));
                 }
 
                 let tree_data: serde_json::Value = response.json().await.map_err(|e| {
-                    GitProviderManagerError::ProviderError(GitProviderError::ApiError(format!(
-                        "Failed to parse tree response: {}",
-                        e
-                    )))
+                    GitProviderError::ApiError(format!("Failed to parse tree response: {}", e))
                 })?;
 
                 let files = tree_data["tree"]
                     .as_array()
-                    .ok_or_else(|| {
-                        GitProviderManagerError::ProviderError(GitProviderError::ApiError(
-                            "No tree in response".to_string(),
-                        ))
-                    })?
+                    .ok_or_else(|| GitProviderError::ApiError("No tree in response".to_string()))?
                     .iter()
                     .filter_map(|item| {
                         if item["type"].as_str() == Some("blob") {
@@ -3200,26 +3218,18 @@ impl GitProviderManager {
                     .send()
                     .await
                     .map_err(|e| {
-                        GitProviderManagerError::ProviderError(GitProviderError::ApiError(format!(
-                            "Failed to get tree: {}",
-                            e
-                        )))
+                        GitProviderError::ApiError(format!("Failed to get tree: {}", e))
                     })?;
 
                 if !response.status().is_success() {
-                    return Err(GitProviderManagerError::ProviderError(
-                        GitProviderError::ApiError(format!(
-                            "Failed to get tree: HTTP {}",
-                            response.status()
-                        )),
+                    return Err(Self::classify_provider_response_error(
+                        response.status(),
+                        &format!("get tree for {}/{}@{}", owner, repo, branch),
                     ));
                 }
 
                 let tree_data: Vec<serde_json::Value> = response.json().await.map_err(|e| {
-                    GitProviderManagerError::ProviderError(GitProviderError::ApiError(format!(
-                        "Failed to parse tree response: {}",
-                        e
-                    )))
+                    GitProviderError::ApiError(format!("Failed to parse tree response: {}", e))
                 })?;
 
                 let files = tree_data
@@ -3301,31 +3311,41 @@ impl GitProviderManager {
         // Repository always has a git provider connection (required field)
         let connection_id = repository.git_provider_connection_id;
 
-        // Get the git provider connection
-        let connection = self.get_connection(connection_id).await?;
-        let provider_service = self.get_provider_service(connection.provider_id).await?;
-
-        // Decrypt access token
-        let access_token = if let Some(ref encrypted) = connection.access_token {
-            self.decrypt_string(encrypted).await?
-        } else {
-            return Err(GitProviderManagerError::InvalidConfiguration(
-                "Git provider connection has no access token configured".to_string(),
-            ));
+        let provider_service = {
+            let connection = self.get_connection(connection_id).await?;
+            self.get_provider_service(connection.provider_id).await?
         };
 
         // Use provided branch or fall back to repository's default branch
         let target_branch = branch.unwrap_or_else(|| repository.default_branch.clone());
 
-        // Get all files in the repository
+        // Get all files in the repository.
+        //
+        // Routed through `execute_with_refresh` so an expired-but-refreshable
+        // access token is refreshed and retried instead of surfacing a 401 to
+        // the user. This previously decrypted the token inline and called
+        // directly, so preset detection was the one provider path that never
+        // got the refresh treatment — and because a provider 401 was also
+        // flattened into a generic `ApiError`, the retry could not have fired
+        // even if it had been wrapped (see
+        // `classify_provider_response_error`).
         let files = self
-            .get_repository_files(
-                &provider_service,
-                &access_token,
-                &repository.owner,
-                &repository.name,
-                &target_branch,
-            )
+            .execute_with_refresh(connection_id, |access_token| {
+                let provider_service = provider_service.clone();
+                let owner = repository.owner.clone();
+                let name = repository.name.clone();
+                let target_branch = target_branch.clone();
+                async move {
+                    self.get_repository_files(
+                        &provider_service,
+                        &access_token,
+                        &owner,
+                        &name,
+                        &target_branch,
+                    )
+                    .await
+                }
+            })
             .await?;
 
         // Detect presets in root and subdirectories
