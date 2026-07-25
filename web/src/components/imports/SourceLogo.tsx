@@ -59,6 +59,25 @@ export function SourceLogo({ source, className }: SourceLogoProps) {
       </svg>
     )
   }
+  if (source === 'kamal') {
+    // No simple-icons entry for Kamal — recognizable lettermark badge
+    return (
+      <svg viewBox="0 0 24 24" role="img" aria-label="Kamal" className={className}>
+        <rect x="1" y="1" width="22" height="22" rx="5" className="fill-foreground" />
+        <text
+          x="12"
+          y="16.5"
+          textAnchor="middle"
+          fontSize="12"
+          fontWeight="700"
+          fontFamily="ui-sans-serif, system-ui"
+          className="fill-background"
+        >
+          K
+        </text>
+      </svg>
+    )
+  }
   if (source === 'dokploy') {
     // Dokploy has no simple-icons entry yet — recognizable lettermark badge
     return (

@@ -82,7 +82,7 @@ interface ImportWizardProps {
 const SOURCE_CREDENTIALS: Record<
   string,
   {
-    fields: Array<'base_url' | 'token' | 'kubeconfig'>
+    fields: Array<'base_url' | 'token' | 'kubeconfig' | 'deploy_yml'>
     baseUrlPlaceholder?: string
     tokenHelp?: string
   }
@@ -110,6 +110,11 @@ const SOURCE_CREDENTIALS: Record<
     baseUrlPlaceholder: 'https://your-portainer-host:9443',
     tokenHelp:
       'Enter the Portainer admin password. A non-admin username can be supplied via the API (credentials.extra.username); the default is "admin".',
+  },
+  kamal: {
+    fields: ['deploy_yml'],
+    tokenHelp:
+      'Paste your config/deploy.yml. Kamal has no server to connect to — the file is the source of truth. Secrets listed under env.secret import as empty placeholders (their values live in .kamal/secrets), and ERB templating must be resolved first with "kamal config".',
   },
   kubernetes: {
     fields: ['kubeconfig'],
@@ -170,6 +175,7 @@ export function ImportWizard({ onCancel, className }: ImportWizardProps) {
   const [credentialBaseUrl, setCredentialBaseUrl] = useState('')
   const [credentialToken, setCredentialToken] = useState('')
   const [credentialKubeconfig, setCredentialKubeconfig] = useState('')
+  const [credentialDeployYml, setCredentialDeployYml] = useState('')
   const [selectedRepository, setSelectedRepository] =
     useState<RepositoryResponse | null>(null)
   const [selectedConnectionId, setSelectedConnectionId] = useState<
@@ -441,6 +447,7 @@ export function ImportWizard({ onCancel, className }: ImportWizardProps) {
   const credentialsComplete = credentialFields.every((field) => {
     if (field === 'base_url') return credentialBaseUrl.trim() !== ''
     if (field === 'token') return credentialToken.trim() !== ''
+    if (field === 'deploy_yml') return credentialDeployYml.trim() !== ''
     return credentialKubeconfig.trim() !== ''
   })
 
@@ -450,6 +457,9 @@ export function ImportWizard({ onCancel, className }: ImportWizardProps) {
     const extra: Record<string, string> = {}
     if (credentialFields.includes('kubeconfig')) {
       extra.kubeconfig = credentialKubeconfig
+    }
+    if (credentialFields.includes('deploy_yml')) {
+      extra.deploy_yml = credentialDeployYml
     }
     return {
       base_url: credentialFields.includes('base_url')
@@ -732,6 +742,19 @@ export function ImportWizard({ onCancel, className }: ImportWizardProps) {
                         onChange={(e) =>
                           setCredentialKubeconfig(e.target.value)
                         }
+                      />
+                    </div>
+                  )}
+                  {credentialFields.includes('deploy_yml') && (
+                    <div className="space-y-2">
+                      <Label htmlFor="import-deploy-yml">config/deploy.yml</Label>
+                      <Textarea
+                        id="import-deploy-yml"
+                        rows={10}
+                        className="font-mono text-xs"
+                        placeholder={'service: my-app\nimage: my-user/my-app\nservers:\n  web:\n    - 192.168.0.1\n…'}
+                        value={credentialDeployYml}
+                        onChange={(e) => setCredentialDeployYml(e.target.value)}
                       />
                     </div>
                   )}

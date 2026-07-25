@@ -57,6 +57,8 @@ pub enum ImportSource {
     Caprover,
     /// Portainer (Docker environments, compose stacks, standalone containers)
     Portainer,
+    /// Kamal (imported from its config/deploy.yml — there is no control plane)
+    Kamal,
     /// Custom/other source
     Custom,
 }
@@ -76,6 +78,7 @@ impl ImportSource {
             ImportSource::Kubernetes => "kubernetes",
             ImportSource::Caprover => "caprover",
             ImportSource::Portainer => "portainer",
+            ImportSource::Kamal => "kamal",
             ImportSource::Custom => "custom",
         }
     }
@@ -108,6 +111,7 @@ impl std::str::FromStr for ImportSource {
             "kubernetes" => Ok(ImportSource::Kubernetes),
             "caprover" => Ok(ImportSource::Caprover),
             "portainer" => Ok(ImportSource::Portainer),
+            "kamal" => Ok(ImportSource::Kamal),
             "custom" => Ok(ImportSource::Custom),
             _ => Err(crate::ImportError::SourceNotAccessible(format!(
                 "Unknown import source: {}",

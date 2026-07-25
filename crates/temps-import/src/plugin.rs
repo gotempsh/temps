@@ -104,6 +104,11 @@ impl TempsPlugin for ImportPlugin {
                 .register_importer(Arc::new(temps_import_portainer::PortainerImporter::new()));
             tracing::info!("Portainer importer registered successfully");
 
+            // Register Kamal importer (reads config/deploy.yml supplied
+            // per-request — Kamal has no control plane to contact)
+            orchestrator.register_importer(Arc::new(temps_import_kamal::KamalImporter::new()));
+            tracing::info!("Kamal importer registered successfully");
+
             let orchestrator = Arc::new(orchestrator);
             context.register_service(orchestrator);
 
