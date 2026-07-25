@@ -647,6 +647,26 @@ pub fn build_env_rewrites(
     rewrites
 }
 
+/// Annotate skipped (source-generated, IP-tied) domains with the temps-side
+/// address that replaces them, so the plan answers "where will my app be
+/// reachable instead?" before the user approves it.
+pub fn annotate_skipped_domains(plan: &mut ImportPlan, preview_host: &str) -> usize {
+    let mut annotated = 0;
+    for domain_plan in plan
+        .domains
+        .iter_mut()
+        .filter(|d| d.action == DomainAction::Skip)
+    {
+        domain_plan.replacement = Some(preview_host.to_string());
+        domain_plan.action_description = format!(
+            "'{}' embeds the source server's IP and would keep pointing at the old machine — on temps this app will be served at '{}' instead",
+            domain_plan.domain, preview_host
+        );
+        annotated += 1;
+    }
+    annotated
+}
+
 /// Apply rewrites to the plan's env vars (substring replacement, longest
 /// patterns first so full URLs win over their embedded hostnames).
 /// Returns the number of variables whose value changed.
@@ -694,7 +714,7 @@ mod tests {
     };
     use temps_import_types::{DomainPlan, MigrationSummary, ResourceCounts, RiskLevel};
 
-    fn plan_with(env: Vec<(&str, &str)>, skipped_domain: &str) -> ImportPlan {
+    pub(super) fn plan_with(env: Vec<(&str, &str)>, skipped_domain: &str) -> ImportPlan {
         ImportPlan {
             version: "1.0".to_string(),
             source: "coolify".to_string(),
@@ -754,6 +774,7 @@ mod tests {
                 status_code: None,
                 action: DomainAction::Skip,
                 action_description: String::new(),
+                replacement: None,
             }],
             additional_deployments: vec![],
             steps: vec![],
@@ -904,5 +925,21 @@ mod parameter_tests {
     #[test]
     fn redis_needs_no_parameters() {
         assert!(service_parameters(&ServiceType::Redis, "cache", None).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod annotation_tests {
+    use super::*;
+
+    #[test]
+    fn skipped_domains_get_replacement_and_explanation() {
+        let mut plan = tests::plan_with(vec![], "lab-shop.1.2.3.4.sslip.io");
+        let annotated = annotate_skipped_domains(&mut plan, "lab.preview.temps.dev");
+        assert_eq!(annotated, 1);
+        let domain = &plan.domains[0];
+        assert_eq!(domain.replacement.as_deref(), Some("lab.preview.temps.dev"));
+        assert!(domain.action_description.contains("lab.preview.temps.dev"));
+        assert!(domain.action_description.contains("source server's IP"));
     }
 }

@@ -312,6 +312,14 @@ pub struct DomainPlan {
     pub action: DomainAction,
     /// Human-readable explanation
     pub action_description: String,
+    /// The temps-side address that replaces this domain when it is skipped.
+    ///
+    /// Source-generated domains (sslip.io / traefik.me / platform subdomains)
+    /// embed the source server's IP and would keep pointing at the old
+    /// machine — this tells the user where the app will be reachable on
+    /// temps instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement: Option<String>,
 }
 
 /// What to do with a domain during migration

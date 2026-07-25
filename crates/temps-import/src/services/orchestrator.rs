@@ -207,6 +207,25 @@ impl ImportOrchestrator {
             (snapshot, plan)
         };
 
+        // Skipped domains are IP-tied (sslip.io & friends) and would keep
+        // pointing at the source machine — show the user the temps address
+        // that replaces them, right in the reviewable plan.
+        match self.config_service.get_settings().await {
+            Ok(settings) => {
+                let preview_host = super::resource_executor::preview_hostname(
+                    &settings.preview_domain,
+                    &plan.environment.subdomain,
+                );
+                super::resource_executor::annotate_skipped_domains(&mut plan, &preview_host);
+            }
+            Err(e) => {
+                warn!(
+                    "Could not load settings to annotate replacement domains in the plan: {}",
+                    e
+                );
+            }
+        }
+
         // Fetch repository information if repository ID is provided
         let (git_provider_connection_id, repo_owner, repo_name) = if let Some(repo_id) =
             repository_id

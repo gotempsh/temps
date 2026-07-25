@@ -1502,6 +1502,7 @@ impl KubernetesImporter {
                     "Register '{}' in temps; you must point its DNS at the temps server afterwards",
                     domain.domain
                 ),
+                replacement: None,
             })
             .collect();
 
