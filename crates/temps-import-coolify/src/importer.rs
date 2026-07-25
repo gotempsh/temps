@@ -484,6 +484,12 @@ impl CoolifyImporter {
             if let Some(version) = &service.version {
                 parameters.insert("version".to_string(), serde_json::json!(version));
             }
+            if reachable {
+                if let Some(url) = &service.connection_url {
+                    // consumed by the orchestrator's data-population phase
+                    parameters.insert("source_url".to_string(), serde_json::json!(url));
+                }
+            }
 
             service_plans.push(ServicePlan {
                 name: service.name.clone(),
@@ -1112,49 +1118,8 @@ async fn execute_plan(
 
     // Service + domain creation is reported honestly as manual until the
     // orchestrator wires the managed-service and domain services.
-    let mut step_results: Vec<StepResult> = Vec::new();
+    let step_results: Vec<StepResult> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
-    for service_plan in plan
-        .services
-        .iter()
-        .filter(|s| s.action == ServiceAction::Create)
-    {
-        let message = format!(
-            "Managed service creation is not yet automated for Coolify imports — create a {} service named '{}' in temps and migrate its data (see the plan's data implications)",
-            service_plan.service_type, service_plan.name
-        );
-        warnings.push(message.clone());
-        step_results.push(StepResult {
-            step_id: format!("create-service-{}", sanitize_slug(&service_plan.name)),
-            step_title: format!("Create managed service '{}'", service_plan.name),
-            success: true,
-            skipped: true,
-            message,
-            created_resources: vec![],
-            duration_seconds: 0.0,
-        });
-    }
-    for domain_plan in plan
-        .domains
-        .iter()
-        .filter(|d| d.action == DomainAction::Import)
-    {
-        let message = format!(
-            "Domain registration is not yet automated for Coolify imports — add '{}' to the environment in temps and update its DNS",
-            domain_plan.domain
-        );
-        warnings.push(message.clone());
-        step_results.push(StepResult {
-            step_id: format!("import-domain-{}", sanitize_slug(&domain_plan.domain)),
-            step_title: format!("Import domain '{}'", domain_plan.domain),
-            success: true,
-            skipped: true,
-            message,
-            created_resources: vec![],
-            duration_seconds: 0.0,
-        });
-    }
-
     if context.dry_run {
         info!(
             "Dry run — would create project '{}' with environment '{}' and image '{}'",

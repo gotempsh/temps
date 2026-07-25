@@ -1,8 +1,10 @@
 //! Import orchestration services
 
 mod orchestrator;
+pub mod resource_executor;
 
 pub use orchestrator::ImportOrchestrator;
+pub use resource_executor::ResourceExecutor;
 
 use axum::http::StatusCode;
 use temps_core::problemdetails::{self, Problem};

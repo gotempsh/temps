@@ -42,6 +42,18 @@ impl TempsPlugin for ImportPlugin {
             let project_service = context.require_service::<temps_projects::ProjectService>();
             let deployment_service =
                 context.require_service::<temps_deployments::DeploymentService>();
+            let external_service_manager =
+                context.require_service::<temps_providers::services::ExternalServiceManager>();
+            let config_service = context.require_service::<temps_config::ConfigService>();
+            let docker = context.require_service::<bollard::Docker>();
+
+            let resource_executor = Arc::new(crate::services::ResourceExecutor::new(
+                external_service_manager,
+                Arc::new(temps_projects::services::CustomDomainService::new(
+                    db.clone(),
+                )),
+                docker,
+            ));
 
             // Create import orchestrator with all required services
             let mut orchestrator = ImportOrchestrator::new(
@@ -49,6 +61,8 @@ impl TempsPlugin for ImportPlugin {
                 git_provider_manager,
                 project_service,
                 deployment_service,
+                resource_executor,
+                config_service,
             );
 
             // Register Docker importer if available

@@ -44,6 +44,11 @@ pub struct ImportOrchestrator {
     git_provider_manager: Arc<temps_git::GitProviderManager>,
     project_service: Arc<temps_projects::ProjectService>,
     deployment_service: Arc<temps_deployments::DeploymentService>,
+    /// Executes the platform-generic plan resources (services, data
+    /// population, domains) around the importer's own execute.
+    resource_executor: Arc<super::ResourceExecutor>,
+    /// Settings access for the preview domain used in env-var rewriting.
+    config_service: Arc<temps_config::ConfigService>,
     /// In-memory session storage (will be replaced with database storage later)
     sessions: Arc<RwLock<HashMap<String, ImportSession>>>,
 }
@@ -74,6 +79,8 @@ impl ImportOrchestrator {
         git_provider_manager: Arc<temps_git::GitProviderManager>,
         project_service: Arc<temps_projects::ProjectService>,
         deployment_service: Arc<temps_deployments::DeploymentService>,
+        resource_executor: Arc<super::ResourceExecutor>,
+        config_service: Arc<temps_config::ConfigService>,
     ) -> Self {
         Self {
             db,
@@ -81,6 +88,8 @@ impl ImportOrchestrator {
             git_provider_manager,
             project_service,
             deployment_service,
+            resource_executor,
+            config_service,
             sessions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -389,15 +398,91 @@ impl ImportOrchestrator {
             metadata: std::collections::HashMap::new(),
         };
 
-        // Delegate execution to the importer
-        let outcome = importer
+        let mut plan = session.plan.clone();
+        let mut pre_steps: Vec<temps_import_types::StepResult> = Vec::new();
+
+        // Phase 1 (real runs only): create managed services BEFORE the
+        // project so env vars can point at them from the first deployment.
+        let created_services = if dry_run {
+            Vec::new()
+        } else {
+            let (steps, created, _resources) = self.resource_executor.create_services(&plan).await;
+            pre_steps.extend(steps);
+
+            // Phase 2: rewrite env vars — source database URLs point at the
+            // new managed services, source-generated domains point at the
+            // environment's preview hostname.
+            match self.config_service.get_settings().await {
+                Ok(settings) => {
+                    let preview_host = super::resource_executor::preview_hostname(
+                        &settings.preview_domain,
+                        &plan.environment.subdomain,
+                    );
+                    let rewrites = super::resource_executor::build_env_rewrites(
+                        &plan,
+                        &created,
+                        &preview_host,
+                    );
+                    let changed =
+                        super::resource_executor::apply_env_rewrites(&mut plan, &rewrites);
+                    if changed > 0 {
+                        pre_steps.push(temps_import_types::StepResult {
+                            step_id: "rewrite-env-vars".to_string(),
+                            step_title: "Rewrite environment variables for temps".to_string(),
+                            success: true,
+                            skipped: false,
+                            message: format!(
+                                "Rewrote {} environment variable(s): source database URLs now point at the new managed service(s) and source-generated domains at '{}'",
+                                changed, preview_host
+                            ),
+                            created_resources: vec![],
+                            duration_seconds: 0.0,
+                        });
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Could not load settings for env-var rewriting during import {}: {} — imported values are unchanged",
+                        session_id, e
+                    );
+                }
+            }
+            created
+        };
+
+        // Delegate project/environment/deployment creation to the importer
+        let mut outcome = importer
             .execute(
                 context,
-                session.plan.clone(),
+                plan.clone(),
                 self as &dyn temps_import_types::ImportServiceProvider,
             )
             .await
             .map_err(|e| ImportServiceError::ExecutionFailed(e.to_string()))?;
+
+        // Phase 3 (real runs only, once the environment exists): custom
+        // domains and data population.
+        if !dry_run && outcome.success {
+            if let (Some(project_id), Some(environment_id)) =
+                (outcome.project_id, outcome.environment_id)
+            {
+                let (domain_steps, domain_resources) = self
+                    .resource_executor
+                    .create_domains(&plan, project_id, environment_id)
+                    .await;
+                outcome.step_results.extend(domain_steps);
+                outcome.created_resources.extend(domain_resources);
+            }
+            let populate_steps = self
+                .resource_executor
+                .populate_services(&created_services)
+                .await;
+            outcome.step_results.extend(populate_steps);
+        }
+
+        // Pre-execution steps (services, env rewrite) come first in the report
+        let mut step_results = pre_steps;
+        step_results.extend(outcome.step_results);
 
         // Convert ImportOutcome to ExecuteImportResponse
         Ok(ExecuteImportResponse {
@@ -410,7 +495,7 @@ impl ImportOrchestrator {
             project_id: outcome.project_id,
             environment_id: outcome.environment_id,
             deployment_id: outcome.deployment_id,
-            step_results: outcome.step_results,
+            step_results,
         })
     }
 
