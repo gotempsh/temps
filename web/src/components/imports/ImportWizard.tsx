@@ -13,6 +13,7 @@ import type {
   CreatePlanResponse,
   RepositoryResponse,
 } from '@/api/client/types.gen'
+import { SourceLogo } from '@/components/imports/SourceLogo'
 import { BranchSelector } from '@/components/deployments/BranchSelector'
 import { RepositorySelector } from '@/components/repository/RepositorySelector'
 import { FrameworkSelector } from '@/components/project/FrameworkSelector'
@@ -30,6 +31,7 @@ import {
 } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Textarea } from '@/components/ui/textarea'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import {
   Select,
@@ -75,6 +77,46 @@ interface ImportWizardProps {
   className?: string
 }
 
+/// Per-source credential inputs. Sources absent from this map (docker) need
+/// no credentials; `kubeconfig` sources use a textarea into credentials.extra.
+const SOURCE_CREDENTIALS: Record<
+  string,
+  {
+    fields: Array<'base_url' | 'token' | 'kubeconfig'>
+    baseUrlPlaceholder?: string
+    tokenHelp?: string
+  }
+> = {
+  coolify: {
+    fields: ['base_url', 'token'],
+    baseUrlPlaceholder: 'http://your-coolify-server:8000',
+    tokenHelp:
+      'Coolify → Keys & Tokens → API tokens (the instance API toggle must be enabled)',
+  },
+  dokploy: {
+    fields: ['base_url', 'token'],
+    baseUrlPlaceholder: 'http://your-dokploy-server:3000',
+    tokenHelp:
+      'Dokploy → Settings → API/CLI → Generate API key. Disable rate limiting on the key — Dokploy defaults to 10 requests/day, which is not enough for discovery.',
+  },
+  caprover: {
+    fields: ['base_url', 'token'],
+    baseUrlPlaceholder: 'http://your-caprover-server:3000',
+    tokenHelp:
+      'Enter the CapRover admin password (the install default is captain42 until changed).',
+  },
+  kubernetes: {
+    fields: ['kubeconfig'],
+    tokenHelp:
+      'Paste a kubeconfig with an embedded token or client certificate. exec-based auth (EKS/GKE plugins) is not supported — mint a ServiceAccount token instead.',
+  },
+  vercel: { fields: ['token'] },
+  railway: { fields: ['token'] },
+  netlify: { fields: ['token'] },
+  render: { fields: ['token'] },
+  fly: { fields: ['token'] },
+}
+
 const STEP_CONFIG = {
   'select-source': {
     title: 'Select Import Source',
@@ -118,6 +160,10 @@ export function ImportWizard({ onCancel, className }: ImportWizardProps) {
   )
   const [selectedWorkload, setSelectedWorkload] =
     useState<WorkloadDescriptor | null>(null)
+  // Source credentials (kept in memory only — sent per-request, never stored)
+  const [credentialBaseUrl, setCredentialBaseUrl] = useState('')
+  const [credentialToken, setCredentialToken] = useState('')
+  const [credentialKubeconfig, setCredentialKubeconfig] = useState('')
   const [selectedRepository, setSelectedRepository] =
     useState<RepositoryResponse | null>(null)
   const [selectedConnectionId, setSelectedConnectionId] = useState<
@@ -381,6 +427,34 @@ export function ImportWizard({ onCancel, className }: ImportWizardProps) {
     setSelectedSource(source)
   }
 
+  // Credential fields required for the selected source (empty = none needed)
+  const credentialFields = selectedSource
+    ? (SOURCE_CREDENTIALS[selectedSource]?.fields ?? [])
+    : []
+
+  const credentialsComplete = credentialFields.every((field) => {
+    if (field === 'base_url') return credentialBaseUrl.trim() !== ''
+    if (field === 'token') return credentialToken.trim() !== ''
+    return credentialKubeconfig.trim() !== ''
+  })
+
+  // Build the per-request credentials payload for the selected source
+  const buildCredentials = () => {
+    if (credentialFields.length === 0) return undefined
+    const extra: Record<string, string> = {}
+    if (credentialFields.includes('kubeconfig')) {
+      extra.kubeconfig = credentialKubeconfig
+    }
+    return {
+      base_url: credentialFields.includes('base_url')
+        ? credentialBaseUrl.trim()
+        : null,
+      token: credentialFields.includes('token') ? credentialToken.trim() : null,
+      team_id: null,
+      extra,
+    }
+  }
+
   // Handle discover workloads
   const handleDiscoverWorkloads = () => {
     if (!selectedSource) return
@@ -388,6 +462,7 @@ export function ImportWizard({ onCancel, className }: ImportWizardProps) {
     discoverMutation.mutate({
       body: {
         source: selectedSource,
+        credentials: buildCredentials(),
       },
     })
   }
@@ -415,6 +490,7 @@ export function ImportWizard({ onCancel, className }: ImportWizardProps) {
         source: selectedSource,
         workload_id: selectedWorkload.id,
         repository_id: selectedRepository?.id || null,
+        credentials: buildCredentials(),
       },
     })
   }
@@ -469,7 +545,7 @@ export function ImportWizard({ onCancel, className }: ImportWizardProps) {
   const canGoNext = () => {
     switch (currentStep) {
       case 'select-source':
-        return !!selectedSource
+        return !!selectedSource && credentialsComplete
       case 'discover-workloads':
         return !!selectedWorkload
       case 'select-repository':
@@ -560,7 +636,10 @@ export function ImportWizard({ onCancel, className }: ImportWizardProps) {
                       <CardHeader>
                         <div className="flex items-center justify-between">
                           <div className="flex items-center gap-3">
-                            <Server className="h-8 w-8 text-primary" />
+                            <SourceLogo
+                              source={source.source}
+                              className="h-8 w-8 shrink-0"
+                            />
                             <div>
                               <CardTitle className="text-base">
                                 {source.name}
@@ -592,6 +671,71 @@ export function ImportWizard({ onCancel, className }: ImportWizardProps) {
                   ))}
                 </div>
               </RadioGroup>
+            )}
+
+            {selectedSource && credentialFields.length > 0 && (
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-base">
+                    Connect to{' '}
+                    {sources?.find((s) => s.source === selectedSource)?.name ??
+                      selectedSource}
+                  </CardTitle>
+                  <CardDescription className="text-xs">
+                    Credentials are used for this import only — they are never
+                    stored.
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  {credentialFields.includes('base_url') && (
+                    <div className="space-y-2">
+                      <Label htmlFor="import-base-url">Instance URL</Label>
+                      <Input
+                        id="import-base-url"
+                        placeholder={
+                          SOURCE_CREDENTIALS[selectedSource]
+                            ?.baseUrlPlaceholder ?? 'https://…'
+                        }
+                        value={credentialBaseUrl}
+                        onChange={(e) => setCredentialBaseUrl(e.target.value)}
+                      />
+                    </div>
+                  )}
+                  {credentialFields.includes('token') && (
+                    <div className="space-y-2">
+                      <Label htmlFor="import-token">API token</Label>
+                      <Input
+                        id="import-token"
+                        type="password"
+                        autoComplete="off"
+                        placeholder="Paste the API token"
+                        value={credentialToken}
+                        onChange={(e) => setCredentialToken(e.target.value)}
+                      />
+                    </div>
+                  )}
+                  {credentialFields.includes('kubeconfig') && (
+                    <div className="space-y-2">
+                      <Label htmlFor="import-kubeconfig">Kubeconfig</Label>
+                      <Textarea
+                        id="import-kubeconfig"
+                        rows={8}
+                        className="font-mono text-xs"
+                        placeholder="apiVersion: v1&#10;kind: Config&#10;…"
+                        value={credentialKubeconfig}
+                        onChange={(e) =>
+                          setCredentialKubeconfig(e.target.value)
+                        }
+                      />
+                    </div>
+                  )}
+                  {SOURCE_CREDENTIALS[selectedSource]?.tokenHelp && (
+                    <p className="text-xs text-muted-foreground">
+                      {SOURCE_CREDENTIALS[selectedSource].tokenHelp}
+                    </p>
+                  )}
+                </CardContent>
+              </Card>
             )}
           </div>
         )
