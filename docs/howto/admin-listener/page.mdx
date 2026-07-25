@@ -131,7 +131,7 @@ export TEMPS_ADMIN_ALLOWED_HOSTS=admin.temps.example.com
 export TEMPS_ADMIN_TRUST_FORWARDED_FOR=true             # honor proxy's XFF
 ```
 
-```caddy
+```nginx
 # Caddyfile
 admin.temps.example.com {
     reverse_proxy 127.0.0.1:8081
