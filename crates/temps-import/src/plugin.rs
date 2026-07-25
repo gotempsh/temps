@@ -62,6 +62,12 @@ impl TempsPlugin for ImportPlugin {
                 }
             }
 
+            // Register Kubernetes importer (stateless — cluster credentials
+            // arrive per-request as a kubeconfig, so construction cannot fail)
+            orchestrator
+                .register_importer(Arc::new(temps_import_kubernetes::KubernetesImporter::new()));
+            tracing::info!("Kubernetes importer registered successfully");
+
             let orchestrator = Arc::new(orchestrator);
             context.register_service(orchestrator);
 

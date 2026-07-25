@@ -563,6 +563,7 @@ impl WorkloadImporter for DockerImporter {
             steps,
             summary,
             metadata,
+            cost_analysis: None, // Docker imports are container-level, no cluster to price
         })
     }
 
@@ -887,6 +888,7 @@ impl WorkloadImporter for DockerImporter {
             supports_services: false,         // Docker doesn't have managed services
             supports_domains: false,          // Docker doesn't have managed domains
             supports_project_snapshot: false, // Docker uses workload-level snapshots
+            supports_cost_analysis: false,    // No cluster/node inventory to price
         }
     }
 }
@@ -1636,6 +1638,7 @@ mod tests {
                 complexity: PlanComplexity::Low,
                 warnings: vec![],
             },
+            cost_analysis: None,
         }
     }
 

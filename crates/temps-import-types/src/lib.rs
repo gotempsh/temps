@@ -23,11 +23,18 @@
 //! Importer implementations (e.g., `temps-import-docker`, `temps-import-vercel`)
 //! depend on this crate and implement the [`WorkloadImporter`] trait.
 
+pub mod cost;
 pub mod error;
 pub mod importer;
 pub mod plan;
 pub mod snapshot;
 pub mod validation;
+
+// Cost analysis types
+pub use cost::{
+    CloudProvider, ClusterCapacity, CostAnalysis, NodeCostInfo, OverprovisioningAssessment,
+    OverprovisioningVerdict, ResourceFootprint, TargetRecommendation, UsageSource,
+};
 
 // Error types
 pub use error::{ImportError, ImportResult};

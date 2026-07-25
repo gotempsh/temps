@@ -51,6 +51,8 @@ pub enum ImportSource {
     Render,
     /// Fly.io deployments (containers, machines)
     Fly,
+    /// Kubernetes clusters (Deployments, StatefulSets, CronJobs via kubeconfig)
+    Kubernetes,
     /// Custom/other source
     Custom,
 }
@@ -67,6 +69,7 @@ impl ImportSource {
             ImportSource::Railway => "railway",
             ImportSource::Render => "render",
             ImportSource::Fly => "fly",
+            ImportSource::Kubernetes => "kubernetes",
             ImportSource::Custom => "custom",
         }
     }
@@ -96,6 +99,7 @@ impl std::str::FromStr for ImportSource {
             "railway" => Ok(ImportSource::Railway),
             "render" => Ok(ImportSource::Render),
             "fly" => Ok(ImportSource::Fly),
+            "kubernetes" => Ok(ImportSource::Kubernetes),
             "custom" => Ok(ImportSource::Custom),
             _ => Err(crate::ImportError::SourceNotAccessible(format!(
                 "Unknown import source: {}",
@@ -498,4 +502,6 @@ pub struct ImporterCapabilities {
     pub supports_domains: bool,
     /// Supports full project-level snapshots (describe_project)
     pub supports_project_snapshot: bool,
+    /// Supports cluster cost + overprovisioning analysis (CostAnalysis in plan)
+    pub supports_cost_analysis: bool,
 }

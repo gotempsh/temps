@@ -124,6 +124,7 @@ impl ImportOrchestrator {
                     supports_services: capabilities.supports_services,
                     supports_domains: capabilities.supports_domains,
                     supports_project_snapshot: capabilities.supports_project_snapshot,
+                    supports_cost_analysis: capabilities.supports_cost_analysis,
                     requires_credentials: source.requires_credentials(),
                 },
             });
@@ -182,11 +183,20 @@ impl ImportOrchestrator {
 
         let importer = self.get_importer(source)?;
 
-        // Get detailed snapshot
-        let snapshot = importer.describe(credentials, &workload_id).await?;
-
-        // Generate plan
-        let mut plan = importer.generate_plan(snapshot.clone())?;
+        // Get detailed snapshot and generate the plan. Importers that support
+        // project-level snapshots (platform/cluster migrations) go through
+        // describe_project/generate_project_plan so attached services, domains,
+        // and cost analysis make it into the plan; workload-level importers
+        // (Docker) keep the original describe/generate_plan path.
+        let (snapshot, mut plan) = if importer.capabilities().supports_project_snapshot {
+            let project_snapshot = importer.describe_project(credentials, &workload_id).await?;
+            let plan = importer.generate_project_plan(project_snapshot.clone())?;
+            (project_snapshot.primary_workload, plan)
+        } else {
+            let snapshot = importer.describe(credentials, &workload_id).await?;
+            let plan = importer.generate_plan(snapshot.clone())?;
+            (snapshot, plan)
+        };
 
         // Fetch repository information if repository ID is provided
         let (git_provider_connection_id, repo_owner, repo_name) = if let Some(repo_id) =
@@ -534,6 +544,7 @@ mod tests {
                 complexity: PlanComplexity::Low,
                 warnings: vec![],
             },
+            cost_analysis: None,
         }
     }
 

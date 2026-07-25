@@ -12062,6 +12062,7 @@ dependencies = [
  "temps-entities",
  "temps-git",
  "temps-import-docker",
+ "temps-import-kubernetes",
  "temps-import-types",
  "temps-presets",
  "temps-projects",
@@ -12087,6 +12088,28 @@ dependencies = [
  "temps-deployments",
  "temps-entities",
  "temps-git",
+ "temps-import-types",
+ "temps-presets",
+ "temps-projects",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "temps-import-kubernetes"
+version = "0.1.0-beta.54"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "reqwest 0.12.28",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "temps-core",
+ "temps-entities",
  "temps-import-types",
  "temps-presets",
  "temps-projects",

@@ -50,6 +50,7 @@ members = [
     "crates/temps-import-types",
     "crates/temps-import",
     "crates/temps-import-docker",
+    "crates/temps-import-kubernetes",
     "crates/temps-captcha-wasm",
     "crates/temps-webhooks",
     "crates/temps-email",

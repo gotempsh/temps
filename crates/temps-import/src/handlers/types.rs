@@ -44,6 +44,8 @@ pub struct ImportSourceCapabilities {
     pub supports_domains: bool,
     /// Supports full project-level snapshots
     pub supports_project_snapshot: bool,
+    /// Supports cluster cost + overprovisioning analysis in the plan
+    pub supports_cost_analysis: bool,
     /// Whether this source requires API credentials (token, base URL)
     pub requires_credentials: bool,
 }

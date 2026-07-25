@@ -70,6 +70,13 @@ pub struct ImportPlan {
     pub summary: MigrationSummary,
     /// Plan metadata
     pub metadata: PlanMetadata,
+
+    // -- Cluster cost + rightsizing analysis (cluster-level sources only) --
+    /// Cost, overprovisioning, and savings analysis. Populated by importers
+    /// that can observe the whole source cluster (currently Kubernetes);
+    /// `None` for container/platform imports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_analysis: Option<crate::cost::CostAnalysis>,
 }
 
 // ---------------------------------------------------------------------------
