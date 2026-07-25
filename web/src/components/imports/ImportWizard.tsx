@@ -105,6 +105,12 @@ const SOURCE_CREDENTIALS: Record<
     tokenHelp:
       'Enter the CapRover admin password (the install default is captain42 until changed).',
   },
+  portainer: {
+    fields: ['base_url', 'token'],
+    baseUrlPlaceholder: 'https://your-portainer-host:9443',
+    tokenHelp:
+      'Enter the Portainer admin password. A non-admin username can be supplied via the API (credentials.extra.username); the default is "admin".',
+  },
   kubernetes: {
     fields: ['kubeconfig'],
     tokenHelp:

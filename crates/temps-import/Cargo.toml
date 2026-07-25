@@ -15,6 +15,7 @@ temps-import-kubernetes = { path = "../temps-import-kubernetes" }
 temps-import-coolify = { path = "../temps-import-coolify" }
 temps-import-dokploy = { path = "../temps-import-dokploy" }
 temps-import-caprover = { path = "../temps-import-caprover" }
+temps-import-portainer = { path = "../temps-import-portainer" }
 temps-core = { path = "../temps-core" }
 temps-entities = { path = "../temps-entities" }
 temps-deployments = { path = "../temps-deployments" }

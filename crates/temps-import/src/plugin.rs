@@ -98,6 +98,12 @@ impl TempsPlugin for ImportPlugin {
                 .register_importer(Arc::new(temps_import_caprover::CaproverImporter::new()));
             tracing::info!("CapRover importer registered successfully");
 
+            // Register Portainer importer (stateless — instance URL +
+            // password arrive per-request, so construction cannot fail)
+            orchestrator
+                .register_importer(Arc::new(temps_import_portainer::PortainerImporter::new()));
+            tracing::info!("Portainer importer registered successfully");
+
             let orchestrator = Arc::new(orchestrator);
             context.register_service(orchestrator);
 

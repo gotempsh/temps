@@ -12069,6 +12069,7 @@ dependencies = [
  "temps-import-docker",
  "temps-import-dokploy",
  "temps-import-kubernetes",
+ "temps-import-portainer",
  "temps-import-types",
  "temps-presets",
  "temps-projects",
@@ -12187,6 +12188,27 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "temps-import-portainer"
+version = "0.1.0-beta.54"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "reqwest 0.12.28",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "temps-core",
+ "temps-entities",
+ "temps-import-types",
+ "temps-presets",
+ "temps-projects",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
 ]
 
 [[package]]

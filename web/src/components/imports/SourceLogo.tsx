@@ -1,6 +1,7 @@
 import {
   siCaprover,
   siCoolify,
+  siPortainer,
   siDocker,
   siFlydotio,
   siKubernetes,
@@ -18,6 +19,7 @@ const BRAND_ICONS: Record<string, { path: string; hex: string; title: string }> 
     kubernetes: siKubernetes,
     coolify: siCoolify,
     caprover: siCaprover,
+    portainer: siPortainer,
     vercel: siVercel,
     railway: siRailway,
     netlify: siNetlify,
