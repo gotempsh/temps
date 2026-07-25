@@ -124,11 +124,15 @@ impl ResourceExecutor {
                 continue;
             };
 
+            let source_url = service_plan
+                .parameters
+                .get(SOURCE_URL_PARAM)
+                .and_then(|v| v.as_str());
             let request = CreateExternalServiceRequest {
                 name: service_plan.name.clone(),
                 service_type,
                 version: service_plan.version.clone(),
-                parameters: HashMap::new(),
+                parameters: service_parameters(&service_type, &service_plan.name, source_url),
                 node_id: None,
                 topology: "standalone".to_string(),
                 members: vec![],
@@ -136,31 +140,15 @@ impl ResourceExecutor {
 
             match self.external_services.create_service(request).await {
                 Ok(info) => {
-                    let local_url = match self.external_services.get_service(info.id).await {
-                        Ok(model) => match self.external_services.get_local_address(model).await {
-                            Ok(address) => Some(address),
-                            Err(e) => {
-                                warn!(
-                                    "Created service {} but could not resolve its local address: {}",
-                                    info.id, e
-                                );
-                                None
-                            }
-                        },
-                        Err(e) => {
-                            warn!(
-                                "Created service {} but could not re-read it: {}",
-                                info.id, e
-                            );
-                            None
-                        }
-                    };
+                    let local_url = self.local_dsn(info.id, &service_plan.service_type).await;
+                    if local_url.is_none() {
+                        warn!(
+                            "Created service {} but could not build its local connection URL — data population and env rewriting are skipped for it",
+                            info.id
+                        );
+                    }
 
-                    let source_url = service_plan
-                        .parameters
-                        .get(SOURCE_URL_PARAM)
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
+                    let source_url = source_url.map(|s| s.to_string());
 
                     resources.push(CreatedResource {
                         resource_type: "service".to_string(),
@@ -209,6 +197,49 @@ impl ResourceExecutor {
         }
 
         (steps, created, resources)
+    }
+
+    /// Build a locally reachable, correctly encoded connection URL for a
+    /// created service. `get_local_address` yields only `host:port`; the
+    /// credentials come from the service's (decrypted) config parameters.
+    async fn local_dsn(&self, service_id: i32, plan_type: &str) -> Option<String> {
+        let model = self.external_services.get_service(service_id).await.ok()?;
+        let config = self
+            .external_services
+            .get_service_config(service_id)
+            .await
+            .ok()?;
+        let address = self.external_services.get_local_address(model).await.ok()?;
+        let (host, port) = address.rsplit_once(':')?;
+
+        let parameter = |key: &str| {
+            config
+                .parameters
+                .get(key)
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        };
+        let scheme = match plan_type {
+            "postgres" | "postgresql" => "postgres",
+            "mysql" | "mariadb" => "mysql",
+            "mongodb" | "mongo" => "mongodb",
+            "redis" | "keydb" | "dragonfly" => "redis",
+            _ => return None,
+        };
+
+        // url::Url percent-encodes credentials correctly on serialization —
+        // generated passwords may contain %, ^, + and other URL-hostile chars.
+        let mut url = url::Url::parse(&format!("{}://{}:{}", scheme, host, port)).ok()?;
+        if let Some(username) = parameter("username") {
+            url.set_username(&username).ok()?;
+        }
+        if let Some(password) = parameter("password") {
+            url.set_password(Some(&password)).ok()?;
+        }
+        if let Some(database) = parameter("database") {
+            url.set_path(&database);
+        }
+        Some(url.to_string())
     }
 
     /// Copy data into each created service that has a reachable source URL,
@@ -366,9 +397,13 @@ impl ResourceExecutor {
         let mut wait = self
             .docker
             .wait_container(&container.id, None::<WaitContainerOptions>);
+        // bollard's wait errors on nonzero exit codes with a often-empty
+        // message — treat it as a failed status and let the log tail explain.
         let status = match wait.next().await {
             Some(Ok(result)) => result.status_code,
+            Some(Err(bollard::errors::Error::DockerContainerWaitError { code, .. })) => code,
             Some(Err(e)) => {
+                let logs = self.container_log_tail(&container.id).await;
                 let _ = self
                     .docker
                     .remove_container(
@@ -379,7 +414,11 @@ impl ResourceExecutor {
                         }),
                     )
                     .await;
-                return Err(format!("transfer container failed: {}", e));
+                return Err(format!(
+                    "transfer container failed: {} — {}",
+                    e,
+                    logs.chars().take(400).collect::<String>()
+                ));
             }
             None => -1,
         };
@@ -501,6 +540,55 @@ impl ResourceExecutor {
         }
 
         (steps, resources)
+    }
+}
+
+/// Required creation parameters per service type, derived from the source
+/// connection URL when available so the imported service matches what the
+/// application expects (database name, user). Passwords are always
+/// auto-generated by the service manager.
+fn service_parameters(
+    service_type: &ServiceType,
+    plan_name: &str,
+    source_url: Option<&str>,
+) -> HashMap<String, serde_json::Value> {
+    let mut parameters = HashMap::new();
+    if !matches!(
+        service_type,
+        ServiceType::Postgres | ServiceType::Mariadb | ServiceType::Mongodb
+    ) {
+        return parameters;
+    }
+
+    let parsed = source_url.and_then(|u| url::Url::parse(u).ok());
+    let database = parsed
+        .as_ref()
+        .map(|u| u.path().trim_start_matches('/').to_string())
+        .filter(|db| !db.is_empty())
+        .unwrap_or_else(|| sanitize_db_identifier(plan_name));
+    let username = parsed
+        .as_ref()
+        .map(|u| u.username().to_string())
+        .filter(|user| !user.is_empty())
+        .unwrap_or_else(|| "app".to_string());
+
+    parameters.insert("database".to_string(), serde_json::json!(database));
+    parameters.insert("username".to_string(), serde_json::json!(username));
+    parameters
+}
+
+/// A safe database identifier from an arbitrary service name
+fn sanitize_db_identifier(name: &str) -> String {
+    let cleaned: String = name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let trimmed = cleaned.trim_matches('_');
+    if trimmed.is_empty() {
+        "app".to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -788,5 +876,33 @@ mod tests {
         let host = preview_hostname("preview.example.com", "lab");
         assert!(host.contains("lab"));
         assert!(host.ends_with("preview.example.com"));
+    }
+}
+
+#[cfg(test)]
+mod parameter_tests {
+    use super::*;
+
+    #[test]
+    fn derives_database_and_username_from_source_url() {
+        let params = service_parameters(
+            &ServiceType::Postgres,
+            "lab-db",
+            Some("postgres://labuser:pw@1.2.3.4:5432/labdb"),
+        );
+        assert_eq!(params.get("database").unwrap(), "labdb");
+        assert_eq!(params.get("username").unwrap(), "labuser");
+    }
+
+    #[test]
+    fn falls_back_to_sanitized_name_without_source_url() {
+        let params = service_parameters(&ServiceType::Postgres, "lab-db", None);
+        assert_eq!(params.get("database").unwrap(), "lab_db");
+        assert_eq!(params.get("username").unwrap(), "app");
+    }
+
+    #[test]
+    fn redis_needs_no_parameters() {
+        assert!(service_parameters(&ServiceType::Redis, "cache", None).is_empty());
     }
 }
