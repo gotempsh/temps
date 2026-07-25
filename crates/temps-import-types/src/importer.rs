@@ -53,6 +53,8 @@ pub enum ImportSource {
     Fly,
     /// Kubernetes clusters (Deployments, StatefulSets, CronJobs via kubeconfig)
     Kubernetes,
+    /// CapRover platform (apps, one-click databases)
+    Caprover,
     /// Custom/other source
     Custom,
 }
@@ -70,6 +72,7 @@ impl ImportSource {
             ImportSource::Render => "render",
             ImportSource::Fly => "fly",
             ImportSource::Kubernetes => "kubernetes",
+            ImportSource::Caprover => "caprover",
             ImportSource::Custom => "custom",
         }
     }
@@ -100,6 +103,7 @@ impl std::str::FromStr for ImportSource {
             "render" => Ok(ImportSource::Render),
             "fly" => Ok(ImportSource::Fly),
             "kubernetes" => Ok(ImportSource::Kubernetes),
+            "caprover" => Ok(ImportSource::Caprover),
             "custom" => Ok(ImportSource::Custom),
             _ => Err(crate::ImportError::SourceNotAccessible(format!(
                 "Unknown import source: {}",

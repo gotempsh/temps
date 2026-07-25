@@ -68,6 +68,22 @@ impl TempsPlugin for ImportPlugin {
                 .register_importer(Arc::new(temps_import_kubernetes::KubernetesImporter::new()));
             tracing::info!("Kubernetes importer registered successfully");
 
+            // Register Coolify importer (stateless — instance URL + API token
+            // arrive per-request as credentials, so construction cannot fail)
+            orchestrator.register_importer(Arc::new(temps_import_coolify::CoolifyImporter::new()));
+            tracing::info!("Coolify importer registered successfully");
+
+            // Register Dokploy importer (stateless — instance URL + API key
+            // arrive per-request as credentials, so construction cannot fail)
+            orchestrator.register_importer(Arc::new(temps_import_dokploy::DokployImporter::new()));
+            tracing::info!("Dokploy importer registered successfully");
+
+            // Register CapRover importer (stateless — instance URL + password
+            // arrive per-request as credentials, so construction cannot fail)
+            orchestrator
+                .register_importer(Arc::new(temps_import_caprover::CaproverImporter::new()));
+            tracing::info!("CapRover importer registered successfully");
+
             let orchestrator = Arc::new(orchestrator);
             context.register_service(orchestrator);
 

@@ -1,0 +1,138 @@
+//! Minimal typed client for the Coolify REST API.
+//!
+//! Built per-request from [`temps_import_types::ImportCredentials`] — the
+//! base URL goes through the same SSRF guard as every other importer and the
+//! token is never stored.
+
+use crate::error::CoolifyImportError;
+use crate::model::{
+    CoolifyApplication, CoolifyDatabase, CoolifyEnvVar, CoolifyProject, CoolifyProjectDetail,
+    CoolifyServer,
+};
+use serde::de::DeserializeOwned;
+use std::time::Duration;
+use temps_core::url_validation::validate_external_url;
+use temps_import_types::ImportCredentials;
+
+/// HTTP client bound to one Coolify instance
+pub struct CoolifyClient {
+    http: reqwest::Client,
+    base_url: url::Url,
+    token: String,
+}
+
+impl CoolifyClient {
+    /// Build a client from per-request credentials.
+    pub fn from_credentials(credentials: &ImportCredentials) -> Result<Self, CoolifyImportError> {
+        let base = credentials
+            .base_url
+            .as_deref()
+            .filter(|u| !u.is_empty())
+            .ok_or(CoolifyImportError::MissingBaseUrl)?;
+        let token = credentials
+            .token
+            .as_deref()
+            .filter(|t| !t.is_empty())
+            .ok_or(CoolifyImportError::MissingToken)?
+            .to_string();
+
+        let base_url =
+            validate_external_url(base).map_err(|e| CoolifyImportError::InvalidBaseUrl {
+                url: base.to_string(),
+                reason: e.to_string(),
+            })?;
+
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| CoolifyImportError::Http {
+                operation: "build http client".to_string(),
+                reason: e.to_string(),
+            })?;
+
+        Ok(Self {
+            http,
+            base_url,
+            token,
+        })
+    }
+
+    async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, CoolifyImportError> {
+        let operation = format!("GET {}", path);
+        let url = self
+            .base_url
+            .join(path)
+            .map_err(|e| CoolifyImportError::InvalidBaseUrl {
+                url: format!("{}{}", self.base_url, path),
+                reason: e.to_string(),
+            })?;
+
+        let response = self
+            .http
+            .get(url)
+            .bearer_auth(&self.token)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| CoolifyImportError::Http {
+                operation: operation.clone(),
+                reason: e.to_string(),
+            })?;
+
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|e| CoolifyImportError::Http {
+                operation: operation.clone(),
+                reason: format!("failed to read response body: {}", e),
+            })?;
+
+        match status.as_u16() {
+            200 => {
+                serde_json::from_str(&body).map_err(|e| CoolifyImportError::UnexpectedResponse {
+                    operation,
+                    reason: e.to_string(),
+                })
+            }
+            401 => Err(CoolifyImportError::Unauthorized { operation }),
+            403 => Err(CoolifyImportError::ApiDisabled { operation }),
+            _ => Err(CoolifyImportError::Api {
+                operation,
+                status: status.as_u16(),
+                body: body.chars().take(500).collect(),
+            }),
+        }
+    }
+
+    pub async fn servers(&self) -> Result<Vec<CoolifyServer>, CoolifyImportError> {
+        self.get_json("/api/v1/servers").await
+    }
+
+    pub async fn projects(&self) -> Result<Vec<CoolifyProject>, CoolifyImportError> {
+        self.get_json("/api/v1/projects").await
+    }
+
+    pub async fn project_detail(
+        &self,
+        uuid: &str,
+    ) -> Result<CoolifyProjectDetail, CoolifyImportError> {
+        self.get_json(&format!("/api/v1/projects/{}", uuid)).await
+    }
+
+    pub async fn applications(&self) -> Result<Vec<CoolifyApplication>, CoolifyImportError> {
+        self.get_json("/api/v1/applications").await
+    }
+
+    pub async fn application_envs(
+        &self,
+        uuid: &str,
+    ) -> Result<Vec<CoolifyEnvVar>, CoolifyImportError> {
+        self.get_json(&format!("/api/v1/applications/{}/envs", uuid))
+            .await
+    }
+
+    pub async fn databases(&self) -> Result<Vec<CoolifyDatabase>, CoolifyImportError> {
+        self.get_json("/api/v1/databases").await
+    }
+}

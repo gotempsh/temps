@@ -12061,7 +12061,10 @@ dependencies = [
  "temps-deployments",
  "temps-entities",
  "temps-git",
+ "temps-import-caprover",
+ "temps-import-coolify",
  "temps-import-docker",
+ "temps-import-dokploy",
  "temps-import-kubernetes",
  "temps-import-types",
  "temps-presets",
@@ -12071,6 +12074,48 @@ dependencies = [
  "tracing",
  "utoipa",
  "uuid",
+]
+
+[[package]]
+name = "temps-import-caprover"
+version = "0.1.0-beta.54"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "reqwest 0.12.28",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "temps-core",
+ "temps-entities",
+ "temps-import-types",
+ "temps-presets",
+ "temps-projects",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "temps-import-coolify"
+version = "0.1.0-beta.54"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "reqwest 0.12.28",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "temps-core",
+ "temps-entities",
+ "temps-import-types",
+ "temps-presets",
+ "temps-projects",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
 ]
 
 [[package]]
@@ -12094,6 +12139,27 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "temps-import-dokploy"
+version = "0.1.0-beta.54"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "reqwest 0.12.28",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "temps-core",
+ "temps-entities",
+ "temps-import-types",
+ "temps-presets",
+ "temps-projects",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
 ]
 
 [[package]]
