@@ -296,16 +296,16 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
         </div>
       </div>
 
-      {/* Autofix section */}
-      {project.git_provider_connection_id && (
-        <div className="mb-6">
-          <AutofixButton
-            projectId={project.id}
-            projectSlug={project.slug}
-            errorGroupId={parseInt(errorGroupId!)}
-          />
-        </div>
-      )}
+      {/* Autofix section — always rendered. When the repo/provider/sandbox
+          aren't set up yet the card onboards the user instead of vanishing. */}
+      <div className="mb-6">
+        <AutofixButton
+          projectId={project.id}
+          projectSlug={project.slug}
+          errorGroupId={parseInt(errorGroupId!)}
+          gitConnected={!!project.git_provider_connection_id}
+        />
+      </div>
 
       {/* Tabs for different views */}
       <Tabs value={selectedTab} onValueChange={setSelectedTab}>

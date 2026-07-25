@@ -14,6 +14,8 @@ import {
 import { useQuery } from '@tanstack/react-query'
 import { Sparkles, Wand2 } from 'lucide-react'
 import { useNavigate } from 'react-router'
+import { useAutofixReadiness } from '@/hooks/useAutofixReadiness'
+import { useAutofixOnboarding } from './AutofixOnboardingContext'
 
 interface AutofixerPageProps {
   project: ProjectResponse
@@ -30,6 +32,12 @@ function formatTimeAgo(dateStr: string): string {
 
 export function AutofixerPage({ project }: AutofixerPageProps) {
   const navigate = useNavigate()
+  const { openOnboarding } = useAutofixOnboarding()
+  const readiness = useAutofixReadiness({
+    projectId: project.id,
+    projectSlug: project.slug,
+    projectGitConnected: !!project.git_provider_connection_id,
+  })
 
   // Fetch unresolved error groups to show fixable errors
   const { data: errorGroups, isLoading } = useQuery({
@@ -39,7 +47,11 @@ export function AutofixerPage({ project }: AutofixerPageProps) {
     }),
   })
 
-  const groups = (errorGroups as any)?.data || (errorGroups as any)?.items || errorGroups || []
+  const groups =
+    (errorGroups as any)?.data ||
+    (errorGroups as any)?.items ||
+    errorGroups ||
+    []
 
   if (isLoading) {
     return (
@@ -60,24 +72,46 @@ export function AutofixerPage({ project }: AutofixerPageProps) {
       </div>
 
       <p className="text-sm text-muted-foreground">
-        Select an error to analyze and fix with AI. Claude will read your codebase, identify the root cause, and generate a fix.
+        Select an error to analyze and fix with AI. Claude will read your
+        codebase, identify the root cause, and generate a fix.
       </p>
 
-      {!project.git_provider_connection_id && (
+      {!readiness.isLoading && !readiness.isReady && (
         <Card>
-          <CardContent className="p-6 text-center text-muted-foreground">
-            <p>Connect a git provider with write access to use the Autofixer.</p>
+          <CardContent className="flex flex-col items-start gap-3 p-6 sm:flex-row sm:items-center sm:justify-between">
+            <div className="min-w-0">
+              <p className="text-sm font-medium">Autofix isn't set up yet</p>
+              <p className="text-xs text-muted-foreground">
+                {readiness.firstIncomplete?.description ??
+                  'Finish setup to run AI fixes on your errors.'}
+              </p>
+            </div>
+            <Button
+              size="sm"
+              className="shrink-0"
+              onClick={() =>
+                openOnboarding({
+                  projectId: project.id,
+                  projectSlug: project.slug,
+                  projectGitConnected: !!project.git_provider_connection_id,
+                })
+              }
+            >
+              <Wand2 className="size-4" />
+              Set up autofix
+            </Button>
           </CardContent>
         </Card>
       )}
 
-      {project.git_provider_connection_id && groups.length === 0 && (
+      {groups.length === 0 && (
         <Card>
           <CardContent className="p-12 flex flex-col items-center justify-center text-center">
             <Sparkles className="h-12 w-12 text-muted-foreground mb-4" />
             <h2 className="text-lg font-semibold mb-2">No unresolved errors</h2>
             <p className="text-sm text-muted-foreground">
-              When errors occur, they'll appear here and you can fix them with AI.
+              When errors occur, they'll appear here and you can fix them with
+              AI.
             </p>
           </CardContent>
         </Card>
@@ -92,7 +126,9 @@ export function AutofixerPage({ project }: AutofixerPageProps) {
                   <TableHead>Error</TableHead>
                   <TableHead className="hidden md:table-cell">Type</TableHead>
                   <TableHead className="hidden md:table-cell">Count</TableHead>
-                  <TableHead className="hidden md:table-cell">Last seen</TableHead>
+                  <TableHead className="hidden md:table-cell">
+                    Last seen
+                  </TableHead>
                   <TableHead className="w-[180px]">Autofix</TableHead>
                 </TableRow>
               </TableHeader>
@@ -118,7 +154,9 @@ export function AutofixerPage({ project }: AutofixerPageProps) {
                         size="sm"
                         variant="outline"
                         onClick={() =>
-                          navigate(`/projects/${project.slug}/errors/${group.id}/autofix`)
+                          navigate(
+                            `/projects/${project.slug}/errors/${group.id}/autofix`
+                          )
                         }
                       >
                         <Wand2 className="h-3 w-3 mr-1" />
