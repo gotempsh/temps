@@ -382,9 +382,20 @@ export function AddEmailProvider() {
 
   return (
     <div className="flex-1 overflow-auto">
-      <div className="container mx-auto max-w-4xl px-4 py-6 sm:px-6">
+      <div className="px-4 py-6 sm:px-6">
         {step === 'type' && (
           <>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="mb-4 -ml-2 text-muted-foreground"
+              onClick={() => navigate('/email?tab=providers')}
+            >
+              <ArrowLeft className="mr-2 size-4" />
+              Back to providers
+            </Button>
+
             <div className="mb-6">
               <p className="text-sm font-medium text-muted-foreground">
                 Step 1 of 2
@@ -399,17 +410,6 @@ export function AddEmailProvider() {
             </div>
 
             <TypeCardRequirements onSelect={handleSelect} />
-
-            <div className="mt-6">
-              <Button
-                type="button"
-                variant="ghost"
-                onClick={() => navigate('/email?tab=providers')}
-              >
-                <ArrowLeft className="mr-2 size-4" />
-                Back to providers
-              </Button>
-            </div>
           </>
         )}
 

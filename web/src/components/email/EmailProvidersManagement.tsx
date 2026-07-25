@@ -60,6 +60,7 @@ import {
 import { AWSIcon } from '@/components/icons/AWSIcon'
 import { ScalewayIcon } from '@/components/icons/ScalewayIcon'
 import { useEffect, useState } from 'react'
+import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
 import { useForm } from 'react-hook-form'
 import { useNavigate } from 'react-router-dom'
 import { toast } from 'sonner'
@@ -966,6 +967,13 @@ export function EmailProvidersManagement() {
     null
   )
   const queryClient = useQueryClient()
+
+  // Keyboard shortcut: N to add a new provider (disabled while a dialog is open)
+  useKeyboardShortcut({
+    key: 'n',
+    path: '/email/providers/new',
+    enabled: !isEditDialogOpen && !isTestDialogOpen,
+  })
 
   const { data: providers, isLoading } = useQuery({
     queryKey: ['email-providers'],
