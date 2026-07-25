@@ -5,7 +5,12 @@ import {
 } from '@/api/client'
 import { AWSIcon } from '@/components/icons/AWSIcon'
 import { ScalewayIcon } from '@/components/icons/ScalewayIcon'
-import { problemMessage } from '@/components/email/sharedUtils'
+import {
+  awsRegions,
+  problemMessage,
+  providerTypeLabel,
+  scalewayRegions,
+} from '@/components/email/sharedUtils'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader } from '@/components/ui/card'
 import {
@@ -30,7 +35,7 @@ import { usePageTitle } from '@/hooks/usePageTitle'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { ArrowLeft, Check, Loader2, Server } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { useNavigate } from 'react-router-dom'
 import { toast } from 'sonner'
@@ -156,30 +161,6 @@ async function createEmailProvider(
   return response.data
 }
 
-// AWS regions for SES
-const awsRegions = [
-  { value: 'us-east-1', label: 'US East (N. Virginia)' },
-  { value: 'us-east-2', label: 'US East (Ohio)' },
-  { value: 'us-west-1', label: 'US West (N. California)' },
-  { value: 'us-west-2', label: 'US West (Oregon)' },
-  { value: 'eu-west-1', label: 'Europe (Ireland)' },
-  { value: 'eu-west-2', label: 'Europe (London)' },
-  { value: 'eu-west-3', label: 'Europe (Paris)' },
-  { value: 'eu-central-1', label: 'Europe (Frankfurt)' },
-  { value: 'ap-southeast-1', label: 'Asia Pacific (Singapore)' },
-  { value: 'ap-southeast-2', label: 'Asia Pacific (Sydney)' },
-  { value: 'ap-northeast-1', label: 'Asia Pacific (Tokyo)' },
-  { value: 'ap-south-1', label: 'Asia Pacific (Mumbai)' },
-  { value: 'sa-east-1', label: 'South America (São Paulo)' },
-]
-
-// Scaleway regions
-const scalewayRegions = [
-  { value: 'fr-par', label: 'Paris, France' },
-  { value: 'nl-ams', label: 'Amsterdam, Netherlands' },
-  { value: 'pl-waw', label: 'Warsaw, Poland' },
-]
-
 interface ProviderOption {
   id: ProviderType
   name: string
@@ -234,22 +215,11 @@ const providerOptions: ProviderOption[] = [
   },
 ]
 
-function providerTypeLabel(type: ProviderType): string {
-  switch (type) {
-    case 'ses':
-      return 'AWS SES'
-    case 'scaleway':
-      return 'Scaleway'
-    case 'smtp':
-      return 'SMTP'
-  }
-}
-
 // ============================================================================
-// Step 1 — provider type selection (three card-layout variants for ui.sh)
+// Step 1 — provider type selection
 // ============================================================================
 
-function TypeCardRequirements({
+function ProviderTypeCards({
   onSelect,
 }: {
   onSelect: (option: ProviderOption) => void
@@ -308,9 +278,17 @@ export function AddEmailProvider() {
   const queryClient = useQueryClient()
   const { setBreadcrumbs } = useBreadcrumbs()
   const [step, setStep] = useState<Step>('type')
+  const headingRef = useRef<HTMLHeadingElement>(null)
   const [selected, setSelected] = useState<ProviderOption | null>(null)
 
   usePageTitle('Add Email Provider')
+
+  // Selecting a type (or going back) unmounts the focused button; move focus
+  // to the new step's heading so keyboard and screen-reader users aren't
+  // dropped to <body>.
+  useEffect(() => {
+    headingRef.current?.focus()
+  }, [step])
 
   useEffect(() => {
     setBreadcrumbs([
@@ -400,7 +378,11 @@ export function AddEmailProvider() {
               <p className="text-sm font-medium text-muted-foreground">
                 Step 1 of 2
               </p>
-              <h1 className="mt-1 text-2xl font-semibold tracking-tight text-balance">
+              <h1
+                ref={headingRef}
+                tabIndex={-1}
+                className="mt-1 text-2xl font-semibold tracking-tight text-balance outline-none"
+              >
                 Choose a provider type
               </h1>
               <p className="mt-1 text-muted-foreground text-pretty">
@@ -409,7 +391,7 @@ export function AddEmailProvider() {
               </p>
             </div>
 
-            <TypeCardRequirements onSelect={handleSelect} />
+            <ProviderTypeCards onSelect={handleSelect} />
           </>
         )}
 
@@ -419,7 +401,11 @@ export function AddEmailProvider() {
               <p className="text-sm font-medium text-muted-foreground">
                 Step 2 of 2
               </p>
-              <h1 className="mt-1 text-2xl font-semibold tracking-tight text-balance">
+              <h1
+                ref={headingRef}
+                tabIndex={-1}
+                className="mt-1 text-2xl font-semibold tracking-tight text-balance outline-none"
+              >
                 Configure {providerTypeLabel(selected.id)}
               </h1>
               <p className="mt-1 text-muted-foreground text-pretty">
@@ -617,6 +603,7 @@ export function AddEmailProvider() {
                               <FormControl>
                                 <Input
                                   placeholder="12345678-1234-1234-1234-123456789012"
+                                  autoComplete="off"
                                   {...field}
                                 />
                               </FormControl>

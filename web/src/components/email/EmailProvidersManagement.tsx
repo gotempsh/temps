@@ -59,9 +59,12 @@ import { useNavigate } from 'react-router-dom'
 import { toast } from 'sonner'
 import { z } from 'zod'
 import {
+  awsRegions,
   deleteEmailProvider,
   problemMessage,
+  providerTypeLabel,
   readMaskedCreds,
+  scalewayRegions,
 } from './sharedUtils'
 
 // Types for email providers — alias over SDK response
@@ -111,30 +114,6 @@ const testEmailSchema = z.object({
 
 type TestEmailFormData = z.infer<typeof testEmailSchema>
 
-// AWS regions for SES
-const awsRegions = [
-  { value: 'us-east-1', label: 'US East (N. Virginia)' },
-  { value: 'us-east-2', label: 'US East (Ohio)' },
-  { value: 'us-west-1', label: 'US West (N. California)' },
-  { value: 'us-west-2', label: 'US West (Oregon)' },
-  { value: 'eu-west-1', label: 'Europe (Ireland)' },
-  { value: 'eu-west-2', label: 'Europe (London)' },
-  { value: 'eu-west-3', label: 'Europe (Paris)' },
-  { value: 'eu-central-1', label: 'Europe (Frankfurt)' },
-  { value: 'ap-southeast-1', label: 'Asia Pacific (Singapore)' },
-  { value: 'ap-southeast-2', label: 'Asia Pacific (Sydney)' },
-  { value: 'ap-northeast-1', label: 'Asia Pacific (Tokyo)' },
-  { value: 'ap-south-1', label: 'Asia Pacific (Mumbai)' },
-  { value: 'sa-east-1', label: 'South America (São Paulo)' },
-]
-
-// Scaleway regions
-const scalewayRegions = [
-  { value: 'fr-par', label: 'Paris, France' },
-  { value: 'nl-ams', label: 'Amsterdam, Netherlands' },
-  { value: 'pl-waw', label: 'Warsaw, Poland' },
-]
-
 function ProviderIcon({ type }: { type: 'ses' | 'scaleway' | 'smtp' }) {
   if (type === 'ses') {
     return <AWSIcon className="h-5 w-5 text-[#FF9900]" />
@@ -143,17 +122,6 @@ function ProviderIcon({ type }: { type: 'ses' | 'scaleway' | 'smtp' }) {
     return <ScalewayIcon className="h-5 w-5 text-[#4F0599]" />
   }
   return <Server className="h-5 w-5 text-slate-600 dark:text-slate-300" />
-}
-
-function providerTypeLabel(type: 'ses' | 'scaleway' | 'smtp'): string {
-  switch (type) {
-    case 'ses':
-      return 'AWS SES'
-    case 'scaleway':
-      return 'Scaleway'
-    case 'smtp':
-      return 'SMTP'
-  }
 }
 
 export function TestEmailDialog({
@@ -1025,6 +993,7 @@ export function EmailProvidersManagement() {
             <CreateActionButton
               to="/email/providers/new"
               label="Add Provider"
+              disabled={isEditDialogOpen || isTestDialogOpen}
             />
           }
         />
