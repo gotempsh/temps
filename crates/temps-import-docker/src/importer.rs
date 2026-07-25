@@ -415,6 +415,7 @@ impl WorkloadImporter for DockerImporter {
             entrypoint: snapshot.entrypoint.clone(),
             working_dir: snapshot.working_dir.clone(),
             health_check,
+            git: None,
         };
 
         // Calculate plan complexity
@@ -1619,6 +1620,7 @@ mod tests {
                 entrypoint: None,
                 working_dir: None,
                 health_check: None,
+                git: None,
             },
             services: vec![],
             domains: vec![],

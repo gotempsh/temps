@@ -12054,6 +12054,7 @@ dependencies = [
  "bollard",
  "chrono",
  "futures-util",
+ "reqwest 0.12.28",
  "sea-orm",
  "serde",
  "serde_json",

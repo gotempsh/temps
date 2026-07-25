@@ -401,7 +401,9 @@ impl ImportOrchestrator {
         let source = ImportSource::from_str(&session.plan.source)?;
         let importer = self.get_importer(source)?;
 
-        // Create execution context
+        // Create execution context (keep the branch around — the context is
+        // moved into the importer, but the deploy phase needs it too)
+        let deploy_branch = main_branch.clone();
         let context = temps_import_types::ImportContext {
             session_id: session_id.clone(),
             user_id,
@@ -425,7 +427,10 @@ impl ImportOrchestrator {
         let created_services = if dry_run {
             Vec::new()
         } else {
-            let (steps, created, _resources) = self.resource_executor.create_services(&plan).await;
+            let (steps, created, _resources) = self
+                .resource_executor
+                .create_services(&plan, &context.project_name)
+                .await;
             pre_steps.extend(steps);
 
             // Phase 2: rewrite env vars — source database URLs point at the
@@ -499,23 +504,85 @@ impl ImportOrchestrator {
             outcome.step_results.extend(populate_steps);
         }
 
+        // Phase 4 (real runs only): actually deploy the imported project and
+        // verify it answers. Creating rows is not a migration — until the app
+        // has been built, started, and responded, nothing has moved.
+        let mut operational = false;
+        if !dry_run && outcome.success {
+            if let (Some(project_id), Some(environment_id)) =
+                (outcome.project_id, outcome.environment_id)
+            {
+                let app_url = self.environment_url(environment_id).await;
+                let verifier = super::DeploymentVerifier::new(
+                    self.db.clone(),
+                    self.deployment_service.clone(),
+                );
+                let verification = verifier
+                    .deploy_and_verify(
+                        project_id,
+                        environment_id,
+                        Some(
+                            plan.deployment
+                                .git
+                                .as_ref()
+                                .map(|g| g.branch.clone())
+                                .filter(|b| !b.is_empty())
+                                .unwrap_or_else(|| deploy_branch.clone()),
+                        ),
+                        app_url,
+                        outcome.deployment_id,
+                    )
+                    .await;
+                operational = verification.operational;
+                outcome.step_results.extend(verification.steps);
+                outcome.warnings.extend(verification.warnings);
+                // The pipeline's deployment is the real one; the importer's
+                // placeholder row is only a record of what was imported.
+                if let Some(deployment_id) = verification.deployment_id {
+                    outcome.deployment_id = Some(deployment_id);
+                }
+            }
+        }
+
         // Pre-execution steps (services, env rewrite) come first in the report
         let mut step_results = pre_steps;
         step_results.extend(outcome.step_results);
 
-        // Convert ImportOutcome to ExecuteImportResponse
+        // An import only counts as completed when the application is actually
+        // running. Everything else is reported as failed so the user is never
+        // told a migration succeeded while the app is down — the created
+        // resources are listed in the steps either way.
+        let status = if outcome.success && (dry_run || operational) {
+            ImportExecutionStatus::Completed
+        } else {
+            ImportExecutionStatus::Failed
+        };
+
         Ok(ExecuteImportResponse {
             session_id: outcome.session_id,
-            status: if outcome.success {
-                ImportExecutionStatus::Completed
-            } else {
-                ImportExecutionStatus::Failed
-            },
+            status,
             project_id: outcome.project_id,
             environment_id: outcome.environment_id,
             deployment_id: outcome.deployment_id,
             step_results,
         })
+    }
+
+    /// The address the imported app should answer on, used for the post-deploy
+    /// check. Always the environment's own preview URL: it is served by this
+    /// proxy immediately, while imported custom domains only resolve here
+    /// after the user cuts DNS over — probing those would report a healthy
+    /// app as down.
+    async fn environment_url(&self, environment_id: i32) -> Option<String> {
+        let environment = temps_entities::environments::Entity::find_by_id(environment_id)
+            .one(self.db.as_ref())
+            .await
+            .ok()
+            .flatten()?;
+        self.deployment_service
+            .compute_environment_url(&environment.subdomain)
+            .await
+            .ok()
     }
 
     /// Get import status
@@ -629,6 +696,7 @@ mod tests {
                 entrypoint: None,
                 working_dir: None,
                 health_check: None,
+                git: None,
             },
             services: vec![],
             domains: vec![],

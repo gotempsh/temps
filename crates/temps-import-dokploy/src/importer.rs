@@ -12,7 +12,7 @@ use crate::validation::DokployValidationRules;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use temps_import_types::plan::{
-    DeploymentConfiguration, EnvironmentConfiguration, PlanComplexity, PlanMetadata,
+    DeploymentConfiguration, EnvironmentConfiguration, GitSourcePlan, PlanComplexity, PlanMetadata,
     ProjectConfiguration, ProjectType, Protocol,
 };
 use temps_import_types::{
@@ -285,6 +285,30 @@ fn deployment_config(snapshot: &WorkloadSnapshot) -> DeploymentConfiguration {
         target: None,
     });
 
+    // Git-built apps carry their repository into the plan so execution can
+    // link the temps project to it and run the real deployment pipeline.
+    let git = (snapshot.image.is_none() && !git_url.is_empty())
+        .then(|| url::Url::parse(git_url).ok())
+        .flatten()
+        .and_then(|parsed| {
+            let host = parsed.host_str()?.to_string();
+            let mut segments = parsed.path_segments()?;
+            let owner = segments.next()?.to_string();
+            let repo = segments.next()?.trim_end_matches(".git").to_string();
+            if owner.is_empty() || repo.is_empty() {
+                return None;
+            }
+            Some(GitSourcePlan {
+                clone_url: Some(format!("https://{}/{}/{}.git", host, owner, repo)),
+                // A plain HTTPS clone URL with no embedded credentials means
+                // the repository is cloneable without authentication.
+                is_public: parsed.username().is_empty() && parsed.password().is_none(),
+                owner,
+                repo,
+                branch: branch.to_string(),
+            })
+        });
+
     let env_vars: Vec<EnvironmentVariable> = {
         let mut vars: Vec<_> = snapshot.env.iter().collect();
         vars.sort_by(|a, b| a.0.cmp(b.0));
@@ -335,6 +359,7 @@ fn deployment_config(snapshot: &WorkloadSnapshot) -> DeploymentConfiguration {
         entrypoint: None,
         working_dir: None,
         health_check: None,
+        git,
     }
 }
 
@@ -1101,12 +1126,39 @@ async fn execute_plan(
         ));
     }
 
+    // Prefer the repository the user linked in the wizard; otherwise fall
+    // back to the public repository the source platform deploys from, so the
+    // real deployment pipeline can clone and build it.
+    let plan_git = plan
+        .deployment
+        .git
+        .as_ref()
+        .filter(|g| context.repo_owner.is_none() && g.is_public);
+    let (repo_owner, repo_name, is_public_repo, git_url) = match plan_git {
+        Some(git) => (
+            Some(git.owner.clone()),
+            Some(git.repo.clone()),
+            Some(true),
+            git.clone_url.clone(),
+        ),
+        None => (
+            context.repo_owner.clone(),
+            context.repo_name.clone(),
+            None,
+            None,
+        ),
+    };
+    let main_branch = plan_git
+        .map(|git| git.branch.clone())
+        .filter(|b| !b.is_empty())
+        .unwrap_or_else(|| context.main_branch.clone());
+
     let create_project_request = temps_projects::services::types::CreateProjectRequest {
         name: context.project_name.clone(),
-        repo_name: context.repo_name.clone(),
-        repo_owner: context.repo_owner.clone(),
+        repo_name,
+        repo_owner,
         directory: context.directory.clone(),
-        main_branch: context.main_branch.clone(),
+        main_branch,
         preset: context.preset.clone(),
         preset_config: None,
         environment_variables: Some(
@@ -1119,8 +1171,8 @@ async fn execute_plan(
         ),
         automatic_deploy: true,
         storage_service_ids: vec![],
-        is_public_repo: None,
-        git_url: None,
+        is_public_repo,
+        git_url,
         git_provider_connection_id: context.git_provider_connection_id,
         exposed_port: None,
         source_type: temps_entities::source_type::SourceType::Git,
@@ -1175,14 +1227,16 @@ async fn execute_plan(
         project_id: Set(project.id),
         environment_id: Set(environment.id),
         slug: Set(deployment_slug.clone()),
-        state: Set("completed".to_string()),
+        state: Set("pending".to_string()),
         metadata: Set(Some(deployment_metadata)),
         image_name: Set(Some(plan.deployment.image.clone())),
         commit_message: Set(Some(format!("Imported from Dokploy ({})", plan.source_id))),
-        deploying_at: Set(Some(now)),
-        ready_at: Set(Some(now)),
-        started_at: Set(Some(now)),
-        finished_at: Set(Some(now)),
+        // Not deployed yet — the orchestrator triggers the real
+        // pipeline and records the outcome after this returns.
+        deploying_at: Set(None),
+        ready_at: Set(None),
+        started_at: Set(None),
+        finished_at: Set(None),
         ..Default::default()
     };
     let deployment = deployment

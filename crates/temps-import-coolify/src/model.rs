@@ -55,6 +55,9 @@ pub struct CoolifyApplication {
     pub git_branch: Option<String>,
     #[serde(default)]
     pub build_pack: Option<String>,
+    /// Set when the repository needs an SSH deploy key — null means public
+    #[serde(default)]
+    pub private_key_id: Option<i64>,
     /// Full URL(s); Coolify separates multiple domains with commas
     #[serde(default)]
     pub fqdn: Option<String>,

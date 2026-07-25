@@ -39,6 +39,7 @@ utoipa = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
+reqwest = { workspace = true }
 uuid = { workspace = true }
 bollard = { workspace = true }
 url = { workspace = true }

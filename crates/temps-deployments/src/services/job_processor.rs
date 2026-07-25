@@ -1332,7 +1332,9 @@ async fn process_git_push_event(
             metadata: sea_orm::Set(Some(deployment_metadata)),
             branch_ref: sea_orm::Set(job.branch.clone()),
             tag_ref: sea_orm::Set(job.tag.clone()),
-            commit_sha: sea_orm::Set(Some(job.commit.clone())),
+            // Manual triggers (redeploy, import) carry no commit — an empty
+            // string must not be stored, or checkout would use '' as a ref.
+            commit_sha: sea_orm::Set((!job.commit.is_empty()).then(|| job.commit.clone())),
             commit_message: sea_orm::Set(commit_info.as_ref().map(|c| c.message.clone())),
             commit_author: sea_orm::Set(commit_info.as_ref().map(|c| c.author.clone())),
             promoted_from_deployment_id: sea_orm::Set(None),
@@ -1373,7 +1375,7 @@ async fn process_git_push_event(
             environment_id: environment.id,
             environment_name: environment.name.clone(),
             branch: job.branch.clone(),
-            commit_sha: Some(job.commit.clone()),
+            commit_sha: (!job.commit.is_empty()).then(|| job.commit.clone()),
         });
         if let Err(e) = queue.send(deployment_created_event).await {
             error!("Failed to send DeploymentCreated event: {}", e);

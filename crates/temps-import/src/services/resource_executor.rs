@@ -88,9 +88,15 @@ impl ResourceExecutor {
     }
 
     /// Create every `action = Create` service in the plan.
+    ///
+    /// `project_name` namespaces the created services: without it, importing
+    /// two projects whose databases share a name (or retrying an import)
+    /// collides on the same managed-service container, and the second import
+    /// silently talks to the first one's database.
     pub async fn create_services(
         &self,
         plan: &ImportPlan,
+        project_name: &str,
     ) -> (
         Vec<StepResult>,
         Vec<CreatedServiceRecord>,
@@ -128,8 +134,13 @@ impl ResourceExecutor {
                 .parameters
                 .get(SOURCE_URL_PARAM)
                 .and_then(|v| v.as_str());
+            let service_name = format!(
+                "{}-{}",
+                sanitize_slug(project_name),
+                sanitize_slug(&service_plan.name)
+            );
             let request = CreateExternalServiceRequest {
-                name: service_plan.name.clone(),
+                name: service_name,
                 service_type,
                 version: service_plan.version.clone(),
                 parameters: service_parameters(&service_type, &service_plan.name, source_url),
@@ -211,6 +222,14 @@ impl ResourceExecutor {
             .ok()?;
         let address = self.external_services.get_local_address(model).await.ok()?;
         let (host, port) = address.rsplit_once(':')?;
+        // Published service ports bind IPv4 only; "localhost" resolves to ::1
+        // first inside the transfer container and the connection is refused
+        // before IPv4 is ever tried.
+        let host = if host == "localhost" {
+            "127.0.0.1"
+        } else {
+            host
+        };
 
         let parameter = |key: &str| {
             config
@@ -227,19 +246,26 @@ impl ResourceExecutor {
             _ => return None,
         };
 
-        // url::Url percent-encodes credentials correctly on serialization —
-        // generated passwords may contain %, ^, + and other URL-hostile chars.
-        let mut url = url::Url::parse(&format!("{}://{}:{}", scheme, host, port)).ok()?;
-        if let Some(username) = parameter("username") {
-            url.set_username(&username).ok()?;
-        }
-        if let Some(password) = parameter("password") {
-            url.set_password(Some(&password)).ok()?;
-        }
-        if let Some(database) = parameter("database") {
-            url.set_path(&database);
-        }
-        Some(url.to_string())
+        // Percent-encode credentials ourselves: url::Url's set_password leaves
+        // a literal '%' untouched (it assumes userinfo is already encoded), so
+        // a generated password containing '%' would produce a DSN that libpq
+        // rejects as an invalid percent-encoded token.
+        let userinfo = match (parameter("username"), parameter("password")) {
+            (Some(username), Some(password)) => format!(
+                "{}:{}@",
+                percent_encode_userinfo(&username),
+                percent_encode_userinfo(&password)
+            ),
+            (Some(username), None) => format!("{}@", percent_encode_userinfo(&username)),
+            _ => String::new(),
+        };
+        let database = parameter("database")
+            .map(|db| format!("/{}", db))
+            .unwrap_or_default();
+        Some(format!(
+            "{}://{}{}:{}{}",
+            scheme, userinfo, host, port, database
+        ))
     }
 
     /// Copy data into each created service that has a reachable source URL,
@@ -553,6 +579,22 @@ fn service_parameters(
     source_url: Option<&str>,
 ) -> HashMap<String, serde_json::Value> {
     let mut parameters = HashMap::new();
+
+    // The port must be chosen here and persisted with the service: providers
+    // auto-assign a free port when none is configured, but that assignment is
+    // never written back — every later config read (local address, backups)
+    // would re-roll a different port than the one the container publishes.
+    let default_port: Option<u16> = match service_type {
+        ServiceType::Postgres => Some(5432),
+        ServiceType::Mariadb => Some(3306),
+        ServiceType::Mongodb => Some(27017),
+        ServiceType::Redis => Some(6379),
+        _ => None,
+    };
+    if let Some(port) = default_port.map(find_free_local_port) {
+        parameters.insert("port".to_string(), serde_json::json!(port.to_string()));
+    }
+
     if !matches!(
         service_type,
         ServiceType::Postgres | ServiceType::Mariadb | ServiceType::Mongodb
@@ -577,6 +619,15 @@ fn service_parameters(
     parameters
 }
 
+/// First host port from `start` upward that accepts a local bind. Falls back
+/// to `start` when nothing in the probed range is free — the provider's own
+/// port-conflict retry will then reassign at container-create time.
+fn find_free_local_port(start: u16) -> u16 {
+    (start..start.saturating_add(200))
+        .find(|port| std::net::TcpListener::bind(("127.0.0.1", *port)).is_ok())
+        .unwrap_or(start)
+}
+
 /// A safe database identifier from an arbitrary service name
 fn sanitize_db_identifier(name: &str) -> String {
     let cleaned: String = name
@@ -592,21 +643,40 @@ fn sanitize_db_identifier(name: &str) -> String {
     }
 }
 
+/// Percent-encode a DSN userinfo component. Everything outside the RFC 3986
+/// unreserved set is encoded — including '%' itself, which the url crate's
+/// userinfo setters pass through unchanged.
+fn percent_encode_userinfo(raw: &str) -> String {
+    let mut encoded = String::with_capacity(raw.len());
+    for byte in raw.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(byte as char)
+            }
+            _ => encoded.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+    encoded
+}
+
 /// Image + shell command per service type for the one-off data transfer.
 /// The command reads `$SRC` (source platform URL) and `$DST` (new local URL).
 fn dump_restore_command(plan_type: &str) -> Option<(String, String)> {
+    // Each command first waits for the freshly created managed service to
+    // accept connections — the database container may still be initializing
+    // when the transfer starts — then runs the dump/restore.
     match plan_type {
         "postgres" | "postgresql" => Some((
             "postgres:16-alpine".to_string(),
-            "pg_dump --no-owner --no-privileges \"$SRC\" | psql \"$DST\"".to_string(),
+            "for i in $(seq 1 45); do pg_isready -d \"$DST\" >/dev/null 2>&1 && break; sleep 2; done; pg_dump --no-owner --no-privileges \"$SRC\" | psql \"$DST\"".to_string(),
         )),
         "mysql" | "mariadb" => Some((
             "mariadb:11".to_string(),
-            "mariadb-dump --skip-ssl \"--uri=$SRC\" | mariadb \"--uri=$DST\"".to_string(),
+            "for i in $(seq 1 45); do mariadb --skip-ssl \"--uri=$DST\" -e 'SELECT 1' >/dev/null 2>&1 && break; sleep 2; done; mariadb-dump --skip-ssl \"--uri=$SRC\" | mariadb \"--uri=$DST\"".to_string(),
         )),
         "mongodb" | "mongo" => Some((
             "mongo:7".to_string(),
-            "mongodump --uri=\"$SRC\" --archive | mongorestore --uri=\"$DST\" --archive"
+            "for i in $(seq 1 45); do mongosh \"$DST\" --quiet --eval 'db.runCommand({ping:1})' >/dev/null 2>&1 && break; sleep 2; done; mongodump --uri=\"$SRC\" --archive | mongorestore --uri=\"$DST\" --archive"
                 .to_string(),
         )),
         _ => None,
@@ -714,6 +784,17 @@ mod tests {
     };
     use temps_import_types::{DomainPlan, MigrationSummary, ResourceCounts, RiskLevel};
 
+    #[test]
+    fn userinfo_encoding_covers_url_hostile_password_chars() {
+        // '%' is the case url::Url::set_password gets wrong — it must be
+        // encoded so libpq does not see an invalid percent-escape.
+        assert_eq!(
+            percent_encode_userinfo("=&v1d%ghuyL@i0^S3"),
+            "%3D%26v1d%25ghuyL%40i0%5ES3"
+        );
+        assert_eq!(percent_encode_userinfo("plain-User_1.~"), "plain-User_1.~");
+    }
+
     pub(super) fn plan_with(env: Vec<(&str, &str)>, skipped_domain: &str) -> ImportPlan {
         ImportPlan {
             version: "1.0".to_string(),
@@ -765,6 +846,7 @@ mod tests {
                 entrypoint: None,
                 working_dir: None,
                 health_check: None,
+                git: None,
             },
             services: vec![],
             domains: vec![DomainPlan {
@@ -923,8 +1005,13 @@ mod parameter_tests {
     }
 
     #[test]
-    fn redis_needs_no_parameters() {
-        assert!(service_parameters(&ServiceType::Redis, "cache", None).is_empty());
+    fn redis_gets_only_a_port() {
+        let params = service_parameters(&ServiceType::Redis, "cache", None);
+        assert_eq!(params.len(), 1);
+        assert!(
+            params.contains_key("port"),
+            "redis still needs a stable port"
+        );
     }
 }
 

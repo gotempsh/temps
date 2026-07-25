@@ -1409,6 +1409,7 @@ impl KubernetesImporter {
             entrypoint: snapshot.entrypoint.clone(),
             working_dir: snapshot.working_dir.clone(),
             health_check,
+            git: None,
         };
 
         // -- Additional deployments (siblings) ------------------------------
@@ -1446,6 +1447,7 @@ impl KubernetesImporter {
                 entrypoint: workload.entrypoint.clone(),
                 working_dir: None,
                 health_check: None,
+                git: None,
             })
             .collect();
 
@@ -1966,17 +1968,19 @@ async fn execute_plan(
         project_id: Set(project.id),
         environment_id: Set(environment.id),
         slug: Set(deployment_slug.clone()),
-        state: Set("completed".to_string()),
+        state: Set("pending".to_string()),
         metadata: Set(Some(deployment_metadata)),
         image_name: Set(Some(plan.deployment.image.clone())),
         commit_message: Set(Some(format!(
             "Imported from Kubernetes ({})",
             plan.source_id
         ))),
-        deploying_at: Set(Some(now)),
-        ready_at: Set(Some(now)),
-        started_at: Set(Some(now)),
-        finished_at: Set(Some(now)),
+        // Not deployed yet — the orchestrator triggers the real
+        // pipeline and records the outcome after this returns.
+        deploying_at: Set(None),
+        ready_at: Set(None),
+        started_at: Set(None),
+        finished_at: Set(None),
         ..Default::default()
     };
     let deployment = deployment

@@ -13,7 +13,7 @@ use crate::validation::CoolifyValidationRules;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use temps_import_types::plan::{
-    DeploymentConfiguration, EnvironmentConfiguration, PlanComplexity, PlanMetadata,
+    DeploymentConfiguration, EnvironmentConfiguration, GitSourcePlan, PlanComplexity, PlanMetadata,
     ProjectConfiguration, ProjectType, Protocol,
 };
 use temps_import_types::{
@@ -245,6 +245,7 @@ fn app_to_snapshot(app: &CoolifyApplication, envs: &[CoolifyEnvVar]) -> Workload
         "build_pack": app.build_pack,
         "git_repository": app.git_repository,
         "git_branch": app.git_branch,
+        "private_key_id": app.private_key_id,
         "base_directory": app.base_directory,
         "fqdn": app.fqdn,
         "coolify_status": app.status,
@@ -332,6 +333,25 @@ fn deployment_config(snapshot: &WorkloadSnapshot) -> DeploymentConfiguration {
         target: None,
     });
 
+    // Git-built apps carry their repository into the plan so execution can
+    // link the temps project to it and run the real deployment pipeline.
+    let git = snapshot
+        .image
+        .is_none()
+        .then(|| parse_git_info(git_repository, Some(git_branch)))
+        .flatten()
+        .map(|info| GitSourcePlan {
+            owner: info.owner,
+            repo: info.repo,
+            branch: info.default_branch,
+            clone_url: info.clone_url,
+            is_public: snapshot
+                .source_metadata
+                .get("private_key_id")
+                .map(|v| v.is_null())
+                .unwrap_or(true),
+        });
+
     let ports: Vec<PortMapping> = {
         let mut sorted: Vec<u16> = snapshot.ports.keys().copied().collect();
         sorted.sort_unstable();
@@ -382,6 +402,7 @@ fn deployment_config(snapshot: &WorkloadSnapshot) -> DeploymentConfiguration {
         entrypoint: None,
         working_dir: None,
         health_check: None,
+        git,
     }
 }
 
@@ -1156,12 +1177,41 @@ async fn execute_plan(
         ));
     }
 
+    // Prefer the repository the user linked in the wizard; otherwise fall
+    // back to the public repository the source platform deploys from, so the
+    // real deployment pipeline can clone and build it. Private source repos
+    // without a linked connection stay unlinked — the deploy step reports
+    // that honestly instead of failing mid-clone.
+    let plan_git = plan
+        .deployment
+        .git
+        .as_ref()
+        .filter(|g| context.repo_owner.is_none() && g.is_public);
+    let (repo_owner, repo_name, is_public_repo, git_url) = match plan_git {
+        Some(git) => (
+            Some(git.owner.clone()),
+            Some(git.repo.clone()),
+            Some(true),
+            git.clone_url.clone(),
+        ),
+        None => (
+            context.repo_owner.clone(),
+            context.repo_name.clone(),
+            None,
+            None,
+        ),
+    };
+    let main_branch = plan_git
+        .map(|git| git.branch.clone())
+        .filter(|b| !b.is_empty())
+        .unwrap_or_else(|| context.main_branch.clone());
+
     let create_project_request = temps_projects::services::types::CreateProjectRequest {
         name: context.project_name.clone(),
-        repo_name: context.repo_name.clone(),
-        repo_owner: context.repo_owner.clone(),
+        repo_name,
+        repo_owner,
         directory: context.directory.clone(),
-        main_branch: context.main_branch.clone(),
+        main_branch,
         preset: context.preset.clone(),
         preset_config: None,
         environment_variables: Some(
@@ -1174,8 +1224,8 @@ async fn execute_plan(
         ),
         automatic_deploy: true,
         storage_service_ids: vec![],
-        is_public_repo: None,
-        git_url: None,
+        is_public_repo,
+        git_url,
         git_provider_connection_id: context.git_provider_connection_id,
         exposed_port: None,
         source_type: temps_entities::source_type::SourceType::Git,
@@ -1234,14 +1284,16 @@ async fn execute_plan(
         project_id: Set(project.id),
         environment_id: Set(environment.id),
         slug: Set(deployment_slug.clone()),
-        state: Set("completed".to_string()),
+        state: Set("pending".to_string()),
         metadata: Set(Some(deployment_metadata)),
         image_name: Set(Some(plan.deployment.image.clone())),
         commit_message: Set(Some(format!("Imported from Coolify ({})", plan.source_id))),
-        deploying_at: Set(Some(now)),
-        ready_at: Set(Some(now)),
-        started_at: Set(Some(now)),
-        finished_at: Set(Some(now)),
+        // Not deployed yet — the orchestrator triggers the real
+        // pipeline and records the outcome after this returns.
+        deploying_at: Set(None),
+        ready_at: Set(None),
+        started_at: Set(None),
+        finished_at: Set(None),
         ..Default::default()
     };
     let deployment = deployment
@@ -1568,6 +1620,19 @@ mod tests {
 
         assert_eq!(plan.summary.overall_risk, RiskLevel::High);
         assert_eq!(plan.project.project_type, ProjectType::Git);
+
+        // The plan carries the git source so execution can link the project
+        // and run the real deployment pipeline (short form implies GitHub,
+        // no private key means public).
+        let git = plan.deployment.git.as_ref().expect("git source in plan");
+        assert_eq!(git.owner, "heroku");
+        assert_eq!(git.repo, "node-js-getting-started");
+        assert_eq!(git.branch, "main");
+        assert!(git.is_public);
+        assert_eq!(
+            git.clone_url.as_deref(),
+            Some("https://github.com/heroku/node-js-getting-started.git")
+        );
     }
 
     #[test]

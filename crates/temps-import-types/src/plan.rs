@@ -398,6 +398,29 @@ pub struct DeploymentConfiguration {
     pub working_dir: Option<String>,
     /// Health check configuration
     pub health_check: Option<HealthCheckConfiguration>,
+    /// Where the application's source code lives, when the source platform
+    /// builds from a git repository. Execution uses this to link the temps
+    /// project to the same repository so the real deployment pipeline can
+    /// clone and build it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git: Option<GitSourcePlan>,
+}
+
+/// Git repository the source platform deploys from
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct GitSourcePlan {
+    /// Repository owner (organization or user)
+    pub owner: String,
+    /// Repository name
+    pub repo: String,
+    /// Branch the source platform deploys
+    pub branch: String,
+    /// Full clone URL, e.g. `https://github.com/owner/repo.git`
+    pub clone_url: Option<String>,
+    /// True when the repository is public (no credentials on the source
+    /// platform) — the project can then build without a git provider
+    /// connection.
+    pub is_public: bool,
 }
 
 /// Build configuration (for building images from source)

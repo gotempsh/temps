@@ -1,8 +1,10 @@
 //! Import orchestration services
 
+pub mod deployment_verifier;
 mod orchestrator;
 pub mod resource_executor;
 
+pub use deployment_verifier::DeploymentVerifier;
 pub use orchestrator::ImportOrchestrator;
 pub use resource_executor::ResourceExecutor;
 

@@ -49,9 +49,10 @@ pub use importer::{
 // Plan types
 pub use plan::{
     BuildConfiguration, DataImplication, DataImplicationSeverity, DeploymentStrategy, DomainAction,
-    DomainPlan, EnvironmentVariable, ImportPlan, ManualAction, ManualActionTiming, MigrationStep,
-    MigrationSummary, NetworkConfiguration, NetworkMode, PortMapping, ResourceCounts,
-    ResourceLimits, RiskLevel, ServiceAction, ServicePlan, StepResourceType, UnsupportedFeature,
+    DomainPlan, EnvironmentVariable, GitSourcePlan, ImportPlan, ManualAction, ManualActionTiming,
+    MigrationStep, MigrationSummary, NetworkConfiguration, NetworkMode, PortMapping,
+    ResourceCounts, ResourceLimits, RiskLevel, ServiceAction, ServicePlan, StepResourceType,
+    UnsupportedFeature,
 };
 
 // Snapshot types
