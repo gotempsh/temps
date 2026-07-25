@@ -27,7 +27,7 @@ import {
   X,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { Link, useNavigate, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 import {
   deleteGlobalSkillMutation,

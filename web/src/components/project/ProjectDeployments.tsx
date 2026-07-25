@@ -37,7 +37,7 @@ import {
 } from '@/utils/errorHandling'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { useState, useCallback, useEffect, useRef } from 'react'
-import { Link, useSearchParams } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'

@@ -27,7 +27,7 @@ import {
   useRef,
   useState,
 } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { Link, useParams } from 'react-router'
 
 /** Tailwind classes per normalized level — mirrors the deployment log viewer. */
 const LEVEL_CLASS: Record<LogLevel, string> = {

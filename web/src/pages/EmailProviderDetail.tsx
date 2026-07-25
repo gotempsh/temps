@@ -44,7 +44,7 @@ import { usePageTitle } from '@/hooks/usePageTitle'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AlertCircle, ArrowLeft, Globe, Plus, Send, Trash2 } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { Link, useNavigate, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 
 async function fetchProvider(id: number): Promise<EmailProviderResponse> {

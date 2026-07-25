@@ -54,7 +54,7 @@ import {
   type ResolvedEnvVar,
 } from '@/lib/resolved-env-vars'
 import { IntegrationBadge } from './IntegrationBadge'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 
 interface EnvironmentVariableRowProps {
   variable: EnvironmentVariableResponse

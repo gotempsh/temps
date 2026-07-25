@@ -29,7 +29,7 @@ import { useSettings } from '@/hooks/useSettings'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Globe, Loader2, RefreshCw, Trash2 } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { useParams } from 'react-router-dom'
+import { useParams } from 'react-router'
 import { toast } from 'sonner'
 import { EnvironmentConfigurationCard } from './EnvironmentConfigurationCard'
 

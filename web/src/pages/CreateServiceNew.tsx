@@ -28,7 +28,7 @@ import { useMutation, useQuery } from '@tanstack/react-query'
 import { customAlphabet } from 'nanoid'
 import { ArrowLeft, CheckCircle2, Plus, Server, Trash2 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
-import { Link, useNavigate, useSearchParams } from 'react-router-dom'
+import { Link, useNavigate, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
 
 // Create a custom nanoid with lowercase alphanumeric characters

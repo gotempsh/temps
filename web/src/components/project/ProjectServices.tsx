@@ -1,5 +1,5 @@
 import { ProjectResponse } from '@/api/client'
-import { Navigate, Route, Routes } from 'react-router-dom'
+import { Navigate, Route, Routes } from 'react-router'
 import { ServicesOverview } from './services/ServicesOverview'
 import { KvService } from './services/KvService'
 import { BlobService } from './services/BlobService'

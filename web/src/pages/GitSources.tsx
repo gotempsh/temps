@@ -46,7 +46,7 @@ import {
 } from 'lucide-react'
 import GithubIcon from '@/icons/Github'
 import { useEffect, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 
 // Helper function to check if provider is GitHub App

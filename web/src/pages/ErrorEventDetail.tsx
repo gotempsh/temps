@@ -21,7 +21,7 @@ import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { AlertTriangle, ArrowLeft, Clock } from 'lucide-react'
 import { useEffect } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams } from 'react-router'
 
 export function ErrorEventDetail({ project }: { project: ProjectResponse }) {
   const { projectSlug, errorGroupId, eventId } = useParams<{

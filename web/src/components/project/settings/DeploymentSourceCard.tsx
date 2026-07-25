@@ -18,7 +18,7 @@ import {
   Loader2,
 } from 'lucide-react'
 import { useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 
 type SourceType = 'git' | 'docker_image' | 'static_files' | 'manual'

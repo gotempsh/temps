@@ -12,7 +12,7 @@ import type { ProjectMonitorHealth } from '@/hooks/useDashboardHealth'
 import { useQuery } from '@tanstack/react-query'
 import { AlertCircle, TrendingDown, TrendingUp, Minus } from 'lucide-react'
 import { useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 import { VisitorSparkline } from './VisitorSparkline'
 
 function formatTrend(trendPercentage: number | null | undefined): {

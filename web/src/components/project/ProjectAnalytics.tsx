@@ -113,7 +113,7 @@ import {
   useNavigate,
   useParams,
   useSearchParams,
-} from 'react-router-dom'
+} from 'react-router'
 import { EventDetail } from '@/components/analytics/EventDetail'
 import {
   DimensionList,

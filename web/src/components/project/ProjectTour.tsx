@@ -9,7 +9,7 @@ import {
   useSyncExternalStore,
 } from 'react'
 import { createPortal } from 'react-dom'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams } from 'react-router'
 
 /**
  * A lightweight, dependency-free guided tour for new projects. It walks the user

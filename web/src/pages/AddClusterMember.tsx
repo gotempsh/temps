@@ -29,7 +29,7 @@ import {
   Server,
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
-import { Link, useNavigate, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 
 // Mirror of `member_provisioning_step` in temps-providers/src/services.rs.

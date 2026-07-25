@@ -29,7 +29,7 @@ import {
   Upload,
   Users,
 } from 'lucide-react'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router'
 
 function formatTrendChange(trendPercentage: number | null | undefined): {
   change: string

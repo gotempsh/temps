@@ -28,7 +28,7 @@ import {
   Users,
 } from 'lucide-react'
 import { ReactNode, useEffect, useMemo } from 'react'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 import { MetricCard } from '../dashboard/MetricCard'
 import { DeploymentActivityGraph } from './DeploymentActivityGraph'
 import { PROJECT_TOUR_EVENT } from './ProjectTour'

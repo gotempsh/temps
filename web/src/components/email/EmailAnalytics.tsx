@@ -37,7 +37,7 @@ import {
   TrendingUp,
 } from 'lucide-react'
 import { useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { EventBadge } from './shared'
 import { parseUserAgent } from './sharedUtils'
 

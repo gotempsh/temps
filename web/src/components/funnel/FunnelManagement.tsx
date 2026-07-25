@@ -30,7 +30,7 @@ import { format, subDays } from 'date-fns'
 import { BarChart3, Calendar as CalendarIcon, Plus } from 'lucide-react'
 import * as React from 'react'
 import { DateRange } from 'react-day-picker'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { FunnelCard } from './FunnelCard'
 
 interface FunnelManagementProps {
