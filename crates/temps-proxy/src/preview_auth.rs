@@ -970,7 +970,8 @@ mod tests {
         sandboxes::Model {
             id: 1,
             public_id: public_id.to_string(),
-            user_id: 1,
+            user_id: Some(1),
+            agent_run_id: None,
             name: "test-sandbox".to_string(),
             status: status.to_string(),
             image: Some("ubuntu:22.04".to_string()),

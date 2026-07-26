@@ -2758,6 +2758,7 @@ mod tests {
 
         // 1. Create sandbox
         let create_config = SandboxCreateConfig {
+            owner_user_id: None,
             run_id,
             container_name_override: None,
             host_work_dir: work_dir.clone(),
@@ -3104,6 +3105,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&work_dir);
 
         let create_config = SandboxCreateConfig {
+            owner_user_id: None,
             run_id,
             container_name_override: None,
             host_work_dir: work_dir.clone(),
@@ -3325,6 +3327,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&work_dir);
 
         let create_config = SandboxCreateConfig {
+            owner_user_id: None,
             run_id,
             container_name_override: Some(label.to_string()),
             host_work_dir: work_dir.clone(),

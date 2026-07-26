@@ -570,8 +570,18 @@ impl AgentExecutor {
             tracing::warn!("Run {}: failed to persist workspace_volume: {}", run_id, e);
         }
 
+        // Attribute the sandbox to the user who triggered the run (if any)
+        // so it shows under their sandboxes in the standalone sandbox API.
+        let owner_user_id = self
+            .run_service
+            .get_run(run_id)
+            .await
+            .ok()
+            .and_then(|r| r.triggered_by_user_id);
+
         let sandbox_config = SandboxCreateConfig {
             run_id,
+            owner_user_id,
             container_name_override: None,
             host_work_dir: host_work_dir.clone(),
             workspace_volume: Some(workspace_volume),
@@ -4066,6 +4076,7 @@ mod tests {
             prompt_text: None,
             workspace_volume: None,
             run_config: None,
+            triggered_by_user_id: None,
         }
     }
 

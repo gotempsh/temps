@@ -1,6 +1,7 @@
 //! Service layer for the standalone sandbox API. All business logic lives
 //! here; HTTP handlers are thin wrappers that call into these services.
 
+pub mod agent_run_bridge;
 pub mod exec;
 pub mod expiration_sweeper;
 pub mod fs;
