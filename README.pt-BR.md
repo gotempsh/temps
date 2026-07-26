@@ -27,8 +27,8 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 ```
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/readme-hero-dark.png">
-  <img alt="Temps — analytics, uptime, error tracking, deployments, request logs, dashboard" src="assets/readme-hero-light.png">
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/create-dark.png">
+  <img alt="Crie um novo projeto no Temps — importe um repositório, comece a partir de um template, clone uma URL Git ou faça deploy de uma imagem Docker" src="assets/screenshots/create-light.png">
 </picture>
 
 
@@ -38,64 +38,63 @@ Pare de pagar por 6 ferramentas SaaS diferentes. O Temps substitui sua plataform
 
 ## Funcionalidades
 
-<table>
-<tr>
-<td width="50%">
+### Web Analytics e Session Replay
 
-**Analytics e Session Replay integrados**
-Web analytics com funis, rastreamento de visitantes e session replay (rrweb). Rastreamento de erros compatível com Sentry. Sem serviços externos — é isso que nenhum outro PaaS self-hosted tem.
+Web analytics com funis, rastreamento de visitantes e session replay (rrweb) integrados — sem serviços externos, sem dados saindo dos seus servidores. É isso que nenhum outro PaaS self-hosted tem.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/analytics-dark.png">
+  <img alt="Web analytics do Temps — visitantes, sessões, páginas, funis" src="assets/screenshots/analytics-light.png">
+</picture>
 
-</td>
-<td width="50%">
+### Monitoramento de Uptime e Alertas
 
-**Monitoramento de Uptime e Alertas**
 Monitores de uptime com linhas do tempo de status, além de alertas para falhas de deploy, crashes em runtime, expiração de certificados e saúde dos backups. Seja notificado antes que os problemas cheguem aos usuários.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/uptime-dark.png">
+  <img alt="Monitoramento de uptime do Temps — linha do tempo de status, porcentagem de uptime, tempo de resposta" src="assets/screenshots/uptime-light.png">
+</picture>
 
-</td>
-</tr>
-<tr>
-<td width="50%">
+### Rastreamento de Erros — compatível com Sentry
 
-**Git Push para Deploy**
-Faça push para o Git e o Temps compila e faz o deploy. Detecta frameworks automaticamente, cria URLs de preview e cuida de rollouts sem downtime.
+Substituição drop-in do Sentry: aponte o SDK oficial do Sentry para o seu DSN do Temps e tenha grupos de erros, stack traces com contexto do código-fonte e alertas. Sem cobrança por evento.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/errors-dark.png">
+  <img alt="Rastreamento de erros do Temps — grupos de erros com eventos e linhas do tempo" src="assets/screenshots/errors-light.png">
+</picture>
 
-</td>
-<td width="50%">
+### Logs de Requisições e Visibilidade do Proxy
 
-**Tudo em um só Dashboard**
+Cada requisição HTTP registrada com método, caminho, status, tempo de resposta e metadados de roteamento — incluindo o tráfego por crawler de IA (OpenAI, Anthropic, Perplexity, Google…). Roda sobre o motor Pingora da Cloudflare com TLS automático via Let's Encrypt (HTTP-01 e DNS-01).
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/request-logs-dark.png">
+  <img alt="Logs de requisições do proxy do Temps com filtragem por agentes de IA" src="assets/screenshots/request-logs-light.png">
+</picture>
+
+### E-mail Transacional
+
+Adicione domínios de envio com registros DKIM pela interface e envie via `@temps-sdk/node-sdk` — ou conecte AWS SES, Scaleway ou qualquer relay SMTP.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/email-dark.png">
+  <img alt="Provedores de e-mail do Temps — SMTP, Scaleway e AWS SES" src="assets/screenshots/email-light.png">
+</picture>
+
+### Tudo em um só Dashboard
+
 Visitantes, erros, status de deploy e saúde do monitoramento por projeto — um único lugar em vez de seis abas do navegador.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/dashboard-dark.png">
+  <img alt="Dashboard de projetos do Temps — todos os projetos com visitantes e status" src="assets/screenshots/dashboard-light.png">
+</picture>
 
-</td>
-</tr>
-<tr>
-<td width="50%">
+### Git Push para Deploy e Serviços Gerenciados
 
-**Proxy com motor Pingora**
-Roda sobre o Pingora, o motor de proxy da Cloudflare. TLS automático via Let's Encrypt (HTTP-01 e DNS-01), domínios personalizados e log completo de requisições.
-
-
-</td>
-<td width="50%">
-
-**Logs de Requisições e Visibilidade do Proxy**
-Cada requisição HTTP registrada com método, caminho, status, tempo de resposta e metadados de roteamento. Filtre e pesquise sem ferramentas extras.
-
-
-</td>
-</tr>
-<tr>
-<td width="100%" colspan="2">
-
-**Serviços Gerenciados e E-mail Transacional**
-Provisione Postgres, Redis, S3 (MinIO) e MongoDB junto com suas aplicações — o Temps cuida da criação, dos backups e do desprovisionamento. Adicione domínios de envio com registros DKIM pela interface e envie e-mail transacional via `@temps-sdk/node-sdk`. Sem necessidade de serviços externos.
-
-</td>
-</tr>
-</table>
+Faça push para o Git e o Temps compila, faz o deploy e cria URLs de preview com rollouts sem downtime — qualquer linguagem, detectada automaticamente. Provisione Postgres, Redis, S3 (MinIO) e MongoDB junto com suas aplicações; a criação, os backups e o desprovisionamento ficam por conta do Temps.
 
 ### Funciona com a sua stack
 

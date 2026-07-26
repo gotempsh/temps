@@ -27,8 +27,8 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 ```
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/readme-hero-dark.png">
-  <img alt="Temps — analytics, uptime, error tracking, deployments, request logs, dashboard" src="assets/readme-hero-light.png">
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/create-dark.png">
+  <img alt="Temps で新規プロジェクトを作成 — リポジトリのインポート、テンプレートからの開始、Git URL のクローン、Docker イメージのデプロイ" src="assets/screenshots/create-light.png">
 </picture>
 
 
@@ -38,64 +38,63 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 
 ## 機能
 
-<table>
-<tr>
-<td width="50%">
+### ウェブアナリティクス & セッションリプレイ
 
-**アナリティクス & セッションリプレイを標準搭載**
-ファネル分析、訪問者トラッキング、セッションリプレイ（rrweb）を備えたウェブアナリティクス。Sentry 互換のエラートラッキングも搭載。外部サービスは不要 —— これは他のセルフホスト型 PaaS にはない機能です。
+ファネル分析、訪問者トラッキング、セッションリプレイ（rrweb）を標準搭載したウェブアナリティクス —— 外部サービスは不要で、データがサーバーの外に出ることもありません。これは他のセルフホスト型 PaaS にはない機能です。
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/analytics-dark.png">
+  <img alt="Temps ウェブアナリティクス —— 訪問者、セッション、ページ、ファネル" src="assets/screenshots/analytics-light.png">
+</picture>
 
-</td>
-<td width="50%">
+### 稼働監視 & アラート
 
-**稼働監視 & アラート**
 ステータスタイムライン付きの稼働モニターに加え、デプロイ失敗、ランタイムのクラッシュ、証明書の期限切れ、バックアップの健全性に対するアラートを提供。問題がユーザーに届く前に通知を受け取れます。
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/uptime-dark.png">
+  <img alt="Temps 稼働監視 —— ステータスタイムライン、稼働率、レスポンスタイム" src="assets/screenshots/uptime-light.png">
+</picture>
 
-</td>
-</tr>
-<tr>
-<td width="50%">
+### エラートラッキング —— Sentry 互換
 
-**Git プッシュでデプロイ**
-Git にプッシュすれば、Temps がビルドしてデプロイします。フレームワークを自動検出し、プレビュー URL を作成し、ゼロダウンタイムのロールアウトを実行します。
+Sentry のドロップイン代替: 公式の Sentry SDK を Temps の DSN に向けるだけで、エラーグループ、ソースコンテキスト付きのスタックトレース、アラートが手に入ります。イベント単位の課金はありません。
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/errors-dark.png">
+  <img alt="Temps エラートラッキング —— イベントとタイムライン付きのエラーグループ" src="assets/screenshots/errors-light.png">
+</picture>
 
-</td>
-<td width="50%">
+### リクエストログ & プロキシの可視化
 
-**すべてを1つのダッシュボードに**
+すべての HTTP リクエストを、メソッド、パス、ステータス、レスポンスタイム、ルーティングメタデータとともに記録 —— AI クローラー別のトラフィック（OpenAI、Anthropic、Perplexity、Google…）も含まれます。Cloudflare の Pingora エンジン上で動作し、Let's Encrypt による自動 TLS（HTTP-01 & DNS-01）に対応します。
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/request-logs-dark.png">
+  <img alt="AI エージェントのフィルタリングに対応した Temps プロキシリクエストログ" src="assets/screenshots/request-logs-light.png">
+</picture>
+
+### トランザクションメール
+
+UI から DKIM レコード付きの送信ドメインを追加し、`@temps-sdk/node-sdk` で送信 —— あるいは AWS SES、Scaleway、任意の SMTP リレーを接続することもできます。
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/email-dark.png">
+  <img alt="Temps メールプロバイダー —— SMTP、Scaleway、AWS SES" src="assets/screenshots/email-light.png">
+</picture>
+
+### すべてを1つのダッシュボードに
+
 訪問者、エラー、デプロイ状況、監視の健全性をプロジェクトごとに一元表示 —— ブラウザのタブを6つ開く代わりに、この1画面で完結します。
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/dashboard-dark.png">
+  <img alt="Temps プロジェクトダッシュボード —— 全プロジェクトの訪問者とステータス" src="assets/screenshots/dashboard-light.png">
+</picture>
 
-</td>
-</tr>
-<tr>
-<td width="50%">
+### Git プッシュでデプロイ & マネージドサービス
 
-**Pingora 駆動のプロキシ**
-Cloudflare の Pingora エンジン上で動作。Let's Encrypt による自動 TLS（HTTP-01 & DNS-01）、カスタムドメイン、完全なリクエストロギングに対応。
-
-
-</td>
-<td width="50%">
-
-**リクエストログ & プロキシの可視化**
-すべての HTTP リクエストを、メソッド、パス、ステータス、レスポンスタイム、ルーティングメタデータとともに記録。追加ツールなしでフィルタリングと検索が可能です。
-
-
-</td>
-</tr>
-<tr>
-<td width="100%" colspan="2">
-
-**マネージドサービス & トランザクションメール**
-Postgres、Redis、S3（MinIO）、MongoDB をアプリと並べてプロビジョニング —— 作成、バックアップ、削除は Temps が処理します。UI から DKIM レコード付きの送信ドメインを追加し、`@temps-sdk/node-sdk` でトランザクションメールを送信できます。外部サービスは不要です。
-
-</td>
-</tr>
-</table>
+Git にプッシュすれば、Temps がビルドとデプロイを行い、ゼロダウンタイムのロールアウトでプレビュー URL を作成します —— あらゆる言語を自動検出。Postgres、Redis、S3（MinIO）、MongoDB をアプリと並べてプロビジョニングでき、作成、バックアップ、削除は Temps が処理します。
 
 ### あなたのスタックでそのまま使える
 

@@ -27,8 +27,8 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 ```
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/readme-hero-dark.png">
-  <img alt="Temps — analytics, uptime, error tracking, deployments, request logs, dashboard" src="assets/readme-hero-light.png">
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/create-dark.png">
+  <img alt="在 Temps 中创建新项目 —— 导入仓库、从模板开始、克隆 Git URL 或部署 Docker 镜像" src="assets/screenshots/create-light.png">
 </picture>
 
 
@@ -38,64 +38,63 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 
 ## 功能特性
 
-<table>
-<tr>
-<td width="50%">
+### 网站分析与会话回放
 
-**内置网站分析与会话回放**
-带漏斗分析、访客追踪和会话回放（rrweb）的网站分析，外加兼容 Sentry 的错误追踪。无需任何外部服务 —— 这是其他自托管 PaaS 都没有的能力。
+内置带漏斗分析、访客追踪和会话回放（rrweb）的网站分析 —— 无需外部服务，数据不会离开你的服务器。这是其他自托管 PaaS 都没有的能力。
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/analytics-dark.png">
+  <img alt="Temps 网站分析 —— 访客、会话、页面、漏斗" src="assets/screenshots/analytics-light.png">
+</picture>
 
-</td>
-<td width="50%">
+### 可用性监控与告警
 
-**可用性监控与告警**
 带状态时间线的可用性监控，以及针对部署失败、运行时崩溃、证书过期和备份健康状况的告警。在问题波及用户之前就收到通知。
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/uptime-dark.png">
+  <img alt="Temps 可用性监控 —— 状态时间线、可用率、响应时间" src="assets/screenshots/uptime-light.png">
+</picture>
 
-</td>
-</tr>
-<tr>
-<td width="50%">
+### 错误追踪 —— 兼容 Sentry
 
-**Git Push 即部署**
-推送到 Git，Temps 自动构建并部署。自动检测框架、生成预览 URL，并完成零停机发布。
+可直接替换 Sentry：将官方 Sentry SDK 指向你的 Temps DSN，即可获得错误分组、带源码上下文的堆栈跟踪和告警。没有按事件计费。
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/errors-dark.png">
+  <img alt="Temps 错误追踪 —— 带事件和时间线的错误分组" src="assets/screenshots/errors-light.png">
+</picture>
 
-</td>
-<td width="50%">
+### 请求日志与代理可观测性
 
-**一个仪表盘掌握全局**
+每个 HTTP 请求都会记录方法、路径、状态码、响应时间和路由元数据 —— 还包括各家 AI 爬虫的流量明细（OpenAI、Anthropic、Perplexity、Google……）。运行在 Cloudflare 的 Pingora 引擎之上，通过 Let's Encrypt 自动签发 TLS 证书（HTTP-01 和 DNS-01）。
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/request-logs-dark.png">
+  <img alt="Temps 代理请求日志，支持按 AI 爬虫过滤" src="assets/screenshots/request-logs-light.png">
+</picture>
+
+### 事务性邮件
+
+通过 UI 添加带 DKIM 记录的发件域名，并通过 `@temps-sdk/node-sdk` 发送邮件 —— 也可以接入 AWS SES、Scaleway 或任意 SMTP 中继。
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/email-dark.png">
+  <img alt="Temps 邮件服务商 —— SMTP、Scaleway 和 AWS SES" src="assets/screenshots/email-light.png">
+</picture>
+
+### 一个仪表盘掌握全局
+
 每个项目的访客、错误、部署状态和监控健康状况 —— 一个页面搞定，不用再开六个浏览器标签页。
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/dashboard-dark.png">
+  <img alt="Temps 项目仪表盘 —— 所有项目的访客与状态" src="assets/screenshots/dashboard-light.png">
+</picture>
 
-</td>
-</tr>
-<tr>
-<td width="50%">
+### Git Push 即部署与托管服务
 
-**基于 Pingora 的代理**
-运行在 Cloudflare 的 Pingora 引擎之上。通过 Let's Encrypt 自动签发 TLS 证书（HTTP-01 和 DNS-01）、支持自定义域名和完整的请求日志。
-
-
-</td>
-<td width="50%">
-
-**请求日志与代理可观测性**
-每个 HTTP 请求都会记录方法、路径、状态码、响应时间和路由元数据。无需额外工具即可过滤和搜索。
-
-
-</td>
-</tr>
-<tr>
-<td width="100%" colspan="2">
-
-**托管服务与事务性邮件**
-在应用旁边一键开通 Postgres、Redis、S3（MinIO）和 MongoDB —— 创建、备份和销毁都由 Temps 负责。通过 UI 添加带 DKIM 记录的发件域名，并通过 `@temps-sdk/node-sdk` 发送事务性邮件。无需任何外部服务。
-
-</td>
-</tr>
-</table>
+推送到 Git，Temps 自动构建、部署并生成预览 URL，零停机发布 —— 支持任何语言，自动检测。在应用旁边一键开通 Postgres、Redis、S3（MinIO）和 MongoDB；创建、备份和销毁都由 Temps 负责。
 
 ### 兼容你的技术栈
 
