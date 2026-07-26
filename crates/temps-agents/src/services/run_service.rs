@@ -9,6 +9,24 @@ use temps_entities::{agent_run_logs, agent_runs};
 
 use crate::error::AgentError;
 
+/// Non-terminal run statuses: a run in one of these states is in-flight.
+/// Used for concurrency counting and restart recovery.
+pub const ACTIVE_RUN_STATUSES: &[&str] = &[
+    "pending",
+    "cloning",
+    "analyzing",
+    "fixing",
+    "pushing",
+    "creating_pr",
+    "deploying",
+];
+
+/// Terminal run statuses: once a run reaches one of these it never
+/// transitions again. Consumers outside this crate (e.g. the sandbox
+/// plugin's orphaned agent-run sandbox cleanup) rely on this to decide
+/// when resources attributed to a run can safely be released.
+pub const TERMINAL_RUN_STATUSES: &[&str] = &["completed", "failed", "no_fix", "cancelled"];
+
 /// Fields that can be updated when changing a run's status.
 #[derive(Default)]
 pub struct UpdateRunFields {
@@ -497,19 +515,17 @@ impl AgentRunService {
 
     /// Recover stuck runs after server restart.
     /// Marks all runs in active (non-terminal) states as failed.
+    ///
+    /// Note on sandboxes: this runs during the plugin *register* phase,
+    /// before the temps-sandbox plugin has injected its managed
+    /// `RunSandboxService` seam, so the runs' `sandboxes` rows (and their
+    /// containers) cannot be released from here. The sandbox plugin's
+    /// `initialize_plugin_services` calls
+    /// `SandboxService::release_orphaned_agent_run_sandboxes` afterwards,
+    /// which releases every sandbox attributed to a now-terminal run.
     pub async fn recover_stuck_runs(&self) -> Result<u64, AgentError> {
-        let active_statuses = vec![
-            "pending",
-            "cloning",
-            "analyzing",
-            "fixing",
-            "pushing",
-            "creating_pr",
-            "deploying",
-        ];
-
         let stuck_runs = agent_runs::Entity::find()
-            .filter(agent_runs::Column::Status.is_in(active_statuses))
+            .filter(agent_runs::Column::Status.is_in(ACTIVE_RUN_STATUSES.iter().copied()))
             .all(self.db.as_ref())
             .await
             .map_err(AgentError::Database)?;
@@ -535,8 +551,7 @@ impl AgentRunService {
     pub async fn cancel_run(&self, run_id: i32) -> Result<agent_runs::Model, AgentError> {
         let run = self.get_run(run_id).await?;
 
-        let terminal = ["completed", "failed", "no_fix", "cancelled"];
-        if terminal.contains(&run.status.as_str()) {
+        if TERMINAL_RUN_STATUSES.contains(&run.status.as_str()) {
             return Err(AgentError::Validation {
                 message: format!(
                     "Run {} is already in terminal state '{}'",
@@ -558,19 +573,9 @@ impl AgentRunService {
 
     /// Count runs in active (non-terminal) states for a project.
     pub async fn count_active_runs(&self, project_id: i32) -> Result<u64, AgentError> {
-        let active_statuses = vec![
-            "pending",
-            "cloning",
-            "analyzing",
-            "fixing",
-            "pushing",
-            "creating_pr",
-            "deploying",
-        ];
-
         let count = agent_runs::Entity::find()
             .filter(agent_runs::Column::ProjectId.eq(project_id))
-            .filter(agent_runs::Column::Status.is_in(active_statuses))
+            .filter(agent_runs::Column::Status.is_in(ACTIVE_RUN_STATUSES.iter().copied()))
             .count(self.db.as_ref())
             .await
             .map_err(AgentError::Database)?;
@@ -851,6 +856,25 @@ mod tests {
             );
         }
         assert_eq!(expected.len(), 7, "Expected exactly 7 active statuses");
+    }
+
+    #[test]
+    fn active_and_terminal_status_sets_are_disjoint_and_complete() {
+        // Every status a run can hold is either active or terminal —
+        // consumers (recover_stuck_runs, count_active_runs, and the
+        // sandbox plugin's orphan cleanup) rely on these two sets
+        // partitioning the lifecycle with no overlap.
+        for s in ACTIVE_RUN_STATUSES {
+            assert!(
+                !TERMINAL_RUN_STATUSES.contains(s),
+                "status '{}' cannot be both active and terminal",
+                s
+            );
+        }
+        assert_eq!(ACTIVE_RUN_STATUSES.len(), 7);
+        assert_eq!(TERMINAL_RUN_STATUSES.len(), 4);
+        assert!(TERMINAL_RUN_STATUSES.contains(&"failed"));
+        assert!(TERMINAL_RUN_STATUSES.contains(&"cancelled"));
     }
 
     #[tokio::test]

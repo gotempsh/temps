@@ -120,6 +120,9 @@ impl From<SandboxError> for Problem {
             SandboxError::InvalidState { .. } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Invalid Sandbox State")
                 .with_detail(error.to_string()),
+            SandboxError::ManagedByAgentRun { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Sandbox Managed By Agent Run")
+                .with_detail(error.to_string()),
             SandboxError::Timeout { .. } => problemdetails::new(StatusCode::GATEWAY_TIMEOUT)
                 .with_title("Sandbox Operation Timed Out")
                 .with_detail(error.to_string()),
@@ -1075,7 +1078,8 @@ pub async fn get_sandbox(
     path = "/v1/sandboxes/{id}/stop",
     responses(
         (status = 204, description = "Sandbox stopped and destroyed"),
-        (status = 404, description = "Not found")
+        (status = 404, description = "Not found"),
+        (status = 409, description = "Sandbox belongs to an active agent run — stop the run instead")
     ),
     security(("bearer_auth" = []))
 )]
@@ -1098,7 +1102,8 @@ pub async fn stop_sandbox(
     path = "/v1/sandboxes/{id}/destroy",
     responses(
         (status = 204, description = "Sandbox destroyed (alias for `/stop` with an explicit verb)"),
-        (status = 404, description = "Not found")
+        (status = 404, description = "Not found"),
+        (status = 409, description = "Sandbox belongs to an active agent run — stop the run instead")
     ),
     security(("bearer_auth" = []))
 )]

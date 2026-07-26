@@ -143,12 +143,14 @@ impl TempsPlugin for SandboxPlugin {
             };
             let db = context.require_service::<sea_orm::DatabaseConnection>();
 
+            let sandbox_service = context.get_service::<SandboxService>();
+
             // Inject this plugin's service into the agents' sandbox registry
             // so agent runs (autofixer, workflow agents) create first-class
             // `sandboxes` rows instead of untracked containers.
             match (
                 context.get_service::<temps_agents::services::sandbox_registry::SandboxRegistry>(),
-                context.get_service::<SandboxService>(),
+                sandbox_service.clone(),
             ) {
                 (Some(agent_registry), Some(service)) => {
                     agent_registry.set_managed(Arc::new(
@@ -196,6 +198,33 @@ impl TempsPlugin for SandboxPlugin {
                 }
                 Err(e) => {
                     warn!("Sandbox plugin: failed to list running sandboxes: {}", e);
+                }
+            }
+
+            // Agent-run counterpart of the recovery above: runs that were
+            // in flight when the server died were just marked failed by
+            // `AgentRunService::recover_stuck_runs` (register phase), but
+            // their `sandboxes` rows still say "running" — and both the
+            // scan above and the expiration sweeper skip agent-run rows by
+            // design. Release them (container destroy by run id + row flip)
+            // so a restart can't leave zombie rows or leaked containers.
+            match &sandbox_service {
+                Some(service) => match service.release_orphaned_agent_run_sandboxes().await {
+                    Ok(0) => {}
+                    Ok(n) => info!(
+                        "Sandbox plugin: released {} orphaned agent-run sandbox(es) on startup",
+                        n
+                    ),
+                    Err(e) => warn!(
+                        "Sandbox plugin: failed to release orphaned agent-run sandboxes: {}",
+                        e
+                    ),
+                },
+                None => {
+                    warn!(
+                        "Sandbox plugin: sandbox service absent — skipping orphaned \
+                         agent-run sandbox cleanup"
+                    );
                 }
             }
 
