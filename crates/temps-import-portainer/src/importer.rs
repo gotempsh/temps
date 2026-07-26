@@ -153,6 +153,7 @@ fn container_to_snapshot(
     container: &DockerContainer,
     detail: &DockerContainerDetail,
     endpoint_id: i64,
+    insecure_tls_skip_verify: bool,
 ) -> WorkloadSnapshot {
     let env: HashMap<String, String> = detail.config.env_pairs().into_iter().collect();
     let ports: HashMap<u16, Option<u16>> = detail.published_ports().into_iter().collect();
@@ -171,6 +172,7 @@ fn container_to_snapshot(
         "stack": container.stack(),
         "volumes": detail.mounts.iter().filter_map(|m| m.name.clone()).collect::<Vec<_>>(),
         "docker_state": container.state,
+        "insecure_tls_skip_verify": insecure_tls_skip_verify,
     });
 
     WorkloadSnapshot {
@@ -641,7 +643,20 @@ impl PortainerImporter {
                 generated_at: chrono::Utc::now(),
                 generator_version: self.version.clone(),
                 complexity,
-                warnings: vec![],
+                warnings: {
+                    let mut warnings = Vec::new();
+                    let insecure_tls_skip_verify = snapshot
+                        .source_metadata
+                        .get("insecure_tls_skip_verify")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if insecure_tls_skip_verify {
+                        warnings.push(
+                            "Connecting to this Portainer instance skips TLS certificate verification (its default self-signed certificate isn't trusted) — the admin password travels over an unverified connection. Set credentials.extra[\"verify_tls\"] = \"true\" if this instance has a trusted certificate.".to_string(),
+                        );
+                    }
+                    warnings
+                },
             },
             cost_analysis: None,
         })
@@ -815,7 +830,12 @@ impl WorkloadImporter for PortainerImporter {
             .container_detail(&jwt, endpoint_id, &container.id)
             .await
             .map_err(ImportError::from)?;
-        Ok(container_to_snapshot(container, &detail, endpoint_id))
+        Ok(container_to_snapshot(
+            container,
+            &detail,
+            endpoint_id,
+            client.skip_tls_verify(),
+        ))
     }
 
     async fn describe_project(
@@ -887,12 +907,16 @@ impl WorkloadImporter for PortainerImporter {
             (*c, d.clone())
         };
 
-        let primary_workload =
-            container_to_snapshot(primary_container, &primary_detail, endpoint_id);
+        let primary_workload = container_to_snapshot(
+            primary_container,
+            &primary_detail,
+            endpoint_id,
+            client.skip_tls_verify(),
+        );
         let additional_workloads: Vec<WorkloadSnapshot> = apps
             .iter()
             .filter(|(c, _)| c.id != primary_container.id)
-            .map(|(c, d)| container_to_snapshot(c, d, endpoint_id))
+            .map(|(c, d)| container_to_snapshot(c, d, endpoint_id, client.skip_tls_verify()))
             .collect();
 
         let services: Vec<ServiceSnapshot> = databases
@@ -1272,7 +1296,7 @@ mod tests {
     }
 
     fn project_snapshot(published_db: bool) -> ProjectSnapshot {
-        let primary = container_to_snapshot(&whoami_container(), &whoami_detail(), 1);
+        let primary = container_to_snapshot(&whoami_container(), &whoami_detail(), 1, false);
         let service = db_to_service_snapshot(
             &db_container(),
             &db_detail(published_db),
@@ -1320,12 +1344,50 @@ mod tests {
 
     #[test]
     fn container_snapshot_drops_image_noise_and_keeps_ports() {
-        let snapshot = container_to_snapshot(&whoami_container(), &whoami_detail(), 1);
+        let snapshot = container_to_snapshot(&whoami_container(), &whoami_detail(), 1, false);
         assert_eq!(snapshot.name.as_deref(), Some("lab-whoami"));
         assert!(snapshot.env.contains_key("LAB_SECRET"));
         assert!(!snapshot.env.contains_key("PATH"));
         assert_eq!(snapshot.ports.get(&80), Some(&Some(8080)));
         assert_eq!(snapshot.status, WorkloadStatus::Running);
+    }
+
+    /// Regression test: Portainer's client accepts its default self-signed
+    /// certificate without verification, but that used to be a silent
+    /// choice — the user importing from a real instance had no way of
+    /// knowing their admin password crossed an unverified TLS connection.
+    /// `PortainerClient::skip_tls_verify()` now flows into the snapshot's
+    /// `source_metadata` and from there into `PlanMetadata.warnings`.
+    #[test]
+    fn test_insecure_tls_skip_verify_surfaces_as_plan_warning() {
+        let importer = PortainerImporter::new();
+        let snapshot = container_to_snapshot(&whoami_container(), &whoami_detail(), 1, true);
+        let plan = importer.generate_plan(snapshot).unwrap();
+
+        assert!(
+            plan.metadata
+                .warnings
+                .iter()
+                .any(|w| w.contains("skips TLS certificate verification")),
+            "expected a TLS-skip warning, got: {:?}",
+            plan.metadata.warnings
+        );
+    }
+
+    #[test]
+    fn test_verified_tls_snapshot_has_no_insecure_tls_warning() {
+        let importer = PortainerImporter::new();
+        let snapshot = container_to_snapshot(&whoami_container(), &whoami_detail(), 1, false);
+        let plan = importer.generate_plan(snapshot).unwrap();
+
+        assert!(
+            !plan
+                .metadata
+                .warnings
+                .iter()
+                .any(|w| w.contains("skips TLS certificate verification")),
+            "a verified connection must not carry the TLS-skip warning"
+        );
     }
 
     #[test]

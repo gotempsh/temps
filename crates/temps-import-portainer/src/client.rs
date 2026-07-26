@@ -25,6 +25,7 @@ pub struct PortainerClient {
     base_url: url::Url,
     username: String,
     password: String,
+    skip_tls_verify: bool,
 }
 
 impl PortainerClient {
@@ -53,10 +54,22 @@ impl PortainerClient {
                 reason: e.to_string(),
             })?;
 
+        // Portainer ships a self-signed cert on :9443 by default, so
+        // verification is skipped unless the user opts into strict
+        // verification (credentials.extra["verify_tls"] = "true" — e.g. a
+        // Portainer instance behind a real CA-issued certificate). Either
+        // way, the admin password only ever travels over this one
+        // connection — skip_tls_verify() lets the importer surface the
+        // choice to the user in the plan instead of silently deciding it.
+        let skip_tls_verify = credentials
+            .extra
+            .get("verify_tls")
+            .map(|v| v != "true")
+            .unwrap_or(true);
+
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
-            // Portainer ships a self-signed cert on :9443 by default.
-            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_certs(skip_tls_verify)
             .build()
             .map_err(|e| PortainerImportError::Http {
                 operation: "build http client".to_string(),
@@ -68,7 +81,16 @@ impl PortainerClient {
             base_url,
             username,
             password,
+            skip_tls_verify,
         })
+    }
+
+    /// Whether this client accepts Portainer's certificate without
+    /// verification — true by default (Portainer's out-of-the-box
+    /// self-signed cert on :9443), false when the user opts into strict
+    /// verification via `credentials.extra["verify_tls"] = "true"`.
+    pub fn skip_tls_verify(&self) -> bool {
+        self.skip_tls_verify
     }
 
     fn url(&self, path: &str) -> Result<url::Url, PortainerImportError> {
