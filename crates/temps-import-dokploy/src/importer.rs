@@ -834,6 +834,46 @@ impl WorkloadImporter for DokployImporter {
         let client = DokployClient::from_credentials(credentials).map_err(ImportError::from)?;
         let projects = client.projects().await.map_err(ImportError::from)?;
 
+        // Database stubs in project.all carry no name; Dokploy has no
+        // batch-fetch endpoint, only one .one?id= call per database. Collect
+        // every stub needing a name across all projects/environments first,
+        // then resolve them all CONCURRENTLY — still N HTTP calls (the API
+        // shape leaves no way around that), but N in parallel rather than N
+        // sequential round-trips, which is what actually made discover()
+        // slow on accounts with many databases.
+        let mut unnamed: Vec<(DokployDbKind, String)> = Vec::new();
+        for project in &projects {
+            for environment in &project.environments {
+                for (kind, stubs) in [
+                    (DokployDbKind::Postgres, &environment.postgres),
+                    (DokployDbKind::Mysql, &environment.mysql),
+                    (DokployDbKind::Mariadb, &environment.mariadb),
+                    (DokployDbKind::Mongo, &environment.mongo),
+                    (DokployDbKind::Redis, &environment.redis),
+                ] {
+                    for stub in stubs {
+                        if stub.name.is_none() {
+                            if let Some(id) = &stub.id {
+                                unnamed.push((kind, id.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let resolved_names: HashMap<(DokployDbKind, String), String> =
+            futures_util::future::join_all(unnamed.into_iter().map(|(kind, id)| {
+                let client = &client;
+                async move {
+                    let name = client.database(kind, &id).await.ok().map(|db| db.name);
+                    (kind, id, name)
+                }
+            }))
+            .await
+            .into_iter()
+            .filter_map(|(kind, id, name)| name.map(|n| ((kind, id), n)))
+            .collect();
+
         let mut descriptors = Vec::new();
         for project in &projects {
             for environment in &project.environments {
@@ -857,12 +897,10 @@ impl WorkloadImporter for DokployImporter {
                 ] {
                     for stub in stubs {
                         let Some(id) = &stub.id else { continue };
-                        // Database stubs in project.all carry no name —
-                        // resolve it so the picker shows something readable.
-                        let name = match &stub.name {
-                            Some(name) => Some(name.clone()),
-                            None => client.database(kind, id).await.ok().map(|db| db.name),
-                        };
+                        let name = stub
+                            .name
+                            .clone()
+                            .or_else(|| resolved_names.get(&(kind, id.clone())).cloned());
                         descriptors.push(WorkloadDescriptor {
                             id: WorkloadId::new(format!("{}/{}", kind.router(), id)),
                             name,

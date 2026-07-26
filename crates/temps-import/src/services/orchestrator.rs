@@ -37,6 +37,27 @@ struct ImportSession {
     created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Shared by every operation that reads or acts on a session
+/// (`execute_import`, `get_status`): a session's plan carries the source
+/// platform's env vars, so leaking one cross-user is a real credential
+/// exposure, not just a privacy nicety. Returning `SessionNotFound` rather
+/// than a distinct "forbidden" error deliberately avoids confirming to a
+/// non-owner that the session id exists at all.
+fn check_session_ownership(
+    session: &ImportSession,
+    user_id: i32,
+    session_id: &str,
+) -> ImportServiceResult<()> {
+    if session.user_id != user_id {
+        warn!(
+            "User {} attempted to access session {} owned by user {}",
+            user_id, session_id, session.user_id
+        );
+        return Err(ImportServiceError::SessionNotFound(session_id.to_string()));
+    }
+    Ok(())
+}
+
 /// Import orchestrator coordinating all import operations
 pub struct ImportOrchestrator {
     db: Arc<DatabaseConnection>,
@@ -99,6 +120,31 @@ impl ImportOrchestrator {
         let source = importer.source();
         info!("Registering importer for source: {}", source);
         self.importers.insert(source, importer);
+    }
+
+    /// Read-lock the session map. A `.unwrap()` here would poison the lock on
+    /// panic and wedge every subsequent import call until the process
+    /// restarts — return a typed error instead so a single bad session can't
+    /// take down the whole import subsystem.
+    fn sessions_read(
+        &self,
+    ) -> ImportServiceResult<std::sync::RwLockReadGuard<'_, HashMap<String, ImportSession>>> {
+        self.sessions.read().map_err(|_| {
+            ImportServiceError::Internal(
+                "import session store lock was poisoned by a prior panic".to_string(),
+            )
+        })
+    }
+
+    /// Write-locked counterpart of [`Self::sessions_read`].
+    fn sessions_write(
+        &self,
+    ) -> ImportServiceResult<std::sync::RwLockWriteGuard<'_, HashMap<String, ImportSession>>> {
+        self.sessions.write().map_err(|_| {
+            ImportServiceError::Internal(
+                "import session store lock was poisoned by a prior panic".to_string(),
+            )
+        })
     }
 
     /// Get an importer for a source
@@ -335,7 +381,7 @@ impl ImportOrchestrator {
         };
 
         {
-            let mut sessions = self.sessions.write().unwrap();
+            let mut sessions = self.sessions_write()?;
             sessions.insert(session_id.clone(), session);
         }
 
@@ -372,7 +418,7 @@ impl ImportOrchestrator {
 
         // Retrieve session from memory
         let session = {
-            let sessions = self.sessions.read().unwrap();
+            let sessions = self.sessions_read()?;
             sessions
                 .get(&session_id)
                 .cloned()
@@ -380,13 +426,7 @@ impl ImportOrchestrator {
         };
 
         // Verify user owns this session
-        if session.user_id != user_id {
-            warn!(
-                "User {} attempted to execute session {} owned by user {}",
-                user_id, session_id, session.user_id
-            );
-            return Err(ImportServiceError::SessionNotFound(session_id));
-        }
+        check_session_ownership(&session, user_id, &session_id)?;
 
         // Check if validation passed
         if !session.validation.can_proceed() {
@@ -586,17 +626,26 @@ impl ImportOrchestrator {
     }
 
     /// Get import status
-    pub async fn get_status(&self, session_id: &str) -> ImportServiceResult<ImportStatusResponse> {
+    pub async fn get_status(
+        &self,
+        user_id: i32,
+        session_id: &str,
+    ) -> ImportServiceResult<ImportStatusResponse> {
         debug!("Getting status for import session: {}", session_id);
 
         // Retrieve session from memory
         let session = {
-            let sessions = self.sessions.read().unwrap();
+            let sessions = self.sessions_read()?;
             sessions
                 .get(session_id)
                 .cloned()
                 .ok_or_else(|| ImportServiceError::SessionNotFound(session_id.to_string()))?
         };
+
+        // Verify user owns this session — the plan it carries includes the
+        // source platform's env vars, so leaking it cross-user is a real
+        // credential exposure, not just a privacy nicety.
+        check_session_ownership(&session, user_id, session_id)?;
 
         // Extract errors and warnings from validation
         let errors: Vec<String> = session
@@ -738,6 +787,41 @@ mod tests {
                 critical_count: 0,
             },
         }
+    }
+
+    fn test_session(user_id: i32) -> ImportSession {
+        ImportSession {
+            session_id: "sess-1".to_string(),
+            user_id,
+            plan: create_test_plan(),
+            validation: create_test_validation(true),
+            repository_id: None,
+            git_provider_connection_id: None,
+            repo_owner: None,
+            repo_name: None,
+            credentials: temps_import_types::ImportCredentials::default(),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    // Pure — no orchestrator/DB/service construction needed, unlike the
+    // integration-shaped tests below that require full service wiring.
+    #[test]
+    fn check_session_ownership_allows_the_owner() {
+        let session = test_session(7);
+        assert!(check_session_ownership(&session, 7, "sess-1").is_ok());
+    }
+
+    #[test]
+    fn check_session_ownership_rejects_a_different_user() {
+        let session = test_session(7);
+        let result = check_session_ownership(&session, 8, "sess-1");
+        assert!(
+            matches!(result, Err(ImportServiceError::SessionNotFound(id)) if id == "sess-1"),
+            "a non-owner must see the same 'not found' error a truly missing \
+             session would produce — never a distinct 'forbidden' response \
+             that would confirm the session id exists"
+        );
     }
 
     // Tests commented out - they require full service initialization which is complex in unit tests.
@@ -1203,7 +1287,7 @@ mod tests {
         }
 
         // Act
-        let result = orchestrator.get_status(&session_id).await;
+        let result = orchestrator.get_status(1, &session_id).await;
 
         // Assert
         assert!(result.is_ok(), "Should return status for existing session");

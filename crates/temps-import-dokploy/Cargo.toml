@@ -26,3 +26,4 @@ async-trait = { workspace = true }
 sea-orm = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
+futures-util = { workspace = true }

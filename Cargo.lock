@@ -12053,6 +12053,7 @@ dependencies = [
 name = "temps-import"
 version = "0.1.0-beta.54"
 dependencies = [
+ "anyhow",
  "async-trait",
  "axum 0.8.9",
  "bollard",
@@ -12159,6 +12160,7 @@ version = "0.1.0-beta.54"
 dependencies = [
  "async-trait",
  "chrono",
+ "futures-util",
  "reqwest 0.12.28",
  "sea-orm",
  "serde",

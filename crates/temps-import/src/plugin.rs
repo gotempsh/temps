@@ -118,12 +118,12 @@ impl TempsPlugin for ImportPlugin {
     }
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
-        let import_orchestrator = context
-            .get_service::<ImportOrchestrator>()
-            .expect("ImportOrchestrator must be registered before configuring routes");
+        let import_orchestrator = context.require_service::<ImportOrchestrator>();
+        let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
 
         let app_state = Arc::new(handlers::types::AppState {
             import_orchestrator,
+            audit_service,
         });
 
         let routes = handlers::configure_routes().with_state(app_state);

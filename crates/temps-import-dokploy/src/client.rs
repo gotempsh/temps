@@ -12,7 +12,7 @@ use temps_core::url_validation::validate_external_url;
 use temps_import_types::ImportCredentials;
 
 /// Database kinds Dokploy models as separate routers
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DokployDbKind {
     Postgres,
     Mysql,

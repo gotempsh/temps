@@ -13,6 +13,7 @@ use crate::services::ImportOrchestrator;
 /// Application state for handlers
 pub struct AppState {
     pub import_orchestrator: Arc<ImportOrchestrator>,
+    pub audit_service: Arc<dyn temps_core::AuditLogger>,
 }
 
 /// Information about an import source

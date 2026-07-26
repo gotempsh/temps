@@ -44,6 +44,7 @@ uuid = { workspace = true }
 bollard = { workspace = true }
 url = { workspace = true }
 futures-util = { workspace = true }
+anyhow = { workspace = true }
 
 [dev-dependencies]
 sea-orm = { workspace = true, features = ["mock"] }
