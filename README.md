@@ -14,7 +14,9 @@
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
 [![GitHub Stars](https://img.shields.io/github/stars/gotempsh/temps?style=social)](https://github.com/gotempsh/temps)
 
-[Website](https://temps.sh) | [Documentation](https://temps.sh/docs) | [Quick Start](https://temps.sh/docs/introduction) | [GitHub](https://github.com/gotempsh/temps)
+[Website](https://temps.sh) | [Documentation](https://temps.sh/docs) | [Quick Start](https://temps.sh/docs/introduction) | [Discussions](https://github.com/gotempsh/temps/discussions)
+
+English | [简体中文](README.zh-CN.md) | [Español](README.es.md) | [Français](README.fr.md) | [Deutsch](README.de.md) | [日本語](README.ja.md) | [Português](README.pt-BR.md)
 
 </div>
 
@@ -42,6 +44,24 @@ Stop paying for 6 different SaaS tools. Temps replaces your deployment platform,
 <tr>
 <td width="50%">
 
+**Built-in Analytics & Session Replay**
+Web analytics with funnels, visitor tracking, and session replay (rrweb). Sentry-compatible error tracking. No external services — this is what no other self-hosted PaaS has.
+
+![Analytics](assets/screenshots/analytics.png)
+
+</td>
+<td width="50%">
+
+**Uptime Monitoring & Alerts**
+Uptime monitors with status timelines, plus alerts for deploy failures, runtime crashes, certificate expiry, and backup health. Get notified before problems reach users.
+
+![Uptime Monitoring](assets/screenshots/monitoring-detail.png)
+
+</td>
+</tr>
+<tr>
+<td width="50%">
+
 **Git Push to Deploy**
 Push to Git, Temps builds and deploys. Auto-detects frameworks, creates preview URLs, and handles zero-downtime rollouts.
 
@@ -50,10 +70,10 @@ Push to Git, Temps builds and deploys. Auto-detects frameworks, creates preview 
 </td>
 <td width="50%">
 
-**Built-in Analytics & Session Replay**
-Web analytics with funnels, visitor tracking, and session replay (rrweb). Sentry-compatible error tracking. No external services.
+**Everything in One Dashboard**
+Visitors, errors, deployment status, and monitoring health per project — one place instead of six browser tabs.
 
-![Analytics](assets/screenshots/analytics.png)
+![Project Overview](assets/screenshots/project-overview.png)
 
 </td>
 </tr>
@@ -68,36 +88,18 @@ Runs on Cloudflare's Pingora engine. Auto TLS via Let's Encrypt (HTTP-01 & DNS-0
 </td>
 <td width="50%">
 
-**Managed Services**
-Provision Postgres, Redis, S3 (MinIO), and MongoDB alongside your apps. Temps handles creation, backups, and teardown.
-
-![Monitoring](assets/screenshots/monitoring-detail.png)
-
-</td>
-</tr>
-<tr>
-<td width="50%">
-
 **Request Logs & Proxy Visibility**
 Every HTTP request logged with method, path, status, response time, and routing metadata. Filter and search without extra tooling.
 
 ![Proxy Logs](assets/screenshots/proxy-logs.png)
 
 </td>
-<td width="50%">
-
-**Monitoring & Alerts**
-Monitors for deploy failures, runtime crashes, certificate expiry, and backup health. Get notified before problems reach users.
-
-![Project Overview](assets/screenshots/project-overview.png)
-
-</td>
 </tr>
 <tr>
 <td width="100%" colspan="2">
 
-**Transactional Email**
-Add sender domains with DKIM records through the UI. Send transactional emails via `@temps-sdk/node-sdk`. No external email service needed.
+**Managed Services & Transactional Email**
+Provision Postgres, Redis, S3 (MinIO), and MongoDB alongside your apps — Temps handles creation, backups, and teardown. Add sender domains with DKIM records through the UI and send transactional email via `@temps-sdk/node-sdk`. No external services needed.
 
 </td>
 </tr>
@@ -128,6 +130,8 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 ```
 
 **Tested on:** Ubuntu 24.04 / 22.04 &nbsp;|&nbsp; Also works on macOS
+
+Prefer not to manage a server? [Temps Cloud](https://temps.sh/pricing) runs Temps for you on managed infrastructure.
 
 ---
 
@@ -240,6 +244,27 @@ const files = await blob.list({ prefix: 'avatars/' });
 ```
 
 </details>
+
+---
+
+## Community
+
+- [GitHub Discussions](https://github.com/gotempsh/temps/discussions) — questions, ideas, and show & tell
+- [GitHub Issues](https://github.com/gotempsh/temps/issues) — bug reports and feature requests
+
+If Temps saves you a SaaS bill, [a star](https://github.com/gotempsh/temps) helps other people find it.
+
+---
+
+## Star History
+
+<a href="https://www.star-history.com/#gotempsh/temps&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=gotempsh/temps&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=gotempsh/temps&type=Date" />
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=gotempsh/temps&type=Date" />
+  </picture>
+</a>
 
 ---
 

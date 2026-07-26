@@ -1,0 +1,293 @@
+<div align="center">
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="web/public/logo/temps-logo-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="web/public/logo/temps-logo-light.png">
+  <img alt="Temps" src="web/public/logo/temps-logo-dark.png" width="280">
+</picture>
+
+### A plataforma de deploy open source e self-hosted.
+### Faça deploy, observe e escale -- a partir de um único binário.
+
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
+[![GitHub Release](https://img.shields.io/github/v/release/gotempsh/temps)](https://github.com/gotempsh/temps/releases)
+[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
+[![GitHub Stars](https://img.shields.io/github/stars/gotempsh/temps?style=social)](https://github.com/gotempsh/temps)
+
+[Site](https://temps.sh) | [Documentação](https://temps.sh/docs) | [Guia Rápido](https://temps.sh/docs/introduction) | [Discussões](https://github.com/gotempsh/temps/discussions)
+
+[English](README.md) | [简体中文](README.zh-CN.md) | [Español](README.es.md) | [Français](README.fr.md) | [Deutsch](README.de.md) | [日本語](README.ja.md) | Português
+
+</div>
+
+---
+
+<p align="center">
+  <img src="temps-demo.gif" alt="Temps — de servidor zerado a deploy concluído em menos de 3 minutos" width="800" />
+  <br />
+  <em>De um servidor zerado ao deploy completo — em menos de 3 minutos (166s).</em>
+</p>
+
+```bash
+curl -fsSL https://temps.sh/deploy.sh | bash
+```
+
+![Dashboard do Temps](assets/screenshots/dashboard.png)
+
+Pare de pagar por 6 ferramentas SaaS diferentes. O Temps substitui sua plataforma de deploy, analytics, rastreamento de erros, session replay, monitoramento de uptime e e-mail transacional -- tudo self-hosted, tudo em um único binário.
+
+---
+
+## Funcionalidades
+
+<table>
+<tr>
+<td width="50%">
+
+**Analytics e Session Replay integrados**
+Web analytics com funis, rastreamento de visitantes e session replay (rrweb). Rastreamento de erros compatível com Sentry. Sem serviços externos — é isso que nenhum outro PaaS self-hosted tem.
+
+![Analytics](assets/screenshots/analytics.png)
+
+</td>
+<td width="50%">
+
+**Monitoramento de Uptime e Alertas**
+Monitores de uptime com linhas do tempo de status, além de alertas para falhas de deploy, crashes em runtime, expiração de certificados e saúde dos backups. Seja notificado antes que os problemas cheguem aos usuários.
+
+![Monitoramento de Uptime](assets/screenshots/monitoring-detail.png)
+
+</td>
+</tr>
+<tr>
+<td width="50%">
+
+**Git Push para Deploy**
+Faça push para o Git e o Temps compila e faz o deploy. Detecta frameworks automaticamente, cria URLs de preview e cuida de rollouts sem downtime.
+
+![Deployments](assets/screenshots/deployments.png)
+
+</td>
+<td width="50%">
+
+**Tudo em um só Dashboard**
+Visitantes, erros, status de deploy e saúde do monitoramento por projeto — um único lugar em vez de seis abas do navegador.
+
+![Visão Geral do Projeto](assets/screenshots/project-overview.png)
+
+</td>
+</tr>
+<tr>
+<td width="50%">
+
+**Proxy com motor Pingora**
+Roda sobre o Pingora, o motor de proxy da Cloudflare. TLS automático via Let's Encrypt (HTTP-01 e DNS-01), domínios personalizados e log completo de requisições.
+
+![Domínios](assets/screenshots/domains.png)
+
+</td>
+<td width="50%">
+
+**Logs de Requisições e Visibilidade do Proxy**
+Cada requisição HTTP registrada com método, caminho, status, tempo de resposta e metadados de roteamento. Filtre e pesquise sem ferramentas extras.
+
+![Logs do Proxy](assets/screenshots/proxy-logs.png)
+
+</td>
+</tr>
+<tr>
+<td width="100%" colspan="2">
+
+**Serviços Gerenciados e E-mail Transacional**
+Provisione Postgres, Redis, S3 (MinIO) e MongoDB junto com suas aplicações — o Temps cuida da criação, dos backups e do desprovisionamento. Adicione domínios de envio com registros DKIM pela interface e envie e-mail transacional via `@temps-sdk/node-sdk`. Sem necessidade de serviços externos.
+
+</td>
+</tr>
+</table>
+
+### Funciona com a sua stack
+
+<p align="center">
+<a href="https://nextjs.org"><img src="https://img.shields.io/badge/Next.js-000?logo=nextdotjs&logoColor=fff&style=for-the-badge" alt="Next.js" /></a>
+<a href="https://vitejs.dev"><img src="https://img.shields.io/badge/Vite-646CFF?logo=vite&logoColor=fff&style=for-the-badge" alt="Vite" /></a>
+<a href="https://go.dev"><img src="https://img.shields.io/badge/Go-00ADD8?logo=go&logoColor=fff&style=for-the-badge" alt="Go" /></a>
+<a href="https://python.org"><img src="https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=fff&style=for-the-badge" alt="Python" /></a>
+<a href="https://rust-lang.org"><img src="https://img.shields.io/badge/Rust-000?logo=rust&logoColor=fff&style=for-the-badge" alt="Rust" /></a>
+<a href="https://java.com"><img src="https://img.shields.io/badge/Java-ED8B00?logo=openjdk&logoColor=fff&style=for-the-badge" alt="Java" /></a>
+<a href="https://dotnet.microsoft.com"><img src="https://img.shields.io/badge/.NET-512BD4?logo=dotnet&logoColor=fff&style=for-the-badge" alt=".NET" /></a>
+<a href="https://nestjs.com"><img src="https://img.shields.io/badge/NestJS-E0234E?logo=nestjs&logoColor=fff&style=for-the-badge" alt="NestJS" /></a>
+<a href="https://docker.com"><img src="https://img.shields.io/badge/Dockerfile-2496ED?logo=docker&logoColor=fff&style=for-the-badge" alt="Docker" /></a>
+</p>
+
+<p align="center"><em>Qualquer linguagem, qualquer framework. Detecção automática ou traga seu próprio Dockerfile.</em></p>
+
+---
+
+## Guia Rápido
+
+```bash
+curl -fsSL https://temps.sh/deploy.sh | bash
+```
+
+**Testado em:** Ubuntu 24.04 / 22.04 &nbsp;|&nbsp; Também funciona no macOS
+
+Prefere não gerenciar um servidor? O [Temps Cloud](https://temps.sh/pricing) roda o Temps para você em infraestrutura gerenciada.
+
+---
+
+## O que o Temps substitui
+
+| O que você ganha | Em vez de pagar por |
+|---|---|
+| Deploys via Git + URLs de preview | Vercel / Netlify / Railway (US$ 20+/mês) |
+| Web analytics + funis | PostHog / Plausible (US$ 0-450/mês) |
+| Session replay | PostHog / FullStory (US$ 0-2000/mês) |
+| Rastreamento de erros | Sentry (US$ 26+/mês) |
+| Monitoramento de uptime | Better Uptime / Pingdom (US$ 20+/mês) |
+| Postgres/Redis/S3 gerenciados | AWS RDS / ElastiCache (US$ 50+/mês) |
+| E-mail transacional + DKIM | Resend / SendGrid (US$ 20-100/mês) |
+| Logs de requisições + proxy | Cloudflare (US$ 0-200/mês) |
+| **Total com o Temps** | **US$ 0 (self-hosted)** |
+
+---
+
+## Temps vs. Alternativas
+
+| Funcionalidade | Temps | Coolify | Dokploy | Kamal | Railway | Render | Vercel |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| Self-hosted e open source | Sim | Sim | Sim | Sim | Não | Não | Não |
+| Instalação em binário único | Sim | Não | Não | Ferramenta CLI | -- | -- | -- |
+| Deploy via git push | Sim | Sim | Sim | Não | Sim | Sim | Sim |
+| Deploys de preview | Sim | Sim | Sim | Não | Sim | Sim | Sim |
+| TLS automático (HTTP-01 + DNS-01) | Sim | Sim | Sim | Sim | Sim | Sim | Sim |
+| Suporte a Docker Compose | Não | Sim | Sim | Não | -- | -- | -- |
+| Biblioteca de templates one-click | Não | 280+ | Sim | Não | Sim | Sim | Sim |
+| Web analytics | Sim | Não | Não | Não | Não | Não | Add-on pago |
+| Session replay | Sim | Não | Não | Não | Não | Não | Não |
+| Rastreamento de erros (compatível com Sentry) | Sim | Não | Não | Não | Não | Não | Não |
+| Monitoramento de uptime | Sim | Não | Não | Não | Não | Não | Não |
+| E-mail transacional + DKIM | Sim | Não | Não | Não | Não | Não | Não |
+| Postgres / Redis gerenciados | Sim | Sim | Sim | Não | Sim | Sim | Add-ons de parceiros |
+| Armazenamento compatível com S3 | Sim | Não | Não | Não | Não | Não | Blob (pago) |
+| Multi-node / clustering | Sim | Sim | Swarm | Sim | Gerenciado | Gerenciado | Gerenciado |
+| Edge functions / rede edge global | Não | Não | Não | Não | Não | Não | Sim |
+| Cobrança por usuário | Não | Não | Não | Não | US$ 20/usuário (Pro) | Por usuário | US$ 20/assento (Pro) |
+
+**Onde as alternativas ganham.** Coolify e Dokploy têm suporte de primeira classe a Docker Compose e bibliotecas de templates one-click (280+ apps no Coolify) que o Temps ainda não tem, e ambos contam com comunidades muito maiores — só o Coolify tem mais de 56 mil estrelas no GitHub, enquanto o Temps é o projeto mais novo desta lista. O Kamal é a escolha mais simples se tudo o que você quer são deploys Docker sem downtime comandados pela CLI. A Vercel e as demais plataformas gerenciadas oferecem uma rede edge global, edge functions e absorção de DDoS que um único VPS não consegue igualar — e elas operam a infraestrutura por você, o que é um valor real se você nunca quiser se preocupar com um servidor.
+
+Comparações detalhadas e atualizadas regularmente: [temps.sh/compare](https://temps.sh/compare)
+
+---
+
+## Stack Tecnológica
+
+- **Backend:** Rust, Axum, Sea-ORM, Pingora (motor de proxy da Cloudflare), Bollard (API do Docker)
+- **Frontend:** React 19, TypeScript, Tailwind CSS, shadcn/ui
+- **Banco de dados:** PostgreSQL + TimescaleDB
+- **Arquitetura:** 30+ crates no workspace, arquitetura de serviços em três camadas
+
+---
+
+## SDKs
+
+| Pacote | Descrição |
+|---|---|
+| [`@temps-sdk/node-sdk`](https://www.npmjs.com/package/@temps-sdk/node-sdk) | Cliente da API da plataforma + rastreamento de erros compatível com Sentry |
+| [`@temps-sdk/react-analytics`](https://www.npmjs.com/package/@temps-sdk/react-analytics) | Analytics para React, session replay, Web Vitals, rastreamento de engajamento |
+| [`@temps-sdk/kv`](https://www.npmjs.com/package/@temps-sdk/kv) | Armazenamento chave-valor serverless |
+| [`@temps-sdk/blob`](https://www.npmjs.com/package/@temps-sdk/blob) | Armazenamento de arquivos (compatível com S3) |
+| [`@temps-sdk/cli`](https://www.npmjs.com/package/@temps-sdk/cli) | Interface de linha de comando |
+
+<details>
+<summary><strong>Exemplos rápidos</strong></summary>
+
+**Analytics** -- envolva sua aplicação React e o resto é automático:
+
+```tsx
+import { TempsAnalyticsProvider } from '@temps-sdk/react-analytics';
+
+export default function App({ children }) {
+  return <TempsAnalyticsProvider>{children}</TempsAnalyticsProvider>;
+}
+```
+
+**Rastreamento de erros** -- compatível com Sentry, substituição drop-in:
+
+```typescript
+import { ErrorTracking } from '@temps-sdk/node-sdk';
+
+ErrorTracking.init({ dsn: 'https://key@your-instance.temps.dev/1' });
+
+try {
+  riskyOperation();
+} catch (error) {
+  ErrorTracking.captureException(error);
+}
+```
+
+**KV store** -- API estilo Redis, zero configuração:
+
+```typescript
+import { kv } from '@temps-sdk/kv';
+
+await kv.set('user:123', { name: 'Alice', plan: 'pro' }, { ex: 3600 });
+const user = await kv.get('user:123');
+```
+
+**Armazenamento de blobs** -- faça upload e sirva arquivos:
+
+```typescript
+import { blob } from '@temps-sdk/blob';
+
+const { url } = await blob.put('avatars/user-123.png', fileBuffer);
+const files = await blob.list({ prefix: 'avatars/' });
+```
+
+</details>
+
+---
+
+## Comunidade
+
+- [GitHub Discussions](https://github.com/gotempsh/temps/discussions) — perguntas, ideias e mostre seu projeto
+- [GitHub Issues](https://github.com/gotempsh/temps/issues) — relatos de bugs e pedidos de funcionalidades
+
+Se o Temps te livrar de uma fatura de SaaS, [uma estrela](https://github.com/gotempsh/temps) ajuda outras pessoas a encontrá-lo.
+
+---
+
+## Histórico de Estrelas
+
+<a href="https://www.star-history.com/#gotempsh/temps&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=gotempsh/temps&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=gotempsh/temps&type=Date" />
+    <img alt="Gráfico do Histórico de Estrelas" src="https://api.star-history.com/svg?repos=gotempsh/temps&type=Date" />
+  </picture>
+</a>
+
+---
+
+## Contribuindo
+
+Contribuições são bem-vindas. Consulte o [CONTRIBUTING.md](CONTRIBUTING.md) para as diretrizes.
+
+```bash
+git clone https://github.com/gotempsh/temps.git
+cd temps
+cargo build --release
+```
+
+---
+
+## Licença
+
+Licenciado sob dupla licença: [MIT](LICENSE-MIT) ou [Apache 2.0](LICENSE).
+
+---
+
+<div align="center">
+
+[temps.sh](https://temps.sh) | [Documentação](https://temps.sh/docs) | [GitHub](https://github.com/gotempsh/temps)
+
+</div>
