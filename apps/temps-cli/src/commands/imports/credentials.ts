@@ -4,8 +4,10 @@
  * Coolify/Dokploy/CapRover/Portainer are self-hosted platforms: importing
  * from them needs a base URL plus a token (or admin password, for CapRover/
  * Portainer) scoped to that instance. Kubernetes needs a full kubeconfig.
- * Docker (the local daemon) and Kamal (deploys from the developer's own
- * checkout) need nothing at all.
+ * Kamal has no control-plane API to call — the backend importer parses the
+ * project's own `config/deploy.yml` instead, so this reads that file and
+ * sends its contents as `credentials.extra.deploy_yml`. Docker (the local
+ * daemon) needs nothing at all.
  */
 
 import { readFileSync, existsSync } from 'node:fs'
@@ -18,7 +20,10 @@ export interface CredentialFlags {
   baseUrl?: string
   username?: string
   kubeconfig?: string
+  deployYml?: string
 }
+
+const DEPLOY_YML_KEY = 'deploy_yml'
 
 /**
  * Sources that need a base URL + bearer token (or, for CapRover/Portainer,
@@ -53,9 +58,12 @@ export async function resolveCredentials(
     return resolveKubernetesCredentials(flags)
   }
 
+  if (source === 'kamal') {
+    return resolveKamalCredentials(flags)
+  }
+
   if (!TOKEN_AND_URL_SOURCES.has(source)) {
-    // docker (local daemon), kamal (deploys from a local checkout, nothing
-    // to authenticate to), and anything else with no credential concept.
+    // docker (local daemon) and anything else with no credential concept.
     return {}
   }
 
@@ -124,6 +132,25 @@ async function resolveKubernetesCredentials(flags: CredentialFlags): Promise<Imp
   return { extra: { kubeconfig: kubeconfigContent } }
 }
 
+async function resolveKamalCredentials(flags: CredentialFlags): Promise<ImportCredentials> {
+  let path = flags.deployYml
+  if (!path) {
+    info('Kamal has no API to discover from — this reads your project\'s config/deploy.yml directly.')
+    path = await promptText({
+      message: 'Path to config/deploy.yml',
+      default: 'config/deploy.yml',
+      required: true,
+    })
+  }
+
+  const expanded = path.startsWith('~') ? path.replace('~', process.env.HOME ?? '~') : path
+  if (!existsSync(expanded)) {
+    throw new Error(`deploy.yml not found at ${expanded}`)
+  }
+  const deployYml = readFileSync(expanded, 'utf-8')
+  return { extra: { [DEPLOY_YML_KEY]: deployYml } }
+}
+
 function readKubeconfigFile(path: string): string {
   const expanded = path.startsWith('~')
     ? path.replace('~', process.env.HOME ?? '~')
@@ -145,6 +172,9 @@ export function describeCredentials(source: ImportSource, credentials: ImportCre
   }
   if (credentials.extra?.kubeconfig) {
     return `${colors.muted(icons.lock)} kubeconfig (${credentials.extra.kubeconfig.length} bytes)`
+  }
+  if (credentials.extra?.[DEPLOY_YML_KEY]) {
+    return `${colors.muted(icons.lock)} deploy.yml (${credentials.extra[DEPLOY_YML_KEY].length} bytes)`
   }
   return null
 }
