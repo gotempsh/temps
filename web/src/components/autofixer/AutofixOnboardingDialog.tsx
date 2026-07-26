@@ -9,7 +9,7 @@ import {
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/utils'
 import { ArrowRight, Check, Loader2, Wand2 } from 'lucide-react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { useAutofixOnboarding } from './AutofixOnboardingContext'
 import {
   useAutofixReadiness,
