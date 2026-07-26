@@ -6,15 +6,15 @@
   <img alt="Temps" src="web/public/logo/temps-logo-dark.png" width="280">
 </picture>
 
-### Die Open-Source-Alternative zu Vercel + Sentry + PostHog + Pingdom.
-### Deployments, Analytics, Session Replay & Error Tracking -- in einem selbst gehosteten Binary.
+**Die Open-Source-Alternative zu Vercel + Sentry + PostHog + Pingdom.**
+Deployments, Analytics, Session Replay & Error Tracking -- in einem selbst gehosteten Binary.
 
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 [![GitHub Release](https://img.shields.io/github/v/release/gotempsh/temps)](https://github.com/gotempsh/temps/releases)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
 [![GitHub Stars](https://img.shields.io/github/stars/gotempsh/temps?style=social)](https://github.com/gotempsh/temps)
 
-[Website](https://temps.sh) | [Dokumentation](https://temps.sh/docs) | [Schnellstart](https://temps.sh/docs/introduction) | [Diskussionen](https://github.com/gotempsh/temps/discussions)
+[Website](https://temps.sh) · [Dokumentation](https://temps.sh/docs) · [Schnellstart](https://temps.sh/docs/introduction) · [Diskussionen](https://github.com/gotempsh/temps/discussions) · [Contributing](CONTRIBUTING.md)
 
 [English](README.md) | [简体中文](README.zh-CN.md) | [Español](README.es.md) | [Français](README.fr.md) | Deutsch | [日本語](README.ja.md) | [Português](README.pt-BR.md)
 
@@ -22,17 +22,15 @@
 
 ---
 
-<p align="center">
-  <img src="assets/temps-demo.gif" alt="Temps — vom nackten Server zum fertigen Deployment in unter 3 Minuten" width="800" />
-  <br />
-  <em>Vom nackten Server zum vollständigen Deployment — in unter 3 Minuten (166s).</em>
-</p>
-
 ```bash
 curl -fsSL https://temps.sh/deploy.sh | bash
 ```
 
-![Temps Dashboard](assets/screenshots/dashboard.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme-hero-dark.png">
+  <img alt="Temps — analytics, uptime, error tracking, deployments, request logs, dashboard" src="assets/readme-hero-light.png">
+</picture>
+
 
 Schluss mit dem Bezahlen für 6 verschiedene SaaS-Tools. Temps ersetzt deine Deployment-Plattform, Analytics, Error-Tracking, Session Replay, Uptime-Monitoring und Transaktions-E-Mails -- alles selbst gehostet, alles in einem Binary.
 
@@ -47,7 +45,6 @@ Schluss mit dem Bezahlen für 6 verschiedene SaaS-Tools. Temps ersetzt deine Dep
 **Integrierte Analytics & Session Replay**
 Web-Analytics mit Funnels, Besucher-Tracking und Session Replay (rrweb). Sentry-kompatibles Error-Tracking. Keine externen Dienste — das bietet keine andere selbst gehostete PaaS.
 
-![Analytics](assets/screenshots/analytics.png)
 
 </td>
 <td width="50%">
@@ -55,7 +52,6 @@ Web-Analytics mit Funnels, Besucher-Tracking und Session Replay (rrweb). Sentry-
 **Uptime-Monitoring & Alerts**
 Uptime-Monitore mit Status-Zeitleisten, dazu Alerts bei fehlgeschlagenen Deployments, Laufzeit-Abstürzen, ablaufenden Zertifikaten und Backup-Problemen. Erfahre von Problemen, bevor deine Nutzer sie bemerken.
 
-![Uptime-Monitoring](assets/screenshots/monitoring-detail.png)
 
 </td>
 </tr>
@@ -65,7 +61,6 @@ Uptime-Monitore mit Status-Zeitleisten, dazu Alerts bei fehlgeschlagenen Deploym
 **Git Push to Deploy**
 Push nach Git, Temps baut und deployt. Erkennt Frameworks automatisch, erstellt Preview-URLs und übernimmt Zero-Downtime-Rollouts.
 
-![Deployments](assets/screenshots/deployments.png)
 
 </td>
 <td width="50%">
@@ -73,7 +68,6 @@ Push nach Git, Temps baut und deployt. Erkennt Frameworks automatisch, erstellt 
 **Alles in einem Dashboard**
 Besucher, Fehler, Deployment-Status und Monitoring-Zustand pro Projekt — an einem Ort statt in sechs Browser-Tabs.
 
-![Projektübersicht](assets/screenshots/project-overview.png)
 
 </td>
 </tr>
@@ -83,7 +77,6 @@ Besucher, Fehler, Deployment-Status und Monitoring-Zustand pro Projekt — an ei
 **Proxy auf Pingora-Basis**
 Läuft auf Cloudflares Pingora-Engine. Automatisches TLS via Let's Encrypt (HTTP-01 & DNS-01), eigene Domains und vollständiges Request-Logging.
 
-![Domains](assets/screenshots/domains.png)
 
 </td>
 <td width="50%">
@@ -91,7 +84,6 @@ Läuft auf Cloudflares Pingora-Engine. Automatisches TLS via Let's Encrypt (HTTP
 **Request-Logs & Proxy-Einblick**
 Jeder HTTP-Request wird mit Methode, Pfad, Status, Antwortzeit und Routing-Metadaten protokolliert. Filtern und suchen ohne zusätzliches Tooling.
 
-![Proxy-Logs](assets/screenshots/proxy-logs.png)
 
 </td>
 </tr>

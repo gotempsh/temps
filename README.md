@@ -6,15 +6,16 @@
   <img alt="Temps" src="web/public/logo/temps-logo-dark.png" width="280">
 </picture>
 
-### The open-source alternative to Vercel + Sentry + PostHog + Pingdom.
-### Deployments, analytics, session replay & error tracking -- one self-hosted binary.
+**The open-source alternative to Vercel + Sentry + PostHog + Pingdom**
+
+Deployments, analytics, session replay, error tracking & uptime monitoring — one self-hosted binary.
 
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 [![GitHub Release](https://img.shields.io/github/v/release/gotempsh/temps)](https://github.com/gotempsh/temps/releases)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
 [![GitHub Stars](https://img.shields.io/github/stars/gotempsh/temps?style=social)](https://github.com/gotempsh/temps)
 
-[Website](https://temps.sh) | [Documentation](https://temps.sh/docs) | [Quick Start](https://temps.sh/docs/introduction) | [Discussions](https://github.com/gotempsh/temps/discussions)
+[Website](https://temps.sh) · [Documentation](https://temps.sh/docs) · [Quick Start](https://temps.sh/docs/introduction) · [Discussions](https://github.com/gotempsh/temps/discussions) · [Contributing](CONTRIBUTING.md)
 
 English | [简体中文](README.zh-CN.md) | [Español](README.es.md) | [Français](README.fr.md) | [Deutsch](README.de.md) | [日本語](README.ja.md) | [Português](README.pt-BR.md)
 
@@ -22,17 +23,14 @@ English | [简体中文](README.zh-CN.md) | [Español](README.es.md) | [Françai
 
 ---
 
-<p align="center">
-  <img src="assets/temps-demo.gif" alt="Temps — from bare server to deployed in under 3 minutes" width="800" />
-  <br />
-  <em>From bare server to fully deployed — in under 3 minutes (166s).</em>
-</p>
-
 ```bash
 curl -fsSL https://temps.sh/deploy.sh | bash
 ```
 
-![Temps Dashboard](assets/screenshots/dashboard.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme-hero-dark.png">
+  <img alt="Everything Temps ships in one binary" src="assets/readme-hero-light.png">
+</picture>
 
 Stop paying for 6 different SaaS tools. Temps replaces your deployment platform, analytics, error tracking, session replay, uptime monitoring, and transactional email -- all self-hosted, all in one binary.
 
@@ -47,7 +45,6 @@ Stop paying for 6 different SaaS tools. Temps replaces your deployment platform,
 **Built-in Analytics & Session Replay**
 Web analytics with funnels, visitor tracking, and session replay (rrweb). Sentry-compatible error tracking. No external services — this is what no other self-hosted PaaS has.
 
-![Analytics](assets/screenshots/analytics.png)
 
 </td>
 <td width="50%">
@@ -55,7 +52,6 @@ Web analytics with funnels, visitor tracking, and session replay (rrweb). Sentry
 **Uptime Monitoring & Alerts**
 Uptime monitors with status timelines, plus alerts for deploy failures, runtime crashes, certificate expiry, and backup health. Get notified before problems reach users.
 
-![Uptime Monitoring](assets/screenshots/monitoring-detail.png)
 
 </td>
 </tr>
@@ -65,7 +61,6 @@ Uptime monitors with status timelines, plus alerts for deploy failures, runtime 
 **Git Push to Deploy**
 Push to Git, Temps builds and deploys. Auto-detects frameworks, creates preview URLs, and handles zero-downtime rollouts.
 
-![Deployments](assets/screenshots/deployments.png)
 
 </td>
 <td width="50%">
@@ -73,7 +68,6 @@ Push to Git, Temps builds and deploys. Auto-detects frameworks, creates preview 
 **Everything in One Dashboard**
 Visitors, errors, deployment status, and monitoring health per project — one place instead of six browser tabs.
 
-![Project Overview](assets/screenshots/project-overview.png)
 
 </td>
 </tr>
@@ -83,7 +77,6 @@ Visitors, errors, deployment status, and monitoring health per project — one p
 **Pingora-Powered Proxy**
 Runs on Cloudflare's Pingora engine. Auto TLS via Let's Encrypt (HTTP-01 & DNS-01), custom domains, and full request logging.
 
-![Domains](assets/screenshots/domains.png)
 
 </td>
 <td width="50%">
@@ -91,7 +84,6 @@ Runs on Cloudflare's Pingora engine. Auto TLS via Let's Encrypt (HTTP-01 & DNS-0
 **Request Logs & Proxy Visibility**
 Every HTTP request logged with method, path, status, response time, and routing metadata. Filter and search without extra tooling.
 
-![Proxy Logs](assets/screenshots/proxy-logs.png)
 
 </td>
 </tr>

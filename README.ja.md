@@ -6,15 +6,15 @@
   <img alt="Temps" src="web/public/logo/temps-logo-dark.png" width="280">
 </picture>
 
-### Vercel + Sentry + PostHog + Pingdom のオープンソース代替。
-### デプロイ、アナリティクス、セッションリプレイ、エラートラッキング —— すべてをセルフホストの単一バイナリで。
+**Vercel + Sentry + PostHog + Pingdom のオープンソース代替。**
+デプロイ、アナリティクス、セッションリプレイ、エラートラッキング —— すべてをセルフホストの単一バイナリで。
 
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 [![GitHub Release](https://img.shields.io/github/v/release/gotempsh/temps)](https://github.com/gotempsh/temps/releases)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
 [![GitHub Stars](https://img.shields.io/github/stars/gotempsh/temps?style=social)](https://github.com/gotempsh/temps)
 
-[ウェブサイト](https://temps.sh) | [ドキュメント](https://temps.sh/docs) | [クイックスタート](https://temps.sh/docs/introduction) | [ディスカッション](https://github.com/gotempsh/temps/discussions)
+[ウェブサイト](https://temps.sh) · [ドキュメント](https://temps.sh/docs) · [クイックスタート](https://temps.sh/docs/introduction) · [ディスカッション](https://github.com/gotempsh/temps/discussions) · [Contributing](CONTRIBUTING.md)
 
 [English](README.md) | [简体中文](README.zh-CN.md) | [Español](README.es.md) | [Français](README.fr.md) | [Deutsch](README.de.md) | 日本語 | [Português](README.pt-BR.md)
 
@@ -22,17 +22,15 @@
 
 ---
 
-<p align="center">
-  <img src="assets/temps-demo.gif" alt="Temps — まっさらなサーバーから3分以内でデプロイ完了" width="800" />
-  <br />
-  <em>まっさらなサーバーからデプロイ完了まで —— 3分以内（166秒）。</em>
-</p>
-
 ```bash
 curl -fsSL https://temps.sh/deploy.sh | bash
 ```
 
-![Temps ダッシュボード](assets/screenshots/dashboard.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme-hero-dark.png">
+  <img alt="Temps — analytics, uptime, error tracking, deployments, request logs, dashboard" src="assets/readme-hero-light.png">
+</picture>
+
 
 6つもの SaaS ツールに料金を払うのはもうやめましょう。Temps はデプロイプラットフォーム、アナリティクス、エラートラッキング、セッションリプレイ、稼働監視、トランザクションメールをまとめて置き換えます —— すべてセルフホストで、すべて1つのバイナリに。
 
@@ -47,7 +45,6 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 **アナリティクス & セッションリプレイを標準搭載**
 ファネル分析、訪問者トラッキング、セッションリプレイ（rrweb）を備えたウェブアナリティクス。Sentry 互換のエラートラッキングも搭載。外部サービスは不要 —— これは他のセルフホスト型 PaaS にはない機能です。
 
-![アナリティクス](assets/screenshots/analytics.png)
 
 </td>
 <td width="50%">
@@ -55,7 +52,6 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 **稼働監視 & アラート**
 ステータスタイムライン付きの稼働モニターに加え、デプロイ失敗、ランタイムのクラッシュ、証明書の期限切れ、バックアップの健全性に対するアラートを提供。問題がユーザーに届く前に通知を受け取れます。
 
-![稼働監視](assets/screenshots/monitoring-detail.png)
 
 </td>
 </tr>
@@ -65,7 +61,6 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 **Git プッシュでデプロイ**
 Git にプッシュすれば、Temps がビルドしてデプロイします。フレームワークを自動検出し、プレビュー URL を作成し、ゼロダウンタイムのロールアウトを実行します。
 
-![デプロイメント](assets/screenshots/deployments.png)
 
 </td>
 <td width="50%">
@@ -73,7 +68,6 @@ Git にプッシュすれば、Temps がビルドしてデプロイします。�
 **すべてを1つのダッシュボードに**
 訪問者、エラー、デプロイ状況、監視の健全性をプロジェクトごとに一元表示 —— ブラウザのタブを6つ開く代わりに、この1画面で完結します。
 
-![プロジェクト概要](assets/screenshots/project-overview.png)
 
 </td>
 </tr>
@@ -83,7 +77,6 @@ Git にプッシュすれば、Temps がビルドしてデプロイします。�
 **Pingora 駆動のプロキシ**
 Cloudflare の Pingora エンジン上で動作。Let's Encrypt による自動 TLS（HTTP-01 & DNS-01）、カスタムドメイン、完全なリクエストロギングに対応。
 
-![ドメイン](assets/screenshots/domains.png)
 
 </td>
 <td width="50%">
@@ -91,7 +84,6 @@ Cloudflare の Pingora エンジン上で動作。Let's Encrypt による自動 
 **リクエストログ & プロキシの可視化**
 すべての HTTP リクエストを、メソッド、パス、ステータス、レスポンスタイム、ルーティングメタデータとともに記録。追加ツールなしでフィルタリングと検索が可能です。
 
-![プロキシログ](assets/screenshots/proxy-logs.png)
 
 </td>
 </tr>

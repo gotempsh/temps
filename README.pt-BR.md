@@ -6,15 +6,15 @@
   <img alt="Temps" src="web/public/logo/temps-logo-dark.png" width="280">
 </picture>
 
-### A alternativa open source ao Vercel + Sentry + PostHog + Pingdom.
-### Deploys, analytics, session replay e error tracking -- em um único binário self-hosted.
+**A alternativa open source ao Vercel + Sentry + PostHog + Pingdom.**
+Deploys, analytics, session replay e error tracking -- em um único binário self-hosted.
 
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 [![GitHub Release](https://img.shields.io/github/v/release/gotempsh/temps)](https://github.com/gotempsh/temps/releases)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
 [![GitHub Stars](https://img.shields.io/github/stars/gotempsh/temps?style=social)](https://github.com/gotempsh/temps)
 
-[Site](https://temps.sh) | [Documentação](https://temps.sh/docs) | [Guia Rápido](https://temps.sh/docs/introduction) | [Discussões](https://github.com/gotempsh/temps/discussions)
+[Site](https://temps.sh) · [Documentação](https://temps.sh/docs) · [Guia Rápido](https://temps.sh/docs/introduction) · [Discussões](https://github.com/gotempsh/temps/discussions) · [Contributing](CONTRIBUTING.md)
 
 [English](README.md) | [简体中文](README.zh-CN.md) | [Español](README.es.md) | [Français](README.fr.md) | [Deutsch](README.de.md) | [日本語](README.ja.md) | Português
 
@@ -22,17 +22,15 @@
 
 ---
 
-<p align="center">
-  <img src="assets/temps-demo.gif" alt="Temps — de servidor zerado a deploy concluído em menos de 3 minutos" width="800" />
-  <br />
-  <em>De um servidor zerado ao deploy completo — em menos de 3 minutos (166s).</em>
-</p>
-
 ```bash
 curl -fsSL https://temps.sh/deploy.sh | bash
 ```
 
-![Dashboard do Temps](assets/screenshots/dashboard.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme-hero-dark.png">
+  <img alt="Temps — analytics, uptime, error tracking, deployments, request logs, dashboard" src="assets/readme-hero-light.png">
+</picture>
+
 
 Pare de pagar por 6 ferramentas SaaS diferentes. O Temps substitui sua plataforma de deploy, analytics, rastreamento de erros, session replay, monitoramento de uptime e e-mail transacional -- tudo self-hosted, tudo em um único binário.
 
@@ -47,7 +45,6 @@ Pare de pagar por 6 ferramentas SaaS diferentes. O Temps substitui sua plataform
 **Analytics e Session Replay integrados**
 Web analytics com funis, rastreamento de visitantes e session replay (rrweb). Rastreamento de erros compatível com Sentry. Sem serviços externos — é isso que nenhum outro PaaS self-hosted tem.
 
-![Analytics](assets/screenshots/analytics.png)
 
 </td>
 <td width="50%">
@@ -55,7 +52,6 @@ Web analytics com funis, rastreamento de visitantes e session replay (rrweb). Ra
 **Monitoramento de Uptime e Alertas**
 Monitores de uptime com linhas do tempo de status, além de alertas para falhas de deploy, crashes em runtime, expiração de certificados e saúde dos backups. Seja notificado antes que os problemas cheguem aos usuários.
 
-![Monitoramento de Uptime](assets/screenshots/monitoring-detail.png)
 
 </td>
 </tr>
@@ -65,7 +61,6 @@ Monitores de uptime com linhas do tempo de status, além de alertas para falhas 
 **Git Push para Deploy**
 Faça push para o Git e o Temps compila e faz o deploy. Detecta frameworks automaticamente, cria URLs de preview e cuida de rollouts sem downtime.
 
-![Deployments](assets/screenshots/deployments.png)
 
 </td>
 <td width="50%">
@@ -73,7 +68,6 @@ Faça push para o Git e o Temps compila e faz o deploy. Detecta frameworks autom
 **Tudo em um só Dashboard**
 Visitantes, erros, status de deploy e saúde do monitoramento por projeto — um único lugar em vez de seis abas do navegador.
 
-![Visão Geral do Projeto](assets/screenshots/project-overview.png)
 
 </td>
 </tr>
@@ -83,7 +77,6 @@ Visitantes, erros, status de deploy e saúde do monitoramento por projeto — um
 **Proxy com motor Pingora**
 Roda sobre o Pingora, o motor de proxy da Cloudflare. TLS automático via Let's Encrypt (HTTP-01 e DNS-01), domínios personalizados e log completo de requisições.
 
-![Domínios](assets/screenshots/domains.png)
 
 </td>
 <td width="50%">
@@ -91,7 +84,6 @@ Roda sobre o Pingora, o motor de proxy da Cloudflare. TLS automático via Let's 
 **Logs de Requisições e Visibilidade do Proxy**
 Cada requisição HTTP registrada com método, caminho, status, tempo de resposta e metadados de roteamento. Filtre e pesquise sem ferramentas extras.
 
-![Logs do Proxy](assets/screenshots/proxy-logs.png)
 
 </td>
 </tr>

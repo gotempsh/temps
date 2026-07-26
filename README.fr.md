@@ -6,15 +6,15 @@
   <img alt="Temps" src="web/public/logo/temps-logo-dark.png" width="280">
 </picture>
 
-### L'alternative open source à Vercel + Sentry + PostHog + Pingdom.
-### Déploiements, analytics, session replay et suivi d'erreurs -- en un seul binaire auto-hébergé.
+**L'alternative open source à Vercel + Sentry + PostHog + Pingdom.**
+Déploiements, analytics, session replay et suivi d'erreurs -- en un seul binaire auto-hébergé.
 
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 [![GitHub Release](https://img.shields.io/github/v/release/gotempsh/temps)](https://github.com/gotempsh/temps/releases)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
 [![GitHub Stars](https://img.shields.io/github/stars/gotempsh/temps?style=social)](https://github.com/gotempsh/temps)
 
-[Site web](https://temps.sh) | [Documentation](https://temps.sh/docs) | [Démarrage rapide](https://temps.sh/docs/introduction) | [Discussions](https://github.com/gotempsh/temps/discussions)
+[Site web](https://temps.sh) · [Documentation](https://temps.sh/docs) · [Démarrage rapide](https://temps.sh/docs/introduction) · [Discussions](https://github.com/gotempsh/temps/discussions) · [Contributing](CONTRIBUTING.md)
 
 [English](README.md) | [简体中文](README.zh-CN.md) | [Español](README.es.md) | Français | [Deutsch](README.de.md) | [日本語](README.ja.md) | [Português](README.pt-BR.md)
 
@@ -22,17 +22,15 @@
 
 ---
 
-<p align="center">
-  <img src="assets/temps-demo.gif" alt="Temps — d'un serveur nu à une application déployée en moins de 3 minutes" width="800" />
-  <br />
-  <em>D'un serveur nu à une application entièrement déployée — en moins de 3 minutes (166 s).</em>
-</p>
-
 ```bash
 curl -fsSL https://temps.sh/deploy.sh | bash
 ```
 
-![Tableau de bord Temps](assets/screenshots/dashboard.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme-hero-dark.png">
+  <img alt="Temps — analytics, uptime, error tracking, deployments, request logs, dashboard" src="assets/readme-hero-light.png">
+</picture>
+
 
 Arrêtez de payer 6 outils SaaS différents. Temps remplace votre plateforme de déploiement, vos analytics, votre suivi d'erreurs, votre session replay, votre monitoring de disponibilité et vos emails transactionnels -- le tout auto-hébergé, le tout dans un seul binaire.
 
@@ -47,7 +45,6 @@ Arrêtez de payer 6 outils SaaS différents. Temps remplace votre plateforme de 
 **Analytics et session replay intégrés**
 Analytics web avec funnels, suivi des visiteurs et session replay (rrweb). Suivi d'erreurs compatible Sentry. Aucun service externe — c'est ce qu'aucune autre PaaS auto-hébergée ne propose.
 
-![Analytics](assets/screenshots/analytics.png)
 
 </td>
 <td width="50%">
@@ -55,7 +52,6 @@ Analytics web avec funnels, suivi des visiteurs et session replay (rrweb). Suivi
 **Monitoring de disponibilité et alertes**
 Moniteurs d'uptime avec chronologie des statuts, plus des alertes en cas d'échec de déploiement, de crash à l'exécution, d'expiration de certificat ou de problème de sauvegarde. Soyez prévenu avant que les problèmes n'atteignent vos utilisateurs.
 
-![Monitoring de disponibilité](assets/screenshots/monitoring-detail.png)
 
 </td>
 </tr>
@@ -65,7 +61,6 @@ Moniteurs d'uptime avec chronologie des statuts, plus des alertes en cas d'éche
 **Git push, c'est déployé**
 Poussez sur Git, Temps build et déploie. Détection automatique des frameworks, URLs de préversion et rollouts sans interruption de service.
 
-![Déploiements](assets/screenshots/deployments.png)
 
 </td>
 <td width="50%">
@@ -73,7 +68,6 @@ Poussez sur Git, Temps build et déploie. Détection automatique des frameworks,
 **Tout dans un seul tableau de bord**
 Visiteurs, erreurs, statut des déploiements et état du monitoring par projet — un seul endroit au lieu de six onglets de navigateur.
 
-![Vue d'ensemble du projet](assets/screenshots/project-overview.png)
 
 </td>
 </tr>
@@ -83,7 +77,6 @@ Visiteurs, erreurs, statut des déploiements et état du monitoring par projet �
 **Proxy propulsé par Pingora**
 Fonctionne sur Pingora, le moteur de Cloudflare. TLS automatique via Let's Encrypt (HTTP-01 et DNS-01), domaines personnalisés et journalisation complète des requêtes.
 
-![Domaines](assets/screenshots/domains.png)
 
 </td>
 <td width="50%">
@@ -91,7 +84,6 @@ Fonctionne sur Pingora, le moteur de Cloudflare. TLS automatique via Let's Encry
 **Logs de requêtes et visibilité du proxy**
 Chaque requête HTTP est journalisée avec méthode, chemin, statut, temps de réponse et métadonnées de routage. Filtrez et recherchez sans outillage supplémentaire.
 
-![Logs du proxy](assets/screenshots/proxy-logs.png)
 
 </td>
 </tr>

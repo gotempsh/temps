@@ -6,15 +6,15 @@
   <img alt="Temps" src="web/public/logo/temps-logo-dark.png" width="280">
 </picture>
 
-### Vercel + Sentry + PostHog + Pingdom 的开源替代品。
-### 部署、分析、会话回放、错误追踪 —— 一个自托管的二进制文件搞定。
+**Vercel + Sentry + PostHog + Pingdom 的开源替代品。**
+部署、分析、会话回放、错误追踪 —— 一个自托管的二进制文件搞定。
 
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 [![GitHub Release](https://img.shields.io/github/v/release/gotempsh/temps)](https://github.com/gotempsh/temps/releases)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
 [![GitHub Stars](https://img.shields.io/github/stars/gotempsh/temps?style=social)](https://github.com/gotempsh/temps)
 
-[官网](https://temps.sh) | [文档](https://temps.sh/docs) | [快速开始](https://temps.sh/docs/introduction) | [讨论区](https://github.com/gotempsh/temps/discussions)
+[官网](https://temps.sh) · [文档](https://temps.sh/docs) · [快速开始](https://temps.sh/docs/introduction) · [讨论区](https://github.com/gotempsh/temps/discussions) · [Contributing](CONTRIBUTING.md)
 
 [English](README.md) | 简体中文 | [Español](README.es.md) | [Français](README.fr.md) | [Deutsch](README.de.md) | [日本語](README.ja.md) | [Português](README.pt-BR.md)
 
@@ -22,17 +22,15 @@
 
 ---
 
-<p align="center">
-  <img src="assets/temps-demo.gif" alt="Temps —— 从裸服务器到完成部署，不到 3 分钟" width="800" />
-  <br />
-  <em>从裸服务器到完成部署 —— 不到 3 分钟（166 秒）。</em>
-</p>
-
 ```bash
 curl -fsSL https://temps.sh/deploy.sh | bash
 ```
 
-![Temps 控制台](assets/screenshots/dashboard.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme-hero-dark.png">
+  <img alt="Temps — analytics, uptime, error tracking, deployments, request logs, dashboard" src="assets/readme-hero-light.png">
+</picture>
+
 
 别再为 6 个不同的 SaaS 工具付费了。Temps 一次性替代你的部署平台、网站分析、错误追踪、会话回放、可用性监控和事务性邮件 —— 全部自托管，全部集成在一个二进制文件里。
 
@@ -47,7 +45,6 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 **内置网站分析与会话回放**
 带漏斗分析、访客追踪和会话回放（rrweb）的网站分析，外加兼容 Sentry 的错误追踪。无需任何外部服务 —— 这是其他自托管 PaaS 都没有的能力。
 
-![网站分析](assets/screenshots/analytics.png)
 
 </td>
 <td width="50%">
@@ -55,7 +52,6 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 **可用性监控与告警**
 带状态时间线的可用性监控，以及针对部署失败、运行时崩溃、证书过期和备份健康状况的告警。在问题波及用户之前就收到通知。
 
-![可用性监控](assets/screenshots/monitoring-detail.png)
 
 </td>
 </tr>
@@ -65,7 +61,6 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 **Git Push 即部署**
 推送到 Git，Temps 自动构建并部署。自动检测框架、生成预览 URL，并完成零停机发布。
 
-![部署](assets/screenshots/deployments.png)
 
 </td>
 <td width="50%">
@@ -73,7 +68,6 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 **一个仪表盘掌握全局**
 每个项目的访客、错误、部署状态和监控健康状况 —— 一个页面搞定，不用再开六个浏览器标签页。
 
-![项目总览](assets/screenshots/project-overview.png)
 
 </td>
 </tr>
@@ -83,7 +77,6 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 **基于 Pingora 的代理**
 运行在 Cloudflare 的 Pingora 引擎之上。通过 Let's Encrypt 自动签发 TLS 证书（HTTP-01 和 DNS-01）、支持自定义域名和完整的请求日志。
 
-![域名](assets/screenshots/domains.png)
 
 </td>
 <td width="50%">
@@ -91,7 +84,6 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 **请求日志与代理可观测性**
 每个 HTTP 请求都会记录方法、路径、状态码、响应时间和路由元数据。无需额外工具即可过滤和搜索。
 
-![代理日志](assets/screenshots/proxy-logs.png)
 
 </td>
 </tr>
