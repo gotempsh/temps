@@ -62,7 +62,7 @@ import {
   X,
 } from 'lucide-react'
 import { Fragment, useMemo, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { TimeAgo } from '../utils/TimeAgo'
 
 interface EventDetailProps {

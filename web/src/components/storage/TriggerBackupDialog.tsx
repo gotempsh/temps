@@ -33,7 +33,7 @@ import { useEffect } from 'react'
 import { useForm } from 'react-hook-form'
 import { toast } from 'sonner'
 import { Alert, AlertDescription } from '@/components/ui/alert'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 
 type FormValues = {
   s3_source_id?: number

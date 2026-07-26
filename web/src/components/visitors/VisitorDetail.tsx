@@ -67,7 +67,7 @@ import {
   Users as UserIcon,
 } from 'lucide-react'
 import * as React from 'react'
-import { useNavigate, useSearchParams } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router'
 
 interface VisitorDetailProps {
   project: ProjectResponse

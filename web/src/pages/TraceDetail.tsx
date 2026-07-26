@@ -61,7 +61,7 @@ import {
   Bot,
 } from 'lucide-react'
 import { useCallback, useMemo, type ReactNode } from 'react'
-import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router'
 
 interface TraceDetailProps {
   project: ProjectResponse

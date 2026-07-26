@@ -45,7 +45,7 @@ import {
   RotateCcw,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams } from 'react-router'
 
 export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
   const { projectSlug, errorGroupId } = useParams<{

@@ -21,7 +21,7 @@ import { format, subDays } from 'date-fns'
 import { ArrowLeft, Calendar as CalendarIcon } from 'lucide-react'
 import * as React from 'react'
 import { DateRange } from 'react-day-picker'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { FunnelVisualization } from './FunnelVisualization'
 
 interface FunnelDetailProps {

@@ -59,7 +59,7 @@ import {
   Trash2,
 } from 'lucide-react'
 import { createContext, useContext, useState } from 'react'
-import { Link, useNavigate, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams } from 'react-router'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { toast } from 'sonner'
 import {

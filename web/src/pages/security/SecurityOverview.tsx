@@ -14,7 +14,7 @@ import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Progress } from '@/components/ui/progress'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Shield, AlertTriangle, CheckCircle2, Play, Loader2, Clock } from 'lucide-react'
-import { useParams } from 'react-router-dom'
+import { useParams } from 'react-router'
 import { toast } from 'sonner'
 import { useEffect } from 'react'
 

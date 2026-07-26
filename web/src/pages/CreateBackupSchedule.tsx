@@ -34,7 +34,7 @@ import { scheduleOptions } from '@/lib/schedule-options'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { ArrowLeft } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { Link, Navigate, useNavigate, useParams } from 'react-router-dom'
+import { Link, Navigate, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 
 interface NewScheduleForm {

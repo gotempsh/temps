@@ -61,7 +61,7 @@ import {
   type LucideIcon,
 } from 'lucide-react'
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
-import { useLocation, useNavigate } from 'react-router-dom'
+import { useLocation, useNavigate } from 'react-router'
 
 interface NavigationItem {
   title: string

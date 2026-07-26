@@ -5,7 +5,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useEffect } from 'react'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 import { useQuery } from '@tanstack/react-query'
 import {
   Card,

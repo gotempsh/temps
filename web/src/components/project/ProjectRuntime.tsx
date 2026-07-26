@@ -20,7 +20,7 @@ import {
   useNavigate,
   useParams,
   useSearchParams,
-} from 'react-router-dom'
+} from 'react-router'
 
 interface ProjectRuntimeProps {
   project: ProjectResponse

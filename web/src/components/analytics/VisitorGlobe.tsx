@@ -31,7 +31,7 @@ import {
   FileText,
   Calendar as CalendarIcon,
 } from 'lucide-react'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router'
 import { format, subDays } from 'date-fns'
 import type { DateRange } from 'react-day-picker'
 import { cn } from '@/lib/utils'

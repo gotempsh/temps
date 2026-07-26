@@ -1,5 +1,5 @@
 import { ProjectResponse } from '@/api/client'
-import { Navigate, Route, Routes } from 'react-router-dom'
+import { Navigate, Route, Routes } from 'react-router'
 import { CronJobDetail } from './settings/CronJobDetail'
 import { CronJobsSettings } from './settings/CronJobsSettings'
 import { DomainsSettings } from './settings/DomainsSettings'

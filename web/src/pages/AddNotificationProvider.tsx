@@ -29,7 +29,7 @@ import {
 import { useEffect, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { FaSlack } from 'react-icons/fa'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import { ProviderForm } from '@/components/monitoring/ProviderForm'
 import {

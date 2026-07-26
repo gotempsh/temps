@@ -41,7 +41,7 @@ import {
 } from '@/hooks/useLogHistory'
 import { useQuery } from '@tanstack/react-query'
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { useSearchParams } from 'react-router-dom'
+import { useSearchParams } from 'react-router'
 import AnsiToHtml from 'ansi-to-html'
 import {
   AlertCircle,

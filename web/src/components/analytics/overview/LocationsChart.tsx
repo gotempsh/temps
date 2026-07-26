@@ -14,7 +14,7 @@ import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { ChevronLeft, ChevronRight, MapPin } from 'lucide-react'
 import * as React from 'react'
-import { useNavigate, useSearchParams } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router'
 import { buildAnalyticsDimensionUrl } from './viewAllUrl'
 
 type LocationType = 'country' | 'region' | 'city'

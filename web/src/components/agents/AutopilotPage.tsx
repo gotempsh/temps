@@ -23,7 +23,7 @@ import {
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AlertTriangle, CheckCircle2, Loader2, Pencil, Play, Sparkles, Terminal } from 'lucide-react'
 import { useState } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import type { Agent } from './AgentEditPage'
 import { CodeBlock } from '@/components/ui/code-block'

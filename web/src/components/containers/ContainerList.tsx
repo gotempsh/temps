@@ -25,7 +25,7 @@ import {
   Square,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { ContainerMetricHistory } from './ContainerMetricHistory'
 
 interface ContainerListProps {

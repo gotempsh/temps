@@ -16,7 +16,7 @@ import { Textarea } from '@/components/ui/textarea'
 import { useQuery } from '@tanstack/react-query'
 import { AlertTriangle, ArrowRight, Loader2, Wand2 } from 'lucide-react'
 import { useMemo, useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 
 // Sentinel for the "use provider default" model option — Radix Select
 // rejects empty-string item values.
