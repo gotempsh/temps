@@ -2285,6 +2285,76 @@ fn resolve_session_client_ip(session: &PingoraSession) -> Option<String> {
     )
 }
 
+/// Selects the upstream read/write/idle timeout for a proxied request.
+/// `default_timeout` is the caller's already-computed websocket-aware value
+/// (3600s for websocket upgrades, 60s otherwise); this only widens it
+/// further, to 600s, for non-websocket traffic bound for the console
+/// address — long-running admin operations (e.g. triggering an import)
+/// routinely exceed the 60s hot-path bound tuned for customer-app traffic.
+/// See the call site in `LoadBalancer::upstream_peer` for the full
+/// rationale.
+fn upstream_io_timeout(
+    peer_addr: &str,
+    console_addr: &str,
+    is_websocket: bool,
+    default_timeout: std::time::Duration,
+) -> std::time::Duration {
+    let is_console = !console_addr.is_empty() && peer_addr == console_addr;
+    if is_console && !is_websocket {
+        std::time::Duration::from_secs(600)
+    } else {
+        default_timeout
+    }
+}
+
+#[cfg(test)]
+mod upstream_io_timeout_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Regression test: POST /api/imports/execute (and any other
+    /// long-running console/control-plane call) used to be RST'd at the
+    /// 60s hot-path default before the handler finished — the import would
+    /// complete successfully server-side while the browser saw a 503 with
+    /// no way to tell the user it actually worked.
+    #[test]
+    fn console_traffic_gets_the_extended_timeout() {
+        let console = "10.0.0.5:8081";
+        let timeout = upstream_io_timeout(console, console, false, Duration::from_secs(60));
+        assert_eq!(timeout, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn customer_app_traffic_keeps_the_hot_path_default() {
+        let timeout = upstream_io_timeout(
+            "10.0.0.9:9000",
+            "10.0.0.5:8081",
+            false,
+            Duration::from_secs(60),
+        );
+        assert_eq!(timeout, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn websocket_upgrade_to_the_console_keeps_the_websocket_timeout() {
+        // Console traffic never upgrades to websocket today, but the
+        // extended 600s console bound must never override the 1h websocket
+        // bound if that combination ever occurs.
+        let console = "10.0.0.5:8081";
+        let timeout = upstream_io_timeout(console, console, true, Duration::from_secs(3600));
+        assert_eq!(timeout, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn empty_console_address_never_matches() {
+        // The trait's default console_address() is "" for resolvers that
+        // don't override it (test mocks) — must never accidentally match a
+        // peer address and grant an unintended extended timeout.
+        let timeout = upstream_io_timeout("10.0.0.9:9000", "", false, Duration::from_secs(60));
+        assert_eq!(timeout, Duration::from_secs(60));
+    }
+}
+
 #[async_trait]
 impl ProxyHttp for LoadBalancer {
     type CTX = ProxyContext;
@@ -4255,9 +4325,27 @@ impl ProxyHttp for LoadBalancer {
 
         let mut peer = selection.peer;
 
+        // The 60s hot-path default (set above) is tuned for customer-app
+        // traffic — a slow customer endpoint shouldn't hang a proxy worker
+        // forever. It's the wrong bound for the console/control-plane API,
+        // which the browser reaches through this same proxy: long-running
+        // admin operations (e.g. POST /api/imports/execute, which
+        // synchronously builds, deploys, and health-checks the imported
+        // app) routinely take well over 60s for a real app. Without this,
+        // the request is RST'd out from under a handler that goes on to
+        // finish successfully server-side — the import completes, but the
+        // browser sees a 503 and the user has no way to know it worked.
+        let io_timeout = upstream_io_timeout(
+            &peer.address().to_string(),
+            self.upstream_resolver.console_address(),
+            is_websocket,
+            io_timeout,
+        );
+
         // Configure upstream connection options. `io_timeout` is bumped to
         // 1h for websocket upgrades (see top of this method) so idle terminals
-        // and SSE streams don't get RST every 60s.
+        // and SSE streams don't get RST every 60s, and to 10 minutes for
+        // console/control-plane traffic (see above).
         peer.options.connection_timeout = Some(std::time::Duration::from_secs(5));
         peer.options.read_timeout = Some(io_timeout);
         peer.options.write_timeout = Some(io_timeout);
