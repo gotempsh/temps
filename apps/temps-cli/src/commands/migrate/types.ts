@@ -16,7 +16,12 @@
 // Source platform identity
 // ---------------------------------------------------------------------------
 
-export type PlatformId = 'vercel' | 'coolify' | 'dokploy'
+// Coolify/Dokploy used to have client-side adapters here too, but temps has
+// a real, deploy-and-verified backend importer for them now (`temps-import`
+// + `temps migrate` in this same CLI, resolveCredentials/pickSource in
+// `../imports/`) — this client-side path is Vercel-only until a backend
+// importer exists for it too.
+export type PlatformId = 'vercel'
 
 export interface PlatformInfo {
   id: PlatformId
@@ -43,36 +48,6 @@ export const PLATFORMS: Record<PlatformId, PlatformInfo> = {
       'Set scope to "Full Account" (or select your team)',
       'Set expiration to at least 1 hour',
       'Copy the generated token',
-    ],
-  },
-  coolify: {
-    id: 'coolify',
-    name: 'Coolify',
-    description: 'Migrate applications from Coolify (self-hosted PaaS)',
-    requiresToken: true,
-    requiresBaseUrl: true,
-    docsUrl: 'https://coolify.io/docs/api-reference',
-    tokenInstructions: [
-      'Open your Coolify dashboard',
-      'Go to Settings (gear icon) -> API Tokens',
-      'Click "Create New Token"',
-      'Give it a descriptive name (e.g. "temps-migration")',
-      'Copy the generated token',
-    ],
-  },
-  dokploy: {
-    id: 'dokploy',
-    name: 'Dokploy',
-    description: 'Migrate applications from Dokploy (self-hosted PaaS)',
-    requiresToken: true,
-    requiresBaseUrl: true,
-    docsUrl: 'https://docs.dokploy.com/docs/api',
-    tokenInstructions: [
-      'Open your Dokploy dashboard',
-      'Click your avatar -> Settings',
-      'Go to the "API/CLI" tab under Profile',
-      'Click "Generate API Key"',
-      'Copy the generated key',
     ],
   },
 }

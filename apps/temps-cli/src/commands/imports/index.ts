@@ -10,6 +10,26 @@ import { newline, header, icons, json, colors, success, info, warning, keyValue,
 import { resolveCredentials, describeCredentials, type CredentialFlags } from './credentials.js'
 import { displayImportPlan } from './plan-display.js'
 import { displayExecuteResult } from './execute-display.js'
+import { runVercelMigrationWizard } from '../migrate/index.js'
+
+const VERCEL_SOURCE: ImportSourceInfo = {
+  source: 'vercel',
+  name: 'Vercel',
+  version: 'client-side',
+  available: true,
+  capabilities: {
+    requires_credentials: true,
+    supports_build: true,
+    supports_cost_analysis: false,
+    supports_domains: true,
+    supports_health_checks: false,
+    supports_networks: false,
+    supports_project_snapshot: true,
+    supports_resource_limits: false,
+    supports_services: true,
+    supports_volumes: false,
+  },
+}
 
 interface SourcesOptions {
   json?: boolean
@@ -43,9 +63,10 @@ interface StatusOptions {
 
 export function registerImportsCommands(program: Command): void {
   const imports = program
-    .command('imports')
+    .command('migrate')
+    .alias('imports')
     .alias('import')
-    .description('Migrate a project from another platform (Coolify, Dokploy, CapRover, Portainer, Kubernetes, Docker) into temps')
+    .description('Migrate a project from another platform (Vercel, Coolify, Dokploy, CapRover, Portainer, Kubernetes, Docker) into temps')
 
   imports
     .command('sources')
@@ -76,9 +97,8 @@ export function registerImportsCommands(program: Command): void {
 
   imports
     .command('run')
-    .alias('migrate')
     .description('Guided end-to-end migration: discover, plan, review, and execute')
-    .option('-s, --source <source>', 'Import source')
+    .option('-s, --source <source>', 'Import source (vercel, coolify, dokploy, caprover, portainer, kubernetes, docker)')
     .option('-w, --workload <workload>', 'Workload ID to import (skips the picker)')
     .option('--token <token>', 'API token / admin password for the source instance')
     .option('--base-url <url>', 'Base URL of the source instance')
@@ -142,6 +162,29 @@ async function pickSource(preselected: string | undefined): Promise<ImportSource
     })),
   })
   return sources.find((s) => s.source === source) as ImportSourceInfo
+}
+
+async function pickSourceForMigration(preselected: string | undefined): Promise<ImportSourceInfo> {
+  const sources = await withSpinner('Fetching import sources...', fetchSources)
+  const allSources = [...sources, VERCEL_SOURCE]
+
+  if (preselected) {
+    const found = allSources.find((s) => s.source === preselected)
+    if (!found) {
+      throw new Error(`Unknown source '${preselected}'. Available: ${allSources.map((s) => s.source).join(', ')}`)
+    }
+    return found
+  }
+
+  const source = await promptSelect({
+    message: 'Select source platform to migrate from',
+    choices: allSources.map((s) => ({
+      name: `${s.name}${s.available ? '' : colors.muted(' (unavailable)')}`,
+      value: s.source,
+      disabled: !s.available,
+    })),
+  })
+  return allSources.find((s) => s.source === source) as ImportSourceInfo
 }
 
 async function discover(source: ImportSource, credentials: ImportCredentials): Promise<WorkloadDescriptor[]> {
@@ -262,7 +305,7 @@ async function planAction(options: PlanOptions): Promise<void> {
   keyValue('Can execute', planResult.can_execute ? colors.success('yes') : colors.error('no'))
   newline()
   info('To execute this plan, run:')
-  info(`  temps imports execute --session-id ${planResult.session_id} --project-name <name>`)
+  info(`  temps migrate execute --session-id ${planResult.session_id} --project-name <name>`)
   newline()
 }
 
@@ -270,7 +313,16 @@ async function runAction(options: RunOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  const sourceInfo = await pickSource(options.source)
+  const sourceInfo = await pickSourceForMigration(options.source)
+
+  if (sourceInfo.source === 'vercel') {
+    // Vercel has no backend importer yet — its migration is a separate,
+    // client-side wizard that talks to Vercel's API directly. See
+    // `../migrate/index.ts` for why.
+    await runVercelMigrationWizard()
+    return
+  }
+
   const credentials = await resolveCredentials(sourceInfo.source, options)
   const credDescription = describeCredentials(sourceInfo.source, credentials)
   if (credDescription) {
