@@ -12,7 +12,7 @@ anyhow = "1.0"
 axum = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }
 log = "0.4"
-maxminddb = "0.29.0"
+maxminddb = "0.30.0"
 moka = { version = "0.12", features = ["future"] }
 rand = { workspace = true }
 sea-orm = { version = "1.0", features = ["sqlx-postgres", "runtime-tokio-rustls", "macros"] }
