@@ -18,13 +18,13 @@ use temps_import_types::plan::{
 use temps_import_types::{
     BuildConfiguration, CredentialValidation, DataImplication, DataImplicationSeverity,
     DeploymentStrategy, DomainAction, DomainPlan, DomainSnapshot, EnvironmentVariable, GitInfo,
-    ImportContext, ImportCredentials, ImportError, ImportOutcome, ImportPlan, ImportResult,
-    ImportSelector, ImportServiceProvider, ImportSource, ImporterCapabilities, ManualAction,
-    ManualActionTiming, MigrationStep, MigrationSummary, NetworkConfiguration, NetworkInfo,
-    NetworkMode, PortMapping, ProjectSnapshot, ResourceCounts, ResourceInfo, ResourceLimits,
-    RiskLevel, ServiceAction, ServicePlan, ServiceSnapshot, SnapshotServiceType, StepResourceType,
-    StepResult, UnsupportedFeature, WorkloadDescriptor, WorkloadId, WorkloadImporter,
-    WorkloadSnapshot, WorkloadStatus, WorkloadType,
+    GitSourcePlan, ImportContext, ImportCredentials, ImportError, ImportOutcome, ImportPlan,
+    ImportResult, ImportSelector, ImportServiceProvider, ImportSource, ImporterCapabilities,
+    ManualAction, ManualActionTiming, MigrationStep, MigrationSummary, NetworkConfiguration,
+    NetworkInfo, NetworkMode, PortMapping, ProjectSnapshot, ResourceCounts, ResourceInfo,
+    ResourceLimits, RiskLevel, ServiceAction, ServicePlan, ServiceSnapshot, SnapshotServiceType,
+    StepResourceType, StepResult, UnsupportedFeature, WorkloadDescriptor, WorkloadId,
+    WorkloadImporter, WorkloadSnapshot, WorkloadStatus, WorkloadType,
 };
 use tracing::info;
 
@@ -209,12 +209,28 @@ fn app_to_snapshot(app: &CaproverApp, root_domain: Option<&str>) -> WorkloadSnap
         list
     };
 
-    // repoInfo password deliberately excluded — it is a secret
+    // repoInfo password deliberately excluded — it is a secret. The parsed
+    // owner/repo/clone_url (git_info_for already extracts these correctly
+    // from repoInfo.repo, which is a bare "host/owner/repo" string, not a
+    // URL) are carried through so deployment_config can build a
+    // GitSourcePlan without re-parsing. CapRover's own convention for "no
+    // real credentials configured" is repoInfo.user == password == "public"
+    // — any other value means a real credential is set, so treat it as
+    // private rather than guess.
+    let git_info = git_info_for(app);
+    let is_public_repo = app
+        .repo_info()
+        .map(|r| r.user == "public" && r.password == "public")
+        .unwrap_or(false);
     let source_metadata = serde_json::json!({
         "has_persistent_data": app.has_persistent_data,
         "instance_count": app.instance_count,
         "repo": app.repo_info().map(|r| r.repo.clone()),
         "repo_branch": app.repo_info().map(|r| r.branch.clone()),
+        "git_owner": git_info.as_ref().map(|g| g.owner.clone()),
+        "git_repo_name": git_info.as_ref().map(|g| g.repo.clone()),
+        "git_clone_url": git_info.as_ref().and_then(|g| g.clone_url.clone()),
+        "git_is_public": is_public_repo,
         "domains": domains,
         "not_expose_as_web_app": app.not_expose_as_web_app,
     });
@@ -330,6 +346,41 @@ fn deployment_config(snapshot: &WorkloadSnapshot) -> DeploymentConfiguration {
         args: HashMap::new(),
         target: None,
     });
+    // Without this, execute_plan has no repo_owner/repo_name to create the
+    // project from — the app and its services get created but the actual
+    // deployment step fails with "repo_owner is missing", even though the
+    // git source was right there in source_metadata the whole time.
+    let git = has_git.then(|| {
+        let owner = snapshot
+            .source_metadata
+            .get("git_owner")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let repo_name = snapshot
+            .source_metadata
+            .get("git_repo_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let clone_url = snapshot
+            .source_metadata
+            .get("git_clone_url")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let is_public = snapshot
+            .source_metadata
+            .get("git_is_public")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        GitSourcePlan {
+            owner,
+            repo: repo_name,
+            branch: branch.to_string(),
+            clone_url,
+            is_public,
+        }
+    });
 
     let env_vars: Vec<EnvironmentVariable> = {
         let mut vars: Vec<_> = snapshot.env.iter().collect();
@@ -381,7 +432,7 @@ fn deployment_config(snapshot: &WorkloadSnapshot) -> DeploymentConfiguration {
         entrypoint: None,
         working_dir: None,
         health_check: None,
-        git: None,
+        git,
     }
 }
 
@@ -1100,12 +1151,41 @@ async fn execute_plan(
         ));
     }
 
+    // Prefer the repository the user linked in the wizard; otherwise fall
+    // back to the public repository CapRover deploys from (repoInfo), so
+    // the real deployment pipeline can clone and build it. Private source
+    // repos without a linked connection stay unlinked — the deploy step
+    // reports that honestly instead of failing mid-clone.
+    let plan_git = plan
+        .deployment
+        .git
+        .as_ref()
+        .filter(|g| context.repo_owner.is_none() && g.is_public);
+    let (repo_owner, repo_name, is_public_repo, git_url) = match plan_git {
+        Some(git) => (
+            Some(git.owner.clone()),
+            Some(git.repo.clone()),
+            Some(true),
+            git.clone_url.clone(),
+        ),
+        None => (
+            context.repo_owner.clone(),
+            context.repo_name.clone(),
+            None,
+            None,
+        ),
+    };
+    let main_branch = plan_git
+        .map(|git| git.branch.clone())
+        .filter(|b| !b.is_empty())
+        .unwrap_or_else(|| context.main_branch.clone());
+
     let create_project_request = temps_projects::services::types::CreateProjectRequest {
         name: context.project_name.clone(),
-        repo_name: context.repo_name.clone(),
-        repo_owner: context.repo_owner.clone(),
+        repo_name,
+        repo_owner,
         directory: context.directory.clone(),
-        main_branch: context.main_branch.clone(),
+        main_branch,
         preset: context.preset.clone(),
         preset_config: None,
         // is_secret vars carry a real value read from CapRover's API
@@ -1122,8 +1202,8 @@ async fn execute_plan(
         ),
         automatic_deploy: true,
         storage_service_ids: vec![],
-        is_public_repo: None,
-        git_url: None,
+        is_public_repo,
+        git_url,
         git_provider_connection_id: context.git_provider_connection_id,
         exposed_port: None,
         source_type: temps_entities::source_type::SourceType::Git,
@@ -1397,6 +1477,62 @@ mod tests {
         // the snapshot must not contain the repo password
         let snapshot = app_to_snapshot(&shop_app(), None);
         assert!(!snapshot.source_metadata.to_string().contains("secret"));
+    }
+
+    /// Regression test: deployment_config() used to hardcode `git: None`
+    /// regardless of repoInfo — execute_plan then had no repo_owner/
+    /// repo_name to create the project from, so the deploy step failed
+    /// with "repo_owner is missing" even though the git source was right
+    /// there in source_metadata (proven live against a real CapRover
+    /// instance during PR #441's e2e verification).
+    #[test]
+    fn deployment_git_source_uses_parsed_owner_repo_and_clone_url() {
+        let snapshot = app_to_snapshot(&shop_app(), None);
+        let deployment = deployment_config(&snapshot);
+        let git = deployment
+            .git
+            .expect("a git-configured app must produce a GitSourcePlan");
+        assert_eq!(git.owner, "heroku");
+        assert_eq!(git.repo, "node-js-getting-started");
+        assert_eq!(git.branch, "main");
+        assert_eq!(
+            git.clone_url.as_deref(),
+            Some("https://github.com/heroku/node-js-getting-started.git")
+        );
+        // shop_app()'s repoInfo has a real (non-"public") password — must
+        // not be misclassified as a credential-free public repository.
+        assert!(!git.is_public);
+    }
+
+    #[test]
+    fn deployment_git_source_is_public_when_caprovers_public_sentinel_is_set() {
+        let app: CaproverApp = serde_json::from_value(serde_json::json!({
+            "appName": "lab-shop",
+            "hasPersistentData": false,
+            "instanceCount": 1,
+            "notExposeAsWebApp": false,
+            "envVars": [],
+            "ports": [],
+            "volumes": [],
+            "customDomain": [],
+            "deployedVersion": 1,
+            "versions": [{"version": 1, "deployedImageName": "node:22-alpine"}],
+            "appPushWebhook": {"repoInfo": {"repo": "github.com/heroku/node-js-getting-started", "user": "public", "password": "public", "branch": "main"}}
+        }))
+        .unwrap();
+        let snapshot = app_to_snapshot(&app, None);
+        let deployment = deployment_config(&snapshot);
+        let git = deployment
+            .git
+            .expect("a git-configured app must produce a GitSourcePlan");
+        assert!(git.is_public);
+    }
+
+    #[test]
+    fn deployment_has_no_git_source_without_repo_info() {
+        let snapshot = app_to_snapshot(&db_app(Some(5432)), None);
+        let deployment = deployment_config(&snapshot);
+        assert!(deployment.git.is_none());
     }
 
     #[test]
