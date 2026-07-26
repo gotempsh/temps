@@ -265,6 +265,23 @@ export function FrameworkSelector({
   )
 }
 
+/**
+ * The `server` / `static` / `container` chip shown beside a preset name.
+ *
+ * Shared by both card types so the two grids can never drift apart, and so the
+ * ui.sh picker toggles them together while a treatment is being chosen.
+ */
+function TypeBadge({ children }: { children: React.ReactNode }) {
+  // Outline keeps the chip visible without adding a filled surface. The old
+  // `secondary` was #fafafa on a white card — an invisible pill that read as
+  // bare near-black text. Matches the repository-list preset badges.
+  return (
+    <Badge variant="outline" className="shrink-0 text-xs font-normal">
+      {children}
+    </Badge>
+  )
+}
+
 // Component for showing a preset from the full catalog
 function PresetCard({
   preset,
@@ -310,9 +327,7 @@ function PresetCard({
           <div className="min-w-0 flex-1 pr-6">
             <div className="mb-1 flex items-center gap-2">
               <h3 className="truncate text-sm font-semibold">{preset.label}</h3>
-              <Badge variant="secondary" className="shrink-0 text-xs">
-                {preset.project_type}
-              </Badge>
+              <TypeBadge>{preset.project_type}</TypeBadge>
             </div>
 
             <p className="line-clamp-2 text-xs text-muted-foreground">
@@ -399,9 +414,7 @@ function DetectedPresetCard({
           <div className="min-w-0 flex-1 pr-6">
             <div className="mb-1 flex items-center gap-2">
               <h3 className="truncate text-sm font-semibold">{label}</h3>
-              <Badge variant="secondary" className="shrink-0 text-xs">
-                {projectType}
-              </Badge>
+              <TypeBadge>{projectType}</TypeBadge>
             </div>
             <p className="line-clamp-2 text-xs text-muted-foreground">
               {description}
