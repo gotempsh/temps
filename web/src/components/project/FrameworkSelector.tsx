@@ -1,14 +1,15 @@
 import { useState, useMemo } from 'react'
-import { Folder, AlertCircle, Grid3x3, RefreshCw } from 'lucide-react'
+import { Folder, AlertCircle, Check, Grid3x3, RefreshCw } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Skeleton } from '@/components/ui/skeleton'
-import type {
-  ProjectPresetResponse,
-  PresetResponse,
-} from '@/api/client'
+import {
+  GitConnectionExpiredAlert,
+  isGitAuthError,
+} from '@/components/git-providers/GitConnectionExpiredAlert'
+import type { ProjectPresetResponse, PresetResponse } from '@/api/client'
 import { usePresets } from '@/contexts/PresetContext'
 
 // Helper function to normalize path for consistent comparison
@@ -57,7 +58,11 @@ export function FrameworkSelector({
   // If the currently selected preset+path isn't in the detected list, inject it
   // so the user sees their current selection highlighted among detected presets
   const detectedProjects = useMemo(() => {
-    if (!selectedPreset || selectedPreset === 'custom' || rawDetectedProjects.length === 0) {
+    if (
+      !selectedPreset ||
+      selectedPreset === 'custom' ||
+      rawDetectedProjects.length === 0
+    ) {
       return rawDetectedProjects
     }
     const [selectedSlug, selectedPath] = selectedPreset.split('::')
@@ -65,7 +70,10 @@ export function FrameworkSelector({
 
     const normalizedSelectedPath = normalizePath(selectedPath)
     const alreadyExists = rawDetectedProjects.some((p) => {
-      return p.preset === selectedSlug && normalizePath(p.path) === normalizedSelectedPath
+      return (
+        p.preset === selectedSlug &&
+        normalizePath(p.path) === normalizedSelectedPath
+      )
     })
 
     if (alreadyExists) return rawDetectedProjects
@@ -180,7 +188,13 @@ export function FrameworkSelector({
       </div>
 
       {/* Show error/info alerts — must match what's actually displayed below */}
-      {error && shouldShowAllPresets && (
+      {/* An expired git credential is not a detection failure: telling the
+          user to "pick one manually" hides an auth problem that will break
+          the next step too, so it gets its own actionable state. */}
+      {error && isGitAuthError(error) && (
+        <GitConnectionExpiredAlert operation="detect this project's framework" />
+      )}
+      {error && !isGitAuthError(error) && shouldShowAllPresets && (
         <Alert>
           <AlertCircle className="h-4 w-4" />
           <AlertDescription>
@@ -251,6 +265,23 @@ export function FrameworkSelector({
   )
 }
 
+/**
+ * The `server` / `static` / `container` chip shown beside a preset name.
+ *
+ * Shared by both card types so the two grids can never drift apart, and so the
+ * ui.sh picker toggles them together while a treatment is being chosen.
+ */
+function TypeBadge({ children }: { children: React.ReactNode }) {
+  // Outline keeps the chip visible without adding a filled surface. The old
+  // `secondary` was #fafafa on a white card — an invisible pill that read as
+  // bare near-black text. Matches the repository-list preset badges.
+  return (
+    <Badge variant="outline" className="shrink-0 text-xs font-normal">
+      {children}
+    </Badge>
+  )
+}
+
 // Component for showing a preset from the full catalog
 function PresetCard({
   preset,
@@ -265,46 +296,45 @@ function PresetCard({
 }) {
   return (
     <Card
-      className={`cursor-pointer transition-all hover:border-primary/50 ${
-        isSelected ? 'border-primary border-2 bg-primary/5' : 'border-border'
-      } ${disabled ? 'opacity-50 cursor-not-allowed' : ''}`}
+      className={`relative cursor-pointer transition-shadow hover:shadow-sm dark:hover:shadow-none ${
+        isSelected
+          ? 'ring-2 ring-primary ring-offset-1 ring-offset-background'
+          : ''
+      } ${disabled ? 'cursor-not-allowed opacity-50' : ''}`}
       onClick={() => !disabled && onSelect()}
+      aria-pressed={isSelected}
     >
       <CardContent className="p-4">
+        {isSelected && (
+          <span className="absolute right-3 top-3 flex size-5 items-center justify-center rounded-full bg-primary text-primary-foreground">
+            <Check className="size-3" />
+          </span>
+        )}
         <div className="flex items-start gap-3">
-          <div className="flex-shrink-0">
+          {/* Tile keeps light brand marks legible on a white card and removes
+              the need for `dark:invert`, which distorted coloured logos. */}
+          <div className="flex size-11 shrink-0 items-center justify-center rounded-lg bg-muted outline-1 -outline-offset-1 outline-black/5 dark:bg-white/5 dark:outline-white/10">
             <img
               src={preset.icon_url || '/presets/custom.svg'}
-              alt={preset.label}
-              className="w-12 h-12 object-contain dark:invert"
+              alt=""
+              className="size-6 object-contain"
               onError={(e) => {
                 e.currentTarget.src = '/presets/custom.svg'
               }}
             />
           </div>
 
-          <div className="flex-1 min-w-0">
-            <div className="flex items-center gap-2 mb-1">
-              <h3 className="font-semibold text-sm truncate">{preset.label}</h3>
-              <Badge variant="secondary" className="text-xs flex-shrink-0">
-                {preset.project_type}
-              </Badge>
+          <div className="min-w-0 flex-1 pr-6">
+            <div className="mb-1 flex items-center gap-2">
+              <h3 className="truncate text-sm font-semibold">{preset.label}</h3>
+              <TypeBadge>{preset.project_type}</TypeBadge>
             </div>
 
-            <p className="text-xs text-muted-foreground line-clamp-2">
+            <p className="line-clamp-2 text-xs text-muted-foreground">
               {preset.description}
             </p>
           </div>
         </div>
-
-        {isSelected && (
-          <div className="mt-3 pt-3 border-t border-border">
-            <div className="flex items-center gap-1.5 text-xs font-medium text-primary">
-              <div className="w-1.5 h-1.5 bg-primary rounded-full" />
-              Selected
-            </div>
-          </div>
-        )}
       </CardContent>
     </Card>
   )
@@ -331,9 +361,11 @@ function DetectedPresetCard({
   // Check if this preset is selected by comparing normalized paths
   const isSelected = useMemo(() => {
     const [selectedSlug, selectedPath] = selectedPreset.split('::')
-    // If no path in selection, match by slug only (e.g. existing project preset)
+    // A selection without a path means "this preset at the repository root".
+    // Matching on the slug alone lit up every card sharing it, so a monorepo
+    // with five Dockerfiles showed five "Selected" cards at once.
     if (!selectedPath) {
-      return project.preset === selectedSlug
+      return project.preset === selectedSlug && normalizedPath === 'root'
     }
     const normalizedSelectedPath = normalizePath(selectedPath)
     return (
@@ -344,75 +376,57 @@ function DetectedPresetCard({
 
   const presetInfo = getPresetBySlug(project.preset)
   const fallbackPreset = getPresetBySlug('nixpacks')
+  const iconSrc =
+    presetInfo?.icon_url || fallbackPreset?.icon_url || '/presets/custom.svg'
+  const label = project.presetLabel || presetInfo?.label || project.preset
+  const projectType = presetInfo?.project_type || 'Server'
+  const description = presetInfo?.description || 'Custom configuration'
+  const pathLabel = project.path && project.path !== '.' ? project.path : './'
+  const onPick = () => !disabled && onSelectPreset(presetKey)
 
   return (
     <Card
-      className={`cursor-pointer transition-all hover:border-primary/50 ${
-        isSelected ? 'border-primary border-2 bg-primary/5' : 'border-border'
-      } ${disabled ? 'opacity-50 cursor-not-allowed' : ''}`}
-      onClick={() => !disabled && onSelectPreset(presetKey)}
+      className={`relative cursor-pointer transition-shadow hover:shadow-sm dark:hover:shadow-none ${
+        isSelected
+          ? 'ring-2 ring-primary ring-offset-1 ring-offset-background'
+          : ''
+      } ${disabled ? 'cursor-not-allowed opacity-50' : ''}`}
+      onClick={onPick}
+      aria-pressed={isSelected}
     >
       <CardContent className="p-4">
+        {isSelected && (
+          <span className="absolute right-3 top-3 flex size-5 items-center justify-center rounded-full bg-primary text-primary-foreground">
+            <Check className="size-3" />
+          </span>
+        )}
         <div className="flex items-start gap-3">
-          {/* Preset Icon */}
-          <div className="flex-shrink-0">
+          <div className="flex size-11 shrink-0 items-center justify-center rounded-lg bg-muted outline-1 -outline-offset-1 outline-black/5 dark:bg-white/5 dark:outline-white/10">
             <img
-              src={
-                presetInfo?.icon_url ||
-                fallbackPreset?.icon_url ||
-                '/presets/custom.svg'
-              }
-              alt={presetInfo?.label || project.preset}
-              className="w-12 h-12 object-contain dark:invert"
+              src={iconSrc}
+              alt=""
+              className="size-6 object-contain"
               onError={(e) => {
                 e.currentTarget.src = '/presets/custom.svg'
               }}
             />
           </div>
-
-          {/* Preset Info */}
-          <div className="flex-1 min-w-0">
-            <div className="flex items-center gap-2 mb-1">
-              <h3 className="font-semibold text-sm truncate">
-                {project.presetLabel || presetInfo?.label || project.preset}
-              </h3>
-              <Badge variant="secondary" className="text-xs flex-shrink-0">
-                {presetInfo?.project_type || 'Server'}
-              </Badge>
+          <div className="min-w-0 flex-1 pr-6">
+            <div className="mb-1 flex items-center gap-2">
+              <h3 className="truncate text-sm font-semibold">{label}</h3>
+              <TypeBadge>{projectType}</TypeBadge>
             </div>
-
-            <p className="text-xs text-muted-foreground line-clamp-2 mb-2">
-              {presetInfo?.description || 'Custom configuration'}
+            <p className="line-clamp-2 text-xs text-muted-foreground">
+              {description}
             </p>
-
-            {/* Path indicator for monorepo */}
-            {project.path && project.path !== '.' && (
-              <div className="flex items-start gap-1 text-xs text-muted-foreground mt-2 p-1.5 bg-muted/50 rounded">
-                <Folder className="h-3 w-3 flex-shrink-0 mt-0.5" />
-                <span className="font-mono break-all" title={project.path}>
-                  {project.path}
-                </span>
-              </div>
-            )}
-
-            {/* Root indicator */}
-            {(!project.path || project.path === '.') && (
-              <div className="text-xs text-muted-foreground mt-2">
-                <span className="font-mono">./</span>
-              </div>
-            )}
+            <div className="mt-2 flex items-center gap-1.5 text-xs text-muted-foreground">
+              <Folder className="size-3 shrink-0" />
+              <span className="truncate font-mono" title={pathLabel}>
+                {pathLabel}
+              </span>
+            </div>
           </div>
         </div>
-
-        {/* Selected indicator */}
-        {isSelected && (
-          <div className="mt-3 pt-3 border-t border-border">
-            <div className="flex items-center gap-1.5 text-xs font-medium text-primary">
-              <div className="w-1.5 h-1.5 bg-primary rounded-full" />
-              Selected
-            </div>
-          </div>
-        )}
       </CardContent>
     </Card>
   )
