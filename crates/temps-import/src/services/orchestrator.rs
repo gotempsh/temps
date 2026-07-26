@@ -62,6 +62,14 @@ fn check_session_ownership(
 /// `***` convention used everywhere else in the codebase (API keys, tokens).
 const MASKED_SECRET: &str = "***";
 
+/// How long an import session (plan + real, unmasked source credentials —
+/// including a full kubeconfig with its private key, for Kubernetes) is
+/// kept in memory before being pruned. A session only needs to survive long
+/// enough for the user to review the plan and click execute; there's no
+/// reason to hold a live credential set indefinitely for a plan nobody ever
+/// executed.
+const SESSION_TTL: chrono::Duration = chrono::Duration::hours(1);
+
 /// Redact secrets out of a plan before it leaves the process as an HTTP
 /// response — `CreatePlanResponse`/`ImportStatusResponse` return the whole
 /// plan, and a plan built from a real platform carries the source
@@ -72,11 +80,31 @@ fn mask_plan_secrets(plan: &ImportPlan) -> ImportPlan {
     let mut masked = plan.clone();
 
     for service in &mut masked.services {
+        let raw_source_url = service
+            .parameters
+            .get(super::resource_executor::SOURCE_URL_PARAM)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
         if let Some(source_url) = service
             .parameters
             .get_mut(super::resource_executor::SOURCE_URL_PARAM)
         {
             *source_url = serde_json::json!(MASKED_SECRET);
+        }
+
+        // Every importer's dump_command() embeds this same URL verbatim
+        // into a copy-pasteable pg_dump/mysqldump/mongodump command in
+        // recommended_action — redact it there too, or the password leaks
+        // right back out through this sibling field.
+        if let Some(raw_url) = raw_source_url {
+            for implication in &mut service.data_implications {
+                if let Some(action) = &mut implication.recommended_action {
+                    if action.contains(raw_url.as_str()) {
+                        *action = action.replace(raw_url.as_str(), MASKED_SECRET);
+                    }
+                }
+            }
         }
     }
 
@@ -182,6 +210,28 @@ impl ImportOrchestrator {
                 "import session store lock was poisoned by a prior panic".to_string(),
             )
         })
+    }
+
+    /// Drop every session older than [`SESSION_TTL`] — a plan the user never
+    /// executed (or a real-time browser tab they closed) must not keep its
+    /// source credentials resident in memory forever. Piggybacks on
+    /// `create_plan`'s own write-lock rather than a background task: import
+    /// volume is low control-plane traffic, so an O(live sessions) sweep on
+    /// every new plan is cheap and needs no extra lifecycle to manage.
+    fn prune_expired_sessions(
+        sessions: &mut std::sync::RwLockWriteGuard<'_, HashMap<String, ImportSession>>,
+    ) {
+        let now = chrono::Utc::now();
+        let before = sessions.len();
+        sessions.retain(|_, session| now - session.created_at < SESSION_TTL);
+        let pruned = before - sessions.len();
+        if pruned > 0 {
+            info!(
+                "Pruned {} expired import session(s) older than {}h",
+                pruned,
+                SESSION_TTL.num_hours()
+            );
+        }
     }
 
     /// Get an importer for a source
@@ -419,6 +469,7 @@ impl ImportOrchestrator {
 
         {
             let mut sessions = self.sessions_write()?;
+            Self::prune_expired_sessions(&mut sessions);
             sessions.insert(session_id.clone(), session);
         }
 
@@ -638,6 +689,23 @@ impl ImportOrchestrator {
         } else {
             ImportExecutionStatus::Failed
         };
+
+        // A completed real import has no further use for its source
+        // credentials — evict it now rather than waiting out SESSION_TTL.
+        // Failed real runs and dry runs are left in place: a failure may be
+        // worth retrying against the same reviewed plan, and a dry run is
+        // explicitly a rehearsal for a real execute call that follows.
+        if !dry_run && status == ImportExecutionStatus::Completed {
+            match self.sessions_write() {
+                Ok(mut sessions) => {
+                    sessions.remove(&session_id);
+                }
+                Err(e) => warn!(
+                    "Could not evict completed import session {}: {} — it will still expire via SESSION_TTL",
+                    session_id, e
+                ),
+            }
+        }
 
         Ok(ExecuteImportResponse {
             session_id: outcome.session_id,
@@ -865,6 +933,41 @@ mod tests {
         );
     }
 
+    /// Regression test: import sessions hold the real, unmasked source
+    /// credentials (a full kubeconfig with its private key, for
+    /// Kubernetes) and used to have no eviction at all — a plan nobody ever
+    /// executed stayed resident in memory for the life of the process.
+    /// `prune_expired_sessions` bounds that to `SESSION_TTL`.
+    #[test]
+    fn prune_expired_sessions_drops_only_stale_entries() {
+        let mut fresh = test_session(1);
+        fresh.session_id = "fresh".to_string();
+        fresh.created_at = chrono::Utc::now();
+
+        let mut stale = test_session(1);
+        stale.session_id = "stale".to_string();
+        stale.created_at = chrono::Utc::now() - (SESSION_TTL + chrono::Duration::minutes(1));
+
+        let lock = std::sync::RwLock::new(HashMap::from([
+            ("fresh".to_string(), fresh),
+            ("stale".to_string(), stale),
+        ]));
+        {
+            let mut sessions = lock.write().unwrap();
+            ImportOrchestrator::prune_expired_sessions(&mut sessions);
+        }
+
+        let sessions = lock.read().unwrap();
+        assert!(
+            sessions.contains_key("fresh"),
+            "a session within the TTL must survive pruning"
+        );
+        assert!(
+            !sessions.contains_key("stale"),
+            "a session older than SESSION_TTL must be evicted, credentials and all"
+        );
+    }
+
     #[test]
     fn mask_plan_secrets_redacts_source_url_and_secret_env_vars_only() {
         let mut plan = create_test_plan();
@@ -882,7 +985,15 @@ mod tests {
             env_var_mappings: HashMap::new(),
             action: ServiceAction::Create,
             action_description: "Create a new managed service".to_string(),
-            data_implications: vec![],
+            data_implications: vec![DataImplication {
+                severity: DataImplicationSeverity::Warning,
+                message: "Database 'lab-db' contains data that will be copied automatically"
+                    .to_string(),
+                recommended_action: Some(format!(
+                    "pg_dump --no-owner --format=custom \"{}\" -f lab-db.dump",
+                    "postgres://lab:hunter2@1.2.3.4:5432/labdb"
+                )),
+            }],
         });
         plan.deployment.env_vars = vec![
             EnvironmentVariable {
@@ -917,12 +1028,34 @@ mod tests {
             "non-secret env vars must pass through unchanged"
         );
 
+        let masked_action = masked.services[0].data_implications[0]
+            .recommended_action
+            .as_ref()
+            .unwrap();
+        assert!(
+            !masked_action.contains("hunter2"),
+            "recommended_action must not leak the source DB password: {}",
+            masked_action
+        );
+        assert_eq!(
+            masked_action,
+            &format!(
+                "pg_dump --no-owner --format=custom \"{}\" -f lab-db.dump",
+                MASKED_SECRET
+            )
+        );
+
         // The original, unmasked plan (what execute_import actually uses)
         // must be untouched — masking must only ever operate on a copy.
         assert_eq!(
             plan.deployment.env_vars[0].value,
             "postgres://lab:hunter2@1.2.3.4:5432/labdb"
         );
+        assert!(plan.services[0].data_implications[0]
+            .recommended_action
+            .as_ref()
+            .unwrap()
+            .contains("hunter2"));
     }
 
     // Tests commented out - they require full service initialization which is complex in unit tests.
