@@ -527,7 +527,15 @@ impl PortainerImporter {
         });
 
         let mut critical_warnings = Vec::new();
-        let mut manual_actions = Vec::new();
+        // Portainer's API exposes no repository metadata for a container, so
+        // the imported project is never linked to a git repo and the first
+        // deployment cannot start automatically.
+        let mut manual_actions = vec![ManualAction {
+            timing: ManualActionTiming::AfterMigration,
+            description: "Link a git repository or trigger the first deployment manually"
+                .to_string(),
+            reason: "Portainer has no repository metadata for this container — the import records configuration only, so temps has nothing to build from yet".to_string(),
+        }];
         for service_plan in &service_plans {
             if service_plan
                 .data_implications
@@ -1468,6 +1476,22 @@ mod tests {
             .manual_actions_required
             .iter()
             .any(|a| a.description.contains("DNS")));
+    }
+
+    #[test]
+    fn plan_warns_the_first_deployment_needs_a_manual_trigger() {
+        let importer = PortainerImporter::new();
+        let plan = importer
+            .generate_project_plan(project_snapshot(true))
+            .unwrap();
+        assert!(
+            plan.summary
+                .manual_actions_required
+                .iter()
+                .any(|a| a.description.contains("trigger the first deployment")),
+            "Portainer's API has no repository metadata, so the plan must tell the \
+             user the first deployment won't start automatically"
+        );
     }
 
     /// Live end-to-end against a real Portainer instance. Skips unless

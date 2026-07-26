@@ -542,7 +542,15 @@ impl WorkloadImporter for DockerImporter {
                 domains: 0,
             },
             critical_warnings: vec![],
-            manual_actions_required: vec![],
+            // Docker's API exposes no repository metadata for a container, so
+            // the imported project is never linked to a git repo and the
+            // first deployment cannot start automatically.
+            manual_actions_required: vec![temps_import_types::ManualAction {
+                timing: temps_import_types::ManualActionTiming::AfterMigration,
+                description: "Link a git repository or trigger the first deployment manually"
+                    .to_string(),
+                reason: "Docker has no repository metadata for this container — the import records configuration only, so temps has nothing to build from yet".to_string(),
+            }],
             unsupported_features: vec![],
         };
 
@@ -1235,6 +1243,23 @@ mod tests {
         assert!(
             !plan.metadata.warnings.is_empty(),
             "Should have warnings for bind mount"
+        );
+    }
+
+    #[test]
+    fn plan_warns_the_first_deployment_needs_a_manual_trigger() {
+        let importer = DockerImporter {
+            docker: Arc::new(Docker::connect_with_local_defaults().unwrap()),
+            version: "1.0.0".to_string(),
+        };
+        let plan = importer.generate_plan(create_test_snapshot()).unwrap();
+        assert!(
+            plan.summary
+                .manual_actions_required
+                .iter()
+                .any(|a| a.description.contains("trigger the first deployment")),
+            "Docker has no repository metadata, so the plan must tell the user \
+             the first deployment won't start automatically"
         );
     }
 

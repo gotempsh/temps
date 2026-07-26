@@ -586,7 +586,15 @@ impl KamalImporter {
 
         // -- Summary ---------------------------------------------------------
         let mut critical_warnings = Vec::new();
-        let mut manual_actions = Vec::new();
+        // deploy.yml never carries a repository reference (Kamal builds from
+        // the checkout it's run in), so the imported project is never linked
+        // to a git repo and the first deployment cannot start automatically.
+        let mut manual_actions = vec![ManualAction {
+            timing: ManualActionTiming::AfterMigration,
+            description: "Link a git repository or trigger the first deployment manually"
+                .to_string(),
+            reason: "deploy.yml has no repository field — the import records configuration only, so temps has nothing to build from yet".to_string(),
+        }];
 
         if secret_count > 0 {
             critical_warnings.push(format!(
@@ -1449,6 +1457,19 @@ accessories:
             .iter()
             .any(|f| f.feature.contains("secrets")));
         assert_eq!(plan.summary.overall_risk, RiskLevel::High);
+    }
+
+    #[test]
+    fn plan_warns_the_first_deployment_needs_a_manual_trigger() {
+        let plan = plan();
+        assert!(
+            plan.summary
+                .manual_actions_required
+                .iter()
+                .any(|a| a.description.contains("trigger the first deployment")),
+            "deploy.yml never carries a repository, so the plan must tell the user \
+             the first deployment won't start automatically"
+        );
     }
 
     /// Regression: the orchestrator calls generate_project_plan (not
