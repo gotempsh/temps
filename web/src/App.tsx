@@ -29,6 +29,8 @@ import { ProtectedLayout } from './components/layout/ProtectedLayout'
 import { SettingsLayout } from './components/settings/SettingsLayout'
 import { SidebarInset, SidebarProvider } from './components/ui/sidebar'
 import { AiAssistantProvider } from './components/ai/AiAssistantContext'
+import { AutofixOnboardingProvider } from './components/autofixer/AutofixOnboardingContext'
+import { AutofixOnboardingDialog } from './components/autofixer/AutofixOnboardingDialog'
 import { AiAssistantDock } from './components/ai/AiAssistantDock'
 import { AuthProvider } from './contexts/AuthContext'
 import { BreadcrumbProvider } from './contexts/BreadcrumbContext'
@@ -392,6 +394,7 @@ const FullAppRoutes = () => {
   return (
     <BreadcrumbProvider>
       <AiAssistantProvider>
+      <AutofixOnboardingProvider>
       <SidebarProvider>
         {/* Wrap sidebar with independent error boundary */}
         <ErrorBoundary
@@ -596,7 +599,11 @@ const FullAppRoutes = () => {
             the user navigates the console. */}
         <AiAssistantDock />
         <CommandPalette />
+        {/* Shared AI-autofix setup dialog — mounted once so any surface can
+            open it via `useAutofixOnboarding()` instead of hiding autofix. */}
+        <AutofixOnboardingDialog />
       </SidebarProvider>
+      </AutofixOnboardingProvider>
       </AiAssistantProvider>
     </BreadcrumbProvider>
   )

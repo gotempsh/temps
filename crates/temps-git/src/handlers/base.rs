@@ -2388,6 +2388,7 @@ pub struct PresetLiveQuery {
     ),
     responses(
         (status = 200, description = "Repository presets calculated successfully - includes root preset and projects in subdirectories", body = RepositoryPresetResponse),
+        (status = 401, description = "The git provider rejected the stored credential - the connection must be re-authorized"),
         (status = 404, description = "Repository not found"),
         (status = 400, description = "Bad request"),
         (status = 500, description = "Internal server error")

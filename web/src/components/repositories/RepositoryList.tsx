@@ -472,34 +472,43 @@ export function RepositoryList({
                           const presetInfo = getPresetBySlug(presetItem.preset)
                           const iconUrl =
                             presetInfo?.icon_url || '/presets/custom.svg'
+                          const icon = (
+                            <img
+                              src={iconUrl}
+                              alt=""
+                              className="h-2.5 w-2.5 mr-1"
+                              style={{ objectFit: 'contain' }}
+                              onError={(e) => {
+                                e.currentTarget.src = '/presets/custom.svg'
+                              }}
+                            />
+                          )
+                          const path = presetItem.path !== './' && (
+                            <span className="text-[9px] ml-0.5 opacity-70">
+                              ({presetItem.path})
+                            </span>
+                          )
+                          // Outline rather than `default`: that variant is the
+                          // primary/CTA colour (near-black in light mode), which
+                          // shouted for plain metadata and swallowed black brand
+                          // marks — rust and nextjs are fill="#000000", so their
+                          // icons were invisible inside the pill.
                           return (
                             <Badge
                               key={index}
-                              variant="default"
-                              className="text-[10px] h-5 px-1.5"
+                              variant="outline"
+                              className="text-[10px] h-5 px-1.5 font-normal"
                             >
-                              <img
-                                src={iconUrl}
-                                alt={presetItem.presetLabel}
-                                className="h-2.5 w-2.5 mr-1"
-                                style={{ objectFit: 'contain' }}
-                                onError={(e) => {
-                                  e.currentTarget.src = '/presets/custom.svg'
-                                }}
-                              />
+                              {icon}
                               {presetItem.presetLabel}
-                              {presetItem.path !== './' && (
-                                <span className="text-[9px] ml-0.5 opacity-70">
-                                  ({presetItem.path})
-                                </span>
-                              )}
+                              {path}
                             </Badge>
                           )
                         })}
                         {repo.preset.length > 3 && (
                           <Badge
-                            variant="secondary"
-                            className="text-[10px] h-5 px-1.5"
+                            variant="outline"
+                            className="text-[10px] h-5 px-1.5 font-normal"
                           >
                             +{repo.preset.length - 3} more
                           </Badge>

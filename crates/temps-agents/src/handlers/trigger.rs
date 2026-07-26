@@ -780,7 +780,9 @@ pub async fn smoke_test_agent(
             }
         }
 
-        let image = format!("temps-sandbox-{}:latest", global_sandbox.runtime);
+        // Same image the real runs and the status check use — an unqualified
+        // `temps-sandbox-<runtime>:latest` resolves to Docker Hub and 404s.
+        let image = crate::sandbox::docker::image_name_for_runtime(&global_sandbox.runtime);
         let sandbox_config = crate::sandbox::SandboxCreateConfig {
             run_id: test_run_id,
             container_name_override: None,

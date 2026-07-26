@@ -425,7 +425,15 @@ impl AgentExecutor {
                 Some(global_sandbox.custom_image.clone())
             }
         } else {
-            Some(format!("temps-sandbox-{}:latest", global_sandbox.runtime))
+            // MUST match what the sandbox-status endpoint validates. This used
+            // to hardcode `temps-sandbox-<runtime>:latest`, an unqualified name
+            // Docker resolves against Docker Hub — where it does not exist — so
+            // status reported "image ready" for the real GHCR image while every
+            // run died on `404 pull access denied`. The log line below already
+            // used this helper, so it also printed an image the run never used.
+            Some(crate::sandbox::docker::image_name_for_runtime(
+                &global_sandbox.runtime,
+            ))
         };
 
         // Inject auth credentials into sandbox based on auth_type and provider.
