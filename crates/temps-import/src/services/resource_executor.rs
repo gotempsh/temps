@@ -1089,6 +1089,26 @@ mod parameter_tests {
             return;
         }
 
+        // The fixture image must be pulled explicitly — CI runners start
+        // clean, unlike a dev machine where busybox is often already cached
+        // from other work, which is exactly why this failed in CI but not
+        // locally the first time around.
+        {
+            use bollard::query_parameters::CreateImageOptions;
+            use futures_util::StreamExt;
+            let mut pull = docker.create_image(
+                Some(CreateImageOptions {
+                    from_image: Some("busybox:latest".to_string()),
+                    ..Default::default()
+                }),
+                None,
+                None,
+            );
+            while let Some(item) = pull.next().await {
+                item.expect("pull busybox:latest fixture image");
+            }
+        }
+
         let name = format!(
             "temps-import-test-hang-{}",
             &uuid::Uuid::new_v4().to_string()[..8]
