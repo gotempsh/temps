@@ -4,6 +4,7 @@ use tokio::sync::RwLock;
 
 use crate::ai_cli::OnEventCallback;
 use crate::error::AgentError;
+use crate::sandbox::managed::RunSandboxService;
 use crate::sandbox::{SandboxCreateConfig, SandboxExecResult, SandboxHandle, SandboxProvider};
 
 /// Registry that maps run IDs to active sandbox handles. This is critical for
@@ -12,6 +13,11 @@ use crate::sandbox::{SandboxCreateConfig, SandboxExecResult, SandboxHandle, Sand
 pub struct SandboxRegistry {
     provider: Arc<dyn SandboxProvider>,
     sandboxes: RwLock<HashMap<i32, SandboxHandle>>,
+    /// When the standalone sandbox plugin is active it injects itself here
+    /// (see `sandbox::managed`) so every agent-run sandbox is created as a
+    /// first-class `sandboxes` row instead of a bare container. Set once
+    /// during plugin initialization; `None` = raw-provider fallback.
+    managed: std::sync::OnceLock<Arc<dyn RunSandboxService>>,
 }
 
 impl SandboxRegistry {
@@ -19,6 +25,15 @@ impl SandboxRegistry {
         Self {
             provider,
             sandboxes: RwLock::new(HashMap::new()),
+            managed: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Inject the managed run-sandbox service (called by the temps-sandbox
+    /// plugin at initialization). Subsequent calls are ignored.
+    pub fn set_managed(&self, managed: Arc<dyn RunSandboxService>) {
+        if self.managed.set(managed).is_err() {
+            tracing::warn!("SandboxRegistry: managed run-sandbox service already set — ignoring");
         }
     }
 
@@ -70,8 +85,13 @@ impl SandboxRegistry {
             return Ok(recovered);
         }
 
-        // Create a new sandbox
-        let handle = self.provider.create(config).await?;
+        // Create a new sandbox — through the standalone sandbox service
+        // when it's registered (gives the run a first-class `sandboxes`
+        // row in the API), otherwise straight through the provider.
+        let handle = match self.managed.get() {
+            Some(managed) => managed.create_for_run(config).await?,
+            None => self.provider.create(config).await?,
+        };
         let mut sandboxes = self.sandboxes.write().await;
         sandboxes.insert(run_id, handle.clone());
 
@@ -145,7 +165,17 @@ impl SandboxRegistry {
             sandboxes.remove(&run_id)
         };
 
-        if let Some(handle) = handle {
+        if let Some(managed) = self.managed.get() {
+            // Managed path: destroys the container AND marks the run's
+            // `sandboxes` row destroyed (with a lifecycle event).
+            if let Err(e) = managed.release_for_run(run_id, handle.as_ref()).await {
+                tracing::warn!(
+                    "Failed to release managed sandbox for run {}: {}",
+                    run_id,
+                    e
+                );
+            }
+        } else if let Some(handle) = handle {
             // Agent runs are ephemeral — purge the home volume too.
             if let Err(e) = self.provider.destroy(&handle, true).await {
                 tracing::warn!(
@@ -210,6 +240,7 @@ mod tests {
     fn test_config(run_id: i32) -> SandboxCreateConfig {
         let work_dir = std::env::temp_dir().join(format!("test-registry-{}", run_id));
         SandboxCreateConfig {
+            owner_user_id: None,
             run_id,
             container_name_override: None,
             host_work_dir: work_dir,

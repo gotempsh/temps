@@ -56,6 +56,18 @@ pub enum SandboxError {
         operation: String,
     },
 
+    /// The sandbox row is attributed to an agent run (`agent_run_id` is
+    /// set). Its container is named `temps-sandbox-<run_id>` — not by the
+    /// row's public id — and the run owns the lifecycle, so standalone
+    /// lifecycle ops (pause/resume/restart/resize, and destroy while the
+    /// run is active) must not act on it: the registry would miss the real
+    /// container and the DB row would drift from reality. Mapped to
+    /// HTTP 409 telling the user to stop/cancel the run instead.
+    #[error(
+        "Sandbox {sandbox_id} belongs to agent run {run_id} and its lifecycle is managed by that run — stop or cancel agent run {run_id} instead"
+    )]
+    ManagedByAgentRun { sandbox_id: String, run_id: i32 },
+
     /// An operation exceeded the per-sandbox timeout.
     #[error("Operation timed out in sandbox {sandbox_id} after {timeout_secs}s")]
     Timeout {
@@ -151,6 +163,19 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("stopped"));
         assert!(msg.contains("exec"));
+    }
+
+    #[test]
+    fn managed_by_agent_run_names_sandbox_and_run() {
+        let err = SandboxError::ManagedByAgentRun {
+            sandbox_id: "sbx_abc".into(),
+            run_id: 42,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("sbx_abc"), "msg: {}", msg);
+        assert!(msg.contains("42"), "msg: {}", msg);
+        // The whole point of this variant: tell the user what to do instead.
+        assert!(msg.contains("stop or cancel"), "msg: {}", msg);
     }
 
     #[test]
