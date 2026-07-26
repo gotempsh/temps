@@ -16,6 +16,7 @@ import { Button } from '@/components/ui/button'
 import { CopyButton } from '@/components/ui/copy-button'
 import { ConnectionList } from '@/components/dashboard/ConnectionList'
 import { InlineGitConnect } from '@/components/dashboard/InlineGitConnect'
+import { SourceLogo } from '@/components/imports/SourceLogo'
 import { cn } from '@/lib/utils'
 
 interface FirstProjectOnboardingProps {
@@ -102,6 +103,21 @@ const DATABASES: ReadonlyArray<{
     icon: HardDrive,
   },
 ]
+
+// The platforms most users migrate in from, shown as one-click tiles that
+// open the import wizard with the source preselected. Ids must match the
+// backend `ImportSource` values. The full list (Portainer, Kamal, Docker, …)
+// lives on the migration screen itself — "See all platforms" links there.
+const TOP_MIGRATION_SOURCES: ReadonlyArray<{
+  source: string
+  label: string
+}> = [
+  { source: 'coolify', label: 'Coolify' },
+  { source: 'dokploy', label: 'Dokploy' },
+  { source: 'caprover', label: 'CapRover' },
+  { source: 'kubernetes', label: 'Kubernetes' },
+  { source: 'docker', label: 'Docker' },
+] as const
 
 /**
  * First-run empty state for the project list. The goal is to reach the
@@ -267,15 +283,44 @@ export function FirstProjectOnboarding({
         </div>
       </div>
 
-      {/* Footer — secondary, but keeps the panel feeling complete: docs for the
-          undecided, and the import-existing path for users migrating in. */}
+      {/* Migrate from another platform — one-click tiles for the platforms
+          people most often arrive from; each opens the import wizard with the
+          source preselected. The wizard migrates the whole setup: apps,
+          databases (with data), domains, and env vars. */}
+      <div className="mx-auto mt-6 max-w-5xl rounded-xl border bg-background p-5 sm:p-6">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex items-center gap-3">
+            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-muted">
+              <Upload className="h-5 w-5 text-muted-foreground" />
+            </div>
+            <div className="min-w-0">
+              <h3 className="text-base font-semibold">
+                Migrate from another platform
+              </h3>
+              <p className="text-xs text-muted-foreground">
+                Bring your apps, databases, domains, and env vars over in one
+                guided import
+              </p>
+            </div>
+          </div>
+          <Button asChild variant="outline" size="sm" className="shrink-0">
+            <Link to="/projects/import-wizard" className="flex items-center gap-1.5">
+              See all platforms
+              <ArrowRight className="h-3.5 w-3.5" />
+            </Link>
+          </Button>
+        </div>
+
+        <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
+          {TOP_MIGRATION_SOURCES.map((platform) => (
+            <MigrationSourceTile key={platform.source} {...platform} />
+          ))}
+        </div>
+      </div>
+
+      {/* Footer — secondary, but keeps the panel feeling complete: docs for
+          the undecided. */}
       <div className="mx-auto mt-6 flex max-w-5xl flex-col items-center justify-center gap-x-6 gap-y-2 border-t pt-5 text-sm sm:flex-row">
-        <Button asChild variant="link" className="h-auto p-0 text-muted-foreground">
-          <Link to="/projects/import-wizard" className="flex items-center gap-1.5">
-            <Upload className="h-3.5 w-3.5" />
-            Import an existing workload
-          </Link>
-        </Button>
         <Button asChild variant="link" className="h-auto p-0 text-muted-foreground">
           <a
             href="https://temps.sh/docs"
@@ -382,6 +427,30 @@ function DatabaseTile({
         <p className="truncate text-xs text-muted-foreground">{description}</p>
       </div>
       <ArrowRight className="h-4 w-4 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100" />
+    </Link>
+  )
+}
+
+function MigrationSourceTile({
+  source,
+  label,
+}: {
+  source: string
+  label: string
+}) {
+  return (
+    <Link
+      to={`/projects/import-wizard?source=${source}`}
+      className={cn(
+        'group flex items-center gap-2.5 rounded-lg border bg-card p-3 text-left transition-colors',
+        'hover:border-primary/50 hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring'
+      )}
+    >
+      <SourceLogo source={source} className="h-5 w-5 shrink-0" />
+      <span className="min-w-0 flex-1 truncate text-sm font-medium">
+        {label}
+      </span>
+      <ArrowRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100" />
     </Link>
   )
 }

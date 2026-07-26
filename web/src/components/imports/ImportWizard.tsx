@@ -75,6 +75,9 @@ type WizardStep =
 interface ImportWizardProps {
   onCancel?: () => void
   className?: string
+  /** Preselect a platform (backend source id, e.g. "coolify") — used by
+   *  onboarding deep links. Unknown values simply leave nothing selected. */
+  initialSource?: string
 }
 
 /// Per-source credential inputs. Sources absent from this map (docker) need
@@ -161,13 +164,17 @@ const STEP_CONFIG = {
   },
 }
 
-export function ImportWizard({ onCancel, className }: ImportWizardProps) {
+export function ImportWizard({
+  onCancel,
+  className,
+  initialSource,
+}: ImportWizardProps) {
   const navigate = useNavigate()
 
   // State management
   const [currentStep, setCurrentStep] = useState<WizardStep>('select-source')
   const [selectedSource, setSelectedSource] = useState<ImportSource | null>(
-    null
+    (initialSource as ImportSource) ?? null
   )
   const [selectedWorkload, setSelectedWorkload] =
     useState<WorkloadDescriptor | null>(null)
