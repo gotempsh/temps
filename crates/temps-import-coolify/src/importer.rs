@@ -1214,11 +1214,15 @@ async fn execute_plan(
         main_branch,
         preset: context.preset.clone(),
         preset_config: None,
+        // is_secret vars carry a real value read from Coolify's API (unlike
+        // Kamal's empty placeholders) — they must reach the deployment or
+        // the app boots without its real credentials. temps encrypts every
+        // env var at rest regardless of this flag; only the plan API
+        // response masks it (mask_plan_secrets in the orchestrator).
         environment_variables: Some(
             plan.deployment
                 .env_vars
                 .iter()
-                .filter(|env| !env.is_secret)
                 .map(|env| (env.key.clone(), env.value.clone()))
                 .collect(),
         ),
