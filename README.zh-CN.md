@@ -83,6 +83,25 @@ curl -fsSL https://temps.sh/deploy.sh | bash
   <img alt="Temps 邮件服务商 —— SMTP、Scaleway 和 AWS SES" src="assets/screenshots/email-light.png">
 </picture>
 
+### OpenTelemetry —— 链路追踪、指标、日志与告警
+
+把任意 OTLP exporter 指向 Temps，分布式链路追踪、指标和结构化日志就会和其他数据汇聚在同一个地方。链路追踪展示跨服务每个 span 的耗时与错误；指标持续记录你的黄金信号；告警基于这些指标触发，并集中到一个队列中供你确认或解决。无需再运维 Grafana、Prometheus、Jaeger 或 Loki。
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/traces-dark.png">
+  <img alt="Temps 分布式链路追踪 —— 每个请求的耗时、span 数量与跨服务错误" src="assets/screenshots/traces-light.png">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/metrics-dark.png">
+  <img alt="Temps OpenTelemetry 指标 —— 请求速率、延迟、数据库与缓存信号" src="assets/screenshots/metrics-light.png">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/alerts-dark.png">
+  <img alt="Temps 告警 —— 覆盖指标、容器、可用性与数据库的触发中、已确认与已解决告警" src="assets/screenshots/alerts-light.png">
+</picture>
+
 ### AI 沙箱 —— 隔离的代码执行
 
 通过 CLI、REST API 或 SDK 为智能体任务、测试和一次性命令启动隔离沙箱 —— 兼容 Vercel Sandbox 的 API，后端可选 Docker 或 Firecracker 微虚拟机。这正是你原本要为 E2B 或 Daytona 付费的能力。
@@ -143,6 +162,7 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 | 网站分析 + 漏斗 | PostHog / Plausible（$0-450/月） |
 | 会话回放 | PostHog / FullStory（$0-2000/月） |
 | 错误追踪 | Sentry（$26+/月） |
+| 链路追踪、指标与日志（OpenTelemetry） | Grafana Cloud / Datadog（$0-500+/月） |
 | 可用性监控 | Better Uptime / Pingdom（$20+/月） |
 | 托管 Postgres/Redis/S3 | AWS RDS / ElastiCache（$50+/月） |
 | 事务性邮件 + DKIM | Resend / SendGrid（$20-100/月） |
@@ -166,6 +186,7 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 | 网站分析 | 是 | 否 | 否 | 否 | 否 | 否 | 付费插件 |
 | 会话回放 | 是 | 否 | 否 | 否 | 否 | 否 | 否 |
 | 错误追踪（兼容 Sentry） | 是 | 否 | 否 | 否 | 否 | 否 | 否 |
+| OpenTelemetry 链路追踪 + 指标 + 日志 | 是 | 否 | 否 | 否 | 否 | 否 | 链路追踪（付费） |
 | 可用性监控 | 是 | 否 | 否 | 否 | 否 | 否 | 否 |
 | 事务性邮件 + DKIM | 是 | 否 | 否 | 否 | 否 | 否 | 否 |
 | 代码执行沙箱（API） | 是 | 否 | 否 | 否 | 否 | 否 | Sandbox（按用量计费） |

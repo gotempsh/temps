@@ -83,6 +83,25 @@ Füge Absender-Domains mit DKIM-Records über die UI hinzu und versende via `@te
   <img alt="Temps E-Mail-Provider — SMTP, Scaleway und AWS SES" src="assets/screenshots/email-light.png">
 </picture>
 
+### OpenTelemetry — Traces, Metriken, Logs & Alerts
+
+Richte einen beliebigen OTLP-Exporter auf Temps und du bekommst verteilte Traces, Metriken und strukturierte Logs am selben Ort wie alles andere. Traces zeigen Latenz und Fehler pro Span über Services hinweg, Metriken halten deine Golden Signals fest, und Alerts feuern auf Basis dieser Metriken in eine einzige Queue, die du bestätigen oder auflösen kannst. Kein Grafana, Prometheus, Jaeger oder Loki zu betreiben.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/traces-dark.png">
+  <img alt="Verteilte Traces in Temps — Latenz pro Request, Span-Anzahl und Fehler über Services hinweg" src="assets/screenshots/traces-light.png">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/metrics-dark.png">
+  <img alt="OpenTelemetry-Metriken in Temps — Request-Rate, Latenz, Datenbank- und Cache-Signale" src="assets/screenshots/metrics-light.png">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/alerts-dark.png">
+  <img alt="Temps-Alerts — feuernde, bestätigte und aufgelöste Alarme aus Metriken, Containern, Uptime und Datenbanken" src="assets/screenshots/alerts-light.png">
+</picture>
+
 ### KI-Sandboxes — isolierte Code-Ausführung
 
 Starte isolierte Sandboxes für Agenten-Aufgaben, Tests und einmalige Befehle per CLI, REST-API oder SDK — eine zu Vercel Sandbox kompatible API mit Docker- oder Firecracker-microVM-Backend. Genau das, wofür du sonst E2B oder Daytona bezahlst.
@@ -143,6 +162,7 @@ Du willst keinen Server verwalten? [Temps Cloud](https://temps.sh/pricing) betre
 | Web-Analytics + Funnels | PostHog / Plausible ($0-450/Monat) |
 | Session Replay | PostHog / FullStory ($0-2000/Monat) |
 | Error-Tracking | Sentry ($26+/Monat) |
+| Traces, Metriken & Logs (OpenTelemetry) | Grafana Cloud / Datadog ($0-500+/Monat) |
 | Uptime-Monitoring | Better Uptime / Pingdom ($20+/Monat) |
 | Managed Postgres/Redis/S3 | AWS RDS / ElastiCache ($50+/Monat) |
 | Transaktions-E-Mails + DKIM | Resend / SendGrid ($20-100/Monat) |
@@ -166,6 +186,7 @@ Du willst keinen Server verwalten? [Temps Cloud](https://temps.sh/pricing) betre
 | Web-Analytics | Ja | Nein | Nein | Nein | Nein | Nein | Kostenpflichtiges Add-on |
 | Session Replay | Ja | Nein | Nein | Nein | Nein | Nein | Nein |
 | Error-Tracking (Sentry-kompatibel) | Ja | Nein | Nein | Nein | Nein | Nein | Nein |
+| OpenTelemetry Traces + Metriken + Logs | Ja | Nein | Nein | Nein | Nein | Nein | Traces (kostenpflichtig) |
 | Uptime-Monitoring | Ja | Nein | Nein | Nein | Nein | Nein | Nein |
 | Transaktions-E-Mails + DKIM | Ja | Nein | Nein | Nein | Nein | Nein | Nein |
 | Code-Sandboxes (API) | Ja | Nein | Nein | Nein | Nein | Nein | Sandbox (nutzungsbasiert) |

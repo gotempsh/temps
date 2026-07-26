@@ -83,6 +83,25 @@ UI から DKIM レコード付きの送信ドメインを追加し、`@temps-sdk
   <img alt="Temps メールプロバイダー —— SMTP、Scaleway、AWS SES" src="assets/screenshots/email-light.png">
 </picture>
 
+### OpenTelemetry —— トレース、メトリクス、ログ、アラート
+
+任意の OTLP エクスポーターを Temps に向けるだけで、分散トレース、メトリクス、構造化ログが他のデータと同じ場所に集まります。トレースはサービスをまたいだスパンごとのレイテンシとエラーを表示し、メトリクスはゴールデンシグナルを記録し、アラートはそのメトリクスから発火して1つのキューに集約され、確認や解決を行えます。Grafana、Prometheus、Jaeger、Loki を運用する必要はありません。
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/traces-dark.png">
+  <img alt="Temps の分散トレース —— リクエストごとのレイテンシ、スパン数、サービス間のエラー" src="assets/screenshots/traces-light.png">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/metrics-dark.png">
+  <img alt="Temps の OpenTelemetry メトリクス —— リクエストレート、レイテンシ、データベースとキャッシュのシグナル" src="assets/screenshots/metrics-light.png">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/alerts-dark.png">
+  <img alt="Temps のアラート —— メトリクス、コンテナ、稼働監視、データベースにまたがる発火中・確認済み・解決済みのアラーム" src="assets/screenshots/alerts-light.png">
+</picture>
+
 ### AI サンドボックス —— 隔離されたコード実行
 
 エージェントの作業、テスト、単発コマンドのための隔離サンドボックスを CLI、REST API、SDK から起動できます —— Vercel Sandbox 互換 API で、バックエンドは Docker または Firecracker マイクロ VM。E2B や Daytona に支払っていた分がこれで不要になります。
@@ -143,6 +162,7 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 | ウェブアナリティクス + ファネル分析 | PostHog / Plausible（月額 $0〜450） |
 | セッションリプレイ | PostHog / FullStory（月額 $0〜2000） |
 | エラートラッキング | Sentry（月額 $26〜） |
+| トレース、メトリクス、ログ（OpenTelemetry） | Grafana Cloud / Datadog（月額 $0〜500+） |
 | 稼働監視 | Better Uptime / Pingdom（月額 $20〜） |
 | マネージド Postgres/Redis/S3 | AWS RDS / ElastiCache（月額 $50〜） |
 | トランザクションメール + DKIM | Resend / SendGrid（月額 $20〜100） |
@@ -166,6 +186,7 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 | ウェブアナリティクス | あり | なし | なし | なし | なし | なし | 有料アドオン |
 | セッションリプレイ | あり | なし | なし | なし | なし | なし | なし |
 | エラートラッキング（Sentry 互換） | あり | なし | なし | なし | なし | なし | なし |
+| OpenTelemetry トレース + メトリクス + ログ | あり | なし | なし | なし | なし | なし | トレース（有料） |
 | 稼働監視 | あり | なし | なし | なし | なし | なし | なし |
 | トランザクションメール + DKIM | あり | なし | なし | なし | なし | なし | なし |
 | コード実行サンドボックス（API） | あり | なし | なし | なし | なし | なし | Sandbox（従量課金） |

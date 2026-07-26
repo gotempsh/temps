@@ -83,6 +83,25 @@ Añade dominios remitentes con registros DKIM desde la interfaz y envía con `@t
   <img alt="Proveedores de email de Temps — SMTP, Scaleway y AWS SES" src="assets/screenshots/email-light.png">
 </picture>
 
+### OpenTelemetry — trazas, métricas, logs y alertas
+
+Apunta cualquier exporter OTLP a Temps y tendrás trazas distribuidas, métricas y logs estructurados en el mismo sitio que todo lo demás. Las trazas muestran la latencia y los errores de cada span entre servicios; las métricas mantienen tus golden signals; las alertas se disparan a partir de esas métricas y llegan a una única cola donde puedes reconocerlas o resolverlas. Sin Grafana, Prometheus, Jaeger ni Loki que mantener.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/traces-dark.png">
+  <img alt="Trazas distribuidas de Temps — latencia por petición, número de spans y errores entre servicios" src="assets/screenshots/traces-light.png">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/metrics-dark.png">
+  <img alt="Métricas OpenTelemetry de Temps — tasa de peticiones, latencia, señales de base de datos y caché" src="assets/screenshots/metrics-light.png">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/alerts-dark.png">
+  <img alt="Alertas de Temps — alarmas activas, reconocidas y resueltas de métricas, contenedores, disponibilidad y bases de datos" src="assets/screenshots/alerts-light.png">
+</picture>
+
 ### Sandboxes de IA — ejecución de código aislada
 
 Levanta sandboxes aislados para trabajo de agentes, tests y comandos puntuales vía CLI, REST API o SDK — una API compatible con Vercel Sandbox, con backends Docker o microVM Firecracker. Justo lo que de otro modo pagarías a E2B o Daytona.
@@ -143,6 +162,7 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 | Analítica web + embudos | PostHog / Plausible ($0-450/mes) |
 | Reproducción de sesiones | PostHog / FullStory ($0-2000/mes) |
 | Seguimiento de errores | Sentry ($26+/mes) |
+| Trazas, métricas y logs (OpenTelemetry) | Grafana Cloud / Datadog ($0-500+/mes) |
 | Monitorización de disponibilidad | Better Uptime / Pingdom ($20+/mes) |
 | Postgres/Redis/S3 gestionados | AWS RDS / ElastiCache ($50+/mes) |
 | Email transaccional + DKIM | Resend / SendGrid ($20-100/mes) |
@@ -166,6 +186,7 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 | Analítica web | Sí | No | No | No | No | No | Complemento de pago |
 | Reproducción de sesiones | Sí | No | No | No | No | No | No |
 | Seguimiento de errores (compatible con Sentry) | Sí | No | No | No | No | No | No |
+| Trazas + métricas + logs OpenTelemetry | Sí | No | No | No | No | No | Trazas (de pago) |
 | Monitorización de disponibilidad | Sí | No | No | No | No | No | No |
 | Email transaccional + DKIM | Sí | No | No | No | No | No | No |
 | Sandboxes de ejecución de código (API) | Sí | No | No | No | No | No | Sandbox (según uso) |

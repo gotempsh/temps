@@ -83,6 +83,25 @@ Add sender domains with DKIM records through the UI and send via `@temps-sdk/nod
   <img alt="Temps email providers — SMTP, Scaleway and AWS SES" src="assets/screenshots/email-light.png">
 </picture>
 
+### OpenTelemetry — traces, metrics, logs & alerts
+
+Point any OTLP exporter at Temps and get distributed traces, metrics, and structured logs in the same place as everything else. Traces show per-span latency and errors across services; metrics keep your golden signals; alerts fire off those metrics and land in one queue you can acknowledge or resolve. No Grafana, Prometheus, Jaeger, or Loki to run.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/traces-dark.png">
+  <img alt="Temps distributed traces — per-request latency, span counts and errors across services" src="assets/screenshots/traces-light.png">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/metrics-dark.png">
+  <img alt="Temps OpenTelemetry metrics — request rate, latency, database and cache signals" src="assets/screenshots/metrics-light.png">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/alerts-dark.png">
+  <img alt="Temps alerts — firing, acknowledged and resolved alarms across metrics, containers, uptime and databases" src="assets/screenshots/alerts-light.png">
+</picture>
+
 ### AI Sandboxes — isolated code execution
 
 Spin up isolated sandboxes for agent work, tests, and one-off commands via CLI, REST API, or SDK — a Vercel Sandbox-compatible API with Docker or Firecracker microVM backends. What you'd otherwise pay E2B or Daytona for.
@@ -143,6 +162,7 @@ Prefer not to manage a server? [Temps Cloud](https://temps.sh/pricing) runs Temp
 | Web analytics + funnels | PostHog / Plausible ($0-450/mo) |
 | Session replay | PostHog / FullStory ($0-2000/mo) |
 | Error tracking | Sentry ($26+/mo) |
+| Traces, metrics & logs (OpenTelemetry) | Grafana Cloud / Datadog ($0-500+/mo) |
 | Uptime monitoring | Better Uptime / Pingdom ($20+/mo) |
 | Managed Postgres/Redis/S3 | AWS RDS / ElastiCache ($50+/mo) |
 | Transactional email + DKIM | Resend / SendGrid ($20-100/mo) |
@@ -166,6 +186,7 @@ Prefer not to manage a server? [Temps Cloud](https://temps.sh/pricing) runs Temp
 | Web analytics | Yes | No | No | No | No | No | Paid add-on |
 | Session replay | Yes | No | No | No | No | No | No |
 | Error tracking (Sentry-compatible) | Yes | No | No | No | No | No | No |
+| OpenTelemetry traces + metrics + logs | Yes | No | No | No | No | No | Traces (paid) |
 | Uptime monitoring | Yes | No | No | No | No | No | No |
 | Transactional email + DKIM | Yes | No | No | No | No | No | No |
 | Code-execution sandboxes (API) | Yes | No | No | No | No | No | Sandbox (usage-based) |
