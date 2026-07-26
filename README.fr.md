@@ -6,8 +6,8 @@
   <img alt="Temps" src="web/public/logo/temps-logo-dark.png" width="280">
 </picture>
 
-**L'alternative open source à Vercel + Sentry + PostHog + Pingdom.**
-Déploiements, analytics, session replay et suivi d'erreurs -- en un seul binaire auto-hébergé.
+**L'alternative open source à Vercel + Sentry + PostHog + Pingdom + Resend + E2B.**
+Déploiements, analytics, session replay, suivi d'erreurs, monitoring de disponibilité, emails transactionnels et sandboxes IA -- en un seul binaire auto-hébergé.
 
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 [![GitHub Release](https://img.shields.io/github/v/release/gotempsh/temps)](https://github.com/gotempsh/temps/releases)
@@ -28,11 +28,11 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/create-dark.png">
-  <img alt="Créer un nouveau projet dans Temps — importez un dépôt, partez d'un template, clonez une URL Git ou déployez une image Docker" src="assets/screenshots/create-light.png">
+  <img alt="Import d'un dépôt public dans Temps — les presets de framework sont détectés automatiquement avant le déploiement" src="assets/screenshots/create-light.png">
 </picture>
 
 
-Arrêtez de payer 6 outils SaaS différents. Temps remplace votre plateforme de déploiement, vos analytics, votre suivi d'erreurs, votre session replay, votre monitoring de disponibilité et vos emails transactionnels -- le tout auto-hébergé, le tout dans un seul binaire.
+Arrêtez de payer 7 outils SaaS différents. Temps remplace votre plateforme de déploiement, vos analytics, votre suivi d'erreurs, votre session replay, votre monitoring de disponibilité, vos emails transactionnels et vos sandboxes d'exécution de code pour l'IA -- le tout auto-hébergé, le tout dans un seul binaire.
 
 ---
 
@@ -81,6 +81,15 @@ Ajoutez des domaines d'envoi avec enregistrements DKIM depuis l'interface et env
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/email-dark.png">
   <img alt="Fournisseurs d'email Temps — SMTP, Scaleway et AWS SES" src="assets/screenshots/email-light.png">
+</picture>
+
+### Sandboxes IA — exécution de code isolée
+
+Lancez des sandboxes isolés pour le travail d'agents, les tests et les commandes ponctuelles via CLI, API REST ou SDK — une API compatible Vercel Sandbox, avec des backends Docker ou micro-VM Firecracker. Exactement ce que vous paieriez sinon à E2B ou Daytona.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/sandboxes-dark.png">
+  <img alt="Sandboxes Temps — créez des sandboxes isolés via CLI, API REST ou SDK" src="assets/screenshots/sandboxes-light.png">
 </picture>
 
 ### Tout dans un seul tableau de bord
@@ -137,6 +146,7 @@ Vous préférez ne pas gérer de serveur ? [Temps Cloud](https://temps.sh/pricin
 | Monitoring de disponibilité | Better Uptime / Pingdom (20 $+/mois) |
 | Postgres/Redis/S3 managés | AWS RDS / ElastiCache (50 $+/mois) |
 | Emails transactionnels + DKIM | Resend / SendGrid (20-100 $/mois) |
+| Sandboxes d'exécution de code IA | E2B / Daytona / Vercel Sandbox (150 $+/mois + usage) |
 | Logs de requêtes + proxy | Cloudflare (0-200 $/mois) |
 | **Total avec Temps** | **0 $ (auto-hébergé)** |
 
@@ -151,20 +161,21 @@ Vous préférez ne pas gérer de serveur ? [Temps Cloud](https://temps.sh/pricin
 | Déploiement par git push | Oui | Oui | Oui | Non | Oui | Oui | Oui |
 | Déploiements de préversion | Oui | Oui | Oui | Non | Oui | Oui | Oui |
 | TLS automatique (HTTP-01 + DNS-01) | Oui | Oui | Oui | Oui | Oui | Oui | Oui |
-| Support de Docker Compose | Non | Oui | Oui | Non | -- | -- | -- |
+| Support de Docker Compose | Oui | Oui | Oui | Non | -- | -- | -- |
 | Bibliothèque de templates en un clic | Non | 280+ | Oui | Non | Oui | Oui | Oui |
 | Analytics web | Oui | Non | Non | Non | Non | Non | Option payante |
 | Session replay | Oui | Non | Non | Non | Non | Non | Non |
 | Suivi d'erreurs (compatible Sentry) | Oui | Non | Non | Non | Non | Non | Non |
 | Monitoring de disponibilité | Oui | Non | Non | Non | Non | Non | Non |
 | Emails transactionnels + DKIM | Oui | Non | Non | Non | Non | Non | Non |
+| Sandboxes d'exécution de code (API) | Oui | Non | Non | Non | Non | Non | Sandbox (à l'usage) |
 | Postgres / Redis managés | Oui | Oui | Oui | Non | Oui | Oui | Add-ons partenaires |
 | Stockage compatible S3 | Oui | Non | Non | Non | Non | Non | Blob (payant) |
 | Multi-nœud / clustering | Oui | Oui | Swarm | Oui | Managé | Managé | Managé |
 | Fonctions edge / réseau edge mondial | Non | Non | Non | Non | Non | Non | Oui |
 | Facturation par siège | Non | Non | Non | Non | 20 $/utilisateur (Pro) | Par utilisateur | 20 $/siège (Pro) |
 
-**Là où les alternatives gagnent.** Coolify et Dokploy offrent un support de Docker Compose de premier ordre et des bibliothèques de templates en un clic (280+ applications sur Coolify) que Temps n'a pas encore, et tous deux ont des communautés bien plus grandes — Coolify à lui seul dépasse les 56k étoiles GitHub, tandis que Temps est le projet le plus récent de cette liste. Kamal est le choix le plus simple si tout ce que vous voulez, ce sont des déploiements Docker sans interruption pilotés depuis une CLI. Vercel et les autres plateformes managées vous offrent un réseau edge mondial, des fonctions edge et une absorption des attaques DDoS qu'un simple VPS ne peut pas égaler — et elles gèrent l'infrastructure à votre place, ce qui est une vraie valeur ajoutée si vous ne voulez jamais avoir à penser à un serveur.
+**Là où les alternatives gagnent.** Coolify et Dokploy offrent des bibliothèques de templates en un clic (280+ applications sur Coolify) que Temps n'a pas encore, et tous deux ont des communautés bien plus grandes — Coolify à lui seul dépasse les 56k étoiles GitHub, tandis que Temps est le projet le plus récent de cette liste. Kamal est le choix le plus simple si tout ce que vous voulez, ce sont des déploiements Docker sans interruption pilotés depuis une CLI. Vercel et les autres plateformes managées vous offrent un réseau edge mondial, des fonctions edge et une absorption des attaques DDoS qu'un simple VPS ne peut pas égaler — et elles gèrent l'infrastructure à votre place, ce qui est une vraie valeur ajoutée si vous ne voulez jamais avoir à penser à un serveur.
 
 Comparatifs détaillés et régulièrement mis à jour : [temps.sh/compare](https://temps.sh/compare)
 

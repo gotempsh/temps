@@ -71,6 +71,7 @@ import {
 
 import { getProjectBySlugOptions } from '@/api/client/@tanstack/react-query.gen'
 import { useAuth } from '@/contexts/AuthContext'
+import { useGettingStarted } from '@/hooks/useGettingStarted'
 import { usePluginsContext } from '@/contexts/PluginsContext'
 import { resolvePluginIcon } from '@/lib/pluginIcons'
 import { cn } from '@/lib/utils'
@@ -381,6 +382,8 @@ export default function AppSidebar() {
         </SidebarMenu>
       </SidebarHeader>
       <SidebarContent>
+        <NavCommandTrigger />
+        <GettingStartedNavItem />
         {showDefault ? (
           <DefaultNav
             pluginItems={pluginItems}
@@ -477,6 +480,66 @@ function NavSection({
           )
         })}
       </SidebarMenu>
+    </SidebarGroup>
+  )
+}
+
+// Persistent link to platform setup progress, pinned just below the Find
+// (⌘K) box at the top of the sidebar content so it shows on every page
+// regardless of which nav mode (default/settings/project) is active. Styled
+// as a bordered callout card (not a plain nav row) with a mini progress bar
+// so it reads as a distinct "you have setup left" prompt. Full checklist
+// detail lives on its own /setup page. Renders nothing once dismissed or
+// fully complete (same visibility rule as the /setup page).
+function GettingStartedNavItem() {
+  const { isMinimal, isMobile } = useSidebar()
+  const compact = isMinimal && !isMobile
+  const { completedCount, totalCount, visible } = useGettingStarted()
+
+  if (!visible) return null
+
+  const pct = Math.round((completedCount / totalCount) * 100)
+
+  if (compact) {
+    return (
+      <SidebarGroup className="pb-0">
+        <SidebarMenu>
+          <SidebarMenuItem>
+            <SidebarMenuButton
+              asChild
+              tooltip={`Finish setup — ${completedCount}/${totalCount}`}
+              className="justify-center"
+            >
+              <Link to="/setup">
+                <BadgeCheck />
+              </Link>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
+        </SidebarMenu>
+      </SidebarGroup>
+    )
+  }
+
+  return (
+    <SidebarGroup className="pb-0">
+      <Link
+        to="/setup"
+        className="group flex flex-col gap-2 rounded-lg border border-sidebar-border bg-sidebar-accent/40 px-3 py-2.5 transition-colors hover:border-primary/40 hover:bg-sidebar-accent/70"
+      >
+        <div className="flex items-center gap-2">
+          <BadgeCheck className="size-4 shrink-0 text-primary" />
+          <span className="flex-1 text-sm font-medium">Finish setup</span>
+          <span className="text-xs tabular-nums text-muted-foreground">
+            {completedCount}/{totalCount}
+          </span>
+        </div>
+        <div className="h-1 w-full overflow-hidden rounded-full bg-sidebar-border">
+          <div
+            className="h-full rounded-full bg-primary transition-all duration-500"
+            style={{ width: `${pct}%` }}
+          />
+        </div>
+      </Link>
     </SidebarGroup>
   )
 }
@@ -711,7 +774,6 @@ function DefaultNav({
 
   return (
     <>
-      <NavCommandTrigger />
       {pinnedProjectSlug && onReturnToProject && (
         <CurrentProjectPin
           slug={pinnedProjectSlug}
@@ -763,7 +825,6 @@ function SettingsNav({ onBack }: { onBack: () => void }) {
   )
   return (
     <>
-      <NavCommandTrigger />
       <SwapHeader title="Settings" onBack={onBack} />
       {settingsGroups.map((group) => {
         const ownUrls = new Set(group.items.map((i) => i.url))
@@ -960,7 +1021,6 @@ function ProjectNav({
   if (!project) {
     return (
       <>
-        <NavCommandTrigger />
         <SwapHeader title="Loading…" onBack={onBack} />
       </>
     )
@@ -981,7 +1041,6 @@ function ProjectNav({
     if (parent?.subItems?.length) {
       return (
         <>
-          <NavCommandTrigger />
           <SwapHeader title={parent.title} onBack={() => setDrilledTo(null)} />
           <SidebarGroup className="pt-0">
             <SidebarMenu>
@@ -1015,7 +1074,6 @@ function ProjectNav({
 
   return (
     <>
-      <NavCommandTrigger />
       <SwapHeader title={project.name} onBack={onBack} />
       <SidebarGroup className="pt-0">
         <SidebarMenu>

@@ -288,6 +288,11 @@ interface ProjectConfiguratorProps {
   onSubmit?: (data: ProjectFormValues) => Promise<void>
   onCancel?: () => void
   showSteps?: boolean
+  /**
+   * Hide the repository summary card when the surrounding page already
+   * displays the repo (e.g. the import page's context bar).
+   */
+  showRepositoryCard?: boolean
   defaultValues?: Partial<ProjectFormValues>
 
   // Styling
@@ -303,6 +308,7 @@ export function ProjectConfigurator({
   onSubmit,
   onCancel,
   showSteps: _showSteps = true,
+  showRepositoryCard = true,
   defaultValues,
   className,
 }: ProjectConfiguratorProps) {
@@ -617,53 +623,54 @@ export function ProjectConfigurator({
     }
   }
 
-  // Render repository config step
+  // Render repository config step. The repository summary card is skipped
+  // when the surrounding page already shows the repo (e.g. the import page's
+  // context bar) so the name isn't printed twice.
   const renderRepoConfig = () => (
     <div className="space-y-4">
-      <div className="flex items-center gap-3 p-4 bg-muted/50 rounded-lg">
-        <GitBranch className="h-5 w-5 text-muted-foreground" />
-        <div>
-          <div className="font-medium">
-            {repository.owner}/{repository.name}
-          </div>
-          <div className="text-sm text-muted-foreground">
-            {repository.full_name}
-          </div>
+      {showRepositoryCard && (
+        <div className="flex items-center gap-3 p-4 bg-muted/50 rounded-lg">
+          <GitBranch className="h-5 w-5 text-muted-foreground" />
+          <div className="font-medium">{repository.full_name}</div>
         </div>
+      )}
+
+      {/* Name and branch share one row — neither needs full width, and the
+          preset grid below is the part that deserves the vertical space. */}
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+        <FormField
+          control={form.control}
+          name="name"
+          render={({ field }) => (
+            <FormItem>
+              <FormLabel>Project Name</FormLabel>
+              <FormControl>
+                <Input {...field} placeholder="Enter project name" />
+              </FormControl>
+              <FormMessage />
+            </FormItem>
+          )}
+        />
+
+        <FormField
+          control={form.control}
+          name="branch"
+          render={({ field }) => (
+            <FormItem>
+              <FormLabel>Branch</FormLabel>
+              <BranchSelector
+                repoOwner={repository.owner}
+                repoName={repository.name}
+                connectionId={connectionId}
+                defaultBranch={repository.default_branch}
+                value={field.value}
+                onChange={field.onChange}
+              />
+              <FormMessage />
+            </FormItem>
+          )}
+        />
       </div>
-
-      <FormField
-        control={form.control}
-        name="name"
-        render={({ field }) => (
-          <FormItem>
-            <FormLabel>Project Name</FormLabel>
-            <FormControl>
-              <Input {...field} placeholder="Enter project name" />
-            </FormControl>
-            <FormMessage />
-          </FormItem>
-        )}
-      />
-
-      <FormField
-        control={form.control}
-        name="branch"
-        render={({ field }) => (
-          <FormItem>
-            <FormLabel>Branch</FormLabel>
-            <BranchSelector
-              repoOwner={repository.owner}
-              repoName={repository.name}
-              connectionId={connectionId}
-              defaultBranch={repository.default_branch}
-              value={field.value}
-              onChange={field.onChange}
-            />
-            <FormMessage />
-          </FormItem>
-        )}
-      />
 
       <FormField
         control={form.control}

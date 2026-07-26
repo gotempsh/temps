@@ -4,7 +4,7 @@ import { useDashboardAnalytics } from '@/hooks/useDashboardAnalytics'
 import { useDashboardHealth } from '@/hooks/useDashboardHealth'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { FirstProjectOnboarding } from '@/components/dashboard/FirstProjectOnboarding'
-import { GettingStartedCard } from '@/components/dashboard/GettingStartedCard'
+import { SIMULATE_EMPTY_INSTALL } from '@/lib/devSimulate'
 import { MetricCard } from '@/components/dashboard/MetricCard'
 import { ProjectCard } from '@/components/dashboard/ProjectCard'
 import { MetricCardSkeleton } from '@/components/skeletons/MetricCardSkeleton'
@@ -83,7 +83,7 @@ export function Projects() {
   const navigate = useNavigate()
   const [page, setPage] = useState(1)
 
-  const { data: projectsData, isLoading } = useQuery({
+  const { data: rawProjectsData, isLoading } = useQuery({
     ...getProjectsOptions({
       query: {
         page,
@@ -92,10 +92,17 @@ export function Projects() {
     }),
   })
 
-  const { data: gitProviders, isLoading: gitProvidersLoading } = useQuery({
+  const { data: rawGitProviders, isLoading: gitProvidersLoading } = useQuery({
     ...listGitProvidersOptions({}),
     retry: false,
   })
+
+  // TEMP: force an empty (brand-new install) dashboard while iterating on the
+  // first-run experience. See lib/devSimulate.ts.
+  const projectsData = SIMULATE_EMPTY_INSTALL
+    ? ({ ...rawProjectsData, projects: [], total: 0 } as typeof rawProjectsData)
+    : rawProjectsData
+  const gitProviders = SIMULATE_EMPTY_INSTALL ? [] : rawGitProviders
 
   useEffect(() => {
     setBreadcrumbs([{ label: 'Projects' }])
@@ -219,14 +226,6 @@ export function Projects() {
 
   return (
     <div className="p-4 sm:p-8 space-y-6">
-      {/* The Getting Started checklist and the first-run "Deploy your first
-          project" empty state both cover connecting Git + the first deploy —
-          showing both at once is redundant and buries the deploy CTAs. On an
-          empty instance the empty state below owns that story; the checklist
-          returns once a project exists, to nudge the remaining setup (wildcard
-          domain, notifications). */}
-      {hasProjects && <GettingStartedCard />}
-
       {/* Metric cards (merged from former Dashboard page). Hidden on an empty
           instance — with no projects every figure is zero, so the cards are
           vanity data that pushes the recommended actions below the fold. The

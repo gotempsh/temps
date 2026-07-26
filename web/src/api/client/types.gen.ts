@@ -13267,6 +13267,11 @@ export type SandboxEventsResponse = {
  */
 export type SandboxInner = {
     /**
+     * Agent run this sandbox executes (autofixer / workflow agent).
+     * `None` for sandboxes created via this API.
+     */
+    agent_run_id?: number | null;
+    /**
      * Isolation backend: "docker" | "firecracker". `None` on legacy rows
      * created before the backend was recorded.
      */
@@ -15580,6 +15585,11 @@ export type TemplateResponse = {
      * Framework/preset to use
      */
     preset: string;
+    /**
+     * URL to a wide screenshot/banner preview of the deployed template.
+     * Absent for templates that don't have one captured yet.
+     */
+    screenshot_url?: string | null;
     /**
      * Required external services
      */
@@ -43717,6 +43727,10 @@ export type GetRepositoryPresetLiveErrors = {
      */
     400: unknown;
     /**
+     * The git provider rejected the stored credential - the connection must be re-authorized
+     */
+    401: unknown;
+    /**
      * Repository not found
      */
     404: unknown;
@@ -45810,6 +45824,10 @@ export type DestroySandboxErrors = {
      * Not found
      */
     404: unknown;
+    /**
+     * Sandbox belongs to an active agent run — stop the run instead
+     */
+    409: unknown;
 };
 
 export type DestroySandboxResponses = {
@@ -46421,6 +46439,10 @@ export type StopSandboxErrors = {
      * Not found
      */
     404: unknown;
+    /**
+     * Sandbox belongs to an active agent run — stop the run instead
+     */
+    409: unknown;
 };
 
 export type StopSandboxResponses = {

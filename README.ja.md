@@ -6,8 +6,8 @@
   <img alt="Temps" src="web/public/logo/temps-logo-dark.png" width="280">
 </picture>
 
-**Vercel + Sentry + PostHog + Pingdom のオープンソース代替。**
-デプロイ、アナリティクス、セッションリプレイ、エラートラッキング —— すべてをセルフホストの単一バイナリで。
+**Vercel + Sentry + PostHog + Pingdom + Resend + E2B のオープンソース代替。**
+デプロイ、アナリティクス、セッションリプレイ、エラートラッキング、アップタイム監視、トランザクションメール、AI サンドボックス —— すべてをセルフホストの単一バイナリで。
 
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 [![GitHub Release](https://img.shields.io/github/v/release/gotempsh/temps)](https://github.com/gotempsh/temps/releases)
@@ -28,11 +28,11 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/create-dark.png">
-  <img alt="Temps で新規プロジェクトを作成 — リポジトリのインポート、テンプレートからの開始、Git URL のクローン、Docker イメージのデプロイ" src="assets/screenshots/create-light.png">
+  <img alt="Temps での公開リポジトリのインポート —— デプロイ前にフレームワークプリセットを自動検出" src="assets/screenshots/create-light.png">
 </picture>
 
 
-6つもの SaaS ツールに料金を払うのはもうやめましょう。Temps はデプロイプラットフォーム、アナリティクス、エラートラッキング、セッションリプレイ、稼働監視、トランザクションメールをまとめて置き換えます —— すべてセルフホストで、すべて1つのバイナリに。
+7 種類の SaaS ツールに料金を払うのはもう終わりです。Temps はデプロイプラットフォーム、アナリティクス、エラートラッキング、セッションリプレイ、稼働監視、トランザクションメール、AI コード実行サンドボックスをまとめて置き換えます —— すべてセルフホストで、すべて1つのバイナリに。
 
 ---
 
@@ -81,6 +81,15 @@ UI から DKIM レコード付きの送信ドメインを追加し、`@temps-sdk
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/email-dark.png">
   <img alt="Temps メールプロバイダー —— SMTP、Scaleway、AWS SES" src="assets/screenshots/email-light.png">
+</picture>
+
+### AI サンドボックス —— 隔離されたコード実行
+
+エージェントの作業、テスト、単発コマンドのための隔離サンドボックスを CLI、REST API、SDK から起動できます —— Vercel Sandbox 互換 API で、バックエンドは Docker または Firecracker マイクロ VM。E2B や Daytona に支払っていた分がこれで不要になります。
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/sandboxes-dark.png">
+  <img alt="Temps のサンドボックス —— CLI、REST API、SDK から隔離サンドボックスを作成" src="assets/screenshots/sandboxes-light.png">
 </picture>
 
 ### すべてを1つのダッシュボードに
@@ -137,6 +146,7 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 | 稼働監視 | Better Uptime / Pingdom（月額 $20〜） |
 | マネージド Postgres/Redis/S3 | AWS RDS / ElastiCache（月額 $50〜） |
 | トランザクションメール + DKIM | Resend / SendGrid（月額 $20〜100） |
+| AI コード実行サンドボックス | E2B / Daytona / Vercel Sandbox（$150+/月 + 従量課金） |
 | リクエストログ + プロキシ | Cloudflare（月額 $0〜200） |
 | **Temps での合計** | **$0（セルフホスト）** |
 
@@ -151,20 +161,21 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 | Git プッシュでデプロイ | あり | あり | あり | なし | あり | あり | あり |
 | プレビューデプロイ | あり | あり | あり | なし | あり | あり | あり |
 | 自動 TLS（HTTP-01 + DNS-01） | あり | あり | あり | あり | あり | あり | あり |
-| Docker Compose 対応 | なし | あり | あり | なし | -- | -- | -- |
+| Docker Compose 対応 | あり | あり | あり | なし | -- | -- | -- |
 | ワンクリックテンプレートライブラリ | なし | 280以上 | あり | なし | あり | あり | あり |
 | ウェブアナリティクス | あり | なし | なし | なし | なし | なし | 有料アドオン |
 | セッションリプレイ | あり | なし | なし | なし | なし | なし | なし |
 | エラートラッキング（Sentry 互換） | あり | なし | なし | なし | なし | なし | なし |
 | 稼働監視 | あり | なし | なし | なし | なし | なし | なし |
 | トランザクションメール + DKIM | あり | なし | なし | なし | なし | なし | なし |
+| コード実行サンドボックス（API） | あり | なし | なし | なし | なし | なし | Sandbox（従量課金） |
 | マネージド Postgres / Redis | あり | あり | あり | なし | あり | あり | パートナーアドオン |
 | S3 互換ストレージ | あり | なし | なし | なし | なし | なし | Blob（有料） |
 | マルチノード / クラスタリング | あり | あり | Swarm | あり | マネージド | マネージド | マネージド |
 | エッジ関数 / グローバルエッジネットワーク | なし | なし | なし | なし | なし | なし | あり |
 | シートごとの課金 | なし | なし | なし | なし | $20/ユーザー（Pro） | ユーザー単位 | $20/シート（Pro） |
 
-**代替ツールが勝る点。** Coolify と Dokploy には、Temps がまだ持っていない本格的な Docker Compose サポートとワンクリックテンプレートライブラリ（Coolify は280以上のアプリ）があり、コミュニティの規模もはるかに大きい —— Coolify だけで GitHub スター56k超を誇る一方、Temps はこのリストで最も新しいプロジェクトです。CLI からのゼロダウンタイム Docker デプロイだけが必要なら、Kamal のほうがシンプルな選択肢です。Vercel をはじめとするマネージドプラットフォームは、単一の VPS では太刀打ちできないグローバルエッジネットワーク、エッジ関数、DDoS 吸収能力を提供し、しかもインフラの運用まで代行してくれます —— サーバーのことを一切考えたくないなら、それは確かな価値です。
+**代替ツールが勝る点。** Coolify と Dokploy には、Temps がまだ持っていないワンクリックテンプレートライブラリ（Coolify は280以上のアプリ）があり、コミュニティの規模もはるかに大きい —— Coolify だけで GitHub スター56k超を誇る一方、Temps はこのリストで最も新しいプロジェクトです。CLI からのゼロダウンタイム Docker デプロイだけが必要なら、Kamal のほうがシンプルな選択肢です。Vercel をはじめとするマネージドプラットフォームは、単一の VPS では太刀打ちできないグローバルエッジネットワーク、エッジ関数、DDoS 吸収能力を提供し、しかもインフラの運用まで代行してくれます —— サーバーのことを一切考えたくないなら、それは確かな価値です。
 
 詳細で定期的に更新される比較はこちら: [temps.sh/compare](https://temps.sh/compare)
 

@@ -45,6 +45,9 @@ import { PluginPage } from './pages/plugins/PluginPage'
 const Account = lazy(() =>
   import('./pages/Account').then((m) => ({ default: m.Account }))
 )
+const Setup = lazy(() =>
+  import('./pages/Setup').then((m) => ({ default: m.Setup }))
+)
 const Projects = lazy(() =>
   import('./pages/Projects').then((m) => ({ default: m.Projects }))
 )
@@ -459,6 +462,7 @@ const FullAppRoutes = () => {
                 <Route path="/" element={<Navigate to="/projects" replace />} />
                 <Route path="/dashboard" element={<Navigate to="/projects" replace />} />
                 <Route path="/account" element={<Account />} />
+                <Route path="/setup" element={<Setup />} />
                 <Route path="/projects" element={<Projects />} />
                 <Route path="/revenue" element={<Revenue />} />
                 <Route path="/sandboxes" element={<Sandboxes />} />

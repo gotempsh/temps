@@ -6,8 +6,8 @@
   <img alt="Temps" src="web/public/logo/temps-logo-dark.png" width="280">
 </picture>
 
-**La alternativa open source a Vercel + Sentry + PostHog + Pingdom.**
-Despliegues, analítica, session replay y error tracking -- en un único binario autoalojado.
+**La alternativa open source a Vercel + Sentry + PostHog + Pingdom + Resend + E2B.**
+Despliegues, analítica, session replay, error tracking, monitorización de disponibilidad, email transaccional y sandboxes de IA -- en un único binario autoalojado.
 
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 [![GitHub Release](https://img.shields.io/github/v/release/gotempsh/temps)](https://github.com/gotempsh/temps/releases)
@@ -28,11 +28,11 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/create-dark.png">
-  <img alt="Crear un nuevo proyecto en Temps — importa un repositorio, empieza desde una plantilla, clona una URL de Git o despliega una imagen de Docker" src="assets/screenshots/create-light.png">
+  <img alt="Importando un repositorio público en Temps — los presets de framework se detectan automáticamente antes del despliegue" src="assets/screenshots/create-light.png">
 </picture>
 
 
-Deja de pagar 6 herramientas SaaS distintas. Temps sustituye tu plataforma de despliegue, analítica web, seguimiento de errores, reproducción de sesiones, monitorización de disponibilidad y email transaccional -- todo autoalojado, todo en un solo binario.
+Deja de pagar 7 herramientas SaaS distintas. Temps sustituye tu plataforma de despliegue, analítica web, seguimiento de errores, reproducción de sesiones, monitorización de disponibilidad, email transaccional y sandboxes de ejecución de código para IA -- todo autoalojado, todo en un solo binario.
 
 ---
 
@@ -81,6 +81,15 @@ Añade dominios remitentes con registros DKIM desde la interfaz y envía con `@t
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/email-dark.png">
   <img alt="Proveedores de email de Temps — SMTP, Scaleway y AWS SES" src="assets/screenshots/email-light.png">
+</picture>
+
+### Sandboxes de IA — ejecución de código aislada
+
+Levanta sandboxes aislados para trabajo de agentes, tests y comandos puntuales vía CLI, REST API o SDK — una API compatible con Vercel Sandbox, con backends Docker o microVM Firecracker. Justo lo que de otro modo pagarías a E2B o Daytona.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/sandboxes-dark.png">
+  <img alt="Sandboxes de Temps — crea sandboxes aislados vía CLI, REST API o SDK" src="assets/screenshots/sandboxes-light.png">
 </picture>
 
 ### Todo en un solo panel
@@ -137,6 +146,7 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 | Monitorización de disponibilidad | Better Uptime / Pingdom ($20+/mes) |
 | Postgres/Redis/S3 gestionados | AWS RDS / ElastiCache ($50+/mes) |
 | Email transaccional + DKIM | Resend / SendGrid ($20-100/mes) |
+| Sandboxes de ejecución de código para IA | E2B / Daytona / Vercel Sandbox ($150+/mes + uso) |
 | Registro de peticiones + proxy | Cloudflare ($0-200/mes) |
 | **Total con Temps** | **$0 (autoalojado)** |
 
@@ -151,20 +161,21 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 | Despliegue con git push | Sí | Sí | Sí | No | Sí | Sí | Sí |
 | Despliegues de vista previa | Sí | Sí | Sí | No | Sí | Sí | Sí |
 | TLS automático (HTTP-01 + DNS-01) | Sí | Sí | Sí | Sí | Sí | Sí | Sí |
-| Soporte de Docker Compose | No | Sí | Sí | No | -- | -- | -- |
+| Soporte de Docker Compose | Sí | Sí | Sí | No | -- | -- | -- |
 | Biblioteca de plantillas con un clic | No | 280+ | Sí | No | Sí | Sí | Sí |
 | Analítica web | Sí | No | No | No | No | No | Complemento de pago |
 | Reproducción de sesiones | Sí | No | No | No | No | No | No |
 | Seguimiento de errores (compatible con Sentry) | Sí | No | No | No | No | No | No |
 | Monitorización de disponibilidad | Sí | No | No | No | No | No | No |
 | Email transaccional + DKIM | Sí | No | No | No | No | No | No |
+| Sandboxes de ejecución de código (API) | Sí | No | No | No | No | No | Sandbox (según uso) |
 | Postgres / Redis gestionados | Sí | Sí | Sí | No | Sí | Sí | Complementos de partners |
 | Almacenamiento compatible con S3 | Sí | No | No | No | No | No | Blob (de pago) |
 | Multinodo / clustering | Sí | Sí | Swarm | Sí | Gestionado | Gestionado | Gestionado |
 | Funciones edge / red edge global | No | No | No | No | No | No | Sí |
 | Tarifas por asiento | No | No | No | No | $20/usuario (Pro) | Por usuario | $20/asiento (Pro) |
 
-**Dónde ganan las alternativas.** Coolify y Dokploy tienen soporte de primera clase para Docker Compose y bibliotecas de plantillas de un clic (más de 280 aplicaciones en Coolify) que Temps todavía no tiene, y ambos cuentan con comunidades mucho más grandes — solo Coolify supera las 56k estrellas en GitHub, mientras que Temps es el proyecto más nuevo de esta lista. Kamal es la opción más sencilla si lo único que quieres son despliegues Docker sin tiempo de inactividad gestionados desde una CLI. Vercel y el resto de plataformas gestionadas te dan una red edge global, funciones edge y absorción de DDoS que un único VPS no puede igualar — y además operan la infraestructura por ti, lo cual tiene un valor real si nunca quieres preocuparte por un servidor.
+**Dónde ganan las alternativas.** Coolify y Dokploy tienen bibliotecas de plantillas de un clic (más de 280 aplicaciones en Coolify) que Temps todavía no tiene, y ambos cuentan con comunidades mucho más grandes — solo Coolify supera las 56k estrellas en GitHub, mientras que Temps es el proyecto más nuevo de esta lista. Kamal es la opción más sencilla si lo único que quieres son despliegues Docker sin tiempo de inactividad gestionados desde una CLI. Vercel y el resto de plataformas gestionadas te dan una red edge global, funciones edge y absorción de DDoS que un único VPS no puede igualar — y además operan la infraestructura por ti, lo cual tiene un valor real si nunca quieres preocuparte por un servidor.
 
 Comparativas detalladas y actualizadas regularmente: [temps.sh/compare](https://temps.sh/compare)
 

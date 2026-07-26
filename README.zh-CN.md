@@ -6,8 +6,8 @@
   <img alt="Temps" src="web/public/logo/temps-logo-dark.png" width="280">
 </picture>
 
-**Vercel + Sentry + PostHog + Pingdom 的开源替代品。**
-部署、分析、会话回放、错误追踪 —— 一个自托管的二进制文件搞定。
+**Vercel + Sentry + PostHog + Pingdom + Resend + E2B 的开源替代品。**
+部署、分析、会话回放、错误追踪、可用性监控、事务性邮件与 AI 沙箱 —— 一个自托管的二进制文件搞定。
 
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 [![GitHub Release](https://img.shields.io/github/v/release/gotempsh/temps)](https://github.com/gotempsh/temps/releases)
@@ -28,11 +28,11 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/create-dark.png">
-  <img alt="在 Temps 中创建新项目 —— 导入仓库、从模板开始、克隆 Git URL 或部署 Docker 镜像" src="assets/screenshots/create-light.png">
+  <img alt="在 Temps 中导入公开仓库 —— 部署前自动检测框架预设" src="assets/screenshots/create-light.png">
 </picture>
 
 
-别再为 6 个不同的 SaaS 工具付费了。Temps 一次性替代你的部署平台、网站分析、错误追踪、会话回放、可用性监控和事务性邮件 —— 全部自托管，全部集成在一个二进制文件里。
+别再为 7 个不同的 SaaS 工具付费了。Temps 一次性替代你的部署平台、网站分析、错误追踪、会话回放、可用性监控、事务性邮件和 AI 代码执行沙箱 —— 全部自托管，全部集成在一个二进制文件里。
 
 ---
 
@@ -81,6 +81,15 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/email-dark.png">
   <img alt="Temps 邮件服务商 —— SMTP、Scaleway 和 AWS SES" src="assets/screenshots/email-light.png">
+</picture>
+
+### AI 沙箱 —— 隔离的代码执行
+
+通过 CLI、REST API 或 SDK 为智能体任务、测试和一次性命令启动隔离沙箱 —— 兼容 Vercel Sandbox 的 API，后端可选 Docker 或 Firecracker 微虚拟机。这正是你原本要为 E2B 或 Daytona 付费的能力。
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/sandboxes-dark.png">
+  <img alt="Temps 沙箱 —— 通过 CLI、REST API 或 SDK 创建隔离沙箱" src="assets/screenshots/sandboxes-light.png">
 </picture>
 
 ### 一个仪表盘掌握全局
@@ -137,6 +146,7 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 | 可用性监控 | Better Uptime / Pingdom（$20+/月） |
 | 托管 Postgres/Redis/S3 | AWS RDS / ElastiCache（$50+/月） |
 | 事务性邮件 + DKIM | Resend / SendGrid（$20-100/月） |
+| AI 代码执行沙箱 | E2B / Daytona / Vercel Sandbox（$150+/月 + 用量） |
 | 请求日志 + 代理 | Cloudflare（$0-200/月） |
 | **使用 Temps 的总成本** | **$0（自托管）** |
 
@@ -151,20 +161,21 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 | Git push 即部署 | 是 | 是 | 是 | 否 | 是 | 是 | 是 |
 | 预览部署 | 是 | 是 | 是 | 否 | 是 | 是 | 是 |
 | 自动 TLS（HTTP-01 + DNS-01） | 是 | 是 | 是 | 是 | 是 | 是 | 是 |
-| Docker Compose 支持 | 否 | 是 | 是 | 否 | -- | -- | -- |
+| Docker Compose 支持 | 是 | 是 | 是 | 否 | -- | -- | -- |
 | 一键模板库 | 否 | 280+ | 是 | 否 | 是 | 是 | 是 |
 | 网站分析 | 是 | 否 | 否 | 否 | 否 | 否 | 付费插件 |
 | 会话回放 | 是 | 否 | 否 | 否 | 否 | 否 | 否 |
 | 错误追踪（兼容 Sentry） | 是 | 否 | 否 | 否 | 否 | 否 | 否 |
 | 可用性监控 | 是 | 否 | 否 | 否 | 否 | 否 | 否 |
 | 事务性邮件 + DKIM | 是 | 否 | 否 | 否 | 否 | 否 | 否 |
+| 代码执行沙箱（API） | 是 | 否 | 否 | 否 | 否 | 否 | Sandbox（按用量计费） |
 | 托管 Postgres / Redis | 是 | 是 | 是 | 否 | 是 | 是 | 合作方插件 |
 | S3 兼容存储 | 是 | 否 | 否 | 否 | 否 | 否 | Blob（付费） |
 | 多节点 / 集群 | 是 | 是 | Swarm | 是 | 平台托管 | 平台托管 | 平台托管 |
 | 边缘函数 / 全球边缘网络 | 否 | 否 | 否 | 否 | 否 | 否 | 是 |
 | 按席位收费 | 否 | 否 | 否 | 否 | $20/用户（Pro） | 按用户 | $20/席位（Pro） |
 
-**这些替代方案的优势所在。** Coolify 和 Dokploy 拥有一流的 Docker Compose 支持和一键模板库（Coolify 上有 280+ 应用），这些 Temps 目前还没有；而且两者的社区规模远大于 Temps —— 仅 Coolify 就有 56k+ GitHub star，Temps 则是这份列表中最年轻的项目。如果你只需要通过 CLI 驱动的零停机 Docker 部署，Kamal 是更简单的选择。Vercel 和其他托管平台提供全球边缘网络、边缘函数和 DDoS 吸收能力，这些是单台 VPS 无法企及的 —— 而且它们替你运维基础设施，如果你完全不想操心服务器，这是实实在在的价值。
+**这些替代方案的优势所在。** Coolify 和 Dokploy 拥有一键模板库（Coolify 上有 280+ 应用），这些 Temps 目前还没有；而且两者的社区规模远大于 Temps —— 仅 Coolify 就有 56k+ GitHub star，Temps 则是这份列表中最年轻的项目。如果你只需要通过 CLI 驱动的零停机 Docker 部署，Kamal 是更简单的选择。Vercel 和其他托管平台提供全球边缘网络、边缘函数和 DDoS 吸收能力，这些是单台 VPS 无法企及的 —— 而且它们替你运维基础设施，如果你完全不想操心服务器，这是实实在在的价值。
 
 详细且持续更新的对比：[temps.sh/compare](https://temps.sh/compare)
 

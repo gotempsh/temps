@@ -6,8 +6,8 @@
   <img alt="Temps" src="web/public/logo/temps-logo-dark.png" width="280">
 </picture>
 
-**Die Open-Source-Alternative zu Vercel + Sentry + PostHog + Pingdom.**
-Deployments, Analytics, Session Replay & Error Tracking -- in einem selbst gehosteten Binary.
+**Die Open-Source-Alternative zu Vercel + Sentry + PostHog + Pingdom + Resend + E2B.**
+Deployments, Analytics, Session Replay, Error Tracking, Uptime-Monitoring, Transaktions-E-Mails & KI-Sandboxes -- in einem selbst gehosteten Binary.
 
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 [![GitHub Release](https://img.shields.io/github/v/release/gotempsh/temps)](https://github.com/gotempsh/temps/releases)
@@ -28,11 +28,11 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/create-dark.png">
-  <img alt="Ein neues Projekt in Temps anlegen — ein Repository importieren, mit einem Template starten, eine Git-URL klonen oder ein Docker-Image deployen" src="assets/screenshots/create-light.png">
+  <img alt="Import eines öffentlichen Repositories in Temps — Framework-Presets werden vor dem Deploy automatisch erkannt" src="assets/screenshots/create-light.png">
 </picture>
 
 
-Schluss mit dem Bezahlen für 6 verschiedene SaaS-Tools. Temps ersetzt deine Deployment-Plattform, Analytics, Error-Tracking, Session Replay, Uptime-Monitoring und Transaktions-E-Mails -- alles selbst gehostet, alles in einem Binary.
+Hör auf, für 7 verschiedene SaaS-Tools zu bezahlen. Temps ersetzt deine Deployment-Plattform, Analytics, Error-Tracking, Session Replay, Uptime-Monitoring, Transaktions-E-Mails und KI-Code-Sandboxes -- alles selbst gehostet, alles in einem Binary.
 
 ---
 
@@ -81,6 +81,15 @@ Füge Absender-Domains mit DKIM-Records über die UI hinzu und versende via `@te
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/email-dark.png">
   <img alt="Temps E-Mail-Provider — SMTP, Scaleway und AWS SES" src="assets/screenshots/email-light.png">
+</picture>
+
+### KI-Sandboxes — isolierte Code-Ausführung
+
+Starte isolierte Sandboxes für Agenten-Aufgaben, Tests und einmalige Befehle per CLI, REST-API oder SDK — eine zu Vercel Sandbox kompatible API mit Docker- oder Firecracker-microVM-Backend. Genau das, wofür du sonst E2B oder Daytona bezahlst.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/sandboxes-dark.png">
+  <img alt="Temps-Sandboxes — isolierte Sandboxes per CLI, REST-API oder SDK erstellen" src="assets/screenshots/sandboxes-light.png">
 </picture>
 
 ### Alles in einem Dashboard
@@ -137,6 +146,7 @@ Du willst keinen Server verwalten? [Temps Cloud](https://temps.sh/pricing) betre
 | Uptime-Monitoring | Better Uptime / Pingdom ($20+/Monat) |
 | Managed Postgres/Redis/S3 | AWS RDS / ElastiCache ($50+/Monat) |
 | Transaktions-E-Mails + DKIM | Resend / SendGrid ($20-100/Monat) |
+| KI-Code-Sandboxes | E2B / Daytona / Vercel Sandbox ($150+/Monat + Nutzung) |
 | Request-Logs + Proxy | Cloudflare ($0-200/Monat) |
 | **Gesamt mit Temps** | **$0 (selbst gehostet)** |
 
@@ -151,20 +161,21 @@ Du willst keinen Server verwalten? [Temps Cloud](https://temps.sh/pricing) betre
 | Git-Push-Deploy | Ja | Ja | Ja | Nein | Ja | Ja | Ja |
 | Preview-Deployments | Ja | Ja | Ja | Nein | Ja | Ja | Ja |
 | Auto-TLS (HTTP-01 + DNS-01) | Ja | Ja | Ja | Ja | Ja | Ja | Ja |
-| Docker-Compose-Unterstützung | Nein | Ja | Ja | Nein | -- | -- | -- |
+| Docker-Compose-Unterstützung | Ja | Ja | Ja | Nein | -- | -- | -- |
 | One-Click-Template-Bibliothek | Nein | 280+ | Ja | Nein | Ja | Ja | Ja |
 | Web-Analytics | Ja | Nein | Nein | Nein | Nein | Nein | Kostenpflichtiges Add-on |
 | Session Replay | Ja | Nein | Nein | Nein | Nein | Nein | Nein |
 | Error-Tracking (Sentry-kompatibel) | Ja | Nein | Nein | Nein | Nein | Nein | Nein |
 | Uptime-Monitoring | Ja | Nein | Nein | Nein | Nein | Nein | Nein |
 | Transaktions-E-Mails + DKIM | Ja | Nein | Nein | Nein | Nein | Nein | Nein |
+| Code-Sandboxes (API) | Ja | Nein | Nein | Nein | Nein | Nein | Sandbox (nutzungsbasiert) |
 | Managed Postgres / Redis | Ja | Ja | Ja | Nein | Ja | Ja | Partner-Add-ons |
 | S3-kompatibler Speicher | Ja | Nein | Nein | Nein | Nein | Nein | Blob (kostenpflichtig) |
 | Multi-Node / Clustering | Ja | Ja | Swarm | Ja | Managed | Managed | Managed |
 | Edge Functions / globales Edge-Netzwerk | Nein | Nein | Nein | Nein | Nein | Nein | Ja |
 | Gebühren pro Nutzer | Nein | Nein | Nein | Nein | $20/Nutzer (Pro) | Pro Nutzer | $20/Seat (Pro) |
 
-**Wo die Alternativen punkten.** Coolify und Dokploy bieten erstklassige Docker-Compose-Unterstützung und One-Click-Template-Bibliotheken (280+ Apps bei Coolify), die Temps noch nicht hat, und beide haben deutlich größere Communities — allein Coolify zählt über 56k GitHub-Sterne, während Temps das jüngste Projekt auf dieser Liste ist. Kamal ist die einfachere Wahl, wenn du nur Zero-Downtime-Docker-Deploys per CLI willst. Vercel und die anderen Managed-Plattformen bieten dir ein globales Edge-Netzwerk, Edge Functions und DDoS-Absorption, mit denen ein einzelner VPS nicht mithalten kann — und sie betreiben die Infrastruktur für dich, was echten Mehrwert bedeutet, wenn du dich nie um einen Server kümmern willst.
+**Wo die Alternativen punkten.** Coolify und Dokploy bieten One-Click-Template-Bibliotheken (280+ Apps bei Coolify), die Temps noch nicht hat, und beide haben deutlich größere Communities — allein Coolify zählt über 56k GitHub-Sterne, während Temps das jüngste Projekt auf dieser Liste ist. Kamal ist die einfachere Wahl, wenn du nur Zero-Downtime-Docker-Deploys per CLI willst. Vercel und die anderen Managed-Plattformen bieten dir ein globales Edge-Netzwerk, Edge Functions und DDoS-Absorption, mit denen ein einzelner VPS nicht mithalten kann — und sie betreiben die Infrastruktur für dich, was echten Mehrwert bedeutet, wenn du dich nie um einen Server kümmern willst.
 
 Ausführliche, regelmäßig aktualisierte Vergleiche: [temps.sh/compare](https://temps.sh/compare)
 

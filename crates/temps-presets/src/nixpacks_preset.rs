@@ -145,6 +145,35 @@ impl NixpacksProvider {
         }
     }
 
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::Auto => "Auto-detects your language and framework from the repository",
+            Self::Node => "Node.js apps — Nuxt, Vue, SvelteKit, Astro, Remix, Express, and more",
+            Self::Python => "Python web applications (Django, Flask, FastAPI, etc.)",
+            Self::Rust => "Rust web applications and services",
+            Self::Go => "Go web applications and services",
+            Self::Java => "Java web applications (Spring Boot, Micronaut, Quarkus, etc.)",
+            Self::Php => "PHP applications — Laravel, Symfony, and more",
+            Self::Ruby => "Ruby applications — Ruby on Rails and more",
+            Self::Deno => "Deno applications and services",
+            Self::Elixir => "Elixir applications — Phoenix and more",
+            Self::CSharp => "C# / .NET applications and services",
+            Self::FSharp => "F# / .NET applications and services",
+            Self::Dart => "Dart applications and services",
+            Self::Swift => "Swift applications and services",
+            Self::Zig => "Zig applications and services",
+            Self::Scala => "Scala applications and services",
+            Self::Haskell => "Haskell applications and services",
+            Self::Clojure => "Clojure applications and services",
+            Self::Crystal => "Crystal applications and services",
+            Self::Cobol => "COBOL applications and services",
+            Self::Gleam => "Gleam applications and services",
+            Self::Lunatic => "Lunatic applications and services",
+            Self::Scheme => "Scheme applications and services",
+            Self::Static => "Pre-built static files, no build step",
+        }
+    }
+
     /// Get all available provider variants
     pub fn all() -> Vec<Self> {
         vec![
@@ -554,6 +583,10 @@ impl Preset for NixpacksPreset {
 
     fn icon_url(&self) -> String {
         self.provider.icon_url().to_string()
+    }
+
+    fn description(&self) -> String {
+        self.provider.description().to_string()
     }
 
     async fn dockerfile(&self, config: DockerfileConfig<'_>) -> DockerfileWithArgs {

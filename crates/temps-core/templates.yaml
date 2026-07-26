@@ -16,6 +16,8 @@ templates:
   - slug: observability-starter
     name: Observability Starter
     description: Cadence — a mock revenue-analytics SaaS pre-wired with analytics, error tracking, distributed tracing, and a Postgres database. Hit Simulate to watch the funnel fill Temps in one deploy.
+    # Screenshot of a real running instance, served from web/public/templates/.
+    screenshot_url: /templates/observability-starter.png
     git:
       url: https://github.com/gotempsh/temps-examples.git
       ref: main
@@ -69,6 +71,7 @@ templates:
   - slug: nextjs-saas-starter
     name: Next.js SaaS Starter
     description: A complete SaaS starter kit with authentication, billing, and database integration
+    screenshot_url: /templates/nextjs-saas-starter.png
     git:
       url: https://github.com/gotempsh/temps-examples.git
       ref: main
@@ -117,6 +120,7 @@ templates:
   - slug: nextjs-docs-template
     name: Next.js Docs Template
     description: A modern documentation site template with syntax highlighting, dark mode, and responsive design
+    screenshot_url: /templates/nextjs-docs-template.png
     git:
       url: https://github.com/gotempsh/temps-examples.git
       ref: main
