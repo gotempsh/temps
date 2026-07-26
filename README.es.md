@@ -6,8 +6,8 @@
   <img alt="Temps" src="web/public/logo/temps-logo-dark.png" width="280">
 </picture>
 
-### La plataforma de despliegue open source y autoalojada.
-### Despliega, observa y escala -- desde un único binario.
+### La alternativa open source a Vercel + Sentry + PostHog + Pingdom.
+### Despliegues, analítica, session replay y error tracking -- en un único binario autoalojado.
 
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 [![GitHub Release](https://img.shields.io/github/v/release/gotempsh/temps)](https://github.com/gotempsh/temps/releases)
@@ -23,7 +23,7 @@
 ---
 
 <p align="center">
-  <img src="temps-demo.gif" alt="Temps — de un servidor vacío a desplegado en menos de 3 minutos" width="800" />
+  <img src="assets/temps-demo.gif" alt="Temps — de un servidor vacío a desplegado en menos de 3 minutos" width="800" />
   <br />
   <em>De un servidor vacío a todo desplegado — en menos de 3 minutos (166 s).</em>
 </p>

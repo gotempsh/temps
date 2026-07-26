@@ -6,8 +6,8 @@
   <img alt="Temps" src="web/public/logo/temps-logo-dark.png" width="280">
 </picture>
 
-### The open-source, self-hosted deployment platform.
-### Deploy, observe, and scale -- from a single binary.
+### The open-source alternative to Vercel + Sentry + PostHog + Pingdom.
+### Deployments, analytics, session replay & error tracking -- one self-hosted binary.
 
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 [![GitHub Release](https://img.shields.io/github/v/release/gotempsh/temps)](https://github.com/gotempsh/temps/releases)
@@ -23,7 +23,7 @@ English | [简体中文](README.zh-CN.md) | [Español](README.es.md) | [Françai
 ---
 
 <p align="center">
-  <img src="temps-demo.gif" alt="Temps — from bare server to deployed in under 3 minutes" width="800" />
+  <img src="assets/temps-demo.gif" alt="Temps — from bare server to deployed in under 3 minutes" width="800" />
   <br />
   <em>From bare server to fully deployed — in under 3 minutes (166s).</em>
 </p>

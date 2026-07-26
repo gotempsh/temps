@@ -6,8 +6,8 @@
   <img alt="Temps" src="web/public/logo/temps-logo-dark.png" width="280">
 </picture>
 
-### 开源、可自托管的部署平台。
-### 部署、观测、扩展 —— 一个二进制文件搞定。
+### Vercel + Sentry + PostHog + Pingdom 的开源替代品。
+### 部署、分析、会话回放、错误追踪 —— 一个自托管的二进制文件搞定。
 
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 [![GitHub Release](https://img.shields.io/github/v/release/gotempsh/temps)](https://github.com/gotempsh/temps/releases)
@@ -23,7 +23,7 @@
 ---
 
 <p align="center">
-  <img src="temps-demo.gif" alt="Temps —— 从裸服务器到完成部署，不到 3 分钟" width="800" />
+  <img src="assets/temps-demo.gif" alt="Temps —— 从裸服务器到完成部署，不到 3 分钟" width="800" />
   <br />
   <em>从裸服务器到完成部署 —— 不到 3 分钟（166 秒）。</em>
 </p>
