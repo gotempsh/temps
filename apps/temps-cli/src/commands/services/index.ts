@@ -32,6 +32,7 @@ import { newline, header, icons, json, colors, success, info, warning, keyValue 
 const SERVICE_TYPE_LABELS: Record<ServiceTypeRoute, string> = {
   postgres: 'PostgreSQL',
   mongodb: 'MongoDB',
+  mariadb: 'MariaDB',
   redis: 'Redis',
   s3: 'MinIO (S3)',
   kv: 'KV',
