@@ -5373,6 +5373,84 @@ impl GitProviderManagerTrait for GitProviderManager {
 }
 
 #[cfg(test)]
+mod classify_provider_response_error_tests {
+    use super::*;
+
+    /// A provider 401 MUST become `AuthenticationFailed`, not `ApiError`.
+    /// `is_authentication_error` keys off this variant to drive the token
+    /// force-refresh-and-retry, and the HTTP layer maps it to 401 +
+    /// `errors/authentication_failed` so clients can say "reconnect this
+    /// account" instead of "the provider is down".
+    #[test]
+    fn unauthorized_is_classified_as_authentication_failure() {
+        let err = GitProviderManager::classify_provider_response_error(
+            reqwest::StatusCode::UNAUTHORIZED,
+            "get tree for owner/repo@main",
+        );
+        assert!(
+            matches!(err, GitProviderError::AuthenticationFailed(_)),
+            "401 must map to AuthenticationFailed, got {err:?}"
+        );
+    }
+
+    /// 403 is the other shape a revoked/insufficient credential takes
+    /// (GitHub returns it for token scope problems and some rate limits).
+    #[test]
+    fn forbidden_is_classified_as_authentication_failure() {
+        let err = GitProviderManager::classify_provider_response_error(
+            reqwest::StatusCode::FORBIDDEN,
+            "get tree for owner/repo@main",
+        );
+        assert!(
+            matches!(err, GitProviderError::AuthenticationFailed(_)),
+            "403 must map to AuthenticationFailed, got {err:?}"
+        );
+    }
+
+    /// Everything else stays a generic API error — a provider outage is not
+    /// a credential problem and must not tell the user to reconnect.
+    #[test]
+    fn server_error_stays_a_generic_api_error() {
+        let err = GitProviderManager::classify_provider_response_error(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "get tree for owner/repo@main",
+        );
+        assert!(
+            matches!(err, GitProviderError::ApiError(_)),
+            "500 must stay ApiError, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn not_found_stays_a_generic_api_error() {
+        let err = GitProviderManager::classify_provider_response_error(
+            reqwest::StatusCode::NOT_FOUND,
+            "get tree for owner/repo@main",
+        );
+        assert!(matches!(err, GitProviderError::ApiError(_)));
+    }
+
+    /// The operation and status must survive into the message — these errors
+    /// are the only breadcrumb when a self-hosted user debugs alone.
+    #[test]
+    fn message_names_the_operation_and_status() {
+        let err = GitProviderManager::classify_provider_response_error(
+            reqwest::StatusCode::UNAUTHORIZED,
+            "get tree for gotempsh/temps-examples@main",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("gotempsh/temps-examples@main"),
+            "message should name the operation: {msg}"
+        );
+        assert!(
+            msg.contains("401"),
+            "message should carry the status: {msg}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use sea_orm::{ActiveModelTrait, Set};
