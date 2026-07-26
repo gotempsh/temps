@@ -36,6 +36,11 @@ import { Switch } from '@/components/ui/switch'
 import GithubIcon from '@/icons/Github'
 import GitlabIcon from '@/icons/Gitlab'
 import { cn } from '@/lib/utils'
+import {
+  normalizePresetPath,
+  presetSelectionKey,
+  splitPresetSelection,
+} from '@/lib/preset-selection'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   Check,
@@ -633,22 +638,9 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
                       return `${project.preset}::${norm}`
                     })()}
                     onSelectPreset={async (value) => {
-                      if (value === 'custom') {
-                        await saveGitField({
-                          preset: 'custom',
-                          directory: './',
-                        })
-                      } else {
-                        const [name, path] = value.split('::')
-                        const dir =
-                          path &&
-                          path !== 'root' &&
-                          path !== '.' &&
-                          path.trim() !== ''
-                            ? `./${path.startsWith('./') ? path.slice(2) : path}`
-                            : './'
-                        await saveGitField({ preset: name, directory: dir })
-                      }
+                      const { preset: slug, directory: dir } =
+                        splitPresetSelection(value)
+                      await saveGitField({ preset: slug, directory: dir })
                       toast.success('Framework updated')
                       close()
                     }}
@@ -1231,7 +1223,23 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
     name: string
   } | null>(null)
   const [directory, setDirectory] = useState(project.directory || './')
-  const [preset, setPreset] = useState<string>(project.preset || '')
+  // Holds the selector's composite `slug::path` key, not a bare slug — a
+  // monorepo can expose the same preset at several paths, and a bare slug
+  // makes every card sharing it render as selected. Split via
+  // `splitPresetSelection` before sending to the API.
+  const [preset, setPreset] = useState<string>(
+    presetSelectionKey(project.preset, project.directory)
+  )
+
+  /**
+   * Adopt a selection from the framework selector. The chosen card's path *is*
+   * the root directory to build from, so both move together — otherwise the
+   * directory input keeps a stale value from whatever was selected before.
+   */
+  const selectPreset = (value: string) => {
+    setPreset(value)
+    setDirectory(splitPresetSelection(value).directory)
+  }
 
   // Detect frameworks/presets for the chosen connected repo.
   const presetQuery = useQuery({
@@ -1241,10 +1249,22 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
     enabled: mode === 'connection' && !!(selectedRepo as { id?: number })?.id,
   })
   useEffect(() => {
-    const detected = (
-      presetQuery.data as { presets?: { preset: string }[] } | undefined
-    )?.presets?.[0]?.preset
-    if (detected) setPreset(detected)
+    const detectedList =
+      (
+        presetQuery.data as
+          { presets?: { preset: string; path?: string }[] } | undefined
+      )?.presets ?? []
+    if (!detectedList.length) return
+    // Prefer the detected entry that sits at the directory already configured,
+    // so auto-detection doesn't silently relocate the build directory to
+    // whichever preset happened to be found first. Fall back to the first.
+    const currentPath = normalizePresetPath(directory)
+    const detected =
+      detectedList.find((p) => normalizePresetPath(p.path) === currentPath) ??
+      detectedList[0]
+    // Carry the detected path into the key. Storing just the slug here was
+    // why auto-detected presets highlighted every card with that slug.
+    selectPreset(presetSelectionKey(detected.preset, detected.path))
   }, [presetQuery.data])
 
   const back = () => navigate(`/projects/${project.slug}/git`)
@@ -1262,7 +1282,10 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
       repo_owner: repoToConnect.owner,
       repo_name: repoToConnect.name,
       directory: directory || './',
-      preset: preset || project.preset || 'custom',
+      // The selector's value is a `slug::path` key; the API takes the slug
+      // only. Submitting the key verbatim was rejected as "Unknown preset:
+      // dockerfile::examples/go-error-tracking".
+      preset: splitPresetSelection(preset).preset || project.preset || 'custom',
       main_branch:
         (selectedRepo as { default_branch?: string })?.default_branch ||
         project.main_branch ||
@@ -1419,7 +1442,7 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
                 isLoading={presetQuery.isLoading}
                 error={presetQuery.error}
                 selectedPreset={preset}
-                onSelectPreset={setPreset}
+                onSelectPreset={selectPreset}
               />
             </div>
             <div className="space-y-2">
