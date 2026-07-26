@@ -1,7 +1,7 @@
 import { Button } from '@/components/ui/button'
 import { useQuery } from '@tanstack/react-query'
 import { Check, ExternalLink, Loader2, Wand2 } from 'lucide-react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import {
   getRunOptions,
   latestRunForSourceOptions,

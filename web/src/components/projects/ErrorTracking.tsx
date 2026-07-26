@@ -56,7 +56,7 @@ import {
   TrendingUp,
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
-import { useNavigate, useSearchParams } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
 import { TimeAgo } from '../utils/TimeAgo'
 import { CopyButton } from '../ui/copy-button'

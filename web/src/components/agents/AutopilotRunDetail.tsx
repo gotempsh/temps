@@ -27,7 +27,7 @@ import {
   Terminal,
   Webhook,
 } from 'lucide-react'
-import { Link, useNavigate, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams } from 'react-router'
 import {
   getErrorGroupOptions,
   getRunWithLogsOptions,

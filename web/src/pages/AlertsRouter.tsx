@@ -1,4 +1,4 @@
-import { Routes, Route } from 'react-router-dom'
+import { Routes, Route } from 'react-router'
 import { ProjectResponse } from '@/api/client'
 import MetricAlerts from './MetricAlerts'
 import MetricAlertForm from './MetricAlertForm'

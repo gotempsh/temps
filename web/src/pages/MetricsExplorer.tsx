@@ -73,7 +73,7 @@ import {
   CollapsibleTrigger,
 } from '@/components/ui/collapsible'
 import { useEffect, useMemo, useState } from 'react'
-import { useSearchParams } from 'react-router-dom'
+import { useSearchParams } from 'react-router'
 
 interface MetricsExplorerProps {
   project: ProjectResponse

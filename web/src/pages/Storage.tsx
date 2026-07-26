@@ -34,7 +34,7 @@ import {
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useEffect, useState } from 'react'
-import { useNavigate, useSearchParams } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 
 export function Storage() {

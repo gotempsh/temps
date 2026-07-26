@@ -40,7 +40,7 @@ import {
   Trash2,
 } from 'lucide-react'
 import { useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import { StatusDot } from '@/components/metrics/alert-format'
 import {

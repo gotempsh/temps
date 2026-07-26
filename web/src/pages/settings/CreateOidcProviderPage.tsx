@@ -25,7 +25,7 @@ import { usePageTitle } from '@/hooks/usePageTitle'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { ArrowLeft } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 
 function createFormToRequest(form: OidcProviderFormValues) {

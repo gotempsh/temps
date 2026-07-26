@@ -12,7 +12,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { useQuery } from '@tanstack/react-query'
 import { Wand2 } from 'lucide-react'
 import { useState } from 'react'
-import { Navigate, useParams } from 'react-router-dom'
+import { Navigate, useParams } from 'react-router'
 
 interface AutofixRedirectProps {
   project: ProjectResponse

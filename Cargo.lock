@@ -2248,7 +2248,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_urlencoded",
- "serde_with 3.20.0",
+ "serde_with 3.21.0",
  "thiserror 2.0.18",
  "url",
  "urlencoding",
@@ -2266,7 +2266,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_urlencoded",
- "serde_with 3.20.0",
+ "serde_with 3.21.0",
  "thiserror 2.0.18",
  "url",
  "urlencoding",
@@ -4220,6 +4220,10 @@ name = "hashbrown"
 version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
+dependencies = [
+ "ahash 0.8.12",
+ "allocator-api2",
+]
 
 [[package]]
 name = "hashbrown"
@@ -4735,7 +4739,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.57.0",
 ]
 
 [[package]]
@@ -6100,7 +6104,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_bytes",
- "serde_with 3.20.0",
+ "serde_with 3.21.0",
  "sha1 0.11.0",
  "sha2 0.11.0",
  "socket2 0.6.3",
@@ -6827,7 +6831,7 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "serde_plain",
- "serde_with 3.20.0",
+ "serde_with 3.21.0",
  "sha2 0.10.9",
  "subtle",
  "thiserror 1.0.69",
@@ -7514,7 +7518,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6705a26ad89d241a989a5395641931ba37076f5ab5fbd19ee92402414a43af32"
 dependencies = [
  "arrayvec",
- "hashbrown 0.12.3",
+ "hashbrown 0.14.5",
  "parking_lot",
  "rand 0.8.6",
 ]
@@ -9690,9 +9694,9 @@ dependencies = [
 
 [[package]]
 name = "serde_with"
-version = "3.20.0"
+version = "3.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e72c1c2cb7b223fafb600a619537a871c2818583d619401b785e7c0b746ccde2"
+checksum = "76a5c54c7310e7b8b9577c286d7e399ddd876c3e12b3ed917a8aabc4b96e9e8c"
 dependencies = [
  "base64 0.22.1",
  "bs58",
@@ -9704,7 +9708,7 @@ dependencies = [
  "schemars 1.2.1",
  "serde_core",
  "serde_json",
- "serde_with_macros 3.20.0",
+ "serde_with_macros 3.21.0",
  "time",
 ]
 
@@ -9722,9 +9726,9 @@ dependencies = [
 
 [[package]]
 name = "serde_with_macros"
-version = "3.20.0"
+version = "3.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b90c488738ecb4fb0262f41f43bc40efc5868d9fb744319ddf5f5317f417bfac"
+checksum = "84d57bc0c8b9a17920c178daa6bb924850d54a9c97ab45194bb8c17ad66bb660"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",
@@ -13281,7 +13285,7 @@ dependencies = [
  "reqwest 0.13.4",
  "serde",
  "serde_json",
- "serde_with 3.20.0",
+ "serde_with 3.21.0",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",

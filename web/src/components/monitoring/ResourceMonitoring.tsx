@@ -40,7 +40,7 @@ import {
   XCircle,
   HelpCircle,
 } from 'lucide-react'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 import { cn } from '@/lib/utils'
 
 // ── Chart configs ────────────────────────────────────────────────────

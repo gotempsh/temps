@@ -32,7 +32,7 @@ import {
   Search,
 } from 'lucide-react'
 import * as React from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 
 interface AiAgentsDetailProps {
   project: ProjectResponse

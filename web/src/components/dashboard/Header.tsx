@@ -18,7 +18,7 @@ import {
   Plus,
 } from 'lucide-react'
 import React, { useMemo, useState } from 'react'
-import { Link, useLocation, useNavigate } from 'react-router-dom'
+import { Link, useLocation, useNavigate } from 'react-router'
 import {
   Breadcrumb,
   BreadcrumbItem,

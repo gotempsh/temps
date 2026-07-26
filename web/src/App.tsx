@@ -17,7 +17,7 @@ import {
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Loader2 } from 'lucide-react'
 import { lazy, Suspense, useEffect } from 'react'
-import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
+import { BrowserRouter, Navigate, Route, Routes } from 'react-router'
 import { toast, Toaster } from 'sonner'
 import { ProblemDetails } from './api/client'
 import { client } from './api/client/client.gen'

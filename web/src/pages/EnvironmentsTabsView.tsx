@@ -5,7 +5,7 @@ import {
 import { Skeleton } from '@/components/ui/skeleton'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { useState } from 'react'
-import { Route, Routes } from 'react-router-dom'
+import { Route, Routes } from 'react-router'
 import { EnvironmentDashboard } from './EnvironmentDashboard'
 import { ContainerDetailPage } from './ContainerDetailPage'
 import { ProjectResponse } from '@/api/client'

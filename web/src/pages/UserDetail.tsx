@@ -35,7 +35,7 @@ import {
   Shield,
 } from 'lucide-react'
 import { ReactNode, useEffect, useMemo, useState } from 'react'
-import { Link, useNavigate, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams } from 'react-router'
 
 const ITEMS_PER_PAGE = 20
 const STATS_WINDOW_MS = 30 * 24 * 60 * 60 * 1000

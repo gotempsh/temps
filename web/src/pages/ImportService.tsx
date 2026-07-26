@@ -34,7 +34,7 @@ import { customAlphabet } from 'nanoid'
 import { getServiceTypeWithFallback } from '@/lib/service-type-detector'
 import { useEffect, useMemo, useState } from 'react'
 import { useForm } from 'react-hook-form'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import * as z from 'zod'
 

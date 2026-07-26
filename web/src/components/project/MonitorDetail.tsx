@@ -38,7 +38,7 @@ import {
   TrendingUp,
 } from 'lucide-react'
 import { useMemo, useState, useRef } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { Link, useParams } from 'react-router'
 import { format, subDays } from 'date-fns'
 import { DateRange } from 'react-day-picker'
 import { cn } from '@/lib/utils'
