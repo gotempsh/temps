@@ -58,6 +58,43 @@ fn check_session_ownership(
     Ok(())
 }
 
+/// Text to substitute for any secret value returned to a client. Matches the
+/// `***` convention used everywhere else in the codebase (API keys, tokens).
+const MASKED_SECRET: &str = "***";
+
+/// Redact secrets out of a plan before it leaves the process as an HTTP
+/// response — `CreatePlanResponse`/`ImportStatusResponse` return the whole
+/// plan, and a plan built from a real platform carries the source
+/// database's connection URL (with its password) and every captured env
+/// var, `is_secret` ones included. The plan kept in the in-memory session
+/// (used to actually run the import) is a separate clone and is untouched.
+fn mask_plan_secrets(plan: &ImportPlan) -> ImportPlan {
+    let mut masked = plan.clone();
+
+    for service in &mut masked.services {
+        if let Some(source_url) = service
+            .parameters
+            .get_mut(super::resource_executor::SOURCE_URL_PARAM)
+        {
+            *source_url = serde_json::json!(MASKED_SECRET);
+        }
+    }
+
+    let mask_env_vars = |deployment: &mut temps_import_types::plan::DeploymentConfiguration| {
+        for env_var in &mut deployment.env_vars {
+            if env_var.is_secret {
+                env_var.value = MASKED_SECRET.to_string();
+            }
+        }
+    };
+    mask_env_vars(&mut masked.deployment);
+    for deployment in &mut masked.additional_deployments {
+        mask_env_vars(deployment);
+    }
+
+    masked
+}
+
 /// Import orchestrator coordinating all import operations
 pub struct ImportOrchestrator {
     db: Arc<DatabaseConnection>,
@@ -391,9 +428,13 @@ impl ImportOrchestrator {
             validation.can_proceed()
         );
 
+        // The session keeps the real, unmasked plan above (it's what
+        // execute_import reads to actually connect to the source database
+        // and inject env vars) — the response the client sees is a
+        // separately masked copy.
         Ok(CreatePlanResponse {
             session_id,
-            plan,
+            plan: mask_plan_secrets(&plan),
             validation: validation.clone(),
             can_execute: validation.can_proceed(),
         })
@@ -667,7 +708,7 @@ impl ImportOrchestrator {
         Ok(ImportStatusResponse {
             session_id: session_id.to_string(),
             status: ImportExecutionStatus::Pending,
-            plan: Some(session.plan),
+            plan: Some(mask_plan_secrets(&session.plan)),
             validation: Some(session.validation),
             project_id: None,
             environment_id: None,
@@ -821,6 +862,66 @@ mod tests {
             "a non-owner must see the same 'not found' error a truly missing \
              session would produce — never a distinct 'forbidden' response \
              that would confirm the session id exists"
+        );
+    }
+
+    #[test]
+    fn mask_plan_secrets_redacts_source_url_and_secret_env_vars_only() {
+        let mut plan = create_test_plan();
+        plan.services.push(ServicePlan {
+            name: "lab-db".to_string(),
+            service_type: "postgres".to_string(),
+            version: Some("16".to_string()),
+            parameters: HashMap::from([
+                (
+                    crate::services::resource_executor::SOURCE_URL_PARAM.to_string(),
+                    serde_json::json!("postgres://lab:hunter2@1.2.3.4:5432/labdb"),
+                ),
+                ("database".to_string(), serde_json::json!("labdb")),
+            ]),
+            env_var_mappings: HashMap::new(),
+            action: ServiceAction::Create,
+            action_description: "Create a new managed service".to_string(),
+            data_implications: vec![],
+        });
+        plan.deployment.env_vars = vec![
+            EnvironmentVariable {
+                key: "DATABASE_URL".to_string(),
+                value: "postgres://lab:hunter2@1.2.3.4:5432/labdb".to_string(),
+                is_secret: true,
+                source_description: None,
+            },
+            EnvironmentVariable {
+                key: "PUBLIC_APP_NAME".to_string(),
+                value: "lab-shop".to_string(),
+                is_secret: false,
+                source_description: None,
+            },
+        ];
+
+        let masked = mask_plan_secrets(&plan);
+
+        let masked_param = masked.services[0]
+            .parameters
+            .get(crate::services::resource_executor::SOURCE_URL_PARAM)
+            .unwrap();
+        assert_eq!(masked_param, &serde_json::json!(MASKED_SECRET));
+        assert_eq!(
+            masked.services[0].parameters.get("database").unwrap(),
+            &serde_json::json!("labdb"),
+            "non-secret parameters must pass through unchanged"
+        );
+        assert_eq!(masked.deployment.env_vars[0].value, MASKED_SECRET);
+        assert_eq!(
+            masked.deployment.env_vars[1].value, "lab-shop",
+            "non-secret env vars must pass through unchanged"
+        );
+
+        // The original, unmasked plan (what execute_import actually uses)
+        // must be untouched — masking must only ever operate on a copy.
+        assert_eq!(
+            plan.deployment.env_vars[0].value,
+            "postgres://lab:hunter2@1.2.3.4:5432/labdb"
         );
     }
 

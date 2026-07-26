@@ -26,6 +26,7 @@
 use bollard::Docker;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use temps_core::public_hostname::PublicHostnameStrategy;
 use temps_import_types::{CreatedResource, DomainAction, ImportPlan, ServiceAction, StepResult};
 use temps_projects::services::CustomDomainService;
@@ -38,6 +39,18 @@ use tracing::{info, warn};
 /// Key inside `ServicePlan.parameters` holding the reachable source
 /// connection URL (set by the platform importers at plan time).
 pub const SOURCE_URL_PARAM: &str = "source_url";
+
+/// Hard cap on how long a data-transfer container may run. A dump/restore
+/// against an unreachable or very slow source database must not hang a
+/// Tokio worker forever — a few of these on a small (cpx22-class) box would
+/// starve every other import. Real transfers on a reachable database finish
+/// in seconds to minutes; 30 shrinks to a few seconds under `cfg(test)` so
+/// the timeout path itself can be exercised against a real container
+/// without a real 30-minute wait.
+#[cfg(not(test))]
+const TRANSFER_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+#[cfg(test)]
+const TRANSFER_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// A managed service created during import, with everything needed to
 /// populate it and rewrite env vars.
@@ -365,7 +378,7 @@ impl ResourceExecutor {
         use bollard::models::{ContainerCreateBody, HostConfig};
         use bollard::query_parameters::{
             CreateContainerOptionsBuilder, CreateImageOptions, RemoveContainerOptions,
-            StartContainerOptions, WaitContainerOptions,
+            StartContainerOptions,
         };
         use futures_util::StreamExt;
 
@@ -419,38 +432,15 @@ impl ResourceExecutor {
             .await
             .map_err(|e| format!("failed to start transfer container: {}", e))?;
 
-        // Wait for completion (bounded by the container's own runtime)
-        let mut wait = self
-            .docker
-            .wait_container(&container.id, None::<WaitContainerOptions>);
-        // bollard's wait errors on nonzero exit codes with a often-empty
-        // message — treat it as a failed status and let the log tail explain.
-        let status = match wait.next().await {
-            Some(Ok(result)) => result.status_code,
-            Some(Err(bollard::errors::Error::DockerContainerWaitError { code, .. })) => code,
-            Some(Err(e)) => {
-                let logs = self.container_log_tail(&container.id).await;
-                let _ = self
-                    .docker
-                    .remove_container(
-                        &container.id,
-                        Some(RemoveContainerOptions {
-                            force: true,
-                            ..Default::default()
-                        }),
-                    )
-                    .await;
-                return Err(format!(
-                    "transfer container failed: {} — {}",
-                    e,
-                    logs.chars().take(400).collect::<String>()
-                ));
-            }
-            None => -1,
+        // Wait for completion, bounded by TRANSFER_TIMEOUT — an unreachable
+        // or hung source database must not tie up a Tokio worker forever.
+        let status = match wait_for_container(&self.docker, &container.id, TRANSFER_TIMEOUT).await {
+            Ok(status) => status,
+            Err(e) => return Err(e),
         };
 
         // Capture the tail of the logs for the error message before removal
-        let logs = self.container_log_tail(&container.id).await;
+        let logs = container_log_tail(&self.docker, &container.id).await;
         let _ = self
             .docker
             .remove_container(
@@ -471,27 +461,6 @@ impl ResourceExecutor {
                 logs.chars().take(500).collect::<String>()
             ))
         }
-    }
-
-    async fn container_log_tail(&self, container_id: &str) -> String {
-        use bollard::query_parameters::LogsOptionsBuilder;
-        use futures_util::StreamExt;
-
-        let mut stream = self.docker.logs(
-            container_id,
-            Some(
-                LogsOptionsBuilder::new()
-                    .stdout(true)
-                    .stderr(true)
-                    .tail("20")
-                    .build(),
-            ),
-        );
-        let mut output = String::new();
-        while let Some(Ok(chunk)) = stream.next().await {
-            output.push_str(&chunk.to_string());
-        }
-        output
     }
 
     /// Create every `action = Import` domain on the imported environment.
@@ -567,6 +536,85 @@ impl ResourceExecutor {
 
         (steps, resources)
     }
+}
+
+/// Wait for `container_id` to finish, bounded by `timeout`. On success
+/// returns the exit status code. On timeout or a wait-stream error, force-
+/// removes the container and returns a descriptive error including the log
+/// tail — callers must not leak a hung container back to Docker.
+async fn wait_for_container(
+    docker: &Docker,
+    container_id: &str,
+    timeout: Duration,
+) -> Result<i64, String> {
+    use bollard::query_parameters::{RemoveContainerOptions, WaitContainerOptions};
+    use futures_util::StreamExt;
+
+    let mut wait = docker.wait_container(container_id, None::<WaitContainerOptions>);
+    // bollard's wait errors on nonzero exit codes with an often-empty
+    // message — treat it as a failed status and let the log tail explain.
+    match tokio::time::timeout(timeout, wait.next()).await {
+        Ok(Some(Ok(result))) => Ok(result.status_code),
+        Ok(Some(Err(bollard::errors::Error::DockerContainerWaitError { code, .. }))) => Ok(code),
+        Ok(Some(Err(e))) => {
+            let logs = container_log_tail(docker, container_id).await;
+            let _ = docker
+                .remove_container(
+                    container_id,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+            Err(format!(
+                "transfer container failed: {} — {}",
+                e,
+                logs.chars().take(400).collect::<String>()
+            ))
+        }
+        Ok(None) => Ok(-1),
+        Err(_) => {
+            let logs = container_log_tail(docker, container_id).await;
+            let _ = docker
+                .remove_container(
+                    container_id,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+            Err(format!(
+                "transfer timed out after {}s — the source database may be \
+                 unreachable or too slow to respond; check network connectivity \
+                 and consider running the dump/restore manually. Log tail: {}",
+                timeout.as_secs(),
+                logs.chars().take(400).collect::<String>()
+            ))
+        }
+    }
+}
+
+async fn container_log_tail(docker: &Docker, container_id: &str) -> String {
+    use bollard::query_parameters::LogsOptionsBuilder;
+    use futures_util::StreamExt;
+
+    let mut stream = docker.logs(
+        container_id,
+        Some(
+            LogsOptionsBuilder::new()
+                .stdout(true)
+                .stderr(true)
+                .tail("20")
+                .build(),
+        ),
+    );
+    let mut output = String::new();
+    while let Some(Ok(chunk)) = stream.next().await {
+        output.push_str(&chunk.to_string());
+    }
+    output
 }
 
 /// Required creation parameters per service type, derived from the source
@@ -1012,6 +1060,98 @@ mod parameter_tests {
             params.contains_key("port"),
             "redis still needs a stable port"
         );
+    }
+
+    /// Regression test for the "unreachable source DB hangs a Tokio worker
+    /// forever" bug: `wait_container` had no timeout, so a hung dump/restore
+    /// container never returned control. Runs a container that sleeps far
+    /// longer than the bound, confirms `wait_for_container` returns a timeout
+    /// error (not hanging until the sleep finishes) and force-removes the
+    /// container instead of leaking it. Skips gracefully if Docker isn't
+    /// available, per this repo's Docker-test convention.
+    #[tokio::test]
+    async fn wait_for_container_times_out_on_a_hung_container() {
+        use bollard::models::ContainerCreateBody;
+        use bollard::query_parameters::{
+            CreateContainerOptionsBuilder, InspectContainerOptions, RemoveContainerOptions,
+            StartContainerOptions,
+        };
+
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => d,
+            Err(e) => {
+                println!("Docker not available, skipping: {}", e);
+                return;
+            }
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not available, skipping");
+            return;
+        }
+
+        let name = format!(
+            "temps-import-test-hang-{}",
+            &uuid::Uuid::new_v4().to_string()[..8]
+        );
+        let container = docker
+            .create_container(
+                Some(CreateContainerOptionsBuilder::new().name(&name).build()),
+                ContainerCreateBody {
+                    image: Some("busybox:latest".to_string()),
+                    cmd: Some(vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        "sleep 300".to_string(),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create hung-container fixture");
+        docker
+            .start_container(&container.id, None::<StartContainerOptions>)
+            .await
+            .expect("start hung-container fixture");
+
+        let started = std::time::Instant::now();
+        let result = wait_for_container(&docker, &container.id, Duration::from_secs(2)).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            result.is_err(),
+            "a sleeping container must time out, not exit cleanly"
+        );
+        let message = result.unwrap_err();
+        assert!(
+            message.contains("timed out after 2s"),
+            "error should name the bound that fired: {}",
+            message
+        );
+        assert!(
+            elapsed < Duration::from_secs(60),
+            "must return promptly on timeout, not wait for the 300s sleep: took {:?}",
+            elapsed
+        );
+
+        // The container must have been force-removed, not left running.
+        let inspect = docker
+            .inspect_container(&container.id, None::<InspectContainerOptions>)
+            .await;
+        assert!(
+            inspect.is_err(),
+            "timed-out container should have been force-removed, but it still exists"
+        );
+
+        // Best-effort cleanup in case the assertion above ever fails.
+        let _ = docker
+            .remove_container(
+                &container.id,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
     }
 }
 

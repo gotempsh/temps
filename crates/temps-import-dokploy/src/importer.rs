@@ -315,8 +315,8 @@ fn deployment_config(snapshot: &WorkloadSnapshot) -> DeploymentConfiguration {
         vars.into_iter()
             .map(|(key, value)| EnvironmentVariable {
                 key: key.clone(),
+                is_secret: temps_import_types::plan::looks_like_secret_env_key(key),
                 value: value.clone(),
-                is_secret: false,
                 source_description: Some("Dokploy environment variable".to_string()),
             })
             .collect()

@@ -537,6 +537,7 @@ impl KubernetesImporter {
             "sidecar_containers": sidecars,
             "has_pvc": has_pvc,
             "cron_schedule": cron_schedule,
+            "insecure_tls_skip_verify": client.skip_tls_verify(),
         });
 
         Ok(WorkloadSnapshot {
@@ -1285,6 +1286,11 @@ impl KubernetesImporter {
                     .collect()
             })
             .unwrap_or_default();
+        let insecure_tls_skip_verify = snapshot
+            .source_metadata
+            .get("insecure_tls_skip_verify")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         let project = ProjectConfiguration {
             name: project_name.to_string(),
@@ -1759,13 +1765,20 @@ impl KubernetesImporter {
                 2..=4 => PlanComplexity::Medium,
                 _ => PlanComplexity::High,
             },
-            warnings: if extras.observation.is_none() {
-                vec![
-                    "Cluster observation unavailable — plan generated without cost analysis"
-                        .to_string(),
-                ]
-            } else {
-                vec![]
+            warnings: {
+                let mut warnings = Vec::new();
+                if extras.observation.is_none() {
+                    warnings.push(
+                        "Cluster observation unavailable — plan generated without cost analysis"
+                            .to_string(),
+                    );
+                }
+                if insecure_tls_skip_verify {
+                    warnings.push(
+                        "Kubeconfig has insecure-skip-tls-verify set — TLS certificate verification was disabled while connecting to this cluster".to_string(),
+                    );
+                }
+                warnings
             },
         };
 
@@ -2297,6 +2310,45 @@ mod tests {
         assert_eq!(plan.deployment.resources.cpu_limit, Some(1000));
         assert_eq!(plan.deployment.resources.memory_limit, Some(1024));
         assert_eq!(plan.deployment.resources.memory_request, Some(768));
+    }
+
+    /// Regression test: a kubeconfig with `insecure-skip-tls-verify` used to
+    /// only produce a server-side `warn!()` log — the user driving the
+    /// import over the API never saw it. `KubeClient::skip_tls_verify()`
+    /// now flows into the snapshot's `source_metadata` and from there into
+    /// `PlanMetadata.warnings`, so it's visible in the plan response.
+    #[test]
+    fn test_insecure_tls_skip_verify_surfaces_as_plan_warning() {
+        let importer = KubernetesImporter::new();
+        let mut workload = snapshot("api");
+        workload.source_metadata["insecure_tls_skip_verify"] = serde_json::json!(true);
+        let plan = importer.generate_plan(workload).unwrap();
+
+        assert!(
+            plan.metadata
+                .warnings
+                .iter()
+                .any(|w| w.contains("insecure-skip-tls-verify")),
+            "expected an insecure-skip-tls-verify warning, got: {:?}",
+            plan.metadata.warnings
+        );
+    }
+
+    #[test]
+    fn test_tls_verified_snapshot_has_no_insecure_tls_warning() {
+        let importer = KubernetesImporter::new();
+        // The fixture doesn't set insecure_tls_skip_verify, matching a
+        // normal kubeconfig that verifies the cluster's CA.
+        let plan = importer.generate_plan(snapshot("api")).unwrap();
+
+        assert!(
+            !plan
+                .metadata
+                .warnings
+                .iter()
+                .any(|w| w.contains("insecure-skip-tls-verify")),
+            "a verified TLS connection must not carry the insecure-skip-tls-verify warning"
+        );
     }
 
     #[test]

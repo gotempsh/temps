@@ -29,6 +29,7 @@ pub struct KubeClient {
     http: reqwest::Client,
     base: String,
     auth: KubeAuth,
+    skip_tls_verify: bool,
 }
 
 impl KubeClient {
@@ -92,7 +93,15 @@ impl KubeClient {
             http,
             base: config.server.clone(),
             auth: config.auth.clone(),
+            skip_tls_verify: config.skip_tls_verify,
         })
+    }
+
+    /// Whether this client was built with `insecure-skip-tls-verify` set —
+    /// callers surface this to the user rather than leaving it as a
+    /// server-side-only log line.
+    pub fn skip_tls_verify(&self) -> bool {
+        self.skip_tls_verify
     }
 
     fn request(&self, path: &str) -> reqwest::RequestBuilder {

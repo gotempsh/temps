@@ -267,12 +267,7 @@ impl WorkloadImporter for DockerImporter {
             .env
             .iter()
             .map(|(k, v)| {
-                // Heuristic: treat variables with "SECRET", "PASSWORD", "TOKEN", "KEY" as secrets
-                let is_secret = k.to_uppercase().contains("SECRET")
-                    || k.to_uppercase().contains("PASSWORD")
-                    || k.to_uppercase().contains("TOKEN")
-                    || k.to_uppercase().contains("KEY")
-                    || k.to_uppercase().contains("API_KEY");
+                let is_secret = temps_import_types::plan::looks_like_secret_env_key(k);
 
                 EnvironmentVariable {
                     key: k.clone(),

@@ -448,6 +448,22 @@ pub enum DeploymentStrategy {
     Rolling,
 }
 
+/// Heuristic: does this env var key look like it holds a secret value?
+///
+/// Importers that read real env values back from a source platform's API
+/// (Dokploy, Coolify, CapRover, Portainer) must classify every variable
+/// through this before putting it in a plan — an unclassified `is_secret:
+/// false` default would carry passwords and API keys in plaintext into
+/// `POST /imports/plan` and `GET /imports/{session_id}` responses.
+pub fn looks_like_secret_env_key(key: &str) -> bool {
+    let upper = key.to_uppercase();
+    upper.contains("SECRET")
+        || upper.contains("PASSWORD")
+        || upper.contains("TOKEN")
+        || upper.contains("KEY")
+        || upper.contains("API_KEY")
+}
+
 /// Environment variable
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct EnvironmentVariable {
