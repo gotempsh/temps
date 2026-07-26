@@ -1151,8 +1151,14 @@ pub async fn list_presets(RequireAuth(_auth): RequireAuth) -> Result<impl IntoRe
             let project_type = preset.project_type().to_string();
             let default_port = Some(preset.default_port());
 
-            // Generate relative icon URL
-            let icon_url = format!("/presets/{}.svg", slug);
+            // Use the preset's own icon, NOT one derived from the slug.
+            // Deriving it invented filenames that were never shipped —
+            // `docker-compose` resolved to `/presets/docker-compose.svg`
+            // (missing) instead of the `docker.svg` the preset declares, and
+            // every `nixpacks-<lang>` slug pointed at a nonexistent file
+            // rather than the language icon it maps to. Those 404s fell back
+            // to the generic gear in the UI.
+            let icon_url = preset.icon_url();
 
             super::types::PresetResponse {
                 slug,
