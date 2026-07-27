@@ -286,10 +286,16 @@ fn db_to_service_snapshot(db: &CoolifyDatabase) -> ServiceSnapshot {
         name: db.name.clone(),
         service_type,
         version: db.version_from_image(),
-        connection_url: db
-            .reachable_url()
-            .map(|u| u.to_string())
-            .or_else(|| db.internal_db_url.clone()),
+        // Only ever the externally-reachable URL, never `internal_db_url`
+        // (Coolify's own docker-network-internal address) -- that value is
+        // attacker-controlled (comes verbatim from the source platform's
+        // API) and must never reach the dump/restore container, which runs
+        // on the host network. `reachable`/`source_url` below are already
+        // gated on this being `Some`, but keeping a dangerous value out of
+        // this field entirely (matching CapRover/Dokploy/Portainer, none of
+        // which have this fallback) removes the risk for any future
+        // consumer that doesn't know to re-check that gate.
+        connection_url: db.reachable_url().map(|u| u.to_string()),
         env_vars: HashMap::new(),
         has_data: true,
         data_size_bytes: None,
