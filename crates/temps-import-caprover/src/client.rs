@@ -44,7 +44,13 @@ impl CaproverClient {
                 reason: e.to_string(),
             })?;
 
-        let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(30));
+        let mut builder = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            // Never follow redirects: a same-origin redirect to an internal
+            // address (e.g. 169.254.169.254) would bypass the DNS-pinning
+            // above entirely, since resolve_to_addrs only pins the original
+            // hostname -- mirrors temps-webhooks's webhook_client_builder.
+            .redirect(reqwest::redirect::Policy::none());
 
         // `validate_external_url` only rejects literal IPs/localhost -- a
         // domain host could still resolve to an internal address by the time

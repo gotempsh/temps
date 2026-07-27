@@ -82,7 +82,12 @@ impl PortainerClient {
 
         let mut builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
-            .danger_accept_invalid_certs(skip_tls_verify);
+            .danger_accept_invalid_certs(skip_tls_verify)
+            // Never follow redirects: a same-origin redirect to an internal
+            // address (e.g. 169.254.169.254) would bypass the DNS-pinning
+            // below entirely, since resolve_to_addrs only pins the original
+            // hostname -- mirrors temps-webhooks's webhook_client_builder.
+            .redirect(reqwest::redirect::Policy::none());
 
         // `validate_external_url` only rejects literal IPs/localhost -- a
         // domain host could still resolve to an internal address by the time
@@ -270,5 +275,60 @@ impl PortainerClient {
             ),
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A literal public IP as base_url so `from_credentials` never takes the
+    // DNS-resolution branch (no network call happens either way -- building
+    // the client doesn't dial anything, so this is safe to run offline).
+    fn credentials(verify_tls: Option<&str>) -> ImportCredentials {
+        let mut extra = std::collections::HashMap::new();
+        if let Some(v) = verify_tls {
+            extra.insert("verify_tls".to_string(), v.to_string());
+        }
+        ImportCredentials {
+            token: Some("admin-password".to_string()),
+            team_id: None,
+            base_url: Some("https://1.1.1.1:9443".to_string()),
+            extra,
+        }
+    }
+
+    #[tokio::test]
+    async fn tls_verification_is_on_by_default() {
+        let client = PortainerClient::from_credentials(&credentials(None))
+            .await
+            .unwrap();
+        assert!(
+            !client.skip_tls_verify(),
+            "verification must be ON unless the user explicitly opts out"
+        );
+    }
+
+    #[tokio::test]
+    async fn tls_verification_is_skipped_only_with_explicit_opt_out() {
+        let client = PortainerClient::from_credentials(&credentials(Some("false")))
+            .await
+            .unwrap();
+        assert!(client.skip_tls_verify());
+    }
+
+    #[tokio::test]
+    async fn any_other_verify_tls_value_keeps_verification_on() {
+        // Only the literal "false" opts out -- "true", typos, or anything
+        // else must NOT silently disable verification.
+        for value in ["true", "no", "0", ""] {
+            let client = PortainerClient::from_credentials(&credentials(Some(value)))
+                .await
+                .unwrap();
+            assert!(
+                !client.skip_tls_verify(),
+                "verify_tls={value:?} must keep verification on"
+            );
+        }
     }
 }
