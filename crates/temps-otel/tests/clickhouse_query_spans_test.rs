@@ -477,3 +477,50 @@ async fn migration_installs_the_recent_spans_projection() {
          projection outright (error 344):\n{ddl}"
     );
 }
+
+/// The page must never be larger than the caller asked for, even when the table
+/// holds pre-merge duplicates.
+///
+/// `spans` is a ReplacingMergeTree and these reads deliberately do not use
+/// FINAL, so a retried OTLP batch leaves two physical rows for one
+/// (project_id, trace_id, span_id) until the next merge. The two-stage query
+/// caps its SUBQUERY at `limit` identity pairs, but the outer statement then
+/// matches every physical row for those pairs — so without a limit of its own
+/// it can hand back more rows than were requested. The single-stage shape
+/// cannot drift this way because its LIMIT applies to the rows themselves.
+#[tokio::test]
+async fn query_spans_never_returns_more_rows_than_the_limit_despite_duplicates() {
+    let Some((storage, _probe, _c)) = seeded().await else {
+        return;
+    };
+
+    // Re-store the three roots verbatim: same identity, so ReplacingMergeTree
+    // will eventually collapse them, but not before this read.
+    let dupes: Vec<_> = fixture()
+        .into_iter()
+        .filter(|s| s.parent_span_id.is_none() && s.project_id == PROJECT)
+        .collect();
+    assert_eq!(dupes.len(), 3, "fixture should have three roots");
+    storage
+        .store_spans(dupes)
+        .await
+        .expect("store duplicate spans");
+
+    for limit in [1u64, 2, 3] {
+        let spans = storage
+            .query_spans(TraceQuery {
+                project_id: PROJECT,
+                root_only: true,
+                limit: Some(limit),
+                ..Default::default()
+            })
+            .await
+            .expect("limited query");
+
+        assert!(
+            spans.len() as u64 <= limit,
+            "asked for {limit} rows, got {} — duplicates leaked past the page size",
+            spans.len()
+        );
+    }
+}

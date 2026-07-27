@@ -31,8 +31,20 @@
 --     drop FINAL + two-stage, no projection     671 ms   rows_read 158.8M
 --     drop FINAL + two-stage + THIS projection  132 ms   rows_read  24.2M
 --
---   34x faster than the shipped query, and the result set is byte-identical
---   (verified by hashing the returned (trace_id, span_id, start_time) rows).
+--   38x faster than the query this replaces, and the result set is
+--   byte-identical (verified by hashing the returned
+--   (trace_id, span_id, start_time) rows).
+--
+--   Those four rows predate the `LIMIT 1 BY (trace_id, span_id)` dedup that
+--   query_spans applies to restore the row-count guarantee FINAL used to give
+--   (see the two-stage comment in storage/clickhouse/mod.rs). Re-measured on a
+--   10M-span single-project rebuild of the same shape:
+--
+--     FINAL, single-stage                       932 ms   rows_read 10.2M
+--     two-stage + projection, no dedup          112 ms   rows_read  5.3M
+--     two-stage + projection + dedup (SHIPS)    122 ms   rows_read  5.3M
+--
+--   The dedup costs ~8% and the projection's advantage is unaffected.
 --
 -- WHY A PROJECTION AND NOT A NEW SORT KEY
 --

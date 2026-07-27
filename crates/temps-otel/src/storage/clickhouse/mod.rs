@@ -1195,28 +1195,47 @@ impl OtelStorage for ClickHouseOtelStorage {
             //
             // Measured on 159.8M spans (150M in one project), root spans, 24h
             // window, LIMIT 100: 5050ms single-stage with FINAL → 132ms here,
-            // with a byte-identical result set.
+            // with a byte-identical result set. The dedup added below costs a
+            // further ~8% (112ms → 122ms on a 10M re-measure).
+            // `LIMIT 1 BY (trace_id, span_id)` in BOTH stages is what keeps the
+            // page honest without FINAL. spans is a ReplacingMergeTree, so a
+            // retried OTLP batch leaves two physical rows for one span identity
+            // until the next merge:
+            //
+            //   * inner — without it, a duplicated pair consumes two of the
+            //     `limit` slots and the page comes back short on distinct spans.
+            //   * outer — without it, the IN-set matches every physical row for
+            //     each pair, so the statement can return MORE rows than the
+            //     caller asked for. The single-stage shape cannot drift this way
+            //     because its LIMIT applies to rows directly.
+            //
+            // This restores the row-count guarantee FINAL used to provide, at
+            // the cost of a dedup over ≤`limit` rows rather than a merge over
+            // every part. Retried rows are byte-identical apart from `_version`,
+            // so which copy survives is not observable (FINAL would keep the
+            // highest `_version`).
             let inner_sql = format!(
                 "SELECT trace_id, span_id FROM spans WHERE {where_sql} \
-                 ORDER BY {order_sql} LIMIT ? OFFSET ?"
+                 ORDER BY {order_sql} LIMIT 1 BY (trace_id, span_id) LIMIT ? OFFSET ?"
             );
             let sql = format!(
                 "SELECT {SPAN_COLUMNS} \
                  FROM spans \
                  WHERE project_id = ?{time_sql} AND (trace_id, span_id) IN ({inner_sql}) \
-                 ORDER BY {order_sql}"
+                 ORDER BY {order_sql} LIMIT 1 BY (trace_id, span_id) LIMIT ?"
             );
 
             // Bind order must match the rendered placeholder order: the outer
             // project_id and time bounds come first (they precede the subquery
-            // in the statement), then the subquery's own binds, then
-            // LIMIT/OFFSET.
-            let mut all_binds: Vec<Bv> = Vec::with_capacity(binds.len() + time_binds.len() + 3);
+            // in the statement), then the subquery's own binds and its
+            // LIMIT/OFFSET, and finally the outer LIMIT.
+            let mut all_binds: Vec<Bv> = Vec::with_capacity(binds.len() + time_binds.len() + 4);
             all_binds.push(Bv::I32(query.project_id));
             all_binds.extend(time_binds);
             all_binds.extend(binds);
             all_binds.push(Bv::I64(limit as i64));
             all_binds.push(Bv::I64(offset as i64));
+            all_binds.push(Bv::I64(limit as i64));
             (sql, all_binds)
         };
 
