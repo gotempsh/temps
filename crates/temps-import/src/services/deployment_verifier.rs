@@ -26,13 +26,15 @@ use temps_entities::deployments;
 use temps_import_types::StepResult;
 use tracing::{info, warn};
 
-/// How long to wait for the pipeline to reach a terminal state.
-const DEPLOY_TIMEOUT: Duration = Duration::from_secs(600);
+/// How long to wait for the pipeline to reach a terminal state. `pub(crate)`
+/// so `resource_executor`'s cross-module invariant test can assert this
+/// stays under the proxy's console timeout alongside `TRANSFER_TIMEOUT_PROD`.
+pub(crate) const DEPLOY_TIMEOUT: Duration = Duration::from_secs(600);
 /// How long to keep retrying the HTTP check once the deployment is done.
-const HTTP_TIMEOUT: Duration = Duration::from_secs(90);
+pub(crate) const HTTP_TIMEOUT: Duration = Duration::from_secs(90);
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// How long to wait for the creation-time deployment before triggering one.
-const TRIGGER_GRACE: Duration = Duration::from_secs(15);
+pub(crate) const TRIGGER_GRACE: Duration = Duration::from_secs(15);
 
 /// Deployment states that mean the pipeline has stopped working.
 /// "running" is NOT terminal — in the temps state machine it means the

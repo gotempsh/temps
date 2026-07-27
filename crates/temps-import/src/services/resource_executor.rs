@@ -40,15 +40,25 @@ use tracing::{info, warn};
 /// connection URL (set by the platform importers at plan time).
 pub const SOURCE_URL_PARAM: &str = "source_url";
 
+/// Hard cap on how long a data-transfer container may run, in production —
+/// deliberately NOT `#[cfg(test)]`-shrunk (unlike `TRANSFER_TIMEOUT` below),
+/// so a same-crate test can assert against the real value regardless of
+/// which cfg it's compiled under. Cross-checked by
+/// `crates/temps-proxy/src/proxy.rs`'s `CONSOLE_IO_TIMEOUT_SECS` (a
+/// different crate, so it duplicates this number with a comment pointing
+/// back here) — the invariant test at the bottom of this file is the
+/// source of truth; update both if this changes.
+pub(crate) const TRANSFER_TIMEOUT_PROD: Duration = Duration::from_secs(30 * 60);
+
 /// Hard cap on how long a data-transfer container may run. A dump/restore
 /// against an unreachable or very slow source database must not hang a
 /// Tokio worker forever — a few of these on a small (cpx22-class) box would
 /// starve every other import. Real transfers on a reachable database finish
-/// in seconds to minutes; 30 shrinks to a few seconds under `cfg(test)` so
+/// in seconds to minutes; shrinks to a few seconds under `cfg(test)` so
 /// the timeout path itself can be exercised against a real container
 /// without a real 30-minute wait.
 #[cfg(not(test))]
-const TRANSFER_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const TRANSFER_TIMEOUT: Duration = TRANSFER_TIMEOUT_PROD;
 #[cfg(test)]
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -836,6 +846,37 @@ mod tests {
         ProjectType, ResourceLimits,
     };
     use temps_import_types::{DomainPlan, MigrationSummary, ResourceCounts, RiskLevel};
+
+    /// `execute_import`'s real worst case is `TRANSFER_TIMEOUT_PROD` (service
+    /// transfers now run concurrently, so N services no longer multiply this)
+    /// plus deploy-and-verify's `TRIGGER_GRACE + DEPLOY_TIMEOUT + HTTP_TIMEOUT`
+    /// -- all inside the one HTTP request `crates/temps-proxy`'s console
+    /// timeout bounds. This crate owns all four constants, so *this* test
+    /// (not `temps-proxy`'s, which can't depend on this crate and must
+    /// duplicate the numbers) is what actually catches drift: if any of
+    /// these four change enough to threaten the invariant, this test fails
+    /// here, at the source, instead of silently only in a hardcoded copy
+    /// three commits and one crate away.
+    ///
+    /// If this ever fails: also update `CONSOLE_IO_TIMEOUT_SECS` and its own
+    /// (necessarily duplicated) test in `crates/temps-proxy/src/proxy.rs`.
+    #[test]
+    fn worst_case_execute_duration_fits_under_the_documented_console_timeout() {
+        use crate::services::deployment_verifier::{DEPLOY_TIMEOUT, HTTP_TIMEOUT, TRIGGER_GRACE};
+
+        const CONSOLE_IO_TIMEOUT_SECS: u64 = 3600; // crates/temps-proxy/src/proxy.rs
+
+        let worst_case = TRANSFER_TIMEOUT_PROD + TRIGGER_GRACE + DEPLOY_TIMEOUT + HTTP_TIMEOUT;
+
+        assert!(
+            worst_case.as_secs() < CONSOLE_IO_TIMEOUT_SECS,
+            "worst-case import execute duration ({}s) must stay under the proxy's \
+             console timeout ({CONSOLE_IO_TIMEOUT_SECS}s), or the exact \
+             'import succeeds server-side, browser sees a dead connection' bug \
+             this timeout exists to prevent reopens",
+            worst_case.as_secs()
+        );
+    }
 
     #[test]
     fn userinfo_encoding_covers_url_hostile_password_chars() {

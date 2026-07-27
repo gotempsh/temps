@@ -2340,6 +2340,15 @@ mod upstream_io_timeout_tests {
 
     /// The console timeout must actually cover the real worst case of the
     /// slowest console operation (import execute), not just be "generous".
+    ///
+    /// This crate can't depend on `temps-import` (wrong direction --
+    /// `temps-proxy` sits below it), so the four constants below are
+    /// necessarily hardcoded copies, not references to the real ones. The
+    /// authoritative check lives in
+    /// `temps_import::services::resource_executor::tests::worst_case_execute_duration_fits_under_the_documented_console_timeout`,
+    /// which owns all four real constants and fails at the source if they
+    /// drift. If you change any of the four numbers below, update that test
+    /// (and this one) too.
     #[test]
     fn console_timeout_covers_the_worst_case_import_execute_duration() {
         const TRIGGER_GRACE_SECS: u64 = 15;
