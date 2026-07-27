@@ -149,10 +149,18 @@ impl ObservabilityService {
         // otherwise scan their whole table for a caller that simply omitted a
         // date. The web UI always sends a range; the API must not depend on
         // that. Rules and measurements live in temps_core::time_window.
-        let window = temps_core::time_window::resolve(
+        //
+        // The SCOPED cap applies unconditionally: `EventFilters::project_id`
+        // is a required `i32`, not `Option` — every call into this feed is
+        // already narrowed to one project's rows, so it gets the same 30-day
+        // ceiling `list_page`/the AI-breakdown endpoints grant a project-scoped
+        // caller (see `ProxyLogService::resolve_window`), matching the 30-day
+        // preset the Observe picker (`ObserveFilterBar.tsx`) already ships.
+        let window = temps_core::time_window::resolve_with_max(
             filters.from,
             filters.to,
             chrono::Duration::hours(temps_core::time_window::DEFAULT_LOOKBACK_HOURS),
+            chrono::Duration::days(temps_core::time_window::MAX_WINDOW_DAYS_SCOPED),
         )
         .map_err(|e| ObservabilityError::InvalidTimeWindow(e.to_string()))?;
         let filters = EventFilters {

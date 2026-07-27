@@ -486,4 +486,17 @@ async fn observe_feed_bounds_the_window_and_rejects_an_over_wide_one() {
     };
     assert!(msg.contains("maximum"), "{msg}");
     assert!(msg.contains("still"), "must name the workaround: {msg}");
+
+    // `EventFilters::project_id` is a required `i32` — every call into this
+    // feed is already scoped to one project — so a 30-day window (exactly the
+    // "Last 30 days" preset ObserveFilterBar.tsx ships) must be ALLOWED, not
+    // rejected like the unscoped 60-day request above. This is the regression
+    // this test guards: the feed's own shipped time-range option must not 400.
+    let mut thirty_days = filters(&[EventKind::Request], None, None);
+    thirty_days.from = Some(Utc::now() - Duration::days(30));
+    thirty_days.to = None;
+    env.service
+        .query(thirty_days)
+        .await
+        .expect("a 30-day project-scoped window must not be rejected");
 }
