@@ -4,8 +4,10 @@ Temps ingests standard OTLP/HTTP (protobuf) metrics exports — counters, gauges
 
 ## Endpoints
 
-- Header-based: `POST /otel/v1/metrics`
-- Path-based: `POST /otel/v1/{project_id}/{environment_id}/{deployment_id}/metrics`
+Routes are registered as `/otel/v1/metrics` inside the crate, but the console server nests every plugin's routes under `/api`, so the real externally-reachable paths are:
+
+- Header-based: `POST /api/otel/v1/metrics`
+- Path-based: `POST /api/otel/v1/{project_id}/{environment_id}/{deployment_id}/metrics`
 
 Same auth (`Authorization: Bearer <tk_|dt_|si_ token>` or `X-Temps-Api-Key`), same rate limit (1000 req/60s/token) and opt-in quota as traces/logs — see the shared-facts section in the top-level SKILL.md.
 

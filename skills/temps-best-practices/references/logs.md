@@ -4,8 +4,10 @@ Temps ingests standard OTLP/HTTP (protobuf) log exports. Use a standard OpenTele
 
 ## Endpoints
 
-- Header-based: `POST /otel/v1/logs`
-- Path-based: `POST /otel/v1/{project_id}/{environment_id}/{deployment_id}/logs`
+Routes are registered as `/otel/v1/logs` inside the crate, but the console server nests every plugin's routes under `/api`, so the real externally-reachable paths are:
+
+- Header-based: `POST /api/otel/v1/logs`
+- Path-based: `POST /api/otel/v1/{project_id}/{environment_id}/{deployment_id}/logs`
 
 Same auth, rate limit, and opt-in quota model as traces/metrics — see the shared-facts section in the top-level SKILL.md.
 

@@ -18,9 +18,13 @@ The `public_key` is per-project and derived from the DB; the `secret_key` (if an
 
 ## Ingestion endpoints
 
-- `POST /{project_id}/store/` — JSON event ingestion (legacy Sentry envelope-less format)
-- `POST /{project_id}/envelope/` — binary/newline-delimited envelope ingestion (what modern Sentry SDKs use by default)
-- `POST /0/projects/{org_slug}/{project_slug}/releases/{version}/files/` — source map upload, `sentry-cli`-compatible (multipart form: `file`, `name`, `dist`, `header`)
+Routes are registered as `/{project_id}/store/` etc. inside the crate, but the console server nests every plugin's routes under `/api` (`temps-cli/src/commands/serve/console.rs`), so the real externally-reachable paths are:
+
+- `POST /api/{project_id}/store/` — JSON event ingestion (legacy Sentry envelope-less format)
+- `POST /api/{project_id}/envelope/` — binary/newline-delimited envelope ingestion (what modern Sentry SDKs use by default)
+- `POST /api/0/projects/{org_slug}/{project_slug}/releases/{version}/files/` — source map upload, `sentry-cli`-compatible (multipart form: `file`, `name`, `dist`, `header`)
+
+This matches standard Sentry SDK behavior unmodified: every conforming Sentry SDK inserts `api/` itself when building the request URL from a DSN, so a DSN of the form `https://<public_key>@<temps-host>/<project_id>` (no `/api` in the DSN) already produces exactly these URLs — nothing Temps-specific to configure. The `/api` prefix only matters if hand-rolling a raw HTTP request (e.g. `curl`) to test ingestion without going through a real SDK.
 
 Implemented in `temps-error-tracking` crate: `src/sentry/handlers.rs`, `src/sentry/service.rs`, `src/sentry/envelope.rs`.
 

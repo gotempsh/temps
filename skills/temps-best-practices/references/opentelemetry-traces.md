@@ -6,20 +6,24 @@ Temps ingests standard OTLP/HTTP (protobuf) trace exports — any language's Ope
 
 ## Endpoints
 
-- Header-based: `POST /otel/v1/traces` — project/environment/deployment resolved from the auth token
-- Path-based: `POST /otel/v1/{project_id}/{environment_id}/{deployment_id}/traces` — explicit scoping in the URL
+Every plugin's routes (public and authenticated alike) are nested under `/api` by the console server (`temps-cli/src/commands/serve/console.rs`), so the real externally-reachable paths are:
+
+- Header-based: `POST /api/otel/v1/traces` — project/environment/deployment resolved from the auth token
+- Path-based: `POST /api/otel/v1/{project_id}/{environment_id}/{deployment_id}/traces` — explicit scoping in the URL
 
 Both accept `application/x-protobuf` bodies (`ExportTraceServiceRequest`), with optional gzip or zstd `Content-Encoding`.
 
-Implemented in `temps-otel` crate: `src/handlers/ingest_handler.rs`.
+Implemented in `temps-otel` crate: `src/handlers/mod.rs` (route table, doc comment lists the full path set), `src/handlers/ingest_handler.rs` (handler logic).
 
 ## Standard OTLP exporter config
 
 ```bash
-OTEL_EXPORTER_OTLP_ENDPOINT=https://<temps-host>/otel/v1
+OTEL_EXPORTER_OTLP_ENDPOINT=https://<temps-host>/api/otel
 OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer%20<dt_or_tk_token>
 OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
 ```
+
+Most OTLP SDKs auto-append `/v1/traces` (or `/v1/metrics`, `/v1/logs`) to `OTEL_EXPORTER_OTLP_ENDPOINT`, landing on the path above. This is exactly the value Temps auto-injects into every deployment (`{TEMPS_API_URL}/otel`, i.e. `{base_url}/api/otel` — see `temps-deployments::workflow_planner::gather_environment_variables`, `crates/temps-deployments/src/services/workflow_planner.rs:448-452`).
 
 For `tk_` tokens (not project-scoped by default), also set:
 
@@ -213,7 +217,7 @@ const provider = new WebTracerProvider({
   spanProcessors: [
     new BatchSpanProcessor(
       new OTLPTraceExporter({
-        url: 'https://<temps-host>/otel/v1/traces',
+        url: 'https://<temps-host>/api/otel/v1/traces',
         headers: { Authorization: 'Bearer <dt_or_tk_token>' },
       })
     ),

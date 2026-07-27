@@ -68,7 +68,7 @@ All Temps telemetry ingestion (OTLP traces/metrics/logs) shares one auth and rat
 - **Auth header**: `Authorization: Bearer <token>` or `X-Temps-Api-Key: <token>`. Some OTLP exporters URL-encode the header as `Bearer%20<token>` — Temps accepts that too.
 - **Rate limit**: 1000 req/60s per token by default (`TEMPS_OTEL_RATE_LIMIT`, `TEMPS_OTEL_RATE_LIMIT_WINDOW_SECS` — server-side config, not something the app sets).
 - **Storage quota**: off by default; a self-hosted instance can opt in via `TEMPS_OTEL_QUOTA_GB`. If ingestion suddenly starts 413'ing, that's the likely cause.
-- **Endpoint shape**: path-based `POST /otel/v1/{project_id}/{environment_id}/{deployment_id}/{traces|metrics|logs}` or header-based `POST /otel/v1/{traces|metrics|logs}` with project/env/deployment resolved from the token. Prefer the standard OTLP exporter env vars (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`) over hand-rolling requests — any OTLP/HTTP protobuf exporter works unmodified against these endpoints.
+- **Endpoint shape**: every plugin's routes are nested under `/api` by the console server — path-based `POST /api/otel/v1/{project_id}/{environment_id}/{deployment_id}/{traces|metrics|logs}` or header-based `POST /api/otel/v1/{traces|metrics|logs}` with project/env/deployment resolved from the token. Prefer the standard OTLP exporter env vars (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`) over hand-rolling requests — any OTLP/HTTP protobuf exporter works unmodified against these endpoints.
 
 ## Verification checklist for a full instrumentation pass
 
@@ -76,7 +76,7 @@ All Temps telemetry ingestion (OTLP traces/metrics/logs) shares one auth and rat
 2. Traces: make a request through the instrumented path, confirm a span appears in **Observe → Traces** with a sane `duration_ms` (see the unit gotcha in [references/opentelemetry-traces.md](references/opentelemetry-traces.md)).
 3. Metrics: confirm a custom metric name passes the `[a-zA-Z0-9_.:- ]` character set (see [references/metrics.md](references/metrics.md)) and shows up in **Observe → Metrics**.
 4. Logs: confirm log records with `trace_id` set join the correct trace in the UI.
-5. Analytics: confirm `/_temps/event` or `/projects/{id}/events/ingest` calls land in **Analytics** within a few seconds.
+5. Analytics: confirm `/api/_temps/event` or `/api/projects/{id}/events/ingest` calls land in **Analytics** within a few seconds — see [references/analytics.md](references/analytics.md) for a language-agnostic quickstart, since analytics has no per-language SDK beyond React.
 
 If a signal never appears, check auth token prefix/header first, then rate limit/quota, before assuming the SDK integration is broken — most "nothing shows up" cases are one of those two.
 
