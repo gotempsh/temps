@@ -15,6 +15,31 @@ Temps replaces Sentry + Datadog/Honeycomb + PostHog with one ingestion surface. 
 - **add-error-tracking** — step-by-step Sentry SDK init per language/framework
 - **add-react-analytics** — step-by-step `@temps-sdk/react-analytics` hook usage
 
+## Quickstart: wire up any app end to end
+
+Goal: an app in any language gets error tracking and traces flowing with minimal setup. Both signals use the same shape — one env var pointing at Temps, and the language's own official SDK does the rest.
+
+**If the app is deployed on Temps, most of this is already done.** Every deployment automatically gets these env vars injected — no manual DSN copy-paste or token minting required:
+
+| Env var | What it's for |
+|---|---|
+| `SENTRY_DSN` | Server-side/generic error tracking DSN, always present |
+| `NEXT_PUBLIC_SENTRY_DSN` / `NUXT_PUBLIC_SENTRY_DSN` / `VITE_SENTRY_DSN` / `PUBLIC_SENTRY_DSN` / `REACT_APP_SENTRY_DSN` | Framework-specific public DSN, added when the detected build preset needs a public-prefixed var to expose it client-side (Next.js/Nuxt/Vite,React,Vue,SolidStart,Remix/SvelteKit,Astro,Rsbuild/Docusaurus respectively) — not added for Angular or backend/generic presets, which just use `SENTRY_DSN` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_PROTOCOL` (always `http/protobuf`), `OTEL_EXPORTER_OTLP_HEADERS` (deployment token auth) | Traces, auto-configured |
+| `OTEL_SERVICE_NAME` (project name), `OTEL_SERVICE_VERSION` (commit SHA when available) | Auto-populated span metadata |
+
+Implemented in `temps-deployments` crate: `src/services/workflow_planner.rs` (`gather_environment_variables`). If any of these are missing on a running deployment, that's a platform bug, not something to work around by hand-rolling credentials.
+
+For an app **not** deployed on Temps (running elsewhere, only sending telemetry to a self-hosted Temps instance), get credentials manually:
+- Error tracking DSN: **Error Tracking → DSN & Setup** (`https://<public_key>@<temps-host>/<project_id>`)
+- A deployment token (`dt_...`) or API key (`tk_...`) for OTLP: **Project Settings → API Keys**
+
+Either way, the app-side steps are the same:
+
+1. **Error tracking**: follow [add-error-tracking](../add-error-tracking/SKILL.md) for the app's language — install the official Sentry SDK, point it at `SENTRY_DSN` (or the framework's public variant). No Temps-specific package exists or is needed.
+2. **Traces**: follow the per-language quickstart in [references/opentelemetry-traces.md](references/opentelemetry-traces.md) — install the official OpenTelemetry SDK/agent for the language; if the three `OTEL_EXPORTER_OTLP_*` env vars are already set, most SDKs pick them up with zero additional config.
+3. **Verify** both landed using the checklist below before considering the app "instrumented."
+
 ## The five pillars
 
 | Pillar | What it's for | Reference |

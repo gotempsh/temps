@@ -2,6 +2,8 @@
 
 Temps ingests standard OTLP/HTTP (protobuf) trace exports — any language's OpenTelemetry SDK works unmodified, there is no Temps-specific tracing SDK. Point the standard OTLP exporter env vars at Temps instead of hand-writing requests.
 
+**Apps deployed on Temps get this for free**: every deployment automatically has `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_SERVICE_NAME`, and `OTEL_SERVICE_VERSION` injected — see the top-level [SKILL.md](../SKILL.md) quickstart. The manual config below is for apps sending telemetry to a self-hosted Temps instance from outside the platform.
+
 ## Endpoints
 
 - Header-based: `POST /otel/v1/traces` — project/environment/deployment resolved from the auth token
@@ -16,6 +18,7 @@ Implemented in `temps-otel` crate: `src/handlers/ingest_handler.rs`.
 ```bash
 OTEL_EXPORTER_OTLP_ENDPOINT=https://<temps-host>/otel/v1
 OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer%20<dt_or_tk_token>
+OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
 ```
 
 For `tk_` tokens (not project-scoped by default), also set:
@@ -25,6 +28,206 @@ OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer%20<tk_token>,X-Temps-Project-Id=
 ```
 
 `dt_` (deployment token) and `si_` tokens are already project/environment/deployment-scoped and don't need the project-id header.
+
+**Always set `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf` explicitly.** Several official SDKs (Node, Python, Java, .NET) default their generic OTLP exporter to gRPC — Temps only accepts OTLP/HTTP with a protobuf body, so a gRPC export will silently fail to connect rather than fall back.
+
+## Quickstart: instrument any language
+
+Every OpenTelemetry SDK reads the three env vars above and needs no Temps-specific code — set them, run the app, and spans land in **Observe → Traces**. These are the same setup patterns from the [add-error-tracking](../../add-error-tracking/SKILL.md) skill's platform list, applied to traces instead of Sentry.
+
+### Node.js (and Next.js server/API routes)
+
+Zero-code, via the OpenTelemetry auto-instrumentation agent — no source changes:
+
+```bash
+npm install --save-dev @opentelemetry/auto-instrumentations-node
+node --require @opentelemetry/auto-instrumentations-node/register app.js
+```
+
+Or set `NODE_OPTIONS="--require @opentelemetry/auto-instrumentations-node/register"` in the deployment env so it applies without changing the start command.
+
+For Next.js specifically, use the built-in `instrumentation.ts` hook instead:
+
+```bash
+npm install @vercel/otel
+```
+
+```ts
+// instrumentation.ts (project root)
+import { registerOTel } from '@vercel/otel';
+
+export function register() {
+  registerOTel({ serviceName: 'your-app' });
+}
+```
+
+`@vercel/otel` reads the same `OTEL_EXPORTER_OTLP_*` env vars — no Temps-specific config needed.
+
+### Python
+
+Zero-code via `opentelemetry-instrument`:
+
+```bash
+pip install opentelemetry-distro opentelemetry-exporter-otlp
+opentelemetry-bootstrap -a install
+opentelemetry-instrument --service_name your-app python app.py
+```
+
+### Go
+
+Go has no stable zero-code agent — initialize the SDK manually and read the standard env vars via `autoexport`:
+
+```bash
+go get go.opentelemetry.io/otel go.opentelemetry.io/contrib/exporters/autoexport go.opentelemetry.io/otel/sdk
+```
+
+```go
+package main
+
+import (
+	"context"
+
+	"go.opentelemetry.io/contrib/exporters/autoexport"
+	"go.opentelemetry.io/otel"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+)
+
+func main() {
+	ctx := context.Background()
+	exporter, err := autoexport.NewSpanExporter(ctx) // reads OTEL_EXPORTER_OTLP_* env vars
+	if err != nil {
+		panic(err)
+	}
+	tp := sdktrace.NewTracerProvider(sdktrace.WithBatcher(exporter))
+	otel.SetTracerProvider(tp)
+	defer tp.Shutdown(ctx)
+
+	// your app
+}
+```
+
+### Rust
+
+```bash
+cargo add opentelemetry opentelemetry-otlp opentelemetry_sdk --features opentelemetry-otlp/http-proto,opentelemetry-otlp/reqwest-client
+```
+
+```rust
+use opentelemetry_otlp::WithExportConfig;
+
+fn main() {
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_http() // reads OTEL_EXPORTER_OTLP_* env vars
+        .build()
+        .expect("failed to build OTLP exporter");
+
+    let provider = opentelemetry_sdk::trace::TracerProvider::builder()
+        .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+        .build();
+
+    opentelemetry::global::set_tracer_provider(provider);
+
+    // your app
+}
+```
+
+### Ruby
+
+Zero-code via the instrumentation-all gem:
+
+```bash
+bundle add opentelemetry-sdk opentelemetry-exporter-otlp opentelemetry-instrumentation-all
+```
+
+```ruby
+# config/initializers/otel.rb (or app entrypoint)
+require 'opentelemetry/sdk'
+require 'opentelemetry/exporter/otlp'
+require 'opentelemetry/instrumentation/all'
+
+OpenTelemetry::SDK.configure do |c|
+  c.service_name = 'your-app'
+  c.use_all # reads OTEL_EXPORTER_OTLP_* env vars
+end
+```
+
+### Java
+
+Zero-code via the OpenTelemetry Java agent — no source changes:
+
+```bash
+curl -L -o opentelemetry-javaagent.jar \
+  https://github.com/open-telemetry/opentelemetry-java-instrumentation/releases/latest/download/opentelemetry-javaagent.jar
+java -javaagent:opentelemetry-javaagent.jar -Dotel.service.name=your-app -jar app.jar
+```
+
+The agent reads the same `OTEL_EXPORTER_OTLP_*` env vars.
+
+### PHP
+
+```bash
+composer require open-telemetry/opentelemetry open-telemetry/exporter-otlp open-telemetry/transport-grpc
+```
+
+```php
+<?php
+// bootstrap.php — include before your app's entrypoint
+use OpenTelemetry\API\Globals;
+use OpenTelemetry\SDK\Trace\TracerProviderFactory;
+
+$tracerProvider = (new TracerProviderFactory())->create(); // reads OTEL_EXPORTER_OTLP_* env vars
+```
+
+### .NET
+
+```bash
+dotnet add package OpenTelemetry.Extensions.Hosting
+dotnet add package OpenTelemetry.Exporter.OpenTelemetryProtocol
+```
+
+```csharp
+// Program.cs
+builder.Services.AddOpenTelemetry()
+    .WithTracing(tracing => tracing
+        .AddAspNetCoreInstrumentation()
+        .AddOtlpExporter()); // reads OTEL_EXPORTER_OTLP_* env vars
+```
+
+### Browser (React, Vue, Svelte, Angular)
+
+Traces from browser code use the OpenTelemetry Web SDK — the same packages work regardless of frontend framework, since instrumentation is framework-agnostic:
+
+```bash
+npm install @opentelemetry/sdk-trace-web @opentelemetry/exporter-trace-otlp-http @opentelemetry/instrumentation-fetch
+```
+
+```ts
+// src/otel.ts — import this first in your app entrypoint
+import { WebTracerProvider } from '@opentelemetry/sdk-trace-web';
+import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
+import { BatchSpanProcessor } from '@opentelemetry/sdk-trace-base';
+import { FetchInstrumentation } from '@opentelemetry/instrumentation-fetch';
+import { registerInstrumentations } from '@opentelemetry/instrumentation';
+
+const provider = new WebTracerProvider({
+  spanProcessors: [
+    new BatchSpanProcessor(
+      new OTLPTraceExporter({
+        url: 'https://<temps-host>/otel/v1/traces',
+        headers: { Authorization: 'Bearer <dt_or_tk_token>' },
+      })
+    ),
+  ],
+});
+provider.register();
+registerInstrumentations({ instrumentations: [new FetchInstrumentation()] });
+```
+
+Browser exporters can't read process env vars, so the endpoint/headers must be passed explicitly in code (via a build-time env var like other bundler-injected config, not hardcoded) rather than through `OTEL_EXPORTER_OTLP_*`.
+
+### React Native / Flutter
+
+Mobile OpenTelemetry SDKs are less mature than the backend/browser ecosystem and package availability changes — check the [OpenTelemetry registry](https://opentelemetry.io/ecosystem/registry/) for the current state before committing to one. For most apps it's more reliable to send mobile telemetry through your own backend (which is already instrumented per above) rather than exporting OTLP directly from the device. Error tracking is the more mature signal for mobile — see [add-error-tracking](../../add-error-tracking/SKILL.md), which has dedicated React Native and Flutter setup.
 
 ## Auth
 

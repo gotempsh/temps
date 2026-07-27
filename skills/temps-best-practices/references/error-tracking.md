@@ -2,6 +2,8 @@
 
 For step-by-step SDK init per language/framework, use the **add-error-tracking** skill — it covers Next.js, React, Vue, Svelte, Angular, Node, React Native, Python, Go, Rust, Ruby, Java, PHP, .NET, Flutter with copy-paste snippets. This file covers the ingestion internals worth knowing when debugging or reviewing that setup.
 
+**Apps deployed on Temps get the DSN for free**: every deployment automatically has `SENTRY_DSN` injected (plus a framework-specific public-prefixed variant when the build preset needs one — see the top-level [SKILL.md](../SKILL.md) quickstart for the exact mapping). No dashboard copy-paste needed for those apps.
+
 ## How it works
 
 Temps is Sentry wire-compatible: it implements Sentry's ingestion protocol server-side, so the official Sentry SDK for any platform works unmodified against a Temps DSN. There is no Temps-specific error-tracking SDK.
