@@ -546,7 +546,7 @@ export function ImportWizard({
         main_branch: selectedBranch,
         project_name: projectName,
         dry_run: false,
-      } as any, // Type assertion until API types are regenerated
+      },
     })
   }
 
