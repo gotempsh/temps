@@ -5,6 +5,156 @@ use temps_import_types::{
     WorkloadSnapshot,
 };
 
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use std::collections::HashMap;
+    use temps_import_types::plan::{
+        DeploymentConfiguration, DeploymentStrategy, DomainAction, DomainPlan,
+        EnvironmentConfiguration, NetworkConfiguration, NetworkMode, PlanComplexity, PlanMetadata,
+        ProjectConfiguration, ProjectType, ResourceCounts, ResourceLimits, RiskLevel,
+        ServiceAction, ServicePlan,
+    };
+    use temps_import_types::{
+        ImportPlan, MigrationSummary, NetworkInfo, ResourceInfo, WorkloadId, WorkloadSnapshot,
+        WorkloadStatus, WorkloadType,
+    };
+
+    pub fn snapshot(image: Option<&str>, repo: Option<&str>) -> WorkloadSnapshot {
+        let source_metadata = match repo {
+            Some(r) => serde_json::json!({ "repo": r }),
+            None => serde_json::json!({}),
+        };
+        WorkloadSnapshot {
+            id: WorkloadId::new("shop"),
+            name: Some("shop".to_string()),
+            workload_type: WorkloadType::Container,
+            status: WorkloadStatus::Running,
+            image: image.map(|i| i.to_string()),
+            command: None,
+            entrypoint: None,
+            working_dir: None,
+            env: HashMap::new(),
+            ports: HashMap::new(),
+            volumes: vec![],
+            network: NetworkInfo {
+                mode: NetworkMode::Bridge,
+                networks: vec![],
+                hostname: None,
+                domain_name: None,
+            },
+            resources: ResourceInfo::default(),
+            labels: HashMap::new(),
+            health_check: None,
+            restart_policy: None,
+            created_at: chrono::Utc::now(),
+            source_metadata,
+        }
+    }
+
+    /// A minimal, otherwise-empty plan with the given services/domains —
+    /// everything else is a dummy value the validation rules under test
+    /// don't read.
+    pub fn plan_with(services: Vec<ServicePlan>, domains: Vec<DomainPlan>) -> ImportPlan {
+        ImportPlan {
+            version: "1".to_string(),
+            source: "caprover".to_string(),
+            source_id: "shop".to_string(),
+            project: ProjectConfiguration {
+                name: "shop".to_string(),
+                slug: "shop".to_string(),
+                project_type: ProjectType::Git,
+                is_web_app: true,
+            },
+            environment: EnvironmentConfiguration {
+                name: "production".to_string(),
+                subdomain: "shop".to_string(),
+                resources: ResourceLimits {
+                    cpu_limit: None,
+                    memory_limit: None,
+                    cpu_request: None,
+                    memory_request: None,
+                },
+            },
+            deployment: DeploymentConfiguration {
+                image: "nginx:latest".to_string(),
+                build: None,
+                strategy: DeploymentStrategy::Replace,
+                env_vars: vec![],
+                ports: vec![],
+                volumes: vec![],
+                network: NetworkConfiguration {
+                    mode: NetworkMode::Bridge,
+                    hostname: None,
+                    dns_servers: vec![],
+                },
+                resources: ResourceLimits {
+                    cpu_limit: None,
+                    memory_limit: None,
+                    cpu_request: None,
+                    memory_request: None,
+                },
+                command: None,
+                entrypoint: None,
+                working_dir: None,
+                health_check: None,
+                git: None,
+            },
+            services,
+            domains,
+            additional_deployments: vec![],
+            steps: vec![],
+            summary: MigrationSummary {
+                headline: "test".to_string(),
+                overall_risk: RiskLevel::Low,
+                resource_counts: ResourceCounts::default(),
+                critical_warnings: vec![],
+                manual_actions_required: vec![],
+                unsupported_features: vec![],
+            },
+            metadata: PlanMetadata {
+                generated_at: chrono::Utc::now(),
+                generator_version: "test".to_string(),
+                complexity: PlanComplexity::Low,
+                warnings: vec![],
+            },
+            cost_analysis: None,
+        }
+    }
+
+    pub fn service(name: &str, unreachable: bool) -> ServicePlan {
+        ServicePlan {
+            name: name.to_string(),
+            service_type: "postgres".to_string(),
+            version: None,
+            parameters: HashMap::new(),
+            env_var_mappings: HashMap::new(),
+            action: ServiceAction::Create,
+            action_description: String::new(),
+            data_implications: if unreachable {
+                vec![temps_import_types::DataImplication {
+                    severity: temps_import_types::DataImplicationSeverity::DataNotMigrated,
+                    message: "not reachable".to_string(),
+                    recommended_action: None,
+                }]
+            } else {
+                vec![]
+            },
+        }
+    }
+
+    pub fn domain(name: &str, action: DomainAction) -> DomainPlan {
+        DomainPlan {
+            domain: name.to_string(),
+            environment: "production".to_string(),
+            redirect_to: None,
+            status_code: None,
+            action,
+            action_description: String::new(),
+            replacement: None,
+        }
+    }
+}
+
 pub struct CaproverValidationRules;
 
 impl CaproverValidationRules {
@@ -151,5 +301,70 @@ impl ImportValidationRule for GeneratedDomainRule {
             remediation: None,
             affected_resources: skipped.iter().map(|s| s.to_string()).collect(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::*;
+    use super::*;
+    use temps_import_types::plan::DomainAction;
+
+    #[test]
+    fn source_present_rule_passes_for_an_image() {
+        let result = SourcePresentRule.validate(
+            &snapshot(Some("nginx:latest"), None),
+            &plan_with(vec![], vec![]),
+        );
+        assert!(result.passed);
+    }
+
+    #[test]
+    fn source_present_rule_passes_for_a_git_repo() {
+        let result = SourcePresentRule.validate(
+            &snapshot(None, Some("github.com/owner/repo")),
+            &plan_with(vec![], vec![]),
+        );
+        assert!(result.passed);
+    }
+
+    #[test]
+    fn source_present_rule_fails_with_neither_image_nor_repo() {
+        let result = SourcePresentRule.validate(&snapshot(None, None), &plan_with(vec![], vec![]));
+        assert!(!result.passed);
+        assert!(result.remediation.is_some());
+    }
+
+    #[test]
+    fn database_reachability_rule_passes_when_all_services_reachable() {
+        let plan = plan_with(vec![service("db", false)], vec![]);
+        let result = DatabaseReachabilityRule.validate(&snapshot(None, None), &plan);
+        assert!(result.passed);
+    }
+
+    #[test]
+    fn database_reachability_rule_fails_and_names_unreachable_services() {
+        let plan = plan_with(vec![service("db", true), service("cache", false)], vec![]);
+        let result = DatabaseReachabilityRule.validate(&snapshot(None, None), &plan);
+        assert!(!result.passed);
+        assert!(result.message.contains("db"));
+        assert!(!result.message.contains("cache"));
+        assert_eq!(result.affected_resources, vec!["db".to_string()]);
+    }
+
+    #[test]
+    fn generated_domain_rule_is_informational_and_lists_skipped_domains() {
+        let plan = plan_with(
+            vec![],
+            vec![
+                domain("app.example.com", DomainAction::Import),
+                domain("app.sslip.io", DomainAction::Skip),
+            ],
+        );
+        let result = GeneratedDomainRule.validate(&snapshot(None, None), &plan);
+        // Informational rule — never blocks, even when domains are skipped.
+        assert!(result.passed);
+        assert!(result.message.contains("app.sslip.io"));
+        assert!(!result.message.contains("app.example.com"));
     }
 }
