@@ -1059,17 +1059,15 @@ impl OtelStorage for ClickHouseOtelStorage {
         // QueryBuilder is not object-safe). Instead we use a small state
         // machine: we render SQL with `?` placeholders in the same order as
         // the values, then call .bind() in the same order.
-        let mut sql = String::from(
-            "SELECT project_id, deployment_id, service_name, service_version, \
-             deployment_environment, trace_id, span_id, parent_span_id, name, kind, \
-             toUnixTimestamp64Milli(start_time) AS start_time_ms, \
-             toUnixTimestamp64Milli(end_time) AS end_time_ms, \
-             duration_ms, status_code, status_message, attributes, events \
-             FROM spans FINAL WHERE project_id = ?",
-        );
+        //
+        // The predicate is accumulated into `where_sql` rather than straight
+        // into the final statement because it is used TWICE — see the
+        // two-stage assembly at the end of this method.
+        let mut where_sql = String::from("project_id = ?");
 
         // We build bind values as a Vec<ChBindValue> — a local enum that lets
         // us defer the actual .bind() calls until we have the full query string.
+        #[derive(Clone)]
         enum Bv {
             I32(i32),
             I64(i64),
@@ -1078,32 +1076,43 @@ impl OtelStorage for ClickHouseOtelStorage {
         }
         let mut binds: Vec<Bv> = vec![Bv::I32(query.project_id)];
 
+        // The time predicates are ALSO tracked separately so the outer stage of
+        // the two-stage query can repeat them. Repeating them is what preserves
+        // monthly partition pruning on the outer read; the `IN` set alone would
+        // leave the outer query unbounded in time.
+        let mut time_sql = String::new();
+        let mut time_binds: Vec<Bv> = Vec::new();
+
         if let Some(ref tid) = query.trace_id {
-            sql.push_str(" AND trace_id = ?");
+            where_sql.push_str(" AND trace_id = ?");
             binds.push(Bv::Str(tid.clone()));
         }
         if let Some(ref svc) = query.service_name {
-            sql.push_str(" AND service_name = ?");
+            where_sql.push_str(" AND service_name = ?");
             binds.push(Bv::Str(svc.clone()));
         }
         if let Some(status) = query.status {
-            sql.push_str(" AND status_code = ?");
+            where_sql.push_str(" AND status_code = ?");
             binds.push(Bv::Str(span_status_to_str(status).to_owned()));
         }
         if let Some(min_dur) = query.min_duration_ms {
-            sql.push_str(" AND duration_ms >= ?");
+            where_sql.push_str(" AND duration_ms >= ?");
             binds.push(Bv::F64(min_dur));
         }
         if let Some(start) = query.start_time {
-            sql.push_str(" AND start_time >= fromUnixTimestamp64Milli(?)");
+            where_sql.push_str(" AND start_time >= fromUnixTimestamp64Milli(?)");
             binds.push(Bv::I64(start.timestamp_millis()));
+            time_sql.push_str(" AND start_time >= fromUnixTimestamp64Milli(?)");
+            time_binds.push(Bv::I64(start.timestamp_millis()));
         }
         if let Some(end) = query.end_time {
-            sql.push_str(" AND start_time <= fromUnixTimestamp64Milli(?)");
+            where_sql.push_str(" AND start_time <= fromUnixTimestamp64Milli(?)");
             binds.push(Bv::I64(end.timestamp_millis()));
+            time_sql.push_str(" AND start_time <= fromUnixTimestamp64Milli(?)");
+            time_binds.push(Bv::I64(end.timestamp_millis()));
         }
         if let Some(did) = query.deployment_id {
-            sql.push_str(" AND deployment_id = ?");
+            where_sql.push_str(" AND deployment_id = ?");
             binds.push(Bv::I32(did));
         }
         // environment_id: CH has no JOIN to deployments; filter delegated when
@@ -1113,39 +1122,107 @@ impl OtelStorage for ClickHouseOtelStorage {
         // a separate Postgres lookup, so we skip that filter here.
         if let Some(ref attrs) = query.attributes {
             for (key, value) in attrs {
-                sql.push_str(" AND JSONExtractString(attributes, ?) = ?");
+                where_sql.push_str(" AND JSONExtractString(attributes, ?) = ?");
                 binds.push(Bv::Str(key.clone()));
                 binds.push(Bv::Str(value.clone()));
             }
         }
         if let Some(ref pattern) = query.name_pattern {
-            sql.push_str(" AND name ILIKE ?");
+            where_sql.push_str(" AND name ILIKE ?");
             binds.push(Bv::Str(format!("%{}%", escape_like_pattern(pattern))));
         }
         if query.root_only {
             // Root spans use the '' sentinel for parent_span_id in the CH
             // schema (0001_spans.sql) — the NULL analog of TimescaleDB's
             // `parent_span_id IS NULL`.
-            sql.push_str(" AND parent_span_id = ''");
+            where_sql.push_str(" AND parent_span_id = ''");
         }
 
         // ORDER BY — enum-derived, injection-safe.
         let order_dir = query.sort_order.as_sql();
-        match query.sort_by {
-            crate::types::TraceSortField::Duration => {
-                sql.push_str(&format!(" ORDER BY duration_ms {order_dir}"));
-            }
-            crate::types::TraceSortField::StartTime => {
-                sql.push_str(&format!(" ORDER BY start_time {order_dir}"));
-            }
-        }
-        sql.push_str(" LIMIT ? OFFSET ?");
-        binds.push(Bv::I64(limit as i64));
-        binds.push(Bv::I64(offset as i64));
+        let order_sql = match query.sort_by {
+            crate::types::TraceSortField::Duration => format!("duration_ms {order_dir}"),
+            crate::types::TraceSortField::StartTime => format!("start_time {order_dir}"),
+        };
+
+        // The full row projection, shared by both assemblies below.
+        const SPAN_COLUMNS: &str = "project_id, deployment_id, service_name, service_version, \
+             deployment_environment, trace_id, span_id, parent_span_id, name, kind, \
+             toUnixTimestamp64Milli(start_time) AS start_time_ms, \
+             toUnixTimestamp64Milli(end_time) AS end_time_ms, \
+             duration_ms, status_code, status_message, attributes, events";
+
+        // NO FINAL in either form below. 0001_spans.sql reserves FINAL for reads
+        // "where dedup correctness is required (trace summaries list)"; this is a
+        // LIMIT-ed span list feeding the Observe console and the Traces page. A
+        // retried OTLP batch showing one span twice until the next merge is
+        // acceptable there; a merge-on-read pass over every part is not.
+        let (sql, all_binds) = if query.trace_id.is_some() {
+            // ── Single stage ─────────────────────────────────────────────────
+            // A trace_id-anchored query already matches a prefix of the sort key
+            // (project_id, trace_id, span_id), so ClickHouse reads one contiguous
+            // block and satisfies the LIMIT almost immediately. Splitting it in
+            // two would read that same prefix twice for nothing — measured on the
+            // 159.8M-span set: 8.0ms single-stage vs 14.6ms two-stage.
+            let sql =
+                format!("SELECT {SPAN_COLUMNS} FROM spans WHERE {where_sql} ORDER BY {order_sql} LIMIT ? OFFSET ?");
+            let mut all_binds = binds;
+            all_binds.push(Bv::I64(limit as i64));
+            all_binds.push(Bv::I64(offset as i64));
+            (sql, all_binds)
+        } else {
+            // ── Two stages ───────────────────────────────────────────────────
+            //
+            // Stage 1 (inner) resolves WHICH spans belong on the page, selecting
+            // only the identity columns. Stage 2 (outer) reads the wide row —
+            // including the `attributes` / `events` JSON blobs, which dominate
+            // the row size — for the ≤100 spans that survived, looking them up
+            // by (project_id, trace_id, span_id), the table's primary key.
+            //
+            // The single-stage form this replaces asked ClickHouse to
+            // materialise every column, blobs included, for every row matching
+            // the filter before sorting and discarding all but 100 of them.
+            // Without a trace_id, ordering by start_time has no sort-key prefix
+            // to lean on (trace_id is a random hash), so "every matching row"
+            // meant the project's entire month.
+            //
+            // Splitting the query also lets stage 1 be served by the
+            // `proj_recent` projection (0007_spans_recent_projection.sql), which
+            // stores exactly these narrow columns ordered by
+            // (project_id, start_time). The projection cannot serve the
+            // single-stage query at all, because that one selects blob columns
+            // the projection does not contain.
+            //
+            // Measured on 159.8M spans (150M in one project), root spans, 24h
+            // window, LIMIT 100: 5050ms single-stage with FINAL → 132ms here,
+            // with a byte-identical result set.
+            let inner_sql = format!(
+                "SELECT trace_id, span_id FROM spans WHERE {where_sql} \
+                 ORDER BY {order_sql} LIMIT ? OFFSET ?"
+            );
+            let sql = format!(
+                "SELECT {SPAN_COLUMNS} \
+                 FROM spans \
+                 WHERE project_id = ?{time_sql} AND (trace_id, span_id) IN ({inner_sql}) \
+                 ORDER BY {order_sql}"
+            );
+
+            // Bind order must match the rendered placeholder order: the outer
+            // project_id and time bounds come first (they precede the subquery
+            // in the statement), then the subquery's own binds, then
+            // LIMIT/OFFSET.
+            let mut all_binds: Vec<Bv> = Vec::with_capacity(binds.len() + time_binds.len() + 3);
+            all_binds.push(Bv::I32(query.project_id));
+            all_binds.extend(time_binds);
+            all_binds.extend(binds);
+            all_binds.push(Bv::I64(limit as i64));
+            all_binds.push(Bv::I64(offset as i64));
+            (sql, all_binds)
+        };
 
         // Apply binds sequentially to the query builder.
         let mut q = self.ch.query(&sql);
-        for b in binds {
+        for b in all_binds {
             q = match b {
                 Bv::I32(v) => q.bind(v),
                 Bv::I64(v) => q.bind(v),

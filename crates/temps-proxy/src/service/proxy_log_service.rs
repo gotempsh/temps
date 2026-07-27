@@ -570,6 +570,39 @@ impl ProxyLogService {
         (query, has_filters)
     }
 
+    /// Lower bound applied to `GET /proxy-logs` when the caller supplies no
+    /// `start_date`.
+    ///
+    /// An unbounded listing has to consider the whole retention window — 30
+    /// days of one-row-per-HTTP-request traffic, which is 100M+ rows on a busy
+    /// deployment — to return 20 rows. That is never what a caller wants and it
+    /// is the single most expensive query the API can be asked to run, so the
+    /// endpoint is always time-bounded. Callers that want a wider window pass
+    /// `start_date` explicitly; the UI's time-range picker does exactly that.
+    pub const DEFAULT_LIST_LOOKBACK_HOURS: i64 = 24;
+
+    /// Resolve the effective lower time bound for a listing.
+    ///
+    /// Applied whenever `start_date` is absent, anchored to `end_date` when one
+    /// was given so an explicit upper bound still returns the window ending
+    /// there rather than a window ending now.
+    fn effective_start_date(
+        start_date: Option<UtcDateTime>,
+        end_date: Option<UtcDateTime>,
+    ) -> Option<UtcDateTime> {
+        if start_date.is_some() {
+            return start_date;
+        }
+        let anchor = end_date.unwrap_or_else(chrono::Utc::now);
+        // Checked arithmetic: `anchor` can come straight from a user-supplied
+        // query parameter, and a bare subtraction panics on overflow.
+        Some(
+            anchor
+                .checked_sub_signed(chrono::Duration::hours(Self::DEFAULT_LIST_LOOKBACK_HOURS))
+                .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC),
+        )
+    }
+
     pub async fn list_with_filters(
         &self,
         start_date: Option<UtcDateTime>,
@@ -578,6 +611,11 @@ impl ProxyLogService {
         page: u64,
         page_size: u64,
     ) -> Result<(Vec<proxy_logs::Model>, u64), ProxyLogServiceError> {
+        // Bound the window before dispatching so BOTH storage backends get the
+        // same treatment — the TimescaleDB hypertable needs chunk exclusion for
+        // the same reason ClickHouse needs partition pruning.
+        let start_date = Self::effective_start_date(start_date, end_date);
+
         if let Some(storage) = &self.storage {
             return storage
                 .list_with_filters(start_date, end_date, filters, page, page_size)
@@ -2203,6 +2241,70 @@ pub struct ProjectHealthSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Default listing window ────────────────────────────────────────────
+    // `GET /proxy-logs` must never issue an unbounded scan: on a 100M-row
+    // deployment that means considering the whole retention window to return
+    // 20 rows.
+
+    #[test]
+    fn effective_start_date_defaults_to_24h_before_now_when_both_absent() {
+        let before = chrono::Utc::now();
+        let start = ProxyLogService::effective_start_date(None, None)
+            .expect("a lower bound is always produced");
+        let after = chrono::Utc::now();
+
+        assert!(
+            start >= before - chrono::Duration::hours(24)
+                && start <= after - chrono::Duration::hours(24),
+            "expected ~24h before now, got {start}"
+        );
+    }
+
+    #[test]
+    fn effective_start_date_anchors_to_end_date_when_only_end_given() {
+        let end = chrono::DateTime::parse_from_rfc3339("2026-07-20T12:00:00Z")
+            .expect("valid fixture timestamp")
+            .with_timezone(&chrono::Utc);
+
+        let start = ProxyLogService::effective_start_date(None, Some(end))
+            .expect("a lower bound is always produced");
+
+        // Window ends where the caller asked, not at "now".
+        assert_eq!(start, end - chrono::Duration::hours(24));
+    }
+
+    #[test]
+    fn effective_start_date_preserves_an_explicit_start() {
+        let start = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .expect("valid fixture timestamp")
+            .with_timezone(&chrono::Utc);
+        let end = chrono::DateTime::parse_from_rfc3339("2026-07-20T12:00:00Z")
+            .expect("valid fixture timestamp")
+            .with_timezone(&chrono::Utc);
+
+        // An explicit start is never narrowed — widening the window past 24h
+        // is exactly how the UI's time-range picker works.
+        assert_eq!(
+            ProxyLogService::effective_start_date(Some(start), Some(end)),
+            Some(start)
+        );
+        assert_eq!(
+            ProxyLogService::effective_start_date(Some(start), None),
+            Some(start)
+        );
+    }
+
+    #[test]
+    fn effective_start_date_saturates_instead_of_panicking_on_underflow() {
+        // `end_date` reaches the service straight from a query parameter, so a
+        // near-MIN value must not panic the subtraction.
+        let end = chrono::DateTime::<chrono::Utc>::MIN_UTC;
+        assert_eq!(
+            ProxyLogService::effective_start_date(None, Some(end)),
+            Some(chrono::DateTime::<chrono::Utc>::MIN_UTC)
+        );
+    }
 
     #[test]
     fn test_is_valid_interval_valid_formats() {

@@ -969,13 +969,21 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
         };
 
         // ── COUNT(*) total (same WHERE) ──────────────────────────────────────
-        // FINAL: proxy_logs is a ReplacingMergeTree, and an insert retry or a
-        // re-run of the TimescaleDB→ClickHouse backfill can leave duplicate rows
-        // that ClickHouse only collapses on a later merge — and two copies in
-        // different parts may never merge together without OPTIMIZE. Without
-        // FINAL this count() over-reports the pagination total. FINAL forces
-        // merge-on-read so the total matches the deduplicated result set.
-        let count_sql = format!("SELECT count() AS cnt FROM proxy_logs FINAL {where_clause}");
+        // NO FINAL — deliberate, restoring the design stated in
+        // 0001_proxy_logs.sql: "the high-volume read paths (list + the 7
+        // aggregations) GROUP BY or LIMIT and tolerate the rare pre-merge
+        // duplicate, so they do NOT use FINAL (keeps the hot scans fast)".
+        //
+        // FINAL forces merge-on-read across every part in every partition. On
+        // an unfiltered listing that turns this count from a metadata-only
+        // lookup (1.2ms in the DDL benchmark) into a full-table merge scan —
+        // multiple seconds once the table reaches 100M+ rows, which is what
+        // made `GET /proxy-logs` unusable. proxy_logs is a ReplacingMergeTree
+        // only so a retried batch is idempotent; duplicates are rare, transient
+        // (collapsed at the next merge), and at worst inflate this total by a
+        // handful of rows out of millions. A pagination total is not worth a
+        // full merge scan for that.
+        let count_sql = format!("SELECT count() AS cnt FROM proxy_logs {where_clause}");
         let (_, count_binds, _) = Self::build_list_where(start_date, end_date, &filters);
         let count_q = apply_binds(self.client.query(&count_sql), count_binds);
         let total = count_q
@@ -990,6 +998,11 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
         // ── Page fetch ───────────────────────────────────────────────────────
         // ORDER BY column is allowlist-derived; direction is a fixed enum. Both
         // are safe to interpolate (no user string reaches the SQL).
+        //
+        // NO FINAL here either (see the count note above). A LIMIT-ed page is
+        // exactly the shape the DDL calls out as duplicate-tolerant: the worst
+        // case is one retried request showing twice on a page until the next
+        // merge, versus merge-on-read over every part on every page load.
         let order_col = sort_column(filters.sort_by.as_deref());
         let order_dir = match filters.sort_order.as_deref() {
             Some("asc") => "ASC",
@@ -1005,7 +1018,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                 container_id, upstream_host, error_message, client_ip, user_agent, referrer, \
                 request_id, ip_geolocation_id, browser, browser_version, operating_system, \
                 device_type, is_bot, bot_name, request_size_bytes, response_size_bytes, cache_status \
-             FROM proxy_logs FINAL \
+             FROM proxy_logs \
              {where_clause} \
              ORDER BY {order_col} {order_dir} \
              LIMIT ? OFFSET ?"
@@ -1066,7 +1079,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                 container_id, upstream_host, error_message, client_ip, user_agent, referrer, \
                 request_id, ip_geolocation_id, browser, browser_version, operating_system, \
                 device_type, is_bot, bot_name, request_size_bytes, response_size_bytes, cache_status \
-             FROM proxy_logs FINAL \
+             FROM proxy_logs \
              {where_clause} \
              ORDER BY {order_col} {order_dir} \
              LIMIT ?"
@@ -1176,10 +1189,10 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
             Self::append_stats_filters(f, &mut clauses, &mut binds);
         }
 
-        // FINAL: dedup ReplacingMergeTree before count() (see the list-count
-        // note above) so retried inserts / backfill re-runs don't inflate this.
+        // NO FINAL (see the list-count note above). This is one of the seven
+        // aggregations the DDL explicitly designates duplicate-tolerant.
         let sql = format!(
-            "SELECT count() AS cnt FROM proxy_logs FINAL WHERE {}",
+            "SELECT count() AS cnt FROM proxy_logs WHERE {}",
             clauses.join(" AND ")
         );
         let q = apply_binds(self.client.query(&sql), binds);
@@ -1245,7 +1258,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                 countIf(status_code >= 400) AS error_count, \
                 sum(ifNull(request_size_bytes, 0)) AS total_request_bytes, \
                 sum(ifNull(response_size_bytes, 0)) AS total_response_bytes \
-             FROM proxy_logs FINAL \
+             FROM proxy_logs \
              WHERE {where_clause} \
              GROUP BY bucket_ms \
              ORDER BY bucket_ms ASC \
@@ -1324,7 +1337,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                 count() AS total_requests, \
                 countIf(status_code >= 500) AS total_errors, \
                 ifNull(avg(response_time_ms), 0) AS avg_response_time_ms \
-             FROM proxy_logs FINAL \
+             FROM proxy_logs \
              WHERE {} \
              GROUP BY project_id",
             clauses.join(" AND ")
@@ -1437,7 +1450,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                 count() AS request_count, \
                 uniqExact(client_ip) AS unique_ips, \
                 toUnixTimestamp64Milli(max(timestamp)) AS last_seen_ms \
-             FROM proxy_logs FINAL \
+             FROM proxy_logs \
              WHERE {where_clause} \
              GROUP BY bot_name \
              ORDER BY request_count DESC \
@@ -1515,7 +1528,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                 count() AS request_count, \
                 uniqExact(bot_name) AS agent_count, \
                 toUnixTimestamp64Milli(max(timestamp)) AS last_seen_ms \
-             FROM proxy_logs FINAL \
+             FROM proxy_logs \
              WHERE {where_clause} \
              GROUP BY path \
              ORDER BY request_count DESC \
@@ -1598,7 +1611,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                 toInt64(toUnixTimestamp(toStartOfInterval(timestamp, INTERVAL {step} SECOND))) * 1000 AS bucket_ms, \
                 bot_name AS agent, \
                 count() AS request_count \
-             FROM proxy_logs FINAL \
+             FROM proxy_logs \
              WHERE {where_clause} \
              GROUP BY bucket_ms, bot_name \
              ORDER BY bucket_ms ASC \
@@ -1715,7 +1728,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                     status_code >= 500 AND status_code < 600, '5xx', \
                     'other') AS status_class, \
                 count() AS request_count \
-             FROM proxy_logs FINAL \
+             FROM proxy_logs \
              WHERE {where_clause} \
              GROUP BY status_class \
              ORDER BY request_count DESC"

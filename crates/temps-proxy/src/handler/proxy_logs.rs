@@ -58,9 +58,15 @@ pub struct ProxyLogsQuery {
     pub visitor_id: Option<i32>,
 
     // Date range filters
-    /// Start date for filtering (ISO 8601 format)
+    /// Start date for filtering (ISO 8601 format).
+    ///
+    /// **Defaults to 24 hours before `end_date` (or before now) when omitted.**
+    /// The listing is always time-bounded: an unbounded query would have to
+    /// consider the entire retention window — 100M+ rows on a busy deployment —
+    /// to return a single page. Pass an explicit `start_date` to widen the
+    /// window, up to the configured retention horizon.
     pub start_date: Option<DateTime>,
-    /// End date for filtering (ISO 8601 format)
+    /// End date for filtering (ISO 8601 format). Defaults to now.
     pub end_date: Option<DateTime>,
 
     // Request filters

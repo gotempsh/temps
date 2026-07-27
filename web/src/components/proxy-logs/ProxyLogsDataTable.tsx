@@ -43,6 +43,7 @@ import {
   ChevronRight as ChevronExpand,
   ChevronsLeft,
   ChevronsRight,
+  Clock,
   Columns,
   ExternalLink,
   Filter,
@@ -50,13 +51,60 @@ import {
   Search,
   X,
 } from 'lucide-react'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useSearchParams } from 'react-router'
 
 interface ProxyLogsDataTableProps {
   projectId?: number
   environmentId?: number
   onRowClick?: (log: ProxyLogResponse) => void
+}
+
+/**
+ * Time window for the listing. The API bounds the query to the last 24h when
+ * no `start_date` is sent (see ProxyLogService::DEFAULT_LIST_LOOKBACK_HOURS),
+ * so the table always sends an explicit window rather than relying on that
+ * fallback — the user should be able to see and change what they are looking
+ * at, and widening the window is a deliberate, visible act.
+ *
+ * `custom` hands control to the start_date/end_date fields in the advanced
+ * filter panel.
+ */
+type TimeRange = '30m' | '6h' | '12h' | '24h' | '3d' | '7d' | 'custom'
+
+const DEFAULT_TIME_RANGE: TimeRange = '24h'
+
+const TIME_RANGES: { value: TimeRange; label: string }[] = [
+  { value: '30m', label: 'Last 30 minutes' },
+  { value: '6h', label: 'Last 6 hours' },
+  { value: '12h', label: 'Last 12 hours' },
+  { value: '24h', label: 'Last 24 hours' },
+  { value: '3d', label: 'Last 3 days' },
+  { value: '7d', label: 'Last 7 days' },
+  { value: 'custom', label: 'Custom range' },
+]
+
+const RANGE_MS: Record<Exclude<TimeRange, 'custom'>, number> = {
+  '30m': 30 * 60 * 1000,
+  '6h': 6 * 60 * 60 * 1000,
+  '12h': 12 * 60 * 60 * 1000,
+  '24h': 24 * 60 * 60 * 1000,
+  '3d': 3 * 24 * 60 * 60 * 1000,
+  '7d': 7 * 24 * 60 * 60 * 1000,
+}
+
+function isTimeRange(v: string | null): v is TimeRange {
+  return !!v && TIME_RANGES.some((r) => r.value === v)
+}
+
+/**
+ * Resolve a preset to the ISO start instant to send as `start_date`.
+ *
+ * Mirrors `timeRangeToFromDate` in Observe.tsx — the clock read lives in a
+ * module-level function so the caller's `useMemo` body stays pure.
+ */
+function timeRangeToStartDate(range: Exclude<TimeRange, 'custom'>): string {
+  return new Date(Date.now() - RANGE_MS[range]).toISOString()
 }
 
 interface FilterState {
@@ -264,6 +312,16 @@ export function ProxyLogsDataTable({
     return searchParams.get('filters') === 'open'
   })
 
+  const [timeRange, setTimeRange] = useState<TimeRange>(() => {
+    const v = searchParams.get('time_range')
+    if (isTimeRange(v)) return v
+    // A URL carrying explicit dates but no time_range (an older bookmark, or a
+    // hand-built link) is a custom window by definition.
+    return searchParams.get('start_date') || searchParams.get('end_date')
+      ? 'custom'
+      : DEFAULT_TIME_RANGE
+  })
+
   const [filters, setFilters] = useState<FilterState>(() =>
     parseFiltersFromParams(searchParams)
   )
@@ -288,9 +346,19 @@ export function ProxyLogsDataTable({
     if (sortBy !== 'timestamp') params.set('sort_by', sortBy)
     if (sortOrder !== 'desc') params.set('sort_order', sortOrder)
     if (showFilters) params.set('filters', 'open')
+    if (timeRange !== DEFAULT_TIME_RANGE) params.set('time_range', timeRange)
     serializeFiltersToParams(filters, params)
     setSearchParams(params, { replace: true })
-  }, [page, pageSize, sortBy, sortOrder, showFilters, filters, setSearchParams])
+  }, [
+    page,
+    pageSize,
+    sortBy,
+    sortOrder,
+    showFilters,
+    timeRange,
+    filters,
+    setSearchParams,
+  ])
 
   useEffect(() => {
     // Skip the initial mount to avoid overwriting params we just read from
@@ -313,6 +381,24 @@ export function ProxyLogsDataTable({
     })
   }, [])
 
+  /**
+   * The window actually sent to the API.
+   *
+   * Deliberately memoised on the RANGE, not on wall-clock time: a preset like
+   * "Last 24 hours" resolves to a fixed instant that only moves when the user
+   * changes the range or the query refetches. Recomputing `Date.now()` on every
+   * render would make the query key unstable and refetch on every keystroke.
+   */
+  const timeWindow = useMemo(() => {
+    if (timeRange === 'custom') {
+      return {
+        start: filters.start_date || null,
+        end: filters.end_date || null,
+      }
+    }
+    return { start: timeRangeToStartDate(timeRange), end: null }
+  }, [timeRange, filters.start_date, filters.end_date])
+
   const { data, isLoading, error } = useQuery({
     ...getProxyLogsOptions({
       query: {
@@ -321,8 +407,8 @@ export function ProxyLogsDataTable({
         deployment_id: filters.deployment_id
           ? parseInt(filters.deployment_id)
           : null,
-        start_date: filters.start_date || null,
-        end_date: filters.end_date || null,
+        start_date: timeWindow.start,
+        end_date: timeWindow.end,
         method: filters.method || null,
         host: filters.host || null,
         path: filters.path || null,
@@ -405,12 +491,38 @@ export function ProxyLogsDataTable({
 
   const applyFilters = () => {
     setFilters(pendingFilters)
+    // Typing an explicit date in the advanced panel IS choosing a custom
+    // window — reflect that in the picker instead of silently ignoring the
+    // dates because a preset is still selected.
+    if (pendingFilters.start_date || pendingFilters.end_date) {
+      setTimeRange('custom')
+    }
     setPage(1)
   }
 
   const clearFilters = () => {
     setFilters({})
     setPendingFilters({})
+    setTimeRange(DEFAULT_TIME_RANGE)
+    setPage(1)
+  }
+
+  const changeTimeRange = (next: TimeRange) => {
+    setTimeRange(next)
+    // A preset owns the window outright; leaving stale start/end values behind
+    // would show a range the picker no longer describes.
+    if (next !== 'custom') {
+      setFilters((prev) => ({
+        ...prev,
+        start_date: undefined,
+        end_date: undefined,
+      }))
+      setPendingFilters((prev) => ({
+        ...prev,
+        start_date: undefined,
+        end_date: undefined,
+      }))
+    }
     setPage(1)
   }
 
@@ -468,9 +580,7 @@ export function ProxyLogsDataTable({
     ]
 
   const aiAgentActive =
-    filters.is_ai_agent === true ||
-    !!filters.ai_provider ||
-    !!filters.ai_agent
+    filters.is_ai_agent === true || !!filters.ai_provider || !!filters.ai_agent
 
   return (
     <div className="space-y-4">
@@ -553,6 +663,25 @@ export function ProxyLogsDataTable({
       {/* Toolbar */}
       <div className="flex items-center justify-between gap-4 flex-wrap">
         <div className="flex items-center gap-2">
+          {/* Time range. The listing is always bounded (the API defaults to
+              24h when no start_date is sent), so this control is the primary
+              way to reach older traffic — up to the retention horizon. */}
+          <Select
+            value={timeRange}
+            onValueChange={(v) => changeTimeRange(v as TimeRange)}
+          >
+            <SelectTrigger className="w-full sm:w-[170px]">
+              <Clock className="h-4 w-4 mr-2 shrink-0 opacity-60" />
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {TIME_RANGES.map((r) => (
+                <SelectItem key={r.value} value={r.value}>
+                  {r.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
           <Button
             variant={showFilters ? 'default' : 'outline'}
             size="sm"
@@ -953,9 +1082,9 @@ export function ProxyLogsDataTable({
                   <SelectContent>
                     <SelectItem value="all">All agents</SelectItem>
                     {(pendingFilters.ai_provider
-                      ? AI_PROVIDERS.find(
+                      ? (AI_PROVIDERS.find(
                           (p) => p.provider === pendingFilters.ai_provider
-                        )?.agents ?? []
+                        )?.agents ?? [])
                       : AI_PROVIDERS.flatMap((p) => p.agents)
                     ).map((agent) => (
                       <SelectItem key={agent} value={agent}>
@@ -1336,10 +1465,7 @@ function ProxyLogTableRow({
 }: ProxyLogTableRowProps) {
   return (
     <>
-      <TableRow
-        className="cursor-pointer hover:bg-muted/50"
-        onClick={onToggle}
-      >
+      <TableRow className="cursor-pointer hover:bg-muted/50" onClick={onToggle}>
         <TableCell className="w-8 px-2">
           <ChevronExpand
             className={`h-4 w-4 text-muted-foreground transition-transform duration-200 ${
@@ -1576,11 +1702,7 @@ function ProxyLogInlineDetail({ log }: { log: ProxyLogResponse }) {
       <div className="flex items-center gap-2 text-xs text-muted-foreground">
         <span>Request ID:</span>
         <code className="font-mono">{log.request_id}</code>
-        <CopyButton
-          value={log.request_id}
-          minimal
-          className="h-4 w-4 p-0"
-        />
+        <CopyButton value={log.request_id} minimal className="h-4 w-4 p-0" />
       </div>
 
       {/* User Agent */}
