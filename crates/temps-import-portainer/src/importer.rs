@@ -660,7 +660,7 @@ impl PortainerImporter {
                         .unwrap_or(false);
                     if insecure_tls_skip_verify {
                         warnings.push(
-                            "Connecting to this Portainer instance skips TLS certificate verification (its default self-signed certificate isn't trusted) — the admin password travels over an unverified connection. Set credentials.extra[\"verify_tls\"] = \"true\" if this instance has a trusted certificate.".to_string(),
+                            "Connecting to this Portainer instance skips TLS certificate verification (credentials.extra[\"verify_tls\"] = \"false\" was set) — the admin password travels over an unverified connection. Remove that override once this instance has a trusted certificate.".to_string(),
                         );
                     }
                     warnings
@@ -697,7 +697,7 @@ impl WorkloadImporter for PortainerImporter {
         &self,
         credentials: &ImportCredentials,
     ) -> ImportResult<CredentialValidation> {
-        let client = match PortainerClient::from_credentials(credentials) {
+        let client = match PortainerClient::from_credentials(credentials).await {
             Ok(client) => client,
             Err(e) => {
                 return Ok(CredentialValidation {
@@ -732,7 +732,9 @@ impl WorkloadImporter for PortainerImporter {
         credentials: &ImportCredentials,
         selector: ImportSelector,
     ) -> ImportResult<Vec<WorkloadDescriptor>> {
-        let client = PortainerClient::from_credentials(credentials).map_err(ImportError::from)?;
+        let client = PortainerClient::from_credentials(credentials)
+            .await
+            .map_err(ImportError::from)?;
         let jwt = client.login().await.map_err(ImportError::from)?;
         let endpoints = client.endpoints(&jwt).await.map_err(ImportError::from)?;
         if endpoints.is_empty() {
@@ -812,7 +814,9 @@ impl WorkloadImporter for PortainerImporter {
         credentials: &ImportCredentials,
         workload_id: &WorkloadId,
     ) -> ImportResult<WorkloadSnapshot> {
-        let client = PortainerClient::from_credentials(credentials).map_err(ImportError::from)?;
+        let client = PortainerClient::from_credentials(credentials)
+            .await
+            .map_err(ImportError::from)?;
         let jwt = client.login().await.map_err(ImportError::from)?;
         let (endpoint_id, _kind, name) =
             parse_workload_id(workload_id.as_str()).ok_or_else(|| {
@@ -851,7 +855,9 @@ impl WorkloadImporter for PortainerImporter {
         credentials: &ImportCredentials,
         workload_id: &WorkloadId,
     ) -> ImportResult<ProjectSnapshot> {
-        let client = PortainerClient::from_credentials(credentials).map_err(ImportError::from)?;
+        let client = PortainerClient::from_credentials(credentials)
+            .await
+            .map_err(ImportError::from)?;
         let jwt = client.login().await.map_err(ImportError::from)?;
         let (endpoint_id, kind, name) =
             parse_workload_id(workload_id.as_str()).ok_or_else(|| {

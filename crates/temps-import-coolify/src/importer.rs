@@ -834,7 +834,7 @@ impl WorkloadImporter for CoolifyImporter {
         &self,
         credentials: &ImportCredentials,
     ) -> ImportResult<CredentialValidation> {
-        let client = match CoolifyClient::from_credentials(credentials) {
+        let client = match CoolifyClient::from_credentials(credentials).await {
             Ok(client) => client,
             Err(e) => {
                 return Ok(CredentialValidation {
@@ -866,7 +866,9 @@ impl WorkloadImporter for CoolifyImporter {
         credentials: &ImportCredentials,
         selector: ImportSelector,
     ) -> ImportResult<Vec<WorkloadDescriptor>> {
-        let client = CoolifyClient::from_credentials(credentials).map_err(ImportError::from)?;
+        let client = CoolifyClient::from_credentials(credentials)
+            .await
+            .map_err(ImportError::from)?;
         let applications = client.applications().await.map_err(ImportError::from)?;
         let databases = client.databases().await.map_err(ImportError::from)?;
 
@@ -915,7 +917,9 @@ impl WorkloadImporter for CoolifyImporter {
         credentials: &ImportCredentials,
         workload_id: &WorkloadId,
     ) -> ImportResult<WorkloadSnapshot> {
-        let client = CoolifyClient::from_credentials(credentials).map_err(ImportError::from)?;
+        let client = CoolifyClient::from_credentials(credentials)
+            .await
+            .map_err(ImportError::from)?;
         let applications = client.applications().await.map_err(ImportError::from)?;
         let app = applications
             .iter()
@@ -937,7 +941,9 @@ impl WorkloadImporter for CoolifyImporter {
         credentials: &ImportCredentials,
         workload_id: &WorkloadId,
     ) -> ImportResult<ProjectSnapshot> {
-        let client = CoolifyClient::from_credentials(credentials).map_err(ImportError::from)?;
+        let client = CoolifyClient::from_credentials(credentials)
+            .await
+            .map_err(ImportError::from)?;
         let applications = client.applications().await.map_err(ImportError::from)?;
         let databases = client.databases().await.map_err(ImportError::from)?;
 

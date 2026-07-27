@@ -799,7 +799,7 @@ impl WorkloadImporter for DokployImporter {
         &self,
         credentials: &ImportCredentials,
     ) -> ImportResult<CredentialValidation> {
-        let client = match DokployClient::from_credentials(credentials) {
+        let client = match DokployClient::from_credentials(credentials).await {
             Ok(client) => client,
             Err(e) => {
                 return Ok(CredentialValidation {
@@ -831,7 +831,9 @@ impl WorkloadImporter for DokployImporter {
         credentials: &ImportCredentials,
         selector: ImportSelector,
     ) -> ImportResult<Vec<WorkloadDescriptor>> {
-        let client = DokployClient::from_credentials(credentials).map_err(ImportError::from)?;
+        let client = DokployClient::from_credentials(credentials)
+            .await
+            .map_err(ImportError::from)?;
         let projects = client.projects().await.map_err(ImportError::from)?;
 
         // Database stubs in project.all carry no name; Dokploy has no
@@ -937,7 +939,9 @@ impl WorkloadImporter for DokployImporter {
         credentials: &ImportCredentials,
         workload_id: &WorkloadId,
     ) -> ImportResult<WorkloadSnapshot> {
-        let client = DokployClient::from_credentials(credentials).map_err(ImportError::from)?;
+        let client = DokployClient::from_credentials(credentials)
+            .await
+            .map_err(ImportError::from)?;
         let app = client
             .application(workload_id.as_str())
             .await
@@ -950,7 +954,9 @@ impl WorkloadImporter for DokployImporter {
         credentials: &ImportCredentials,
         workload_id: &WorkloadId,
     ) -> ImportResult<ProjectSnapshot> {
-        let client = DokployClient::from_credentials(credentials).map_err(ImportError::from)?;
+        let client = DokployClient::from_credentials(credentials)
+            .await
+            .map_err(ImportError::from)?;
         let projects = client.projects().await.map_err(ImportError::from)?;
 
         let (project, environment) = locate_application(&projects, workload_id.as_str())

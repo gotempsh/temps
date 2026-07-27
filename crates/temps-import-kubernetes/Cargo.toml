@@ -27,3 +27,4 @@ async-trait = { workspace = true }
 sea-orm = { workspace = true }
 reqwest = { workspace = true }
 base64 = { workspace = true }
+url = { workspace = true }

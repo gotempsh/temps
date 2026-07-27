@@ -152,11 +152,11 @@ fn resolve_credentials(
     resolve_kubeconfig(&yaml, credentials.extra.get("context").map(|s| s.as_str()))
 }
 
-fn build_client(
+async fn build_client(
     credentials: &ImportCredentials,
 ) -> Result<(KubeClient, ResolvedKubeconfig), KubernetesImportError> {
     let config = resolve_credentials(credentials)?;
-    let client = KubeClient::new(&config)?;
+    let client = KubeClient::new(&config).await?;
     Ok((client, config))
 }
 
@@ -713,7 +713,7 @@ impl WorkloadImporter for KubernetesImporter {
         &self,
         credentials: &ImportCredentials,
     ) -> ImportResult<CredentialValidation> {
-        let (client, config) = match build_client(credentials) {
+        let (client, config) = match build_client(credentials).await {
             Ok(pair) => pair,
             Err(e) => {
                 return Ok(CredentialValidation {
@@ -745,7 +745,7 @@ impl WorkloadImporter for KubernetesImporter {
         credentials: &ImportCredentials,
         selector: ImportSelector,
     ) -> ImportResult<Vec<WorkloadDescriptor>> {
-        let (client, config) = build_client(credentials)?;
+        let (client, config) = build_client(credentials).await?;
         info!("Discovering Kubernetes workloads on {}", config.server);
 
         let deployments: Vec<Deployment> = client
@@ -895,7 +895,7 @@ impl WorkloadImporter for KubernetesImporter {
         credentials: &ImportCredentials,
         workload_id: &WorkloadId,
     ) -> ImportResult<WorkloadSnapshot> {
-        let (client, _) = build_client(credentials)?;
+        let (client, _) = build_client(credentials).await?;
         let workload_ref = WorkloadRef::parse(workload_id)?;
         Ok(self.describe_internal(&client, &workload_ref).await?)
     }
@@ -905,7 +905,7 @@ impl WorkloadImporter for KubernetesImporter {
         credentials: &ImportCredentials,
         workload_id: &WorkloadId,
     ) -> ImportResult<ProjectSnapshot> {
-        let (client, _) = build_client(credentials)?;
+        let (client, _) = build_client(credentials).await?;
         let workload_ref = WorkloadRef::parse(workload_id)?;
         let namespace = workload_ref.namespace.clone();
 

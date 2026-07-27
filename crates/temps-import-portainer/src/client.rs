@@ -16,7 +16,7 @@ use crate::model::{
 };
 use serde::de::DeserializeOwned;
 use std::time::Duration;
-use temps_core::url_validation::validate_external_url;
+use temps_core::url_validation::{resolve_and_validate_domain, validate_external_url};
 use temps_import_types::ImportCredentials;
 
 /// HTTP client bound to one Portainer instance
@@ -28,8 +28,22 @@ pub struct PortainerClient {
     skip_tls_verify: bool,
 }
 
+/// Substrings that show up in TLS handshake failures across the TLS
+/// backends reqwest can be built with. Used only to turn a raw connect
+/// error into an actionable hint -- never to change control flow.
+fn looks_like_cert_error(e: &reqwest::Error) -> bool {
+    let s = e.to_string().to_lowercase();
+    e.is_connect()
+        && (s.contains("certificate")
+            || s.contains("self signed")
+            || s.contains("self-signed")
+            || s.contains("unable to get local issuer"))
+}
+
 impl PortainerClient {
-    pub fn from_credentials(credentials: &ImportCredentials) -> Result<Self, PortainerImportError> {
+    pub async fn from_credentials(
+        credentials: &ImportCredentials,
+    ) -> Result<Self, PortainerImportError> {
         let base = credentials
             .base_url
             .as_deref()
@@ -54,27 +68,42 @@ impl PortainerClient {
                 reason: e.to_string(),
             })?;
 
-        // Portainer ships a self-signed cert on :9443 by default, so
-        // verification is skipped unless the user opts into strict
-        // verification (credentials.extra["verify_tls"] = "true" — e.g. a
-        // Portainer instance behind a real CA-issued certificate). Either
-        // way, the admin password only ever travels over this one
-        // connection — skip_tls_verify() lets the importer surface the
-        // choice to the user in the plan instead of silently deciding it.
+        // Portainer ships a self-signed cert on :9443 by default, but the
+        // admin password travels over this connection, so verification is
+        // ON unless the user explicitly opts out (credentials.extra
+        // ["verify_tls"] = "false") after seeing the certificate error --
+        // never silently by default. skip_tls_verify() lets the importer
+        // surface the choice in the plan instead of hiding it.
         let skip_tls_verify = credentials
             .extra
             .get("verify_tls")
-            .map(|v| v != "true")
-            .unwrap_or(true);
+            .map(|v| v == "false")
+            .unwrap_or(false);
 
-        let http = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
-            .danger_accept_invalid_certs(skip_tls_verify)
-            .build()
-            .map_err(|e| PortainerImportError::Http {
-                operation: "build http client".to_string(),
-                reason: e.to_string(),
-            })?;
+            .danger_accept_invalid_certs(skip_tls_verify);
+
+        // `validate_external_url` only rejects literal IPs/localhost -- a
+        // domain host could still resolve to an internal address by the time
+        // reqwest actually dials it (DNS rebinding). Re-resolve here and pin
+        // the client to the validated address(es), mirroring the webhook
+        // service's delivery-time re-validation.
+        if let Some(url::Host::Domain(domain)) = base_url.host() {
+            let port = base_url.port_or_known_default().unwrap_or(443);
+            let addrs = resolve_and_validate_domain(domain, port)
+                .await
+                .map_err(|e| PortainerImportError::InvalidBaseUrl {
+                    url: base.to_string(),
+                    reason: e.to_string(),
+                })?;
+            builder = builder.resolve_to_addrs(domain, &addrs);
+        }
+
+        let http = builder.build().map_err(|e| PortainerImportError::Http {
+            operation: "build http client".to_string(),
+            reason: e.to_string(),
+        })?;
 
         Ok(Self {
             http,
@@ -86,9 +115,10 @@ impl PortainerClient {
     }
 
     /// Whether this client accepts Portainer's certificate without
-    /// verification — true by default (Portainer's out-of-the-box
-    /// self-signed cert on :9443), false when the user opts into strict
-    /// verification via `credentials.extra["verify_tls"] = "true"`.
+    /// verification — false by default (verification is on), true only
+    /// when the user explicitly opted out via
+    /// `credentials.extra["verify_tls"] = "false"` (e.g. Portainer's
+    /// out-of-the-box self-signed cert on :9443).
     pub fn skip_tls_verify(&self) -> bool {
         self.skip_tls_verify
     }
@@ -114,9 +144,20 @@ impl PortainerClient {
             }))
             .send()
             .await
-            .map_err(|e| PortainerImportError::Http {
-                operation: operation.to_string(),
-                reason: e.to_string(),
+            .map_err(|e| {
+                let reason = if looks_like_cert_error(&e) {
+                    format!(
+                        "{e} — if this Portainer instance uses a self-signed certificate \
+                         (Portainer's default), set credentials.extra[\"verify_tls\"] = \"false\" \
+                         to accept it (not recommended over an untrusted network)"
+                    )
+                } else {
+                    e.to_string()
+                };
+                PortainerImportError::Http {
+                    operation: operation.to_string(),
+                    reason,
+                }
             })?;
 
         if !response.status().is_success() {

@@ -37,18 +37,35 @@ impl KubeClient {
     ///
     /// Validates the API server URL against the importer SSRF policy before
     /// anything else.
-    pub fn new(config: &ResolvedKubeconfig) -> Result<Self, KubernetesImportError> {
-        temps_core::url_validation::validate_external_url(&config.server).map_err(|e| {
-            KubernetesImportError::ServerUrlRejected {
-                url: config.server.clone(),
-                reason: e.to_string(),
-            }
-        })?;
+    pub async fn new(config: &ResolvedKubeconfig) -> Result<Self, KubernetesImportError> {
+        let parsed =
+            temps_core::url_validation::validate_external_url(&config.server).map_err(|e| {
+                KubernetesImportError::ServerUrlRejected {
+                    url: config.server.clone(),
+                    reason: e.to_string(),
+                }
+            })?;
 
         let mut builder = reqwest::Client::builder()
             .use_rustls_tls()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30));
+
+        // `validate_external_url` only rejects literal IPs/localhost -- a
+        // domain host could still resolve to an internal address by the time
+        // reqwest actually dials it (DNS rebinding). Re-resolve here and pin
+        // the client to the validated address(es), mirroring the webhook
+        // service's delivery-time re-validation.
+        if let Some(url::Host::Domain(domain)) = parsed.host() {
+            let port = parsed.port_or_known_default().unwrap_or(443);
+            let addrs = temps_core::url_validation::resolve_and_validate_domain(domain, port)
+                .await
+                .map_err(|e| KubernetesImportError::ServerUrlRejected {
+                    url: config.server.clone(),
+                    reason: e.to_string(),
+                })?;
+            builder = builder.resolve_to_addrs(domain, &addrs);
+        }
 
         if let Some(ca_pem) = &config.ca_pem {
             let cert = reqwest::Certificate::from_pem(ca_pem).map_err(|e| {
