@@ -144,13 +144,44 @@ Pointez n'importe quel exporter OTLP vers Temps et vous obtenez les traces distr
   <img alt="Alertes Temps — alarmes actives, acquittées et résolues sur les métriques, conteneurs, disponibilité et bases de données" src="assets/screenshots/alerts-light.png">
 </picture>
 
-### Sandboxes IA — exécution de code isolée
+### Sandboxes IA — micro-VM Firecracker, auto-hébergés
 
-Lancez des sandboxes isolés pour le travail d'agents, les tests et les commandes ponctuelles via CLI, API REST ou SDK — une API compatible Vercel Sandbox, avec des backends Docker ou micro-VM Firecracker. Exactement ce que vous paieriez sinon à E2B ou Daytona.
+**Une isolation matérielle réelle, pas seulement des conteneurs.** Les sandboxes tournent sur des **micro-VM Firecracker** — la technologie derrière AWS Lambda — avec **Docker** comme backend par défaut. Lancez `temps firecracker setup` et Temps route automatiquement les sandboxes vers des micro-VM ; chacune a son propre noyau, donc le code généré par un agent ne partage jamais le noyau de votre hôte.
+
+**Un SDK drop-in.** `@temps-sdk/sandbox` est compatible avec la forme de `@vercel/sandbox` — changez de fournisseur en changeant l'import et l'URL de base :
+
+```ts
+import { Sandbox } from '@temps-sdk/sandbox'
+
+const sandbox = await Sandbox.create({
+  source: { type: 'git', url: 'https://github.com/example/repo.git', revision: 'main' },
+})
+
+const { stdout } = await sandbox.exec(['npm', 'test'])
+const url = sandbox.domain(3000) // aperçu en direct d'un serveur de dev dans la VM
+```
+
+**Aperçus protégés par mot de passe.** Chaque port d'un sandbox peut être exposé sur une URL publique verrouillée par un mot de passe généré :
+
+```bash
+bunx @temps-sdk/cli sandbox password sbx_abc123 --rotate --length 32
+bunx @temps-sdk/cli sandbox password sbx_abc123 --clear   # la rouvrir
+```
+
+Partagez une branche en cours d'exécution sans la publier au monde entier.
+
+Également disponible via CLI et API REST. Exactement ce que vous paieriez sinon à E2B, Daytona ou Vercel Sandbox.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/sandboxes-dark.png">
-  <img alt="Sandboxes Temps — créez des sandboxes isolés via CLI, API REST ou SDK" src="assets/screenshots/sandboxes-light.png">
+  <img alt="Sandboxes Temps — sandboxes en cours d'exécution avec des extraits CLI, REST et SDK prêts à copier" src="assets/screenshots/sandboxes-light.png">
+</picture>
+
+Chaque sandbox dispose d'un shell, d'un modèle d'URL d'aperçu pour tout port qu'il ouvre, et d'une chronologie de tout ce qui lui est arrivé :
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/sandbox-detail-dark.png">
+  <img alt="Détail d'un sandbox Temps — backend Docker/Firecracker, exécuteur de commandes dans le navigateur, modèle d'URL d'aperçu et aperçus protégés par mot de passe" src="assets/screenshots/sandbox-detail-light.png">
 </picture>
 
 ### Tout dans un seul tableau de bord

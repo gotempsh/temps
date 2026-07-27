@@ -144,13 +144,44 @@ Temps 也能替你运行这些智能体：工作流沙箱会针对你的仓库�
   <img alt="Temps 告警 —— 覆盖指标、容器、可用性与数据库的触发中、已确认与已解决告警" src="assets/screenshots/alerts-light.png">
 </picture>
 
-### AI 沙箱 —— 隔离的代码执行
+### AI 沙箱 —— Firecracker 微虚拟机，自托管
 
-通过 CLI、REST API 或 SDK 为智能体任务、测试和一次性命令启动隔离沙箱 —— 兼容 Vercel Sandbox 的 API，后端可选 Docker 或 Firecracker 微虚拟机。这正是你原本要为 E2B 或 Daytona 付费的能力。
+**真正的硬件级隔离，不只是容器。** 沙箱运行在 **Firecracker 微虚拟机**上 —— 与 AWS Lambda 背后是同一套技术 —— 默认后端为 **Docker**。运行 `temps firecracker setup`，Temps 会自动把沙箱调度到微虚拟机；每个沙箱都有独立内核，智能体生成的不可信代码绝不会与你的宿主机共享内核。
+
+**可直接替换的 SDK。** `@temps-sdk/sandbox` 兼容 `@vercel/sandbox` 的形态 —— 换个 import 和 base URL 就能切换服务商：
+
+```ts
+import { Sandbox } from '@temps-sdk/sandbox'
+
+const sandbox = await Sandbox.create({
+  source: { type: 'git', url: 'https://github.com/example/repo.git', revision: 'main' },
+})
+
+const { stdout } = await sandbox.exec(['npm', 'test'])
+const url = sandbox.domain(3000) // 虚拟机内开发服务器的实时预览
+```
+
+**带密码保护的预览。** 沙箱的任意端口都可以映射到公开预览 URL，并用生成的密码锁住：
+
+```bash
+bunx @temps-sdk/cli sandbox password sbx_abc123 --rotate --length 32
+bunx @temps-sdk/cli sandbox password sbx_abc123 --clear   # 重新开放
+```
+
+分享一个正在运行的分支，而不必把它公开给所有人。
+
+同样支持 CLI 和 REST API。这正是你原本要为 E2B、Daytona 或 Vercel Sandbox 付费的能力。
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/sandboxes-dark.png">
-  <img alt="Temps 沙箱 —— 通过 CLI、REST API 或 SDK 创建隔离沙箱" src="assets/screenshots/sandboxes-light.png">
+  <img alt="Temps 沙箱 —— 运行中的沙箱，附带可直接复制的 CLI、REST 和 SDK 代码片段" src="assets/screenshots/sandboxes-light.png">
+</picture>
+
+每个沙箱都自带 shell、任意绑定端口的预览 URL 模板，以及一条完整的操作时间线：
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/sandbox-detail-dark.png">
+  <img alt="Temps 沙箱详情 —— Docker/Firecracker 后端、浏览器内命令执行器、预览 URL 模板与密码保护的预览" src="assets/screenshots/sandbox-detail-light.png">
 </picture>
 
 ### 一个仪表盘掌握全局

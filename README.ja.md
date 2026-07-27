@@ -144,13 +144,44 @@ UI から DKIM レコード付きの送信ドメインを追加し、`@temps-sdk
   <img alt="Temps のアラート —— メトリクス、コンテナ、稼働監視、データベースにまたがる発火中・確認済み・解決済みのアラーム" src="assets/screenshots/alerts-light.png">
 </picture>
 
-### AI サンドボックス —— 隔離されたコード実行
+### AI サンドボックス —— Firecracker マイクロ VM、セルフホスト
 
-エージェントの作業、テスト、単発コマンドのための隔離サンドボックスを CLI、REST API、SDK から起動できます —— Vercel Sandbox 互換 API で、バックエンドは Docker または Firecracker マイクロ VM。E2B や Daytona に支払っていた分がこれで不要になります。
+**コンテナだけではない、本物のハードウェアレベルの隔離。** サンドボックスは **Firecracker マイクロ VM**（AWS Lambda を支えるのと同じ技術）上で動き、既定のバックエンドは **Docker** です。`temps firecracker setup` を実行すれば、Temps は自動でサンドボックスをマイクロ VM に振り分けます。各サンドボックスが独自のカーネルを持つため、エージェントが生成した信頼できないコードがホストとカーネルを共有することはありません。
+
+**そのまま差し替えられる SDK。** `@temps-sdk/sandbox` は `@vercel/sandbox` と互換の形をしています —— import とベース URL を変えるだけでプロバイダを切り替えられます:
+
+```ts
+import { Sandbox } from '@temps-sdk/sandbox'
+
+const sandbox = await Sandbox.create({
+  source: { type: 'git', url: 'https://github.com/example/repo.git', revision: 'main' },
+})
+
+const { stdout } = await sandbox.exec(['npm', 'test'])
+const url = sandbox.domain(3000) // VM 内の開発サーバーのライブプレビュー
+```
+
+**パスワード保護されたプレビュー。** サンドボックスの各ポートは公開プレビュー URL として公開でき、生成されたパスワードでロックできます:
+
+```bash
+bunx @temps-sdk/cli sandbox password sbx_abc123 --rotate --length 32
+bunx @temps-sdk/cli sandbox password sbx_abc123 --clear   # 再び公開する
+```
+
+動作中のブランチを、世界中に公開することなく共有できます。
+
+CLI と REST API からも利用できます。E2B や Daytona、Vercel Sandbox に支払っていた分がこれで不要になります。
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/sandboxes-dark.png">
-  <img alt="Temps のサンドボックス —— CLI、REST API、SDK から隔離サンドボックスを作成" src="assets/screenshots/sandboxes-light.png">
+  <img alt="Temps のサンドボックス —— 実行中のサンドボックスと、そのままコピーできる CLI・REST・SDK のスニペット" src="assets/screenshots/sandboxes-light.png">
+</picture>
+
+各サンドボックスにはシェル、バインドした任意のポート用のプレビュー URL テンプレート、そして起きたことすべてのタイムラインが付いてきます:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/sandbox-detail-dark.png">
+  <img alt="Temps サンドボックス詳細 —— Docker/Firecracker バックエンド、ブラウザ内コマンド実行、プレビュー URL テンプレート、パスワード保護されたプレビュー" src="assets/screenshots/sandbox-detail-light.png">
 </picture>
 
 ### すべてを1つのダッシュボードに

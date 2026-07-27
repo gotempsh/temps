@@ -144,13 +144,44 @@ Point any OTLP exporter at Temps and get distributed traces, metrics, and struct
   <img alt="Temps alerts — firing, acknowledged and resolved alarms across metrics, containers, uptime and databases" src="assets/screenshots/alerts-light.png">
 </picture>
 
-### AI Sandboxes — isolated code execution
+### AI Sandboxes — Firecracker microVMs, self-hosted
 
-Spin up isolated sandboxes for agent work, tests, and one-off commands via CLI, REST API, or SDK — a Vercel Sandbox-compatible API with Docker or Firecracker microVM backends. What you'd otherwise pay E2B or Daytona for.
+**Real hardware-level isolation, not just containers.** Sandboxes run on **Firecracker microVMs** — the same tech behind AWS Lambda — with a **Docker** backend as the default. Run `temps firecracker setup` and Temps routes sandboxes to microVMs automatically; each one gets its own kernel, so untrusted agent-generated code never shares a kernel with your host.
+
+**A drop-in SDK.** `@temps-sdk/sandbox` is compatible with the `@vercel/sandbox` shape — switch providers by changing the import and base URL:
+
+```ts
+import { Sandbox } from '@temps-sdk/sandbox'
+
+const sandbox = await Sandbox.create({
+  source: { type: 'git', url: 'https://github.com/example/repo.git', revision: 'main' },
+})
+
+const { stdout } = await sandbox.exec(['npm', 'test'])
+const url = sandbox.domain(3000) // live preview of a dev server inside the VM
+```
+
+**Password-protected previews.** Every sandbox port can be exposed on a public preview URL and locked behind a generated password:
+
+```bash
+bunx @temps-sdk/cli sandbox password sbx_abc123 --rotate --length 32
+bunx @temps-sdk/cli sandbox password sbx_abc123 --clear   # open it back up
+```
+
+Share a running branch without shipping it to the world.
+
+Also available via CLI and REST API. What you'd otherwise pay E2B, Daytona, or Vercel Sandbox for.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/sandboxes-dark.png">
-  <img alt="Temps sandboxes — create isolated sandboxes via CLI, REST API or SDK" src="assets/screenshots/sandboxes-light.png">
+  <img alt="Temps sandboxes — running sandboxes with copy-paste CLI, REST and SDK snippets" src="assets/screenshots/sandboxes-light.png">
+</picture>
+
+Each sandbox gets a shell, a preview URL template for any port it binds, and a timeline of everything that happened to it:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/sandbox-detail-dark.png">
+  <img alt="Temps sandbox detail — Docker/Firecracker backend, in-browser command runner, preview URL template and password-protected previews" src="assets/screenshots/sandbox-detail-light.png">
 </picture>
 
 ### Everything in One Dashboard
