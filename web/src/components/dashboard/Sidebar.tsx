@@ -27,6 +27,7 @@ import {
   ChevronsUpDown,
   Clock,
   Cloud,
+  Check,
   CreditCard,
   Database,
   DatabaseBackup,
@@ -47,6 +48,7 @@ import {
   LogOut,
   Mail,
   Monitor,
+  Moon,
   Network,
   Play,
   Puzzle,
@@ -54,11 +56,13 @@ import {
   Rss,
   Search,
   ScrollText,
+  MessageSquare,
   Server,
   Settings,
   Settings2,
   Shield,
   ShieldAlert,
+  Sun,
   ShieldCheck,
   SlidersHorizontal,
   Sparkles,
@@ -87,8 +91,12 @@ import {
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from '../ui/dropdown-menu'
+import { useTheme } from 'next-themes'
 
 // Daily-use root: short, scannable list. Dense areas (AI, Source) drill
 // down into sub-views per the §6.12 sidebar standard.
@@ -126,6 +134,7 @@ const navWorkflow: PlatformNavItem[] = [
     url: '/ai-gateway',
     icon: Sparkles,
     subItems: [
+      { title: 'AI Chat', url: '/chat', icon: MessageSquare },
       { title: 'AI Gateway', url: '/ai-gateway', icon: Sparkles },
       { title: 'AI Workflows', url: '/agent-sandbox', icon: Bot },
       { title: 'Skills', url: '/skills', icon: Wand2 },
@@ -544,6 +553,34 @@ function GettingStartedNavItem() {
   )
 }
 
+/** Light / Dark / System, nested under the account menu. */
+function ThemeSubmenu() {
+  const { theme, setTheme } = useTheme()
+  const options = [
+    { value: 'light', label: 'Light', icon: Sun },
+    { value: 'dark', label: 'Dark', icon: Moon },
+    { value: 'system', label: 'System', icon: Monitor },
+  ] as const
+  const current = options.find((o) => o.value === theme) ?? options[2]
+  return (
+    <DropdownMenuSub>
+      <DropdownMenuSubTrigger>
+        <current.icon className="mr-2 h-4 w-4" />
+        <span>Appearance</span>
+      </DropdownMenuSubTrigger>
+      <DropdownMenuSubContent>
+        {options.map((o) => (
+          <DropdownMenuItem key={o.value} onClick={() => setTheme(o.value)}>
+            <o.icon className="mr-2 h-4 w-4" />
+            <span>{o.label}</span>
+            {theme === o.value && <Check className="ml-auto h-4 w-4" />}
+          </DropdownMenuItem>
+        ))}
+      </DropdownMenuSubContent>
+    </DropdownMenuSub>
+  )
+}
+
 function NavUser() {
   const { user } = useAuth()
   const { isMobile, isMinimal, setOpenMobile } = useSidebar()
@@ -665,6 +702,10 @@ function NavUser() {
                   <span>Account</span>
                 </Link>
               </DropdownMenuItem>
+              {/* Appearance lives with the account rather than as a fourth
+                  icon in the header — it's a per-user preference you set once,
+                  not something you reach for while working. */}
+              <ThemeSubmenu />
             </DropdownMenuGroup>
             <DropdownMenuSeparator />
             <DropdownMenuItem

@@ -162,12 +162,24 @@ const settingsNavItems: NavigationItem[] = [
     icon: Key,
     keywords: ['tokens', 'auth', 'authentication', 'api'],
   },
+  {
+    title: 'Create API Key',
+    url: '/settings/keys/new',
+    icon: Key,
+    keywords: ['new', 'create', 'add', 'token', 'api', 'key'],
+  },
   // Infrastructure
   {
     title: 'Domains',
     url: '/domains',
     icon: Globe,
     keywords: ['dns', 'urls', 'websites', 'custom domain'],
+  },
+  {
+    title: 'Provision Domain',
+    url: '/domains/add',
+    icon: Globe,
+    keywords: ['new', 'create', 'add', 'domain', 'dns', 'custom domain'],
   },
   {
     title: 'Databases',
@@ -210,6 +222,12 @@ const settingsNavItems: NavigationItem[] = [
     url: '/git-providers',
     icon: GitBranch,
     keywords: ['github', 'gitlab', 'version control', 'repositories'],
+  },
+  {
+    title: 'Add Git Provider',
+    url: '/git-providers/add',
+    icon: GitBranch,
+    keywords: ['new', 'create', 'add', 'connect', 'github', 'gitlab', 'bitbucket', 'gitea'],
   },
   {
     title: 'DNS Providers',
