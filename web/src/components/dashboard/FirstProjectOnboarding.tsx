@@ -7,24 +7,16 @@ import {
   Bug,
   Database,
   GitBranch,
-  Globe,
   Mail,
   Network,
   Play,
   ScrollText,
-  Sparkles,
   Terminal,
-  Upload,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { CopyButton } from '@/components/ui/copy-button'
 import { ConnectionList } from '@/components/dashboard/ConnectionList'
 import { InlineGitConnect } from '@/components/dashboard/InlineGitConnect'
-import { SourceLogo } from '@/components/imports/SourceLogo'
-import {
-  TOP_MIGRATION_SOURCES,
-  importHref,
-} from '@/components/imports/migration-sources'
 import { cn } from '@/lib/utils'
 
 interface FirstProjectOnboardingProps {
@@ -56,7 +48,7 @@ const SHOWCASE: ReadonlyArray<{
 }> = [
   {
     icon: BarChart3,
-    name: 'Web analytics',
+    name: 'Analytics',
     blurb: 'Visitors, pages, funnels, and a live globe — no third-party scripts.',
     href: 'https://temps.sh/docs/analytics',
   },
@@ -92,13 +84,13 @@ const SHOWCASE: ReadonlyArray<{
   },
   {
     icon: Database,
-    name: 'Managed databases',
+    name: 'Databases',
     blurb: 'Postgres, Redis, MongoDB, and S3-compatible storage.',
     href: 'https://temps.sh/docs/databases',
   },
   {
     icon: Mail,
-    name: 'Transactional email',
+    name: 'Email',
     blurb: 'Send via SES, Scaleway, or SMTP with DKIM signing.',
     href: 'https://temps.sh/docs/email',
   },
@@ -133,114 +125,69 @@ export function FirstProjectOnboarding({
 
   return (
     <div className="col-span-full min-w-0 space-y-6 animate-in fade-in-50">
-      {/* Hero — the demo is the wow entry point. */}
-      <div className="relative overflow-hidden rounded-2xl border border-primary/20 bg-card">
-        <div
-          className="p-6 sm:p-8 lg:p-10"
-          style={{
-            backgroundImage:
-              'radial-gradient(120% 120% at 15% 0%, color-mix(in oklch, var(--primary) 10%, transparent) 0%, transparent 55%)',
-          }}
-        >
-          <div className="flex flex-col gap-6 lg:flex-row lg:items-center lg:justify-between">
-            <div className="max-w-2xl">
-              <span className="inline-flex items-center gap-1.5 rounded-full border border-primary/30 bg-primary/10 px-2.5 py-1 text-xs font-medium text-primary">
-                <Sparkles className="h-3.5 w-3.5" />
-                No setup required
-              </span>
-              <h2 className="mt-4 text-2xl font-semibold tracking-tight text-balance sm:text-3xl">
-                Deploy one app. Watch your whole stack light up.
-              </h2>
-              <p className="mt-3 text-sm text-muted-foreground text-balance sm:text-base">
-                One click ships a sample app with a database — pre-wired with
-                analytics, error tracking, logs, and tracing. Deploy it to see
-                exactly what Temps gives you, then add the same to your own
-                projects.
-              </p>
-              <div className="mt-5 flex flex-col gap-3 sm:flex-row sm:items-center">
-                <Button asChild size="lg" className="group">
-                  <Link to={DEMO_TEMPLATE_HREF}>
-                    Deploy the demo app
-                    <ArrowRight className="ml-1.5 h-4 w-4 transition-transform group-hover:translate-x-0.5" />
-                  </Link>
-                </Button>
-                <a
-                  href="#deploy-your-own"
-                  className="text-sm font-medium text-muted-foreground hover:text-foreground"
-                >
-                  or deploy your own app ↓
-                </a>
-              </div>
-            </div>
-
-            {/* Payoff glyph — the live globe is the single most striking
-                Temps feature, so it anchors the hero. */}
-            <div className="hidden shrink-0 lg:block">
-              <div className="flex h-32 w-32 items-center justify-center rounded-full border border-primary/20 bg-primary/5">
-                <Globe className="h-16 w-16 text-primary/70" />
-              </div>
-            </div>
-          </div>
+      {/* Hero. Deliberately one band, not a screen: the demo CTA and the list
+          of what lights up carry the pitch, and the ways to get an app on
+          Temps sit directly below without scrolling. Flat bg-card, same as
+          every other panel on the page — no gradient wash. */}
+      <div className="rounded-2xl border border-primary/20 bg-card p-5 sm:p-6">
+        {/* Title and CTA share one line; the capability chips wrap onto the
+            next. The badge, the sub-paragraph and the payoff glyph are gone —
+            each was another 40-130px of height for something the headline and
+            the chips already say. */}
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <h2 className="text-base font-semibold tracking-tight text-balance sm:text-lg">
+            Deploy one app. Watch your whole stack light up.
+          </h2>
+          <Button asChild size="sm" className="group shrink-0">
+            <Link to={DEMO_TEMPLATE_HREF}>
+              Deploy the demo app
+              <ArrowRight className="ml-1.5 h-4 w-4 transition-transform group-hover:translate-x-0.5" />
+            </Link>
+          </Button>
         </div>
-      </div>
 
-      {/* Showcase — the whole platform, and how to add each to your project. */}
-      <section className="rounded-2xl border bg-card p-6 sm:p-8">
-        <div className="mb-5 sm:mb-6">
-          <h3 className="text-lg font-semibold tracking-tight">
-            Everything you get, in one platform
-          </h3>
-          <p className="mt-1 text-sm text-muted-foreground">
-            Deploy the demo to see these populate with live data — or click any
-            to learn how to add it to your own app.
-          </p>
-        </div>
-        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <span className="mr-0.5 text-xs text-muted-foreground">
+            Pre-wired with
+          </span>
           {SHOWCASE.map((f) => (
-            <ShowcaseCard key={f.name} {...f} />
+            <ShowcaseChip key={f.name} {...f} />
           ))}
         </div>
-      </section>
+      </div>
 
       {/* Deploy your own — Git / CLI. */}
       <section
         id="deploy-your-own"
-        className="rounded-2xl border bg-card p-6 sm:p-8"
+        className="rounded-2xl border bg-card p-5 sm:p-6"
       >
-        <div className="mx-auto mb-6 max-w-2xl text-center">
-          <div className="mx-auto flex h-11 w-11 items-center justify-center rounded-xl bg-muted">
-            <Upload className="h-5 w-5 text-muted-foreground" />
-          </div>
-          <h3 className="mt-4 text-xl font-semibold tracking-tight">
-            Deploy your own app
+        <div className="mb-4 flex flex-col gap-1 sm:flex-row sm:items-baseline sm:justify-between">
+          <h3 className="text-lg font-semibold tracking-tight">
+            Get your own app on Temps
           </h3>
-          <p className="mt-2 text-sm text-balance text-muted-foreground">
-            Ship from Git or straight from your machine — a live URL in a couple
-            of minutes. Attach a Postgres, Redis, or MongoDB as you go.
-          </p>
+          <a
+            href="https://temps.sh/docs"
+            target="_blank"
+            rel="noreferrer"
+            className="flex shrink-0 items-center gap-1.5 text-sm text-muted-foreground transition-colors hover:text-foreground"
+          >
+            <BookOpen className="h-3.5 w-3.5" />
+            Read the deployment docs
+          </a>
         </div>
 
-        <div className="relative mx-auto flex max-w-5xl flex-col gap-4 md:grid md:grid-cols-2 md:gap-8">
-          <div
-            aria-hidden
-            className="pointer-events-none absolute inset-y-0 left-1/2 z-10 hidden -translate-x-1/2 md:block"
-          >
-            <div className="relative flex h-full w-px items-center justify-center">
-              <span className="h-full w-px bg-border" />
-              <span className="absolute flex h-7 min-w-7 items-center justify-center rounded-full border border-border bg-card px-2 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-                or
-              </span>
-            </div>
-          </div>
-
+        {/* Two peer paths — Git and CLI. Migrating from another platform has
+            its own entry point in the page header above, so it isn't repeated
+            here as a third card. */}
+        <div className="grid gap-5 sm:grid-cols-2">
           {/* Path A — Deploy from Git */}
-          <div className="flex flex-col rounded-xl border bg-background p-5 text-left sm:p-6">
-            <div className="flex items-center gap-3">
-              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-primary/10">
-                <GitBranch className="h-5 w-5 text-primary" />
+          <div className="flex flex-col rounded-xl border bg-background p-4 text-left sm:p-5">
+            <div className="flex items-center gap-2.5">
+              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-primary/10">
+                <GitBranch className="h-4 w-4 text-primary" />
               </div>
               <div className="min-w-0">
-                <h4 className="text-base font-semibold">Deploy from Git</h4>
+                <h4 className="text-sm font-semibold">Deploy from Git</h4>
                 <p className="text-xs text-muted-foreground">
                   Git-push deploys with automatic builds
                 </p>
@@ -249,24 +196,14 @@ export function FirstProjectOnboarding({
             {gitConnected ? <ConnectionList /> : <InlineGitConnect />}
           </div>
 
-          <div
-            aria-hidden
-            className="relative flex items-center justify-center md:hidden"
-          >
-            <span className="h-px w-full bg-border" />
-            <span className="absolute flex h-7 min-w-7 items-center justify-center rounded-full border border-border bg-card px-2 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-              or
-            </span>
-          </div>
-
           {/* Path B — Deploy from your machine (CLI) */}
-          <div className="flex flex-col rounded-xl border bg-background p-5 text-left sm:p-6">
-            <div className="flex items-center gap-3">
-              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-muted">
-                <Terminal className="h-5 w-5 text-muted-foreground" />
+          <div className="flex flex-col rounded-xl border bg-background p-4 text-left sm:p-5">
+            <div className="flex items-center gap-2.5">
+              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-muted">
+                <Terminal className="h-4 w-4 text-muted-foreground" />
               </div>
               <div className="min-w-0">
-                <h4 className="text-base font-semibold">
+                <h4 className="text-sm font-semibold">
                   Deploy from your machine
                 </h4>
                 <p className="text-xs text-muted-foreground">
@@ -275,108 +212,33 @@ export function FirstProjectOnboarding({
               </div>
             </div>
 
-            <div className="mt-4 space-y-2">
+            <div className="mt-3 space-y-2">
               {cliCommands.map((cmd) => (
                 <CliCommand key={cmd} command={cmd} />
               ))}
             </div>
 
-            <ol className="mt-4 flex-1 space-y-2">
+            <ol className="mt-3 flex-1 space-y-2">
               {CLI_STEPS.map((step, i) => (
                 <Step key={step} index={i + 1} label={step} />
               ))}
             </ol>
           </div>
         </div>
-
-        {/* Migrate from another platform — one-click tiles for the platforms
-            people most often arrive from; each opens the import wizard with the
-            source preselected. The wizard migrates the whole setup: apps,
-            databases (with data), domains, and env vars. */}
-        <div className="mx-auto mt-6 max-w-5xl rounded-xl border bg-background p-5 sm:p-6">
-          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-            <div className="flex items-center gap-3">
-              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-muted">
-                <Upload className="h-5 w-5 text-muted-foreground" />
-              </div>
-              <div className="min-w-0">
-                <h3 className="text-base font-semibold">
-                  Already running somewhere else?
-                </h3>
-                <p className="text-xs text-muted-foreground">
-                  Bring your apps, databases, domains, and env vars over in one
-                  guided import
-                </p>
-              </div>
-            </div>
-            <Button asChild variant="outline" size="sm" className="shrink-0">
-              <Link
-                to="/projects/import-wizard"
-                className="flex items-center gap-1.5"
-              >
-                See all platforms
-                <ArrowRight className="h-3.5 w-3.5" />
-              </Link>
-            </Button>
-          </div>
-
-          <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
-            {TOP_MIGRATION_SOURCES.map((platform) => (
-              <MigrationSourceTile key={platform.source} {...platform} />
-            ))}
-          </div>
-        </div>
-
-        <div className="mx-auto mt-6 flex max-w-5xl flex-col items-center justify-center gap-x-6 gap-y-2 border-t pt-5 text-sm sm:flex-row">
-          <Button
-            asChild
-            variant="link"
-            className="h-auto p-0 text-muted-foreground"
-          >
-            <a
-              href="https://temps.sh/docs"
-              target="_blank"
-              rel="noreferrer"
-              className="flex items-center gap-1.5"
-            >
-              <BookOpen className="h-3.5 w-3.5" />
-              Read the deployment docs
-            </a>
-          </Button>
-        </div>
       </section>
     </div>
   )
 }
 
-function MigrationSourceTile({
-  source,
-  label,
-}: {
-  source: string
-  label: string
-}) {
-  return (
-    <Link
-      to={importHref(source)}
-      className={cn(
-        'group flex items-center gap-2.5 rounded-lg border bg-card p-3 text-left transition-colors',
-        'hover:border-primary/50 hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring'
-      )}
-    >
-      <SourceLogo source={source} className="h-5 w-5 shrink-0" />
-      <span className="min-w-0 flex-1 truncate text-sm font-medium">
-        {label}
-      </span>
-      <ArrowRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100" />
-    </Link>
-  )
-}
-
-function ShowcaseCard({
+/**
+ * One capability, as a compact chip. Replaces the previous card-with-blurb:
+ * eight of those cost a full screen to communicate "you get all of this",
+ * which the names alone already do. The link still goes to the docs page that
+ * shows how to add it to your own app.
+ */
+function ShowcaseChip({
   icon: Icon,
   name,
-  blurb,
   href,
 }: {
   icon: React.ComponentType<{ className?: string }>
@@ -390,21 +252,12 @@ function ShowcaseCard({
       target="_blank"
       rel="noreferrer"
       className={cn(
-        'group flex flex-col rounded-xl border bg-background p-4 text-left transition-colors',
-        'hover:border-primary/40 hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring'
+        'inline-flex items-center gap-1.5 rounded-full border bg-background/70 px-2.5 py-1 text-xs font-medium transition-colors',
+        'hover:border-primary/40 hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring'
       )}
     >
-      <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary/10 text-primary">
-        <Icon className="h-4 w-4" />
-      </div>
-      <p className="mt-3 text-sm font-semibold">{name}</p>
-      <p className="mt-1 flex-1 text-xs leading-relaxed text-muted-foreground">
-        {blurb}
-      </p>
-      <span className="mt-3 inline-flex items-center gap-0.5 text-xs font-medium text-primary opacity-0 transition-opacity group-hover:opacity-100">
-        Learn how
-        <ArrowRight className="h-3 w-3" />
-      </span>
+      <Icon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+      {name}
     </a>
   )
 }
