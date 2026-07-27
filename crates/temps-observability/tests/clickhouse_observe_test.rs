@@ -14,9 +14,10 @@
 //! be `#[ignore]`d — they detect unavailability at runtime and return).
 //!
 //! The inner Postgres connections are sea-orm `MockDatabase`s: the Request and
-//! Span fetchers under test read only ClickHouse, and the query is restricted
-//! to those two kinds so the error/revenue fetchers (always Postgres) never
-//! run.
+//! Span fetchers under test read only ClickHouse. The error and revenue
+//! fetchers are always Postgres-backed, so the service's own mock is primed
+//! with empty result sets — they resolve to empty streams rather than erroring
+//! when a test enables all four kinds.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -163,7 +164,20 @@ async fn setup() -> Option<ChTestEnv> {
         .await
         .expect("store_spans to ClickHouse");
 
-    let service = ObservabilityService::new(mock_pg(), proxy_logs, ch_otel);
+    // The service's own Postgres handle backs the error and revenue fetchers.
+    // Those kinds have nothing seeded here, but a bare MockDatabase errors with
+    // "`query_results` buffer is empty" the moment they run — which would make
+    // any test that enables all four kinds fail on the harness rather than on
+    // the behaviour under test. Queue empty result sets so they resolve to
+    // empty streams instead.
+    let empty_pg_result = || Vec::<BTreeMap<String, sea_orm::Value>>::new();
+    let service_db = Arc::new(
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(std::iter::repeat_with(empty_pg_result).take(8))
+            .into_connection(),
+    );
+
+    let service = ObservabilityService::new(service_db, proxy_logs, ch_otel);
     Some(ChTestEnv {
         service,
         _container: Box::new(container),
@@ -359,4 +373,76 @@ async fn observe_feed_reads_requests_and_spans_from_clickhouse() {
         wrong_project.is_err(),
         "request_id lookups must not leak across projects"
     );
+}
+
+/// The per-kind fetchers run concurrently via `try_join!` rather than being
+/// awaited one after another, which changed how a DISABLED kind is represented:
+/// it used to contribute nothing to the merge input, and now contributes an
+/// empty stream. `merge_desc_by_ts` therefore has to tolerate empty cursors
+/// interleaved with populated ones — if it did not, asking for a subset of
+/// kinds would drop rows or reorder them wrongly, and the feed would look
+/// subtly wrong rather than fail outright.
+///
+/// Errors also still short-circuit: `try_join!` propagates the first failure,
+/// matching the previous `?`-per-fetcher behaviour, so one broken store fails
+/// the request instead of silently returning a partial feed.
+#[tokio::test]
+async fn observe_feed_merges_correctly_when_only_some_kinds_are_enabled() {
+    let Some(env) = setup().await else { return };
+
+    // All four kinds: the baseline the subsets are checked against.
+    let all = env
+        .service
+        .query(filters(
+            &[
+                EventKind::Request,
+                EventKind::Error,
+                EventKind::Revenue,
+                EventKind::Span,
+            ],
+            None,
+            None,
+        ))
+        .await
+        .expect("all-kinds query");
+
+    // Requests only — three empty streams (error, revenue, span) join the merge.
+    let requests_only = env
+        .service
+        .query(filters(&[EventKind::Request], None, None))
+        .await
+        .expect("requests-only query");
+    assert!(
+        requests_only.iter().all(|e| e.kind() == EventKind::Request),
+        "a disabled kind must not surface"
+    );
+    assert_eq!(
+        requests_only.len(),
+        3,
+        "empty streams from disabled kinds must not swallow rows"
+    );
+
+    // Spans only — same, with the populated stream in a different slot, so a
+    // positional bug in the merge input can't pass both cases.
+    let spans_only = env
+        .service
+        .query(filters(&[EventKind::Span], None, None))
+        .await
+        .expect("spans-only query");
+    assert!(spans_only.iter().all(|e| e.kind() == EventKind::Span));
+    assert_eq!(spans_only.len(), 1);
+
+    // The subsets must partition the full result, not merely be contained in it.
+    assert_eq!(
+        requests_only.len() + spans_only.len(),
+        all.len(),
+        "enabling every kind must yield exactly the union of the subsets \
+         (errors and revenue live in Postgres and are unseeded here)"
+    );
+
+    // Descending-by-ts ordering has to survive the empty cursors.
+    let timestamps: Vec<_> = requests_only.iter().map(|e| e.ts()).collect();
+    let mut sorted = timestamps.clone();
+    sorted.sort_by(|a, b| b.cmp(a));
+    assert_eq!(timestamps, sorted, "feed must stay newest-first");
 }
