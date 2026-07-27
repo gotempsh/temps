@@ -455,6 +455,13 @@ pub enum DeploymentStrategy {
 /// through this before putting it in a plan — an unclassified `is_secret:
 /// false` default would carry passwords and API keys in plaintext into
 /// `POST /imports/plan` and `GET /imports/{session_id}` responses.
+///
+/// Includes connection-string-shaped keys (`DATABASE_URL`, `REDIS_URL`,
+/// `MONGO_URI`, `SMTP_DSN`, ...) since their *value* commonly embeds a
+/// password even though the key itself isn't `PASSWORD`/`SECRET`/`TOKEN`.
+/// This over-masks a few harmless keys too (e.g. `PUBLIC_APP_URL`) — an
+/// acceptable trade since masking only affects what's echoed back in the
+/// plan response, never the real value `execute()` deploys with.
 pub fn looks_like_secret_env_key(key: &str) -> bool {
     let upper = key.to_uppercase();
     upper.contains("SECRET")
@@ -462,6 +469,11 @@ pub fn looks_like_secret_env_key(key: &str) -> bool {
         || upper.contains("TOKEN")
         || upper.contains("KEY")
         || upper.contains("API_KEY")
+        || upper.contains("_URL")
+        || upper.contains("_URI")
+        || upper.contains("DSN")
+        || upper.contains("CONNECTION_STRING")
+        || upper.contains("CONN_STRING")
 }
 
 /// Environment variable
@@ -606,5 +618,61 @@ impl ImportPlan {
     /// Backward-compatible accessor for `source_id` (was `source_container_id`)
     pub fn source_container_id(&self) -> &str {
         &self.source_id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn looks_like_secret_env_key_matches_classic_secret_keys() {
+        for key in [
+            "SECRET",
+            "APP_SECRET",
+            "PASSWORD",
+            "DB_PASSWORD",
+            "TOKEN",
+            "AUTH_TOKEN",
+            "API_KEY",
+            "SOME_KEY",
+        ] {
+            assert!(
+                looks_like_secret_env_key(key),
+                "{key} should be classified as secret"
+            );
+        }
+    }
+
+    #[test]
+    fn looks_like_secret_env_key_matches_connection_string_shaped_keys() {
+        // These commonly embed a password in the *value* even though the
+        // key itself has no PASSWORD/SECRET/TOKEN substring.
+        for key in [
+            "DATABASE_URL",
+            "REDIS_URL",
+            "MONGO_URI",
+            "RABBITMQ_URL",
+            "AMQP_URL",
+            "SMTP_DSN",
+            "SENTRY_DSN",
+            "CONNECTION_STRING",
+            "DB_CONN_STRING",
+        ] {
+            assert!(
+                looks_like_secret_env_key(key),
+                "{key} should be classified as secret"
+            );
+        }
+    }
+
+    #[test]
+    fn looks_like_secret_env_key_does_not_match_plain_config_keys() {
+        for key in ["NODE_ENV", "PORT", "LOG_LEVEL", "FEATURE_CHECKOUT", "PLAN"] {
+            assert!(
+                !looks_like_secret_env_key(key),
+                "{key} should not be classified as secret"
+            );
+        }
     }
 }
