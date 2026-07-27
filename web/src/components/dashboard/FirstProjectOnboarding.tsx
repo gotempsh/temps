@@ -21,6 +21,10 @@ import { CopyButton } from '@/components/ui/copy-button'
 import { ConnectionList } from '@/components/dashboard/ConnectionList'
 import { InlineGitConnect } from '@/components/dashboard/InlineGitConnect'
 import { SourceLogo } from '@/components/imports/SourceLogo'
+import {
+  TOP_MIGRATION_SOURCES,
+  importHref,
+} from '@/components/imports/migration-sources'
 import { cn } from '@/lib/utils'
 
 interface FirstProjectOnboardingProps {
@@ -113,21 +117,6 @@ const CLI_STEPS = [
   'Authorize the CLI in your browser',
   'Temps detects your framework',
   'Build, push, and deploy from this folder',
-] as const
-
-// The platforms most users migrate in from, shown as one-click tiles that
-// open the import wizard with the source preselected. Ids must match the
-// backend `ImportSource` values. The full list (Portainer, Kamal, Docker, …)
-// lives on the migration screen itself — "See all platforms" links there.
-const TOP_MIGRATION_SOURCES: ReadonlyArray<{
-  source: string
-  label: string
-}> = [
-  { source: 'coolify', label: 'Coolify' },
-  { source: 'dokploy', label: 'Dokploy' },
-  { source: 'caprover', label: 'CapRover' },
-  { source: 'kubernetes', label: 'Kubernetes' },
-  { source: 'docker', label: 'Docker' },
 ] as const
 
 /**
@@ -369,7 +358,7 @@ function MigrationSourceTile({
 }) {
   return (
     <Link
-      to={`/projects/import-wizard?source=${source}`}
+      to={importHref(source)}
       className={cn(
         'group flex items-center gap-2.5 rounded-lg border bg-card p-3 text-left transition-colors',
         'hover:border-primary/50 hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring'
