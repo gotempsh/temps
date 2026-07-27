@@ -1,0 +1,76 @@
+name: Nightly Release
+
+# Cuts a nightly prerelease build from main once a day, but only when main
+# has moved since the last nightly tag. The tag it mints
+# (v<version>-nightly.<date>.<short-sha>) contains a `-`, so it matches the
+# `release.yml` tag trigger (`v*.*.*-*`) and rides that same pipeline —
+# there is no separate nightly build/publish logic to keep in sync.
+
+on:
+  schedule:
+    # 03:00 UTC daily
+    - cron: "0 3 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  check-and-tag:
+    name: Check for new commits and tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Determine if a nightly build is needed
+        id: check
+        run: |
+          set -euo pipefail
+
+          head_sha="$(git rev-parse HEAD)"
+          echo "HEAD is at $head_sha"
+
+          # Last nightly tag, if any (sorted by tag creation date via version sort on the date segment).
+          last_nightly_tag="$(git tag -l 'v*-nightly.*' --sort=-creatordate | head -n1 || true)"
+
+          if [ -z "$last_nightly_tag" ]; then
+            echo "No previous nightly tag found -- building."
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          else
+            last_nightly_sha="$(git rev-list -n1 "$last_nightly_tag")"
+            echo "Last nightly tag: $last_nightly_tag ($last_nightly_sha)"
+            if [ "$last_nightly_sha" = "$head_sha" ]; then
+              echo "No new commits on main since last nightly -- skipping."
+              echo "should_release=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "New commits since last nightly -- building."
+              echo "should_release=true" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Compute nightly tag
+        id: tag
+        if: steps.check.outputs.should_release == 'true'
+        run: |
+          set -euo pipefail
+          base_version="$(grep -m1 '^version' Cargo.toml | sed -E 's/version = "([^"]+)"/\1/' | sed -E 's/-.*//')"
+          date_stamp="$(date -u +%Y%m%d)"
+          short_sha="$(git rev-parse --short HEAD)"
+          tag="v${base_version}-nightly.${date_stamp}.${short_sha}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Nightly tag: $tag"
+
+      - name: Create and push nightly tag
+        if: steps.check.outputs.should_release == 'true'
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Nightly build $TAG"
+          git push origin "$TAG"
