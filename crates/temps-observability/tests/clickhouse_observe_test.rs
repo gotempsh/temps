@@ -446,3 +446,44 @@ async fn observe_feed_merges_correctly_when_only_some_kinds_are_enabled() {
     sorted.sort_by(|a, b| b.cmp(a));
     assert_eq!(timestamps, sorted, "feed must stay newest-first");
 }
+
+/// The feed must be bounded even when the client sends no `from`.
+///
+/// `from` is an optional query parameter and the request/span stores take the
+/// range verbatim, so an omitted date used to mean "scan the whole table". The
+/// web UI always sends a range, but the API cannot depend on that. A window
+/// wider than the shared cap is refused outright rather than served slowly.
+#[tokio::test]
+async fn observe_feed_bounds_the_window_and_rejects_an_over_wide_one() {
+    let Some(env) = setup().await else { return };
+
+    // No `from` at all: still returns the seeded rows (they are recent), and
+    // crucially does not error — the default window is applied silently.
+    let mut open = filters(&[EventKind::Request], None, None);
+    open.from = None;
+    open.to = None;
+    let events = env
+        .service
+        .query(open)
+        .await
+        .expect("an omitted range must be defaulted, not rejected");
+    assert_eq!(events.len(), 3, "recent rows are inside the default window");
+
+    // A range wider than the cap is a client error, not a slow query.
+    let mut too_wide = filters(&[EventKind::Request], None, None);
+    too_wide.from = Some(Utc::now() - Duration::days(60));
+    too_wide.to = None;
+    let err = env
+        .service
+        .query(too_wide)
+        .await
+        .expect_err("60 days must exceed the cap");
+
+    // Must be the variant the handler maps to 400 — a client mistake surfacing
+    // as a 500 would be misleading.
+    let temps_observability::ObservabilityError::InvalidTimeWindow(msg) = err else {
+        panic!("expected InvalidTimeWindow so the handler returns 400, got {err:?}");
+    };
+    assert!(msg.contains("maximum"), "{msg}");
+    assert!(msg.contains("still"), "must name the workaround: {msg}");
+}

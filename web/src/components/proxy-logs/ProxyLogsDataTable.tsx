@@ -61,21 +61,33 @@ interface ProxyLogsDataTableProps {
 }
 
 /**
- * Time window for the listing. The API bounds the query to the last 24h when
- * no `start_date` is sent (see ProxyLogService::DEFAULT_LIST_LOOKBACK_HOURS),
- * so the table always sends an explicit window rather than relying on that
- * fallback — the user should be able to see and change what they are looking
- * at, and widening the window is a deliberate, visible act.
+ * Time window for the listing. The API bounds every request server-side
+ * (`temps_core::time_window`, shared across proxy-log and Observe endpoints)
+ * even when no `start_date` is sent, but the table always sends an explicit
+ * window rather than relying on that fallback — the user should be able to
+ * see and change what they are looking at, and widening the window is a
+ * deliberate, visible act. A custom range past the shared 7-day cap is
+ * rejected by the API with an actionable error rather than served slowly.
  *
  * `custom` hands control to the start_date/end_date fields in the advanced
  * filter panel.
  */
-type TimeRange = '30m' | '6h' | '12h' | '24h' | '3d' | '7d' | 'custom'
+type TimeRange = '30m' | '1h' | '6h' | '12h' | '24h' | '3d' | '7d' | 'custom'
 
-const DEFAULT_TIME_RANGE: TimeRange = '24h'
+/**
+ * One hour, not a day: the listing's cost is linear in how much time the window
+ * spans, because `ORDER BY timestamp DESC` cannot be answered from the sort key
+ * when no project is selected. Measured on 150M rows, whole endpoint:
+ * 7.7ms over 1h against 123ms over 24h and 1.3s over 7d.
+ *
+ * Kept in step with `temps_core::time_window::DEFAULT_LOOKBACK_HOURS` so a
+ * client that sends no range sees the same window the picker reports.
+ */
+const DEFAULT_TIME_RANGE: TimeRange = '1h'
 
 const TIME_RANGES: { value: TimeRange; label: string }[] = [
   { value: '30m', label: 'Last 30 minutes' },
+  { value: '1h', label: 'Last hour' },
   { value: '6h', label: 'Last 6 hours' },
   { value: '12h', label: 'Last 12 hours' },
   { value: '24h', label: 'Last 24 hours' },
@@ -86,6 +98,7 @@ const TIME_RANGES: { value: TimeRange; label: string }[] = [
 
 const RANGE_MS: Record<Exclude<TimeRange, 'custom'>, number> = {
   '30m': 30 * 60 * 1000,
+  '1h': 60 * 60 * 1000,
   '6h': 6 * 60 * 60 * 1000,
   '12h': 12 * 60 * 60 * 1000,
   '24h': 24 * 60 * 60 * 1000,
@@ -664,8 +677,9 @@ export function ProxyLogsDataTable({
       <div className="flex items-center justify-between gap-4 flex-wrap">
         <div className="flex items-center gap-2">
           {/* Time range. The listing is always bounded (the API defaults to
-              24h when no start_date is sent), so this control is the primary
-              way to reach older traffic — up to the retention horizon. */}
+              1h when no start_date is sent, and rejects a custom range wider
+              than 7 days), so this control is the primary way to reach older
+              traffic — up to the retention horizon. */}
           <Select
             value={timeRange}
             onValueChange={(v) => changeTimeRange(v as TimeRange)}
@@ -1312,8 +1326,9 @@ export function ProxyLogsDataTable({
             <div className="flex flex-col items-center justify-center py-12 text-center">
               <AlertCircle className="h-12 w-12 text-destructive mb-4" />
               <p className="text-lg font-semibold">Failed to load proxy logs</p>
-              <p className="text-sm text-muted-foreground">
-                Please try again later
+              <p className="text-sm text-muted-foreground max-w-md">
+                {(error as { detail?: string })?.detail ||
+                  'Please try again later.'}
               </p>
             </div>
           ) : !data || data.logs.length === 0 ? (
@@ -1321,7 +1336,15 @@ export function ProxyLogsDataTable({
               <Search className="h-12 w-12 text-muted-foreground mb-4" />
               <p className="text-lg font-semibold">No proxy logs found</p>
               <p className="text-sm text-muted-foreground">
-                Try adjusting your filters
+                {timeRange === 'custom'
+                  ? 'No requests in the selected date range.'
+                  : `No requests in the ${(
+                      TIME_RANGES.find((r) => r.value === timeRange)?.label ??
+                      'selected range'
+                    ).toLowerCase()}.`}{' '}
+                {hasActiveFilters
+                  ? 'Try widening the time range or clearing filters.'
+                  : 'Try widening the time range.'}
               </p>
             </div>
           ) : (

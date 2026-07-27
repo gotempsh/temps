@@ -143,6 +143,24 @@ impl ObservabilityService {
     ) -> Result<Vec<ObservabilityEvent>, ObservabilityError> {
         filters.validate()?;
 
+        // Bound the window BEFORE any fetcher runs, so every kind inherits it.
+        // `from` is an optional query parameter, and the span and request
+        // stores take the range verbatim — `query_spans` and `list_page` would
+        // otherwise scan their whole table for a caller that simply omitted a
+        // date. The web UI always sends a range; the API must not depend on
+        // that. Rules and measurements live in temps_core::time_window.
+        let window = temps_core::time_window::resolve(
+            filters.from,
+            filters.to,
+            chrono::Duration::hours(temps_core::time_window::DEFAULT_LOOKBACK_HOURS),
+        )
+        .map_err(|e| ObservabilityError::InvalidTimeWindow(e.to_string()))?;
+        let filters = EventFilters {
+            from: Some(window.start),
+            to: window.end,
+            ..filters
+        };
+
         // A disabled kind resolves to an empty stream without touching its
         // store, so the join arms stay uniform in type.
         let requests = async {

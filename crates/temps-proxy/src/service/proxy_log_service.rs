@@ -570,37 +570,41 @@ impl ProxyLogService {
         (query, has_filters)
     }
 
-    /// Lower bound applied to `GET /proxy-logs` when the caller supplies no
-    /// `start_date`.
+    /// Resolve a caller-supplied range into a bounded, capped window.
     ///
-    /// An unbounded listing has to consider the whole retention window — 30
-    /// days of one-row-per-HTTP-request traffic, which is 100M+ rows on a busy
-    /// deployment — to return 20 rows. That is never what a caller wants and it
-    /// is the single most expensive query the API can be asked to run, so the
-    /// endpoint is always time-bounded. Callers that want a wider window pass
-    /// `start_date` explicitly; the UI's time-range picker does exactly that.
-    pub const DEFAULT_LIST_LOOKBACK_HOURS: i64 = 24;
-
-    /// Resolve the effective lower time bound for a listing.
+    /// Delegates to [`temps_core::time_window`], which owns the contract shared
+    /// by every high-volume read endpoint: a default lower bound so omitting a
+    /// date never means "scan the retention window", and a maximum span so a
+    /// single request cannot ask for a query that takes tens of seconds. See
+    /// that module for the measurements behind both numbers.
     ///
-    /// Applied whenever `start_date` is absent, anchored to `end_date` when one
-    /// was given so an explicit upper bound still returns the window ending
-    /// there rather than a window ending now.
-    fn effective_start_date(
+    /// Returns the window as the `(start, end)` pair the storage layer takes,
+    /// so callers stay unchanged apart from the `?`.
+    fn resolve_window(
         start_date: Option<UtcDateTime>,
         end_date: Option<UtcDateTime>,
-    ) -> Option<UtcDateTime> {
-        if start_date.is_some() {
-            return start_date;
-        }
-        let anchor = end_date.unwrap_or_else(chrono::Utc::now);
-        // Checked arithmetic: `anchor` can come straight from a user-supplied
-        // query parameter, and a bare subtraction panics on overflow.
-        Some(
-            anchor
-                .checked_sub_signed(chrono::Duration::hours(Self::DEFAULT_LIST_LOOKBACK_HOURS))
-                .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC),
+    ) -> Result<(Option<UtcDateTime>, Option<UtcDateTime>), ProxyLogServiceError> {
+        let window = temps_core::time_window::resolve(
+            start_date,
+            end_date,
+            chrono::Duration::hours(temps_core::time_window::DEFAULT_LOOKBACK_HOURS),
         )
+        .map_err(|e| ProxyLogServiceError::InvalidFilter(e.to_string()))?;
+        Ok((Some(window.start), window.end))
+    }
+
+    /// Reject a range wider than the shared cap.
+    ///
+    /// The stats endpoints take a REQUIRED range, so there is nothing to
+    /// default — only the width needs enforcing. These are GROUP BY scans
+    /// rather than sorted pages, so they are cheaper per row, but they still
+    /// read every row in the window and a month-wide request is seconds of work
+    /// on a 150M-row table.
+    fn enforce_window_span(
+        start_time: UtcDateTime,
+        end_time: UtcDateTime,
+    ) -> Result<(), ProxyLogServiceError> {
+        Self::resolve_window(Some(start_time), Some(end_time)).map(|_| ())
     }
 
     pub async fn list_with_filters(
@@ -614,7 +618,7 @@ impl ProxyLogService {
         // Bound the window before dispatching so BOTH storage backends get the
         // same treatment — the TimescaleDB hypertable needs chunk exclusion for
         // the same reason ClickHouse needs partition pruning.
-        let start_date = Self::effective_start_date(start_date, end_date);
+        let (start_date, end_date) = Self::resolve_window(start_date, end_date)?;
 
         if let Some(storage) = &self.storage {
             return storage
@@ -652,6 +656,10 @@ impl ProxyLogService {
         filters: crate::handler::proxy_logs::ProxyLogsQuery,
         limit: u64,
     ) -> Result<Vec<proxy_logs::Model>, ProxyLogServiceError> {
+        // Same bounding as list_with_filters — this is the count-free variant
+        // the Observe feed uses, not a laxer one.
+        let (start_date, end_date) = Self::resolve_window(start_date, end_date)?;
+
         if let Some(storage) = &self.storage {
             return storage
                 .list_page(start_date, end_date, filters, limit)
@@ -859,6 +867,8 @@ impl ProxyLogService {
         bucket_interval: String, // e.g., "1 hour", "1 day", "5 minutes"
         filters: Option<StatsFilters>,
     ) -> Result<Vec<TimeBucketStats>, ProxyLogServiceError> {
+        Self::enforce_window_span(start_time, end_time)?;
+
         if let Some(storage) = &self.storage {
             return storage
                 .get_time_bucket_stats(start_time, end_time, bucket_interval, filters)
@@ -1060,6 +1070,8 @@ impl ProxyLogService {
         end_time: UtcDateTime,
         is_bot: Option<bool>,
     ) -> Result<Vec<ProjectHealthSummary>, ProxyLogServiceError> {
+        Self::enforce_window_span(start_time, end_time)?;
+
         if let Some(storage) = &self.storage {
             return storage
                 .get_projects_health_summary(project_ids, start_time, end_time, is_bot)
@@ -1477,6 +1489,8 @@ impl ProxyLogService {
         end_time: UtcDateTime,
         limit: u64,
     ) -> Result<Vec<AiAgentBreakdownRow>, ProxyLogServiceError> {
+        Self::enforce_window_span(start_time, end_time)?;
+
         if let Some(storage) = &self.storage {
             return storage
                 .get_ai_agent_breakdown(
@@ -1607,6 +1621,8 @@ impl ProxyLogService {
         end_time: UtcDateTime,
         limit: u64,
     ) -> Result<Vec<AiPageBreakdownRow>, ProxyLogServiceError> {
+        Self::enforce_window_span(start_time, end_time)?;
+
         if let Some(storage) = &self.storage {
             return storage
                 .get_ai_page_breakdown(
@@ -1714,6 +1730,8 @@ impl ProxyLogService {
         end_time: UtcDateTime,
         limit: u64,
     ) -> Result<Vec<AiAgentPageRow>, ProxyLogServiceError> {
+        Self::enforce_window_span(start_time, end_time)?;
+
         let known = crate::ai_agent_detector::known_agents();
         if !known.iter().any(|(_, m)| m.agent == agent) {
             return Ok(vec![]);
@@ -1800,6 +1818,8 @@ impl ProxyLogService {
         bucket_interval: String,
         group_by: AiTimelineGroupBy,
     ) -> Result<Vec<AiAgentTimelineRow>, ProxyLogServiceError> {
+        Self::enforce_window_span(start_time, end_time)?;
+
         if let Some(storage) = &self.storage {
             return storage
                 .get_ai_agent_timeline(
@@ -2005,6 +2025,8 @@ impl ProxyLogService {
         start_time: UtcDateTime,
         end_time: UtcDateTime,
     ) -> Result<Vec<AiStatusBreakdownRow>, ProxyLogServiceError> {
+        Self::enforce_window_span(start_time, end_time)?;
+
         if let Some(storage) = &self.storage {
             return storage
                 .get_ai_status_breakdown(project_id, environment_id, start_time, end_time)
@@ -2242,68 +2264,68 @@ pub struct ProjectHealthSummary {
 mod tests {
     use super::*;
 
-    // ── Default listing window ────────────────────────────────────────────
-    // `GET /proxy-logs` must never issue an unbounded scan: on a 100M-row
-    // deployment that means considering the whole retention window to return
-    // 20 rows.
+    // ── Listing window ────────────────────────────────────────────────────
+    // `GET /proxy-logs` must never issue an unbounded scan (on a 100M-row
+    // deployment that means considering the whole retention window to return 20
+    // rows) and must never accept a window so wide the query takes tens of
+    // seconds. The rules themselves live in temps_core::time_window and are
+    // tested there; these cover the SERVICE's contract — that it applies them,
+    // and that a violation surfaces as a 400-mapped InvalidFilter rather than
+    // an opaque 500.
 
     #[test]
-    fn effective_start_date_defaults_to_24h_before_now_when_both_absent() {
+    fn resolve_window_bounds_an_open_request() {
+        let lookback = chrono::Duration::hours(temps_core::time_window::DEFAULT_LOOKBACK_HOURS);
         let before = chrono::Utc::now();
-        let start = ProxyLogService::effective_start_date(None, None)
-            .expect("a lower bound is always produced");
+        let (start, end) =
+            ProxyLogService::resolve_window(None, None).expect("open request is bounded");
         let after = chrono::Utc::now();
 
+        let start = start.expect("a lower bound is always produced");
         assert!(
-            start >= before - chrono::Duration::hours(24)
-                && start <= after - chrono::Duration::hours(24),
-            "expected ~24h before now, got {start}"
+            start >= before - lookback && start <= after - lookback,
+            "expected ~{}h before now, got {start}",
+            temps_core::time_window::DEFAULT_LOOKBACK_HOURS
+        );
+        assert_eq!(end, None, "an open upper bound stays open");
+    }
+
+    #[test]
+    fn resolve_window_preserves_an_explicit_range_within_the_cap() {
+        let start = chrono::DateTime::parse_from_rfc3339("2026-07-14T00:00:00Z")
+            .expect("valid fixture timestamp")
+            .with_timezone(&chrono::Utc);
+        let end = chrono::DateTime::parse_from_rfc3339("2026-07-20T00:00:00Z")
+            .expect("valid fixture timestamp")
+            .with_timezone(&chrono::Utc);
+
+        // Widening past the default is exactly how the UI's range picker works.
+        assert_eq!(
+            ProxyLogService::resolve_window(Some(start), Some(end)).expect("within cap"),
+            (Some(start), Some(end))
         );
     }
 
     #[test]
-    fn effective_start_date_anchors_to_end_date_when_only_end_given() {
-        let end = chrono::DateTime::parse_from_rfc3339("2026-07-20T12:00:00Z")
+    fn resolve_window_rejects_a_range_wider_than_the_cap_as_a_bad_request() {
+        let start = chrono::DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
+            .expect("valid fixture timestamp")
+            .with_timezone(&chrono::Utc);
+        let end = chrono::DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
             .expect("valid fixture timestamp")
             .with_timezone(&chrono::Utc);
 
-        let start = ProxyLogService::effective_start_date(None, Some(end))
-            .expect("a lower bound is always produced");
+        let err = ProxyLogService::resolve_window(Some(start), Some(end))
+            .expect_err("30 days exceeds the cap");
 
-        // Window ends where the caller asked, not at "now".
-        assert_eq!(start, end - chrono::Duration::hours(24));
-    }
-
-    #[test]
-    fn effective_start_date_preserves_an_explicit_start() {
-        let start = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
-            .expect("valid fixture timestamp")
-            .with_timezone(&chrono::Utc);
-        let end = chrono::DateTime::parse_from_rfc3339("2026-07-20T12:00:00Z")
-            .expect("valid fixture timestamp")
-            .with_timezone(&chrono::Utc);
-
-        // An explicit start is never narrowed — widening the window past 24h
-        // is exactly how the UI's time-range picker works.
-        assert_eq!(
-            ProxyLogService::effective_start_date(Some(start), Some(end)),
-            Some(start)
-        );
-        assert_eq!(
-            ProxyLogService::effective_start_date(Some(start), None),
-            Some(start)
-        );
-    }
-
-    #[test]
-    fn effective_start_date_saturates_instead_of_panicking_on_underflow() {
-        // `end_date` reaches the service straight from a query parameter, so a
-        // near-MIN value must not panic the subtraction.
-        let end = chrono::DateTime::<chrono::Utc>::MIN_UTC;
-        assert_eq!(
-            ProxyLogService::effective_start_date(None, Some(end)),
-            Some(chrono::DateTime::<chrono::Utc>::MIN_UTC)
-        );
+        // InvalidFilter is the variant the handler maps to 400; anything else
+        // would surface a client mistake as a server error.
+        let ProxyLogServiceError::InvalidFilter(msg) = err else {
+            panic!("expected InvalidFilter so the handler returns 400, got {err:?}");
+        };
+        // The detail reaches the client verbatim, so it must stay actionable.
+        assert!(msg.contains("7-day maximum"), "{msg}");
+        assert!(msg.contains("still"), "must name the workaround: {msg}");
     }
 
     #[test]
