@@ -2094,6 +2094,22 @@ impl WorkflowExecutionService {
             for container in containers {
                 let container_id = container.container_id.clone();
 
+                // Mark the row deleted *before* stopping the container in Docker.
+                // ContainerHealthMonitor (temps-monitoring) polls
+                // `deployment_containers` filtered on `DeletedAt.is_null()` on its
+                // own independent schedule. If that poll lands between
+                // `stop_container()` below (which puts Docker's container state
+                // into `Exited`) and this row being marked deleted, it has no way
+                // to tell the exit was an intentional teardown and fires a false
+                // ContainerCrash alarm. Writing `deleted_at` first closes that
+                // window: once this update commits, the health monitor's next
+                // query no longer returns this row at all.
+                use sea_orm::{ActiveModelTrait, Set};
+                let mut active_container: deployment_containers::ActiveModel = container.into();
+                active_container.deleted_at = Set(Some(chrono::Utc::now()));
+                active_container.status = Set(Some("deleted".to_string()));
+                active_container.update(self.db.as_ref()).await?;
+
                 // Stop and remove the container
                 match self.container_deployer.stop_container(&container_id).await {
                     Ok(_) => {
@@ -2116,13 +2132,6 @@ impl WorkflowExecutionService {
                         warn!("Failed to remove container {}: {}", container_id, e);
                     }
                 }
-
-                // Mark container as deleted
-                use sea_orm::{ActiveModelTrait, Set};
-                let mut active_container: deployment_containers::ActiveModel = container.into();
-                active_container.deleted_at = Set(Some(chrono::Utc::now()));
-                active_container.status = Set(Some("deleted".to_string()));
-                active_container.update(self.db.as_ref()).await?;
 
                 if first_stopped_container_id.is_none() {
                     first_stopped_container_id = Some(container_id);
@@ -2951,5 +2960,195 @@ mod tests {
         fn is_enabled(&self) -> bool {
             true
         }
+    }
+
+    /// Deployer used only by
+    /// `test_teardown_previous_deployment_marks_deleted_before_stopping_container`.
+    /// Asserts that by the time Docker is asked to stop a container, its
+    /// `deployment_containers` row is already marked deleted in the database —
+    /// the invariant that closes the race with `ContainerHealthMonitor`'s
+    /// independent poll loop (see the comment in `teardown_previous_deployment`).
+    struct AssertDeletedBeforeStopDeployer {
+        db: Arc<DbConnection>,
+    }
+
+    #[async_trait]
+    impl ContainerDeployer for AssertDeletedBeforeStopDeployer {
+        async fn deploy_container(
+            &self,
+            _request: temps_deployer::DeployRequest,
+        ) -> Result<temps_deployer::DeployResult, temps_deployer::DeployerError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn start_container(
+            &self,
+            _container_id: &str,
+        ) -> Result<(), temps_deployer::DeployerError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn stop_container(
+            &self,
+            container_id: &str,
+        ) -> Result<(), temps_deployer::DeployerError> {
+            let container = temps_entities::deployment_containers::Entity::find()
+                .filter(temps_entities::deployment_containers::Column::ContainerId.eq(container_id))
+                .one(self.db.as_ref())
+                .await
+                .expect("query deployment_containers row")
+                .expect("deployment_containers row exists");
+            assert!(
+                container.deleted_at.is_some(),
+                "container {container_id} must be marked deleted before stop_container() \
+                 is called — otherwise ContainerHealthMonitor's concurrent poll can \
+                 observe an Exited container with no signal that the exit is an \
+                 intentional teardown, and fires a false ContainerCrash alarm"
+            );
+            Ok(())
+        }
+
+        async fn pause_container(
+            &self,
+            _container_id: &str,
+        ) -> Result<(), temps_deployer::DeployerError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn resume_container(
+            &self,
+            _container_id: &str,
+        ) -> Result<(), temps_deployer::DeployerError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn remove_container(
+            &self,
+            _container_id: &str,
+        ) -> Result<(), temps_deployer::DeployerError> {
+            Ok(())
+        }
+
+        async fn get_container_info(
+            &self,
+            _container_id: &str,
+        ) -> Result<temps_deployer::ContainerInfo, temps_deployer::DeployerError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn get_container_stats(
+            &self,
+            _container_id: &str,
+        ) -> Result<temps_deployer::ContainerStats, temps_deployer::DeployerError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn list_containers(
+            &self,
+        ) -> Result<Vec<temps_deployer::ContainerInfo>, temps_deployer::DeployerError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn get_container_logs(
+            &self,
+            _container_id: &str,
+        ) -> Result<String, temps_deployer::DeployerError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn stream_container_logs(
+            &self,
+            _container_id: &str,
+        ) -> Result<
+            Box<dyn futures::Stream<Item = String> + Unpin + Send>,
+            temps_deployer::DeployerError,
+        > {
+            unimplemented!("not exercised by this test")
+        }
+    }
+
+    #[tokio::test]
+    async fn test_teardown_previous_deployment_marks_deleted_before_stopping_container(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use temps_entities::deployment_containers;
+
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        let (project, environment, current_deployment) = create_test_data(&db).await?;
+
+        // A previous deployment in the same environment, still active, whose
+        // container should be torn down now that `current_deployment` is live.
+        let previous_deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("previous-deployment".to_string()),
+            state: Set("completed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            created_at: Set(Utc::now() - chrono::Duration::minutes(5)),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let container = deployment_containers::ActiveModel {
+            deployment_id: Set(previous_deployment.id),
+            container_id: Set("old-container-1".to_string()),
+            container_name: Set("old-container-1".to_string()),
+            container_port: Set(3000),
+            deployed_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let (queue, _receiver) = temps_queue::BroadcastQueueService::create_broadcast_channel(100);
+        let queue = Arc::new(queue) as Arc<dyn temps_core::JobQueue>;
+        let git_provider = Arc::new(MockGitProvider);
+        let image_builder = Arc::new(MockImageBuilder { should_fail: false });
+        let container_deployer = Arc::new(AssertDeletedBeforeStopDeployer { db: db.clone() });
+        let static_deployer = Arc::new(MockStaticDeployer);
+        let log_service = Arc::new(LogService::new(std::env::temp_dir()));
+        let cron_service =
+            Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>;
+        let config_service = create_mock_config_service(db.clone());
+        let screenshot_service = Arc::new(ScreenshotService::new(config_service.clone()).await?);
+        let docker = Arc::new(
+            bollard::Docker::connect_with_local_defaults()
+                .unwrap_or_else(|_| panic!("Failed to connect to Docker")),
+        );
+
+        let service = WorkflowExecutionService::new(
+            db.clone(),
+            queue,
+            git_provider,
+            image_builder,
+            container_deployer,
+            static_deployer,
+            log_service,
+            cron_service,
+            Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
+            config_service,
+            screenshot_service,
+            docker,
+        );
+
+        let stopped_container_id = service
+            .teardown_previous_deployment(project.id, environment.id, current_deployment.id)
+            .await?;
+
+        assert_eq!(stopped_container_id, Some("old-container-1".to_string()));
+
+        let refreshed = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("container row still exists");
+        assert!(refreshed.deleted_at.is_some());
+        assert_eq!(refreshed.status.as_deref(), Some("deleted"));
+
+        Ok(())
     }
 }

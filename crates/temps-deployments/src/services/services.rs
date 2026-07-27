@@ -1787,6 +1787,19 @@ impl DeploymentService {
 
             for container in containers {
                 let container_id = container.container_id.clone();
+
+                // Mark the row deleted *before* stopping the container in Docker
+                // (see the identical race explained in
+                // WorkflowExecutionService::teardown_previous_deployment):
+                // ContainerHealthMonitor polls on its own schedule and would
+                // otherwise observe this container mid-exit with no signal that
+                // the exit is an intentional pre-rollback cleanup, firing a
+                // false ContainerCrash alarm.
+                let mut active_container: deployment_containers::ActiveModel = container.into();
+                active_container.deleted_at = Set(Some(chrono::Utc::now()));
+                active_container.status = Set(Some("removed".to_string()));
+                let _ = active_container.update(self.db.as_ref()).await;
+
                 if let Err(e) = self.deployer.stop_container(&container_id).await {
                     warn!(
                         "Failed to stop container {} during pre-rollback cleanup: {}",
@@ -1799,12 +1812,6 @@ impl DeploymentService {
                         container_id, e
                     );
                 }
-
-                // Mark container as deleted
-                let mut active_container: deployment_containers::ActiveModel = container.into();
-                active_container.deleted_at = Set(Some(chrono::Utc::now()));
-                active_container.status = Set(Some("removed".to_string()));
-                let _ = active_container.update(self.db.as_ref()).await;
 
                 info!(
                     "Pre-rollback: stopped and removed container {}",
